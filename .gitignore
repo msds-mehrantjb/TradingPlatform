@@ -1,0 +1,55 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pycache-check/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# Runtime databases and generated data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+data/
+backend/data/
+backend/trading.db*
+
+# Logs
+*.log
+*.out.log
+*.err.log
+
+# Generated trading artifacts
+ml_comparison_*.json
+dynamic_trading_artifact_*.json
+candidate_dataset_*.json
+candidate_dataset_*.jsonl
+candidate_dataset_*.csv
+train_dataset_*.jsonl
+train_dataset_*.csv
+test_dataset_*.jsonl
+test_dataset_*.csv
+train_test_dataset_*.json
+ml_diagnostics_*.json
+trading_rag_corpus_*.json
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
