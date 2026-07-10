@@ -23,6 +23,121 @@ type CandleResponse = {
   candles: Candle[];
 };
 
+type MarketForecastPrediction = {
+  status: "ready" | "fallback" | "insufficient_data" | "error";
+  symbol: string;
+  horizonMinutes: number;
+  probabilitySuccess: number | null;
+  probabilityBuySuccess: number | null;
+  probabilitySellSuccess: number | null;
+  probabilityStop: number | null;
+  probabilityTimeout: number | null;
+  outcome: {
+    predicted: "target_hit_first" | "stop_hit_first" | "timeout_no_edge";
+    probabilities: Record<"target_hit_first" | "stop_hit_first" | "timeout_no_edge", number | null>;
+    labels: Record<"target_hit_first" | "stop_hit_first" | "timeout_no_edge", number>;
+  };
+  decision: {
+    action: "buy" | "sell" | "no_trade";
+    candidateAction: "buy" | "sell" | "no_trade";
+    confidence: number | null;
+    edgeGap: number | null;
+    minimumConfidence: number;
+    minimumEdgeGap: number;
+    modelDisagreement?: number | null;
+    maximumModelDisagreement?: number;
+    spreadAtr?: number;
+    maximumSpreadAtr?: number;
+    expectedValue: number | null;
+    positionSizeMultiplier: number;
+    reasons: string[];
+  };
+  threshold: number;
+  minimumEdgeGap: number;
+  maximumModelDisagreement?: number;
+  expectedValue: number | null;
+  buyExpectedValue?: number | null;
+  sellExpectedValue?: number | null;
+  barriers?: {
+    targetDistance: number | null;
+    stopDistance: number | null;
+    minTargetPct: number;
+    minStopPct: number;
+    targetAtrMultiplier: number;
+    stopAtrMultiplier: number;
+    fixedTargetDollars?: number;
+    fixedStopDollars?: number;
+    atr5m?: number;
+  };
+  expectedMove: number | null;
+  costs: number;
+  allowed: boolean;
+  model: {
+    status: string;
+    kind: string;
+    message: string;
+    brier?: number;
+    calibration?: string | null;
+    uncertaintyMembers?: number;
+    installedLibraries?: string[];
+    libraryCandidates?: Record<string, boolean>;
+  };
+  regime: {
+    trend: string;
+    volatility: string;
+    vwap: string;
+    timeOfDay: string;
+  };
+  marketRegime?: {
+    trend: string;
+    volatility: string;
+    session: string;
+    allowedLong: boolean;
+    allowedShort: boolean;
+    thresholdAdjustment: number;
+    positionSizeMultiplier: number;
+    notes: string[];
+  };
+  algorithmSignals?: {
+    weightedScores?: {
+      buy?: number;
+      sell?: number;
+      hold?: number;
+      buyMinusSell?: number;
+      winnerMargin?: number;
+    };
+    familyScores?: MetaFamilyAggregationScores;
+    disagreement?: number;
+  };
+  uncertainty?: {
+    modelCount: number;
+    modelDisagreement: number | null;
+    maximumModelDisagreement: number;
+    members: Array<{ name: string; buy: number; sell: number; timeout: number }>;
+  };
+  features: Record<string, unknown>;
+  topDrivers: string[];
+  missingInputs: string[];
+  updatedAt: string;
+};
+
+type ForecastSafetyDecisionChange = {
+  id: string;
+  recordedAt: string;
+  mode: TradingWindowMode;
+  symbol: string;
+  action: "block_buy" | "keep_stopped_lot" | "close_stopped_lot" | "keep_opening_grace";
+  originalDecision: string;
+  finalDecision: string;
+  reason: string;
+  latestPrice: number;
+  latestTimestamp: string | null;
+  forecastAction: MarketForecastPrediction["decision"]["action"] | null;
+  forecastConfidence: number | null;
+  forecastExpectedValue: number | null;
+  forecastEdgeGap: number | null;
+};
+
 type MarketStatus = {
   status: string;
   isOpen: boolean;
@@ -232,6 +347,15 @@ type TradeSummaryResponse = {
 type AlgoSignal = "Buy" | "Sell" | "Hold";
 type BacktestResultTimeframe = "1Min" | "5Min" | "1Hour" | "1Day" | "1Week" | "Event";
 type AlgoBacktestTimeframe = BacktestResultTimeframe | "Trading";
+const FAST_INTRADAY_ALGO_TIMEFRAMES = new Set<AlgoBacktestTimeframe>(["1Min", "5Min"]);
+
+function visibleAlgoBacktestTimeframe(timeframe: AlgoBacktestTimeframe | undefined): AlgoBacktestTimeframe {
+  return timeframe && FAST_INTRADAY_ALGO_TIMEFRAMES.has(timeframe) ? timeframe : "1Min";
+}
+
+function shouldRefreshVotingTradingRag() {
+  return state.algoBacktestTimeframe === "1Min" || state.algoBacktestTimeframe === "5Min" || state.algoBacktestTimeframe === "Trading";
+}
 
 type AlgoVote = {
   strategy: string;
@@ -249,6 +373,26 @@ type ConfidenceStrategy = {
   name: string;
   baseWeight: number;
   signal: (market: ConfidenceMarket) => ConfidenceStrategyRawSignal;
+};
+
+type MetaStrategyRole = "directional" | "context" | "meta_safety";
+type MetaStrategyFamily =
+  | "trend"
+  | "breakout"
+  | "mean_reversion"
+  | "reversal"
+  | "volume_confirmation"
+  | "market_regime"
+  | "vwap"
+  | "event"
+  | "safety";
+
+type MetaStrategyDefinition = {
+  name: string;
+  role: MetaStrategyRole;
+  family: MetaStrategyFamily;
+  source: "ensemble" | "confidence" | "alias";
+  alias?: string;
 };
 
 type ConfidenceStrategySignal = "buy" | "sell" | "hold";
@@ -342,6 +486,164 @@ type ConfidenceMarket = {
   timeOfDay: ConfidenceTimeOfDayContext;
 };
 
+type RegimePrimaryTrend = "Strong uptrend" | "Weak uptrend" | "Strong downtrend" | "Weak downtrend" | "Sideways / range-bound";
+type RegimeVolatilityState = "Low volatility" | "Normal volatility" | "High volatility";
+type RegimeOpportunityState =
+  | "Trend continuation"
+  | "Bullish breakout"
+  | "Bearish breakout"
+  | "Bullish reversal risk"
+  | "Bearish reversal risk"
+  | "Mean reversion"
+  | "No-trade";
+type RegimeDecisionSignal = AlgoSignal | "No-trade";
+
+type RegimeSelectionFeature = {
+  name: string;
+  value: string;
+  status: "ok" | "warn" | "block" | "na";
+};
+
+type RegimeSelectedStrategy = ConfidenceStrategyResult & {
+  selected: boolean;
+  selectorReason: string;
+};
+
+type RegimeSelectionScores = {
+  buy: number;
+  sell: number;
+  hold: number;
+};
+
+type RegimeConditionSnapshot = {
+  primaryTrend: RegimePrimaryTrend;
+  volatility: RegimeVolatilityState;
+  opportunity: RegimeOpportunityState;
+  confidence: number;
+  key: string;
+  contextKey: string;
+};
+
+type RegimeSelectionResult = {
+  signal: RegimeDecisionSignal;
+  aggregateSignal: ConfidenceStrategySignal;
+  scores: RegimeSelectionScores;
+  rawCondition: string;
+  confirmedCondition: string;
+  confirmationCount: number;
+  conditionHeld: boolean;
+  primaryTrend: RegimePrimaryTrend;
+  volatility: RegimeVolatilityState;
+  opportunity: RegimeOpportunityState;
+  confidence: number;
+  buyScore: number;
+  sellScore: number;
+  holdScore: number;
+  secondBestScore: number;
+  scoreEdge: number;
+  normalizedNetScore: number;
+  tradeAllowed: boolean;
+  tradeBlockers: string[];
+  activeStrategyCount: number;
+  selectedStrategyCount: number;
+  features: RegimeSelectionFeature[];
+  selectedStrategies: RegimeSelectedStrategy[];
+  skippedStrategies: Array<{ name: string; reason: string }>;
+  reasons: string[];
+  noTradeReasons: string[];
+};
+
+type MetaStrategyFeature = {
+  name: string;
+  role: MetaStrategyRole;
+  family: MetaStrategyFamily;
+  signal: ConfidenceStrategySignal;
+  confidence: number;
+  direction: ConfidenceStrategyDirection;
+  contribution: number;
+  effectiveContribution: number;
+  source: string;
+  reason: string;
+};
+
+type MetaFamilyAggregationScores = {
+  trend_buy_score: number;
+  trend_sell_score: number;
+  breakout_buy_score: number;
+  breakout_sell_score: number;
+  mean_reversion_buy_score: number;
+  mean_reversion_sell_score: number;
+  reversal_buy_score: number;
+  reversal_sell_score: number;
+  confirmation_score: number;
+  regime_score: number;
+};
+
+type MetaFamilyDisplayScore = {
+  label: string;
+  value: number;
+};
+
+type MetaStrategyResult = {
+  signal: AlgoSignal;
+  decisionLabel: ConfidenceDecisionLabel;
+  buyScore: number;
+  sellScore: number;
+  holdScore: number;
+  netScore: number;
+  edge: number;
+  contextMultiplier: number;
+  aggregateScale: number;
+  activeDirectionalCount: number;
+  familyAggregation: MetaFamilyAggregationScores;
+  familyScores: Record<MetaStrategyFamily, { buy: number; sell: number; hold: number; capped: boolean }>;
+  familyDisplayScores: Partial<Record<MetaStrategyFamily, MetaFamilyDisplayScore>>;
+  safetyGates: { label: string; status: "pass" | "fail" | "info"; detail: string }[];
+  strategies: MetaStrategyFeature[];
+  reasons: string[];
+};
+
+type MetaStrategyTrainingMetric = {
+  accuracy?: number;
+  macroF1?: number;
+  directionalMacroF1?: number;
+  nonHoldRecall?: number;
+  balancedAccuracy?: number;
+  trustScore?: number;
+  [key: string]: unknown;
+};
+
+type MetaStrategyTrainingStatus = {
+  status: string;
+  trusted?: boolean;
+  trainedAt?: string;
+  symbol?: string;
+  sessionDate?: string | null;
+  rows?: number;
+  trainRows?: number;
+  testRows?: number;
+  featureCount?: number;
+  bestModel?: string;
+  bestBaselineMacroF1?: number;
+  labelCounts?: Record<string, number>;
+  trainingLabelCounts?: Record<string, number>;
+  validationLabelCounts?: Record<string, number>;
+  labelPolicy?: string;
+  message?: string;
+  latestPath?: string;
+  artifactPath?: string;
+  metrics?: {
+    baselines?: Record<string, MetaStrategyTrainingMetric>;
+    models?: Record<string, MetaStrategyTrainingMetric>;
+    unavailableModels?: Record<string, string>;
+    bestModel?: string;
+    trusted?: boolean;
+    bestBaselineMacroF1?: number;
+    bestBaselineTrustScore?: number;
+    bestBaselineDirectionalMacroF1?: number;
+  };
+};
+
 type ConfidenceVolumeContext = {
   relativeVolume: number;
   volumeSpike: boolean;
@@ -402,13 +704,16 @@ type ConfidencePositionSizing = {
   riskDollars: number;
   stopDistance: number;
   sharesByRisk: number;
+  sharesByOrder: number;
   sharesByCapital: number;
   sharesByBuyingPower: number;
+  sharesByLiquidity: number;
   finalQuantity: number;
   availableBuyingPower: number;
   accountEquity: number;
   maxPositionDollars: number;
   currentPositionValue: number;
+  limitingFactor: string;
   blockedReason: string;
 };
 
@@ -483,9 +788,6 @@ type WeightedTimeframeSignal = {
 
 type WeightedTimeframeContext = {
   fiveMinute: WeightedTimeframeSignal;
-  oneHour: WeightedTimeframeSignal;
-  oneDay: WeightedTimeframeSignal;
-  oneWeek: WeightedTimeframeSignal;
 };
 
 type WeightedTripleBarrierResult = {
@@ -894,6 +1196,7 @@ type TradingSettings = {
   riskBudgetPercentOfOrder: number;
   maxTradesPerDay: number;
   stopLossPercent: number;
+  fixedStopDistanceDollars: number;
   takeProfitR: number;
   slippagePerShare: number;
   useDefaultSizingSettings: boolean;
@@ -921,6 +1224,7 @@ const defaultTradingSettings = (): TradingSettings => ({
   riskBudgetPercentOfOrder: 50,
   maxTradesPerDay: 10,
   stopLossPercent: 0.35,
+  fixedStopDistanceDollars: 1,
   takeProfitR: 1.5,
   slippagePerShare: 0.02,
   useDefaultSizingSettings: true,
@@ -943,19 +1247,31 @@ const defaultTradingSettings = (): TradingSettings => ({
 
 const MIN_TARGET_PROFIT_PER_SHARE = 1;
 const MIN_TARGET_PROFIT_PER_TRADE = 4;
-const MAX_ORDER_ALLOCATION_PERCENT = 10;
+const MAX_ORDER_ALLOCATION_PERCENT = 100;
+const VOTING_MAX_ORDER_ALLOCATION_PERCENT = 100;
+const REGIME_MAX_ORDER_ALLOCATION_PERCENT = 100;
+const FORECAST_SAFETY_STRONG_CONFIDENCE = 0.7;
+const FORECAST_SAFETY_STOP_OVERRIDE_CONFIDENCE = 0.65;
+const FORECAST_SAFETY_OVEREXTENSION_THRESHOLD = 0.003;
+const OPENING_GRACE_MINUTES = 15;
+const OPENING_GRACE_EMERGENCY_RISK_MULTIPLE = 1.5;
+const FORECAST_SAFETY_LOG_STORAGE_KEY = "market-forecast-safety-decision-log-v1";
 
 const weightedTradingSettingsStorageKey = "weighted-voting-trading-settings-v1";
 const weightedTargetOrderOverridesStorageKey = "weighted-voting-target-order-overrides-v1";
 const confidenceDecisionSettingsStorageKey = "weighted-confidence-decision-settings-v1";
 const confidenceTradingSettingsStorageKey = "weighted-confidence-trading-settings-v1";
 const confidenceTargetOrderOverridesStorageKey = "weighted-confidence-target-order-overrides-v1";
+const regimeTradingSettingsStorageKey = "regime-selection-trading-settings-v1";
+const regimeTargetOrderOverridesStorageKey = "regime-selection-target-order-overrides-v1";
+const metaTradingSettingsStorageKey = "meta-strategy-trading-settings-v1";
+const metaTargetOrderOverridesStorageKey = "meta-strategy-target-order-overrides-v1";
 const tradingSettingsStorageKey = "voting-ensemble-trading-settings-v1";
 const targetOrderOverridesStorageKey = "voting-ensemble-target-order-overrides-v1";
 const uiStateStorageKey = "trading-dashboard-ui-state-v1";
 const autoSubmittedOrderKeysStorageKey = "trading-dashboard.auto-submitted-order-keys.v1";
 
-function sanitizeTradingSettings(input: Partial<TradingSettings>): TradingSettings {
+function sanitizeTradingSettings(input: Partial<TradingSettings>, maxOrderAllocationPercent = MAX_ORDER_ALLOCATION_PERCENT): TradingSettings {
   const defaults = defaultTradingSettings();
   const dailyAllocationPercent = finiteOrDefault(input.dailyAllocationPercent, defaults.dailyAllocationPercent);
   const maxTradesPerDay = finiteOrDefault(input.maxTradesPerDay, defaults.maxTradesPerDay);
@@ -965,12 +1281,13 @@ function sanitizeTradingSettings(input: Partial<TradingSettings>): TradingSettin
     orderAllocationPercent: clampNumber(
       finiteOrDefault(input.orderAllocationPercent, defaults.orderAllocationPercent),
       0,
-      MAX_ORDER_ALLOCATION_PERCENT,
+      maxOrderAllocationPercent,
     ),
     dailyAllocationPercent: dailyAllocationPercent === 30 ? defaults.dailyAllocationPercent : dailyAllocationPercent,
     riskBudgetPercentOfOrder: finiteOrDefault(input.riskBudgetPercentOfOrder, defaults.riskBudgetPercentOfOrder),
     maxTradesPerDay: maxTradesPerDay === 3 ? defaults.maxTradesPerDay : maxTradesPerDay,
     stopLossPercent: finiteOrDefault(input.stopLossPercent, defaults.stopLossPercent),
+    fixedStopDistanceDollars: Math.max(0, finiteOrDefault(input.fixedStopDistanceDollars, defaults.fixedStopDistanceDollars)),
     takeProfitR: finiteOrDefault(input.takeProfitR, defaults.takeProfitR),
     slippagePerShare: finiteOrDefault(input.slippagePerShare, defaults.slippagePerShare),
     useDefaultSizingSettings: typeof input.useDefaultSizingSettings === "boolean" ? input.useDefaultSizingSettings : defaults.useDefaultSizingSettings,
@@ -992,8 +1309,8 @@ function sanitizeTradingSettings(input: Partial<TradingSettings>): TradingSettin
   };
 }
 
-function sanitizeLoadedTradingSettings(input: Partial<TradingSettings>): TradingSettings {
-  const settings = sanitizeTradingSettings(input);
+function sanitizeLoadedTradingSettings(input: Partial<TradingSettings>, maxOrderAllocationPercent = MAX_ORDER_ALLOCATION_PERCENT): TradingSettings {
+  const settings = sanitizeTradingSettings(input, maxOrderAllocationPercent);
   const defaults = defaultTradingSettings();
   const savedMinimumOneMinuteVolume = Number(input.minimumOneMinuteVolume);
   return {
@@ -1010,6 +1327,34 @@ function finiteOrDefault(value: unknown, fallback: number) {
 function finitePositiveOrDefault(value: unknown, fallback: number) {
   const numeric = Number(value);
   return Number.isFinite(numeric) && numeric > 0 ? numeric : fallback;
+}
+
+function fixedStopDistanceDollars(value: unknown) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+}
+
+function defaultSizingStopDistance(
+  defaults: { fixedStopDistanceDollars?: number; atrStopMultiplier: number; minimumStopDistancePercent: number },
+  priceValue: number,
+  atrValue: number,
+) {
+  const fixed = fixedStopDistanceDollars(defaults.fixedStopDistanceDollars);
+  if (fixed > 0) {
+    return fixed;
+  }
+  return Math.max(atrValue * Math.max(0.01, defaults.atrStopMultiplier), priceValue * (Math.max(0, defaults.minimumStopDistancePercent) / 100));
+}
+
+function tradingSettingsStopDistance(settings: TradingSettings, priceValue: number, atrValue = 0) {
+  const fixed = fixedStopDistanceDollars(settings.fixedStopDistanceDollars);
+  if (fixed > 0) {
+    return fixed;
+  }
+  if (settings.useDefaultSizingSettings) {
+    return Math.max(atrValue * Math.max(0.01, settings.atrStopMultiplier), priceValue * (Math.max(0, settings.minimumStopDistancePercent) / 100));
+  }
+  return priceValue * (Math.max(0.0001, settings.stopLossPercent) / 100);
 }
 
 function clampNumber(value: number, min: number, max: number) {
@@ -1045,17 +1390,43 @@ function saveConfidenceTradingSettings(settings: TradingSettings) {
   window.localStorage.setItem(confidenceTradingSettingsStorageKey, JSON.stringify(sanitizeTradingSettings(settings)));
 }
 
+function loadRegimeTradingSettings(): TradingSettings {
+  try {
+    const raw = window.localStorage.getItem(regimeTradingSettingsStorageKey);
+    return raw ? sanitizeLoadedTradingSettings(JSON.parse(raw) as Partial<TradingSettings>, REGIME_MAX_ORDER_ALLOCATION_PERCENT) : defaultTradingSettings();
+  } catch {
+    return defaultTradingSettings();
+  }
+}
+
+function saveRegimeTradingSettings(settings: TradingSettings) {
+  window.localStorage.setItem(regimeTradingSettingsStorageKey, JSON.stringify(sanitizeTradingSettings(settings, REGIME_MAX_ORDER_ALLOCATION_PERCENT)));
+}
+
+function loadMetaTradingSettings(): TradingSettings {
+  try {
+    const raw = window.localStorage.getItem(metaTradingSettingsStorageKey);
+    return raw ? sanitizeLoadedTradingSettings(JSON.parse(raw) as Partial<TradingSettings>, REGIME_MAX_ORDER_ALLOCATION_PERCENT) : defaultTradingSettings();
+  } catch {
+    return defaultTradingSettings();
+  }
+}
+
+function saveMetaTradingSettings(settings: TradingSettings) {
+  window.localStorage.setItem(metaTradingSettingsStorageKey, JSON.stringify(sanitizeTradingSettings(settings, REGIME_MAX_ORDER_ALLOCATION_PERCENT)));
+}
+
 function loadTradingSettings(): TradingSettings {
   try {
     const raw = window.localStorage.getItem(tradingSettingsStorageKey);
-    return raw ? sanitizeLoadedTradingSettings(JSON.parse(raw) as Partial<TradingSettings>) : defaultTradingSettings();
+    return raw ? sanitizeLoadedTradingSettings(JSON.parse(raw) as Partial<TradingSettings>, VOTING_MAX_ORDER_ALLOCATION_PERCENT) : defaultTradingSettings();
   } catch {
     return defaultTradingSettings();
   }
 }
 
 function saveTradingSettings(settings: TradingSettings) {
-  window.localStorage.setItem(tradingSettingsStorageKey, JSON.stringify(sanitizeTradingSettings(settings)));
+  window.localStorage.setItem(tradingSettingsStorageKey, JSON.stringify(sanitizeTradingSettings(settings, VOTING_MAX_ORDER_ALLOCATION_PERCENT)));
 }
 
 function loadWeightedTargetOrderOverrides(): Partial<TargetOrderSettings> {
@@ -1082,6 +1453,32 @@ function loadConfidenceTargetOrderOverrides(): Partial<TargetOrderSettings> {
 
 function saveConfidenceTargetOrderOverrides(overrides: Partial<TargetOrderSettings>) {
   window.localStorage.setItem(confidenceTargetOrderOverridesStorageKey, JSON.stringify(overrides));
+}
+
+function loadRegimeTargetOrderOverrides(): Partial<TargetOrderSettings> {
+  try {
+    const raw = window.localStorage.getItem(regimeTargetOrderOverridesStorageKey);
+    return raw ? (JSON.parse(raw) as Partial<TargetOrderSettings>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveRegimeTargetOrderOverrides(overrides: Partial<TargetOrderSettings>) {
+  window.localStorage.setItem(regimeTargetOrderOverridesStorageKey, JSON.stringify(overrides));
+}
+
+function loadMetaTargetOrderOverrides(): Partial<TargetOrderSettings> {
+  try {
+    const raw = window.localStorage.getItem(metaTargetOrderOverridesStorageKey);
+    return raw ? (JSON.parse(raw) as Partial<TargetOrderSettings>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveMetaTargetOrderOverrides(overrides: Partial<TargetOrderSettings>) {
+  window.localStorage.setItem(metaTargetOrderOverridesStorageKey, JSON.stringify(overrides));
 }
 
 function loadTargetOrderOverrides(): Partial<TargetOrderSettings> {
@@ -1195,13 +1592,14 @@ type TargetOrderSettings = {
 };
 
 type SubmitOrderMode = "Manual" | "Automatic";
-type TradingWindowMode = "ensemble" | "weighted" | "confidence";
+type TradingWindowMode = "ensemble" | "weighted" | "confidence" | "regime" | "meta";
 
-type AlgoTab = "voting" | "weighted" | "confidence";
+type AlgoTab = "voting" | "weighted" | "confidence" | "regime" | "meta";
 
 type PersistedUiState = {
   algoTab?: AlgoTab;
   tradingWindowMode?: TradingWindowMode;
+  tradingEnabled?: boolean;
   selectedSellSetupByMode?: Record<TradingWindowMode, string>;
   sellSetupSelectionLockedByMode?: Record<TradingWindowMode, boolean>;
   feed?: string;
@@ -1216,6 +1614,7 @@ type PersistedUiState = {
   showVisualConditions?: boolean;
   showLayerBackgrounds?: boolean;
   algoBacktestTimeframe?: AlgoBacktestTimeframe;
+  algoIntradayTradesExpanded?: boolean;
   algoVotesExpanded?: boolean;
   weightedVotingExpanded?: boolean;
   weightedDataExpanded?: boolean;
@@ -1225,6 +1624,12 @@ type PersistedUiState = {
   confidenceTradingSettingsExpanded?: boolean;
   confidenceDefaultSizingExpanded?: boolean;
   confidenceStrategiesExpanded?: boolean;
+  regimeTradingSettingsExpanded?: boolean;
+  regimeDefaultSizingExpanded?: boolean;
+  regimeIndicatorsExpanded?: boolean;
+  regimeStrategiesExpanded?: boolean;
+  metaStrategiesExpanded?: boolean;
+  metaChecksExpanded?: boolean;
   tradingSettingsExpanded?: boolean;
   votingDefaultSizingExpanded?: boolean;
   weightedTradingSettingsExpanded?: boolean;
@@ -1255,6 +1660,7 @@ function saveUiState() {
   const payload: PersistedUiState = {
     algoTab: state.algoTab,
     tradingWindowMode: state.tradingWindowMode,
+    tradingEnabled: state.tradingEnabled,
     selectedSellSetupByMode: state.selectedSellSetupByMode,
     sellSetupSelectionLockedByMode: state.sellSetupSelectionLockedByMode,
     feed: state.feed,
@@ -1269,6 +1675,7 @@ function saveUiState() {
     showVisualConditions: state.showVisualConditions,
     showLayerBackgrounds: state.showLayerBackgrounds,
     algoBacktestTimeframe: state.algoBacktestTimeframe,
+    algoIntradayTradesExpanded: state.algoIntradayTradesExpanded,
     algoVotesExpanded: state.algoVotesExpanded,
     weightedVotingExpanded: state.weightedVotingExpanded,
     weightedDataExpanded: state.weightedDataExpanded,
@@ -1278,6 +1685,12 @@ function saveUiState() {
     confidenceTradingSettingsExpanded: state.confidenceTradingSettingsExpanded,
     confidenceDefaultSizingExpanded: state.confidenceDefaultSizingExpanded,
     confidenceStrategiesExpanded: state.confidenceStrategiesExpanded,
+    regimeTradingSettingsExpanded: state.regimeTradingSettingsExpanded,
+    regimeDefaultSizingExpanded: state.regimeDefaultSizingExpanded,
+    regimeIndicatorsExpanded: state.regimeIndicatorsExpanded,
+    regimeStrategiesExpanded: state.regimeStrategiesExpanded,
+    metaStrategiesExpanded: state.metaStrategiesExpanded,
+    metaChecksExpanded: state.metaChecksExpanded,
     tradingSettingsExpanded: state.tradingSettingsExpanded,
     votingDefaultSizingExpanded: state.votingDefaultSizingExpanded,
     weightedTradingSettingsExpanded: state.weightedTradingSettingsExpanded,
@@ -1302,6 +1715,65 @@ type TradeHistoryRow = {
   notional: number;
   recordedAt: string;
   closedLotId?: string;
+  evidence?: OrderEvidenceSnapshot;
+};
+
+type TradeHistoryRolloverState = {
+  archivedSessionDates: string[];
+  clearedSessionDates: string[];
+};
+
+type OrderEvidenceSnapshot = {
+  algorithm: TradingWindowMode;
+  algorithmLabel: string;
+  submitMode: SubmitOrderMode | "Close Position";
+  trigger: string;
+  capturedAt: string;
+  market: {
+    status: string;
+    symbol: string;
+    timeframe: Timeframe;
+    feed: string;
+    source: string;
+    latest?: Pick<Candle, "timestamp" | "open" | "high" | "low" | "close" | "volume">;
+  };
+  execution: {
+    side: "Buy" | "Sell";
+    quantity: number;
+    price: number;
+    notional: number;
+    closedLotId?: string;
+  };
+  positionBefore: PositionSummary | null;
+  settings: Partial<TradingSettings>;
+  targetOrder: Partial<ManualOrderRecommendation> | null;
+  sellSetup: Partial<LotOrderTemplate> | null;
+  backtest: {
+    label: string;
+    timeframe?: string;
+    range?: string;
+    trades?: number;
+    pnl?: number;
+    profitFactor?: number | null;
+    winRate?: number;
+    maxDrawdown?: number;
+  } | null;
+  mlArtifact: {
+    status: string;
+    artifactId?: string;
+    range?: string;
+    best?: string;
+  };
+  decision: {
+    winner?: AlgoSignal;
+    voteCounts?: string;
+    strategies?: string[];
+    weighted?: string;
+    confidence?: string;
+    gates?: string[];
+    failedGates?: string[];
+    summary?: string;
+  };
 };
 
 type OpenOrderLot = {
@@ -1323,6 +1795,8 @@ type LotOrderTemplate = {
   riskDollars: number;
   plannedStopRiskDollars: number;
   estimatedSlippage: number;
+  forecastSafetyNote?: string;
+  forecastExitReason?: string;
 };
 
 type LotOrderOverride = Partial<Omit<LotOrderTemplate, "action">>;
@@ -1417,6 +1891,9 @@ type MarketLayer = {
 
 type StrategyFit = {
   name: string;
+  role?: MetaStrategyRole;
+  family?: MetaStrategyFamily | "uncategorized";
+  strategy_family?: MetaStrategyFamily | "uncategorized";
   status: "Strong Fit" | "Allowed" | "Watch" | "Avoid";
   score: number;
   matches: string[];
@@ -1441,6 +1918,272 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
 const BACKTEST_API_CANDIDATES = ["http://127.0.0.1:8020", API_BASE].filter(
   (value, index, values) => values.indexOf(value) === index,
 );
+const BROWSER_STORAGE_SNAPSHOT_INTERVAL_MS = 5 * 60_000;
+const AUTO_DAILY_ALGORITHM_BACKTESTS = false;
+const WAKE_CHECK_INTERVAL_MS = 15_000;
+const WAKE_GAP_THRESHOLD_MS = 90_000;
+const DECISION_SNAPSHOT_MAX_CANDLES = 500;
+let browserStorageSnapshotTimer: number | null = null;
+let browserStorageSnapshotInFlight = false;
+let lastBrowserStorageSnapshotBody = "";
+let decisionSnapshotInFlight = false;
+let lastDecisionSnapshotKey = "";
+let wakeCheckTimer: number | null = null;
+let lastWakeCheckAt = Date.now();
+let appActivationInFlight = false;
+let tradeHistoryRolloverInFlight = false;
+
+function collectBrowserStorageItems(): Record<string, string> {
+  const items: Record<string, string> = {};
+  for (let index = 0; index < window.localStorage.length; index += 1) {
+    const key = window.localStorage.key(index);
+    if (!key) {
+      continue;
+    }
+    items[key] = window.localStorage.getItem(key) ?? "";
+  }
+  return items;
+}
+
+function browserStorageSnapshotBody(reason: string) {
+  return JSON.stringify({
+    origin: window.location.origin,
+    userAgent: window.navigator.userAgent,
+    reason,
+    items: collectBrowserStorageItems(),
+  });
+}
+
+async function saveBrowserStorageSnapshot(reason: string, keepalive = false) {
+  if (browserStorageSnapshotInFlight && !keepalive) {
+    return;
+  }
+  const body = browserStorageSnapshotBody(reason);
+  if (body === lastBrowserStorageSnapshotBody && reason !== "page-hide" && reason !== "unload") {
+    return;
+  }
+  browserStorageSnapshotInFlight = true;
+  try {
+    const response = await fetch(`${API_BASE}/api/browser-state/snapshot`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive,
+    });
+    if (response.ok) {
+      lastBrowserStorageSnapshotBody = body;
+    }
+  } catch {
+    // Browser state snapshots are best-effort; the dashboard should keep running offline.
+  } finally {
+    browserStorageSnapshotInFlight = false;
+  }
+}
+
+function compactCandle(candle: Candle) {
+  return {
+    timestamp: candle.timestamp,
+    open: candle.open,
+    high: candle.high,
+    low: candle.low,
+    close: candle.close,
+    volume: candle.volume,
+    trade_count: candle.trade_count,
+    vwap: candle.vwap,
+    timeframe: candle.timeframe,
+    symbol: candle.symbol,
+  };
+}
+
+function compactIndicatorsFromMarket(market: ConfidenceMarket | null) {
+  if (!market) {
+    return null;
+  }
+  return {
+    latest: compactCandle(market.latest),
+    priorClose: market.priorClose,
+    dayOpen: market.dayOpen,
+    premarketHigh: market.premarketHigh,
+    premarketLow: market.premarketLow,
+    vwap: market.vwap,
+    vwapSlope: market.vwapSlope,
+    openingRange: market.openingRange,
+    priorHigh: market.priorHigh,
+    priorLow: market.priorLow,
+    averageVolume: market.averageVolume,
+    sma20: market.sma20,
+    sma50: market.sma50,
+    rsi: market.rsi,
+    macd: market.macd,
+    atr: market.atr,
+    bands: market.bands,
+    adx: market.adx,
+    volume: market.volume,
+    spreadLiquidity: market.spreadLiquidity,
+    timeOfDay: market.timeOfDay,
+  };
+}
+
+function paperTradeResultForMode(mode: TradingWindowMode, latest: Candle | null) {
+  const latestPrice = latest?.close ?? 0;
+  const previousPrice = latest ? latest.open : latestPrice;
+  const history = tradeHistoryForMode(mode);
+  return {
+    mode,
+    tradeCount: history.length,
+    tradesToday: history.filter(isTradeHistoryRowFromToday).length,
+    todayRealizedPnl: todayRealizedPnlForMode(mode),
+    todayPnl: latest ? todayPnlForMode(mode, latest.close) : todayRealizedPnlForMode(mode),
+    position: latest ? summarizePositionFromTradeHistory(latestPrice, previousPrice, mode) : null,
+    latestTrade: history[0] ?? null,
+    trades: history.slice(0, 20),
+  };
+}
+
+function buildDecisionRecorderSnapshot(reason: string) {
+  const latest = latestExecutionCandleForMode();
+  const market = confidenceMarketSnapshot();
+  const voting = votingEnsembleScoreSummary();
+  const weighted = calculateWeightedVote();
+  const confidence = calculateConfidenceAggregation();
+  const regime = calculateRegimeSelection();
+  const meta = calculateMetaStrategy();
+  const activeMode = state.tradingWindowMode;
+  const candles = latestRegularSessionCandles().length ? latestRegularSessionCandles() : state.candles.slice(-DECISION_SNAPSHOT_MAX_CANDLES);
+  const weightedOneMinuteCandles = latestRegularSessionCandlesFrom(state.weightedMarketData.timeframeCandles["1Min"] ?? []);
+  const candlePayload = {
+    chart: state.candles.slice(-DECISION_SNAPSHOT_MAX_CANDLES).map(compactCandle),
+    session: candles.slice(-DECISION_SNAPSHOT_MAX_CANDLES).map(compactCandle),
+    weightedOneMinute: weightedOneMinuteCandles.slice(-DECISION_SNAPSHOT_MAX_CANDLES).map(compactCandle),
+  };
+  const targetOrder = targetOrderForMode(activeMode);
+  const finalDecision = {
+    activeMode,
+    activeAlgorithmLabel: algorithmDisplayName(activeMode),
+    activeTargetOrder: compactTargetOrder(targetOrder),
+    voting: { signal: voting.winner, scores: voting.scores },
+    weighted: { signal: weighted.signal, buyScore: weighted.buyScore, sellScore: weighted.sellScore, holdScore: weighted.holdScore, margin: weighted.margin },
+    confidence: { signal: confidence.signal, decisionLabel: confidence.decisionLabel, normalizedNetScore: confidence.normalizedNetScore },
+    regime: { signal: regime.signal, aggregateSignal: regime.aggregateSignal, confidence: regime.confidence, scoreEdge: regime.scoreEdge },
+    meta: { signal: meta.signal, decisionLabel: meta.decisionLabel, netScore: meta.netScore, edge: meta.edge },
+  };
+
+  return {
+    version: 1,
+    reason,
+    capturedAt: new Date().toISOString(),
+    sessionDate: latest ? localDateKey(latest.timestamp) : localDateKey(new Date()),
+    symbol: state.symbol,
+    feed: state.feed,
+    timeframe: state.timeframe,
+    marketStatus: state.marketStatus,
+    source: state.source,
+    candles: candlePayload,
+    indicators: compactIndicatorsFromMarket(market),
+    marketContext: state.marketContext,
+    strategyOutputs: {
+      voting: voting.votes,
+      weighted: weighted.strategies,
+      confidence: confidence.strategies,
+      regime: {
+        selectedStrategies: regime.selectedStrategies,
+        skippedStrategies: regime.skippedStrategies,
+      },
+      meta: meta.strategies,
+    },
+    familyScores: {
+      meta: meta.familyAggregation,
+      forecast: state.marketForecast?.algorithmSignals?.familyScores ?? null,
+    },
+    ensembleVotingResult: {
+      signal: voting.winner,
+      eligibleCount: voting.eligibleVotes.length,
+      scores: voting.scores,
+      votes: voting.votes,
+    },
+    metaModelFeatures: {
+      familyAggregation: meta.familyAggregation,
+      familyScores: meta.familyScores,
+      contextMultiplier: meta.contextMultiplier,
+      activeDirectionalCount: meta.activeDirectionalCount,
+      safetyGates: meta.safetyGates,
+      forecastFeatures: state.marketForecast?.features ?? null,
+    },
+    finalDecision,
+    paperTradeResult: {
+      ensemble: paperTradeResultForMode("ensemble", latest),
+      weighted: paperTradeResultForMode("weighted", latest),
+      confidence: paperTradeResultForMode("confidence", latest),
+      regime: paperTradeResultForMode("regime", latest),
+    },
+  };
+}
+
+function decisionSnapshotKey(snapshot: ReturnType<typeof buildDecisionRecorderSnapshot>) {
+  const latestTimestamp =
+    snapshot.candles.weightedOneMinute.at(-1)?.timestamp
+    ?? snapshot.candles.session.at(-1)?.timestamp
+    ?? snapshot.candles.chart.at(-1)?.timestamp
+    ?? "";
+  const paperCounts = Object.values(snapshot.paperTradeResult).map((result) => `${result.mode}:${result.tradeCount}:${result.tradesToday}`).join("|");
+  return [
+    snapshot.symbol,
+    snapshot.feed,
+    snapshot.timeframe,
+    latestTimestamp,
+    snapshot.finalDecision.activeMode,
+    snapshot.finalDecision.meta.signal,
+    snapshot.finalDecision.voting.signal,
+    snapshot.finalDecision.weighted.signal,
+    snapshot.finalDecision.confidence.signal,
+    snapshot.finalDecision.regime.signal,
+    paperCounts,
+  ].join("::");
+}
+
+async function maybeSaveDecisionSnapshot(reason: string) {
+  if (state.marketStatus !== "open" || decisionSnapshotInFlight) {
+    return;
+  }
+  const snapshot = buildDecisionRecorderSnapshot(reason);
+  const key = decisionSnapshotKey(snapshot);
+  if (key === lastDecisionSnapshotKey) {
+    return;
+  }
+  decisionSnapshotInFlight = true;
+  try {
+    const response = await fetch(`${API_BASE}/api/decision-snapshots`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ snapshot }),
+    });
+    if (response.ok) {
+      lastDecisionSnapshotKey = key;
+    }
+  } catch {
+    // Decision snapshots are a recorder aid; live trading UI should continue if storage is offline.
+  } finally {
+    decisionSnapshotInFlight = false;
+  }
+}
+
+function startBrowserStorageDiskSnapshots() {
+  void saveBrowserStorageSnapshot("startup");
+  if (browserStorageSnapshotTimer !== null) {
+    window.clearInterval(browserStorageSnapshotTimer);
+  }
+  browserStorageSnapshotTimer = window.setInterval(() => {
+    void saveBrowserStorageSnapshot("interval");
+  }, BROWSER_STORAGE_SNAPSHOT_INTERVAL_MS);
+  window.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      void saveBrowserStorageSnapshot("page-hide", true);
+    }
+  });
+  window.addEventListener("beforeunload", () => {
+    void saveBrowserStorageSnapshot("unload", true);
+  });
+}
 const DEFAULT_BACKTEST_START_DATE = "2020-07-28";
 const DEFAULT_BACKTEST_END_DATE = "2026-06-18";
 const TRADE_HISTORY_STORAGE_KEY = "trading-dashboard.trade-history.v1";
@@ -1448,10 +2191,17 @@ const ORDER_CONTROL_MODES_STORAGE_KEY = "trading-dashboard.order-control-modes.v
 const ORDER_CONTROL_OVERRIDES_STORAGE_KEY = "trading-dashboard.order-control-overrides.v1";
 const WEIGHTED_TRADE_HISTORY_STORAGE_KEY = "trading-dashboard.weighted-trade-history.v1";
 const CONFIDENCE_TRADE_HISTORY_STORAGE_KEY = "trading-dashboard.confidence-trade-history.v1";
+const REGIME_TRADE_HISTORY_STORAGE_KEY = "trading-dashboard.regime-trade-history.v1";
+const META_TRADE_HISTORY_STORAGE_KEY = "trading-dashboard.meta-strategy-trade-history.v1";
 const WEIGHTED_ORDER_CONTROL_MODES_STORAGE_KEY = "trading-dashboard.weighted-order-control-modes.v1";
 const WEIGHTED_ORDER_CONTROL_OVERRIDES_STORAGE_KEY = "trading-dashboard.weighted-order-control-overrides.v1";
 const CONFIDENCE_ORDER_CONTROL_MODES_STORAGE_KEY = "trading-dashboard.confidence-order-control-modes.v1";
 const CONFIDENCE_ORDER_CONTROL_OVERRIDES_STORAGE_KEY = "trading-dashboard.confidence-order-control-overrides.v1";
+const REGIME_ORDER_CONTROL_MODES_STORAGE_KEY = "trading-dashboard.regime-order-control-modes.v1";
+const REGIME_ORDER_CONTROL_OVERRIDES_STORAGE_KEY = "trading-dashboard.regime-order-control-overrides.v1";
+const META_ORDER_CONTROL_MODES_STORAGE_KEY = "trading-dashboard.meta-strategy-order-control-modes.v1";
+const META_ORDER_CONTROL_OVERRIDES_STORAGE_KEY = "trading-dashboard.meta-strategy-order-control-overrides.v1";
+const TRADE_HISTORY_ROLLOVER_STORAGE_KEY = "trading-dashboard.trade-history-rollover.v1";
 const DEFAULT_SUBMIT_MODE: SubmitOrderMode = "Automatic";
 const CONFIDENCE_BACKTEST_RESULT_STORAGE_KEY = "trading-dashboard.confidence-backtest-result.v1";
 const DAILY_BACKTEST_COMPLETION_POPUP_STORAGE_KEY = "trading-dashboard.daily-backtest-completion-popup.v1";
@@ -1465,6 +2215,7 @@ let confidenceBacktestCache: { key: string; result: BacktestResult } | null = st
 let confidenceBacktestStatus: "idle" | "waiting" | "running" | "ready" | "error" = storedConfidenceBacktest ? "ready" : "idle";
 let confidenceBacktestResult: BacktestResult | null = storedConfidenceBacktest?.result ?? null;
 let confidenceBacktestError = "";
+let lastConfirmedRegimeCondition: RegimeConditionSnapshot | null = null;
 let confidenceBacktestAutoRunKey = "";
 let confidenceBacktestDatasetCheckInFlight = false;
 let confidenceBacktestNextDatasetCheckAt = 0;
@@ -1772,8 +2523,53 @@ const confidenceAggregationStrategies: ConfidenceStrategy[] = [
   { key: "C11", slug: "volume_confirmation", name: "Volume Confirmation", baseWeight: confidenceBaseWeights.volume_confirmation, signal: confidenceVolumeConfirmation },
 ];
 
-const weightedVotingStorageKey = "weighted-voting-daily-weights-v4";
-const weightedStrategyPerformanceStorageKey = "weighted-strategy-performance-v4";
+const regimeSelectionStrategies: ConfidenceStrategy[] = [
+  ...confidenceAggregationStrategies,
+  { key: "R1", slug: "vwap_trend_continuation", name: "VWAP Trend Continuation", baseWeight: 0.1, signal: confidenceVwapTrendContinuation },
+  { key: "R2", slug: "vwap_mean_reversion", name: "VWAP Mean Reversion", baseWeight: 0.09, signal: confidenceVwapMeanReversion },
+  { key: "R3", slug: "failed_breakout_reversal", name: "Failed Breakout Reversal", baseWeight: 0.08, signal: confidenceFailedBreakoutReversal },
+  { key: "R4", slug: "liquidity_sweep_reversal", name: "Liquidity Sweep Reversal", baseWeight: 0.08, signal: confidenceLiquiditySweepReversal },
+  { key: "R5", slug: "adx_trend_strength", name: "ADX Trend Strength Filter", baseWeight: 0.08, signal: confidenceAdxTrendStrength },
+  { key: "R6", slug: "atr_volatility_regime", name: "ATR Volatility Regime", baseWeight: 0.07, signal: confidenceAtrVolatilityRegime },
+  { key: "R7", slug: "volatility_breakout", name: "Volatility Breakout", baseWeight: 0.08, signal: confidenceVolatilityBreakout },
+  { key: "R8", slug: "cash_avoid_filter", name: "Cash / Avoid Trading Filter", baseWeight: 0.04, signal: confidenceCashAvoidFilter },
+];
+
+const metaStrategyCatalog: MetaStrategyDefinition[] = [
+  { name: "Multi-Timeframe Trend Alignment", role: "directional", family: "trend", source: "ensemble" },
+  { name: "First Pullback After Open", role: "directional", family: "trend", source: "ensemble" },
+  { name: "Failed Breakout Strategy", role: "directional", family: "reversal", source: "ensemble" },
+  { name: "Liquidity Sweep Reversal", role: "directional", family: "reversal", source: "ensemble" },
+  { name: "Bollinger Band Reversion", role: "directional", family: "mean_reversion", source: "alias", alias: "Bollinger Band Mean Reversion" },
+  { name: "ATR Overextension Reversion", role: "directional", family: "mean_reversion", source: "ensemble" },
+  { name: "Moving Average Trend", role: "directional", family: "trend", source: "confidence" },
+  { name: "Trend Pullback Strategy", role: "directional", family: "trend", source: "confidence" },
+  { name: "RSI Mean Reversion", role: "directional", family: "mean_reversion", source: "confidence" },
+  { name: "Bollinger Band Mean Reversion", role: "directional", family: "mean_reversion", source: "confidence" },
+  { name: "Opening Range Breakout", role: "directional", family: "breakout", source: "confidence" },
+  { name: "Intraday Breakout Strategy", role: "directional", family: "breakout", source: "confidence" },
+  { name: "MACD Momentum", role: "directional", family: "trend", source: "confidence" },
+  { name: "Market Structure Strategy", role: "directional", family: "trend", source: "confidence" },
+  { name: "Gap Continuation / Gap Fade", role: "directional", family: "event", source: "confidence" },
+  { name: "VWAP Trend Continuation", role: "directional", family: "vwap", source: "confidence" },
+  { name: "VWAP Mean Reversion", role: "directional", family: "mean_reversion", source: "confidence" },
+  { name: "Failed Breakout Reversal", role: "directional", family: "reversal", source: "confidence" },
+  { name: "Bollinger/ATR Reversion", role: "directional", family: "mean_reversion", source: "alias", alias: "Bollinger Band Mean Reversion" },
+  { name: "Volatility Breakout", role: "directional", family: "breakout", source: "confidence" },
+  { name: "Relative Strength vs QQQ/IWM", role: "context", family: "market_regime", source: "ensemble" },
+  { name: "Market Breadth Momentum", role: "context", family: "market_regime", source: "ensemble" },
+  { name: "Economic Event Reaction Strategy", role: "context", family: "event", source: "ensemble" },
+  { name: "VWAP Position Strategy", role: "context", family: "vwap", source: "confidence" },
+  { name: "Volume Confirmation", role: "context", family: "volume_confirmation", source: "confidence" },
+  { name: "ADX Trend Strength Filter", role: "context", family: "market_regime", source: "confidence" },
+  { name: "ATR Volatility Regime", role: "context", family: "market_regime", source: "confidence" },
+  { name: "Ensemble Strategy Voting", role: "meta_safety", family: "safety", source: "ensemble" },
+  { name: "Cash / Avoid Trading Filter", role: "meta_safety", family: "safety", source: "confidence" },
+];
+
+const weightedVotingStorageKey = "weighted-voting-daily-weights-short-cycle-v5";
+const weightedStrategyPerformanceStorageKey = "weighted-strategy-performance-short-cycle-v5";
+const WEIGHTED_BROWSER_BACKTEST_BOOTSTRAP_ENABLED = false;
 const weightedMinimumTradesForFullWeight = 40;
 const weightedVotingDefaultWeights: Record<WeightedAlphaKey, number> = {
   S1: 0.125,
@@ -1787,11 +2583,11 @@ const weightedVotingDefaultWeights: Record<WeightedAlphaKey, number> = {
 };
 
 const weightedRelativeStrengthSymbols = ["QQQ", "IWM"];
-const weightedSectorEtfSymbols = ["XLK", "XLF", "XLV", "XLY", "XLI", "XLC", "XLP", "XLE", "XLU", "XLRE", "XLB"];
-const weightedSpyBasketSampleSymbols = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "AVGO", "JPM"];
+const weightedSectorEtfSymbols: string[] = [];
+const weightedSpyBasketSampleSymbols: string[] = [];
 const weightedAuxiliarySymbols = [...weightedRelativeStrengthSymbols, ...weightedSectorEtfSymbols, ...weightedSpyBasketSampleSymbols];
-const weightedSpyContextTimeframes = ["1Min", "5Min", "1Hour", "1Day"] as const;
-type WeightedSpyContextTimeframe = (typeof weightedSpyContextTimeframes)[number] | "1Week";
+const weightedSpyContextTimeframes = ["1Min", "5Min"] as const;
+type WeightedSpyContextTimeframe = (typeof weightedSpyContextTimeframes)[number];
 
 const persistedUiState = loadUiState();
 
@@ -1813,17 +2609,22 @@ const state = {
   loadingOlder: false,
   historyEndReached: false,
   candles: [] as Candle[],
+  marketForecast: null as MarketForecastPrediction | null,
+  marketForecastStatus: "idle" as "idle" | "loading" | "ready" | "fallback" | "error",
+  marketForecastError: "",
   hoveredIndex: -1,
   hoverX: -1,
   hoverY: -1,
   lastRefreshAt: "",
   lastRefreshStatus: "waiting",
   algoTab: persistedUiState.algoTab ?? "voting" as AlgoTab,
-  algoBacktestTimeframe: persistedUiState.algoBacktestTimeframe ?? "Trading" as AlgoBacktestTimeframe,
+  algoBacktestTimeframe: visibleAlgoBacktestTimeframe(persistedUiState.algoBacktestTimeframe),
   algoBacktestCandles: [] as Candle[],
   algoBacktestResult: null as BacktestResult | null,
   algoBacktestStatus: "loading",
   algoBacktestWarning: "",
+  algoIntradayTradesExpanded:
+    persistedUiState.algoIntradayTradesExpanded ?? ["1Min", "5Min"].includes(visibleAlgoBacktestTimeframe(persistedUiState.algoBacktestTimeframe)),
   algoVotesExpanded: persistedUiState.algoVotesExpanded ?? false,
   weightedVotingExpanded: persistedUiState.weightedVotingExpanded ?? true,
   weightedDataExpanded: persistedUiState.weightedDataExpanded ?? false,
@@ -1833,8 +2634,19 @@ const state = {
   confidenceTradingSettingsExpanded: persistedUiState.confidenceTradingSettingsExpanded ?? false,
   confidenceDefaultSizingExpanded: persistedUiState.confidenceDefaultSizingExpanded ?? false,
   confidenceStrategiesExpanded: persistedUiState.confidenceStrategiesExpanded ?? true,
+  regimeTradingSettingsExpanded: persistedUiState.regimeTradingSettingsExpanded ?? false,
+  regimeDefaultSizingExpanded: persistedUiState.regimeDefaultSizingExpanded ?? false,
+  regimeIndicatorsExpanded: persistedUiState.regimeIndicatorsExpanded ?? false,
+  regimeStrategiesExpanded: persistedUiState.regimeStrategiesExpanded ?? false,
+  metaStrategiesExpanded: persistedUiState.metaStrategiesExpanded ?? false,
+  metaChecksExpanded: persistedUiState.metaChecksExpanded ?? false,
+  metaTrainingStatus: "idle" as "idle" | "loading" | "ready" | "error",
+  metaTrainingResult: null as MetaStrategyTrainingStatus | null,
+  metaTrainingWarning: "",
   confidenceDecisionSettings: loadConfidenceDecisionSettings(),
   confidenceTradingSettings: loadConfidenceTradingSettings(),
+  regimeTradingSettings: loadRegimeTradingSettings(),
+  metaTradingSettings: loadMetaTradingSettings(),
   weightedMarketData: {
     candlesBySymbol: {} as Record<string, Candle[]>,
     timeframeCandles: {} as Partial<Record<WeightedSpyContextTimeframe, Candle[]>>,
@@ -1871,21 +2683,30 @@ const state = {
   weightedDefaultSizingExpanded: persistedUiState.weightedDefaultSizingExpanded ?? false,
   weightedTargetOrderOverrides: loadWeightedTargetOrderOverrides(),
   confidenceTargetOrderOverrides: loadConfidenceTargetOrderOverrides(),
+  regimeTargetOrderOverrides: loadRegimeTargetOrderOverrides(),
+  metaTargetOrderOverrides: loadMetaTargetOrderOverrides(),
   targetOrderOverrides: loadTargetOrderOverrides(),
   currentTargetOrder: null as ManualOrderRecommendation | null,
   currentWeightedTargetOrder: null as ManualOrderRecommendation | null,
   currentConfidenceTargetOrder: null as ManualOrderRecommendation | null,
+  currentRegimeTargetOrder: null as ManualOrderRecommendation | null,
+  currentMetaTargetOrder: null as ManualOrderRecommendation | null,
   autoSubmittedOrderKeys: loadAutoSubmittedOrderKeys(),
+  tradingEnabled: persistedUiState.tradingEnabled ?? false,
   tradingWindowMode: persistedUiState.tradingWindowMode ?? "ensemble" as TradingWindowMode,
   selectedSellSetupByMode: {
     ensemble: persistedUiState.selectedSellSetupByMode?.ensemble ?? "",
     weighted: persistedUiState.selectedSellSetupByMode?.weighted ?? "",
     confidence: persistedUiState.selectedSellSetupByMode?.confidence ?? "",
+    regime: persistedUiState.selectedSellSetupByMode?.regime ?? "",
+    meta: persistedUiState.selectedSellSetupByMode?.meta ?? "",
   } as Record<TradingWindowMode, string>,
   sellSetupSelectionLockedByMode: {
     ensemble: persistedUiState.sellSetupSelectionLockedByMode?.ensemble ?? false,
     weighted: persistedUiState.sellSetupSelectionLockedByMode?.weighted ?? false,
     confidence: persistedUiState.sellSetupSelectionLockedByMode?.confidence ?? false,
+    regime: persistedUiState.sellSetupSelectionLockedByMode?.regime ?? false,
+    meta: persistedUiState.sellSetupSelectionLockedByMode?.meta ?? false,
   } as Record<TradingWindowMode, boolean>,
   orderControlModes: loadOrderControlModes(),
   orderControlOverrides: loadOrderControlOverrides(),
@@ -1896,6 +2717,12 @@ const state = {
   confidenceOrderControlModes: loadConfidenceOrderControlModes(),
   confidenceOrderControlOverrides: loadConfidenceOrderControlOverrides(),
   confidenceTradeHistory: loadConfidenceTradeHistory(),
+  regimeOrderControlModes: loadRegimeOrderControlModes(),
+  regimeOrderControlOverrides: loadRegimeOrderControlOverrides(),
+  regimeTradeHistory: loadRegimeTradeHistory(),
+  metaOrderControlModes: loadMetaOrderControlModes(),
+  metaOrderControlOverrides: loadMetaOrderControlOverrides(),
+  metaTradeHistory: loadMetaTradeHistory(),
   dynamicArtifact: null as DynamicTradingArtifact | null,
   dynamicArtifactStatus: "idle" as "idle" | "loading" | "ready" | "error" | "stale",
   dynamicArtifactWarning: "",
@@ -1952,8 +2779,10 @@ let nextChartRefreshAt = 0;
 let contextTimer: number | undefined;
 let tradingRagRefreshInFlight = false;
 let automaticSubmitInFlight = false;
+let marketForecastRequestKey = "";
 let lastTradingRagCandleTimestamp = "";
 let chartDrawFrame: number | undefined;
+let pendingRegimeSelectionUpdateFrame: number | undefined;
 let lastMetaKey = "";
 let tradingSettingsMountKey = "";
 let weightedTradingSettingsMountKey = "";
@@ -2099,23 +2928,25 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <div id="strategyList" class="strategy-list"></div>
         </section>
 
-        <section class="decision-strip" aria-label="Decision making">
+        <section class="decision-strip" aria-label="Market forecast and context">
           <div class="decision-header">
-            <span>Decision Making</span>
-            <strong id="decisionAction">Waiting for context</strong>
+            <span>Market Forecast</span>
+            <strong id="decisionAction"></strong>
           </div>
-          <div class="decision-grid">
-            <div class="decision-tile">
-              <span>Bias</span>
-              <strong id="decisionBias">--</strong>
+          <div id="marketForecastPanel" class="market-forecast-panel" data-status="waiting"></div>
+          <div class="decision-context-scroll">
+            <div class="decision-grid">
+              <div class="decision-tile">
+                <span>Regime</span>
+                <strong id="decisionBias">--</strong>
+              </div>
+              <div class="decision-tile">
+                <span>Risk State</span>
+                <strong id="decisionRisk">--</strong>
+              </div>
             </div>
-            <div class="decision-tile">
-              <span>Risk State</span>
-              <strong id="decisionRisk">--</strong>
-            </div>
+            <div id="decisionChecklist" class="decision-checklist"></div>
           </div>
-          <div id="decisionReason" class="decision-reason">Waiting for market context</div>
-          <div id="decisionChecklist" class="decision-checklist"></div>
         </section>
 
         <footer class="statusbar">
@@ -2138,7 +2969,10 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <div class="quote-sticky-summary">
           <div class="quote-header">
             <span>SPDR S&P 500 ETF TRUST</span>
-            <strong id="quoteSymbol">SPY</strong>
+            <div class="quote-header-actions">
+              <button id="tradeToggleButton" class="trade-toggle-button" type="button" aria-pressed="false">Trade Off</button>
+              <strong id="quoteSymbol">SPY</strong>
+            </div>
           </div>
           <div class="quote-price-row">
             <div>
@@ -2161,6 +2995,8 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
             <button id="ensembleTradingWindowTab" class="trading-window-tab active" type="button" role="tab" aria-selected="true" aria-controls="tradingWindowPanel">Voting Ensemble</button>
             <button id="weightedTradingWindowTab" class="trading-window-tab" type="button" role="tab" aria-selected="false" aria-controls="tradingWindowPanel">Weighted Voting</button>
             <button id="confidenceTradingWindowTab" class="trading-window-tab" type="button" role="tab" aria-selected="false" aria-controls="tradingWindowPanel">WCA</button>
+            <button id="regimeTradingWindowTab" class="trading-window-tab" type="button" role="tab" aria-selected="false" aria-controls="tradingWindowPanel">Regime</button>
+            <button id="metaTradingWindowTab" class="trading-window-tab" type="button" role="tab" aria-selected="false" aria-controls="tradingWindowPanel">Meta-Strategy</button>
           </div>
           <div id="tradingWindowPanel" class="trading-window-panel" role="tabpanel">
             <div class="section-title">Position</div>
@@ -2249,35 +3085,19 @@ leftRail.innerHTML = `
   <section class="placeholder-shell">
     <div class="algo-shell">
       <div class="algo-tabs" role="tablist" aria-label="Algorithmic strategies">
-        <button id="algoVotingEnsembleTabButton" class="algo-tab-button active" type="button" role="tab" aria-selected="true" aria-controls="algoVotingEnsemblePanel">Voting Ensemble</button>
-        <button id="algoWeightedVotingTabButton" class="algo-tab-button" type="button" role="tab" aria-selected="false" aria-controls="algoWeightedVotingPanel">Weighted Voting</button>
-        <button id="algoConfidenceAggregationTabButton" class="algo-tab-button" type="button" role="tab" aria-selected="false" aria-controls="algoConfidenceAggregationPanel">Weighted Confidence Aggregation</button>
+        <button id="algoVotingEnsembleTabButton" class="algo-tab-button active" type="button" role="tab" aria-selected="true" aria-controls="algoVotingEnsemblePanel"><span class="algo-tab-label">Voting Ensemble</span></button>
+        <button id="algoWeightedVotingTabButton" class="algo-tab-button" type="button" role="tab" aria-selected="false" aria-controls="algoWeightedVotingPanel"><span class="algo-tab-label">Weighted Voting</span></button>
+        <button id="algoConfidenceAggregationTabButton" class="algo-tab-button" type="button" role="tab" aria-selected="false" aria-controls="algoConfidenceAggregationPanel"><span class="algo-tab-label">WCA</span></button>
+        <button id="algoRegimeSelectionTabButton" class="algo-tab-button" type="button" role="tab" aria-selected="false" aria-controls="algoRegimeSelectionPanel"><span class="algo-tab-label">Regime</span></button>
+        <button id="algoMetaStrategyTabButton" class="algo-tab-button" type="button" role="tab" aria-selected="false" aria-controls="algoMetaStrategyPanel"><span class="algo-tab-label">Meta-Strategy</span></button>
       </div>
       <div id="algoVotingEnsemblePanel" class="algo-panel active" role="tabpanel" aria-labelledby="algoVotingEnsembleTabButton">
         <div class="algo-header">
-          <div>
-            <span>All Strategies</span>
-            <strong>Winner Vote Ensemble</strong>
-          </div>
           <div id="algoFinalSignal" class="algo-final hold">Hold</div>
         </div>
         <div id="algoVoteCounts" class="algo-vote-grid"></div>
-        <button id="algoVotesToggle" class="algo-expand-toggle" type="button" aria-expanded="false" aria-controls="algoVoteList">
-          <span>Algorithms</span>
-          <strong id="algoVotesToggleMeta">10 strategies</strong>
-          <b id="algoVotesToggleIcon">+</b>
-        </button>
-        <div id="algoVoteList" class="algo-vote-list" hidden></div>
-        <div class="algo-section-title">Trades</div>
-        <div class="algo-timeframe-toggle" role="group" aria-label="Voting Ensemble backtest timeframe">
-          <button id="algoBacktest1mButton" class="algo-timeframe-button active" type="button">1m</button>
-          <button id="algoBacktest5mButton" class="algo-timeframe-button" type="button">5m</button>
-          <button id="algoBacktest1hButton" class="algo-timeframe-button" type="button">1h</button>
-          <button id="algoBacktest1dButton" class="algo-timeframe-button" type="button">D</button>
-          <button id="algoBacktest1wButton" class="algo-timeframe-button" type="button">W</button>
-          <button id="algoBacktestEventButton" class="algo-timeframe-button" type="button">Event</button>
-          <button id="algoBacktestTradingButton" class="algo-timeframe-button" type="button">Trading</button>
-        </div>
+        <div id="algoResultsBody" class="algo-rule-list"></div>
+        <div id="algoTradePlanTitle" class="algo-section-title">Trades</div>
         <div id="algoTradePlan" class="algo-rule-list"></div>
         <div class="algo-table-wrap">
           <table class="algo-trade-table">
@@ -2293,14 +3113,42 @@ leftRail.innerHTML = `
           </table>
         </div>
         <div id="tradingSettingsMount" class="algo-stable-settings"></div>
-        <div class="algo-section-title">Results</div>
-        <div id="algoResultsBody" class="algo-rule-list"></div>
+        <button id="algoVotesToggle" class="algo-expand-toggle" type="button" aria-expanded="false" aria-controls="algoVoteList">
+          <span>Strategies</span>
+          <strong id="algoVotesToggleMeta">10 strategies</strong>
+          <b id="algoVotesToggleIcon">+</b>
+        </button>
+        <div id="algoVoteList" class="algo-vote-list" hidden></div>
+        <div class="algo-timeframe-toggle" role="group" aria-label="Voting Ensemble backtest timeframe">
+          <button id="algoIntradayTradesToggle" class="algo-timeframe-button algo-timeframe-menu-toggle" type="button" aria-expanded="false" aria-controls="algoIntradayTradesPanel">
+            <span>1m/5m Trades</span>
+            <b id="algoIntradayTradesToggleIcon">+</b>
+          </button>
+          <div id="algoIntradayTradesPanel" class="algo-timeframe-subtoggle" hidden>
+            <button id="algoBacktest1mButton" class="algo-timeframe-button active" type="button">1m</button>
+            <button id="algoBacktest5mButton" class="algo-timeframe-button" type="button">5m</button>
+            <div id="algoIntradayTradesContent" class="algo-intraday-trades-content">
+              <div id="algoIntradayTradesSummary" class="algo-rule-list algo-intraday-trades-summary"></div>
+              <div class="algo-table-wrap">
+                <table class="algo-trade-table">
+                  <thead>
+                    <tr>
+                      <th>Side</th>
+                      <th>Entry</th>
+                      <th>Exit</th>
+                      <th>P/L</th>
+                    </tr>
+                  </thead>
+                  <tbody id="algoIntradayTradesTable"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+          <button id="algoBacktestTradingButton" class="algo-timeframe-button" type="button" hidden>Trading</button>
+        </div>
       </div>
       <div id="algoWeightedVotingPanel" class="algo-panel" role="tabpanel" aria-labelledby="algoWeightedVotingTabButton" hidden>
         <div class="algo-header">
-          <div>
-            <strong>Daily-Smoothed Weighted Vote</strong>
-          </div>
           <div id="weightedFinalSignal" class="algo-final hold">Hold</div>
         </div>
         <div id="weightedScoreGrid" class="weighted-score-grid"></div>
@@ -2333,9 +3181,6 @@ leftRail.innerHTML = `
       </div>
       <div id="algoConfidenceAggregationPanel" class="algo-panel" role="tabpanel" aria-labelledby="algoConfidenceAggregationTabButton" hidden>
         <div class="algo-header">
-          <div>
-            <strong>Weighted Confidence Aggregation</strong>
-          </div>
           <div id="confidenceFinalSignal" class="algo-final hold">Hold</div>
         </div>
         <div id="confidenceScoreGrid" class="weighted-score-grid"></div>
@@ -2373,6 +3218,49 @@ leftRail.innerHTML = `
           <b id="confidenceStrategiesToggleIcon">-</b>
         </button>
         <div id="confidenceStrategiesList" class="weighted-strategy-list"></div>
+      </div>
+      <div id="algoRegimeSelectionPanel" class="algo-panel" role="tabpanel" aria-labelledby="algoRegimeSelectionTabButton" hidden>
+        <div class="algo-header">
+          <div id="regimeFinalSignal" class="algo-final hold">Hold</div>
+        </div>
+        <div id="regimeScoreGrid" class="weighted-score-grid"></div>
+        <div id="regimeSummary" class="algo-rule-list weighted-summary"></div>
+        <div id="regimeTradingSettingsMount" class="algo-stable-settings"></div>
+        <button id="regimeIndicatorsToggle" class="algo-expand-toggle regime-indicators-toggle" type="button" aria-expanded="true" aria-controls="regimeFeatureGrid">
+          <span>Market Indicators</span>
+          <strong id="regimeIndicatorsToggleMeta">0 indicators</strong>
+          <b id="regimeIndicatorsToggleIcon">-</b>
+        </button>
+        <div id="regimeFeatureGrid" class="regime-feature-grid"></div>
+        <button id="regimeStrategiesToggle" class="algo-expand-toggle regime-strategies-toggle" type="button" aria-expanded="true" aria-controls="regimeStrategiesList">
+          <span>Strategies</span>
+          <strong id="regimeStrategiesToggleMeta">0 selected</strong>
+          <b id="regimeStrategiesToggleIcon">-</b>
+        </button>
+        <div id="regimeStrategiesList" class="weighted-strategy-list"></div>
+      </div>
+      <div id="algoMetaStrategyPanel" class="algo-panel" role="tabpanel" aria-labelledby="algoMetaStrategyTabButton" hidden>
+        <div class="algo-header">
+          <div id="metaFinalSignal" class="algo-final hold">Hold</div>
+        </div>
+        <div id="metaScoreGrid" class="weighted-score-grid"></div>
+        <div id="metaSummary" class="algo-rule-list weighted-summary" hidden></div>
+        <div id="metaMlReadinessBox" class="meta-ml-readiness-box" data-status="loading"></div>
+        <div id="metaFamilyGrid" class="regime-feature-grid meta-family-grid expanded"></div>
+        <button id="metaStrategiesToggle" class="algo-expand-toggle meta-strategies-toggle" type="button" aria-expanded="false" aria-controls="metaStrategiesPanel">
+          <span>Strategies</span>
+          <strong id="metaStrategiesToggleMeta">0 active / 29 strategies</strong>
+          <b id="metaStrategiesToggleIcon">+</b>
+        </button>
+        <div id="metaStrategiesPanel" class="meta-strategies-panel" hidden>
+          <div id="metaStrategiesList" class="weighted-strategy-list"></div>
+        </div>
+        <button id="metaChecksToggle" class="algo-expand-toggle meta-checks-toggle" type="button" aria-expanded="false" aria-controls="metaGateList">
+          <span>Meta Decision Checks</span>
+          <strong id="metaChecksToggleMeta">0 checks</strong>
+          <b id="metaChecksToggleIcon">+</b>
+        </button>
+        <div id="metaGateList" class="weighted-gate-list meta-checks-list" hidden></div>
       </div>
     </div>
   </section>
@@ -2654,8 +3542,8 @@ const strategyList = document.querySelector<HTMLDivElement>("#strategyList")!;
 const decisionAction = document.querySelector<HTMLSpanElement>("#decisionAction")!;
 const decisionBias = document.querySelector<HTMLSpanElement>("#decisionBias")!;
 const decisionRisk = document.querySelector<HTMLSpanElement>("#decisionRisk")!;
-const decisionReason = document.querySelector<HTMLDivElement>("#decisionReason")!;
 const decisionChecklist = document.querySelector<HTMLDivElement>("#decisionChecklist")!;
+const marketForecastPanel = document.querySelector<HTMLDivElement>("#marketForecastPanel")!;
 const widgetsTabButton = document.querySelector<HTMLButtonElement>("#widgetsTabButton")!;
 const newsTabButton = document.querySelector<HTMLButtonElement>("#newsTabButton")!;
 const summaryTabButton = document.querySelector<HTMLButtonElement>("#summaryTabButton")!;
@@ -2736,19 +3624,25 @@ const algoWeightedVotingTabButton = document.querySelector<HTMLButtonElement>("#
 const algoWeightedVotingPanel = document.querySelector<HTMLDivElement>("#algoWeightedVotingPanel")!;
 const algoConfidenceAggregationTabButton = document.querySelector<HTMLButtonElement>("#algoConfidenceAggregationTabButton")!;
 const algoConfidenceAggregationPanel = document.querySelector<HTMLDivElement>("#algoConfidenceAggregationPanel")!;
+const algoRegimeSelectionTabButton = document.querySelector<HTMLButtonElement>("#algoRegimeSelectionTabButton")!;
+const algoRegimeSelectionPanel = document.querySelector<HTMLDivElement>("#algoRegimeSelectionPanel")!;
+const algoMetaStrategyTabButton = document.querySelector<HTMLButtonElement>("#algoMetaStrategyTabButton")!;
+const algoMetaStrategyPanel = document.querySelector<HTMLDivElement>("#algoMetaStrategyPanel")!;
 const algoFinalSignal = document.querySelector<HTMLDivElement>("#algoFinalSignal")!;
 const algoVoteCounts = document.querySelector<HTMLDivElement>("#algoVoteCounts")!;
 const algoVoteList = document.querySelector<HTMLDivElement>("#algoVoteList")!;
 const algoVotesToggle = document.querySelector<HTMLButtonElement>("#algoVotesToggle")!;
 const algoVotesToggleMeta = document.querySelector<HTMLElement>("#algoVotesToggleMeta")!;
 const algoVotesToggleIcon = document.querySelector<HTMLElement>("#algoVotesToggleIcon")!;
+const algoIntradayTradesToggle = document.querySelector<HTMLButtonElement>("#algoIntradayTradesToggle")!;
+const algoIntradayTradesToggleIcon = document.querySelector<HTMLElement>("#algoIntradayTradesToggleIcon")!;
+const algoIntradayTradesPanel = document.querySelector<HTMLDivElement>("#algoIntradayTradesPanel")!;
+const algoIntradayTradesSummary = document.querySelector<HTMLDivElement>("#algoIntradayTradesSummary")!;
+const algoIntradayTradesTable = document.querySelector<HTMLTableSectionElement>("#algoIntradayTradesTable")!;
 const algoBacktest1mButton = document.querySelector<HTMLButtonElement>("#algoBacktest1mButton")!;
 const algoBacktest5mButton = document.querySelector<HTMLButtonElement>("#algoBacktest5mButton")!;
-const algoBacktest1hButton = document.querySelector<HTMLButtonElement>("#algoBacktest1hButton")!;
-const algoBacktest1dButton = document.querySelector<HTMLButtonElement>("#algoBacktest1dButton")!;
-const algoBacktest1wButton = document.querySelector<HTMLButtonElement>("#algoBacktest1wButton")!;
-const algoBacktestEventButton = document.querySelector<HTMLButtonElement>("#algoBacktestEventButton")!;
 const algoBacktestTradingButton = document.querySelector<HTMLButtonElement>("#algoBacktestTradingButton")!;
+const algoTradePlanTitle = document.querySelector<HTMLDivElement>("#algoTradePlanTitle")!;
 const algoTradePlan = document.querySelector<HTMLDivElement>("#algoTradePlan")!;
 const algoTableWrap = document.querySelector<HTMLDivElement>(".algo-table-wrap")!;
 const algoTradesTable = document.querySelector<HTMLTableSectionElement>("#algoTradesTable")!;
@@ -2788,6 +3682,32 @@ const confidenceStrategiesToggle = document.querySelector<HTMLButtonElement>("#c
 const confidenceStrategiesToggleMeta = document.querySelector<HTMLElement>("#confidenceStrategiesToggleMeta")!;
 const confidenceStrategiesToggleIcon = document.querySelector<HTMLElement>("#confidenceStrategiesToggleIcon")!;
 const confidenceStrategiesList = document.querySelector<HTMLDivElement>("#confidenceStrategiesList")!;
+const regimeFinalSignal = document.querySelector<HTMLDivElement>("#regimeFinalSignal")!;
+const regimeScoreGrid = document.querySelector<HTMLDivElement>("#regimeScoreGrid")!;
+const regimeSummary = document.querySelector<HTMLDivElement>("#regimeSummary")!;
+const regimeTradingSettingsMount = document.querySelector<HTMLDivElement>("#regimeTradingSettingsMount")!;
+const regimeIndicatorsToggle = document.querySelector<HTMLButtonElement>("#regimeIndicatorsToggle")!;
+const regimeIndicatorsToggleMeta = document.querySelector<HTMLElement>("#regimeIndicatorsToggleMeta")!;
+const regimeIndicatorsToggleIcon = document.querySelector<HTMLElement>("#regimeIndicatorsToggleIcon")!;
+const regimeFeatureGrid = document.querySelector<HTMLDivElement>("#regimeFeatureGrid")!;
+const regimeStrategiesToggle = document.querySelector<HTMLButtonElement>("#regimeStrategiesToggle")!;
+const regimeStrategiesToggleMeta = document.querySelector<HTMLElement>("#regimeStrategiesToggleMeta")!;
+const regimeStrategiesToggleIcon = document.querySelector<HTMLElement>("#regimeStrategiesToggleIcon")!;
+const regimeStrategiesList = document.querySelector<HTMLDivElement>("#regimeStrategiesList")!;
+const metaFinalSignal = document.querySelector<HTMLDivElement>("#metaFinalSignal")!;
+const metaScoreGrid = document.querySelector<HTMLDivElement>("#metaScoreGrid")!;
+const metaSummary = document.querySelector<HTMLDivElement>("#metaSummary")!;
+const metaGateList = document.querySelector<HTMLDivElement>("#metaGateList")!;
+const metaStrategiesToggle = document.querySelector<HTMLButtonElement>("#metaStrategiesToggle")!;
+const metaStrategiesToggleMeta = document.querySelector<HTMLElement>("#metaStrategiesToggleMeta")!;
+const metaStrategiesToggleIcon = document.querySelector<HTMLElement>("#metaStrategiesToggleIcon")!;
+const metaStrategiesPanel = document.querySelector<HTMLDivElement>("#metaStrategiesPanel")!;
+const metaChecksToggle = document.querySelector<HTMLButtonElement>("#metaChecksToggle")!;
+const metaChecksToggleMeta = document.querySelector<HTMLElement>("#metaChecksToggleMeta")!;
+const metaChecksToggleIcon = document.querySelector<HTMLElement>("#metaChecksToggleIcon")!;
+const metaMlReadinessBox = document.querySelector<HTMLDivElement>("#metaMlReadinessBox")!;
+const metaFamilyGrid = document.querySelector<HTMLDivElement>("#metaFamilyGrid")!;
+const metaStrategiesList = document.querySelector<HTMLDivElement>("#metaStrategiesList")!;
 const zoomLevel = document.querySelector<HTMLSpanElement>("#zoomLevel")!;
 const feedSelect = document.querySelector<HTMLSelectElement>("#feedSelect")!;
 const startInput = document.querySelector<HTMLInputElement>("#startInput")!;
@@ -2802,6 +3722,7 @@ const quoteAsk = document.querySelector<HTMLSpanElement>("#quoteAsk")!;
 const quoteBid = document.querySelector<HTMLSpanElement>("#quoteBid")!;
 const quoteStats = document.querySelector<HTMLDivElement>("#quoteStats")!;
 const quotePosition = document.querySelector<HTMLDivElement>("#quotePosition")!;
+const tradeToggleButton = document.querySelector<HTMLButtonElement>("#tradeToggleButton")!;
 const buyOrderButton = document.querySelector<HTMLButtonElement>("#buyOrderButton")!;
 const sellOrderButton = document.querySelector<HTMLButtonElement>("#sellOrderButton")!;
 const closePositionButton = document.querySelector<HTMLButtonElement>("#closePositionButton")!;
@@ -2809,6 +3730,8 @@ const clearTradeHistoryButton = document.querySelector<HTMLButtonElement>("#clea
 const ensembleTradingWindowTab = document.querySelector<HTMLButtonElement>("#ensembleTradingWindowTab")!;
 const weightedTradingWindowTab = document.querySelector<HTMLButtonElement>("#weightedTradingWindowTab")!;
 const confidenceTradingWindowTab = document.querySelector<HTMLButtonElement>("#confidenceTradingWindowTab")!;
+const regimeTradingWindowTab = document.querySelector<HTMLButtonElement>("#regimeTradingWindowTab")!;
+const metaTradingWindowTab = document.querySelector<HTMLButtonElement>("#metaTradingWindowTab")!;
 const openOrderControls = document.querySelector<HTMLDivElement>("#openOrderControls")!;
 const tradeHistoryTitle = document.querySelector<HTMLSpanElement>("#tradeHistoryTitle")!;
 const tradeHistoryBody = document.querySelector<HTMLTableSectionElement>("#tradeHistoryBody")!;
@@ -2821,10 +3744,12 @@ endInput.value = state.end;
 updateCandleSettingsControls();
 updateOverlayToggleControls();
 updateZoomLevel();
+updateTradeToggleButton();
 setAlgoTab(state.algoTab);
 
 function makeTimeframeButtons(container: Element, compact = false) {
-  container.innerHTML = timeframeItems
+  const items = compact ? timeframeItems.filter((item) => item.value === "1Min" || item.value === "5Min") : timeframeItems;
+  container.innerHTML = items
     .map(
       (item) => `
         <button class="tf-button ${item.value === state.timeframe ? "active" : ""}" data-timeframe="${item.value}">
@@ -3026,24 +3951,33 @@ document.querySelector("#latestButton")!.addEventListener("click", () => {
   void loadCandles({ refresh: true });
 });
 
+tradeToggleButton.addEventListener("click", () => {
+  state.tradingEnabled = !state.tradingEnabled;
+  saveUiState();
+  updateTradeToggleButton();
+  updateQuoteCard(currentCandle());
+  if (state.tradingEnabled) {
+    maybeAutoSubmitAllAlgorithms();
+  }
+});
+
 buyOrderButton.addEventListener("click", () => {
-  recordTradeHistory("Buy", activeTradingModeFromAlgoTab());
+  recordTradeHistory("Buy", state.tradingWindowMode);
 });
 
 sellOrderButton.addEventListener("click", () => {
-  submitSelectedOpenOrderSell(activeTradingModeFromAlgoTab());
+  submitSelectedOpenOrderSell(state.tradingWindowMode);
 });
 
 clearTradeHistoryButton.addEventListener("click", () => {
-  setTradingLedger(state.tradingWindowMode, []);
-  setOrderControlModesForMode(state.tradingWindowMode, {});
-  setOrderControlOverridesForMode(state.tradingWindowMode, {});
+  clearTodaysTradeHistoryForMode(state.tradingWindowMode);
   if (state.tradingWindowMode === "ensemble") {
     clearRecommendedTargetOverrides();
   }
   suppressCurrentAutomaticTargetOrder(state.tradingWindowMode);
   updateAlgorithmPanel(visibleCandles());
   updateQuoteCard(currentCandle());
+  void saveBrowserStorageSnapshot("clear-today-trade-history");
 });
 
 ensembleTradingWindowTab.addEventListener("click", () => {
@@ -3056,6 +3990,14 @@ weightedTradingWindowTab.addEventListener("click", () => {
 
 confidenceTradingWindowTab.addEventListener("click", () => {
   setTradingWindowMode("confidence");
+});
+
+regimeTradingWindowTab.addEventListener("click", () => {
+  setTradingWindowMode("regime");
+});
+
+metaTradingWindowTab.addEventListener("click", () => {
+  setTradingWindowMode("meta");
 });
 
 openOrderControls.addEventListener("change", (event) => {
@@ -3097,21 +4039,24 @@ openOrderControls.addEventListener("click", (event) => {
   if (!button) {
     return;
   }
-  submitOpenOrderLot(button.dataset.sellLotId ?? "", false);
+  submitOpenOrderLot(button.dataset.sellLotId ?? "", false, state.tradingWindowMode);
 });
 
 closePositionButton.addEventListener("click", () => {
-  const latest = currentCandle();
-  if (!latest || !isMarketOpenForOrders()) {
+  const mode = state.tradingWindowMode;
+  const latest = latestExecutionCandleForMode(mode);
+  if (!latest || !canSubmitTrades()) {
     return;
   }
-  const mode = state.tradingWindowMode;
   const lots = openOrderLots(mode);
   if (!lots.length) {
     return;
   }
   lots.forEach((lot) => {
-    appendTradeHistory("Sell", lot.remainingQuantity, latest.close, lot.id, mode);
+    appendTradeHistory("Sell", lot.remainingQuantity, latest.close, lot.id, mode, {
+      submitMode: "Close Position",
+      trigger: "Close Position button",
+    });
   });
   if (mode === "ensemble") {
     clearRecommendedTargetOverrides();
@@ -3224,11 +4169,59 @@ algoConfidenceAggregationTabButton.addEventListener("click", () => {
   setAlgoTab("confidence");
 });
 
+algoRegimeSelectionTabButton.addEventListener("click", () => {
+  setAlgoTab("regime");
+});
+
+algoMetaStrategyTabButton.addEventListener("click", () => {
+  setAlgoTab("meta");
+});
+
 algoVotesToggle.addEventListener("click", () => {
   state.algoVotesExpanded = !state.algoVotesExpanded;
   saveUiState();
   renderAlgoVotesExpandedState();
   updateWeightedVotingPanel();
+});
+
+regimeStrategiesToggle.addEventListener("click", () => {
+  state.regimeStrategiesExpanded = !state.regimeStrategiesExpanded;
+  saveUiState();
+  if (state.regimeStrategiesExpanded) {
+    updateRegimeSelectionPanel();
+  } else {
+    renderRegimeStrategiesExpandedState();
+  }
+});
+
+regimeIndicatorsToggle.addEventListener("click", () => {
+  state.regimeIndicatorsExpanded = !state.regimeIndicatorsExpanded;
+  saveUiState();
+  if (state.regimeIndicatorsExpanded) {
+    updateRegimeSelectionPanel();
+  } else {
+    renderRegimeIndicatorsExpandedState();
+  }
+});
+
+metaStrategiesToggle.addEventListener("click", () => {
+  state.metaStrategiesExpanded = !state.metaStrategiesExpanded;
+  saveUiState();
+  renderMetaStrategiesExpandedState();
+});
+
+metaChecksToggle.addEventListener("click", () => {
+  state.metaChecksExpanded = !state.metaChecksExpanded;
+  saveUiState();
+  renderMetaChecksExpandedState();
+});
+
+metaMlReadinessBox.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-meta-training-action]");
+  if (!button) {
+    return;
+  }
+  void loadMetaStrategyTrainingStatus({ train: button.dataset.metaTrainingAction === "train" });
 });
 
 weightedStrategiesToggle.addEventListener("click", () => {
@@ -3284,6 +4277,12 @@ confidenceStrategiesToggle.addEventListener("click", () => {
   renderConfidenceStrategiesExpandedState();
 });
 
+algoIntradayTradesToggle.addEventListener("click", () => {
+  state.algoIntradayTradesExpanded = !state.algoIntradayTradesExpanded;
+  saveUiState();
+  updateAlgoBacktestControls();
+});
+
 algoBacktest1mButton.addEventListener("click", () => {
   void setAlgoBacktestTimeframe("1Min");
 });
@@ -3292,27 +4291,11 @@ algoBacktest5mButton.addEventListener("click", () => {
   void setAlgoBacktestTimeframe("5Min");
 });
 
-algoBacktest1hButton.addEventListener("click", () => {
-  void setAlgoBacktestTimeframe("1Hour");
-});
-
-algoBacktest1dButton.addEventListener("click", () => {
-  void setAlgoBacktestTimeframe("1Day");
-});
-
-algoBacktest1wButton.addEventListener("click", () => {
-  void setAlgoBacktestTimeframe("1Week");
-});
-
-algoBacktestEventButton.addEventListener("click", () => {
-  void setAlgoBacktestTimeframe("Event");
-});
-
 algoBacktestTradingButton.addEventListener("click", () => {
   void setAlgoBacktestTimeframe("Trading");
 });
 
-document.addEventListener("input", (event) => {
+function handleTradingSettingChange(event: Event) {
   const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-trading-setting]");
   if (!input) {
     return;
@@ -3321,24 +4304,41 @@ document.addEventListener("input", (event) => {
   if (!key || key === "positionSizingMode") {
     return;
   }
+  const shouldRerender = event.type !== "input" || input.type === "checkbox";
   if (key === "useDefaultSizingSettings" || key === "pyramidingEnabled") {
-    state.tradingSettings = sanitizeTradingSettings({ ...state.tradingSettings, [key]: input.checked });
+    state.tradingSettings = sanitizeTradingSettings(
+      { ...state.tradingSettings, [key]: input.checked },
+      VOTING_MAX_ORDER_ALLOCATION_PERCENT,
+    );
     saveTradingSettings(state.tradingSettings);
     clearRecommendedTargetOverrides();
-    updateAlgorithmPanel(visibleCandles());
+    if (shouldRerender) {
+      updateAlgorithmPanel(visibleCandles());
+    }
+    return;
+  }
+  if (input.value.trim() === "") {
     return;
   }
   const value = Number(input.value);
   if (!Number.isFinite(value)) {
     return;
   }
-  state.tradingSettings = sanitizeTradingSettings({ ...state.tradingSettings, [key]: value });
+  state.tradingSettings = sanitizeTradingSettings(
+    { ...state.tradingSettings, [key]: value },
+    VOTING_MAX_ORDER_ALLOCATION_PERCENT,
+  );
   saveTradingSettings(state.tradingSettings);
   clearRecommendedTargetOverrides();
-  updateAlgorithmPanel(visibleCandles());
-});
+  if (shouldRerender) {
+    updateAlgorithmPanel(visibleCandles());
+  }
+}
 
-document.addEventListener("input", (event) => {
+document.addEventListener("input", handleTradingSettingChange);
+document.addEventListener("change", handleTradingSettingChange);
+
+function handleWeightedTradingSettingChange(event: Event) {
   const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-weighted-trading-setting]");
   if (!input) {
     return;
@@ -3347,10 +4347,16 @@ document.addEventListener("input", (event) => {
   if (!key || key === "positionSizingMode") {
     return;
   }
+  const shouldRerender = event.type !== "input" || input.type === "checkbox";
   if (key === "useDefaultSizingSettings" || key === "pyramidingEnabled") {
     state.weightedTradingSettings = sanitizeTradingSettings({ ...state.weightedTradingSettings, [key]: input.checked });
     saveWeightedTradingSettings(state.weightedTradingSettings);
-    updateWeightedVotingPanel();
+    if (shouldRerender) {
+      updateWeightedVotingPanel();
+    }
+    return;
+  }
+  if (input.value.trim() === "") {
     return;
   }
   const value = Number(input.value);
@@ -3359,10 +4365,15 @@ document.addEventListener("input", (event) => {
   }
   state.weightedTradingSettings = sanitizeTradingSettings({ ...state.weightedTradingSettings, [key]: value });
   saveWeightedTradingSettings(state.weightedTradingSettings);
-  updateWeightedVotingPanel();
-});
+  if (shouldRerender) {
+    updateWeightedVotingPanel();
+  }
+}
 
-document.addEventListener("input", (event) => {
+document.addEventListener("input", handleWeightedTradingSettingChange);
+document.addEventListener("change", handleWeightedTradingSettingChange);
+
+function handleConfidenceTradingSettingChange(event: Event) {
   const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-confidence-trading-setting]");
   if (!input) {
     return;
@@ -3371,10 +4382,17 @@ document.addEventListener("input", (event) => {
   if (!key || key === "positionSizingMode") {
     return;
   }
+  const shouldRerender = event.type !== "input" || input.type === "checkbox";
   if (key === "useDefaultSizingSettings" || key === "pyramidingEnabled") {
     state.confidenceTradingSettings = sanitizeTradingSettings({ ...state.confidenceTradingSettings, [key]: input.checked });
     saveConfidenceTradingSettings(state.confidenceTradingSettings);
-    updateConfidenceAggregationPanel();
+    if (shouldRerender) {
+      updateConfidenceAggregationPanel();
+      updateRegimeSelectionPanel();
+    }
+    return;
+  }
+  if (input.value.trim() === "") {
     return;
   }
   const value = Number(input.value);
@@ -3383,8 +4401,49 @@ document.addEventListener("input", (event) => {
   }
   state.confidenceTradingSettings = sanitizeTradingSettings({ ...state.confidenceTradingSettings, [key]: value });
   saveConfidenceTradingSettings(state.confidenceTradingSettings);
-  updateConfidenceAggregationPanel();
-});
+  if (shouldRerender) {
+    updateConfidenceAggregationPanel();
+    updateRegimeSelectionPanel();
+  }
+}
+
+document.addEventListener("input", handleConfidenceTradingSettingChange);
+document.addEventListener("change", handleConfidenceTradingSettingChange);
+
+function handleRegimeTradingSettingChange(event: Event) {
+  const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-regime-trading-setting]");
+  if (!input) {
+    return;
+  }
+  const key = input.dataset.regimeTradingSetting as keyof TradingSettings | undefined;
+  if (!key || key === "positionSizingMode") {
+    return;
+  }
+  const shouldRerender = event.type !== "input" || input.type === "checkbox";
+  if (key === "useDefaultSizingSettings" || key === "pyramidingEnabled") {
+    state.regimeTradingSettings = sanitizeTradingSettings({ ...state.regimeTradingSettings, [key]: input.checked }, REGIME_MAX_ORDER_ALLOCATION_PERCENT);
+    saveRegimeTradingSettings(state.regimeTradingSettings);
+    if (shouldRerender) {
+      updateRegimeSelectionPanel();
+    }
+    return;
+  }
+  if (input.value.trim() === "") {
+    return;
+  }
+  const value = Number(input.value);
+  if (!Number.isFinite(value)) {
+    return;
+  }
+  state.regimeTradingSettings = sanitizeTradingSettings({ ...state.regimeTradingSettings, [key]: value }, REGIME_MAX_ORDER_ALLOCATION_PERCENT);
+  saveRegimeTradingSettings(state.regimeTradingSettings);
+  if (shouldRerender) {
+    updateRegimeSelectionPanel();
+  }
+}
+
+document.addEventListener("input", handleRegimeTradingSettingChange);
+document.addEventListener("change", handleRegimeTradingSettingChange);
 
 document.addEventListener("click", (event) => {
   const tradingSettingsToggle = (event.target as HTMLElement).closest<HTMLButtonElement>("#confidenceTradingSettingsToggle");
@@ -3394,11 +4453,25 @@ document.addEventListener("click", (event) => {
     updateConfidenceAggregationPanel();
     return;
   }
+  const regimeTradingSettingsToggle = (event.target as HTMLElement).closest<HTMLButtonElement>("#regimeTradingSettingsToggle");
+  if (regimeTradingSettingsToggle) {
+    state.regimeTradingSettingsExpanded = !state.regimeTradingSettingsExpanded;
+    saveUiState();
+    updateRegimeSelectionPanel();
+    return;
+  }
   const defaultSizingToggle = (event.target as HTMLElement).closest<HTMLButtonElement>("#confidenceDefaultSizingToggle");
   if (defaultSizingToggle) {
     state.confidenceDefaultSizingExpanded = !state.confidenceDefaultSizingExpanded;
     saveUiState();
     updateConfidenceAggregationPanel();
+    return;
+  }
+  const regimeDefaultSizingToggle = (event.target as HTMLElement).closest<HTMLButtonElement>("#regimeDefaultSizingToggle");
+  if (regimeDefaultSizingToggle) {
+    state.regimeDefaultSizingExpanded = !state.regimeDefaultSizingExpanded;
+    saveUiState();
+    updateRegimeSelectionPanel();
   }
 });
 
@@ -3411,8 +4484,11 @@ function handleTargetSettingInput(event: Event) {
   if (!key) {
     return;
   }
+  const shouldRerender = event.type !== "input" || !(input instanceof HTMLInputElement);
   if (isRecommendedTargetSetting(key)) {
-    updateAlgorithmPanel(visibleCandles());
+    if (shouldRerender) {
+      updateAlgorithmPanel(visibleCandles());
+    }
     return;
   }
   const numericKeys = new Set<keyof TargetOrderSettings>([
@@ -3429,13 +4505,18 @@ function handleTargetSettingInput(event: Event) {
     "plannedStopRiskDollars",
     "estimatedSlippage",
   ]);
+  if (numericKeys.has(key) && input.value.trim() === "") {
+    return;
+  }
   const nextValue = numericKeys.has(key) ? Number(input.value) : input.value;
   if (numericKeys.has(key) && !Number.isFinite(nextValue as number)) {
     return;
   }
   state.targetOrderOverrides = { ...state.targetOrderOverrides, [key]: nextValue };
   saveTargetOrderOverrides(state.targetOrderOverrides);
-  updateAlgorithmPanel(visibleCandles());
+  if (shouldRerender) {
+    updateAlgorithmPanel(visibleCandles());
+  }
 }
 
 function isRecommendedTargetSetting(key: keyof TargetOrderSettings) {
@@ -3475,6 +4556,9 @@ document.addEventListener("change", handleTargetSettingInput);
 function handleWeightedTargetSettingInput(event: Event) {
   const input = (event.target as HTMLElement).closest<HTMLInputElement | HTMLSelectElement>("[data-weighted-target-setting]");
   if (!input) {
+    return;
+  }
+  if (event.type === "input" && input instanceof HTMLInputElement) {
     return;
   }
   const key = input.dataset.weightedTargetSetting as keyof TargetOrderSettings | undefined;
@@ -3571,6 +4655,128 @@ function handleConfidenceTargetSettingInput(event: Event) {
 
 document.addEventListener("input", handleConfidenceTargetSettingInput);
 document.addEventListener("change", handleConfidenceTargetSettingInput);
+
+function handleRegimeTargetSettingInput(event: Event) {
+  const input = (event.target as HTMLElement).closest<HTMLInputElement | HTMLSelectElement>("[data-regime-target-setting]");
+  if (!input) {
+    return;
+  }
+  const key = input.dataset.regimeTargetSetting as keyof TargetOrderSettings | undefined;
+  if (!key) {
+    return;
+  }
+  if (key === "quantity") {
+    updateRegimeSelectionPanel();
+    return;
+  }
+  const generatedKeys = new Set<keyof TargetOrderSettings>([
+    "symbol",
+    "side",
+    "orderType",
+    "triggerPrice",
+    "limitPrice",
+    "stopPrice",
+    "targetPrice",
+    "accountBalance",
+    "orderLimitDollars",
+    "dailyLimitDollars",
+    "riskDollars",
+    "orderNotional",
+    "plannedStopRiskDollars",
+    "estimatedSlippage",
+    "timeInForce",
+    "cutoff",
+  ]);
+  if (state.regimeTradingSettings.useDefaultSizingSettings && generatedKeys.has(key)) {
+    updateRegimeSelectionPanel();
+    return;
+  }
+  const numericKeys = new Set<keyof TargetOrderSettings>([
+    "quantity",
+    "triggerPrice",
+    "limitPrice",
+    "stopPrice",
+    "targetPrice",
+    "accountBalance",
+    "orderLimitDollars",
+    "dailyLimitDollars",
+    "riskDollars",
+    "orderNotional",
+    "plannedStopRiskDollars",
+    "estimatedSlippage",
+  ]);
+  const nextValue = numericKeys.has(key) ? Number(input.value) : input.value;
+  if (numericKeys.has(key) && !Number.isFinite(nextValue as number)) {
+    return;
+  }
+  state.regimeTargetOrderOverrides = { ...state.regimeTargetOrderOverrides, [key]: nextValue };
+  saveRegimeTargetOrderOverrides(state.regimeTargetOrderOverrides);
+  updateRegimeSelectionPanel();
+}
+
+document.addEventListener("input", handleRegimeTargetSettingInput);
+document.addEventListener("change", handleRegimeTargetSettingInput);
+
+function handleMetaTargetSettingInput(event: Event) {
+  const input = (event.target as HTMLElement).closest<HTMLInputElement | HTMLSelectElement>("[data-meta-target-setting]");
+  if (!input) {
+    return;
+  }
+  const key = input.dataset.metaTargetSetting as keyof TargetOrderSettings | undefined;
+  if (!key) {
+    return;
+  }
+  if (key === "quantity") {
+    updateMetaStrategyPanel();
+    return;
+  }
+  const generatedKeys = new Set<keyof TargetOrderSettings>([
+    "symbol",
+    "side",
+    "orderType",
+    "triggerPrice",
+    "limitPrice",
+    "stopPrice",
+    "targetPrice",
+    "accountBalance",
+    "orderLimitDollars",
+    "dailyLimitDollars",
+    "riskDollars",
+    "orderNotional",
+    "plannedStopRiskDollars",
+    "estimatedSlippage",
+    "timeInForce",
+    "cutoff",
+  ]);
+  if (state.metaTradingSettings.useDefaultSizingSettings && generatedKeys.has(key)) {
+    updateMetaStrategyPanel();
+    return;
+  }
+  const numericKeys = new Set<keyof TargetOrderSettings>([
+    "quantity",
+    "triggerPrice",
+    "limitPrice",
+    "stopPrice",
+    "targetPrice",
+    "accountBalance",
+    "orderLimitDollars",
+    "dailyLimitDollars",
+    "riskDollars",
+    "orderNotional",
+    "plannedStopRiskDollars",
+    "estimatedSlippage",
+  ]);
+  const nextValue = numericKeys.has(key) ? Number(input.value) : input.value;
+  if (numericKeys.has(key) && !Number.isFinite(nextValue as number)) {
+    return;
+  }
+  state.metaTargetOrderOverrides = { ...state.metaTargetOrderOverrides, [key]: nextValue };
+  saveMetaTargetOrderOverrides(state.metaTargetOrderOverrides);
+  updateMetaStrategyPanel();
+}
+
+document.addEventListener("input", handleMetaTargetSettingInput);
+document.addEventListener("change", handleMetaTargetSettingInput);
 
 dailyBacktestPopupClose.addEventListener("click", () => {
   dailyBacktestPopup.hidden = true;
@@ -3762,7 +4968,7 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
     const payload = (await response.json()) as CandleResponse;
     const previousLatest = state.candles[state.candles.length - 1];
     const wasLive = state.viewportOffset === 0;
-    const shouldStayLive = options.refresh && !state.start && !state.end && (wasLive || state.algoBacktestTimeframe === "Trading");
+    const shouldStayLive = options.refresh && !state.start && !state.end && (wasLive || shouldRefreshVotingTradingRag());
     const nextCandles = normalizeCandles(payload.candles);
     const nextLatest = nextCandles[nextCandles.length - 1];
     const latestChanged = candleChanged(previousLatest, nextLatest);
@@ -3774,7 +4980,7 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
     state.error = payload.warning ?? "";
     markRefresh(latestChanged ? "updated" : "checked");
     updateLastCandleStatus(nextLatest);
-    if (latestChanged && nextLatest && state.algoBacktestTimeframe === "Trading") {
+    if (latestChanged && nextLatest && shouldRefreshVotingTradingRag()) {
       void refreshVotingEnsembleTradingOnNewCandle(nextLatest.timestamp);
     }
   } catch (error) {
@@ -3782,7 +4988,9 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
       state.candles = [];
     }
     state.error = error instanceof Error ? error.message : "Unable to load candles";
-    state.source = "error";
+    if (!state.candles.length) {
+      state.source = "error";
+    }
     markRefresh("failed");
   }
 
@@ -3791,8 +4999,11 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
   updateLastCandleStatus(state.candles[state.candles.length - 1]);
   updateMeta();
   drawChart();
+  void loadMarketForecast({ refresh: false });
   void loadWeightedMarketData({ refresh: shouldRefresh });
-  void ensureWeightedInitialWeightsFromBacktest();
+  if (WEIGHTED_BROWSER_BACKTEST_BOOTSTRAP_ENABLED) {
+    void ensureWeightedInitialWeightsFromBacktest();
+  }
   void maybeRunDailyAlgorithmBacktests("candles");
   if (state.algoBacktestTimeframe !== "Trading") {
     scheduleVisibleContextUpdate(0);
@@ -3800,10 +5011,14 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
 }
 
 async function setAlgoBacktestTimeframe(timeframe: AlgoBacktestTimeframe) {
+  timeframe = visibleAlgoBacktestTimeframe(timeframe);
   if (state.algoBacktestTimeframe === timeframe && (state.algoBacktestResult || (timeframe === "Trading" && state.tradingRag))) {
     return;
   }
   state.algoBacktestTimeframe = timeframe;
+  if (timeframe === "1Min" || timeframe === "5Min") {
+    state.algoIntradayTradesExpanded = true;
+  }
   saveUiState();
   if (timeframe === "Trading") {
     state.algoBacktestResult = null;
@@ -3929,51 +5144,43 @@ async function loadAlgoBacktestCandles() {
     await loadTradingRag();
     return;
   }
+  state.algoBacktestStatus = "loading";
+  state.algoBacktestWarning = "";
+  updateAlgorithmPanel(visibleCandles());
+  if (requestedTimeframe === "1Min" || requestedTimeframe === "5Min") {
+    try {
+      const cachedBacktest = await fetchVotingEnsembleBacktest(requestedTimeframe);
+      if (loadId !== algoBacktestLoadId || state.algoBacktestTimeframe !== requestedTimeframe) {
+        return;
+      }
+      state.algoBacktestResult = compactVotingBacktestForDisplay(cachedBacktest, { preserveTrades: true });
+      state.algoBacktestCandles = [];
+      state.algoBacktestStatus = "ready";
+      state.algoBacktestWarning = "";
+      updateAlgorithmPanel(visibleCandles());
+      return;
+    } catch (error) {
+      if (loadId !== algoBacktestLoadId || state.algoBacktestTimeframe !== requestedTimeframe) {
+        return;
+      }
+      state.algoBacktestWarning =
+        error instanceof Error ? error.message : `Unable to load ${algoBacktestTimeframeLabel(requestedTimeframe)} cached backtest`;
+    }
+  }
   const dynamicBacktest = dynamicBacktestForTimeframe(requestedTimeframe);
   if (dynamicBacktest) {
-    state.algoBacktestResult = dynamicBacktest;
+    state.algoBacktestResult = compactVotingBacktestForDisplay(dynamicBacktest, {
+      preserveTrades: requestedTimeframe === "1Min" || requestedTimeframe === "5Min",
+    });
     state.algoBacktestCandles = [];
     state.algoBacktestStatus = "ready";
     state.algoBacktestWarning = "";
     updateAlgorithmPanel(visibleCandles());
-    void loadMlComparison();
-    void loadCandidateDataset();
-    void loadMlDiagnostics();
-    void loadDailyRefinement();
-    void loadEventRefinement();
-    void loadWeeklyRiskTuning();
     return;
   }
-  state.algoBacktestStatus = "loading";
-  state.algoBacktestWarning = "";
+  state.algoBacktestStatus = "fallback";
+  state.algoBacktestWarning = "Using loaded chart candles while the dynamic artifact is unavailable.";
   updateAlgorithmPanel(visibleCandles());
-
-  try {
-    const result = await fetchVotingEnsembleBacktest(requestedTimeframe);
-    if (loadId !== algoBacktestLoadId || state.algoBacktestTimeframe !== requestedTimeframe) {
-      return;
-    }
-    state.algoBacktestResult = result;
-    state.algoBacktestCandles = [];
-    state.algoBacktestStatus = "ready";
-    updateAlgorithmPanel(visibleCandles());
-    void loadMlComparison();
-    void loadCandidateDataset();
-    void loadMlDiagnostics();
-    void loadDailyRefinement();
-    void loadEventRefinement();
-    void loadWeeklyRiskTuning();
-    return;
-  } catch (error) {
-    if (loadId !== algoBacktestLoadId || state.algoBacktestTimeframe !== requestedTimeframe) {
-      return;
-    }
-    state.algoBacktestResult = null;
-    state.algoBacktestWarning =
-      error instanceof Error ? error.message : `Unable to load ${algoBacktestTimeframeLabel(requestedTimeframe)} full-range backtest`;
-    state.algoBacktestStatus = "fallback";
-    updateAlgorithmPanel(visibleCandles());
-  }
 
   try {
     const timeframe = requestedTimeframe;
@@ -4009,7 +5216,6 @@ async function loadAlgoBacktestCandles() {
   }
 
   updateAlgorithmPanel(visibleCandles());
-  void loadMlComparison();
 }
 
 async function loadTradingRag() {
@@ -4028,7 +5234,7 @@ async function loadTradingRag() {
 }
 
 async function refreshVotingEnsembleTradingOnNewCandle(timestamp: string) {
-  if (state.algoBacktestTimeframe !== "Trading" || tradingRagRefreshInFlight || lastTradingRagCandleTimestamp === timestamp) {
+  if (!shouldRefreshVotingTradingRag() || tradingRagRefreshInFlight || lastTradingRagCandleTimestamp === timestamp) {
     return;
   }
   tradingRagRefreshInFlight = true;
@@ -4261,6 +5467,7 @@ function tradingSettingsKey(settings: TradingSettings) {
     riskBudgetPercentOfOrder: roundNumber(settings.riskBudgetPercentOfOrder, 4),
     maxTradesPerDay: Math.round(settings.maxTradesPerDay),
     stopLossPercent: roundNumber(settings.stopLossPercent, 4),
+    fixedStopDistanceDollars: roundNumber(settings.fixedStopDistanceDollars, 4),
     takeProfitR: roundNumber(settings.takeProfitR, 4),
     slippagePerShare: roundNumber(settings.slippagePerShare, 4),
     positionSizingMode: settings.positionSizingMode,
@@ -4305,7 +5512,7 @@ async function fetchVotingEnsembleBacktest(timeframe: AlgoBacktestTimeframe) {
   }
   const params = await backtestRangeParams({
     timeframe,
-    max_trades: "200",
+    max_trades: "20",
   });
   const candidates = [
     ...BACKTEST_API_CANDIDATES,
@@ -4333,7 +5540,7 @@ async function fetchVotingEnsembleBacktest(timeframe: AlgoBacktestTimeframe) {
 
 async function fetchOpenCloseEventsBacktest() {
   const params = await backtestRangeParams({
-    max_trades: "200",
+    max_trades: "20",
   });
   const candidates = [
     ...BACKTEST_API_CANDIDATES,
@@ -4357,6 +5564,23 @@ async function fetchOpenCloseEventsBacktest() {
     }
   }
   throw new Error(`Opening/closing event backtest unavailable (${lastStatus || 503})`);
+}
+
+function compactVotingBacktestForDisplay(result: BacktestResult, options: { preserveTrades?: boolean } = {}): BacktestResult {
+  const totalTrades = result.totalTrades ?? result.trades.length;
+  if (options.preserveTrades) {
+    return {
+      ...result,
+      totalTrades,
+      displayedTrades: result.displayedTrades ?? result.trades.length,
+    };
+  }
+  return {
+    ...result,
+    trades: [],
+    totalTrades,
+    displayedTrades: 0,
+  };
 }
 
 async function loadMlComparison() {
@@ -4700,46 +5924,49 @@ async function loadWeightedMarketData(options: { refresh?: boolean } = {}) {
   weightedMarketDataInFlight = true;
   state.weightedMarketData.status = "loading";
   state.weightedMarketData.warning = "";
-  const [results, timeframeResults] = await Promise.all([
-    Promise.allSettled(weightedAuxiliarySymbols.map(async (symbol) => [symbol, await fetchWeightedSymbolCandles(symbol, options.refresh ?? false)] as const)),
-    Promise.allSettled(
-      weightedSpyContextTimeframes.map(async (timeframe) => [timeframe, await fetchWeightedTimeframeCandles(timeframe, options.refresh ?? false)] as const),
-    ),
-  ]);
-  const candlesBySymbol: Record<string, Candle[]> = { ...state.weightedMarketData.candlesBySymbol };
-  const timeframeCandles: Partial<Record<WeightedSpyContextTimeframe, Candle[]>> = { ...state.weightedMarketData.timeframeCandles };
-  const failed: string[] = [];
-  results.forEach((result, index) => {
-    if (result.status === "fulfilled") {
-      const [symbol, candles] = result.value;
-      candlesBySymbol[symbol] = normalizeCandles(candles);
-    } else {
-      failed.push(weightedAuxiliarySymbols[index]);
-    }
-  });
-  timeframeResults.forEach((result, index) => {
-    const timeframe = weightedSpyContextTimeframes[index];
-    if (result.status === "fulfilled") {
-      const [, candles] = result.value;
-      timeframeCandles[timeframe] = normalizeCandles(candles);
-    } else {
-      failed.push(`SPY ${timeframe}`);
-    }
-  });
-  if (timeframeCandles["1Day"]?.length) {
-    timeframeCandles["1Week"] = aggregateDailyCandlesToWeeks(timeframeCandles["1Day"]);
+  try {
+    const [results, timeframeResults] = await Promise.all([
+      Promise.allSettled(weightedAuxiliarySymbols.map(async (symbol) => [symbol, await fetchWeightedSymbolCandles(symbol, options.refresh ?? false)] as const)),
+      Promise.allSettled(
+        weightedSpyContextTimeframes.map(async (timeframe) => [timeframe, await fetchWeightedTimeframeCandles(timeframe, options.refresh ?? false)] as const),
+      ),
+    ]);
+    const candlesBySymbol: Record<string, Candle[]> = { ...state.weightedMarketData.candlesBySymbol };
+    const timeframeCandles: Partial<Record<WeightedSpyContextTimeframe, Candle[]>> = { ...state.weightedMarketData.timeframeCandles };
+    const failed: string[] = [];
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        const [symbol, candles] = result.value;
+        candlesBySymbol[symbol] = normalizeCandles(candles);
+      } else {
+        failed.push(weightedAuxiliarySymbols[index]);
+      }
+    });
+    timeframeResults.forEach((result, index) => {
+      const timeframe = weightedSpyContextTimeframes[index];
+      if (result.status === "fulfilled") {
+        const [, candles] = result.value;
+        timeframeCandles[timeframe] = normalizeCandles(candles);
+      } else {
+        failed.push(`SPY ${timeframe}`);
+      }
+    });
+    state.weightedMarketData.candlesBySymbol = candlesBySymbol;
+    state.weightedMarketData.timeframeCandles = timeframeCandles;
+    state.weightedMarketData.updatedAt = new Date().toISOString();
+    const loadedCount = weightedAuxiliarySymbols.filter((symbol) => candlesBySymbol[symbol]?.length).length;
+    const timeframeLoadedCount = weightedSpyContextTimeframes.filter((timeframe) => timeframeCandles[timeframe]?.length).length;
+    const expectedCount = weightedAuxiliarySymbols.length + weightedSpyContextTimeframes.length;
+    const totalLoadedCount = loadedCount + timeframeLoadedCount;
+    state.weightedMarketData.status = totalLoadedCount === expectedCount ? "ready" : totalLoadedCount ? "partial" : "error";
+    state.weightedMarketData.warning = failed.length ? `Weighted market data unavailable: ${failed.join(", ")}` : "";
+    updateAlgorithmPanel(visibleCandles());
+  } catch (error) {
+    state.weightedMarketData.status = "error";
+    state.weightedMarketData.warning = error instanceof Error ? error.message : "Weighted market data refresh failed";
+  } finally {
+    weightedMarketDataInFlight = false;
   }
-  state.weightedMarketData.candlesBySymbol = candlesBySymbol;
-  state.weightedMarketData.timeframeCandles = timeframeCandles;
-  state.weightedMarketData.updatedAt = new Date().toISOString();
-  const loadedCount = weightedAuxiliarySymbols.filter((symbol) => candlesBySymbol[symbol]?.length).length;
-  const timeframeLoadedCount = weightedSpyContextTimeframes.filter((timeframe) => timeframeCandles[timeframe]?.length).length;
-  const expectedCount = weightedAuxiliarySymbols.length + weightedSpyContextTimeframes.length;
-  const totalLoadedCount = loadedCount + timeframeLoadedCount;
-  state.weightedMarketData.status = totalLoadedCount === expectedCount ? "ready" : totalLoadedCount ? "partial" : "error";
-  state.weightedMarketData.warning = failed.length ? `Weighted market data unavailable: ${failed.join(", ")}` : "";
-  weightedMarketDataInFlight = false;
-  updateAlgorithmPanel(visibleCandles());
 }
 
 async function fetchWeightedSymbolCandles(symbol: string, refresh: boolean) {
@@ -4747,7 +5974,7 @@ async function fetchWeightedSymbolCandles(symbol: string, refresh: boolean) {
     symbol,
     feed: state.feed,
     timeframe: "1Min",
-    limit: "260",
+    limit: "120",
     refresh: String(refresh),
   });
   const start = toAlpacaTime(state.start);
@@ -4767,15 +5994,11 @@ async function fetchWeightedSymbolCandles(symbol: string, refresh: boolean) {
 }
 
 async function fetchWeightedTimeframeCandles(timeframe: WeightedSpyContextTimeframe, refresh: boolean) {
-  if (timeframe === "1Week") {
-    return aggregateDailyCandlesToWeeks(state.weightedMarketData.timeframeCandles["1Day"] ?? []);
-  }
-  const limit = timeframe === "1Min" ? "260" : timeframe === "5Min" ? "260" : timeframe === "1Hour" ? "240" : "260";
   const params = new URLSearchParams({
     symbol: state.symbol,
     feed: state.feed,
     timeframe,
-    limit,
+    limit: "120",
     refresh: String(refresh),
   });
   const start = toAlpacaTime(state.start);
@@ -4803,6 +6026,7 @@ async function loadMarketStatus() {
     const payload = (await response.json()) as MarketStatus;
     state.marketStatus = payload.status;
     updateMarketStatus(payload);
+    void handleTradeHistoryMarketRollover(payload);
     void maybeRunDailyAlgorithmBacktests("market-status");
     return payload;
   } catch (error) {
@@ -4813,6 +6037,7 @@ async function loadMarketStatus() {
     };
     state.marketStatus = "unknown";
     updateMarketStatus(fallback);
+    void handleTradeHistoryMarketRollover(fallback);
     void maybeRunDailyAlgorithmBacktests("market-status");
     return fallback;
   }
@@ -4987,6 +6212,64 @@ async function loadEsSnapshot() {
   }
 
   updateEsSnapshot();
+}
+
+async function loadMarketForecast(options: { refresh?: boolean } = {}) {
+  const requestKey = `${state.symbol}|${state.feed}|${options.refresh ? "refresh" : "cache"}`;
+  if (marketForecastRequestKey === requestKey) {
+    return;
+  }
+  marketForecastRequestKey = requestKey;
+  state.marketForecastStatus = state.marketForecast ? state.marketForecastStatus : "loading";
+  renderMarketForecastPanel();
+  try {
+    const params = new URLSearchParams({
+      symbol: state.symbol,
+      feed: state.feed,
+      timeframe: "1Min",
+      limit: "240",
+      refresh: String(options.refresh ?? false),
+    });
+    const response = await fetchWithTimeout(`${API_BASE}/api/market-forecast/prediction?${params.toString()}`, 4000);
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+    state.marketForecast = (await response.json()) as MarketForecastPrediction;
+    state.marketForecastStatus = state.marketForecast.status === "ready" ? "ready" : "fallback";
+    state.marketForecastError = "";
+  } catch (error) {
+    state.marketForecastStatus = state.marketForecast ? "fallback" : "error";
+    state.marketForecastError = error instanceof Error ? error.message : "Market forecast unavailable";
+  } finally {
+    if (marketForecastRequestKey === requestKey) {
+      marketForecastRequestKey = "";
+    }
+  }
+  renderMarketForecastPanel();
+}
+
+async function startMarketForecastPredictionLedger(reason: string) {
+  try {
+    await fetchWithTimeout(`${API_BASE}/api/market-forecast/ledger/start`, 10000, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    });
+  } catch {
+    // Wake activation should keep the app live even if the ledger kick fails.
+  }
+}
+
+async function requestSystemSleepIfMarketClosed(reason: string) {
+  try {
+    await fetchWithTimeout(`${API_BASE}/api/system/sleep-if-market-closed`, 5000, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    });
+  } catch {
+    // Browser-level app sleep still applies even if Windows rejects system sleep.
+  }
 }
 
 async function loadSpyNews() {
@@ -6169,6 +7452,7 @@ function updateMeta(force = false) {
   quoteSymbol.textContent = state.symbol;
   sourceBadge.textContent = state.source;
   sourceBadge.dataset.source = state.source;
+  sourceBadge.title = state.error ? `${state.source.toUpperCase()}: ${state.error}` : `Data source: ${state.source.toUpperCase()}`;
   const metaKey = latest
     ? [
         state.symbol,
@@ -6183,6 +7467,9 @@ function updateMeta(force = false) {
         state.tradingWindowMode,
         state.tradeHistory.length,
         state.weightedTradeHistory.length,
+        state.confidenceTradeHistory.length,
+        state.regimeTradeHistory.length,
+        state.metaTradeHistory.length,
         state.marketStatus,
         state.currentTargetOrder?.side ?? "none",
         state.currentTargetOrder?.quantity ?? 0,
@@ -6190,8 +7477,17 @@ function updateMeta(force = false) {
         state.currentWeightedTargetOrder?.side ?? "none",
         state.currentWeightedTargetOrder?.quantity ?? 0,
         state.currentWeightedTargetOrder?.limitPrice ?? 0,
+        state.currentConfidenceTargetOrder?.side ?? "none",
+        state.currentConfidenceTargetOrder?.quantity ?? 0,
+        state.currentConfidenceTargetOrder?.limitPrice ?? 0,
+        state.currentRegimeTargetOrder?.side ?? "none",
+        state.currentRegimeTargetOrder?.quantity ?? 0,
+        state.currentRegimeTargetOrder?.limitPrice ?? 0,
+        state.currentMetaTargetOrder?.side ?? "none",
+        state.currentMetaTargetOrder?.quantity ?? 0,
+        state.currentMetaTargetOrder?.limitPrice ?? 0,
       ].join("|")
-    : `empty|${state.symbol}|${state.feed}|${state.timeframe}|${state.source}|${state.tradingWindowMode}|${state.tradeHistory.length}|${state.weightedTradeHistory.length}|${state.confidenceTradeHistory.length}`;
+    : `empty|${state.symbol}|${state.feed}|${state.timeframe}|${state.source}|${state.tradingWindowMode}|${state.tradeHistory.length}|${state.weightedTradeHistory.length}|${state.confidenceTradeHistory.length}|${state.regimeTradeHistory.length}|${state.metaTradeHistory.length}`;
 
   if (!force && metaKey === lastMetaKey) {
     return;
@@ -6224,6 +7520,30 @@ function currentCandle() {
   return state.hoveredIndex >= 0 && state.hoveredIndex < visible.length
     ? visible[state.hoveredIndex]
     : visible[visible.length - 1];
+}
+
+function latestLoadedCandle() {
+  return state.candles.at(-1) ?? null;
+}
+
+function latestWeightedOneMinuteCandle() {
+  const oneMinuteCandles = state.weightedMarketData.timeframeCandles["1Min"] ?? [];
+  const sessionCandles = oneMinuteCandles.length ? latestRegularSessionCandlesFrom(oneMinuteCandles) : [];
+  return sessionCandles.at(-1) ?? oneMinuteCandles.at(-1) ?? null;
+}
+
+function newestCandle(...candles: Array<Candle | null | undefined>) {
+  return candles
+    .filter((candle): candle is Candle => Boolean(candle))
+    .sort((left, right) => new Date(right.timestamp).getTime() - new Date(left.timestamp).getTime())
+    .at(0) ?? null;
+}
+
+function latestExecutionCandleForMode(mode: TradingWindowMode = state.tradingWindowMode) {
+  if (mode === "weighted" || mode === "confidence" || mode === "regime") {
+    return newestCandle(latestWeightedOneMinuteCandle(), latestLoadedCandle());
+  }
+  return latestLoadedCandle();
 }
 
 function summarizePositionFromTradeHistory(latestPrice: number, previousPrice: number, mode: TradingWindowMode = state.tradingWindowMode): PositionSummary {
@@ -6265,17 +7585,32 @@ function isMarketOpenForOrders() {
   return state.marketStatus === "open";
 }
 
+function canSubmitTrades() {
+  return state.tradingEnabled && isMarketOpenForOrders();
+}
+
+function tradeSubmissionBlockedTitle() {
+  return state.tradingEnabled ? "Market is closed" : "Trade is off";
+}
+
+function updateTradeToggleButton() {
+  tradeToggleButton.textContent = state.tradingEnabled ? "Trade On" : "Trade Off";
+  tradeToggleButton.setAttribute("aria-pressed", String(state.tradingEnabled));
+  tradeToggleButton.dataset.enabled = String(state.tradingEnabled);
+  tradeToggleButton.title = state.tradingEnabled ? "Trading enabled for all algorithms" : "Trading disabled for all algorithms";
+}
+
 function updateOrderButtonStates(position: PositionSummary) {
-  const mode = activeTradingModeFromAlgoTab();
+  const mode = state.tradingWindowMode;
   const order = targetOrderForMode(mode);
   const targetSide = order?.side ?? "Hold";
-  const latest = currentCandle();
+  const latest = latestExecutionCandleForMode(mode);
   const sellableLot = latest ? selectedSellableOpenOrderLot(mode, latest.close) : null;
-  if (!isMarketOpenForOrders()) {
+  if (!canSubmitTrades()) {
     buyOrderButton.disabled = true;
     sellOrderButton.disabled = true;
-    buyOrderButton.title = "Market is closed";
-    sellOrderButton.title = "Market is closed";
+    buyOrderButton.title = tradeSubmissionBlockedTitle();
+    sellOrderButton.title = tradeSubmissionBlockedTitle();
     return;
   }
 
@@ -6292,8 +7627,12 @@ function updateOrderButtonStates(position: PositionSummary) {
 }
 
 function activeTradingModeFromAlgoTab(): TradingWindowMode {
-  return algoConfidenceAggregationTabButton.classList.contains("active")
-    ? "confidence"
+  return algoRegimeSelectionTabButton.classList.contains("active")
+    ? "regime"
+    : algoMetaStrategyTabButton.classList.contains("active")
+      ? "meta"
+    : algoConfidenceAggregationTabButton.classList.contains("active")
+      ? "confidence"
     : algoWeightedVotingTabButton.classList.contains("active")
       ? "weighted"
       : "ensemble";
@@ -6305,19 +7644,49 @@ function setTradingWindowMode(mode: TradingWindowMode) {
   ensembleTradingWindowTab.classList.toggle("active", mode === "ensemble");
   weightedTradingWindowTab.classList.toggle("active", mode === "weighted");
   confidenceTradingWindowTab.classList.toggle("active", mode === "confidence");
+  regimeTradingWindowTab.classList.toggle("active", mode === "regime");
+  metaTradingWindowTab.classList.toggle("active", mode === "meta");
   ensembleTradingWindowTab.setAttribute("aria-selected", String(mode === "ensemble"));
   weightedTradingWindowTab.setAttribute("aria-selected", String(mode === "weighted"));
   confidenceTradingWindowTab.setAttribute("aria-selected", String(mode === "confidence"));
+  regimeTradingWindowTab.setAttribute("aria-selected", String(mode === "regime"));
+  metaTradingWindowTab.setAttribute("aria-selected", String(mode === "meta"));
   tradeHistoryTitle.textContent =
-    mode === "confidence" ? "WCA Trade History" : mode === "weighted" ? "Weighted Voting Trade History" : "Voting Ensemble Trade History";
+    mode === "meta"
+      ? "Meta-Strategy Trade History"
+      : mode === "regime"
+      ? "Regime Trade History"
+      : mode === "confidence"
+        ? "WCA Trade History"
+        : mode === "weighted"
+          ? "Weighted Voting Trade History"
+          : "Voting Ensemble Trade History";
   updateQuoteCard(currentCandle());
 }
 
 function tradeHistoryForMode(mode: TradingWindowMode) {
-  return mode === "confidence" ? state.confidenceTradeHistory : mode === "weighted" ? state.weightedTradeHistory : state.tradeHistory;
+  return mode === "meta"
+    ? state.metaTradeHistory
+    : mode === "regime"
+    ? state.regimeTradeHistory
+    : mode === "confidence"
+      ? state.confidenceTradeHistory
+      : mode === "weighted"
+        ? state.weightedTradeHistory
+        : state.tradeHistory;
 }
 
 function setTradingLedger(mode: TradingWindowMode, rows: TradeHistoryRow[]) {
+  if (mode === "meta") {
+    state.metaTradeHistory = rows;
+    saveMetaTradeHistory();
+    return;
+  }
+  if (mode === "regime") {
+    state.regimeTradeHistory = rows;
+    saveRegimeTradeHistory();
+    return;
+  }
   if (mode === "confidence") {
     state.confidenceTradeHistory = rows;
     saveConfidenceTradeHistory();
@@ -6332,8 +7701,257 @@ function setTradingLedger(mode: TradingWindowMode, rows: TradeHistoryRow[]) {
   saveTradeHistory();
 }
 
+function isTradeHistoryRowFromToday(row: TradeHistoryRow) {
+  return new Date(row.recordedAt).toDateString() === new Date().toDateString();
+}
+
+function clearTodaysTradeHistoryForMode(mode: TradingWindowMode) {
+  const protectedRows = new Set(openPositionTradeRowsForMode(mode).map((row) => row.id));
+  const remainingRows = normalizedTradeHistoryForMode(mode).filter((row) => !isTradeHistoryRowFromToday(row) || protectedRows.has(row.id));
+  const remainingBuyLotIds = new Set(remainingRows.filter((row) => row.side === "Buy").map((row) => row.id));
+  const remainingOrderModes = Object.fromEntries(
+    Object.entries(orderControlModesForMode(mode)).filter(([lotId]) => remainingBuyLotIds.has(lotId)),
+  );
+  const remainingOrderOverrides = Object.fromEntries(
+    Object.entries(orderControlOverridesForMode(mode)).filter(([lotId]) => remainingBuyLotIds.has(lotId)),
+  );
+  setTradingLedger(mode, remainingRows);
+  setOrderControlModesForMode(mode, remainingOrderModes);
+  setOrderControlOverridesForMode(mode, remainingOrderOverrides);
+}
+
+function tradeHistoryRolloverState(): TradeHistoryRolloverState {
+  try {
+    const raw = window.localStorage.getItem(TRADE_HISTORY_ROLLOVER_STORAGE_KEY);
+    if (!raw) {
+      return { archivedSessionDates: [], clearedSessionDates: [] };
+    }
+    const parsed = JSON.parse(raw) as Partial<TradeHistoryRolloverState>;
+    return {
+      archivedSessionDates: Array.isArray(parsed.archivedSessionDates) ? parsed.archivedSessionDates.filter((value) => typeof value === "string") : [],
+      clearedSessionDates: Array.isArray(parsed.clearedSessionDates) ? parsed.clearedSessionDates.filter((value) => typeof value === "string") : [],
+    };
+  } catch {
+    return { archivedSessionDates: [], clearedSessionDates: [] };
+  }
+}
+
+function saveTradeHistoryRolloverState(rollover: TradeHistoryRolloverState) {
+  window.localStorage.setItem(
+    TRADE_HISTORY_ROLLOVER_STORAGE_KEY,
+    JSON.stringify({
+      archivedSessionDates: rollover.archivedSessionDates.slice(-20),
+      clearedSessionDates: rollover.clearedSessionDates.slice(-20),
+    }),
+  );
+}
+
+function localDateKey(value: string | Date) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
+function latestTradeHistorySessionDate() {
+  const dates = (["ensemble", "weighted", "confidence", "regime", "meta"] as TradingWindowMode[])
+    .flatMap((mode) => tradeHistoryForMode(mode))
+    .map((row) => localDateKey(row.recordedAt))
+    .filter(Boolean)
+    .sort();
+  return dates.at(-1) ?? "";
+}
+
+function marketReferenceDateKey(market: MarketStatus) {
+  return localDateKey(market.timestamp || new Date());
+}
+
+function marketNextOpenDateKey(market: MarketStatus) {
+  return market.nextOpen ? localDateKey(market.nextOpen) : "";
+}
+
+function shouldArchiveTradeHistoryForMarket(market: MarketStatus, sessionDate: string) {
+  if (!sessionDate) {
+    return false;
+  }
+  if (!market.isOpen && (market.status === "closed" || market.status === "holiday")) {
+    return true;
+  }
+  const marketDate = marketReferenceDateKey(market);
+  return market.isOpen && Boolean(marketDate) && sessionDate < marketDate;
+}
+
+function shouldClearArchivedTradeHistoryBeforeOpen(market: MarketStatus, sessionDate: string, rollover: TradeHistoryRolloverState) {
+  if (!rollover.archivedSessionDates.includes(sessionDate) || rollover.clearedSessionDates.includes(sessionDate)) {
+    return false;
+  }
+  const marketDate = marketReferenceDateKey(market);
+  const nextOpenDate = marketNextOpenDateKey(market);
+  if (market.isOpen) {
+    return Boolean(marketDate) && sessionDate < marketDate;
+  }
+  return Boolean(marketDate && nextOpenDate) && marketDate >= nextOpenDate;
+}
+
+function openPositionTradeRowsForMode(mode: TradingWindowMode) {
+  const rows = normalizedTradeHistoryForMode(mode);
+  const openLotIds = new Set(openOrderLots(mode).map((lot) => lot.id));
+  if (!openLotIds.size) {
+    return [];
+  }
+  return rows.filter((row) => openLotIds.has(row.id) || Boolean(row.closedLotId && openLotIds.has(row.closedLotId)));
+}
+
+function clearClosedTradeHistoryForMode(mode: TradingWindowMode) {
+  const remainingRows = openPositionTradeRowsForMode(mode);
+  const remainingBuyLotIds = new Set(remainingRows.filter((row) => row.side === "Buy").map((row) => row.id));
+  const remainingOrderModes = Object.fromEntries(
+    Object.entries(orderControlModesForMode(mode)).filter(([lotId]) => remainingBuyLotIds.has(lotId)),
+  );
+  const remainingOrderOverrides = Object.fromEntries(
+    Object.entries(orderControlOverridesForMode(mode)).filter(([lotId]) => remainingBuyLotIds.has(lotId)),
+  );
+  setTradingLedger(mode, remainingRows);
+  setOrderControlModesForMode(mode, remainingOrderModes);
+  setOrderControlOverridesForMode(mode, remainingOrderOverrides);
+}
+
+function archiveRowsForMode(mode: TradingWindowMode) {
+  const rows = normalizedTradeHistoryForMode(mode);
+  const latest = currentCandle();
+  return {
+    algorithm: mode,
+    algorithmLabel: algorithmDisplayName(mode),
+    rowCount: rows.length,
+    rows,
+    openLots: openOrderLots(mode),
+    position: latest ? summarizePositionFromTradeHistory(latest.close, latest.close, mode) : null,
+    settings: compactTradingSettings(tradingSettingsForMode(mode)),
+    targetOrder: compactTargetOrder(targetOrderForMode(mode)),
+    decision: safeArchiveValue(() => decisionEvidence(mode, targetOrderForMode(mode)), { summary: "Decision evidence unavailable" }),
+    backtest:
+      mode === "meta"
+        ? null
+        : mode === "confidence" || mode === "regime"
+        ? compactBacktestEvidence(confidenceBacktestResult, mode === "regime" ? "Regime backtest" : "WCA backtest")
+        : mode === "weighted"
+          ? null
+          : compactBacktestEvidence(state.algoBacktestResult, "Voting Ensemble backtest"),
+  };
+}
+
+function safeArchiveValue<T>(reader: () => T, fallback: T): T {
+  try {
+    return reader();
+  } catch {
+    return fallback;
+  }
+}
+
+function buildTradeHistoryArchivePayload(sessionDate: string, reason: string) {
+  const latest = currentCandle();
+  return {
+    sessionDate,
+    reason,
+    symbol: state.symbol,
+    marketStatus: state.marketStatus,
+    appContext: {
+      capturedAt: new Date().toISOString(),
+      feed: state.feed,
+      timeframe: state.timeframe,
+      source: state.source,
+      latestCandle: latest
+        ? {
+            timestamp: latest.timestamp,
+            open: latest.open,
+            high: latest.high,
+            low: latest.low,
+            close: latest.close,
+            volume: latest.volume,
+          }
+        : null,
+      marketContext: state.marketContext,
+      mlArtifact: mlArtifactEvidence(),
+      dynamicArtifact: state.dynamicArtifact
+        ? {
+            artifactId: state.dynamicArtifact.artifactId,
+            status: state.dynamicArtifact.status,
+            rangeLabel: state.dynamicArtifact.rangeLabel,
+          }
+        : null,
+    },
+    algorithms: {
+      ensemble: archiveRowsForMode("ensemble"),
+      weighted: archiveRowsForMode("weighted"),
+      confidence: archiveRowsForMode("confidence"),
+      regime: archiveRowsForMode("regime"),
+      meta: archiveRowsForMode("meta"),
+    },
+  };
+}
+
+async function archiveTradeHistoryForSession(sessionDate: string, reason: string) {
+  const response = await fetch(`${API_BASE}/api/trade-history/archive`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(buildTradeHistoryArchivePayload(sessionDate, reason)),
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.json() as Promise<{ ok: boolean; path: string; savedAt: string; sessionDate: string }>;
+}
+
+function clearAllAlgorithmTradeHistory() {
+  (["ensemble", "weighted", "confidence", "regime", "meta"] as TradingWindowMode[]).forEach((mode) => {
+    clearClosedTradeHistoryForMode(mode);
+  });
+  updateQuoteCard(currentCandle());
+}
+
+async function handleTradeHistoryMarketRollover(market: MarketStatus) {
+  if (tradeHistoryRolloverInFlight) {
+    return;
+  }
+  const sessionDate = latestTradeHistorySessionDate();
+  if (!shouldArchiveTradeHistoryForMarket(market, sessionDate)) {
+    return;
+  }
+  const rollover = tradeHistoryRolloverState();
+  tradeHistoryRolloverInFlight = true;
+  try {
+    if (!rollover.archivedSessionDates.includes(sessionDate)) {
+      await archiveTradeHistoryForSession(sessionDate, market.isOpen ? "market-open-carryover" : `market-${market.status}`);
+      rollover.archivedSessionDates = [...rollover.archivedSessionDates, sessionDate];
+      saveTradeHistoryRolloverState(rollover);
+      void saveBrowserStorageSnapshot(`trade-history-archive-${sessionDate}`);
+    }
+    if (shouldClearArchivedTradeHistoryBeforeOpen(market, sessionDate, rollover)) {
+      clearAllAlgorithmTradeHistory();
+      rollover.clearedSessionDates = [...rollover.clearedSessionDates, sessionDate];
+      saveTradeHistoryRolloverState(rollover);
+      void saveBrowserStorageSnapshot(`trade-history-clear-${sessionDate}`);
+    }
+  } catch {
+    // Keep trade rows in local storage if archiving fails; losing the archive is worse than stale UI.
+  } finally {
+    tradeHistoryRolloverInFlight = false;
+  }
+}
+
 function orderControlModesForMode(mode: TradingWindowMode) {
-  return mode === "confidence" ? state.confidenceOrderControlModes : mode === "weighted" ? state.weightedOrderControlModes : state.orderControlModes;
+  return mode === "meta"
+    ? state.metaOrderControlModes
+    : mode === "regime"
+    ? state.regimeOrderControlModes
+    : mode === "confidence"
+      ? state.confidenceOrderControlModes
+      : mode === "weighted"
+        ? state.weightedOrderControlModes
+        : state.orderControlModes;
 }
 
 function orderControlSubmitMode(mode: TradingWindowMode, lotId: string): SubmitOrderMode {
@@ -6341,6 +7959,16 @@ function orderControlSubmitMode(mode: TradingWindowMode, lotId: string): SubmitO
 }
 
 function setOrderControlModesForMode(mode: TradingWindowMode, modes: Record<string, SubmitOrderMode>) {
+  if (mode === "meta") {
+    state.metaOrderControlModes = modes;
+    saveMetaOrderControlModes();
+    return;
+  }
+  if (mode === "regime") {
+    state.regimeOrderControlModes = modes;
+    saveRegimeOrderControlModes();
+    return;
+  }
   if (mode === "confidence") {
     state.confidenceOrderControlModes = modes;
     saveConfidenceOrderControlModes();
@@ -6356,10 +7984,28 @@ function setOrderControlModesForMode(mode: TradingWindowMode, modes: Record<stri
 }
 
 function orderControlOverridesForMode(mode: TradingWindowMode) {
-  return mode === "confidence" ? state.confidenceOrderControlOverrides : mode === "weighted" ? state.weightedOrderControlOverrides : state.orderControlOverrides;
+  return mode === "meta"
+    ? state.metaOrderControlOverrides
+    : mode === "regime"
+    ? state.regimeOrderControlOverrides
+    : mode === "confidence"
+      ? state.confidenceOrderControlOverrides
+      : mode === "weighted"
+        ? state.weightedOrderControlOverrides
+        : state.orderControlOverrides;
 }
 
 function setOrderControlOverridesForMode(mode: TradingWindowMode, overrides: Record<string, LotOrderOverride>) {
+  if (mode === "meta") {
+    state.metaOrderControlOverrides = overrides;
+    saveMetaOrderControlOverrides();
+    return;
+  }
+  if (mode === "regime") {
+    state.regimeOrderControlOverrides = overrides;
+    saveRegimeOrderControlOverrides();
+    return;
+  }
   if (mode === "confidence") {
     state.confidenceOrderControlOverrides = overrides;
     saveConfidenceOrderControlOverrides();
@@ -6375,14 +8021,31 @@ function setOrderControlOverridesForMode(mode: TradingWindowMode, overrides: Rec
 }
 
 function tradingSettingsForMode(mode: TradingWindowMode) {
-  return mode === "confidence" ? state.confidenceTradingSettings : mode === "weighted" ? state.weightedTradingSettings : state.tradingSettings;
+  return mode === "meta"
+    ? state.metaTradingSettings
+    : mode === "regime"
+    ? state.regimeTradingSettings
+    : mode === "confidence"
+      ? state.confidenceTradingSettings
+      : mode === "weighted"
+        ? state.weightedTradingSettings
+        : state.tradingSettings;
 }
 
 function targetOrderForMode(mode: TradingWindowMode) {
-  return mode === "confidence" ? state.currentConfidenceTargetOrder : mode === "weighted" ? state.currentWeightedTargetOrder : state.currentTargetOrder;
+  return mode === "meta"
+    ? state.currentMetaTargetOrder
+    : mode === "regime"
+    ? state.currentRegimeTargetOrder
+    : mode === "confidence"
+      ? state.currentConfidenceTargetOrder
+      : mode === "weighted"
+        ? state.currentWeightedTargetOrder
+        : state.currentTargetOrder;
 }
 
 function updateQuoteCard(latest: Candle | null) {
+  updateTradeToggleButton();
   if (!latest) {
     quotePrice.textContent = "--";
     quoteChange.textContent = "--";
@@ -6443,12 +8106,12 @@ function updateQuoteCard(latest: Candle | null) {
     ["Realized P&L", money(position.realizedPnl)],
   ]);
   closePositionButton.hidden = position.shares === 0;
-  closePositionButton.disabled = position.shares === 0 || !isMarketOpenForOrders();
+  closePositionButton.disabled = position.shares === 0 || !canSubmitTrades();
   closePositionButton.title = position.shares === 0
     ? "No open position"
-    : isMarketOpenForOrders()
+    : canSubmitTrades()
       ? "Close the full open position"
-      : "Market is closed";
+      : tradeSubmissionBlockedTitle();
   updateOrderButtonStates(position);
   renderOpenOrderControls(latest.close);
   renderTradeHistory();
@@ -6458,11 +8121,11 @@ function recordTradeHistory(side: TradeHistoryRow["side"], mode: TradingWindowMo
   if (state.tradingWindowMode !== mode) {
     setTradingWindowMode(mode);
   }
-  const latest = currentCandle();
+  const latest = latestExecutionCandleForMode(mode);
   if (!latest) {
     return;
   }
-  if (!isMarketOpenForOrders()) {
+  if (!canSubmitTrades()) {
     updateQuoteCard(latest);
     return;
   }
@@ -6474,6 +8137,18 @@ function recordTradeHistory(side: TradeHistoryRow["side"], mode: TradingWindowMo
   const executionPrice = order ? targetOrderExecutionPrice(order, latest.close) : latest.close;
   const position = summarizePositionFromTradeHistory(latest.close, latest.close, mode);
   const quantity = order ? automaticOrderQuantity(order, position, mode) : 1;
+  const lateSessionBuyBlocker = side === "Buy" ? lateSessionAboveAverageBuyBlocker(mode, executionPrice, latest.timestamp) : "";
+  if (lateSessionBuyBlocker) {
+    window.alert(lateSessionBuyBlocker);
+    updateQuoteCard(latest);
+    return;
+  }
+  const forecastBuyBlockers = side === "Buy" ? forecastBuySafetyBlockers(mode, executionPrice, latest.timestamp) : [];
+  if (forecastBuyBlockers.length) {
+    window.alert(forecastBuyBlockers.join("\n"));
+    updateQuoteCard(latest);
+    return;
+  }
   if (quantity <= 0) {
     updateQuoteCard(latest);
     return;
@@ -6483,7 +8158,10 @@ function recordTradeHistory(side: TradeHistoryRow["side"], mode: TradingWindowMo
     updateQuoteCard(latest);
     return;
   }
-  appendTradeHistory(side, quantity, executionPrice, undefined, mode);
+  appendTradeHistory(side, quantity, executionPrice, undefined, mode, {
+    submitMode: "Manual",
+    trigger: `${side} Order button`,
+  });
   if (mode === "ensemble") {
     clearRecommendedTargetOverrides();
   }
@@ -6515,6 +8193,353 @@ function targetOrderConsistencyWarnings(side: TradeHistoryRow["side"], order: Ma
   return warnings;
 }
 
+function isLastThirtyRegularSessionMinutes(timestamp: string) {
+  const minutes = easternMinutes(timestamp);
+  return isRegularSession(timestamp) && minutes >= 15 * 60 + 30 && minutes < 16 * 60;
+}
+
+function lateSessionAboveAverageBuyBlocker(
+  mode: TradingWindowMode,
+  latestPrice: number,
+  timestamp?: string | null,
+) {
+  if (!["ensemble", "weighted", "confidence", "regime"].includes(mode)) {
+    return "";
+  }
+  if (!timestamp || latestPrice <= 0 || !isLastThirtyRegularSessionMinutes(timestamp)) {
+    return "";
+  }
+  const position = summarizePositionFromTradeHistory(latestPrice, latestPrice, mode);
+  if (position.shares <= 0 || position.avgPrice <= 0 || latestPrice <= position.avgPrice) {
+    return "";
+  }
+  return `${algorithmDisplayName(mode)} late-session buy guard: no new Buy orders in the last 30 minutes before close when price ${price(latestPrice)} is above avg price ${price(position.avgPrice)}.`;
+}
+
+function lateSessionAboveAverageBuyGate(
+  mode: TradingWindowMode,
+  latestPrice: number,
+  timestamp?: string | null,
+): TradeLayerGate | null {
+  const detail = lateSessionAboveAverageBuyBlocker(mode, latestPrice, timestamp);
+  if (!detail) {
+    return null;
+  }
+  return {
+    layer: `${algorithmDisplayName(mode)} Late-session Buy Guard`,
+    status: "fail",
+    signal: "Buy blocked",
+    detail,
+  };
+}
+
+function activeReadyMarketForecast() {
+  const forecast = state.marketForecast;
+  if (!forecast || forecast.status !== "ready") {
+    return null;
+  }
+  const updatedAt = new Date(forecast.updatedAt).getTime();
+  if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > 10 * 60 * 1000) {
+    return null;
+  }
+  return forecast;
+}
+
+function forecastActionConfidence(forecast: MarketForecastPrediction, action = forecast.decision.action) {
+  if (action === "buy") {
+    return forecast.probabilityBuySuccess ?? forecast.probabilitySuccess ?? forecast.decision.confidence;
+  }
+  if (action === "sell") {
+    return forecast.probabilitySellSuccess ?? forecast.probabilityStop ?? forecast.decision.confidence;
+  }
+  return forecast.probabilityTimeout ?? forecast.decision.confidence;
+}
+
+function forecastActionExpectedValue(forecast: MarketForecastPrediction, action = forecast.decision.action) {
+  if (action === "buy") {
+    return forecast.buyExpectedValue ?? forecast.expectedValue ?? forecast.decision.expectedValue;
+  }
+  if (action === "sell") {
+    return forecast.sellExpectedValue ?? forecast.expectedValue ?? forecast.decision.expectedValue;
+  }
+  return forecast.expectedValue ?? forecast.decision.expectedValue;
+}
+
+function forecastMinimumEdge(forecast: MarketForecastPrediction) {
+  return Math.max(
+    0,
+    forecast.minimumEdgeGap ?? 0,
+    forecast.decision.minimumEdgeGap ?? 0,
+  );
+}
+
+function forecastPredictsUpStrongly(forecast: MarketForecastPrediction, minimumConfidence = FORECAST_SAFETY_STOP_OVERRIDE_CONFIDENCE) {
+  const confidence = forecastActionConfidence(forecast, "buy") ?? 0;
+  const expectedValue = forecastActionExpectedValue(forecast, "buy") ?? 0;
+  const edgeGap = forecast.decision.edgeGap ?? 0;
+  return (
+    forecast.allowed &&
+    forecast.decision.action === "buy" &&
+    confidence >= Math.max(minimumConfidence, forecast.threshold ?? 0) &&
+    expectedValue > 0 &&
+    edgeGap >= forecastMinimumEdge(forecast)
+  );
+}
+
+function forecastPredictsDown(forecast: MarketForecastPrediction) {
+  const action = forecast.decision.action === "sell" ? "sell" : forecast.decision.candidateAction === "sell" ? "sell" : "no_trade";
+  if (action !== "sell") {
+    return false;
+  }
+  const confidence = forecastActionConfidence(forecast, "sell") ?? 0;
+  const edgeGap = forecast.decision.edgeGap ?? 0;
+  return confidence >= Math.max(forecast.threshold ?? 0, 0.55) && edgeGap >= forecastMinimumEdge(forecast);
+}
+
+function forecastStrongEnoughForOverextendedBuy(forecast: MarketForecastPrediction) {
+  const confidence = forecastActionConfidence(forecast, "buy") ?? 0;
+  const expectedValue = forecastActionExpectedValue(forecast, "buy") ?? 0;
+  const edgeGap = forecast.decision.edgeGap ?? 0;
+  return (
+    forecastPredictsUpStrongly(forecast, FORECAST_SAFETY_STRONG_CONFIDENCE) &&
+    confidence >= FORECAST_SAFETY_STRONG_CONFIDENCE &&
+    expectedValue > 0 &&
+    edgeGap >= forecastMinimumEdge(forecast) * 1.25
+  );
+}
+
+function intradayTrendIsUp(latestPrice: number) {
+  const forecastTrend = state.marketForecast?.marketRegime?.trend ?? state.marketForecast?.regime?.trend ?? "";
+  if (forecastTrend.toLowerCase().includes("up")) {
+    return true;
+  }
+  const sessionCandles = latestRegularSessionCandles();
+  if (sessionCandles.length < 20) {
+    return false;
+  }
+  const closes = sessionCandles.map((candle) => candle.close);
+  const sma20 = simpleMovingAverage(closes, Math.min(20, closes.length));
+  const sma50 = simpleMovingAverage(closes, Math.min(50, closes.length));
+  const vwap = sessionVwapValue(sessionCandles);
+  return sma20 !== null && sma50 !== null && vwap !== null && latestPrice > vwap && sma20 >= sma50 && latestPrice >= sma20;
+}
+
+function dayAverageVwapExtension(latestPrice: number) {
+  const sessionCandles = latestRegularSessionCandles();
+  if (!sessionCandles.length || latestPrice <= 0) {
+    return null;
+  }
+  const dayAverage = simpleMovingAverage(sessionCandles.map((candle) => candle.close), sessionCandles.length);
+  const vwap = sessionVwapValue(sessionCandles);
+  const extensions = [dayAverage, vwap]
+    .filter((value): value is number => value !== null && value > 0)
+    .map((value) => ({ reference: value, extension: (latestPrice - value) / value }));
+  const over = extensions.filter((item) => item.extension > 0).sort((left, right) => right.extension - left.extension).at(0);
+  return over ? { ...over, dayAverage, vwap } : null;
+}
+
+function forecastBuySafetyBlockers(mode: TradingWindowMode, latestPrice: number, timestamp?: string | null) {
+  const forecast = activeReadyMarketForecast();
+  if (!forecast || !["ensemble", "weighted", "confidence", "regime", "meta"].includes(mode)) {
+    return [] as string[];
+  }
+  const blockers: string[] = [];
+  if (intradayTrendIsUp(latestPrice) && forecastPredictsDown(forecast)) {
+    blockers.push(`${algorithmDisplayName(mode)} forecast conflict: intraday trend is up, but the 5-minute forecast predicts downside.`);
+  }
+  const extension = dayAverageVwapExtension(latestPrice);
+  if (
+    extension &&
+    extension.extension >= FORECAST_SAFETY_OVEREXTENSION_THRESHOLD &&
+    !forecastStrongEnoughForOverextendedBuy(forecast)
+  ) {
+    blockers.push(
+      `${algorithmDisplayName(mode)} overextension guard: price ${price(latestPrice)} is ${formatProbability(extension.extension)} above day average/VWAP reference ${price(extension.reference)}, and forecast confidence/EV is not strong enough to chase.`,
+    );
+  }
+  blockers.forEach((reason) => {
+    recordForecastSafetyDecisionChange({
+      mode,
+      action: "block_buy",
+      originalDecision: "Buy",
+      finalDecision: "Hold",
+      reason,
+      latestPrice,
+      latestTimestamp: timestamp ?? null,
+      forecast,
+    });
+  });
+  return blockers;
+}
+
+function forecastBuySafetyGates(mode: TradingWindowMode, latestPrice: number, timestamp?: string | null): TradeLayerGate[] {
+  return forecastBuySafetyBlockers(mode, latestPrice, timestamp).map((detail) => ({
+    layer: `${algorithmDisplayName(mode)} Forecast Safety`,
+    status: "fail",
+    signal: "Buy blocked",
+    detail,
+  }));
+}
+
+function forecastStopOverrideKeepReason(
+  mode: TradingWindowMode,
+  lot: OpenOrderLot,
+  template: LotOrderTemplate,
+  latestPrice: number,
+  timestamp?: string | null,
+) {
+  const forecast = activeReadyMarketForecast();
+  if (!forecast || !["ensemble", "weighted", "confidence", "regime"].includes(mode)) {
+    return "";
+  }
+  const currentLoss = currentDailyLossDollars(mode, latestPrice, timestamp);
+  const maxDailyLoss = maxAllowedDailyLossDollars(mode);
+  if (!forecastPredictsUpStrongly(forecast) || maxDailyLoss <= 0 || currentLoss >= maxDailyLoss) {
+    return "";
+  }
+  const stopDistance = Math.max(0, lot.entryPrice - template.stopPrice);
+  const reason = `${algorithmDisplayName(mode)} forecast shock-stop hold: price ${price(latestPrice)} is below the protective stop ${price(template.stopPrice)} (${currency(stopDistance)}/share from entry), but the 5-minute forecast predicts upside with ${formatProbability(forecastActionConfidence(forecast, "buy") ?? 0)} confidence and daily loss ${currency(currentLoss)} is still inside the max daily loss ${currency(maxDailyLoss)}.`;
+  recordForecastSafetyDecisionChange({
+    mode,
+    action: "keep_stopped_lot",
+    originalDecision: "Sell",
+    finalDecision: "Keep",
+    reason,
+    latestPrice,
+    latestTimestamp: timestamp ?? null,
+    forecast,
+  });
+  return reason;
+}
+
+function forecastStopCloseReason(
+  mode: TradingWindowMode,
+  lot: OpenOrderLot,
+  template: LotOrderTemplate,
+  latestPrice: number,
+  timestamp?: string | null,
+) {
+  const forecast = activeReadyMarketForecast();
+  if (!forecast || !["ensemble", "weighted", "confidence", "regime", "meta"].includes(mode) || !forecastPredictsDown(forecast)) {
+    return "";
+  }
+  const currentLoss = currentDailyLossDollars(mode, latestPrice, timestamp);
+  const maxDailyLoss = maxAllowedDailyLossDollars(mode);
+  const stopDistance = Math.max(0, lot.entryPrice - template.stopPrice);
+  const reason = `${algorithmDisplayName(mode)} forecast shock-stop close: price ${price(latestPrice)} hit the protective stop ${price(template.stopPrice)} (${currency(stopDistance)}/share from entry) and the 5-minute forecast predicts downside with ${formatProbability(forecastActionConfidence(forecast, "sell") ?? 0)} confidence. Daily loss is ${currency(currentLoss)} of max ${currency(maxDailyLoss)}.`;
+  recordForecastSafetyDecisionChange({
+    mode,
+    action: "close_stopped_lot",
+    originalDecision: "Keep",
+    finalDecision: "Sell",
+    reason,
+    latestPrice,
+    latestTimestamp: timestamp ?? null,
+    forecast,
+  });
+  return reason;
+}
+
+function isOpeningGraceWindow(timestamp?: string | null) {
+  if (!timestamp || !isRegularSession(timestamp)) {
+    return false;
+  }
+  const minutes = easternMinutes(timestamp);
+  return minutes >= 9 * 60 + 30 && minutes < 9 * 60 + 30 + OPENING_GRACE_MINUTES;
+}
+
+function isPreviousSessionLot(lot: OpenOrderLot, timestamp?: string | null) {
+  if (!timestamp) {
+    return false;
+  }
+  return easternDateString(lot.recordedAt) < easternDateString(timestamp);
+}
+
+function openingGraceKeepReason(
+  mode: TradingWindowMode,
+  lot: OpenOrderLot,
+  template: LotOrderTemplate,
+  latestPrice: number,
+  timestamp?: string | null,
+) {
+  if (!["ensemble", "weighted", "confidence", "regime", "meta"].includes(mode)) {
+    return "";
+  }
+  if (!isOpeningGraceWindow(timestamp) || !isPreviousSessionLot(lot, timestamp)) {
+    return "";
+  }
+  const currentLoss = Math.max(0, (lot.entryPrice - latestPrice) * template.quantity);
+  const maxRisk = Math.max(template.riskDollars, template.plannedStopRiskDollars, 0);
+  const emergencyRisk = maxRisk * OPENING_GRACE_EMERGENCY_RISK_MULTIPLE;
+  if (maxRisk <= 0 || currentLoss > emergencyRisk) {
+    return "";
+  }
+  const forecast = activeReadyMarketForecast();
+  if (forecast && forecastPredictsDown(forecast)) {
+    return "";
+  }
+  const forecastText = forecast
+    ? `5-minute forecast is not strongly bearish (${forecast.decision.action})`
+    : "5-minute forecast is unavailable, so only emergency risk is used";
+  const reason = `${algorithmDisplayName(mode)} opening grace: previous-day position is below protective stop ${price(template.stopPrice)} during the first ${OPENING_GRACE_MINUTES} minutes, but current loss ${currency(currentLoss)} is inside emergency risk ${currency(emergencyRisk)} and ${forecastText}.`;
+  recordForecastSafetyDecisionChange({
+    mode,
+    action: "keep_opening_grace",
+    originalDecision: "Sell",
+    finalDecision: "Keep",
+    reason,
+    latestPrice,
+    latestTimestamp: timestamp ?? null,
+    forecast,
+  });
+  return reason;
+}
+
+function recordForecastSafetyDecisionChange(input: {
+  mode: TradingWindowMode;
+  action: ForecastSafetyDecisionChange["action"];
+  originalDecision: string;
+  finalDecision: string;
+  reason: string;
+  latestPrice: number;
+  latestTimestamp: string | null;
+  forecast?: MarketForecastPrediction | null;
+}) {
+  const id = [
+    input.mode,
+    input.action,
+    input.latestTimestamp ?? "no-time",
+    input.forecast?.updatedAt ?? "no-forecast",
+    input.reason,
+  ].join("|");
+  try {
+    const raw = window.localStorage.getItem(FORECAST_SAFETY_LOG_STORAGE_KEY);
+    const existing = raw ? (JSON.parse(raw) as ForecastSafetyDecisionChange[]) : [];
+    if (existing.some((item) => item.id === id)) {
+      return;
+    }
+    const entry: ForecastSafetyDecisionChange = {
+      id,
+      recordedAt: new Date().toISOString(),
+      mode: input.mode,
+      symbol: state.symbol,
+      action: input.action,
+      originalDecision: input.originalDecision,
+      finalDecision: input.finalDecision,
+      reason: input.reason,
+      latestPrice: roundNumber(input.latestPrice, 4),
+      latestTimestamp: input.latestTimestamp,
+      forecastAction: input.forecast?.decision.action ?? null,
+      forecastConfidence: input.forecast ? forecastActionConfidence(input.forecast) : null,
+      forecastExpectedValue: input.forecast ? forecastActionExpectedValue(input.forecast) : null,
+      forecastEdgeGap: input.forecast?.decision.edgeGap ?? null,
+    };
+    window.localStorage.setItem(FORECAST_SAFETY_LOG_STORAGE_KEY, JSON.stringify([entry, ...existing].slice(0, 500)));
+  } catch {
+    // Logging must never block a trade-safety decision.
+  }
+}
+
 function confirmTargetOrderMismatch(
   side: TradeHistoryRow["side"],
   warnings: string[],
@@ -6536,12 +8561,15 @@ function maybeAutoSubmitTargetOrder() {
   if (automaticSubmitInFlight) {
     return;
   }
-  const latest = currentCandle();
+  const latest = latestExecutionCandleForMode("ensemble");
   const order = state.currentTargetOrder;
-  if (!latest || !order || order.submitMode !== "Automatic" || !isMarketOpenForOrders()) {
+  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitTrades()) {
     return;
   }
   if (order.side === "Sell") {
+    return;
+  }
+  if (automaticTradeAlreadySubmittedForCandle("ensemble", latest)) {
     return;
   }
   const executionPrice = targetOrderExecutionPrice(order, latest.close);
@@ -6558,7 +8586,10 @@ function maybeAutoSubmitTargetOrder() {
 
   automaticSubmitInFlight = true;
   try {
-    appendTradeHistory(order.side as TradeHistoryRow["side"], quantity, executionPrice, undefined, "ensemble");
+    appendTradeHistory(order.side as TradeHistoryRow["side"], quantity, executionPrice, undefined, "ensemble", {
+      submitMode: "Automatic",
+      trigger: "Voting Ensemble target order",
+    });
     rememberAutoSubmittedOrderKey(key);
     clearRecommendedTargetOverrides();
     updateAlgorithmPanel(visibleCandles());
@@ -6572,12 +8603,15 @@ function maybeAutoSubmitWeightedTargetOrder() {
   if (automaticSubmitInFlight) {
     return;
   }
-  const latest = currentCandle();
+  const latest = latestExecutionCandleForMode("weighted");
   const order = state.currentWeightedTargetOrder;
-  if (!latest || !order || order.submitMode !== "Automatic" || !isMarketOpenForOrders()) {
+  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitTrades()) {
     return;
   }
   if (order.side !== "Buy") {
+    return;
+  }
+  if (automaticTradeAlreadySubmittedForCandle("weighted", latest)) {
     return;
   }
   const executionPrice = targetOrderExecutionPrice(order, latest.close);
@@ -6594,7 +8628,10 @@ function maybeAutoSubmitWeightedTargetOrder() {
 
   automaticSubmitInFlight = true;
   try {
-    appendTradeHistory("Buy", quantity, executionPrice, undefined, "weighted");
+    appendTradeHistory("Buy", quantity, executionPrice, undefined, "weighted", {
+      submitMode: "Automatic",
+      trigger: "Weighted Voting target order",
+    });
     rememberAutoSubmittedOrderKey(key);
     updateWeightedVotingPanel();
     updateQuoteCard(latest);
@@ -6607,12 +8644,15 @@ function maybeAutoSubmitConfidenceTargetOrder() {
   if (automaticSubmitInFlight) {
     return;
   }
-  const latest = currentCandle();
+  const latest = latestExecutionCandleForMode("confidence");
   const order = state.currentConfidenceTargetOrder;
-  if (!latest || !order || order.submitMode !== "Automatic" || !isMarketOpenForOrders()) {
+  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitTrades()) {
     return;
   }
   if (order.side !== "Buy") {
+    return;
+  }
+  if (automaticTradeAlreadySubmittedForCandle("confidence", latest)) {
     return;
   }
   const executionPrice = targetOrderExecutionPrice(order, latest.close);
@@ -6629,13 +8669,68 @@ function maybeAutoSubmitConfidenceTargetOrder() {
 
   automaticSubmitInFlight = true;
   try {
-    appendTradeHistory("Buy", quantity, executionPrice, undefined, "confidence");
+    appendTradeHistory("Buy", quantity, executionPrice, undefined, "confidence", {
+      submitMode: "Automatic",
+      trigger: "WCA target order",
+    });
     rememberAutoSubmittedOrderKey(key);
     updateConfidenceAggregationPanel();
     updateQuoteCard(latest);
   } finally {
     automaticSubmitInFlight = false;
   }
+}
+
+function maybeAutoSubmitRegimeTargetOrder() {
+  if (automaticSubmitInFlight) {
+    return;
+  }
+  const latest = latestExecutionCandleForMode("regime");
+  const order = state.currentRegimeTargetOrder;
+  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitTrades()) {
+    return;
+  }
+  if (order.side !== "Buy") {
+    return;
+  }
+  if (automaticTradeAlreadySubmittedForCandle("regime", latest)) {
+    return;
+  }
+  const executionPrice = targetOrderExecutionPrice(order, latest.close);
+  const position = summarizePositionFromTradeHistory(latest.close, latest.close, "regime");
+  const quantity = automaticOrderQuantity(order, position, "regime");
+  const rejection = automaticOrderRejectionReason(order, position, quantity, executionPrice, "regime");
+  if (rejection) {
+    return;
+  }
+  const key = automaticOrderKeyForMode("regime", order, quantity, executionPrice);
+  if (state.autoSubmittedOrderKeys.includes(key)) {
+    return;
+  }
+
+  automaticSubmitInFlight = true;
+  try {
+    appendTradeHistory("Buy", quantity, executionPrice, undefined, "regime", {
+      submitMode: "Automatic",
+      trigger: "Regime target order",
+    });
+    rememberAutoSubmittedOrderKey(key);
+    updateRegimeSelectionPanel();
+    updateQuoteCard(latest);
+  } finally {
+    automaticSubmitInFlight = false;
+  }
+}
+
+function maybeAutoSubmitAllAlgorithms() {
+  if (!canSubmitTrades()) {
+    return;
+  }
+  maybeAutoSubmitTargetOrder();
+  maybeAutoSubmitWeightedTargetOrder();
+  maybeAutoSubmitConfidenceTargetOrder();
+  maybeAutoSubmitRegimeTargetOrder();
+  maybeAutoSubmitOpenOrderControls();
 }
 
 function openOrderLots(mode: TradingWindowMode = state.tradingWindowMode) {
@@ -6697,9 +8792,9 @@ function lotOrderTemplate(lot: OpenOrderLot, latestPrice: number, mode: TradingW
   const shouldSell = Boolean(targetOrder?.eligible && targetOrder.side === "Sell" && isActiveTargetOrder(targetOrder));
   const atr = mode === "weighted" ? averageTrueRange(latestRegularSessionCandles(), 14) ?? 0 : 0;
   const weightedStopDistance = weightedDefaults
-    ? Math.max(atr * weightedDefaults.atrStopMultiplier, lot.entryPrice * (weightedDefaults.minimumStopDistancePercent / 100), 0.01)
+    ? defaultSizingStopDistance(weightedDefaults, lot.entryPrice, atr)
     : 0;
-  const riskPerShare = weightedDefaults ? weightedStopDistance : lot.entryPrice * (settings.stopLossPercent / 100);
+  const riskPerShare = weightedDefaults ? weightedStopDistance : tradingSettingsStopDistance(settings, lot.entryPrice, atr);
   const fallbackStop = roundNumber(lot.entryPrice - riskPerShare, 2);
   const fallbackTarget = roundNumber(lot.entryPrice + riskPerShare * settings.takeProfitR, 2);
   const triggerPrice = shouldSell && targetOrder?.triggerPrice !== null && targetOrder?.triggerPrice !== undefined
@@ -6716,7 +8811,9 @@ function lotOrderTemplate(lot: OpenOrderLot, latestPrice: number, mode: TradingW
     : fallbackTarget;
   const riskDollars = weightedDefaults ? settings.startingCapital * (weightedDefaults.baseRiskPercent / 100) : targetOrder?.riskDollars ?? 0;
   const maxPositionShares = weightedDefaults ? Math.max(1, Math.floor((settings.startingCapital * (weightedDefaults.maxPositionPercent / 100)) / Math.max(lot.entryPrice, 0.01))) : lot.remainingQuantity;
-  const participationShares = weightedDefaults ? Math.max(1, Math.floor((currentCandle()?.volume ?? 0) * (weightedDefaults.maxParticipationPercent / 100))) : lot.remainingQuantity;
+  const participationShares = weightedDefaults
+    ? Math.max(1, Math.floor((latestExecutionCandleForMode(mode)?.volume ?? 0) * (weightedDefaults.maxParticipationPercent / 100)))
+    : lot.remainingQuantity;
   const maxAllowedShares = weightedDefaults?.maxAllowedShares ? weightedDefaults.maxAllowedShares : Number.MAX_SAFE_INTEGER;
   const defaultQuantity = Math.max(0, Math.min(lot.remainingQuantity, maxPositionShares, participationShares, maxAllowedShares));
   const plannedStopRiskDollars = roundNumber(defaultQuantity * Math.max(0, lot.entryPrice - stopPrice), 2);
@@ -6764,40 +8861,31 @@ function withLotExitAction(
   lot: OpenOrderLot,
   template: LotOrderTemplate,
   latestPrice: number,
-  targetOrderSaysSell: boolean,
+  _targetOrderSaysSell: boolean,
   mode: TradingWindowMode,
 ): LotOrderTemplate {
   const sellExecutionPrice = openOrderSellExecutionPrice(latestPrice, mode);
   const reachedTakeProfit = sellExecutionPrice >= template.targetPrice;
   const reachedStop = sellExecutionPrice <= template.stopPrice;
-  const shortCycleExit = shortCycleSellExitSignal(latestPrice, mode);
-  const exitWouldLoseOrBreakeven = sellExecutionPrice <= lot.entryPrice;
-  const profitExitReady = reachedTakeProfit || sellExecutionMeetsProfitFloor(lot, template.quantity, sellExecutionPrice);
-  const riskExitReady = reachedStop || ((targetOrderSaysSell || shortCycleExit) && exitWouldLoseOrBreakeven);
-  const shouldSell = riskExitReady || profitExitReady;
+  const profitExitReady = reachedTakeProfit;
+  const riskExitReady = reachedStop;
+  const latestTimestamp = latestExecutionCandleForMode(mode)?.timestamp;
+  const forecastSafetyNote =
+    riskExitReady && !profitExitReady
+      ? openingGraceKeepReason(mode, lot, template, latestPrice, latestTimestamp) ||
+        forecastStopOverrideKeepReason(mode, lot, template, latestPrice, latestTimestamp)
+      : "";
+  const forecastExitReason =
+    riskExitReady && !profitExitReady && !forecastSafetyNote
+      ? forecastStopCloseReason(mode, lot, template, latestPrice, latestTimestamp)
+      : "";
+  const shouldSell = (riskExitReady && !forecastSafetyNote) || profitExitReady;
   return {
     ...template,
     action: shouldSell ? "Sell" : "Keep",
+    forecastSafetyNote: forecastSafetyNote || undefined,
+    forecastExitReason: forecastExitReason || undefined,
   };
-}
-
-function shortCycleSellExitSignal(latestPrice: number, mode: TradingWindowMode = state.tradingWindowMode) {
-  const sessionCandles = latestRegularSessionCandles();
-  const latest = sessionCandles.at(-1) ?? null;
-  if (!latest) {
-    return false;
-  }
-  const vwap = sessionCandles.length ? sessionVwapValue(sessionCandles) : null;
-  const fiveMinute = aggregateCandlesToFiveMinute(sessionCandles);
-  const latest5 = fiveMinute.at(-1);
-  const prior5 = fiveMinute.at(-2);
-  const momentumTolerance = prior5 ? Math.max(0.05, prior5.close * 0.0002) : 0;
-  const lostVwap = vwap !== null && latestPrice < vwap;
-  const shortCycleMomentumFailed = Boolean(latest5 && prior5 && latest5.close < prior5.close - momentumTolerance);
-  if (mode === "ensemble") {
-    return lostVwap && shortCycleMomentumFailed;
-  }
-  return lostVwap || shortCycleMomentumFailed;
 }
 
 function renderOpenOrderControls(latestPrice: number, mode: TradingWindowMode = state.tradingWindowMode) {
@@ -6821,8 +8909,8 @@ function renderOpenOrderControls(latestPrice: number, mode: TradingWindowMode = 
     renderSellSetupSelector(
       selectableSetups,
       selectedLotId,
-      mode === "confidence" ? "Selected entry" : "Selected sell setup",
-      mode === "confidence" ? "No WCA entries selected" : "No active sell setup selected",
+      mode === "confidence" || mode === "regime" ? "Selected entry" : "Selected sell setup",
+      mode === "regime" ? "No Regime entries selected" : mode === "confidence" ? "No WCA entries selected" : "No active sell setup selected",
     ),
     ...renderedLots.map(({ lot, template }) => renderOpenOrderControl(lot, template, mode, selectedLotId)),
   ].join("");
@@ -6889,13 +8977,15 @@ function selectedProfitableAutomaticSellReady(
   mode: TradingWindowMode,
   selectedLotId = state.selectedSellSetupByMode[mode],
 ) {
-  const latestPrice = currentCandle()?.close;
+  const latestPrice = latestExecutionCandleForMode(mode)?.close;
   const executionPrice = latestPrice === undefined ? 0 : openOrderSellExecutionPrice(latestPrice, mode);
+  const reachedTakeProfit = executionPrice >= template.targetPrice;
+  const reachedStop = executionPrice <= template.stopPrice;
   return (
     lot.id === selectedLotId &&
     orderControlSubmitMode(mode, lot.id) === "Automatic" &&
     template.quantity > 0 &&
-    sellExecutionMeetsProfitFloor(lot, template.quantity, executionPrice)
+    (reachedTakeProfit || reachedStop)
   );
 }
 
@@ -6932,7 +9022,15 @@ function renderOpenOrderControl(
   const canManualSell = lot.id === selectedLotId;
   const selectedAutoSellReady = selectedProfitableAutomaticSellReady(lot, template, mode, selectedLotId);
   const displayAction = template.action === "Sell" || selectedAutoSellReady ? "Sell" : template.action;
-  const canSell = isMarketOpenForOrders() && template.quantity > 0 && (template.action === "Sell" || canManualSell || selectedAutoSellReady);
+  const canSell = canSubmitTrades() && !template.forecastSafetyNote && template.quantity > 0 && (template.action === "Sell" || canManualSell || selectedAutoSellReady);
+  const statusText = openOrderControlStatusText({
+    lot,
+    template,
+    submitMode,
+    canManualSell,
+    selectedAutoSellReady,
+    canSell,
+  });
   return `
     <article class="open-order-card" data-action="${displayAction.toLowerCase()}">
       <div class="open-order-head">
@@ -6960,8 +9058,46 @@ function renderOpenOrderControl(
         </label>
         <button type="button" data-sell-lot-id="${escapeHtml(lot.id)}" ${canSell ? "" : "disabled"}>Sell Order</button>
       </div>
+      <span class="open-order-status">${escapeHtml(statusText)}</span>
     </article>
   `;
+}
+
+function openOrderControlStatusText(input: {
+  lot: OpenOrderLot;
+  template: LotOrderTemplate;
+  submitMode: SubmitOrderMode;
+  canManualSell: boolean;
+  selectedAutoSellReady: boolean;
+  canSell: boolean;
+}) {
+  if (!canSubmitTrades()) {
+    return tradeSubmissionBlockedTitle();
+  }
+  if (input.template.forecastSafetyNote) {
+    return input.template.forecastSafetyNote;
+  }
+  if (input.template.forecastExitReason && input.template.action === "Sell") {
+    return input.template.forecastExitReason;
+  }
+  if (input.template.quantity <= 0) {
+    return "Quantity is 0, so no sell can be submitted.";
+  }
+  if (input.selectedAutoSellReady) {
+    return "Automatic sell is armed because the selected entry reached its stop or take-profit.";
+  }
+  if (input.submitMode === "Automatic") {
+    return input.template.action === "Sell"
+      ? "Automatic sell condition is ready."
+      : "Automatic sell is waiting for profit target or stop trigger.";
+  }
+  if (input.template.action === "Sell" && input.canManualSell) {
+    return "Manual sell is ready. Click Sell Order to close this selected entry.";
+  }
+  if (input.canManualSell) {
+    return "Manual sell is available for the selected entry.";
+  }
+  return "Select this entry above before using manual Sell Order.";
 }
 
 function renderLotOrderInput(
@@ -7027,18 +9163,23 @@ function isEditableLotOrderKey(key: string): key is keyof LotOrderOverride {
 }
 
 function maybeAutoSubmitOpenOrderControls() {
-  if (automaticSubmitInFlight || !isMarketOpenForOrders()) {
+  if (automaticSubmitInFlight || !canSubmitTrades()) {
     return;
   }
-  const latest = currentCandle();
-  if (!latest) {
-    return;
-  }
-  for (const mode of ["ensemble", "weighted", "confidence"] as TradingWindowMode[]) {
-    for (const lot of openOrderLots(mode)) {
-      if (orderControlSubmitMode(mode, lot.id) === "Automatic") {
-        submitOpenOrderLot(lot.id, true, mode);
-      }
+  for (const mode of ["ensemble", "weighted", "confidence", "regime", "meta"] as TradingWindowMode[]) {
+    const latest = latestExecutionCandleForMode(mode);
+    if (!latest) {
+      continue;
+    }
+    if (automaticTradeAlreadySubmittedForCandle(mode, latest) || automaticTradeAlreadySubmittedThisMinute(mode, "Sell")) {
+      continue;
+    }
+    const selectableSetups = openOrderLots(mode)
+      .map((lot) => ({ lot, template: lotOrderTemplate(lot, latest.close, mode) }))
+      .filter(({ template }) => template.quantity > 0);
+    const selectedLotId = selectedSellSetupLotId(mode, selectableSetups);
+    if (selectedLotId && orderControlSubmitMode(mode, selectedLotId) === "Automatic") {
+      submitOpenOrderLot(selectedLotId, true, mode);
     }
   }
 }
@@ -7052,6 +9193,9 @@ function selectedSellableOpenOrderLot(mode: TradingWindowMode, latestPrice: numb
   if (!selectedSetup) {
     return null;
   }
+  if (selectedSetup.template.forecastSafetyNote) {
+    return null;
+  }
   return orderControlSubmitMode(mode, selectedSetup.lot.id) === "Manual" || selectedSetup.template.action === "Sell"
     ? selectedSetup.lot
     : null;
@@ -7061,8 +9205,8 @@ function submitSelectedOpenOrderSell(mode: TradingWindowMode = activeTradingMode
   if (state.tradingWindowMode !== mode) {
     setTradingWindowMode(mode);
   }
-  const latest = currentCandle();
-  if (!latest || !isMarketOpenForOrders()) {
+  const latest = latestExecutionCandleForMode(mode);
+  if (!latest || !canSubmitTrades()) {
     updateQuoteCard(latest);
     return;
   }
@@ -7075,8 +9219,8 @@ function submitSelectedOpenOrderSell(mode: TradingWindowMode = activeTradingMode
 }
 
 function submitOpenOrderLot(lotId: string, automatic: boolean, mode: TradingWindowMode = state.tradingWindowMode) {
-  const latest = currentCandle();
-  if (!latest || !isMarketOpenForOrders()) {
+  const latest = latestExecutionCandleForMode(mode);
+  if (!latest || !canSubmitTrades()) {
     return;
   }
   const lot = openOrderLots(mode).find((item) => item.id === lotId);
@@ -7090,7 +9234,13 @@ function submitOpenOrderLot(lotId: string, automatic: boolean, mode: TradingWind
   const selectedLotId = selectedSellSetupLotId(mode, selectableSetups);
   const manualSelectedSell = !automatic && state.selectedSellSetupByMode[mode] === lot.id;
   const selectedAutomaticSell = automatic && selectedProfitableAutomaticSellReady(lot, template, mode, selectedLotId);
+  if (template.forecastSafetyNote) {
+    return;
+  }
   if ((!manualSelectedSell && !selectedAutomaticSell && template.action !== "Sell") || template.quantity <= 0) {
+    return;
+  }
+  if (automatic && automaticTradeAlreadySubmittedThisMinute(mode, "Sell")) {
     return;
   }
   const key = `lot|${lot.id}|${template.quantity}|${price(template.limitPrice)}|${price(template.stopPrice)}|${price(template.targetPrice)}`;
@@ -7098,7 +9248,9 @@ function submitOpenOrderLot(lotId: string, automatic: boolean, mode: TradingWind
     return;
   }
   const maxTradesPerDay =
-    mode === "confidence"
+    mode === "regime"
+      ? regimeDefaultSizingSettings().maxDailyTrades
+      : mode === "confidence"
       ? confidenceDefaultSizingSettings().maxDailyTrades
       : mode === "weighted"
         ? weightedDefaultSizingSettings().maxDailyTrades
@@ -7106,11 +9258,14 @@ function submitOpenOrderLot(lotId: string, automatic: boolean, mode: TradingWind
   if (automatic && effectiveTodaysTradeCount(mode, maxTradesPerDay, latest.close) >= maxTradesPerDay) {
     return;
   }
-  const executionPrice = openOrderSellExecutionPrice(latest.close, mode);
+  const executionPrice = template.limitPrice;
 
   automaticSubmitInFlight = true;
   try {
-    appendTradeHistory("Sell", template.quantity, executionPrice, lot.id, mode);
+    appendTradeHistory("Sell", template.quantity, executionPrice, lot.id, mode, {
+      submitMode: automatic ? "Automatic" : "Manual",
+      trigger: automatic ? "Automatic sell setup" : "Selected sell setup",
+    });
     rememberAutoSubmittedOrderKey(key);
     if (mode === "ensemble") {
       clearRecommendedTargetOverrides();
@@ -7132,7 +9287,7 @@ function automaticOrderQuantity(order: ManualOrderRecommendation, position: Posi
   if (order.side === "Sell") {
     return Math.min(requestedQuantity, position.shares);
   }
-  const executionPrice = targetOrderExecutionPrice(order, currentCandle()?.close ?? order.triggerPrice ?? 0);
+  const executionPrice = targetOrderExecutionPrice(order, latestExecutionCandleForMode(mode)?.close ?? order.triggerPrice ?? 0);
   const maxQuantity = maxPerTradeBuyQuantity(order, executionPrice, mode);
   return Math.min(requestedQuantity, maxQuantity);
 }
@@ -7144,9 +9299,17 @@ function maxPerTradeBuyQuantity(order: ManualOrderRecommendation, executionPrice
 
 function maxPerTradeBuyQuantityForPrice(executionPrice: number, mode: TradingWindowMode = state.tradingWindowMode) {
   const settings = tradingSettingsForMode(mode);
-  const orderAllocationPercent = Math.min(Math.max(0, settings.orderAllocationPercent), MAX_ORDER_ALLOCATION_PERCENT);
+  const orderAllocationPercent = Math.min(Math.max(0, settings.orderAllocationPercent), maxOrderAllocationPercentForMode(mode));
   const maxOrderDollars = Math.max(0, settings.startingCapital) * (orderAllocationPercent / 100);
   return executionPrice > 0 ? Math.max(0, Math.floor(maxOrderDollars / executionPrice)) : 0;
+}
+
+function maxOrderAllocationPercentForMode(mode: TradingWindowMode) {
+  return mode === "ensemble"
+    ? VOTING_MAX_ORDER_ALLOCATION_PERCENT
+    : mode === "regime" || mode === "meta"
+      ? REGIME_MAX_ORDER_ALLOCATION_PERCENT
+      : MAX_ORDER_ALLOCATION_PERCENT;
 }
 
 function automaticOrderRejectionReason(
@@ -7166,7 +9329,9 @@ function automaticOrderRejectionReason(
     return "Recommended quantity is not positive";
   }
   const pyramidingEnabled =
-    mode === "confidence"
+    mode === "regime"
+      ? regimeDefaultSizingSettings().pyramidingEnabled
+      : mode === "confidence"
       ? confidenceDefaultSizingSettings().pyramidingEnabled
       : mode === "weighted"
         ? weightedDefaultSizingSettings().pyramidingEnabled
@@ -7177,11 +9342,24 @@ function automaticOrderRejectionReason(
   if (order.side === "Sell" && position.shares <= 0) {
     return "Automatic sell blocked because there are no shares to close";
   }
+  if (order.side === "Buy") {
+    const latest = latestExecutionCandleForMode(mode);
+    const lateSessionBuyBlocker = lateSessionAboveAverageBuyBlocker(mode, executionPrice, latest?.timestamp);
+    if (lateSessionBuyBlocker) {
+      return lateSessionBuyBlocker;
+    }
+    const forecastBuyBlockers = forecastBuySafetyBlockers(mode, executionPrice, latest?.timestamp);
+    if (forecastBuyBlockers.length) {
+      return forecastBuyBlockers.join(" | ");
+    }
+  }
   if (targetOrderConsistencyWarnings(order.side as TradeHistoryRow["side"], order, executionPrice).length) {
     return "Target order settings are inconsistent";
   }
   const maxTradesPerDay =
-    mode === "confidence"
+    mode === "regime"
+      ? regimeDefaultSizingSettings().maxDailyTrades
+      : mode === "confidence"
       ? confidenceDefaultSizingSettings().maxDailyTrades
       : mode === "weighted"
         ? weightedDefaultSizingSettings().maxDailyTrades
@@ -7209,13 +9387,42 @@ function automaticOrderKeyForMode(mode: TradingWindowMode, order: ManualOrderRec
   return mode === "ensemble" ? key : `${mode}|${key}`;
 }
 
+function automaticTradeAlreadySubmittedForCandle(
+  mode: TradingWindowMode,
+  latest: Candle | null,
+  side?: TradeHistoryRow["side"],
+) {
+  const latestTimestamp = latest?.timestamp ?? "";
+  if (!latestTimestamp) {
+    return side
+      ? automaticTradeAlreadySubmittedThisMinute(mode, side)
+      : (["Buy", "Sell"] as TradeHistoryRow["side"][]).some((candidate) => automaticTradeAlreadySubmittedThisMinute(mode, candidate));
+  }
+  return tradeHistoryForMode(mode).some((row) => (
+    row.symbol === state.symbol &&
+    (!side || row.side === side) &&
+    row.evidence?.submitMode === "Automatic" &&
+    row.evidence?.market.latest?.timestamp === latestTimestamp
+  ));
+}
+
+function automaticTradeAlreadySubmittedThisMinute(mode: TradingWindowMode, side: TradeHistoryRow["side"]) {
+  const minuteKey = new Date().toISOString().slice(0, 16);
+  return tradeHistoryForMode(mode).some((row) => (
+    row.symbol === state.symbol &&
+    row.side === side &&
+    row.recordedAt.slice(0, 16) === minuteKey &&
+    row.evidence?.submitMode === "Automatic"
+  ));
+}
+
 function rememberAutoSubmittedOrderKey(key: string) {
   state.autoSubmittedOrderKeys = [key, ...state.autoSubmittedOrderKeys.filter((existing) => existing !== key)].slice(0, 100);
   saveAutoSubmittedOrderKeys(state.autoSubmittedOrderKeys);
 }
 
 function suppressCurrentAutomaticTargetOrder(mode: TradingWindowMode) {
-  const latest = currentCandle();
+  const latest = latestExecutionCandleForMode(mode);
   const order = targetOrderForMode(mode);
   if (!latest || !order || order.submitMode !== "Automatic") {
     return;
@@ -7230,8 +9437,7 @@ function suppressCurrentAutomaticTargetOrder(mode: TradingWindowMode) {
 }
 
 function todaysTradeCount(mode: TradingWindowMode = state.tradingWindowMode) {
-  const today = new Date().toDateString();
-  return tradeHistoryForMode(mode).filter((trade) => new Date(trade.recordedAt).toDateString() === today).length;
+  return tradeHistoryForMode(mode).filter(isTradeHistoryRowFromToday).length;
 }
 
 function effectiveTodaysTradeCount(mode: TradingWindowMode, maxTradesPerDay: number, latestPrice?: number) {
@@ -7267,6 +9473,55 @@ function todayPnlForMode(mode: TradingWindowMode, latestPrice?: number) {
   return roundNumber(realized + openPnl, 2);
 }
 
+function marketDataCandlesForMode(mode: TradingWindowMode) {
+  if (mode === "weighted" || mode === "confidence" || mode === "regime") {
+    return state.weightedMarketData.timeframeCandles["1Min"]?.length
+      ? state.weightedMarketData.timeframeCandles["1Min"]
+      : state.candles;
+  }
+  return state.candles;
+}
+
+function priorRegularCloseForMode(mode: TradingWindowMode, timestamp?: string | null) {
+  const latestTimestamp = timestamp ?? latestExecutionCandleForMode(mode)?.timestamp;
+  if (!latestTimestamp) {
+    return null;
+  }
+  const latestDay = easternDateString(latestTimestamp);
+  return marketDataCandlesForMode(mode)
+    .filter((candle) => isRegularSession(candle.timestamp) && easternDateString(candle.timestamp) < latestDay)
+    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime())
+    .at(-1)?.close ?? null;
+}
+
+function currentSessionBaselineForMode(mode: TradingWindowMode, timestamp?: string | null) {
+  const latestTimestamp = timestamp ?? latestExecutionCandleForMode(mode)?.timestamp;
+  if (!latestTimestamp) {
+    return null;
+  }
+  const latestDay = easternDateString(latestTimestamp);
+  const currentSession = marketDataCandlesForMode(mode)
+    .filter((candle) => isRegularSession(candle.timestamp) && easternDateString(candle.timestamp) === latestDay)
+    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
+  return priorRegularCloseForMode(mode, latestTimestamp) ?? currentSession[0]?.open ?? null;
+}
+
+function maxAllowedDailyLossDollars(mode: TradingWindowMode) {
+  const settings = tradingSettingsForMode(mode);
+  return roundNumber(Math.max(0, settings.startingCapital) * (Math.max(0, settings.maxDailyLossPercent) / 100), 2);
+}
+
+function currentDailyLossDollars(mode: TradingWindowMode, latestPrice: number, timestamp?: string | null) {
+  const realized = todayRealizedPnlForMode(mode);
+  const baseline = currentSessionBaselineForMode(mode, timestamp);
+  const openDayPnl = baseline === null
+    ? summarizePositionFromTradeHistory(latestPrice, latestPrice, mode).unrealizedPnl
+    : openOrderLots(mode)
+      .filter((lot) => lot.symbol === state.symbol)
+      .reduce((total, lot) => total + (latestPrice - baseline) * lot.remainingQuantity, 0);
+  return roundNumber(Math.max(0, -(realized + openDayPnl)), 2);
+}
+
 function todayRealizedPnlForMode(mode: TradingWindowMode) {
   const today = new Date().toDateString();
   const lots: Array<{ id: string; remainingQuantity: number; entryPrice: number }> = [];
@@ -7299,7 +9554,243 @@ function todayRealizedPnlForMode(mode: TradingWindowMode) {
   return roundNumber(realizedPnl, 2);
 }
 
-function appendTradeHistory(side: TradeHistoryRow["side"], quantity: number, tradePrice: number, closedLotId?: string, mode: TradingWindowMode = state.tradingWindowMode) {
+function algorithmDisplayName(mode: TradingWindowMode) {
+  return mode === "meta"
+    ? "Meta-Strategy"
+    : mode === "regime"
+    ? "Regime"
+    : mode === "confidence"
+      ? "WCA"
+      : mode === "weighted"
+        ? "Weighted Voting"
+        : "Voting Ensemble";
+}
+
+function compactTradingSettings(settings: TradingSettings): Partial<TradingSettings> {
+  return {
+    startingCapital: settings.startingCapital,
+    orderAllocationPercent: settings.orderAllocationPercent,
+    dailyAllocationPercent: settings.dailyAllocationPercent,
+    riskBudgetPercentOfOrder: settings.riskBudgetPercentOfOrder,
+    maxTradesPerDay: settings.maxTradesPerDay,
+    stopLossPercent: settings.stopLossPercent,
+    fixedStopDistanceDollars: settings.fixedStopDistanceDollars,
+    takeProfitR: settings.takeProfitR,
+    slippagePerShare: settings.slippagePerShare,
+    useDefaultSizingSettings: settings.useDefaultSizingSettings,
+    minimumBuyScore: settings.minimumBuyScore,
+    minimumSignalEdge: settings.minimumSignalEdge,
+    maxPositionPercent: settings.maxPositionPercent,
+    maxParticipationPercent: settings.maxParticipationPercent,
+    minimumOneMinuteVolume: settings.minimumOneMinuteVolume,
+    pyramidingEnabled: settings.pyramidingEnabled,
+  };
+}
+
+function compactTargetOrder(order: ManualOrderRecommendation | null): Partial<ManualOrderRecommendation> | null {
+  if (!order) {
+    return null;
+  }
+  return {
+    eligible: order.eligible,
+    side: order.side,
+    orderType: order.orderType,
+    symbol: order.symbol,
+    quantity: order.quantity,
+    triggerPrice: order.triggerPrice,
+    limitPrice: order.limitPrice,
+    stopPrice: order.stopPrice,
+    targetPrice: order.targetPrice,
+    orderLimitDollars: order.orderLimitDollars,
+    dailyLimitDollars: order.dailyLimitDollars,
+    riskDollars: order.riskDollars,
+    orderNotional: order.orderNotional,
+    plannedStopRiskDollars: order.plannedStopRiskDollars,
+    estimatedSlippage: order.estimatedSlippage,
+    submitMode: order.submitMode,
+    failedGates: order.failedGates,
+    summary: order.summary,
+  };
+}
+
+function compactBacktestEvidence(backtest: BacktestResult | null, label: string): OrderEvidenceSnapshot["backtest"] {
+  if (!backtest) {
+    return null;
+  }
+  const totalTrades = backtest.totalTrades ?? backtest.trades.length;
+  return {
+    label,
+    timeframe: algoBacktestTimeframeLabel(backtest.timeframe),
+    range: backtest.rangeLabel ?? `${backtest.startDate ?? ""} to ${backtest.endDate ?? ""}`.trim(),
+    trades: totalTrades,
+    pnl: roundNumber(backtest.totalPnl, 2),
+    profitFactor: backtest.profitFactor ?? null,
+    winRate: totalTrades ? roundNumber(backtest.winners / totalTrades, 4) : 0,
+    maxDrawdown: typeof backtest.maxDrawdown === "number" ? roundNumber(backtest.maxDrawdown, 2) : undefined,
+  };
+}
+
+function mlArtifactEvidence(): OrderEvidenceSnapshot["mlArtifact"] {
+  const best = state.dynamicArtifact?.mlComparison?.bestByTimeframe?.[0] ?? state.mlComparison?.bestByTimeframe?.[0];
+  return {
+    status: dynamicArtifactStatusLabel(),
+    artifactId: state.dynamicArtifact?.artifactId,
+    range: state.dynamicArtifact?.rangeLabel,
+    best: best ? `${best.timeframe} ${best.verdict} ${best.bestVariant} ${signedCurrency(best.bestPnl)}` : undefined,
+  };
+}
+
+function decisionEvidence(mode: TradingWindowMode, order: ManualOrderRecommendation | null): OrderEvidenceSnapshot["decision"] {
+  if (mode === "meta") {
+    const result = calculateMetaStrategy();
+    return {
+      winner: result.signal,
+      confidence: `${result.decisionLabel} net ${result.netScore.toFixed(2)}, edge ${result.edge.toFixed(2)}, active ${result.activeDirectionalCount}/${metaStrategyCatalog.length}`,
+      strategies: result.strategies
+        .filter((strategy) => strategy.signal !== "hold")
+        .slice(0, 6)
+        .map((strategy) => `${strategy.name}: ${strategy.signal} confidence ${strategy.confidence.toFixed(2)} family ${metaFamilyLabel(strategy.family)}`),
+      gates: result.safetyGates.map((gate) => `${gate.label}: ${gate.status} - ${gate.detail}`),
+      failedGates: result.safetyGates.filter((gate) => gate.status === "fail").map((gate) => `${gate.label}: ${gate.detail}`),
+      summary: result.reasons.join("; ") || order?.summary,
+    };
+  }
+  if (mode === "weighted") {
+    const result = calculateWeightedVote();
+    return {
+      winner: result.signal,
+      weighted: `${result.signal} score ${result.maxScore.toFixed(2)}, margin ${result.margin.toFixed(2)}, size ${formatProbability(result.positionSize)}`,
+      strategies: result.strategies
+        .slice(0, 5)
+        .map(
+          (strategy) =>
+            `${strategy.name}: B ${formatProbability(strategy.pBuy)} / S ${formatProbability(strategy.pSell)} / H ${formatProbability(strategy.pHold)} strength ${formatProbability(strategy.strength)}`,
+        ),
+      gates: result.gates.map((gate) => `${gate.label}: ${gate.status} - ${gate.detail}`),
+      failedGates: result.gates.filter((gate) => gate.status === "fail").map((gate) => `${gate.label}: ${gate.detail}`),
+      summary: weightedTradingSettingsSummary(state.weightedTradingSettings, result),
+    };
+  }
+  if (mode === "confidence") {
+    const result = calculateConfidenceAggregation();
+    return {
+      winner: result.signal,
+      confidence: `${result.decisionLabel} net ${result.normalizedNetScore.toFixed(2)}, active ${result.activeStrategyCount}/${confidenceAggregationStrategies.length}`,
+      strategies: result.strategies.slice(0, 5).map((strategy) => `${strategy.name}: ${strategy.direction} confidence ${strategy.confidence.toFixed(2)}`),
+      gates: result.hardFilters.map((filter) => `${filter.label}: ${filter.status} - ${filter.detail}`),
+      failedGates: result.hardFilters.filter((filter) => filter.status === "fail").map((filter) => `${filter.label}: ${filter.detail}`),
+      summary: result.detail,
+    };
+  }
+  if (mode === "regime") {
+    const result = calculateRegimeSelection();
+    return {
+      winner: result.signal === "No-trade" ? "Hold" : result.signal,
+      confidence: `${result.confirmedCondition}, confidence ${formatProbability(result.confidence)}, buy ${formatProbability(result.scores.buy)}, edge ${formatProbability(result.scoreEdge)}`,
+      strategies: result.selectedStrategies
+        .filter((strategy) => strategy.selected)
+        .slice(0, 5)
+        .map((strategy) => `${strategy.name}: ${strategy.direction} confidence ${strategy.confidence.toFixed(2)}`),
+      gates: [
+        `Regime Selector: ${result.tradeAllowed ? "pass" : "fail"} - ${result.tradeBlockers.length ? result.tradeBlockers.join("; ") : "Trade gates passed"}`,
+        `Market Condition: ${result.confidence >= 0.65 ? "pass" : "fail"} - ${result.confirmedCondition}`,
+        `Opportunity: ${result.opportunity === "No-trade" ? "fail" : "pass"} - ${result.opportunity}`,
+      ],
+      failedGates: result.tradeBlockers,
+      summary: result.reasons.join("; "),
+    };
+  }
+  const votes = strategyEnsembleSignals(state.marketContext);
+  const eligibleVotes = votes.filter(isEligibleStrategyVote);
+  const buyVotes = eligibleVotes.filter((vote) => vote.signal === "Buy").length;
+  const sellVotes = eligibleVotes.filter((vote) => vote.signal === "Sell").length;
+  const holdVotes = eligibleVotes.filter((vote) => vote.signal === "Hold").length;
+  return {
+    winner: winningVoteSignal(buyVotes, sellVotes, holdVotes),
+    voteCounts: `${buyVotes}B / ${sellVotes}S / ${holdVotes}H`,
+    strategies: eligibleVotes
+      .filter((vote) => vote.signal !== "Hold")
+      .slice(0, 6)
+      .map((vote) => `${vote.strategy}: ${vote.signal}${typeof vote.score === "number" ? ` score ${Math.round(vote.score * 100)}%` : ""}`),
+    gates: order?.gates.map((gate) => `${gate.layer}: ${gate.status} - ${gate.detail}`) ?? [],
+    failedGates: order?.failedGates ?? [],
+    summary: order?.summary,
+  };
+}
+
+function buildOrderEvidenceSnapshot(
+  side: TradeHistoryRow["side"],
+  quantity: number,
+  executionPrice: number,
+  mode: TradingWindowMode,
+  options: { closedLotId?: string; submitMode?: OrderEvidenceSnapshot["submitMode"]; trigger?: string } = {},
+): OrderEvidenceSnapshot {
+  const latest = latestExecutionCandleForMode(mode);
+  const order = targetOrderForMode(mode);
+  const lot = options.closedLotId ? openOrderLots(mode).find((item) => item.id === options.closedLotId) : null;
+  const sellTemplate = lot && latest ? lotOrderTemplate(lot, latest.close, mode) : null;
+  const submitMode = options.submitMode ?? (automaticSubmitInFlight ? "Automatic" : "Manual");
+  const backtest =
+    mode === "meta"
+      ? null
+      : mode === "confidence" || mode === "regime"
+      ? compactBacktestEvidence(confidenceBacktestResult, mode === "regime" ? "Regime backtest" : "WCA backtest")
+      : mode === "weighted"
+        ? null
+        : compactBacktestEvidence(state.algoBacktestResult, "Voting Ensemble backtest");
+  return {
+    algorithm: mode,
+    algorithmLabel: algorithmDisplayName(mode),
+    submitMode,
+    trigger: options.trigger ?? `${submitMode} ${side}`,
+    capturedAt: new Date().toISOString(),
+    market: {
+      status: state.marketStatus,
+      symbol: state.symbol,
+      timeframe: state.timeframe,
+      feed: state.feed,
+      source: state.source,
+      ...(latest
+        ? {
+            latest: {
+              timestamp: latest.timestamp,
+              open: latest.open,
+              high: latest.high,
+              low: latest.low,
+              close: latest.close,
+              volume: latest.volume,
+            },
+          }
+        : {}),
+    },
+    execution: {
+      side,
+      quantity,
+      price: executionPrice,
+      notional: roundNumber(quantity * executionPrice, 2),
+      ...(options.closedLotId ? { closedLotId: options.closedLotId } : {}),
+    },
+    positionBefore: latest ? summarizePositionFromTradeHistory(latest.close, latest.close, mode) : null,
+    settings: compactTradingSettings(tradingSettingsForMode(mode)),
+    targetOrder: compactTargetOrder(order),
+    sellSetup: sellTemplate,
+    backtest,
+    mlArtifact: mlArtifactEvidence(),
+    decision: decisionEvidence(mode, order),
+  };
+}
+
+function appendTradeHistory(
+  side: TradeHistoryRow["side"],
+  quantity: number,
+  tradePrice: number,
+  closedLotId?: string,
+  mode: TradingWindowMode = state.tradingWindowMode,
+  options: { submitMode?: OrderEvidenceSnapshot["submitMode"]; trigger?: string } = {},
+) {
+  if (!canSubmitTrades()) {
+    return;
+  }
   const executionPrice = Number.isFinite(tradePrice) && tradePrice > 0 ? tradePrice : 0;
   const requestedQuantity = Math.max(0, Math.floor(Number(quantity) || 0));
   const cappedQuantity =
@@ -7316,9 +9807,16 @@ function appendTradeHistory(side: TradeHistoryRow["side"], quantity: number, tra
     notional: cappedQuantity * executionPrice,
     recordedAt: new Date().toISOString(),
     ...(closedLotId ? { closedLotId } : {}),
+    evidence: buildOrderEvidenceSnapshot(side, cappedQuantity, executionPrice, mode, {
+      closedLotId,
+      submitMode: options.submitMode,
+      trigger: options.trigger,
+    }),
   };
   setTradingLedger(mode, [row, ...tradeHistoryForMode(mode)].slice(0, 50));
   seedOrderControlsFromTargetOrder(row, mode);
+  void saveBrowserStorageSnapshot("trade-history-update");
+  void maybeSaveDecisionSnapshot("paper-trade-update");
 }
 
 function normalizedTradeHistoryForMode(mode: TradingWindowMode) {
@@ -7518,6 +10016,8 @@ function resetHoverState() {
 function setAlgoTab(tab: AlgoTab) {
   const weighted = tab === "weighted";
   const confidence = tab === "confidence";
+  const regime = tab === "regime";
+  const meta = tab === "meta";
   state.algoTab = tab;
   saveUiState();
   algoVotingEnsembleTabButton.classList.toggle("active", tab === "voting");
@@ -7529,12 +10029,24 @@ function setAlgoTab(tab: AlgoTab) {
   algoConfidenceAggregationTabButton.classList.toggle("active", confidence);
   algoConfidenceAggregationTabButton.setAttribute("aria-selected", String(confidence));
   algoConfidenceAggregationPanel.hidden = !confidence;
-  setTradingWindowMode(confidence ? "confidence" : weighted ? "weighted" : "ensemble");
+  algoRegimeSelectionTabButton.classList.toggle("active", regime);
+  algoRegimeSelectionTabButton.setAttribute("aria-selected", String(regime));
+  algoRegimeSelectionPanel.hidden = !regime;
+  algoMetaStrategyTabButton.classList.toggle("active", meta);
+  algoMetaStrategyTabButton.setAttribute("aria-selected", String(meta));
+  algoMetaStrategyPanel.hidden = !meta;
+  setTradingWindowMode(meta ? "meta" : regime ? "regime" : confidence ? "confidence" : weighted ? "weighted" : "ensemble");
   if (weighted) {
     updateWeightedVotingPanel();
   }
   if (confidence) {
     updateConfidenceAggregationPanel();
+  }
+  if (regime) {
+    scheduleRegimeSelectionPanelUpdate();
+  }
+  if (meta) {
+    updateMetaStrategyPanel();
   }
 }
 
@@ -7551,6 +10063,9 @@ function updateAlgorithmPanel(_candles: Candle[]) {
   algoFinalSignal.className = `algo-final ${finalSignal.toLowerCase()}`;
   const excludedVotes = votes.length - eligibleVotes.length;
   updateConfidenceAggregationPanel();
+  updateWeightedVotingPanel();
+  updateRegimeSelectionPanel();
+  updateMetaStrategyPanel();
   algoVoteCounts.innerHTML = [
     ["Eligible Buy", buyVotes, "buy"],
     ["Eligible Sell", sellVotes, "sell"],
@@ -7570,7 +10085,7 @@ function updateAlgorithmPanel(_candles: Candle[]) {
   renderAlgoVotesExpandedState();
   if (state.algoBacktestTimeframe === "Trading") {
     algoTableWrap.hidden = true;
-    algoTradePlan.innerHTML = "";
+    setAlgoTradePlanContent("");
     algoTradesTable.innerHTML = "";
     const tradingResults = renderTradingRagResults();
     tradingSettingsMount.hidden = false;
@@ -7579,25 +10094,59 @@ function updateAlgorithmPanel(_candles: Candle[]) {
     });
     algoResultsBody.innerHTML = tradingResults;
     updateQuoteCard(currentCandle());
-    updateWeightedVotingPanel();
     maybeAutoSubmitTargetOrder();
     maybeAutoSubmitOpenOrderControls();
+    void maybeSaveDecisionSnapshot("trading-panel");
     return;
   }
-  state.currentTargetOrder = null;
-  state.currentWeightedTargetOrder = null;
-  tradingSettingsMount.hidden = true;
-  tradingSettingsMount.innerHTML = "";
-  tradingSettingsMountKey = "";
+  tradingSettingsMount.hidden = false;
+  if (state.tradingRagStatus === "idle") {
+    void loadTradingRag();
+  }
+  const manualOrder = syncCurrentTargetOrderFromTradingRag();
+  updateTradingSettingsMount(manualOrder ?? undefined, {
+    preserveExisting: state.tradingRagStatus === "loading",
+  });
   const backtestCandles =
     state.algoBacktestCandles.length || state.algoBacktestTimeframe !== state.timeframe
       ? state.algoBacktestCandles
       : state.candles;
-  const backtest = state.algoBacktestResult ?? backtestVotingEnsembleLastDay(backtestCandles, state.algoBacktestTimeframe);
-  algoTableWrap.hidden = false;
-  algoTradePlan.innerHTML = renderAlgoTradePlan(finalSignal, votes, backtest);
-  algoTradesTable.innerHTML = renderBacktestTrades(backtest.trades);
+  const backtest = compactVotingBacktestForDisplay(
+    state.algoBacktestResult ?? backtestVotingEnsembleLastDay(backtestCandles, state.algoBacktestTimeframe),
+    { preserveTrades: state.algoBacktestTimeframe === "1Min" || state.algoBacktestTimeframe === "5Min" },
+  );
+  algoTableWrap.hidden = true;
+  setAlgoTradePlanContent(renderAlgoTradePlan(finalSignal, votes, backtest));
+  renderAlgoIntradayTrades(backtest);
   algoResultsBody.innerHTML = renderAlgoResults(finalSignal, buyVotes, sellVotes, holdVotes, votes, backtest);
+  maybeAutoSubmitTargetOrder();
+  maybeAutoSubmitOpenOrderControls();
+  void maybeSaveDecisionSnapshot("algorithm-panel");
+}
+
+function renderAlgoIntradayTrades(backtest: BacktestResult) {
+  if (state.algoBacktestTimeframe !== "1Min" && state.algoBacktestTimeframe !== "5Min") {
+    algoIntradayTradesSummary.innerHTML = "";
+    algoIntradayTradesTable.innerHTML = renderBacktestTrades([]);
+    return;
+  }
+  const totalTrades = backtest.totalTrades ?? backtest.trades.length;
+  const winRate = totalTrades ? formatProbability(backtest.winners / totalTrades) : "0%";
+  const rangeLabel = backtest.rangeLabel ?? backtest.dateLabel;
+  algoIntradayTradesSummary.innerHTML = `
+    <span>Backtest: <strong>${escapeHtml(algoBacktestTimeframeLabel(backtest.timeframe))}</strong></span>
+    <span>Range: ${escapeHtml(rangeLabel)}</span>
+    <span>Trades: ${totalTrades} · Win rate: ${winRate}</span>
+    <span>P/L: <strong class="${backtest.totalPnl >= 0 ? "positive" : "negative"}">${signedCurrency(backtest.totalPnl)}</strong> (${signed(backtest.totalReturnPercent)}%)</span>
+  `;
+  algoIntradayTradesTable.innerHTML = renderBacktestTrades(backtest.trades);
+}
+
+function setAlgoTradePlanContent(html: string) {
+  const hasContent = html.trim().length > 0;
+  algoTradePlanTitle.hidden = !hasContent;
+  algoTradePlan.hidden = !hasContent;
+  algoTradePlan.innerHTML = html;
 }
 
 function isEligibleStrategyVote(vote: AlgoVote) {
@@ -7653,13 +10202,1167 @@ function renderConfidenceRequirementsExpandedState() {
   confidenceRequirementsToggleIcon.textContent = state.confidenceRequirementsExpanded ? "-" : "+";
 }
 
+function renderRegimeStrategiesExpandedState() {
+  regimeStrategiesToggle.setAttribute("aria-expanded", String(state.regimeStrategiesExpanded));
+  regimeStrategiesList.hidden = !state.regimeStrategiesExpanded;
+  regimeStrategiesList.classList.toggle("expanded", state.regimeStrategiesExpanded);
+  regimeStrategiesToggleIcon.textContent = state.regimeStrategiesExpanded ? "-" : "+";
+}
+
+function renderRegimeIndicatorsExpandedState() {
+  regimeIndicatorsToggle.setAttribute("aria-expanded", String(state.regimeIndicatorsExpanded));
+  regimeFeatureGrid.hidden = !state.regimeIndicatorsExpanded;
+  regimeFeatureGrid.classList.toggle("expanded", state.regimeIndicatorsExpanded);
+  regimeIndicatorsToggleIcon.textContent = state.regimeIndicatorsExpanded ? "-" : "+";
+}
+
+function renderMetaStrategiesExpandedState() {
+  metaStrategiesToggle.setAttribute("aria-expanded", String(state.metaStrategiesExpanded));
+  metaStrategiesPanel.hidden = !state.metaStrategiesExpanded;
+  metaStrategiesPanel.classList.toggle("expanded", state.metaStrategiesExpanded);
+  metaStrategiesToggleIcon.textContent = state.metaStrategiesExpanded ? "-" : "+";
+}
+
+function renderMetaChecksExpandedState() {
+  metaChecksToggle.setAttribute("aria-expanded", String(state.metaChecksExpanded));
+  metaGateList.hidden = !state.metaChecksExpanded;
+  metaGateList.classList.toggle("expanded", state.metaChecksExpanded);
+  metaChecksToggleIcon.textContent = state.metaChecksExpanded ? "-" : "+";
+}
+
+async function loadMetaStrategyTrainingStatus(options: { train?: boolean } = {}) {
+  state.metaTrainingStatus = "loading";
+  state.metaTrainingWarning = "";
+  renderMetaMlReadiness();
+  try {
+    const response = await fetch(`${API_BASE}${options.train ? "/api/meta-strategy/train-baselines" : "/api/meta-strategy/training-status"}`, {
+      method: options.train ? "POST" : "GET",
+      headers: options.train ? { "Content-Type": "application/json" } : undefined,
+      body: options.train ? JSON.stringify({ symbol: state.symbol, minRows: 30 }) : undefined,
+    });
+    if (!response.ok) {
+      if (response.status === 404) {
+        state.metaTrainingResult = {
+          status: "endpoint_unavailable",
+          trusted: false,
+          message: options.train
+            ? "Train endpoint is unavailable in the running backend. Restart the backend so the Meta-Strategy training route is loaded."
+            : "Training status endpoint is unavailable in the running backend. Restart the backend so the Meta-Strategy status route is loaded.",
+        };
+        state.metaTrainingStatus = "ready";
+        renderMetaMlReadiness();
+        return;
+      }
+      throw new Error(await readableResponseError(response));
+    }
+    state.metaTrainingResult = (await response.json()) as MetaStrategyTrainingStatus;
+    state.metaTrainingStatus = "ready";
+  } catch (error) {
+    state.metaTrainingStatus = "error";
+    state.metaTrainingWarning = error instanceof Error ? error.message : "Meta-Strategy training status unavailable.";
+  }
+  renderMetaMlReadiness();
+}
+
+async function readableResponseError(response: Response) {
+  const text = await response.text();
+  if (!text) {
+    return `${response.status} ${response.statusText}`.trim();
+  }
+  try {
+    const parsed = JSON.parse(text) as { detail?: unknown; message?: unknown };
+    const detail = parsed.detail ?? parsed.message;
+    return typeof detail === "string" ? detail : JSON.stringify(parsed);
+  } catch {
+    return text;
+  }
+}
+
+function renderMetaMlReadiness() {
+  const result = state.metaTrainingResult;
+  const metrics = result?.metrics ?? {};
+  const trusted = Boolean(metrics.trusted ?? result?.trusted);
+  const status = state.metaTrainingStatus === "loading" ? "loading" : state.metaTrainingStatus === "error" ? "error" : trusted ? "trusted" : "untrusted";
+  metaMlReadinessBox.dataset.status = status;
+
+  if (state.metaTrainingStatus === "loading") {
+    metaMlReadinessBox.innerHTML = `
+      <div class="meta-ml-readiness-head">
+        <span>ML Selector Readiness</span>
+        <strong>Loading</strong>
+      </div>
+      <small>Reading latest Meta-Strategy training results.</small>
+    `;
+    return;
+  }
+
+  if (state.metaTrainingStatus === "error") {
+    metaMlReadinessBox.innerHTML = `
+      <div class="meta-ml-readiness-head">
+        <span>ML Selector Readiness</span>
+        <strong>Error</strong>
+      </div>
+      <small>${escapeHtml(state.metaTrainingWarning || "Training status unavailable.")}</small>
+      <div class="meta-ml-readiness-actions">
+        <button type="button" data-meta-training-action="refresh">Refresh</button>
+        <button type="button" data-meta-training-action="train">Train</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (!result || result.status === "not_trained" || result.status === "endpoint_unavailable") {
+    metaMlReadinessBox.innerHTML = `
+      <div class="meta-ml-readiness-head">
+        <span>ML Selector Readiness</span>
+        <strong>${result?.status === "endpoint_unavailable" ? "Backend update needed" : "Not trained"}</strong>
+      </div>
+      <div class="meta-ml-readiness-grid">
+        ${renderMetaTrainingStatusTile("Status", result?.status === "endpoint_unavailable" ? "Route unavailable" : "No artifact", result?.message ?? "No training result has been created yet.")}
+        ${renderMetaTrainingStatusTile("Result", "Baseline active", "No trusted ML selector is available yet.")}
+      </div>
+      <div class="meta-ml-readiness-actions">
+        <button type="button" data-meta-training-action="refresh">Refresh</button>
+        <button type="button" data-meta-training-action="train">Train</button>
+      </div>
+    `;
+    return;
+  }
+
+  const bestModel = String(metrics.bestModel ?? result.bestModel ?? "NA");
+  const bestModelMetric = (metrics.models ?? {})[bestModel] ?? {};
+  const bestBaseline = bestBaselineMetric(metrics.baselines ?? {});
+  const statusLabel =
+    trusted
+      ? "Ready"
+      : result.status === "insufficient_class_balance"
+        ? "Class balance needed"
+        : result.status === "insufficient_data"
+          ? "More labels needed"
+          : "Keep baseline";
+  const rowDetail =
+    result.featureCount === undefined || result.featureCount === null
+      ? `${result.trainRows ?? 0} train / ${result.testRows ?? 0} test / not trained`
+      : `${result.trainRows ?? 0} train / ${result.testRows ?? 0} test / ${result.featureCount} features`;
+  metaMlReadinessBox.innerHTML = `
+    <div class="meta-ml-readiness-head">
+      <span>ML Selector Readiness</span>
+      <strong>${trusted ? "Trusted" : "Not trusted"}</strong>
+    </div>
+    <div class="meta-ml-readiness-grid">
+      ${renderMetaTrainingStatusTile("Status", statusLabel, trusted ? "Best ML model beat every baseline." : result.message ?? "ML has not beaten every baseline yet.")}
+      ${renderMetaTrainingStatusTile("Best ML", metaTrainingLabel(bestModel), metricSummary(bestModelMetric))}
+      ${renderMetaTrainingStatusTile("Best Baseline", metaTrainingLabel(bestBaseline.name), metricSummary(bestBaseline.metric))}
+      ${renderMetaTrainingStatusTile("Rows", `${result.rows ?? 0} total`, rowDetail)}
+    </div>
+    ${renderMetaTrainingScoreTable("ML Models", metrics.models ?? {})}
+    ${renderMetaTrainingScoreTable("Baselines", metrics.baselines ?? {})}
+    ${renderMetaTrainingUnavailableModels(metrics.unavailableModels ?? {})}
+    <small>${escapeHtml(renderMetaTrainingLabels(result))}</small>
+    <div class="meta-ml-readiness-actions">
+      <button type="button" data-meta-training-action="refresh">Refresh</button>
+      <button type="button" data-meta-training-action="train">Train</button>
+    </div>
+  `;
+}
+
+function renderMetaTrainingStatusTile(label: string, value: string, detail: string) {
+  return `
+    <div>
+      <b>${escapeHtml(label)}</b>
+      <strong>${escapeHtml(value)}</strong>
+      <span>${escapeHtml(detail)}</span>
+    </div>
+  `;
+}
+
+function renderMetaTrainingScoreTable(title: string, rows: Record<string, MetaStrategyTrainingMetric>) {
+  const entries = Object.entries(rows);
+  if (!entries.length) {
+    return "";
+  }
+  return `
+    <div class="meta-ml-score-table">
+      <b>${escapeHtml(title)}</b>
+      ${entries
+        .map(
+          ([name, metric]) => `
+            <span>${escapeHtml(metaTrainingLabel(name))}</span>
+            <strong>${escapeHtml(metricSummary(metric))}</strong>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderMetaTrainingUnavailableModels(rows: Record<string, string>) {
+  const entries = Object.entries(rows);
+  if (!entries.length) {
+    return "";
+  }
+  return `
+    <div class="meta-ml-score-table">
+      <b>Unavailable Models</b>
+      ${entries
+        .map(
+          ([name, reason]) => `
+            <span>${escapeHtml(metaTrainingLabel(name))}</span>
+            <strong>${escapeHtml(reason)}</strong>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function bestBaselineMetric(rows: Record<string, MetaStrategyTrainingMetric>) {
+  return Object.entries(rows).reduce(
+    (best, [name, metric]) => {
+      const score = metricTrustScore(metric);
+      const bestScore = metricTrustScore(best.metric);
+      return score > bestScore ? { name, metric } : best;
+    },
+    { name: "NA", metric: {} as MetaStrategyTrainingMetric },
+  );
+}
+
+function metricSummary(metric: MetaStrategyTrainingMetric) {
+  const trustScore = metricTrustScore(metric);
+  const directionalScore = metricDirectionalMacroF1(metric);
+  const trust = Number.isFinite(trustScore) && trustScore >= 0 ? formatProbability(trustScore) : "NA";
+  const directionalF1 = Number.isFinite(directionalScore) && directionalScore >= 0 ? formatProbability(directionalScore) : "NA";
+  const macroF1 = typeof metric.macroF1 === "number" ? formatProbability(metric.macroF1) : "NA";
+  const accuracy = typeof metric.accuracy === "number" ? formatProbability(metric.accuracy) : "NA";
+  return `Trust ${trust} / Dir F1 ${directionalF1} / F1 ${macroF1} / Acc ${accuracy}`;
+}
+
+function metricTrustScore(metric: MetaStrategyTrainingMetric) {
+  if (typeof metric.trustScore === "number") {
+    return metric.trustScore;
+  }
+  const directionalF1 = metricDirectionalMacroF1(metric);
+  const macroF1 = typeof metric.macroF1 === "number" ? metric.macroF1 : -1;
+  const nonHoldRecall = metricNonHoldRecall(metric);
+  if (directionalF1 < 0 || macroF1 < 0 || nonHoldRecall < 0) {
+    return macroF1;
+  }
+  return 0.45 * directionalF1 + 0.35 * macroF1 + 0.2 * nonHoldRecall;
+}
+
+function metricDirectionalMacroF1(metric: MetaStrategyTrainingMetric) {
+  if (typeof metric.directionalMacroF1 === "number") {
+    return metric.directionalMacroF1;
+  }
+  const buyF1 = metricClassValue(metric, "BUY", "f1");
+  const sellF1 = metricClassValue(metric, "SELL", "f1");
+  if (buyF1 === null && sellF1 === null) {
+    return -1;
+  }
+  return ((buyF1 ?? 0) + (sellF1 ?? 0)) / 2;
+}
+
+function metricNonHoldRecall(metric: MetaStrategyTrainingMetric) {
+  if (typeof metric.nonHoldRecall === "number") {
+    return metric.nonHoldRecall;
+  }
+  const recalls = (["BUY", "SELL"] as const)
+    .map((label) => metricClassValue(metric, label, "recall"))
+    .filter((value): value is number => value !== null);
+  if (!recalls.length) {
+    return -1;
+  }
+  return recalls.reduce((sum, value) => sum + value, 0) / recalls.length;
+}
+
+function metricClassValue(metric: MetaStrategyTrainingMetric, label: "BUY" | "SELL" | "HOLD", key: "f1" | "recall") {
+  const perClass = metric.perClass;
+  if (!perClass || typeof perClass !== "object") {
+    return null;
+  }
+  const classMetric = (perClass as Record<string, unknown>)[label];
+  if (!classMetric || typeof classMetric !== "object") {
+    return null;
+  }
+  const value = (classMetric as Record<string, unknown>)[key];
+  return typeof value === "number" ? value : null;
+}
+
+function metaTrainingLabel(value: string) {
+  return value.replaceAll("_", " ");
+}
+
+function renderMetaTrainingLabels(result: MetaStrategyTrainingStatus) {
+  const labels = result.trainingLabelCounts ?? result.labelCounts ?? {};
+  const validationLabels = result.validationLabelCounts;
+  const trainedAt = result.trainedAt ? `Trained ${formatDate(result.trainedAt)}` : "No trained timestamp";
+  const validationText = validationLabels
+    ? ` - Strict B ${validationLabels.BUY ?? 0} / S ${validationLabels.SELL ?? 0} / H ${validationLabels.HOLD ?? 0}`
+    : "";
+  return `${trainedAt} - Training labels B ${labels.BUY ?? 0} / S ${labels.SELL ?? 0} / H ${labels.HOLD ?? 0}${validationText}`;
+}
+
+function scheduleRegimeSelectionPanelUpdate() {
+  if (pendingRegimeSelectionUpdateFrame !== undefined) {
+    window.cancelAnimationFrame(pendingRegimeSelectionUpdateFrame);
+  }
+  pendingRegimeSelectionUpdateFrame = window.requestAnimationFrame(() => {
+    pendingRegimeSelectionUpdateFrame = undefined;
+    if (!algoRegimeSelectionPanel.hidden) {
+      updateRegimeSelectionPanel();
+    }
+  });
+}
+
+function updateRegimeSelectionPanel() {
+  const result = calculateRegimeSelection();
+  regimeFinalSignal.textContent = result.signal;
+  regimeFinalSignal.className = `algo-final ${regimeSignalClass(result.signal)}`;
+  regimeScoreGrid.innerHTML = renderRegimeScoreGrid(result);
+  regimeSummary.innerHTML = renderRegimeSummary(result);
+  if (!isEditingWithin(regimeTradingSettingsMount)) {
+    regimeTradingSettingsMount.innerHTML = renderRegimeTradingSettingsPanel(result);
+  }
+  if (state.regimeIndicatorsExpanded) {
+    regimeFeatureGrid.innerHTML = renderRegimeFeatureGrid(result.features);
+  }
+  regimeIndicatorsToggleMeta.textContent = `${result.features.length} indicators`;
+  regimeStrategiesToggleMeta.textContent = `${result.selectedStrategyCount} selected / ${regimeSelectionStrategies.length} available`;
+  if (state.regimeStrategiesExpanded) {
+    regimeStrategiesList.innerHTML = renderRegimeStrategyList(result);
+  }
+  renderRegimeIndicatorsExpandedState();
+  renderRegimeStrategiesExpandedState();
+  updateQuoteCard(currentCandle());
+  maybeAutoSubmitRegimeTargetOrder();
+  maybeAutoSubmitOpenOrderControls();
+}
+
+function calculateRegimeSelection(): RegimeSelectionResult {
+  const market = confidenceMarketSnapshot();
+  if (!market) {
+    return emptyRegimeSelectionResult("Waiting for regular-session candles");
+  }
+
+  const rawCondition = rawRegimeConditionFromMarket(market);
+  const confirmation = confirmedRegimeCondition(market, rawCondition);
+  const features = rawCondition.features;
+  const noTradeReasons = rawCondition.noTradeReasons;
+  const primaryTrend = confirmation.condition.primaryTrend;
+  const volatility = confirmation.condition.volatility;
+  const opportunity = confirmation.condition.opportunity;
+  const selectedSlugs = regimeSelectedStrategySlugs(primaryTrend, volatility, opportunity);
+  const selectedSlugSet = new Set(selectedSlugs);
+  const selectedStrategies: RegimeSelectedStrategy[] = [];
+  const skippedStrategies: Array<{ name: string; reason: string }> = [];
+
+  regimeSelectionStrategies.forEach((strategy) => {
+    if (!selectedSlugSet.has(strategy.slug)) {
+      skippedStrategies.push({ name: strategy.name, reason: regimeStrategyAvoidReason(strategy.slug, primaryTrend, volatility, opportunity) });
+      return;
+    }
+
+    const raw = strategy.signal(market);
+    const confidence = clampNumber(raw.confidence, 0, 1);
+    const contractSignal = confidenceContractSignal(raw.signal);
+    const direction = confidenceSignalDirection(contractSignal);
+    const effectiveWeight = roundNumber(Math.max(0, strategy.baseWeight * confidenceSystemWeightMultiplier(strategy, contractSignal, market)), 4);
+    selectedStrategies.push({
+      strategy: strategy.slug,
+      signal: contractSignal,
+      confidence,
+      base_weight: strategy.baseWeight,
+      effective_weight: effectiveWeight,
+      direction,
+      reason: raw.reason,
+      key: strategy.key,
+      name: strategy.name,
+      contribution: roundNumber(direction * effectiveWeight * confidence, 4),
+      selected: true,
+      selectorReason: regimeStrategySelectorReason(strategy.slug, primaryTrend, volatility, opportunity),
+    });
+  });
+
+  const activeStrategies = selectedStrategies.filter((strategy) => strategy.confidence > 0);
+  const aggregation = aggregateRegimeStrategyScores(selectedStrategies);
+  const buyScore = aggregation.scores.buy;
+  const sellScore = aggregation.scores.sell;
+  const holdScore = aggregation.scores.hold;
+  const secondBestScore = Math.max(sellScore, holdScore);
+  const scoreEdge = roundNumber(buyScore - secondBestScore, 4);
+  const conditionConfidence = confirmation.condition.confidence;
+  const normalizedNetScore = roundNumber(buyScore - sellScore, 4);
+  const tradeBlockers = regimeTradeBlockers(aggregation.finalSignal, aggregation.scores, scoreEdge, conditionConfidence, opportunity, confirmation.held);
+  const tradeAllowed = tradeBlockers.length === 0;
+  const signal: RegimeDecisionSignal =
+    opportunity === "No-trade"
+      ? "No-trade"
+      : tradeAllowed && aggregation.finalSignal === "buy"
+        ? "Buy"
+        : aggregation.finalSignal === "sell"
+          ? "Sell"
+          : "Hold";
+
+  return {
+    signal,
+    rawCondition: rawCondition.key,
+    confirmedCondition: confirmation.condition.key,
+    confirmationCount: confirmation.confirmationCount,
+    conditionHeld: confirmation.held,
+    primaryTrend,
+    volatility,
+    opportunity,
+    confidence: conditionConfidence,
+    aggregateSignal: aggregation.finalSignal,
+    scores: aggregation.scores,
+    buyScore,
+    sellScore,
+    holdScore,
+    secondBestScore,
+    scoreEdge,
+    normalizedNetScore,
+    tradeAllowed,
+    tradeBlockers,
+    activeStrategyCount: activeStrategies.length,
+    selectedStrategyCount: selectedStrategies.length,
+    features: features.display,
+    selectedStrategies,
+    skippedStrategies,
+    reasons: [
+      `${primaryTrend} + ${volatility} + ${opportunity}`,
+      confirmation.held
+        ? `Raw condition ${rawCondition.key} is waiting for 2-of-3 confirmation or 65% confidence before switching`
+        : `Condition confirmed: ${confirmation.confirmationCount}/3 recent candles match or confidence is strong`,
+      `${selectedStrategies.length} strategies selected before voting; aggregate winner ${aggregation.finalSignal}`,
+      `Normalized scores buy ${buyScore.toFixed(2)}, sell ${sellScore.toFixed(2)}, hold ${holdScore.toFixed(2)}; edge ${scoreEdge.toFixed(2)}`,
+    ],
+    noTradeReasons,
+  };
+}
+
+function emptyRegimeSelectionResult(reason: string): RegimeSelectionResult {
+  return {
+    signal: "No-trade",
+    aggregateSignal: "hold",
+    scores: { buy: 0, sell: 0, hold: 1 },
+    rawCondition: "No-trade",
+    confirmedCondition: "No-trade",
+    confirmationCount: 0,
+    conditionHeld: false,
+    primaryTrend: "Sideways / range-bound",
+    volatility: "Normal volatility",
+    opportunity: "No-trade",
+    confidence: 0,
+    buyScore: 0,
+    sellScore: 0,
+    holdScore: 1,
+    secondBestScore: 0,
+    scoreEdge: 1,
+    normalizedNetScore: 0,
+    tradeAllowed: false,
+    tradeBlockers: [reason],
+    activeStrategyCount: 0,
+    selectedStrategyCount: 0,
+    features: [{ name: "Market data", value: reason, status: "na" }],
+    selectedStrategies: [],
+    skippedStrategies: regimeSelectionStrategies.map((strategy) => ({ name: strategy.name, reason })),
+    reasons: [reason],
+    noTradeReasons: [reason],
+  };
+}
+
+function regimeSelectionFeatures(market: ConfidenceMarket) {
+  const ema20Series = exponentialMovingAverageSeries(market.closes, 20);
+  const ema20 = lastDefined(ema20Series);
+  const ema50 = lastDefined(exponentialMovingAverageSeries(market.closes, 50));
+  const structure = marketStructureContext(market.candles, market.vwap);
+  const priorDay = priorDayRangeForRegimeSelection(market.latest.timestamp);
+  const vwapDistance = (market.latest.close - market.vwap) / Math.max(market.vwap, 0.01);
+  const recentRange = recentRangeForRegimeSelection(market.candles);
+  const openingBreakUp = market.latest.close > market.openingRange.high;
+  const openingBreakDown = market.latest.close < market.openingRange.low;
+  const priorDayBreakUp = priorDay ? market.latest.close > priorDay.high : false;
+  const priorDayBreakDown = priorDay ? market.latest.close < priorDay.low : false;
+  const ema20Slope = emaSlopeFromSeries(ema20Series, market.latest.close);
+  const higherHighAndHigherLow = Boolean(structure?.higherHigh && structure.higherLow);
+  const lowerHighAndLowerLow = Boolean(structure?.lowerHigh && structure.lowerLow);
+  const macdHistogram = market.macd?.histogram ?? null;
+  const atrPercent = market.atr.atr1m !== null ? market.atr.atr1m / Math.max(market.latest.close, 0.01) : market.atr.atrPercent;
+  const atrHistory = oneMinuteAtrPercentHistoryForRegimeSelection(market);
+  const atrPercentile = atrHistory.length && atrPercent ? percentileRank(atrHistory, atrPercent) : null;
+  const atrExpanding = atrHistory.length >= 6 && atrPercent > meanNumber(atrHistory.slice(-6));
+  const bearishRejectionCandle = isBearishRejectionCandle(market.latest);
+  const bullishRejectionCandle = isBullishRejectionCandle(market.latest);
+  const recentVwapCrosses = recentLevelCrosses(market.candles.map((candle) => candle.close), market.vwap, 14);
+  const priceChoppingAroundVwap = recentVwapCrosses >= 4 && Math.abs(vwapDistance) < 0.0015;
+  const bullScore =
+    (market.latest.close > market.vwap ? 1 : 0) +
+    (ema20 !== null && market.latest.close > ema20 ? 1 : 0) +
+    (ema20 !== null && ema50 !== null && ema20 > ema50 ? 1 : 0) +
+    (ema20Slope > 0 ? 1 : 0) +
+    (higherHighAndHigherLow ? 1 : 0) +
+    (macdHistogram !== null && macdHistogram > 0 ? 1 : 0);
+  const bearScore =
+    (market.latest.close < market.vwap ? 1 : 0) +
+    (ema20 !== null && market.latest.close < ema20 ? 1 : 0) +
+    (ema20 !== null && ema50 !== null && ema20 < ema50 ? 1 : 0) +
+    (ema20Slope < 0 ? 1 : 0) +
+    (lowerHighAndLowerLow ? 1 : 0) +
+    (macdHistogram !== null && macdHistogram < 0 ? 1 : 0);
+  return {
+    ema20,
+    ema50,
+    ema20Slope,
+    vwap: market.vwap,
+    adx: market.adx?.adx ?? null,
+    atr: market.atr.atr1m,
+    atrPercent,
+    atrPercentile,
+    atrExpanding,
+    rsi: market.rsi,
+    macdHistogram,
+    bullScore,
+    bearScore,
+    volumeRatio: market.volume.relativeVolume,
+    structure,
+    higherHigh: Boolean(structure?.higherHigh),
+    higherLow: Boolean(structure?.higherLow),
+    lowerHigh: Boolean(structure?.lowerHigh),
+    lowerLow: Boolean(structure?.lowerLow),
+    higherHighAndHigherLow,
+    lowerHighAndLowerLow,
+    openingRangeHigh: market.openingRange.high,
+    openingRangeLow: market.openingRange.low,
+    recentRangeHigh: recentRange.high,
+    recentRangeLow: recentRange.low,
+    priorDayHigh: priorDay?.high ?? null,
+    priorDayLow: priorDay?.low ?? null,
+    distanceFromVwap: vwapDistance,
+    openingBreakUp,
+    openingBreakDown,
+    priorDayBreakUp,
+    priorDayBreakDown,
+    bearishRejectionCandle,
+    bullishRejectionCandle,
+    priceChoppingAroundVwap,
+    spreadTooWide: market.spreadLiquidity.spreadTooWide,
+    volumeTooLow: market.spreadLiquidity.volumeTooLow || market.volume.relativeVolume < 0.55,
+    display: [
+      regimeFeature("Bull / Bear score", `${bullScore} / ${bearScore}`, Math.abs(bullScore - bearScore) <= 1 ? "warn" : "ok"),
+      regimeFeature("EMA 20", ema20 === null ? "NA" : price(ema20), ema20 === null ? "na" : "ok"),
+      regimeFeature("EMA 50", ema50 === null ? "NA" : price(ema50), ema50 === null ? "na" : "ok"),
+      regimeFeature("EMA20 slope", formatProbability(ema20Slope), ema20Slope === 0 ? "warn" : "ok"),
+      regimeFeature("VWAP", price(market.vwap), "ok"),
+      regimeFeature("ADX 14", market.adx === null ? "NA" : market.adx.adx.toFixed(1), market.adx === null ? "na" : market.adx.adx >= 20 ? "ok" : "warn"),
+      regimeFeature("ATR %ile", atrPercentile === null ? "NA" : formatProbability(atrPercentile), atrPercentile === null ? "na" : atrPercentile > 0.7 || atrPercentile < 0.3 ? "warn" : "ok"),
+      regimeFeature("ATR expanding", atrExpanding ? "Yes" : "No", atrExpanding ? "ok" : "warn"),
+      regimeFeature("RSI 14", market.rsi === null ? "NA" : market.rsi.toFixed(1), market.rsi === null ? "na" : market.rsi <= 30 || market.rsi >= 70 ? "warn" : "ok"),
+      regimeFeature("MACD histogram", macdHistogram === null ? "NA" : macdHistogram.toFixed(3), macdHistogram === null ? "na" : macdHistogram === 0 ? "warn" : "ok"),
+      regimeFeature("Volume ratio", `${market.volume.relativeVolume.toFixed(2)}x`, market.volume.relativeVolume < 0.75 ? "warn" : "ok"),
+      regimeFeature("HH+HL / LH+LL", `${higherHighAndHigherLow ? "HH+HL" : "--"} / ${lowerHighAndLowerLow ? "LH+LL" : "--"}`, structure ? "ok" : "na"),
+      regimeFeature("Recent range", `${price(recentRange.low)} - ${price(recentRange.high)}`, "ok"),
+      regimeFeature("Prior day H/L", priorDay ? `${price(priorDay.low)} - ${price(priorDay.high)}` : "NA", priorDay ? "ok" : "na"),
+      regimeFeature("Distance from VWAP", formatProbability(vwapDistance), Math.abs(vwapDistance) >= 0.004 ? "warn" : "ok"),
+    ],
+  };
+}
+
+function regimeFeature(name: string, value: string, status: RegimeSelectionFeature["status"]): RegimeSelectionFeature {
+  return { name, value, status };
+}
+
+function rawRegimeConditionFromMarket(market: ConfidenceMarket) {
+  const features = regimeSelectionFeatures(market);
+  const noTradeReasons = regimeNoTradeReasons(market, features);
+  const primaryTrend = classifyRegimePrimaryTrend(market, features);
+  const volatility = classifyRegimeVolatility(features);
+  const opportunity = classifyRegimeOpportunity(market, features, primaryTrend, noTradeReasons);
+  const confidence = regimeMarketConditionConfidence(features, primaryTrend, volatility, opportunity, noTradeReasons);
+  return {
+    features,
+    noTradeReasons,
+    primaryTrend,
+    volatility,
+    opportunity,
+    confidence,
+    key: regimeConditionKey(primaryTrend, volatility, opportunity),
+    contextKey: regimeConditionContextKey(market),
+  };
+}
+
+function confirmedRegimeCondition(market: ConfidenceMarket, raw: ReturnType<typeof rawRegimeConditionFromMarket>) {
+  if (lastConfirmedRegimeCondition?.contextKey !== raw.contextKey) {
+    lastConfirmedRegimeCondition = null;
+  }
+
+  const confirmationCount = recentRegimeConditionKeys(market).filter((key) => key === raw.key).length;
+  const previous = lastConfirmedRegimeCondition;
+  const isSwitch = Boolean(previous && previous.key !== raw.key);
+  const switchConfirmed = !previous || !isSwitch || confirmationCount >= 2 || raw.confidence >= 0.65;
+
+  if (switchConfirmed) {
+    lastConfirmedRegimeCondition = {
+      primaryTrend: raw.primaryTrend,
+      volatility: raw.volatility,
+      opportunity: raw.opportunity,
+      confidence: raw.confidence,
+      key: raw.key,
+      contextKey: raw.contextKey,
+    };
+    return { condition: lastConfirmedRegimeCondition, confirmationCount, held: false };
+  }
+
+  return { condition: previous!, confirmationCount, held: true };
+}
+
+function recentRegimeConditionKeys(market: ConfidenceMarket) {
+  const keys: string[] = [];
+  const start = Math.max(0, market.candles.length - 3);
+  for (let index = start; index < market.candles.length; index += 1) {
+    const prefix = market.candles.slice(0, index + 1);
+    const snapshot = confidenceMarketSnapshotFromCandles(prefix, state.candles);
+    if (!snapshot) {
+      continue;
+    }
+    const condition = rawRegimeConditionFromMarket(snapshot);
+    keys.push(condition.key);
+  }
+  return keys;
+}
+
+function regimeConditionKey(primaryTrend: RegimePrimaryTrend, volatility: RegimeVolatilityState, opportunity: RegimeOpportunityState) {
+  return `${primaryTrend} + ${volatility} + ${opportunity}`;
+}
+
+function regimeConditionContextKey(market: ConfidenceMarket) {
+  return `${market.latest.symbol}|${easternDateString(market.latest.timestamp)}`;
+}
+
+function aggregateRegimeStrategyScores(strategyOutputs: RegimeSelectedStrategy[]) {
+  const scores: RegimeSelectionScores = { buy: 0, sell: 0, hold: 0 };
+  strategyOutputs.forEach((output) => {
+    const signal = output.signal;
+    const confidence = clampNumber(output.confidence, 0, 1);
+    const weight = Number.isFinite(output.effective_weight) && output.effective_weight > 0 ? output.effective_weight : 1;
+    scores[signal] += confidence * weight;
+  });
+
+  const total = scores.buy + scores.sell + scores.hold;
+  if (total > 0) {
+    scores.buy = roundNumber(scores.buy / total, 4);
+    scores.sell = roundNumber(scores.sell / total, 4);
+    scores.hold = roundNumber(scores.hold / total, 4);
+  }
+
+  const finalSignal = (Object.entries(scores).sort((left, right) => right[1] - left[1])[0]?.[0] ?? "hold") as ConfidenceStrategySignal;
+  return { finalSignal, scores };
+}
+
+function regimeMarketConditionConfidence(
+  features: ReturnType<typeof regimeSelectionFeatures>,
+  primaryTrend: RegimePrimaryTrend,
+  volatility: RegimeVolatilityState,
+  opportunity: RegimeOpportunityState,
+  noTradeReasons: string[],
+) {
+  if (opportunity === "No-trade") {
+    return roundNumber(clampNumber(0.35 - noTradeReasons.length * 0.08, 0, 0.6), 4);
+  }
+  const trendScore = Math.max(features.bullScore, features.bearScore) / 6;
+  const trendClarity = Math.abs(features.bullScore - features.bearScore) / 6;
+  const adxConfidence = clampNumber((features.adx ?? 0) / 30, 0, 1);
+  const volatilityConfidence =
+    features.atrPercentile === null
+      ? 0.5
+      : volatility === "Normal volatility"
+        ? 0.65
+        : Math.max(features.atrPercentile, 1 - features.atrPercentile);
+  const opportunityBoost =
+    opportunity === "Bullish breakout" || opportunity === "Bearish breakout"
+      ? features.atrExpanding && features.volumeRatio > 1.2
+        ? 0.15
+        : 0
+      : opportunity === "Bullish reversal risk" || opportunity === "Bearish reversal risk"
+        ? 0.1
+        : 0.05;
+  const trendPenalty = primaryTrend === "Sideways / range-bound" && opportunity === "Trend continuation" ? -0.15 : 0;
+  return roundNumber(clampNumber(0.2 + trendScore * 0.25 + trendClarity * 0.25 + adxConfidence * 0.15 + volatilityConfidence * 0.15 + opportunityBoost + trendPenalty, 0, 1), 4);
+}
+
+function regimeTradeBlockers(
+  finalSignal: ConfidenceStrategySignal,
+  scores: RegimeSelectionScores,
+  scoreEdge: number,
+  conditionConfidence: number,
+  opportunity: RegimeOpportunityState,
+  conditionHeld: boolean,
+) {
+  const blockers: string[] = [];
+  if (conditionHeld) {
+    blockers.push("Market condition switch is not confirmed yet");
+  }
+  if (finalSignal !== "buy") {
+    blockers.push("Final aggregate signal is not Buy");
+  }
+  if (scores.buy < 0.6) {
+    blockers.push(`Buy score ${formatProbability(scores.buy)} is below 60%`);
+  }
+  if (scoreEdge < 0.2) {
+    blockers.push(`Buy edge ${formatProbability(scoreEdge)} is below 20%`);
+  }
+  if (conditionConfidence < 0.65) {
+    blockers.push(`Market condition confidence ${formatProbability(conditionConfidence)} is below 65%`);
+  }
+  if (opportunity === "No-trade") {
+    blockers.push("Opportunity state is No-trade");
+  }
+  return blockers;
+}
+
+function classifyRegimePrimaryTrend(market: ConfidenceMarket, features: ReturnType<typeof regimeSelectionFeatures>): RegimePrimaryTrend {
+  const adx = features.adx ?? 0;
+  if (features.bullScore >= 5 && adx >= 20) {
+    return "Strong uptrend";
+  }
+  if (features.bullScore >= 3) {
+    return "Weak uptrend";
+  }
+  if (features.bearScore >= 5 && adx >= 20) {
+    return "Strong downtrend";
+  }
+  if (features.bearScore >= 3) {
+    return "Weak downtrend";
+  }
+  return "Sideways / range-bound";
+}
+
+function classifyRegimeVolatility(features: ReturnType<typeof regimeSelectionFeatures>): RegimeVolatilityState {
+  if (features.atrPercentile !== null && features.atrPercentile > 0.7) {
+    return "High volatility";
+  }
+  if (features.atrPercentile !== null && features.atrPercentile < 0.3) {
+    return "Low volatility";
+  }
+  return "Normal volatility";
+}
+
+function classifyRegimeOpportunity(
+  market: ConfidenceMarket,
+  features: ReturnType<typeof regimeSelectionFeatures>,
+  primaryTrend: RegimePrimaryTrend,
+  noTradeReasons: string[],
+): RegimeOpportunityState {
+  if (noTradeReasons.length > 0) {
+    return "No-trade";
+  }
+  const volumeConfirms = features.volumeRatio > 1.2;
+  if (market.latest.close > features.recentRangeHigh && volumeConfirms && features.atrExpanding) {
+    return "Bullish breakout";
+  }
+  if (market.latest.close < features.recentRangeLow && volumeConfirms && features.atrExpanding) {
+    return "Bearish breakout";
+  }
+  if (
+    features.rsi !== null &&
+    features.rsi > 70 &&
+    features.distanceFromVwap > 0.004 &&
+    features.bearishRejectionCandle
+  ) {
+    return "Bearish reversal risk";
+  }
+  if (
+    features.rsi !== null &&
+    features.rsi < 30 &&
+    features.distanceFromVwap < -0.004 &&
+    features.bullishRejectionCandle
+  ) {
+    return "Bullish reversal risk";
+  }
+  if (primaryTrend === "Sideways / range-bound") {
+    return "Mean reversion";
+  }
+  return "Trend continuation";
+}
+
+function regimeNoTradeReasons(market: ConfidenceMarket, features: ReturnType<typeof regimeSelectionFeatures>) {
+  const reasons: string[] = [];
+  if (market.candles.length < 50) {
+    reasons.push("Need at least 50 regular-session candles for EMA 50 and regime quality");
+  }
+  if (features.spreadTooWide) {
+    reasons.push("Spread is too wide");
+  }
+  if (features.volumeTooLow) {
+    reasons.push("Volume is too light versus the recent average");
+  }
+  if (Math.abs(features.bullScore - features.bearScore) <= 1 && Math.max(features.bullScore, features.bearScore) >= 2) {
+    reasons.push(`Bull and bear scores are close (${features.bullScore}/${features.bearScore})`);
+  }
+  if (features.priceChoppingAroundVwap) {
+    reasons.push("Price is chopping around VWAP");
+  }
+  if (market.timeOfDay.minutes >= 15 * 60 + 45) {
+    reasons.push("New entries are late in the session");
+  }
+  return reasons;
+}
+
+function regimeSelectedStrategySlugs(
+  primaryTrend: RegimePrimaryTrend,
+  volatility: RegimeVolatilityState,
+  opportunity: RegimeOpportunityState,
+) {
+  const slugs = new Set<string>();
+  if (opportunity === "No-trade") {
+    return ["cash_avoid_filter"];
+  }
+
+  const activate = (...names: string[]) => names.forEach((slug) => slugs.add(slug));
+  const avoid = (...names: string[]) => names.forEach((slug) => slugs.delete(slug));
+
+  switch (primaryTrend) {
+    case "Strong uptrend":
+      activate(
+        "moving_average_trend",
+        "trend_pullback",
+        "opening_range_breakout",
+        "intraday_breakout",
+        "vwap_trend_continuation",
+        "macd_momentum",
+        "adx_trend_strength",
+        "market_structure",
+        "volume_confirmation",
+      );
+      avoid("vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal");
+      break;
+    case "Weak uptrend":
+      activate("trend_pullback", "vwap_mean_reversion", "rsi_mean_reversion", "vwap_position", "market_structure", "volume_confirmation");
+      avoid("volatility_breakout", "intraday_breakout");
+      break;
+    case "Strong downtrend":
+      activate(
+        "moving_average_trend",
+        "vwap_position",
+        "vwap_trend_continuation",
+        "macd_momentum",
+        "adx_trend_strength",
+        "market_structure",
+        "volatility_breakout",
+        "atr_volatility_regime",
+        "volume_confirmation",
+      );
+      avoid("rsi_mean_reversion", "bollinger_band_mean_reversion");
+      break;
+    case "Weak downtrend":
+      activate("vwap_position", "market_structure", "atr_volatility_regime", "volume_confirmation", "cash_avoid_filter");
+      avoid("opening_range_breakout", "intraday_breakout", "vwap_trend_continuation");
+      break;
+    case "Sideways / range-bound":
+      activate("vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal", "market_structure");
+      avoid("moving_average_trend", "trend_pullback", "vwap_trend_continuation", "macd_momentum", "adx_trend_strength");
+      break;
+  }
+
+  if (opportunity === "Bullish breakout" || opportunity === "Bearish breakout") {
+    activate("opening_range_breakout", "volatility_breakout", "intraday_breakout", "vwap_trend_continuation", "macd_momentum", "volume_confirmation");
+    avoid("vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal");
+  }
+  if (opportunity === "Bullish reversal risk" || opportunity === "Bearish reversal risk") {
+    activate("rsi_mean_reversion", "vwap_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal", "cash_avoid_filter");
+    avoid("moving_average_trend", "trend_pullback", "vwap_trend_continuation", "opening_range_breakout", "intraday_breakout", "volatility_breakout", "macd_momentum");
+  }
+  if (opportunity === "Mean reversion") {
+    activate("vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "market_structure");
+    avoid("moving_average_trend", "vwap_trend_continuation", "macd_momentum");
+  }
+  if (volatility === "Low volatility") {
+    if (opportunity !== "Bullish breakout" && opportunity !== "Bearish breakout") {
+      activate("vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion");
+    }
+    avoid("volatility_breakout", "intraday_breakout");
+  }
+  if (volatility === "High volatility" && opportunity !== "Bullish reversal risk" && opportunity !== "Bearish reversal risk") {
+    activate("volatility_breakout", "atr_volatility_regime");
+  }
+
+  return Array.from(slugs);
+}
+
+function regimeStrategySelectorReason(
+  slug: string,
+  primaryTrend: RegimePrimaryTrend,
+  volatility: RegimeVolatilityState,
+  opportunity: RegimeOpportunityState,
+) {
+  if (slug.includes("breakout") || slug === "opening_range_breakout") {
+    return opportunity === "Bullish breakout" || opportunity === "Bearish breakout"
+      ? `Selected for ${opportunity}`
+      : `Selected as a range-edge check in ${opportunity}`;
+  }
+  if (slug.includes("reversion") || slug.includes("rsi") || slug.includes("bollinger")) {
+    return opportunity === "Bullish reversal risk" || opportunity === "Bearish reversal risk" || opportunity === "Mean reversion"
+      ? `Selected for ${opportunity}`
+      : `Selected as a pullback risk check`;
+  }
+  if (slug.includes("volatility") || slug.includes("atr")) {
+    return `Selected for ${volatility}`;
+  }
+  return `Selected for ${primaryTrend}`;
+}
+
+function regimeStrategyAvoidReason(
+  slug: string,
+  primaryTrend: RegimePrimaryTrend,
+  volatility: RegimeVolatilityState,
+  opportunity: RegimeOpportunityState,
+) {
+  const trendFollowing = ["moving_average_trend", "trend_pullback", "vwap_trend_continuation", "macd_momentum", "adx_trend_strength"].includes(slug);
+  const meanReversion = ["vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal"].includes(slug);
+  const breakout = ["opening_range_breakout", "intraday_breakout", "volatility_breakout"].includes(slug);
+
+  if (opportunity === "No-trade") {
+    return "Avoided because No-trade activates only Cash / Avoid Trading";
+  }
+  if ((opportunity === "Bullish breakout" || opportunity === "Bearish breakout") && meanReversion) {
+    return "Avoided: mean reversion against active breakout";
+  }
+  if ((opportunity === "Bullish reversal risk" || opportunity === "Bearish reversal risk") && (trendFollowing || breakout)) {
+    return "Avoided: reversal/exhaustion risk blocks chasing trend late";
+  }
+  if (primaryTrend === "Strong uptrend" && meanReversion) {
+    return "Avoided: short mean reversion in strong uptrend";
+  }
+  if (primaryTrend === "Strong downtrend" && meanReversion) {
+    return "Avoided: dip-buying behavior in strong downtrend";
+  }
+  if (primaryTrend === "Weak uptrend" && breakout) {
+    return "Avoided: aggressive breakout in weak uptrend";
+  }
+  if (primaryTrend === "Weak downtrend" && breakout) {
+    return "Avoided: strong long breakout in weak downtrend";
+  }
+  if (primaryTrend === "Sideways / range-bound" && trendFollowing) {
+    return "Avoided: trend following in sideways market";
+  }
+  if (volatility === "Low volatility" && breakout) {
+    return "Avoided: wide breakout system in low volatility";
+  }
+  if (volatility === "High volatility" && slug === "cash_avoid_filter") {
+    return "Avoided: high volatility favors ATR/volatility logic before cash filter unless other blockers exist";
+  }
+  return `Avoided: not suitable for ${primaryTrend}, ${volatility}, ${opportunity}`;
+}
+
+function priorDayRangeForRegimeSelection(latestTimestamp: string) {
+  const latestDay = easternDateString(latestTimestamp);
+  const priorCandles = state.candles
+    .filter((candle) => isRegularSession(candle.timestamp) && easternDateString(candle.timestamp) < latestDay)
+    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
+  const priorDay = priorCandles.at(-1) ? easternDateString(priorCandles.at(-1)!.timestamp) : "";
+  const dayCandles = priorCandles.filter((candle) => easternDateString(candle.timestamp) === priorDay);
+  if (!dayCandles.length) {
+    return null;
+  }
+  return {
+    high: Math.max(...dayCandles.map((candle) => candle.high)),
+    low: Math.min(...dayCandles.map((candle) => candle.low)),
+  };
+}
+
+function recentRangeForRegimeSelection(candles: Candle[]) {
+  const sample = candles.slice(-21, -1);
+  const rangeCandles = sample.length ? sample : candles.slice(-20);
+  return {
+    high: Math.max(...rangeCandles.map((candle) => candle.high)),
+    low: Math.min(...rangeCandles.map((candle) => candle.low)),
+  };
+}
+
+function emaSlopeFromSeries(values: Array<number | null>, latestPrice: number) {
+  const defined = values.filter((value): value is number => value !== null);
+  if (defined.length < 6) {
+    return 0;
+  }
+  const current = defined.at(-1)!;
+  const previous = defined.at(-6)!;
+  return (current - previous) / Math.max(latestPrice, 0.01);
+}
+
+function oneMinuteAtrPercentHistoryForRegimeSelection(market: ConfidenceMarket) {
+  const latestTime = new Date(market.latest.timestamp).getTime();
+  const source = (state.weightedMarketData.timeframeCandles["1Min"]?.length ? state.weightedMarketData.timeframeCandles["1Min"]! : state.candles)
+    .filter((candle) => isRegularSession(candle.timestamp) && new Date(candle.timestamp).getTime() <= latestTime)
+    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
+  const historySource = source.length >= 80 ? source.slice(-1600) : market.candles;
+  const values: number[] = [];
+  for (let end = 15; end <= historySource.length; end += 1) {
+    const sample = historySource.slice(0, end);
+    const atr = averageTrueRange(sample, 14);
+    const close = sample.at(-1)?.close ?? 0;
+    if (atr !== null && close > 0) {
+      values.push(atr / close);
+    }
+  }
+  return values;
+}
+
+function percentileRank(values: number[], current: number) {
+  const finiteValues = values.filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+  if (!finiteValues.length) {
+    return null;
+  }
+  return finiteValues.filter((value) => value <= current).length / finiteValues.length;
+}
+
+function meanNumber(values: number[]) {
+  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+}
+
+function recentLevelCrosses(values: number[], level: number, lookback: number) {
+  const sample = values.slice(-lookback);
+  if (sample.length < 2 || !level) {
+    return 0;
+  }
+  const signs = sample.map((value) => value >= level);
+  return signs.slice(1).reduce((count, sign, index) => count + (sign !== signs[index] ? 1 : 0), 0);
+}
+
+function isBearishRejectionCandle(candle: Candle) {
+  const range = Math.max(candle.high - candle.low, 0.01);
+  const body = Math.abs(candle.close - candle.open);
+  const upperWick = candle.high - Math.max(candle.open, candle.close);
+  const closeBelowMidpoint = candle.close < candle.low + range * 0.45;
+  return upperWick >= Math.max(body * 1.2, range * 0.35) && closeBelowMidpoint;
+}
+
+function isBullishRejectionCandle(candle: Candle) {
+  const range = Math.max(candle.high - candle.low, 0.01);
+  const body = Math.abs(candle.close - candle.open);
+  const lowerWick = Math.min(candle.open, candle.close) - candle.low;
+  const closeAboveMidpoint = candle.close > candle.low + range * 0.55;
+  return lowerWick >= Math.max(body * 1.2, range * 0.35) && closeAboveMidpoint;
+}
+
+function lastDefined(values: Array<number | null>) {
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    if (values[index] !== null) {
+      return values[index]!;
+    }
+  }
+  return null;
+}
+
+function regimeSignalClass(signal: RegimeDecisionSignal) {
+  return signal === "No-trade" ? "no-trade" : signal.toLowerCase();
+}
+
+function renderRegimeScoreGrid(result: RegimeSelectionResult) {
+  return [
+    ["Buy", result.scores.buy.toFixed(2), "buy"],
+    ["Sell", result.scores.sell.toFixed(2), "sell"],
+    ["Hold", result.scores.hold.toFixed(2), "hold"],
+    ["Buy Edge", result.scoreEdge.toFixed(2), result.scoreEdge >= 0.2 ? "buy" : "no-trade"],
+    ["Condition", formatProbability(result.confidence), result.confidence >= 0.65 ? "buy" : "no-trade"],
+  ]
+    .map(
+      ([label, value, kind]) => `
+        <div class="weighted-score-card ${kind}">
+          <span>${label}</span>
+          <strong>${value}</strong>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderRegimeSummary(result: RegimeSelectionResult) {
+  const adapted = regimeSelectionAsConfidenceResult(result);
+  const sizingBlocker = adapted.sizing.blockedReason ? `Sizing: ${adapted.sizing.blockedReason}` : "";
+  const quantityBlockers = uniqueStrings([...result.tradeBlockers, sizingBlocker].filter(Boolean));
+  const noTrade = result.noTradeReasons.length
+    ? renderRegimeSummaryRow("No-trade checks", escapeHtml(result.noTradeReasons.join("; ")), "warn")
+    : "";
+  const blockers = quantityBlockers.length
+    ? renderRegimeSummaryRow("Quantity gate", `0 - ${escapeHtml(quantityBlockers.join("; "))}`, "block")
+    : renderRegimeSummaryRow("Quantity gate", `${adapted.positionSize} shares - Buy score, edge, condition confidence, opportunity, and sizing passed.`, "pass");
+  const confirmation = result.conditionHeld
+    ? `Raw ${escapeHtml(result.rawCondition)} has ${result.confirmationCount}/3 confirmation, keeping ${escapeHtml(result.confirmedCondition)}.`
+    : `${result.confirmationCount}/3 recent candles support ${escapeHtml(result.confirmedCondition)}, or confidence is >= 65%.`;
+  return `
+    <div class="regime-summary-grid">
+      ${renderRegimeSummaryRow("Condition", `${escapeHtml(result.primaryTrend)} + ${escapeHtml(result.volatility)} + ${escapeHtml(result.opportunity)}`, "info")}
+      ${renderRegimeSummaryRow(result.conditionHeld ? "Condition hold" : "Confirmation", confirmation, result.conditionHeld ? "pass" : "info")}
+      ${renderRegimeSummaryRow("Aggregate winner", `${escapeHtml(result.aggregateSignal)} (${result.activeStrategyCount} active strategy outputs)`, "info")}
+      ${renderRegimeSummaryRow(
+        "Trade decision",
+        `${escapeHtml(result.signal)}; target qty ${adapted.positionSize}; buy ${formatProbability(result.scores.buy)}, second best ${formatProbability(result.secondBestScore)}, edge ${formatProbability(result.scoreEdge)}`,
+        quantityBlockers.length || result.signal === "No-trade" ? "block" : result.signal === "Hold" ? "warn" : "pass",
+      )}
+      ${blockers}
+      ${renderRegimeSummaryRow("Selector", "Strategies are filtered before voting; skipped strategies cannot affect this result.", "neutral")}
+      ${noTrade}
+    </div>
+  `;
+}
+
+function renderRegimeSummaryRow(label: string, value: string, tone: "info" | "pass" | "warn" | "block" | "neutral") {
+  return `
+    <div class="regime-summary-row" data-tone="${tone}">
+      <b>${escapeHtml(label)}</b>
+      <span>${value}</span>
+    </div>
+  `;
+}
+
+function renderRegimeFeatureGrid(features: RegimeSelectionFeature[]) {
+  return features
+    .map(
+      (feature) => `
+        <div class="regime-feature" data-status="${feature.status}">
+          <span>${escapeHtml(feature.name)}</span>
+          <strong>${escapeHtml(feature.value)}</strong>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderRegimeStrategyList(result: RegimeSelectionResult) {
+  const selected = result.selectedStrategies.length
+    ? result.selectedStrategies.map(renderRegimeStrategyRow).join("")
+    : `<article class="algo-vote-card" data-signal="hold" data-eligible="false"><div><strong>No selected strategy</strong><span>${escapeHtml(result.noTradeReasons[0] ?? "Waiting for a clean market condition")}</span></div><b class="algo-signal-badge">Excluded</b></article>`;
+  const skipped = result.skippedStrategies.slice(0, 8);
+  return `
+    ${selected}
+    <div class="regime-skipped">
+      <strong>Skipped</strong>
+      ${skipped.map((strategy) => `<span>${escapeHtml(strategy.name)} - ${escapeHtml(strategy.reason)}</span>`).join("")}
+    </div>
+  `;
+}
+
+function renderRegimeStrategyRow(strategy: RegimeSelectedStrategy) {
+  return `
+    <article class="algo-vote-card" data-signal="${strategy.signal}" data-eligible="true">
+      <div>
+        <strong>${escapeHtml(strategy.name)}</strong>
+        <span>${escapeHtml(strategy.selectorReason)}</span>
+        <span>${escapeHtml(strategy.reason)}; confidence ${formatProbability(strategy.confidence)}, weight ${strategy.effective_weight.toFixed(2)}</span>
+      </div>
+      <b class="algo-signal-badge">${escapeHtml(strategy.signal === "buy" ? "Buy" : strategy.signal === "sell" ? "Sell" : "Hold")}</b>
+    </article>
+  `;
+}
+
 function updateConfidenceAggregationPanel() {
   const result = calculateConfidenceAggregation();
   confidenceFinalSignal.textContent = result.decisionLabel;
   confidenceFinalSignal.className = `algo-final ${result.signal.toLowerCase()}`;
   confidenceScoreGrid.innerHTML = renderConfidenceScoreGrid(result);
   confidenceSummary.innerHTML = renderConfidenceSummary(result);
-  confidenceTradingSettingsMount.innerHTML = renderConfidenceTradingSettingsPanel(result);
+  if (!isEditingWithin(confidenceTradingSettingsMount)) {
+    confidenceTradingSettingsMount.innerHTML = renderConfidenceTradingSettingsPanel(result);
+  }
   renderConfidenceBacktestState();
   confidenceRequirementsToggleMeta.textContent = `${result.activeStrategyCount}/${state.confidenceDecisionSettings.minimumActiveStrategies} active · ${formatProbability(state.confidenceDecisionSettings.minimumDirectionalAgreement)} agree · ${formatProbability(state.confidenceDecisionSettings.minimumAverageConfidence)} avg`;
   confidenceRequirementsPanel.innerHTML = renderConfidenceRequirementsPanel(result);
@@ -7827,8 +11530,7 @@ function calculateConfidenceAggregationFromMarket(
 }
 
 function confidenceMarketSnapshot(): ConfidenceMarket | null {
-  const oneMinuteCandles = state.weightedMarketData.timeframeCandles["1Min"] ?? [];
-  const sessionCandles = oneMinuteCandles.length ? latestRegularSessionCandlesFrom(oneMinuteCandles) : latestRegularSessionCandles();
+  const sessionCandles = latestWeightedCalculationCandles();
   const candles = sessionCandles.length ? sessionCandles : state.candles.slice(-240);
   const latest = candles.at(-1);
   if (!latest || candles.length < 5) {
@@ -7841,13 +11543,14 @@ function confidenceMarketSnapshot(): ConfidenceMarket | null {
   const fiveMinuteCandles = state.weightedMarketData.timeframeCandles["5Min"]?.length
     ? latestRegularSessionCandlesFrom(state.weightedMarketData.timeframeCandles["5Min"]!)
     : aggregateCandlesToFiveMinute(candles);
-  const sourceCandles = oneMinuteCandles.length ? oneMinuteCandles : state.candles;
+  const sourceCandles = state.weightedMarketData.timeframeCandles["1Min"]?.length
+    ? state.weightedMarketData.timeframeCandles["1Min"]!
+    : state.candles;
   const premarketCandles = sourceCandles.filter(
     (candle) => easternDateString(candle.timestamp) === easternDateString(latest.timestamp) && !isRegularSession(candle.timestamp) && easternMinutes(candle.timestamp) < 570,
   );
-  const dailyCandles = state.weightedMarketData.timeframeCandles["1Day"] ?? [];
   const latestDay = easternDateString(latest.timestamp);
-  const priorDaily = dailyCandles
+  const priorSessionClose = sourceCandles
     .filter((candle) => easternDateString(candle.timestamp) < latestDay)
     .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime())
     .at(-1);
@@ -7861,7 +11564,7 @@ function confidenceMarketSnapshot(): ConfidenceMarket | null {
     candles,
     closes,
     latest,
-    priorClose: priorDaily?.close ?? null,
+    priorClose: priorSessionClose?.close ?? null,
     dayOpen: candles[0].open,
     premarketHigh: premarketCandles.length ? Math.max(...premarketCandles.map((candle) => candle.high)) : null,
     premarketLow: premarketCandles.length ? Math.min(...premarketCandles.map((candle) => candle.low)) : null,
@@ -8675,10 +12378,15 @@ function confidencePositionSizing(
   market: ConfidenceMarket,
   signal: AlgoSignal,
   normalizedNetScore: number,
-  options: { automaticShortCycleBuy?: boolean; result?: ConfidenceAggregationResult } = {},
+  options: { automaticShortCycleBuy?: boolean; result?: ConfidenceAggregationResult; mode?: TradingWindowMode } = {},
 ): ConfidencePositionSizing {
-  const settings = state.confidenceTradingSettings;
-  const defaults = confidenceDefaultSizingSettings();
+  const settings =
+    options.mode === "regime"
+      ? state.regimeTradingSettings
+      : options.mode === "meta"
+        ? state.metaTradingSettings
+        : state.confidenceTradingSettings;
+  const defaults = options.mode === "regime" ? regimeDefaultSizingSettings() : confidenceDefaultSizingSettings();
   const accountEquity = settings.startingCapital;
   const priceValue = Math.max(market.latest.close, 0.01);
   const signalStrength = Math.abs(normalizedNetScore);
@@ -8698,20 +12406,37 @@ function confidencePositionSizing(
     options.automaticShortCycleBuy && signal !== "Hold"
       ? clampNumber(confidenceSizeMultiplier(Math.max(0.5, Math.max(0, normalizedNetScore))) + automaticContextBoost, 0.25, 1)
       : confidenceSizeMultiplier(signalStrength);
-  const currentPosition = confidencePositionSummary(priceValue);
+  const currentPosition =
+    options.mode === "regime"
+      ? summarizePositionFromTradeHistory(priceValue, priceValue, "regime")
+      : options.mode === "meta"
+        ? summarizePositionFromTradeHistory(priceValue, priceValue, "meta")
+      : confidencePositionSummary(priceValue);
   const maxPositionDollars = accountEquity * (defaults.maxPositionPercent / 100);
   const maxOrderDollars = accountEquity * (settings.orderAllocationPercent / 100);
   const dailyBuyingPowerDollars = accountEquity * (settings.dailyAllocationPercent / 100);
   const availableBuyingPower = Math.max(0, Math.min(maxPositionDollars, dailyBuyingPowerDollars) - currentPosition.marketValue);
   const riskDollars = accountEquity * (defaults.baseRiskPercent / 100) * sizeMultiplier;
   const primaryAtr = market.atr.atr1m ?? (market.atr.atr5m !== null ? market.atr.atr5m / 5 : 0);
-  const stopDistance = Math.max(primaryAtr * defaults.atrStopMultiplier, priceValue * (defaults.minimumStopDistancePercent / 100));
+  const stopDistance = defaultSizingStopDistance(defaults, priceValue, primaryAtr);
   const sharesByRisk = stopDistance > 0 ? riskDollars / stopDistance : 0;
   const sharesByOrder = maxOrderDollars / priceValue;
   const sharesByCapital = maxPositionDollars / priceValue;
   const sharesByBuyingPower = availableBuyingPower / priceValue;
   const sharesByLiquidity = defaults.maxParticipationPercent > 0 ? market.latest.volume * (defaults.maxParticipationPercent / 100) : Number.POSITIVE_INFINITY;
   const maxAllowedShares = defaults.maxAllowedShares > 0 ? defaults.maxAllowedShares : Number.POSITIVE_INFINITY;
+  const sizingCaps = [
+    { label: "risk budget", shares: sharesByRisk },
+    { label: "order limit", shares: sharesByOrder },
+    { label: "max position", shares: sharesByCapital },
+    { label: "buying power", shares: sharesByBuyingPower },
+    { label: "liquidity participation", shares: sharesByLiquidity },
+    { label: "max shares", shares: maxAllowedShares },
+  ].filter((cap) => Number.isFinite(cap.shares));
+  const limitingCap = sizingCaps.reduce(
+    (smallest, cap) => (cap.shares < smallest.shares ? cap : smallest),
+    { label: "sizing", shares: Number.POSITIVE_INFINITY },
+  );
   const finalQuantity =
     signal === "Hold" || sizeMultiplier <= 0 || stopDistance <= 0
       ? 0
@@ -8724,7 +12449,7 @@ function confidencePositionSizing(
         : stopDistance <= 0
           ? "stop distance is unavailable"
           : finalQuantity < 1
-            ? "final quantity is below 1 share"
+            ? `${limitingCap.label} allows ${formatShareLimit(limitingCap.shares)}, below 1 share`
             : "";
   return {
     signalStrength,
@@ -8732,13 +12457,16 @@ function confidencePositionSizing(
     riskDollars,
     stopDistance,
     sharesByRisk,
+    sharesByOrder,
     sharesByCapital,
     sharesByBuyingPower,
+    sharesByLiquidity,
     finalQuantity,
     availableBuyingPower,
     accountEquity,
     maxPositionDollars,
     currentPositionValue: currentPosition.marketValue,
+    limitingFactor: limitingCap.label,
     blockedReason,
   };
 }
@@ -8750,15 +12478,25 @@ function confidenceEmptyPositionSizing(blockedReason: string): ConfidencePositio
     riskDollars: 0,
     stopDistance: 0,
     sharesByRisk: 0,
+    sharesByOrder: 0,
     sharesByCapital: 0,
     sharesByBuyingPower: 0,
+    sharesByLiquidity: 0,
     finalQuantity: 0,
     availableBuyingPower: 0,
     accountEquity: state.confidenceTradingSettings.startingCapital,
     maxPositionDollars: 0,
     currentPositionValue: 0,
+    limitingFactor: "sizing",
     blockedReason,
   };
+}
+
+function formatShareLimit(value: number) {
+  if (!Number.isFinite(value)) {
+    return "unlimited shares";
+  }
+  return value < 10 ? `${value.toFixed(2)} shares` : `${Math.floor(value).toLocaleString()} shares`;
 }
 
 function confidenceSizeMultiplier(signalStrength: number) {
@@ -8832,7 +12570,7 @@ function renderConfidenceSummary(result: ConfidenceAggregationResult) {
       <article data-status="${result.positionSize > 0 ? "pass" : "info"}">
         <small>Position</small>
         <strong>${result.positionSize} shares</strong>
-        <span>${formatProbability(result.positionSizeMultiplier)} size · stop ${price(result.stopDistance)}</span>
+        <span>${formatProbability(result.positionSizeMultiplier)} size - stop ${price(result.sizing.stopDistance)}</span>
       </article>
     </div>
     <div class="confidence-score-breakdown">
@@ -8884,6 +12622,111 @@ function renderConfidenceRequirementsPanel(result: ConfidenceAggregationResult) 
   `;
 }
 
+function renderRegimeTradingSettingsPanel(result: RegimeSelectionResult) {
+  const adapted = regimeSelectionAsConfidenceResult(result);
+  const settings = state.regimeTradingSettings;
+  const expanded = state.regimeTradingSettingsExpanded;
+  const targetOrder = confidenceTargetOrderRecommendation(adapted, "regime");
+  state.currentRegimeTargetOrder = targetOrder;
+  return `
+    <div class="trading-settings-panel weighted-trading-settings-panel" data-status="ready" data-expanded="${String(expanded)}">
+      <button id="regimeTradingSettingsToggle" class="trading-settings-head" type="button" aria-expanded="${String(expanded)}" aria-controls="regimeTradingSettingsBody">
+        <span class="trading-settings-title">
+          <b>${expanded ? "-" : "+"}</b>
+          <strong>Strategy Settings</strong>
+        </span>
+        <span class="trading-settings-summary">${escapeHtml(regimeTradingSettingsSummary(result, adapted))}</span>
+      </button>
+      <div id="regimeTradingSettingsBody" class="trading-settings-body" ${expanded ? "" : "hidden"}>
+        <div class="trading-settings-grid">
+          ${renderRegimeTradingSettingInput("startingCapital", "Total balance", settings.startingCapital, 1000, 10000000, 100)}
+          ${renderRegimeTradingSettingInput("orderAllocationPercent", "Order limit %", settings.orderAllocationPercent, 0.1, REGIME_MAX_ORDER_ALLOCATION_PERCENT, 0.1)}
+          ${renderRegimeTradingSettingInput("dailyAllocationPercent", "Buying power %", settings.dailyAllocationPercent, 0.1, 100, 0.1)}
+          ${renderRegimeTradingSettingInput("riskBudgetPercentOfOrder", "Risk budget %", settings.riskBudgetPercentOfOrder, 0.1, 100, 0.1)}
+          ${renderRegimeTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 1, 50, 1)}
+          ${renderRegimeTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
+          ${renderRegimeTradingSettingInput("stopLossPercent", "Stop %", settings.stopLossPercent, 0.01, 20, 0.01)}
+          ${renderRegimeTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
+          ${renderRegimeTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
+        </div>
+        ${renderConfidenceTargetOrderSettings(targetOrder, "Regime", "regime")}
+        ${renderRegimeDefaultSizingSection(settings, adapted)}
+      </div>
+    </div>
+  `;
+}
+
+function regimeTradingSettingsSummary(result: RegimeSelectionResult, adapted: ConfidenceAggregationResult) {
+  return `Qty ${adapted.positionSize} · ${formatProbability(result.scores.buy)} buy · edge ${formatProbability(result.scoreEdge)} · ${formatProbability(result.confidence)} condition`;
+}
+
+function renderRegimeDefaultSizingSection(settings: TradingSettings, result: ConfidenceAggregationResult) {
+  return renderConfidenceDefaultSizingSection(settings, result, {
+    expanded: state.regimeDefaultSizingExpanded,
+    toggleId: "regimeDefaultSizingToggle",
+    bodyId: "regimeDefaultSizingBody",
+    inputRenderer: renderRegimeTradingSettingInput,
+    toggleRenderer: renderRegimeTradingSettingToggle,
+  });
+}
+
+function regimeSelectionAsConfidenceResult(result: RegimeSelectionResult): ConfidenceAggregationResult {
+  const market = confidenceMarketSnapshot();
+  const signal: AlgoSignal = result.tradeAllowed ? "Buy" : result.signal === "Sell" ? "Sell" : "Hold";
+  const normalizedNetScore = result.tradeAllowed ? result.scores.buy : 0;
+  const sizing = market ? confidencePositionSizing(market, signal, normalizedNetScore, { mode: "regime" }) : confidenceEmptyPositionSizing("Waiting for session candles");
+  const hardFilters: ConfidenceAggregationResult["hardFilters"] = [
+    {
+      label: "Regime Selector",
+      status: result.tradeAllowed ? "pass" : "fail",
+      detail: result.tradeBlockers.length ? result.tradeBlockers.join("; ") : "Regime score, edge, confidence, and opportunity passed",
+    },
+    {
+      label: "Market Condition",
+      status: result.confidence >= 0.65 ? "pass" : "fail",
+      detail: `${result.confirmedCondition}, confidence ${formatProbability(result.confidence)}`,
+    },
+    {
+      label: "Buy Score",
+      status: result.scores.buy >= 0.6 ? "pass" : "fail",
+      detail: `${formatProbability(result.scores.buy)} / required 60%`,
+    },
+    {
+      label: "Buy Edge",
+      status: result.scoreEdge >= 0.2 ? "pass" : "fail",
+      detail: `${formatProbability(result.scoreEdge)} / required 20%`,
+    },
+  ];
+  return {
+    signal,
+    decisionLabel: signal === "Buy" ? "Buy" : signal === "Sell" ? "Sell" : "Hold",
+    buyScore: result.scores.buy,
+    sellScore: result.scores.sell,
+    netScore: result.scores.buy - result.scores.sell,
+    activeWeight: 1,
+    normalizedNetScore,
+    activeStrategyCount: result.activeStrategyCount,
+    buyWeight: result.scores.buy,
+    sellWeight: result.scores.sell,
+    buyAgreement: result.scores.buy,
+    sellAgreement: result.scores.sell,
+    buyAverageConfidence: result.scores.buy,
+    sellAverageConfidence: result.scores.sell,
+    buyThreshold: 0.6,
+    sellThreshold: -0.6,
+    strongBuyThreshold: 0.8,
+    strongSellThreshold: -0.8,
+    strategies: result.selectedStrategies,
+    stopDistance: sizing.stopDistance,
+    positionSizeMultiplier: sizing.sizeMultiplier,
+    positionSize: sizing.finalQuantity,
+    sizing,
+    hardFilters,
+    logs: result.reasons,
+    detail: result.tradeAllowed ? "Regime Selector trade gates passed." : `Regime Selector blocked order: ${result.tradeBlockers.join("; ")}`,
+  };
+}
+
 function renderConfidenceTradingSettingsPanel(result: ConfidenceAggregationResult) {
   const settings = state.confidenceTradingSettings;
   const expanded = state.confidenceTradingSettingsExpanded;
@@ -8905,6 +12748,7 @@ function renderConfidenceTradingSettingsPanel(result: ConfidenceAggregationResul
           ${renderConfidenceTradingSettingInput("dailyAllocationPercent", "Buying power %", settings.dailyAllocationPercent, 0.1, 100, 0.1)}
           ${renderConfidenceTradingSettingInput("riskBudgetPercentOfOrder", "Risk budget %", settings.riskBudgetPercentOfOrder, 0.1, 100, 0.1)}
           ${renderConfidenceTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 1, 50, 1)}
+          ${renderConfidenceTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
           ${renderConfidenceTradingSettingInput("stopLossPercent", "Stop %", settings.stopLossPercent, 0.01, 20, 0.01)}
           ${renderConfidenceTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
           ${renderConfidenceTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
@@ -8920,40 +12764,59 @@ function confidenceTradingSettingsSummary(settings: TradingSettings, result: Con
   return `Qty ${result.positionSize} · ${formatProbability(result.sizing.signalStrength)} strength · ${formatProbability(result.sizing.sizeMultiplier)} size · ${currency(settings.startingCapital)} account`;
 }
 
-function renderConfidenceDefaultSizingSection(settings: TradingSettings, result: ConfidenceAggregationResult) {
-  const expanded = state.confidenceDefaultSizingExpanded;
+function renderConfidenceDefaultSizingSection(
+  settings: TradingSettings,
+  result: ConfidenceAggregationResult,
+  options: {
+    expanded?: boolean;
+    toggleId?: string;
+    bodyId?: string;
+    inputRenderer?: typeof renderConfidenceTradingSettingInput;
+    toggleRenderer?: typeof renderConfidenceTradingSettingToggle;
+  } = {},
+) {
+  const expanded = options.expanded ?? state.confidenceDefaultSizingExpanded;
+  const toggleId = options.toggleId ?? "confidenceDefaultSizingToggle";
+  const bodyId = options.bodyId ?? "confidenceDefaultSizingBody";
+  const inputRenderer = options.inputRenderer ?? renderConfidenceTradingSettingInput;
+  const toggleRenderer = options.toggleRenderer ?? renderConfidenceTradingSettingToggle;
+  const defaults = defaultSizingSettingsFromTradingSettings(settings);
   const sizing = result.sizing;
   return `
     <div class="trading-default-section weighted-default-section" data-expanded="${String(expanded)}">
       <div class="trading-default-head">
-        <button id="confidenceDefaultSizingToggle" class="trading-default-expand" type="button" aria-expanded="${String(expanded)}" aria-controls="confidenceDefaultSizingBody">
+        <button id="${toggleId}" class="trading-default-expand" type="button" aria-expanded="${String(expanded)}" aria-controls="${bodyId}">
           <b>${expanded ? "-" : "+"}</b>
           <strong>Default Settings</strong>
         </button>
-        ${renderConfidenceTradingSettingToggle("useDefaultSizingSettings", "On / Off", settings.useDefaultSizingSettings)}
+        ${toggleRenderer("useDefaultSizingSettings", "On / Off", settings.useDefaultSizingSettings)}
       </div>
-      <div id="confidenceDefaultSizingBody" class="trading-default-body" ${expanded ? "" : "hidden"}>
+      <div id="${bodyId}" class="trading-default-body" ${expanded ? "" : "hidden"}>
         <div class="trading-settings-grid trading-default-grid">
-          ${renderConfidenceTradingSettingInput("minimumBuyScore", "Minimum buy score", settings.minimumBuyScore, 0, 1, 0.01)}
-          ${renderConfidenceTradingSettingInput("minimumSignalEdge", "Minimum signal edge", settings.minimumSignalEdge, 0, 1, 0.01)}
-          ${renderConfidenceTradingSettingInput("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0.01, 10, 0.01)}
-          ${renderConfidenceTradingSettingInput("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0.1, 100, 0.1)}
-          ${renderConfidenceTradingSettingInput("atrStopMultiplier", "ATR stop multiplier", settings.atrStopMultiplier, 0.1, 10, 0.1)}
-          ${renderConfidenceTradingSettingInput("minimumStopDistancePercent", "Min stop distance %", settings.minimumStopDistancePercent, 0.001, 5, 0.001)}
-          ${renderConfidenceTradingSettingInput("maxParticipationPercent", "Max participation %", settings.maxParticipationPercent, 0.001, 10, 0.001)}
-          ${renderConfidenceTradingSettingInput("minimumOneMinuteVolume", "Min 1m volume", settings.minimumOneMinuteVolume, 0, 10000000, 1)}
-          ${renderConfidenceTradingSettingInput("maxAllowedShares", "Max shares (0 auto)", settings.maxAllowedShares, 0, 1000000, 1)}
-          ${renderConfidenceTradingSettingInput("maxDailyLossPercent", "Max daily loss %", settings.maxDailyLossPercent, 0.1, 10, 0.1)}
-          ${renderConfidenceTradingSettingToggle("pyramidingEnabled", "Pyramiding", settings.pyramidingEnabled)}
+          ${inputRenderer("minimumBuyScore", "Minimum buy score", settings.minimumBuyScore, 0, 1, 0.01)}
+          ${inputRenderer("minimumSignalEdge", "Minimum signal edge", settings.minimumSignalEdge, 0, 1, 0.01)}
+          ${inputRenderer("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0.01, 10, 0.01)}
+          ${inputRenderer("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0.1, 100, 0.1)}
+          ${inputRenderer("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
+          ${inputRenderer("atrStopMultiplier", "ATR stop multiplier", settings.atrStopMultiplier, 0.1, 10, 0.1)}
+          ${inputRenderer("minimumStopDistancePercent", "Min stop distance %", settings.minimumStopDistancePercent, 0.001, 5, 0.001)}
+          ${inputRenderer("maxParticipationPercent", "Max participation %", settings.maxParticipationPercent, 0.001, 10, 0.001)}
+          ${inputRenderer("minimumOneMinuteVolume", "Min 1m volume", settings.minimumOneMinuteVolume, 0, 10000000, 1)}
+          ${inputRenderer("maxAllowedShares", "Max shares (0 auto)", settings.maxAllowedShares, 0, 1000000, 1)}
+          ${inputRenderer("maxDailyLossPercent", "Max daily loss %", settings.maxDailyLossPercent, 0.1, 10, 0.1)}
+          ${toggleRenderer("pyramidingEnabled", "Pyramiding", settings.pyramidingEnabled)}
         </div>
         <div class="confidence-sizing-preview">
           <span><b>Size Ladder</b> 50-60% = 25%, 60-70% = 50%, 70-80% = 75%, 80-100% = 100%</span>
           <span><b>Signal Strength</b> ${formatProbability(sizing.signalStrength)} -> ${formatProbability(sizing.sizeMultiplier)} size multiplier</span>
-          <span><b>Risk Dollars</b> ${currency(sizing.accountEquity)} x ${roundNumber(confidenceDefaultSizingSettings().baseRiskPercent, 3)}% x ${formatProbability(sizing.sizeMultiplier)} = ${currency(sizing.riskDollars)}</span>
-          <span><b>Stop Distance</b> max(ATR x ${roundNumber(confidenceDefaultSizingSettings().atrStopMultiplier, 2)}, price x ${roundNumber(confidenceDefaultSizingSettings().minimumStopDistancePercent, 3)}%) = ${price(sizing.stopDistance)}</span>
+          <span><b>Risk Dollars</b> ${currency(sizing.accountEquity)} x ${roundNumber(defaults.baseRiskPercent, 3)}% x ${formatProbability(sizing.sizeMultiplier)} = ${currency(sizing.riskDollars)}</span>
+          <span><b>Stop Distance</b> ${price(defaults.fixedStopDistanceDollars)} fixed $/share = ${price(sizing.stopDistance)}</span>
           <span><b>Shares By Risk</b> ${Number.isFinite(sizing.sharesByRisk) ? Math.floor(sizing.sharesByRisk).toLocaleString() : "0"}</span>
+          <span><b>Shares By Order Limit</b> ${formatShareLimit(sizing.sharesByOrder)}</span>
           <span><b>Shares By Capital</b> ${Math.floor(sizing.sharesByCapital).toLocaleString()}</span>
           <span><b>Shares By Buying Power</b> ${Math.floor(sizing.sharesByBuyingPower).toLocaleString()}</span>
+          <span><b>Shares By Liquidity</b> ${formatShareLimit(sizing.sharesByLiquidity)}</span>
+          <span><b>Current Position Value</b> ${currency(sizing.currentPositionValue)} / ${currency(sizing.maxPositionDollars)} max</span>
           <span><b>Final Quantity</b> ${sizing.finalQuantity.toLocaleString()}${sizing.blockedReason ? ` · ${escapeHtml(sizing.blockedReason)}` : ""}</span>
         </div>
       </div>
@@ -8961,17 +12824,24 @@ function renderConfidenceDefaultSizingSection(settings: TradingSettings, result:
   `;
 }
 
-function confidenceTargetOrderRecommendation(result: ConfidenceAggregationResult): ManualOrderRecommendation {
-  const settings = state.confidenceTradingSettings;
-  const latest = currentCandle();
-  const submitMode = (state.confidenceTargetOrderOverrides.submitMode as SubmitOrderMode | undefined) ?? DEFAULT_SUBMIT_MODE;
+function confidenceTargetOrderRecommendation(result: ConfidenceAggregationResult, mode: TradingWindowMode = "confidence"): ManualOrderRecommendation {
+  const settings = tradingSettingsForMode(mode);
+  const latest = latestExecutionCandleForMode(mode);
+  const targetOverrides =
+    mode === "regime"
+      ? state.regimeTargetOrderOverrides
+      : mode === "meta"
+        ? state.metaTargetOrderOverrides
+        : state.confidenceTargetOrderOverrides;
+  const submitMode = (targetOverrides.submitMode as SubmitOrderMode | undefined) ?? DEFAULT_SUBMIT_MODE;
   const automaticShortCycleBuy = submitMode === "Automatic";
-  const market = automaticShortCycleBuy ? confidenceMarketSnapshot() : null;
+  const useAutomaticSizingBoost = automaticShortCycleBuy && mode === "confidence";
+  const market = useAutomaticSizingBoost ? confidenceMarketSnapshot() : null;
   const sizing =
-    automaticShortCycleBuy && market
-      ? confidencePositionSizing(market, "Buy", result.normalizedNetScore, { automaticShortCycleBuy, result })
+    useAutomaticSizingBoost && market
+      ? confidencePositionSizing(market, "Buy", result.normalizedNetScore, { automaticShortCycleBuy: true, result, mode })
       : result.sizing;
-  const failedGates = confidenceTargetOrderFailedGates(result, automaticShortCycleBuy, market).map((filter) => `${filter.label}: ${filter.detail}`);
+  const failedGates = confidenceTargetOrderFailedGates(result, useAutomaticSizingBoost, market, mode).map((filter) => `${filter.label}: ${filter.detail}`);
   if (sizing.blockedReason) {
     failedGates.push(`Sizing: ${sizing.blockedReason}`);
   }
@@ -9012,7 +12882,7 @@ function confidenceTargetOrderRecommendation(result: ConfidenceAggregationResult
   const orderType = eligible ? `${side} stop-limit` : "No order";
   const summary =
     !eligible
-      ? `No order: ${uniqueStrings(failedGates).join(", ") || "WCA final signal is Hold"}.`
+      ? `No order: ${uniqueStrings(failedGates).join(", ") || `${algorithmDisplayName(mode)} final signal is Hold`}.`
       : `${orderType} ${state.symbol}, ${quantity} shares, trigger ${price(triggerPrice ?? 0)}, limit ${price(limitPrice ?? 0)}, stop ${price(stopPrice ?? 0)}, target ${price(targetPrice ?? 0)}.`;
   return applyConfidenceTargetOrderOverrides({
     eligible,
@@ -9049,15 +12919,34 @@ function confidenceTargetOrderRecommendation(result: ConfidenceAggregationResult
       lastTime: latest?.timestamp ?? null,
     },
     summary,
-  });
+  }, mode);
 }
 
 function confidenceTargetOrderFailedGates(
   result: ConfidenceAggregationResult,
   automaticShortCycleBuy: boolean,
   market: ConfidenceMarket | null,
+  mode: TradingWindowMode = "confidence",
 ) {
   const failed = result.hardFilters.filter((filter) => filter.status === "fail");
+  const latest = latestExecutionCandleForMode(mode);
+  if ((mode === "confidence" || mode === "regime") && latest && (automaticShortCycleBuy || result.signal === "Buy")) {
+    const lateSessionBlocker = lateSessionAboveAverageBuyBlocker(mode, latest.close, latest.timestamp);
+    if (lateSessionBlocker) {
+      failed.push({
+        label: mode === "regime" ? "Regime Late-session Buy Guard" : "WCA Late-session Buy Guard",
+        status: "fail",
+        detail: lateSessionBlocker,
+      });
+    }
+    forecastBuySafetyBlockers(mode, latest.close, latest.timestamp).forEach((detail) => {
+      failed.push({
+        label: mode === "regime" ? "Regime Forecast Safety" : "WCA Forecast Safety",
+        status: "fail",
+        detail,
+      });
+    });
+  }
   if (!automaticShortCycleBuy) {
     return failed;
   }
@@ -9076,9 +12965,15 @@ function confidenceTargetOrderFailedGates(
   return hardFailures;
 }
 
-function applyConfidenceTargetOrderOverrides(order: ManualOrderRecommendation): ManualOrderRecommendation {
-  const overrides = state.confidenceTargetOrderOverrides;
-  const useDefaults = state.confidenceTradingSettings.useDefaultSizingSettings;
+function applyConfidenceTargetOrderOverrides(order: ManualOrderRecommendation, mode: TradingWindowMode = "confidence"): ManualOrderRecommendation {
+  const overrides =
+    mode === "regime"
+      ? state.regimeTargetOrderOverrides
+      : mode === "meta"
+        ? state.metaTargetOrderOverrides
+        : state.confidenceTargetOrderOverrides;
+  const settings = tradingSettingsForMode(mode);
+  const useDefaults = settings.useDefaultSizingSettings;
   const quantity = order.quantity;
   const triggerPrice = useDefaults ? order.triggerPrice : overrides.triggerPrice === null ? null : Number(overrides.triggerPrice ?? order.triggerPrice);
   const limitPrice = useDefaults ? order.limitPrice : overrides.limitPrice === null ? null : Number(overrides.limitPrice ?? order.limitPrice);
@@ -9104,7 +12999,7 @@ function applyConfidenceTargetOrderOverrides(order: ManualOrderRecommendation): 
     ? order.estimatedSlippage
     : Number.isFinite(Number(overrides.estimatedSlippage))
       ? Number(overrides.estimatedSlippage)
-      : roundNumber(quantity * state.confidenceTradingSettings.slippagePerShare * 2, 2);
+      : roundNumber(quantity * settings.slippagePerShare * 2, 2);
   const submitMode = (overrides.submitMode as SubmitOrderMode | undefined) ?? order.submitMode;
   const side = submitMode === "Automatic" ? "Buy" : useDefaults ? order.side : (overrides.side as AlgoSignal | undefined) ?? order.side;
   return {
@@ -9130,32 +13025,33 @@ function applyConfidenceTargetOrderOverrides(order: ManualOrderRecommendation): 
   };
 }
 
-function renderConfidenceTargetOrderSettings(order: ManualOrderRecommendation) {
-  const defaultsOn = state.confidenceTradingSettings.useDefaultSizingSettings;
+function renderConfidenceTargetOrderSettings(order: ManualOrderRecommendation, sourceLabel = "WCA", mode: TradingWindowMode = "confidence") {
+  const defaultsOn = tradingSettingsForMode(mode).useDefaultSizingSettings;
+  const targetDataset = mode === "regime" ? "regime-target-setting" : mode === "meta" ? "meta-target-setting" : "confidence-target-setting";
   return `
     <div class="target-settings-panel weighted-target-settings-panel" data-side="${escapeHtml(order.side.toLowerCase())}">
       <strong>Target Order</strong>
-      <span class="target-settings-note">${defaultsOn ? "Generated from WCA sizing and default settings" : "Manual target-order overrides enabled"}</span>
+      <span class="target-settings-note">${defaultsOn ? `Generated from ${escapeHtml(sourceLabel)} sizing and default settings` : "Manual target-order overrides enabled"}</span>
       ${renderTargetOrderBlockers(order)}
       <div class="target-settings-grid">
-        ${renderConfidenceTargetSettingInput("accountBalance", "Total balance", order.accountBalance, "number", 0.01, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("dailyLimitDollars", "Buying power", order.dailyLimitDollars, "number", 0.01, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("orderLimitDollars", "Order limit", order.orderLimitDollars, "number", 0.01, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("orderNotional", "Order value", order.orderNotional, "number", 0.01, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("symbol", "Symbol", order.symbol, "text", undefined, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingSelect("side", "Side", order.side, ["Buy", "Sell", "Hold"], undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingSelect("orderType", "Order type", order.orderType, ["No order", "Buy stop-limit", "Sell stop-limit"], undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("quantity", "Quantity", order.quantity, "number", 1, undefined, true)}
-        ${renderConfidenceTargetSettingInput("triggerPrice", "Trigger / stop price", order.triggerPrice, "number", 0.01, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("limitPrice", "Limit price", order.limitPrice, "number", 0.01, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("stopPrice", "Protective stop", order.stopPrice, "number", 0.01, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("targetPrice", "Take profit", order.targetPrice, "number", 0.01, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("riskDollars", "Risk budget", order.riskDollars, "number", 0.01, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("plannedStopRiskDollars", "Planned stop risk", order.plannedStopRiskDollars, "number", 0.01, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("estimatedSlippage", "Estimated slippage", order.estimatedSlippage, "number", 0.01, undefined, defaultsOn)}
-        ${renderConfidenceTargetSettingInput("timeInForce", "Time in force", order.timeInForce, "text", undefined, "half", defaultsOn)}
-        ${renderConfidenceTargetSettingInput("cutoff", "Cutoff", order.cutoff, "text", undefined, "half", defaultsOn)}
-        ${renderConfidenceTargetSettingSelect("submitMode", "Submit order", order.submitMode, ["Manual", "Automatic"], "half", false)}
+        ${renderConfidenceTargetSettingInput("accountBalance", "Total balance", order.accountBalance, "number", 0.01, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("dailyLimitDollars", "Buying power", order.dailyLimitDollars, "number", 0.01, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("orderLimitDollars", "Order limit", order.orderLimitDollars, "number", 0.01, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("orderNotional", "Order value", order.orderNotional, "number", 0.01, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("symbol", "Symbol", order.symbol, "text", undefined, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingSelect("side", "Side", order.side, ["Buy", "Sell", "Hold"], undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingSelect("orderType", "Order type", order.orderType, ["No order", "Buy stop-limit", "Sell stop-limit"], undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("quantity", "Quantity", order.quantity, "number", 1, undefined, true, targetDataset)}
+        ${renderConfidenceTargetSettingInput("triggerPrice", "Trigger / stop price", order.triggerPrice, "number", 0.01, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("limitPrice", "Limit price", order.limitPrice, "number", 0.01, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("stopPrice", "Protective stop", order.stopPrice, "number", 0.01, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("targetPrice", "Take profit", order.targetPrice, "number", 0.01, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("riskDollars", "Risk budget", order.riskDollars, "number", 0.01, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("plannedStopRiskDollars", "Planned stop risk", order.plannedStopRiskDollars, "number", 0.01, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("estimatedSlippage", "Estimated slippage", order.estimatedSlippage, "number", 0.01, undefined, defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("timeInForce", "Time in force", order.timeInForce, "text", undefined, "half", defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingInput("cutoff", "Cutoff", order.cutoff, "text", undefined, "half", defaultsOn, targetDataset)}
+        ${renderConfidenceTargetSettingSelect("submitMode", "Submit order", order.submitMode, ["Manual", "Automatic"], "half", false, targetDataset)}
       </div>
       <span class="trading-settings-warning">${escapeHtml(order.summary)}</span>
     </div>
@@ -9170,12 +13066,13 @@ function renderConfidenceTargetSettingInput(
   step?: number,
   layout?: "wide" | "half",
   locked = false,
+  datasetName = "confidence-target-setting",
 ) {
   const inputValue = value === null ? "" : String(value);
   return `
     <label class="${layout ?? ""}" data-generated="${String(locked)}">
       <span>${escapeHtml(label)}</span>
-      <input data-confidence-target-setting="${escapeHtml(name)}" type="${type}" ${step ? `step="${step}"` : ""} value="${escapeHtml(inputValue)}" ${locked ? "readonly" : ""} />
+      <input data-${datasetName}="${escapeHtml(name)}" type="${type}" ${step ? `step="${step}"` : ""} value="${escapeHtml(inputValue)}" ${locked ? "readonly" : ""} />
     </label>
   `;
 }
@@ -9187,11 +13084,12 @@ function renderConfidenceTargetSettingSelect(
   options: string[],
   layout?: "wide" | "half",
   locked = false,
+  datasetName = "confidence-target-setting",
 ) {
   return `
     <label class="${layout ?? ""}" data-generated="${String(locked)}">
       <span>${escapeHtml(label)}</span>
-      <select data-confidence-target-setting="${escapeHtml(name)}" ${locked ? "disabled" : ""}>
+      <select data-${datasetName}="${escapeHtml(name)}" ${locked ? "disabled" : ""}>
         ${options.map((option) => `<option value="${escapeHtml(option)}" ${option === value ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}
       </select>
     </label>
@@ -9223,6 +13121,35 @@ function renderConfidenceTradingSettingToggle(
     <label class="trading-default-toggle">
       <span>${escapeHtml(label)}</span>
       <input data-confidence-trading-setting="${escapeHtml(name)}" type="checkbox" ${checked ? "checked" : ""} />
+    </label>
+  `;
+}
+
+function renderRegimeTradingSettingInput(
+  name: keyof TradingSettings,
+  label: string,
+  value: number,
+  min: number,
+  max: number,
+  step: number,
+) {
+  return `
+    <label>
+      <span>${escapeHtml(label)}</span>
+      <input data-regime-trading-setting="${escapeHtml(name)}" type="number" min="${min}" max="${max}" step="${step}" value="${value}" />
+    </label>
+  `;
+}
+
+function renderRegimeTradingSettingToggle(
+  name: keyof TradingSettings,
+  label: string,
+  checked: boolean,
+) {
+  return `
+    <label class="trading-default-toggle">
+      <span>${escapeHtml(label)}</span>
+      <input data-regime-trading-setting="${escapeHtml(name)}" type="checkbox" ${checked ? "checked" : ""} />
     </label>
   `;
 }
@@ -9281,6 +13208,632 @@ function renderConfidenceStrategies(strategies: ConfidenceStrategyResult[]) {
   `;
 }
 
+function updateMetaStrategyPanel() {
+  const result = calculateMetaStrategy();
+  state.currentMetaTargetOrder = metaTargetOrderRecommendation(result);
+  metaFinalSignal.textContent = result.decisionLabel;
+  metaFinalSignal.className = `algo-final ${result.signal.toLowerCase()}`;
+  metaScoreGrid.innerHTML = renderMetaScoreGrid(result);
+  metaSummary.innerHTML = "";
+  metaSummary.hidden = true;
+  renderMetaMlReadiness();
+  if (state.metaTrainingStatus === "idle") {
+    void loadMetaStrategyTrainingStatus();
+  }
+  metaGateList.innerHTML = renderMetaDecisionChecks(result);
+  metaFamilyGrid.innerHTML = renderMetaFamilyGrid(result);
+  metaStrategiesList.innerHTML = renderMetaStrategies(result.strategies);
+  metaStrategiesToggleMeta.textContent = `${result.strategies.filter((strategy) => strategy.signal !== "hold").length} active / ${result.strategies.length} strategies`;
+  const failedChecks = result.safetyGates.filter((gate) => gate.status === "fail").length;
+  const infoChecks = result.safetyGates.filter((gate) => gate.status === "info").length;
+  metaChecksToggleMeta.textContent = failedChecks
+    ? `${failedChecks} blocked / ${result.safetyGates.length} checks`
+    : `${result.safetyGates.length - infoChecks} pass / ${result.safetyGates.length} checks`;
+  renderMetaStrategiesExpandedState();
+  renderMetaChecksExpandedState();
+}
+
+function metaTargetOrderRecommendation(result: MetaStrategyResult): ManualOrderRecommendation | null {
+  const market = confidenceMarketSnapshot();
+  const latest = latestExecutionCandleForMode("meta");
+  if (!market || !latest) {
+    return null;
+  }
+  const settings = state.metaTradingSettings;
+  const submitMode = (state.metaTargetOrderOverrides.submitMode as SubmitOrderMode | undefined) ?? DEFAULT_SUBMIT_MODE;
+  const sizing = confidencePositionSizing(market, result.signal, result.netScore, { mode: "meta" });
+  const failedGates = result.safetyGates.filter((gate) => gate.status === "fail").map((gate) => `${gate.label}: ${gate.detail}`);
+  if (result.signal === "Hold") {
+    failedGates.push(`Signal: Meta-Strategy final signal is ${result.decisionLabel}`);
+  }
+  if (sizing.blockedReason) {
+    failedGates.push(`Sizing: ${sizing.blockedReason}`);
+  }
+  const side: AlgoSignal = failedGates.length ? "Hold" : result.signal;
+  const priceValue = latest.close;
+  const pricingSide: Exclude<AlgoSignal, "Hold"> = side === "Buy" || side === "Sell" ? side : result.netScore < 0 ? "Sell" : "Buy";
+  const triggerPrice =
+    pricingSide === "Buy"
+      ? roundNumber(priceValue + settings.slippagePerShare, 2)
+      : roundNumber(Math.max(0, priceValue - settings.slippagePerShare), 2);
+  const limitPrice =
+    pricingSide === "Buy"
+      ? roundNumber(triggerPrice + settings.slippagePerShare, 2)
+      : roundNumber(Math.max(0, triggerPrice - settings.slippagePerShare), 2);
+  const stopPrice =
+    pricingSide === "Buy"
+      ? roundNumber(Math.max(0, triggerPrice - sizing.stopDistance), 2)
+      : roundNumber(triggerPrice + sizing.stopDistance, 2);
+  const quantity = side === "Hold" ? 0 : sizing.finalQuantity;
+  const targetDistance = targetProfitDistancePerShare(quantity, sizing.stopDistance, settings.takeProfitR);
+  const targetPrice =
+    pricingSide === "Buy"
+      ? roundNumber(triggerPrice + targetDistance, 2)
+      : roundNumber(Math.max(0, triggerPrice - targetDistance), 2);
+  const orderNotional = roundNumber(quantity * triggerPrice, 2);
+  const plannedStopRiskDollars = roundNumber(quantity * Math.abs(triggerPrice - stopPrice), 2);
+  const estimatedSlippage = roundNumber(quantity * settings.slippagePerShare * 2, 2);
+  const eligible = side !== "Hold" && quantity > 0 && failedGates.length === 0;
+  const orderType = eligible ? `${side} stop-limit` : "No order";
+  const summary =
+    eligible
+      ? `${orderType} ${state.symbol}, ${quantity} shares, trigger ${price(triggerPrice)}, limit ${price(limitPrice)}, stop ${price(stopPrice)}, target ${price(targetPrice)}.`
+      : `No order: ${uniqueStrings(failedGates).join(", ") || "Meta-Strategy final signal is Hold"}.`;
+  return applyMetaTargetOrderOverrides({
+    eligible,
+    side,
+    orderType,
+    symbol: state.symbol,
+    quantity,
+    triggerPrice,
+    limitPrice,
+    stopPrice,
+    targetPrice,
+    accountBalance: sizing.accountEquity,
+    orderLimitDollars: sizing.accountEquity * (settings.orderAllocationPercent / 100),
+    dailyLimitDollars: sizing.availableBuyingPower + sizing.currentPositionValue,
+    riskDollars: sizing.riskDollars,
+    orderNotional,
+    plannedStopRiskDollars,
+    estimatedSlippage,
+    timeInForce: "Day",
+    cutoff: "No new trades after 15:30 ET",
+    submitMode,
+    failedGates: uniqueStrings(failedGates),
+    gates: result.safetyGates.map((gate) => ({
+      layer: gate.label,
+      status: gate.status,
+      signal: result.decisionLabel,
+      detail: gate.detail,
+    })),
+    levels: {
+      last: priceValue,
+      vwap: market.vwap,
+      openingHigh: market.openingRange.high,
+      openingLow: market.openingRange.low,
+      lastTime: latest.timestamp,
+    },
+    summary,
+  });
+}
+
+function applyMetaTargetOrderOverrides(order: ManualOrderRecommendation): ManualOrderRecommendation {
+  const overrides = state.metaTargetOrderOverrides;
+  const settings = state.metaTradingSettings;
+  const useDefaults = settings.useDefaultSizingSettings;
+  const quantity = order.quantity;
+  const triggerPrice = useDefaults ? order.triggerPrice : overrides.triggerPrice === null ? null : Number(overrides.triggerPrice ?? order.triggerPrice);
+  const limitPrice = useDefaults ? order.limitPrice : overrides.limitPrice === null ? null : Number(overrides.limitPrice ?? order.limitPrice);
+  const stopPrice = useDefaults ? order.stopPrice : overrides.stopPrice === null ? null : Number(overrides.stopPrice ?? order.stopPrice);
+  const targetPrice = useDefaults ? order.targetPrice : overrides.targetPrice === null ? null : Number(overrides.targetPrice ?? order.targetPrice);
+  const orderNotional =
+    useDefaults
+      ? order.orderNotional
+      : Number.isFinite(Number(overrides.orderNotional))
+        ? Number(overrides.orderNotional)
+        : triggerPrice !== null && Number.isFinite(triggerPrice)
+          ? roundNumber(quantity * triggerPrice, 2)
+          : order.orderNotional;
+  const plannedStopRiskDollars =
+    useDefaults
+      ? order.plannedStopRiskDollars
+      : Number.isFinite(Number(overrides.plannedStopRiskDollars))
+        ? Number(overrides.plannedStopRiskDollars)
+        : triggerPrice !== null && stopPrice !== null && Number.isFinite(triggerPrice) && Number.isFinite(stopPrice)
+          ? roundNumber(quantity * Math.abs(triggerPrice - stopPrice), 2)
+          : order.plannedStopRiskDollars;
+  const estimatedSlippage = useDefaults
+    ? order.estimatedSlippage
+    : Number.isFinite(Number(overrides.estimatedSlippage))
+      ? Number(overrides.estimatedSlippage)
+      : roundNumber(quantity * settings.slippagePerShare * 2, 2);
+  const submitMode = (overrides.submitMode as SubmitOrderMode | undefined) ?? order.submitMode;
+  const side = useDefaults ? order.side : (overrides.side as AlgoSignal | undefined) ?? order.side;
+  return {
+    ...order,
+    side,
+    orderType: useDefaults ? order.orderType : String(overrides.orderType ?? order.orderType),
+    symbol: String((useDefaults ? order.symbol : overrides.symbol ?? order.symbol)).toUpperCase(),
+    quantity,
+    triggerPrice: triggerPrice !== null && Number.isFinite(triggerPrice) ? triggerPrice : null,
+    limitPrice: limitPrice !== null && Number.isFinite(limitPrice) ? limitPrice : null,
+    stopPrice: stopPrice !== null && Number.isFinite(stopPrice) ? stopPrice : null,
+    targetPrice: targetPrice !== null && Number.isFinite(targetPrice) ? targetPrice : null,
+    accountBalance: roundNumber(useDefaults ? order.accountBalance : Number(overrides.accountBalance ?? order.accountBalance), 2),
+    orderLimitDollars: roundNumber(useDefaults ? order.orderLimitDollars : Number(overrides.orderLimitDollars ?? order.orderLimitDollars), 2),
+    dailyLimitDollars: roundNumberUp(useDefaults ? order.dailyLimitDollars : Number(overrides.dailyLimitDollars ?? order.dailyLimitDollars), 2),
+    riskDollars: roundNumber(useDefaults ? order.riskDollars : Number(overrides.riskDollars ?? order.riskDollars), 2),
+    orderNotional,
+    plannedStopRiskDollars,
+    estimatedSlippage,
+    timeInForce: useDefaults ? order.timeInForce : String(overrides.timeInForce ?? order.timeInForce),
+    cutoff: useDefaults ? order.cutoff : String(overrides.cutoff ?? order.cutoff),
+    submitMode,
+  };
+}
+
+function calculateMetaStrategy(): MetaStrategyResult {
+  const market = confidenceMarketSnapshot();
+  if (!market) {
+    return emptyMetaStrategyResult("Waiting for session candles");
+  }
+
+  const ensembleVotes = new Map(strategyEnsembleSignals(state.marketContext).map((vote) => [vote.strategy, vote]));
+  const rawFeatures = metaStrategyCatalog.map((definition) => metaStrategyFeature(definition, market, ensembleVotes));
+  const families = emptyMetaFamilyScores();
+  const familyRawTotals = new Map<MetaStrategyFamily, number>();
+
+  rawFeatures.forEach((feature) => {
+    if (feature.role !== "directional") {
+      return;
+    }
+    const weight = metaRoleWeight(feature.role);
+    const strength = feature.confidence * weight;
+    if (feature.direction === 1) {
+      families[feature.family].buy += strength;
+    } else if (feature.direction === -1) {
+      families[feature.family].sell += strength;
+    } else {
+      families[feature.family].hold += Math.max(0.05, feature.confidence * 0.25);
+    }
+    familyRawTotals.set(feature.family, (familyRawTotals.get(feature.family) ?? 0) + Math.abs(strength));
+  });
+
+  const familyCap = 0.36;
+  for (const family of metaStrategyFamilies()) {
+    const directionalTotal = families[family].buy + families[family].sell;
+    if (directionalTotal > familyCap) {
+      const scale = familyCap / directionalTotal;
+      families[family].buy = roundNumber(families[family].buy * scale, 4);
+      families[family].sell = roundNumber(families[family].sell * scale, 4);
+      families[family].capped = true;
+    }
+    families[family].hold = roundNumber(families[family].hold, 4);
+  }
+
+  const contextFeatures = rawFeatures.filter((feature) => feature.role === "context");
+  const buyContext = contextFeatures.filter((feature) => feature.direction === 1).reduce((sum, feature) => sum + feature.confidence * 0.07, 0);
+  const sellContext = contextFeatures.filter((feature) => feature.direction === -1).reduce((sum, feature) => sum + feature.confidence * 0.07, 0);
+  const familyAggregation = metaFamilyAggregationScores(families, contextFeatures);
+  const contextMultiplier = clampNumber(1 + Math.max(buyContext, sellContext) - Math.min(buyContext, sellContext) * 0.5, 0.85, 1.18);
+  const buyContextMultiplier = clampNumber(1 + buyContext - sellContext * 0.5, 0.75, 1.2);
+  const sellContextMultiplier = clampNumber(1 + sellContext - buyContext * 0.5, 0.75, 1.2);
+
+  let buyScore = roundNumber(metaStrategyFamilies().reduce((sum, family) => sum + families[family].buy, 0) * buyContextMultiplier, 4);
+  let sellScore = roundNumber(metaStrategyFamilies().reduce((sum, family) => sum + families[family].sell, 0) * sellContextMultiplier, 4);
+  const holdScore = roundNumber(metaStrategyFamilies().reduce((sum, family) => sum + families[family].hold, 0), 4);
+
+  const ensembleFeature = rawFeatures.find((feature) => feature.name === "Ensemble Strategy Voting");
+  if (ensembleFeature && ensembleFeature.direction !== 0 && ensembleFeature.confidence >= 0.62) {
+    if (ensembleFeature.direction === 1) {
+      buyScore = roundNumber(buyScore + ensembleFeature.confidence * 0.08, 4);
+    } else {
+      sellScore = roundNumber(sellScore + ensembleFeature.confidence * 0.08, 4);
+    }
+  }
+
+  const aggregateDirectionalTotal = buyScore + sellScore;
+  const aggregateScale = aggregateDirectionalTotal > 1 ? 1 / aggregateDirectionalTotal : 1;
+  if (aggregateScale < 1) {
+    buyScore = roundNumber(buyScore * aggregateScale, 4);
+    sellScore = roundNumber(sellScore * aggregateScale, 4);
+  }
+
+  const cashFeature = rawFeatures.find((feature) => feature.name === "Cash / Avoid Trading Filter");
+  const cashBlocked = Boolean(cashFeature && cashFeature.confidence >= 0.75);
+  const netScore = roundNumber(clampNumber(buyScore - sellScore, -1, 1), 4);
+  const edge = roundNumber(Math.min(1, Math.abs(netScore)), 4);
+  const rawSignal: AlgoSignal = edge >= 0.08 && Math.max(buyScore, sellScore) >= 0.22 ? (netScore > 0 ? "Buy" : "Sell") : "Hold";
+  const signal: AlgoSignal = cashBlocked ? "Hold" : rawSignal;
+  const decisionLabel: ConfidenceDecisionLabel =
+    signal === "Buy" && edge >= 0.18
+      ? "Strong Buy"
+      : signal === "Buy"
+        ? "Buy"
+        : signal === "Sell" && edge >= 0.18
+          ? "Strong Sell"
+          : signal === "Sell"
+            ? "Sell"
+            : "Hold";
+
+  const activeDirectionalCount = rawFeatures.filter((feature) => feature.role === "directional" && feature.direction !== 0).length;
+  const cappedFamilies = metaStrategyFamilies().filter((family) => families[family].capped);
+  const safetyGates = [
+    {
+      label: "Cash filter",
+      status: cashBlocked ? "fail" : "pass",
+      detail: cashFeature ? cashFeature.reason : "Cash filter unavailable",
+    },
+    {
+      label: "Edge",
+      status: rawSignal === "Hold" ? "info" : "pass",
+      detail: `Net ${netScore.toFixed(2)} with edge ${edge.toFixed(2)} after family and aggregate caps`,
+    },
+    {
+      label: "Family caps",
+      status: cappedFamilies.length ? "info" : "pass",
+      detail: cappedFamilies.length ? `${cappedFamilies.map(metaFamilyLabel).join(", ")} capped at ${formatProbability(familyCap)}` : "No family hit the cap",
+    },
+    {
+      label: "Aggregate cap",
+      status: aggregateScale < 1 ? "info" : "pass",
+      detail:
+        aggregateScale < 1
+          ? `Buy/sell total normalized by ${aggregateScale.toFixed(2)}x to stay within 1.00`
+          : "Buy/sell total stayed within 1.00",
+    },
+    {
+      label: "Context",
+      status: contextFeatures.some((feature) => feature.direction !== 0) ? "pass" : "info",
+      detail: `${contextFeatures.filter((feature) => feature.direction !== 0).length}/${contextFeatures.length} context modifiers active`,
+    },
+  ] satisfies MetaStrategyResult["safetyGates"];
+
+  const effectiveFeatures = rawFeatures.map((feature) => {
+    if (feature.role !== "directional") {
+      return feature;
+    }
+    const rawTotal = familyRawTotals.get(feature.family) ?? 0;
+    const cappedTotal = families[feature.family].buy + families[feature.family].sell;
+    const scale = (rawTotal > 0 ? Math.min(1, cappedTotal / rawTotal) : 1) * aggregateScale;
+    return { ...feature, effectiveContribution: roundNumber(feature.contribution * scale, 4) };
+  });
+  const familyDisplayScores = metaFamilyDisplayScores(rawFeatures, familyAggregation);
+
+  return {
+    signal,
+    decisionLabel,
+    buyScore,
+    sellScore,
+    holdScore,
+    netScore,
+    edge,
+    contextMultiplier: roundNumber(contextMultiplier, 4),
+    aggregateScale: roundNumber(aggregateScale, 4),
+    activeDirectionalCount,
+    familyAggregation,
+    familyScores: families,
+    familyDisplayScores,
+    safetyGates,
+    strategies: effectiveFeatures,
+    reasons: [
+      `${activeDirectionalCount} directional strategy outputs are active across ${metaStrategyFamilies().length} capped families.`,
+      `Context modifiers adjusted buy/sell by ${buyContextMultiplier.toFixed(2)}x/${sellContextMultiplier.toFixed(2)}x.`,
+      aggregateScale < 1 ? `Aggregate directional score normalized by ${aggregateScale.toFixed(2)}x.` : "Aggregate directional score stayed within the 1.00 cap.",
+      cashBlocked ? "Cash / Avoid Trading Filter forced Hold." : `Final signal ${decisionLabel} from net score ${netScore.toFixed(2)}.`,
+    ],
+  };
+}
+
+function emptyMetaStrategyResult(reason: string): MetaStrategyResult {
+  return {
+    signal: "Hold",
+    decisionLabel: "Hold",
+    buyScore: 0,
+    sellScore: 0,
+    holdScore: 1,
+    netScore: 0,
+    edge: 0,
+    contextMultiplier: 1,
+    aggregateScale: 1,
+    activeDirectionalCount: 0,
+    familyAggregation: emptyMetaFamilyAggregationScores(),
+    familyScores: emptyMetaFamilyScores(),
+    familyDisplayScores: {},
+    safetyGates: [{ label: "Market data", status: "info", detail: reason }],
+    strategies: metaStrategyCatalog.map((definition) => ({
+      name: definition.name,
+      role: definition.role,
+      family: definition.family,
+      signal: "hold",
+      confidence: 0,
+      direction: 0,
+      contribution: 0,
+      effectiveContribution: 0,
+      source: definition.source,
+      reason,
+    })),
+    reasons: [reason],
+  };
+}
+
+function metaStrategyFeature(
+  definition: MetaStrategyDefinition,
+  market: ConfidenceMarket,
+  ensembleVotes: Map<string, AlgoVote>,
+): MetaStrategyFeature {
+  const ensembleVote = ensembleVotes.get(definition.name);
+  if (definition.source === "ensemble" && ensembleVote) {
+    const confidence = isEligibleStrategyVote(ensembleVote) ? clampNumber((ensembleVote.score ?? 0) / 100, 0, 1) : 0;
+    const signal = confidenceContractSignal(confidence > 0 ? ensembleVote.signal : "Hold");
+    const direction = confidenceSignalDirection(signal);
+    const contribution = roundNumber(direction * confidence * metaRoleWeight(definition.role), 4);
+    return {
+      name: definition.name,
+      role: definition.role,
+      family: definition.family,
+      signal,
+      confidence,
+      direction,
+      contribution,
+      effectiveContribution: contribution,
+      source: "Voting Ensemble",
+      reason: ensembleVote.detail,
+    };
+  }
+
+  const sourceName = definition.alias ?? definition.name;
+  const confidenceStrategy = regimeSelectionStrategies.find((strategy) => strategy.name === sourceName);
+  if (!confidenceStrategy) {
+    return {
+      name: definition.name,
+      role: definition.role,
+      family: definition.family,
+      signal: "hold",
+      confidence: 0,
+      direction: 0,
+      contribution: 0,
+      effectiveContribution: 0,
+      source: definition.source,
+      reason: "No isolated read-only source is available",
+    };
+  }
+
+  const raw = confidenceStrategy.signal(market);
+  const signal = confidenceContractSignal(raw.signal);
+  const confidence = clampNumber(raw.confidence, 0, 1);
+  const direction = confidenceSignalDirection(signal);
+  const contribution = roundNumber(direction * confidence * metaRoleWeight(definition.role), 4);
+  return {
+    name: definition.name,
+    role: definition.role,
+    family: definition.family,
+    signal,
+    confidence,
+    direction,
+    contribution,
+    effectiveContribution: contribution,
+    source: definition.alias ? `${sourceName} copy` : "WCA/Regime output",
+    reason: raw.reason,
+  };
+}
+
+function metaRoleWeight(role: MetaStrategyRole) {
+  return role === "directional" ? 1 : role === "context" ? 0.35 : 0.2;
+}
+
+function metaStrategyFamilies(): MetaStrategyFamily[] {
+  return ["trend", "breakout", "mean_reversion", "reversal", "volume_confirmation", "market_regime", "vwap", "event", "safety"];
+}
+
+function metaFamilyUsesDisplayScore(family: MetaStrategyFamily) {
+  return family === "volume_confirmation" || family === "market_regime" || family === "event" || family === "safety";
+}
+
+function emptyMetaFamilyScores(): Record<MetaStrategyFamily, { buy: number; sell: number; hold: number; capped: boolean }> {
+  return Object.fromEntries(metaStrategyFamilies().map((family) => [family, { buy: 0, sell: 0, hold: 0, capped: false }])) as Record<
+    MetaStrategyFamily,
+    { buy: number; sell: number; hold: number; capped: boolean }
+  >;
+}
+
+function emptyMetaFamilyAggregationScores(): MetaFamilyAggregationScores {
+  return {
+    trend_buy_score: 0,
+    trend_sell_score: 0,
+    breakout_buy_score: 0,
+    breakout_sell_score: 0,
+    mean_reversion_buy_score: 0,
+    mean_reversion_sell_score: 0,
+    reversal_buy_score: 0,
+    reversal_sell_score: 0,
+    confirmation_score: 0,
+    regime_score: 0,
+  };
+}
+
+function metaFamilyDisplayScores(features: MetaStrategyFeature[], aggregation: MetaFamilyAggregationScores): Partial<Record<MetaStrategyFamily, MetaFamilyDisplayScore>> {
+  const signedAverage = (family: MetaStrategyFamily) => {
+    const familyFeatures = features.filter((feature) => feature.family === family && feature.role !== "directional");
+    if (!familyFeatures.length) {
+      return 0;
+    }
+    return roundNumber(familyFeatures.reduce((sum, feature) => sum + feature.direction * feature.confidence, 0) / familyFeatures.length, 4);
+  };
+  const safetyFeature = features.find((feature) => feature.family === "safety" && feature.name === "Cash / Avoid Trading Filter");
+  return {
+    volume_confirmation: { label: "Confirm", value: signedAverage("volume_confirmation") },
+    market_regime: { label: "Regime", value: aggregation.regime_score },
+    event: { label: "Event", value: signedAverage("event") },
+    safety: { label: "Gate", value: safetyFeature ? roundNumber(safetyFeature.confidence, 4) : 0 },
+  };
+}
+
+function metaFamilyAggregationScores(
+  families: Record<MetaStrategyFamily, { buy: number; sell: number; hold: number; capped: boolean }>,
+  contextFeatures: MetaStrategyFeature[],
+): MetaFamilyAggregationScores {
+  const signedAverage = (features: MetaStrategyFeature[]) => {
+    if (!features.length) {
+      return 0;
+    }
+    return roundNumber(features.reduce((sum, feature) => sum + feature.direction * feature.confidence, 0) / features.length, 4);
+  };
+  return {
+    trend_buy_score: roundNumber(families.trend.buy, 4),
+    trend_sell_score: roundNumber(families.trend.sell, 4),
+    breakout_buy_score: roundNumber(families.breakout.buy, 4),
+    breakout_sell_score: roundNumber(families.breakout.sell, 4),
+    mean_reversion_buy_score: roundNumber(families.mean_reversion.buy, 4),
+    mean_reversion_sell_score: roundNumber(families.mean_reversion.sell, 4),
+    reversal_buy_score: roundNumber(families.reversal.buy, 4),
+    reversal_sell_score: roundNumber(families.reversal.sell, 4),
+    confirmation_score: signedAverage(contextFeatures),
+    regime_score: signedAverage(contextFeatures.filter((feature) => feature.family === "market_regime")),
+  };
+}
+
+function metaFamilyLabel(family: MetaStrategyFamily) {
+  return family.replaceAll("_", " ");
+}
+
+function renderMetaScoreGrid(result: MetaStrategyResult) {
+  return [
+    ["Buy", result.buyScore.toFixed(2), "buy"],
+    ["Sell", result.sellScore.toFixed(2), "sell"],
+    ["Edge", result.edge.toFixed(2), result.signal.toLowerCase()],
+    ["Confirm", result.familyAggregation.confirmation_score.toFixed(2), result.familyAggregation.confirmation_score >= 0 ? "buy" : "sell"],
+    ["Regime", result.familyAggregation.regime_score.toFixed(2), result.familyAggregation.regime_score >= 0 ? "buy" : "sell"],
+  ]
+    .map(
+      ([label, value, tone]) => `
+        <div class="weighted-score-card ${tone}">
+          <span>${escapeHtml(label)}</span>
+          <strong>${escapeHtml(value)}</strong>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderMetaSummary(result: MetaStrategyResult) {
+  return result.reasons.map((reason) => `<span>${escapeHtml(reason)}</span>`).join("");
+}
+
+function renderMetaDecisionChecks(result: MetaStrategyResult) {
+  const summary = result.reasons.length
+    ? `
+      <span class="meta-check-summary" data-status="info">
+        <b>Decision summary</b>
+        ${result.reasons.map((reason) => `<em>${escapeHtml(reason)}</em>`).join("")}
+      </span>
+    `
+    : "";
+  return `${summary}${result.safetyGates.map(renderWeightedGate).join("")}`;
+}
+
+function renderMetaFamilyGrid(result: MetaStrategyResult) {
+  return metaStrategyFamilies()
+    .map((family) => {
+      const score = result.familyScores[family];
+      const total = score.buy + score.sell + score.hold;
+      const displayScore = result.familyDisplayScores[family];
+      const usesDisplayScore = metaFamilyUsesDisplayScore(family) && Boolean(displayScore);
+      const buyShare = total > 0 ? score.buy / total : 0;
+      const sellShare = total > 0 ? score.sell / total : 0;
+      const holdShare = total > 0 ? score.hold / total : 0;
+      const dominant =
+        usesDisplayScore && displayScore
+          ? `${displayScore.label} ${displayScore.value >= 0 ? "+" : ""}${displayScore.value.toFixed(2)}`
+          : total <= 0
+          ? "No signal"
+          : buyShare >= sellShare && buyShare >= holdShare
+            ? "Buy"
+            : sellShare >= buyShare && sellShare >= holdShare
+              ? "Sell"
+              : "Hold";
+      const tone =
+        usesDisplayScore && displayScore
+          ? displayScore.value > 0
+            ? "buy"
+            : displayScore.value < 0
+              ? "sell"
+              : "empty"
+          : dominant === "Buy"
+            ? "buy"
+            : dominant === "Sell"
+              ? "sell"
+              : dominant === "Hold"
+                ? "hold"
+                : "empty";
+      const normalizedNet = total > 0 ? (score.buy - score.sell) / total : 0;
+      const capLabel = score.capped ? "Capped" : "Open";
+      const rawTitle = `Raw ${metaFamilyLabel(family)} score: buy ${score.buy.toFixed(2)}, sell ${score.sell.toFixed(2)}, hold ${score.hold.toFixed(2)}`;
+      const detailLine =
+        usesDisplayScore && displayScore
+          ? `${displayScore.label} score ${displayScore.value >= 0 ? "+" : ""}${displayScore.value.toFixed(2)}`
+          : `Net ${normalizedNet >= 0 ? "+" : ""}${formatProbability(normalizedNet)} - ${capLabel}`;
+      return `
+        <div class="meta-family-card" data-tone="${tone}" data-capped="${String(score.capped)}" title="${escapeHtml(rawTitle)}">
+          <div class="meta-family-head">
+            <span>${escapeHtml(metaFamilyLabel(family))}</span>
+            <strong>${escapeHtml(dominant)}</strong>
+          </div>
+          <div class="meta-family-bar" aria-label="${escapeHtml(rawTitle)}">
+            <i class="buy" style="width:${roundNumber(buyShare * 100, 2)}%"></i>
+            <i class="sell" style="width:${roundNumber(sellShare * 100, 2)}%"></i>
+            <i class="hold" style="width:${roundNumber(holdShare * 100, 2)}%"></i>
+          </div>
+          <div class="meta-family-values">
+            <span><b>B</b>${formatProbability(buyShare)}</span>
+            <span><b>S</b>${formatProbability(sellShare)}</span>
+            <span><b>H</b>${formatProbability(holdShare)}</span>
+          </div>
+          <small>${escapeHtml(detailLine)}</small>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function renderMetaStrategies(strategies: MetaStrategyFeature[]) {
+  return `
+    <table class="weighted-strategy-table confidence-strategy-table">
+      <colgroup>
+        <col class="confidence-strategy-metric-col" />
+        <col class="confidence-strategy-metric-col" />
+        <col class="confidence-strategy-metric-col" />
+        <col class="confidence-strategy-metric-col" />
+        <col class="confidence-strategy-metric-col" />
+        <col class="confidence-strategy-reason-col" />
+      </colgroup>
+      <tbody>
+        ${strategies
+          .map(
+            (strategy, strategyIndex) => `
+              <tr class="weighted-strategy-name-row" data-tone="${strategyIndex % 4}" data-disabled="${String(strategy.signal === "hold")}">
+                <td colspan="5">${escapeHtml(strategy.name)}</td>
+                <td>${escapeHtml(strategy.signal)}</td>
+              </tr>
+              <tr class="weighted-strategy-detail-row" data-tone="${strategyIndex % 4}" data-disabled="${String(strategy.signal === "hold")}">
+                ${renderWeightedMetricCell("Role", strategy.role.replaceAll("_", " "))}
+                ${renderWeightedMetricCell("Family", metaFamilyLabel(strategy.family))}
+                ${renderWeightedMetricCell("Confidence", strategy.confidence.toFixed(2))}
+                ${renderWeightedMetricCell("Raw", strategy.contribution.toFixed(2))}
+                ${renderWeightedMetricCell("Capped", strategy.effectiveContribution.toFixed(2))}
+                <td>
+                  <small>${escapeHtml(strategy.source)}</small>
+                  <strong>${escapeHtml(strategy.reason)}</strong>
+                </td>
+              </tr>
+            `,
+          )
+          .join("")}
+      </tbody>
+    </table>
+  `;
+}
+
 function updateWeightedVotingPanel() {
   const result = calculateWeightedVote();
   weightedFinalSignal.textContent = result.signal;
@@ -9305,8 +13858,7 @@ function updateWeightedVotingPanel() {
 }
 
 function calculateWeightedVote(): WeightedVoteResult {
-  const oneMinuteCandles = state.weightedMarketData.timeframeCandles["1Min"] ?? [];
-  const sessionCandles = oneMinuteCandles.length ? latestRegularSessionCandlesFrom(oneMinuteCandles) : latestRegularSessionCandles();
+  const sessionCandles = latestWeightedCalculationCandles();
   const candles = sessionCandles.length ? sessionCandles : state.candles.slice(-240);
   const latest = candles.at(-1) ?? null;
   if (!latest || candles.length < 20) {
@@ -9326,10 +13878,9 @@ function calculateWeightedVote(): WeightedVoteResult {
   const sma50 = simpleMovingAverage(closes, 50);
   const relativeStrengthScore = weightedRelativeStrengthScore(candles);
   const breadthScore = weightedBreadthScore(candles);
-  const eventRiskScoreResult = weightedEventRiskScore();
   const relativeStrength = relativeStrengthScore.value;
   const breadth = breadthScore.value;
-  const eventRisk = eventRiskScoreResult.value;
+  const eventRisk = 0;
   const volatilityPercent = atr && latest.close ? atr / latest.close : 0;
   const minutes = easternMinutes(latest.timestamp);
   const regime = weightedMarketRegime({
@@ -9420,9 +13971,11 @@ function calculateWeightedVote(): WeightedVoteResult {
   const weightedDefaults = weightedDefaultSizingSettings();
   const activeStrategyCount = strategies.filter((strategy) => strategy.finalWeight > 0 && !strategy.disabledReason).length;
   const buyStrategyCount = strategies.filter((strategy) => strategy.finalWeight > 0 && strategy.pBuy > strategy.pSell && strategy.pBuy > strategy.pHold).length;
+  const sellStrategyCount = strategies.filter((strategy) => strategy.finalWeight > 0 && strategy.pSell > strategy.pBuy && strategy.pSell > strategy.pHold).length;
+  const directionalStrategyCount = rawWinner === "Buy" ? buyStrategyCount : rawWinner === "Sell" ? sellStrategyCount : 0;
   const expectedReturnAfterCosts = roundNumber(strategies.reduce((sum, strategy) => sum + strategy.finalWeight * strategy.expectedReturnAfterCosts, 0), 5);
   const tripleBarrier = weightedTripleBarrierFilter(rawWinner, expectedReturnAfterCosts, market, strategies);
-  const metaLabelProbability = weightedMetaLabelProbability(rawWinner, maxScore, margin, eventRisk, tripleBarrier, timeframes);
+  const metaLabelProbability = weightedMetaLabelProbability(rawWinner, maxScore, margin, tripleBarrier, timeframes);
   const confidenceMultiplier = maxScore < weightedDefaults.minimumBuyScore || margin < weightedDefaults.minimumSignalEdge ? 0 : Math.min(1.4, 0.7 + maxScore + margin);
   const volatilityAdjustment = atr && latest.close ? Math.max(0.35, Math.min(1.2, 1 - (atr / latest.close) * 18)) : 0.75;
   const baseSize = state.weightedTradingSettings.startingCapital * (weightedDefaults.maxPositionPercent / 100);
@@ -9445,9 +13998,11 @@ function calculateWeightedVote(): WeightedVoteResult {
       detail: `${activeStrategyCount}/${weightedDefaults.minimumActiveStrategies} active`,
     },
     {
-      label: "Buy Strategy Count",
-      status: rawWinner !== "Buy" || buyStrategyCount >= weightedDefaults.minimumBuyStrategyCount ? "pass" : "fail",
-      detail: `${buyStrategyCount}/${weightedDefaults.minimumBuyStrategyCount} buy-leaning strategies`,
+      label: "Directional Strategy Count",
+      status: rawWinner === "Hold" || directionalStrategyCount >= weightedDefaults.minimumBuyStrategyCount ? "pass" : "fail",
+      detail: rawWinner === "Hold"
+        ? "Hold does not need directional strategy count"
+        : `${directionalStrategyCount}/${weightedDefaults.minimumBuyStrategyCount} ${rawWinner.toLowerCase()}-leaning strategies`,
     },
     {
       label: "5m Confirmation",
@@ -9473,11 +14028,6 @@ function calculateWeightedVote(): WeightedVoteResult {
       label: "Daily Loss",
       status: dailyLoss.limitReached ? "fail" : "pass",
       detail: `${signedCurrency(dailyLoss.pnl)} today, limit ${currency(dailyLoss.limit)}`,
-    },
-    {
-      label: "Event Risk",
-      status: eventRisk < 0.85 ? "pass" : "fail",
-      detail: `${formatProbability(eventRisk)} risk score`,
     },
     {
       label: "Spread/Slippage",
@@ -9529,7 +14079,7 @@ function calculateWeightedVote(): WeightedVoteResult {
       breadth,
       breadthSource: breadthScore.source,
       eventRisk,
-      eventRiskSource: eventRiskScoreResult.source,
+      eventRiskSource: "Removed from short-cycle mode",
       trendDirection: regime.trendDirection,
       trendSource: regime.trendSource,
       volatilityLevel: regime.volatilityLevel,
@@ -9541,6 +14091,26 @@ function calculateWeightedVote(): WeightedVoteResult {
       updatePolicy: "Weights update once per day after the close; live candles only update probabilities and gates.",
     },
   };
+}
+
+function latestWeightedCalculationCandles() {
+  const weightedOneMinute = state.weightedMarketData.timeframeCandles["1Min"] ?? [];
+  const weightedSessionCandles = weightedOneMinute.length ? latestRegularSessionCandlesFrom(weightedOneMinute) : [];
+  const chartSessionCandles = latestRegularSessionCandles();
+  const base = weightedSessionCandles.length ? weightedSessionCandles : chartSessionCandles;
+  const chartLatest = chartSessionCandles.at(-1);
+  const baseLatest = base.at(-1);
+  if (
+    chartLatest &&
+    (!baseLatest || (
+      easternDateString(chartLatest.timestamp) === easternDateString(baseLatest.timestamp) &&
+      new Date(chartLatest.timestamp).getTime() > new Date(baseLatest.timestamp).getTime()
+    ))
+  ) {
+    return [...base.filter((candle) => candle.timestamp !== chartLatest.timestamp), chartLatest]
+      .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
+  }
+  return base;
 }
 
 function emptyWeightedVote(latest: Candle | null): WeightedVoteResult {
@@ -9593,7 +14163,7 @@ function emptyWeightedVote(latest: Candle | null): WeightedVoteResult {
       breadth: 0,
       breadthSource: "Waiting for sector ETF candles",
       eventRisk: 0,
-      eventRiskSource: "Waiting for event calendar",
+      eventRiskSource: "Removed from short-cycle mode",
       trendDirection: "neutral",
       trendSource: "Waiting for at least 20 one-minute candles",
       volatilityLevel: "unknown",
@@ -9615,7 +14185,6 @@ function weightedWaitingGates(): WeightedVoteResult["gates"] {
     { label: "Meta Label", status: "info", detail: "Waiting for final weighted signal" },
     { label: "Triple Barrier", status: "info", detail: "Waiting for target/stop/time-barrier setup" },
     { label: "Daily Loss", status: "info", detail: "Waiting for latest tradable price" },
-    { label: "Event Risk", status: "info", detail: "Waiting for event risk score" },
     { label: "Spread/Slippage", status: "info", detail: "Waiting for latest price and slippage estimate" },
   ];
 }
@@ -9632,10 +14201,12 @@ function weightedAlphaSignal(strategy: WeightedAlphaStrategy, market: ReturnType
   const distanceFromVwap = (latest.close - market.vwap) / Math.max(market.vwap, 0.01);
   const atrPercent = market.atr && latest.close ? market.atr / latest.close : 0.0035;
   const costEstimate = latest.close ? (state.weightedTradingSettings.slippagePerShare * 2 + 0.02) / latest.close : 0.0001;
-  let pBuy = 0.12;
-  let pSell = 0.12;
-  let pHold = 0.76;
+  const recentMomentum = market.closes.length > 8 ? (latest.close - market.closes[Math.max(0, market.closes.length - 9)]) / Math.max(market.closes[Math.max(0, market.closes.length - 9)], 0.01) : 0;
+  let pBuy = 0.18;
+  let pSell = 0.18;
+  let pHold = 0.64;
   let detail = "No active setup";
+  let setupActive = false;
 
   if (strategy.key === "S1") {
     if (latest.close > market.openingRange.high && volumeExpansion) {
@@ -9643,11 +14214,13 @@ function weightedAlphaSignal(strategy: WeightedAlphaStrategy, market: ReturnType
       pSell = 0.08;
       pHold = 0.26;
       detail = "Opening range high broke with volume expansion";
+      setupActive = true;
     } else if (latest.close < market.openingRange.low && volumeExpansion) {
       pBuy = 0.08;
       pSell = 0.66;
       pHold = 0.26;
       detail = "Opening range low broke with volume expansion";
+      setupActive = true;
     }
   } else if (strategy.key === "S2") {
     const nearSma20 = market.sma20 !== null && Math.abs(latest.close - market.sma20) / latest.close < 0.0025;
@@ -9656,11 +14229,13 @@ function weightedAlphaSignal(strategy: WeightedAlphaStrategy, market: ReturnType
       pSell = 0.1;
       pHold = 0.27;
       detail = "Trend pullback is holding near 20 SMA";
+      setupActive = true;
     } else if (trendDown && nearSma20) {
       pBuy = 0.1;
       pSell = 0.63;
       pHold = 0.27;
       detail = "Downtrend pullback is rejecting near 20 SMA";
+      setupActive = true;
     }
   } else if (strategy.key === "S3") {
     if (trendUp && latest.close > market.openingRange.high) {
@@ -9668,11 +14243,25 @@ function weightedAlphaSignal(strategy: WeightedAlphaStrategy, market: ReturnType
       pSell = 0.07;
       pHold = 0.25;
       detail = "VWAP and trend continuation agree above opening range";
+      setupActive = true;
+    } else if (trendUp && latest.close > market.vwap && recentMomentum > 0.001) {
+      pBuy = 0.64;
+      pSell = 0.09;
+      pHold = 0.27;
+      detail = "Bullish intraday continuation above VWAP";
+      setupActive = true;
     } else if (trendDown && latest.close < market.openingRange.low) {
       pBuy = 0.07;
       pSell = 0.68;
       pHold = 0.25;
       detail = "VWAP and trend continuation agree below opening range";
+      setupActive = true;
+    } else if (trendDown && latest.close < market.vwap && recentMomentum < -0.001) {
+      pBuy = 0.09;
+      pSell = 0.64;
+      pHold = 0.27;
+      detail = "Bearish intraday continuation below VWAP";
+      setupActive = true;
     }
   } else if (strategy.key === "S4") {
     if (distanceFromVwap < -0.003 && market.rangeCondition.toLowerCase().includes("chop")) {
@@ -9680,11 +14269,13 @@ function weightedAlphaSignal(strategy: WeightedAlphaStrategy, market: ReturnType
       pSell = 0.13;
       pHold = 0.26;
       detail = "Price is stretched below VWAP during choppy trade";
+      setupActive = true;
     } else if (distanceFromVwap > 0.003 && market.rangeCondition.toLowerCase().includes("chop")) {
       pBuy = 0.13;
       pSell = 0.61;
       pHold = 0.26;
       detail = "Price is stretched above VWAP during choppy trade";
+      setupActive = true;
     }
   } else if (strategy.key === "S5") {
     if (failedHigh) {
@@ -9692,11 +14283,13 @@ function weightedAlphaSignal(strategy: WeightedAlphaStrategy, market: ReturnType
       pSell = 0.7;
       pHold = 0.22;
       detail = "Prior high breakout failed back below range";
+      setupActive = true;
     } else if (failedLow) {
       pBuy = 0.7;
       pSell = 0.08;
       pHold = 0.22;
       detail = "Prior low breakdown failed back above range";
+      setupActive = true;
     }
   } else if (strategy.key === "S6") {
     if (failedHigh && volumeExpansion) {
@@ -9704,11 +14297,13 @@ function weightedAlphaSignal(strategy: WeightedAlphaStrategy, market: ReturnType
       pSell = 0.72;
       pHold = 0.21;
       detail = "High-side liquidity sweep with expanded volume";
+      setupActive = true;
     } else if (failedLow && volumeExpansion) {
       pBuy = 0.72;
       pSell = 0.07;
       pHold = 0.21;
       detail = "Low-side liquidity sweep with expanded volume";
+      setupActive = true;
     }
   } else if (strategy.key === "S7") {
     if (market.bands && market.atr && latest.close < market.bands.lower - market.atr * 0.15) {
@@ -9716,11 +14311,13 @@ function weightedAlphaSignal(strategy: WeightedAlphaStrategy, market: ReturnType
       pSell = 0.11;
       pHold = 0.25;
       detail = "Bollinger and ATR downside extension";
+      setupActive = true;
     } else if (market.bands && market.atr && latest.close > market.bands.upper + market.atr * 0.15) {
       pBuy = 0.11;
       pSell = 0.64;
       pHold = 0.25;
       detail = "Bollinger and ATR upside extension";
+      setupActive = true;
     }
   } else if (strategy.key === "S8") {
     if (market.volatilityLevel === "high" && volumeExpansion && latest.close > market.priorHigh) {
@@ -9728,18 +14325,26 @@ function weightedAlphaSignal(strategy: WeightedAlphaStrategy, market: ReturnType
       pSell = 0.09;
       pHold = 0.26;
       detail = "Volatility expansion broke above prior range";
+      setupActive = true;
     } else if (market.volatilityLevel === "high" && volumeExpansion && latest.close < market.priorLow) {
       pBuy = 0.09;
       pSell = 0.65;
       pHold = 0.26;
       detail = "Volatility expansion broke below prior range";
+      setupActive = true;
     }
   }
 
   const maxDirectional = Math.max(pBuy, pSell);
   const signalQuality = Math.max(0, maxDirectional - pHold * 0.35);
-  const directionalEdge = pBuy - pSell;
-  const expectedReturn = directionalEdge * Math.max(atrPercent, 0.0015) * 0.6;
+  const directionalSide = pBuy > pSell && pBuy > pHold ? "Buy" : pSell > pBuy && pSell > pHold ? "Sell" : "Hold";
+  const directionalEdge =
+    directionalSide === "Buy"
+      ? pBuy - Math.max(pSell, pHold)
+      : directionalSide === "Sell"
+        ? pSell - Math.max(pBuy, pHold)
+        : 0;
+  const expectedReturn = Math.max(0, directionalEdge) * Math.max(atrPercent, 0.0015) * 0.6;
   const expectedReturnAfterCosts = expectedReturn - costEstimate;
   const tradeCount = weightedStrategyTradeCount(strategy.key);
   const liveOutcomeCount = weightedStrategyLiveOutcomeCount(strategy.key);
@@ -9749,13 +14354,13 @@ function weightedAlphaSignal(strategy: WeightedAlphaStrategy, market: ReturnType
   const drawdownScore = weightedStrategyDrawdownScore(recentDrawdown);
   const components = weightedStrengthComponents(strategy, signalQuality, expectedReturnAfterCosts, market, sampleSizeScore, drawdownScore);
   const strength = roundNumber(
-    0.25 * components.profitFactor +
+    (0.25 * components.profitFactor +
       0.2 * components.expectancy +
       0.15 * components.precision +
       0.15 * components.drawdown +
       0.1 * components.recentPerformance +
       0.1 * components.regimeMatch +
-      0.05 * components.sampleSize,
+      0.05 * components.sampleSize) * (setupActive ? 1 : 0.35),
     4,
   );
   const disabledReason =
@@ -9818,9 +14423,6 @@ function weightedMarketType() {
 function emptyWeightedTimeframeContext(): WeightedTimeframeContext {
   return {
     fiveMinute: { direction: "neutral", score: 0, source: "5m confirmation: unavailable" },
-    oneHour: { direction: "neutral", score: 0, source: "1h intraday trend: unavailable" },
-    oneDay: { direction: "neutral", score: 0, source: "1d daily bias: unavailable" },
-    oneWeek: { direction: "neutral", score: 0, source: "1w higher regime: unavailable" },
   };
 }
 
@@ -9880,17 +14482,8 @@ function weightedTimeframeContext(oneMinuteCandles: Candle[]): WeightedTimeframe
     state.weightedMarketData.timeframeCandles["5Min"]?.length
       ? state.weightedMarketData.timeframeCandles["5Min"]!
       : aggregateCandlesToMinutes(oneMinuteCandles, 5, "5Min");
-  const oneHourCandles = state.weightedMarketData.timeframeCandles["1Hour"] ?? [];
-  const oneDayCandles = state.weightedMarketData.timeframeCandles["1Day"] ?? [];
-  const oneWeekCandles =
-    state.weightedMarketData.timeframeCandles["1Week"]?.length
-      ? state.weightedMarketData.timeframeCandles["1Week"]!
-      : aggregateDailyCandlesToWeeks(oneDayCandles);
   return {
     fiveMinute: weightedDirectionalTimeframeSignal(fiveMinuteCandles, 6, 0.0008, "5m confirmation"),
-    oneHour: weightedDirectionalTimeframeSignal(oneHourCandles, 6, 0.0015, "1h intraday trend"),
-    oneDay: weightedDirectionalTimeframeSignal(oneDayCandles, 20, 0.004, "1d daily bias"),
-    oneWeek: weightedDirectionalTimeframeSignal(oneWeekCandles, 8, 0.008, "1w higher regime"),
   };
 }
 
@@ -9987,7 +14580,6 @@ function weightedFilterMultipliers(
 ) {
   const regimeDirectional = market.trendDirection === "up" ? "long" : market.trendDirection === "down" ? "short" : "neutral";
   const sessionText = market.rangeCondition.toLowerCase();
-  const activeEvent = state.marketContext?.event.strategyTags.includes("event-rules") || market.eventRisk > 0.55;
   const familyLeader = strategies
     .filter((item) => item.family === strategy.family)
     .sort((left, right) => right.strength - left.strength)[0];
@@ -9997,9 +14589,7 @@ function weightedFilterMultipliers(
       ? 1.15
       : strategy.family === "reversion" && sessionText.includes("chop")
         ? 1.2
-        : strategy.family === "breakout" && activeEvent
-          ? 1.12
-          : strategy.family === "volatility" && market.volatilityLevel === "high"
+        : strategy.family === "volatility" && market.volatilityLevel === "high"
             ? 1.1
             : trendRegime && strategy.family === "reversion"
               ? 0.85
@@ -10026,44 +14616,21 @@ function weightedFilterMultipliers(
       : 1;
   const side = weightedSignalSide(strategy);
   const fiveMinuteAlignment = side ? weightedSignalTimeframeAlignment(side, market.timeframes.fiveMinute) : 0;
-  const oneHourAlignment = side ? weightedSignalTimeframeAlignment(side, market.timeframes.oneHour) : 0;
-  const dailyAlignment = side ? weightedSignalTimeframeAlignment(side, market.timeframes.oneDay) : 0;
-  const weeklyAlignment = side ? weightedSignalTimeframeAlignment(side, market.timeframes.oneWeek) : 0;
   const fiveMinuteMultiplier = fiveMinuteAlignment > 0 ? 1.08 : fiveMinuteAlignment < -0.35 ? 0.78 : fiveMinuteAlignment < 0 ? 0.9 : 1;
-  const oneHourMultiplier =
-    oneHourAlignment > 0 && (strategy.family === "trend" || strategy.family === "breakout")
-      ? 1.1
-      : oneHourAlignment < -0.35 && (strategy.family === "trend" || strategy.family === "breakout")
-        ? 0.82
-        : 1;
-  const dailyBiasMultiplier = dailyAlignment > 0 ? 1.05 : dailyAlignment < -0.45 ? 0.88 : 1;
-  const weeklyRegimeMultiplier = weeklyAlignment > 0 ? 1.03 : weeklyAlignment < -0.45 ? 0.9 : 1;
   const breadthMultiplier =
     Math.abs(market.breadth) > 0.35
       ? strategy.family === "trend" || strategy.family === "volatility"
         ? 1.07
         : 0.95
       : 1;
-  const eventRiskMultiplier =
-    market.eventRisk > 0.75
-      ? strategy.key === "S1" || strategy.key === "S8"
-        ? 0.95
-        : 0.72
-      : activeEvent && (strategy.key === "S1" || strategy.key === "S8")
-        ? 1.08
-        : 1;
   const drawdownMultiplier = strategy.recentDrawdown > 0.006 ? 0.72 : strategy.recentDrawdown > 0.003 ? 0.86 : 1;
   const correlationPenalty = familyLeader?.key === strategy.key ? 1 : strategy.family === familyLeader?.family ? 0.86 : 1;
   return {
     regime: regimeMultiplier,
     timeOfDay: timeOfDayMultiplier,
     fiveMinute: fiveMinuteMultiplier,
-    oneHour: oneHourMultiplier,
-    dailyBias: dailyBiasMultiplier,
-    weeklyRegime: weeklyRegimeMultiplier,
     relativeStrength: relativeStrengthMultiplier,
     breadth: breadthMultiplier,
-    eventRisk: eventRiskMultiplier,
     drawdown: drawdownMultiplier,
     correlation: correlationPenalty,
   };
@@ -10111,7 +14678,7 @@ function weightedVotingHasBacktestSeed() {
 }
 
 async function ensureWeightedInitialWeightsFromBacktest() {
-  if (weightedInitialWeightsInFlight || weightedVotingHasBacktestSeed() || state.symbol !== "SPY") {
+  if (!WEIGHTED_BROWSER_BACKTEST_BOOTSTRAP_ENABLED || weightedInitialWeightsInFlight || weightedVotingHasBacktestSeed() || state.symbol !== "SPY") {
     return;
   }
   weightedInitialWeightsInFlight = true;
@@ -10641,11 +15208,7 @@ function weightedTripleBarrierFilter(
   const pathReturn = expectedReturnAfterCosts * horizonBars * Math.max(0.5, directionalQuality);
   const oppositePressure = signal === "Buy" ? strategies.reduce((sum, strategy) => sum + strategy.finalWeight * strategy.pSell, 0) : strategies.reduce((sum, strategy) => sum + strategy.finalWeight * strategy.pBuy, 0);
   const timeframeAdjustment =
-    weightedSignalTimeframeAlignment(signal, market.timeframes.fiveMinute) * 0.25 +
-    weightedSignalTimeframeAlignment(signal, market.timeframes.oneHour) * 0.2 +
-    weightedSignalTimeframeAlignment(signal, market.timeframes.oneDay) * 0.12 +
-    weightedSignalTimeframeAlignment(signal, market.timeframes.oneWeek) * 0.08 -
-    market.eventRisk * 0.08;
+    weightedSignalTimeframeAlignment(signal, market.timeframes.fiveMinute) * 0.25;
   const adjustedPathReturn = pathReturn + timeframeAdjustment * targetReturn;
   const likelyTargetFirst = adjustedPathReturn >= targetReturn && directionalQuality - oppositePressure + timeframeAdjustment >= 0.12;
   const likelyStopFirst = adjustedPathReturn <= -stopReturn || oppositePressure > directionalQuality + Math.max(0, timeframeAdjustment);
@@ -10678,7 +15241,6 @@ function weightedMetaLabelProbability(
   signal: AlgoSignal,
   maxScore: number,
   margin: number,
-  eventRisk: number,
   tripleBarrier: WeightedTripleBarrierResult,
   timeframes: WeightedTimeframeContext,
 ) {
@@ -10686,18 +15248,11 @@ function weightedMetaLabelProbability(
     return 0.5;
   }
   const bestRows = state.dynamicArtifact?.mlComparison?.bestByTimeframe ?? state.mlComparison?.bestByTimeframe ?? [];
-  const eventRow = bestRows.find((row) => row.timeframe === "Event");
-  const fiveMinuteRow = bestRows.find((row) => row.timeframe === "5Min");
-  const row = eventRisk > 0.55 ? eventRow ?? fiveMinuteRow : fiveMinuteRow ?? eventRow;
+  const row = bestRows.find((item) => item.timeframe === "5Min");
   const artifactScore =
     row?.verdict === "Improved" ? 0.65 : row?.verdict === "Mixed" ? 0.6 : row?.verdict === "Worse" ? 0.52 : row ? 0.56 : 0.58;
   const tripleBarrierAdjustment = tripleBarrier.label === "positive" ? 0.04 : tripleBarrier.label === "negative" ? -0.08 : -0.03;
-  const timeframeAdjustment =
-    weightedSignalTimeframeAlignment(signal, timeframes.fiveMinute) * 0.05 +
-    weightedSignalTimeframeAlignment(signal, timeframes.oneHour) * 0.04 +
-    weightedSignalTimeframeAlignment(signal, timeframes.oneDay) * 0.03 +
-    weightedSignalTimeframeAlignment(signal, timeframes.oneWeek) * 0.02 -
-    eventRisk * 0.04;
+  const timeframeAdjustment = weightedSignalTimeframeAlignment(signal, timeframes.fiveMinute) * 0.05;
   return Math.max(0.35, Math.min(0.82, artifactScore + (maxScore - 0.58) * 0.25 + margin * 0.35 + tripleBarrierAdjustment + timeframeAdjustment));
 }
 
@@ -10937,6 +15492,7 @@ function weightedDefaultSizingSettings() {
       maxPositionPercent: Math.max(0, settings.orderAllocationPercent),
       maxDailyLossPercent: Math.max(0, settings.dailyAllocationPercent),
       maxDailyTrades: Math.max(1, Math.round(settings.maxTradesPerDay)),
+      fixedStopDistanceDollars: fixedStopDistanceDollars(settings.fixedStopDistanceDollars),
       atrStopMultiplier: Math.max(0.01, settings.stopLossPercent / 0.05),
       minimumStopDistancePercent: Math.max(0.0001, settings.stopLossPercent),
       maxSpreadPercent: latestManualSpreadPercent(settings),
@@ -10955,6 +15511,7 @@ function weightedDefaultSizingSettings() {
     maxPositionPercent: Math.max(0, settings.maxPositionPercent),
     maxDailyLossPercent: Math.max(0, settings.maxDailyLossPercent),
     maxDailyTrades: Math.max(1, Math.round(settings.maxTradesPerDay)),
+    fixedStopDistanceDollars: fixedStopDistanceDollars(settings.fixedStopDistanceDollars),
     atrStopMultiplier: Math.max(0.01, settings.atrStopMultiplier),
     minimumStopDistancePercent: Math.max(0, settings.minimumStopDistancePercent),
     maxSpreadPercent: Math.max(0, settings.maxSpreadPercent),
@@ -11060,18 +15617,18 @@ function confidencePositionSummary(latestPrice: number): PositionSummary {
   };
 }
 
-function confidenceDefaultSizingSettings() {
-  const settings = state.confidenceTradingSettings;
+function defaultSizingSettingsFromTradingSettings(settings: TradingSettings) {
   if (!settings.useDefaultSizingSettings) {
     return {
       minimumBuyScore: 0.6,
       minimumSignalEdge: 0.2,
-      minimumActiveStrategies: state.confidenceDecisionSettings.minimumActiveStrategies,
+      minimumActiveStrategies: Math.max(1, Math.round(settings.minimumActiveStrategies)),
       minimumBuyStrategyCount: 1,
       baseRiskPercent: Math.max(0, settings.orderAllocationPercent * (settings.riskBudgetPercentOfOrder / 100)),
       maxPositionPercent: Math.max(0, settings.orderAllocationPercent),
       maxDailyLossPercent: Math.max(0, settings.dailyAllocationPercent),
       maxDailyTrades: Math.max(1, Math.round(settings.maxTradesPerDay)),
+      fixedStopDistanceDollars: fixedStopDistanceDollars(settings.fixedStopDistanceDollars),
       atrStopMultiplier: Math.max(0.01, settings.stopLossPercent / 0.05),
       minimumStopDistancePercent: Math.max(0.0001, settings.stopLossPercent),
       maxSpreadPercent: latestManualSpreadPercent(settings),
@@ -11084,12 +15641,13 @@ function confidenceDefaultSizingSettings() {
   return {
     minimumBuyScore: clampNumber(settings.minimumBuyScore, 0, 1),
     minimumSignalEdge: clampNumber(settings.minimumSignalEdge, 0, 1),
-    minimumActiveStrategies: state.confidenceDecisionSettings.minimumActiveStrategies,
+    minimumActiveStrategies: Math.max(1, Math.round(settings.minimumActiveStrategies)),
     minimumBuyStrategyCount: 1,
     baseRiskPercent: Math.max(0, settings.baseRiskPercent),
     maxPositionPercent: Math.max(0, settings.maxPositionPercent),
     maxDailyLossPercent: Math.max(0, settings.maxDailyLossPercent),
     maxDailyTrades: Math.max(1, Math.round(settings.maxTradesPerDay)),
+    fixedStopDistanceDollars: fixedStopDistanceDollars(settings.fixedStopDistanceDollars),
     atrStopMultiplier: Math.max(0.01, settings.atrStopMultiplier),
     minimumStopDistancePercent: Math.max(0, settings.minimumStopDistancePercent),
     maxSpreadPercent: Math.max(0, settings.maxSpreadPercent),
@@ -11100,8 +15658,16 @@ function confidenceDefaultSizingSettings() {
   };
 }
 
+function confidenceDefaultSizingSettings() {
+  return defaultSizingSettingsFromTradingSettings(state.confidenceTradingSettings);
+}
+
+function regimeDefaultSizingSettings() {
+  return defaultSizingSettingsFromTradingSettings(state.regimeTradingSettings);
+}
+
 function latestManualSpreadPercent(settings: TradingSettings) {
-  const latest = currentCandle();
+  const latest = latestLoadedCandle();
   return latest?.close ? ((settings.slippagePerShare * 2) / latest.close) * 100 : 0.1;
 }
 
@@ -11220,12 +15786,8 @@ function renderWeightedDataGrid(result: WeightedVoteResult) {
     ["Bollinger", bands ? `${price(bands.lower)} / ${price(bands.middle)} / ${price(bands.upper)}` : "NA"],
     ["Relative Strength", `${formatBasisPoints(result.data.relativeStrength)} ${result.data.relativeStrengthSource}`],
     ["Breadth", `${formatProbability((result.data.breadth + 1) / 2)} ${result.data.breadthSource}`],
-    ["Event Risk", `${formatProbability(result.data.eventRisk)} ${result.data.eventRiskSource}`],
     ["Regime", `${result.data.trendDirection.toUpperCase()} / ${escapeHtml(result.data.volatilityLevel)} / ${escapeHtml(result.data.rangeCondition)}`],
     ["5m Confirm", result.data.timeframes.fiveMinute.source],
-    ["1h Trend", result.data.timeframes.oneHour.source],
-    ["1d Bias", result.data.timeframes.oneDay.source],
-    ["1w Regime", result.data.timeframes.oneWeek.source],
     ["Trend Source", result.data.trendSource],
     ["Session", result.data.sessionLabel],
   ]
@@ -11255,9 +15817,9 @@ function renderWeightedControlRules() {
     <span>Smoothing: new weight = 70% old weight + 30% recalculated weight.</span>
     <span>Caps: maximum one-strategy weight 25%; minimum active weight 2%; disabled strategies receive 0%.</span>
     <span>Eligibility: all strategies start live-eligible; require 40 live triple-barrier outcomes before disabling negative rolling expectancy.</span>
-    <span>Multi-timeframe flow: 1m generates signals, 5m confirms, 1h detects intraday trend, 1d/1w set bias and regime, Event adjusts risk/meta/triple-barrier.</span>
-    <span>Risk trims: reduce weight for observed drawdown, high event risk, poor regime match, higher-timeframe conflict, and high correlation with a stronger strategy.</span>
-    <span>Final gates: confidence, 5m confirmation, expected value, meta-label, triple barrier, daily loss, event risk, and slippage must pass.</span>
+    <span>Short-cycle flow: 1m generates signals and 5m confirms them.</span>
+    <span>Risk trims: reduce weight for observed drawdown, poor regime match, 5m conflict, and high correlation with a stronger strategy.</span>
+    <span>Final gates: confidence, 5m confirmation, expected value, meta-label, triple barrier, daily loss, and slippage must pass.</span>
   `;
 }
 
@@ -11302,9 +15864,9 @@ function strategyVote(name: (typeof strategyVoteCatalog)[number], strategy: Stra
 
   switch (name) {
     case "Multi-Timeframe Trend Alignment":
-      return vote(directionalSignal(context.regime.directionBias, context.session.directionBias), `${status} ${score}% aligns regime and session trend`);
+      return vote(directionalSignal(context.session.directionBias, context.event.directionBias), `${status} ${score}% aligns intraday session and event trend`);
     case "First Pullback After Open":
-      return vote(directionalSignal(context.session.directionBias, context.regime.directionBias), `${status} ${score}% waits for first trend pullback`);
+      return vote(directionalSignal(context.session.directionBias, context.event.directionBias), `${status} ${score}% waits for first intraday trend pullback`);
     case "Failed Breakout Strategy":
       return vote(oppositeSignal(context.event.directionBias), `${status} ${score}% fades failed range expansion`);
     case "Liquidity Sweep Reversal":
@@ -11314,9 +15876,9 @@ function strategyVote(name: (typeof strategyVoteCatalog)[number], strategy: Stra
     case "ATR Overextension Reversion":
       return vote(oppositeSignal(context.session.directionBias), `${status} ${score}% fades ATR overextension`);
     case "Relative Strength vs QQQ/IWM":
-      return vote(directionalSignal(context.regime.directionBias, context.session.directionBias), `${status} ${score}% follows relative-strength proxy`);
+      return vote(directionalSignal(context.session.directionBias, context.event.directionBias), `${status} ${score}% follows intraday relative-strength proxy`);
     case "Market Breadth Momentum":
-      return vote(directionalSignal(context.session.directionBias, context.regime.directionBias), `${status} ${score}% follows breadth-momentum proxy`);
+      return vote(directionalSignal(context.session.directionBias, context.event.directionBias), `${status} ${score}% follows intraday breadth-momentum proxy`);
     case "Economic Event Reaction Strategy":
       return vote(directionalSignal(context.event.directionBias, context.session.directionBias), `${status} ${score}% follows event reaction`);
     case "Ensemble Strategy Voting": {
@@ -11351,28 +15913,37 @@ function renderTradingRagPlan(finalSignal: AlgoSignal, buyVotes: number, sellVot
 
 function renderTradingRagResults() {
   if (state.tradingRagStatus === "loading") {
-    state.currentTargetOrder = null;
+    const localOrder = syncCurrentTargetOrderFromTradingRag();
     return `
+      ${renderManualOrderRecommendation(localOrder)}
       <div class="trading-rag-card loading">
         <strong>Trading RAG</strong>
-        <span>Retrieving historical trading results and building local context...</span>
+        <span>Retrieving historical trading results. Voting Ensemble is using live local gates until RAG is ready.</span>
       </div>
     `;
   }
   if (state.tradingRagStatus === "error" || !state.tradingRag) {
-    state.currentTargetOrder = null;
+    const localOrder = syncCurrentTargetOrderFromTradingRag();
     return `
+      ${renderManualOrderRecommendation(localOrder)}
       <div class="trading-rag-card warning">
         <strong>Trading RAG unavailable</strong>
-        <span>${escapeHtml(state.tradingRagWarning || "Trading RAG endpoint unavailable.")}</span>
+        <span>${escapeHtml(state.tradingRagWarning || "Trading RAG endpoint unavailable.")} Voting Ensemble is using live local gates.</span>
       </div>
     `;
   }
   const answer = state.tradingRag.answer;
   const retrieved = state.tradingRag.retrieved ?? [];
   const bestMatch = retrieved[0];
-  const manualOrder = manualOrderRecommendation(bestMatch, answer);
-  state.currentTargetOrder = manualOrder;
+  const manualOrder = syncCurrentTargetOrderFromTradingRag();
+  if (!manualOrder) {
+    return `
+      <div class="trading-rag-card warning">
+        <strong>Trading RAG unavailable</strong>
+        <span>Target order could not be generated from the current trading context.</span>
+      </div>
+    `;
+  }
   return `
     ${renderManualOrderRecommendation(manualOrder)}
     <div class="trading-rag-card">
@@ -11395,6 +15966,30 @@ function renderTradingRagResults() {
       ${retrieved.length ? retrieved.map(renderTradingRagSource).join("") : "<span>No matching source documents found.</span>"}
     </div>
   `;
+}
+
+function syncCurrentTargetOrderFromTradingRag() {
+  const answer = state.tradingRagStatus === "ready" && state.tradingRag ? state.tradingRag.answer : localVotingEnsembleFallbackAnswer();
+  const bestMatch = state.tradingRagStatus === "ready" && state.tradingRag ? (state.tradingRag.retrieved ?? [])[0] : undefined;
+  const manualOrder = manualOrderRecommendation(bestMatch, answer);
+  state.currentTargetOrder = manualOrder;
+  return manualOrder;
+}
+
+function localVotingEnsembleFallbackAnswer(): TradingRagResponse["answer"] {
+  const summary = votingEnsembleScoreSummary();
+  const buyScore = formatProbability(summary.scores.Buy);
+  const sellScore = formatProbability(summary.scores.Sell);
+  const holdScore = formatProbability(summary.scores.Hold);
+  return {
+    conclusion: `Local Voting Ensemble winner is ${summary.winner}.`,
+    bias: summary.winner,
+    confidence: summary.winner === "Hold" ? "low" : "live",
+    bestHistoricalMatch: "Local live ensemble gates",
+    drivers: [`Votes B/S/H ${buyScore}/${sellScore}/${holdScore}`, "Market permission gate", "Short-cycle direction gate", "Execution gate"],
+    risks: ["Historical RAG context is not ready", "Use live gates and target-order risk controls"],
+    actionPlan: ["Use the local Voting Ensemble target order until RAG context is available."],
+  };
 }
 
 function renderTradingRagComparison(bestMatch: TradingRagResponse["retrieved"][number] | undefined, answer: TradingRagResponse["answer"]) {
@@ -11435,6 +16030,9 @@ function updateTradingSettingsMount(order?: ManualOrderRecommendation, options: 
   if (options.preserveExisting && tradingSettingsMount.innerHTML.trim()) {
     return;
   }
+  if (isEditingWithin(tradingSettingsMount)) {
+    return;
+  }
   const key = JSON.stringify({
     expanded: state.tradingSettingsExpanded,
     defaultSizingExpanded: state.votingDefaultSizingExpanded,
@@ -11449,6 +16047,15 @@ function updateTradingSettingsMount(order?: ManualOrderRecommendation, options: 
   }
   tradingSettingsMountKey = key;
   tradingSettingsMount.innerHTML = renderTradingSettingsPanel(order);
+}
+
+function isEditingWithin(container: HTMLElement) {
+  const activeElement = document.activeElement;
+  return (
+    activeElement instanceof HTMLElement &&
+    container.contains(activeElement) &&
+    activeElement.matches("input, select, textarea")
+  );
 }
 
 function renderTradingSettingsPanel(order?: ManualOrderRecommendation) {
@@ -11471,10 +16078,11 @@ function renderTradingSettingsPanel(order?: ManualOrderRecommendation) {
       <div id="tradingSettingsBody" class="trading-settings-body" ${expanded ? "" : "hidden"}>
         <div class="trading-settings-grid">
           ${renderTradingSettingInput("startingCapital", "Total balance", settings.startingCapital, 1000, 10000000, 100)}
-          ${renderTradingSettingInput("orderAllocationPercent", "Order limit %", settings.orderAllocationPercent, 0.1, MAX_ORDER_ALLOCATION_PERCENT, 0.1)}
+          ${renderTradingSettingInput("orderAllocationPercent", "Order limit %", settings.orderAllocationPercent, 0.1, VOTING_MAX_ORDER_ALLOCATION_PERCENT, 0.1)}
           ${renderTradingSettingInput("dailyAllocationPercent", "Daily max %", settings.dailyAllocationPercent, 0.1, 100, 0.1)}
           ${renderTradingSettingInput("riskBudgetPercentOfOrder", "Risk budget %", settings.riskBudgetPercentOfOrder, 0.1, 100, 0.1)}
           ${renderTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 1, 50, 1)}
+          ${renderTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
           ${renderTradingSettingInput("stopLossPercent", "Stop %", settings.stopLossPercent, 0.01, 20, 0.01)}
           ${renderTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
           ${renderTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
@@ -11502,6 +16110,9 @@ function updateWeightedTradingSettingsMount(result?: WeightedVoteResult) {
   if (key === weightedTradingSettingsMountKey) {
     return;
   }
+  if (isEditingWithin(weightedTradingSettingsMount)) {
+    return;
+  }
   weightedTradingSettingsMountKey = key;
   weightedTradingSettingsMount.innerHTML = renderWeightedTradingSettingsPanel(result, order);
 }
@@ -11525,6 +16136,7 @@ function renderWeightedTradingSettingsPanel(result?: WeightedVoteResult, order?:
           ${renderWeightedTradingSettingInput("dailyAllocationPercent", "Daily max %", settings.dailyAllocationPercent, 0.1, 100, 0.1)}
           ${renderWeightedTradingSettingInput("riskBudgetPercentOfOrder", "Risk budget %", settings.riskBudgetPercentOfOrder, 0.1, 100, 0.1)}
           ${renderWeightedTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 1, 50, 1)}
+          ${renderWeightedTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
           ${renderWeightedTradingSettingInput("stopLossPercent", "Stop %", settings.stopLossPercent, 0.01, 20, 0.01)}
           ${renderWeightedTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
           ${renderWeightedTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
@@ -11538,12 +16150,16 @@ function renderWeightedTradingSettingsPanel(result?: WeightedVoteResult, order?:
 
 function weightedTargetOrderRecommendation(result: WeightedVoteResult): ManualOrderRecommendation {
   const settings = state.weightedTradingSettings;
-  const latest = result.data.latest ?? currentCandle();
+  const latest = result.data.latest ?? latestExecutionCandleForMode("weighted");
   const submitMode = (state.weightedTargetOrderOverrides.submitMode as SubmitOrderMode | undefined) ?? DEFAULT_SUBMIT_MODE;
   const automaticShortCycleBuy = submitMode === "Automatic";
-  const sizing = latest ? weightedBuyTargetSizing(result, latest, automaticShortCycleBuy) : null;
-  const targetFailedGates = weightedTargetOrderFailedGates(result, automaticShortCycleBuy);
-  const side = automaticShortCycleBuy ? "Buy" : targetFailedGates.length ? "Hold" : sizing?.side ?? "Hold";
+  const requestedSide: AlgoSignal = automaticShortCycleBuy ? weightedAutomaticTargetSide(result, latest) : result.signal;
+  const sizing =
+    latest && (requestedSide === "Buy" || requestedSide === "Sell")
+      ? weightedTargetSizing(result, latest, requestedSide, automaticShortCycleBuy)
+      : null;
+  const targetFailedGates = weightedTargetOrderFailedGates(result, automaticShortCycleBuy, requestedSide);
+  const side = targetFailedGates.length ? "Hold" : sizing?.side ?? "Hold";
   const accountBalance = sizing?.accountEquity ?? settings.startingCapital;
   const orderLimitDollars = accountBalance * (settings.orderAllocationPercent / 100);
   const dailyLimitDollars = sizing?.availableBuyingPower ?? accountBalance * (settings.dailyAllocationPercent / 100);
@@ -11560,16 +16176,20 @@ function weightedTargetOrderRecommendation(result: WeightedVoteResult): ManualOr
     lastTime: latest?.timestamp ?? null,
   };
   if (side === "Hold" || !latest || !sizing) {
+    const blockedCandidate =
+      latest && (requestedSide === "Buy" || requestedSide === "Sell")
+        ? weightedBlockedCandidateOrderLevels(result, latest, requestedSide)
+        : null;
     return applyWeightedTargetOrderOverrides({
       eligible: false,
       side,
       orderType: "No order",
       symbol: state.symbol,
       quantity: 0,
-      triggerPrice: null,
-      limitPrice: null,
-      stopPrice: null,
-      targetPrice: null,
+      triggerPrice: blockedCandidate?.triggerPrice ?? null,
+      limitPrice: blockedCandidate?.limitPrice ?? null,
+      stopPrice: blockedCandidate?.stopPrice ?? null,
+      targetPrice: blockedCandidate?.targetPrice ?? null,
       accountBalance,
       orderLimitDollars,
       dailyLimitDollars,
@@ -11587,26 +16207,35 @@ function weightedTargetOrderRecommendation(result: WeightedVoteResult): ManualOr
     });
   }
 
-  const buySizing = sizing;
-  const triggerPrice = buySizing.entryPrice;
-  const limitPrice = roundNumber(buySizing.ask + settings.slippagePerShare, 2);
-  const stopPrice = roundNumber(buySizing.entryPrice - buySizing.stopDistance, 2);
-  const quantity = buySizing.quantity;
-  const targetDistance = targetProfitDistancePerShare(quantity, buySizing.stopDistance, settings.takeProfitR);
-  const targetPrice = roundNumber(buySizing.entryPrice + targetDistance, 2);
+  const directionalSizing = sizing;
+  const triggerPrice = directionalSizing.entryPrice;
+  const limitPrice =
+    side === "Buy"
+      ? roundNumber(directionalSizing.ask + settings.slippagePerShare, 2)
+      : roundNumber(Math.max(0, directionalSizing.bid - settings.slippagePerShare), 2);
+  const stopPrice =
+    side === "Buy"
+      ? roundNumber(directionalSizing.entryPrice - directionalSizing.stopDistance, 2)
+      : roundNumber(directionalSizing.entryPrice + directionalSizing.stopDistance, 2);
+  const quantity = directionalSizing.quantity;
+  const targetDistance = targetProfitDistancePerShare(quantity, directionalSizing.stopDistance, settings.takeProfitR);
+  const targetPrice =
+    side === "Buy"
+      ? roundNumber(directionalSizing.entryPrice + targetDistance, 2)
+      : roundNumber(Math.max(0, directionalSizing.entryPrice - targetDistance), 2);
   const orderNotional = roundNumber(quantity * triggerPrice, 2);
-  const plannedStopRiskDollars = roundNumber(quantity * buySizing.stopDistance, 2);
-  const estimatedSlippage = roundNumber(quantity * (buySizing.ask - buySizing.bid), 2);
+  const plannedStopRiskDollars = roundNumber(quantity * directionalSizing.stopDistance, 2);
+  const estimatedSlippage = roundNumber(quantity * (directionalSizing.ask - directionalSizing.bid), 2);
   const nextFailedGates = [...failedGates];
   if (quantity < 1) {
     nextFailedGates.push("weighted sizing quantity below 1 share");
   }
   if (plannedStopRiskDollars > riskDollars) {
-    nextFailedGates.push(`planned stop risk exceeds ${buySizing.baseRiskPercent}% account risk budget`);
+    nextFailedGates.push(`planned stop risk exceeds ${directionalSizing.baseRiskPercent}% account risk budget`);
   }
   const eligible = nextFailedGates.length === 0;
   const orderType = eligible ? `${side} stop-limit` : "No order";
-  const orderLine = `Buy stop-limit ${state.symbol}, ${quantity} shares, stop ${price(triggerPrice)}, limit ${price(limitPrice)}, protective stop ${price(stopPrice)}, target ${price(targetPrice)}.`;
+  const orderLine = `${side} stop-limit ${state.symbol}, ${quantity} shares, stop ${price(triggerPrice)}, limit ${price(limitPrice)}, protective stop ${price(stopPrice)}, target ${price(targetPrice)}.`;
   return applyWeightedTargetOrderOverrides({
     eligible,
     side,
@@ -11636,7 +16265,34 @@ function weightedTargetOrderRecommendation(result: WeightedVoteResult): ManualOr
   });
 }
 
-function weightedTargetOrderFailedGates(result: WeightedVoteResult, automaticShortCycleBuy: boolean) {
+function weightedBlockedCandidateOrderLevels(
+  result: WeightedVoteResult,
+  latest: Candle,
+  side: Exclude<AlgoSignal, "Hold">,
+) {
+  const settings = state.weightedTradingSettings;
+  const defaults = weightedDefaultSizingSettings();
+  const bid = roundNumber(Math.max(0, latest.close - settings.slippagePerShare), 2);
+  const ask = roundNumber(latest.close + settings.slippagePerShare, 2);
+  const triggerPrice = side === "Buy" ? ask : bid;
+  const limitPrice =
+    side === "Buy"
+      ? roundNumber(triggerPrice + settings.slippagePerShare, 2)
+      : roundNumber(Math.max(0, triggerPrice - settings.slippagePerShare), 2);
+  const stopDistance = defaultSizingStopDistance(defaults, latest.close, result.data.atr ?? 0);
+  const stopPrice =
+    side === "Buy"
+      ? roundNumber(Math.max(0, triggerPrice - stopDistance), 2)
+      : roundNumber(triggerPrice + stopDistance, 2);
+  const targetDistance = Math.max(stopDistance * settings.takeProfitR, MIN_TARGET_PROFIT_PER_SHARE);
+  const targetPrice =
+    side === "Buy"
+      ? roundNumber(triggerPrice + targetDistance, 2)
+      : roundNumber(Math.max(0, triggerPrice - targetDistance), 2);
+  return { triggerPrice, limitPrice, stopPrice, targetPrice };
+}
+
+function weightedTargetOrderFailedGates(result: WeightedVoteResult, automaticShortCycleBuy: boolean, requestedSide: AlgoSignal) {
   const failed = result.gates.filter((gate) => gate.status === "fail");
   if (!automaticShortCycleBuy) {
     return failed;
@@ -11644,6 +16300,7 @@ function weightedTargetOrderFailedGates(result: WeightedVoteResult, automaticSho
   const shortCycleContextGates = new Set([
     "Confidence",
     "Active Strategies",
+    "Directional Strategy Count",
     "Buy Strategy Count",
     "5m Confirmation",
     "Expected Value",
@@ -11652,25 +16309,73 @@ function weightedTargetOrderFailedGates(result: WeightedVoteResult, automaticSho
     "Event Risk",
   ]);
   const hardFailures = failed.filter((gate) => !shortCycleContextGates.has(gate.label));
+  if (requestedSide === "Hold") {
+    hardFailures.push({
+      label: "Weighted Decision",
+      status: "fail",
+      detail: "No automatic short-cycle Buy/Sell side is available",
+    });
+  }
   const latest = result.data.latest;
   const vwap = result.data.vwap;
+  if (latest && requestedSide === "Buy") {
+    const lateSessionBlocker = lateSessionAboveAverageBuyBlocker("weighted", latest.close, latest.timestamp);
+    if (lateSessionBlocker) {
+      hardFailures.push({
+        label: "Weighted Late-session Buy Guard",
+        status: "fail",
+        detail: lateSessionBlocker,
+      });
+    }
+    forecastBuySafetyBlockers("weighted", latest.close, latest.timestamp).forEach((detail) => {
+      hardFailures.push({
+        label: "Weighted Forecast Safety",
+        status: "fail",
+        detail,
+      });
+    });
+  }
   if (!latest || vwap === null) {
     hardFailures.push({
       label: "Short-cycle VWAP",
       status: "fail",
       detail: "Waiting for live price and VWAP",
     });
-  } else if (latest.close <= vwap) {
+  } else if (requestedSide === "Buy" && latest.close <= vwap) {
     hardFailures.push({
       label: "Short-cycle VWAP",
       status: "fail",
       detail: `Close ${price(latest.close)} is not above VWAP ${price(vwap)}`,
     });
+  } else if (requestedSide === "Sell" && latest.close >= vwap) {
+    hardFailures.push({
+      label: "Short-cycle VWAP",
+      status: "fail",
+      detail: `Close ${price(latest.close)} is not below VWAP ${price(vwap)}`,
+    });
   }
   return hardFailures;
 }
 
-function weightedBuyTargetSizing(result: WeightedVoteResult, latest: Candle, automaticShortCycleBuy = false) {
+function weightedAutomaticTargetSide(result: WeightedVoteResult, latest: Candle | null): AlgoSignal {
+  const vwap = result.data.vwap;
+  if (latest && vwap !== null) {
+    if (latest.close > vwap) {
+      return "Buy";
+    }
+    if (latest.close < vwap) {
+      return "Sell";
+    }
+  }
+  return result.rawWinner === "Buy" || result.rawWinner === "Sell" ? result.rawWinner : "Hold";
+}
+
+function weightedTargetSizing(
+  result: WeightedVoteResult,
+  latest: Candle,
+  side: Exclude<AlgoSignal, "Hold">,
+  automaticShortCycleBuy = false,
+) {
   const settings = state.weightedTradingSettings;
   const defaults = weightedDefaultSizingSettings();
   const totalScore = result.buyScore + result.holdScore + result.sellScore;
@@ -11690,7 +16395,7 @@ function weightedBuyTargetSizing(result: WeightedVoteResult, latest: Candle, aut
   const dailyRealizedPnl = weightedTodayRealizedPnl();
   const tradesToday = effectiveTodaysTradeCount("weighted", defaults.maxDailyTrades, priceValue);
   const activeStrategyCount = result.strategies.filter((strategy) => strategy.finalWeight > 0 && !strategy.disabledReason).length;
-  const buyStrategyCount = result.strategies.filter((strategy) => strategy.finalWeight > 0 && weightedSignalSide(strategy) === "Buy").length;
+  const directionalStrategyCount = result.strategies.filter((strategy) => strategy.finalWeight > 0 && weightedSignalSide(strategy) === side).length;
 
   const hold = (blockedReason: string) => ({
     side: "Hold" as AlgoSignal,
@@ -11720,28 +16425,39 @@ function weightedBuyTargetSizing(result: WeightedVoteResult, latest: Candle, aut
   const buyScore = result.buyScore / totalScore;
   const holdScore = result.holdScore / totalScore;
   const sellScore = result.sellScore / totalScore;
-  const buyIsWinner = buyScore > holdScore && buyScore > sellScore;
-  const secondBestScore = Math.max(holdScore, sellScore);
-  const signalEdge = buyScore - secondBestScore;
+  const sideScore = side === "Buy" ? buyScore : sellScore;
+  const oppositeScore = side === "Buy" ? sellScore : buyScore;
+  const sideIsWinner = sideScore > holdScore && sideScore > oppositeScore;
+  const secondBestScore = Math.max(holdScore, oppositeScore);
+  const signalEdge = sideScore - secondBestScore;
   const vwap = result.data.vwap;
-  const shortCycleBuyConfirmed = automaticShortCycleBuy && vwap !== null && latest.close > vwap;
+  const shortCycleConfirmed =
+    automaticShortCycleBuy &&
+    vwap !== null &&
+    (side === "Buy" ? latest.close > vwap : latest.close < vwap);
 
   if (automaticShortCycleBuy) {
-    if (!shortCycleBuyConfirmed) {
-      return hold(vwap === null ? "Waiting for live VWAP" : `short-cycle close ${price(latest.close)} is not above VWAP ${price(vwap)}`);
+    if (!shortCycleConfirmed) {
+      return hold(
+        vwap === null
+          ? "Waiting for live VWAP"
+          : side === "Buy"
+            ? `short-cycle close ${price(latest.close)} is not above VWAP ${price(vwap)}`
+            : `short-cycle close ${price(latest.close)} is not below VWAP ${price(vwap)}`,
+      );
     }
   } else {
-    if (!buyIsWinner) {
-      return hold(`winner is not Buy (${formatProbability(Math.max(buyScore, holdScore, sellScore))})`);
+    if (!sideIsWinner) {
+      return hold(`winner is not ${side} (${formatProbability(Math.max(buyScore, holdScore, sellScore))})`);
     }
     if (activeStrategyCount < defaults.minimumActiveStrategies) {
       return hold(`active strategy count ${activeStrategyCount} is below ${defaults.minimumActiveStrategies}`);
     }
-    if (buyStrategyCount < defaults.minimumBuyStrategyCount) {
-      return hold(`buy strategy count ${buyStrategyCount} is below ${defaults.minimumBuyStrategyCount}`);
+    if (directionalStrategyCount < defaults.minimumBuyStrategyCount) {
+      return hold(`${side.toLowerCase()} strategy count ${directionalStrategyCount} is below ${defaults.minimumBuyStrategyCount}`);
     }
-    if (buyScore < defaults.minimumBuyScore) {
-      return hold(`Buy score ${formatProbability(buyScore)} is below ${formatProbability(defaults.minimumBuyScore)}`);
+    if (sideScore < defaults.minimumBuyScore) {
+      return hold(`${side} score ${formatProbability(sideScore)} is below ${formatProbability(defaults.minimumBuyScore)}`);
     }
     if (signalEdge < defaults.minimumSignalEdge) {
       return hold(`signal edge ${formatProbability(signalEdge)} is below ${formatProbability(defaults.minimumSignalEdge)}`);
@@ -11761,8 +16477,8 @@ function weightedBuyTargetSizing(result: WeightedVoteResult, latest: Candle, aut
   if (atrOneMinute > 1.5) {
     return hold(`ATR ${price(atrOneMinute)} is above 1.50`);
   }
-  const stopDistance = Math.max(atrOneMinute * defaults.atrStopMultiplier, priceValue * (defaults.minimumStopDistancePercent / 100));
-  const entryQualityBlock = weightedEntryQualityBlockedReason(result, latest, stopDistance, automaticShortCycleBuy);
+  const stopDistance = defaultSizingStopDistance(defaults, priceValue, atrOneMinute);
+  const entryQualityBlock = weightedEntryQualityBlockedReason(result, latest, side, stopDistance, automaticShortCycleBuy);
   if (entryQualityBlock) {
     return hold(entryQualityBlock);
   }
@@ -11777,7 +16493,9 @@ function weightedBuyTargetSizing(result: WeightedVoteResult, latest: Candle, aut
     return hold("pyramiding disabled while a weighted position is open");
   }
 
-  const fiveMinuteConfirms = result.gates.find((gate) => gate.label === "5m Confirmation")?.status === "pass";
+  const fiveMinuteConfirms = automaticShortCycleBuy
+    ? weightedAutomaticFiveMinuteConfirms(result, side)
+    : result.gates.find((gate) => gate.label === "5m Confirmation")?.status === "pass";
   const contextSizeMultiplier =
     signalEdge < 0.2
       ? 0.25
@@ -11805,11 +16523,11 @@ function weightedBuyTargetSizing(result: WeightedVoteResult, latest: Candle, aut
   const quantity = Math.floor(Math.min(riskBasedShares, orderBasedShares, capitalBasedShares, buyingPowerShares, liquidityBasedShares, maxAllowedShares));
 
   if (quantity < 1) {
-    return hold("final buy shares below 1");
+    return hold(`final ${side.toLowerCase()} shares below 1`);
   }
 
   return {
-    side: "Buy" as AlgoSignal,
+    side,
     quantity,
     blockedReason: "",
     accountEquity,
@@ -11826,7 +16544,7 @@ function weightedBuyTargetSizing(result: WeightedVoteResult, latest: Candle, aut
     riskDollars,
     baseRiskPercent: defaults.baseRiskPercent,
     stopDistance,
-    entryPrice: ask,
+    entryPrice: side === "Buy" ? ask : bid,
     signalEdge,
     sizeMultiplier,
     riskBasedShares,
@@ -11849,6 +16567,7 @@ function weightedTargetOrderGates(result: WeightedVoteResult): TradeLayerGate[] 
 function weightedEntryQualityBlockedReason(
   result: WeightedVoteResult,
   latest: Candle,
+  side: Exclude<AlgoSignal, "Hold">,
   stopDistance: number,
   automaticShortCycleBuy: boolean,
 ) {
@@ -11856,27 +16575,45 @@ function weightedEntryQualityBlockedReason(
   if (vwap === null) {
     return automaticShortCycleBuy ? "Waiting for live VWAP" : "";
   }
-  const vwapCushion = Math.max(0.05, stopDistance);
-  const requiredEntry = vwap + vwapCushion;
-  if (latest.close < requiredEntry) {
-    return `entry ${price(latest.close)} is too close to VWAP ${price(vwap)}; need ${price(requiredEntry)} or higher`;
+  const entryCushion = automaticShortCycleBuy
+    ? weightedAutomaticEntryCushion(result, stopDistance)
+    : Math.max(0.05, stopDistance);
+  if (side === "Buy") {
+    const requiredEntry = vwap + entryCushion;
+    if (latest.close < requiredEntry) {
+      return `entry ${price(latest.close)} is too close to VWAP ${price(vwap)}; need ${price(requiredEntry)} or higher`;
+    }
+  } else {
+    const requiredEntry = vwap - entryCushion;
+    if (latest.close > requiredEntry) {
+      return `entry ${price(latest.close)} is too close to VWAP ${price(vwap)}; need ${price(requiredEntry)} or lower`;
+    }
   }
-  const fragileEntryReason = automaticShortCycleBuy ? weightedFragileEntryBlockedReason(latest, stopDistance) : "";
+  const fragileEntryReason = automaticShortCycleBuy ? weightedFragileEntryBlockedReason(latest, entryCushion, side) : "";
   if (fragileEntryReason) {
     return fragileEntryReason;
   }
   if (automaticShortCycleBuy) {
-    const fiveMinuteGate = result.gates.find((gate) => gate.label === "5m Confirmation");
-    if (fiveMinuteGate?.status !== "pass") {
-      return `5m confirmation is not strong enough: ${fiveMinuteGate?.detail ?? "unavailable"}`;
+    const fiveMinute = result.data.timeframes.fiveMinute;
+    const alignment = weightedSignalTimeframeAlignment(side, fiveMinute);
+    if (alignment < 0) {
+      return `5m confirmation is not strong enough: ${fiveMinute.source}`;
     }
   }
   return "";
 }
 
-function weightedFragileEntryBlockedReason(latest: Candle, stopDistance: number) {
-  const oneMinuteCandles = state.weightedMarketData.timeframeCandles["1Min"] ?? [];
-  const sessionCandles = oneMinuteCandles.length ? latestRegularSessionCandlesFrom(oneMinuteCandles) : latestRegularSessionCandles();
+function weightedAutomaticFiveMinuteConfirms(result: WeightedVoteResult, side: Exclude<AlgoSignal, "Hold">) {
+  return weightedSignalTimeframeAlignment(side, result.data.timeframes.fiveMinute) >= 0;
+}
+
+function weightedAutomaticEntryCushion(result: WeightedVoteResult, stopDistance: number) {
+  const atrCushion = (result.data.atr ?? stopDistance) * 0.5;
+  return Math.max(0.05, Math.min(0.25, stopDistance * 0.25, atrCushion));
+}
+
+function weightedFragileEntryBlockedReason(latest: Candle, entryCushion: number, side: Exclude<AlgoSignal, "Hold">) {
+  const sessionCandles = latestWeightedCalculationCandles();
   const recent = sessionCandles.slice(-6);
   if (recent.length < 4) {
     return "fragile entry: waiting for more recent 1m candles";
@@ -11884,21 +16621,40 @@ function weightedFragileEntryBlockedReason(latest: Candle, stopDistance: number)
   const prior = recent.at(-2)!;
   const priorTwo = recent.at(-3)!;
   const latestBody = latest.close - latest.open;
-  if (latestBody <= 0) {
-    return `fragile entry: latest 1m candle is not green (${price(latest.open)} to ${price(latest.close)})`;
+  if (side === "Buy") {
+    if (latestBody < 0 && latest.close <= prior.close) {
+      return `fragile entry: latest 1m candle is red and below prior close (${price(latest.open)} to ${price(latest.close)})`;
+    }
+    if (latest.close < prior.close || prior.close < priorTwo.close) {
+      return `fragile entry: 1m momentum is weakening (${price(priorTwo.close)} -> ${price(prior.close)} -> ${price(latest.close)})`;
+    }
+    const recentLow = Math.min(...recent.slice(0, -1).map((candle) => candle.low));
+    const lowCushion = latest.close - recentLow;
+    const requiredLowCushion = Math.max(0.12, entryCushion * 1.25);
+    if (lowCushion < requiredLowCushion) {
+      return `fragile entry: only ${price(lowCushion)} above recent low; need ${price(requiredLowCushion)}`;
+    }
+    const recentHighClose = Math.max(...recent.slice(0, -1).map((candle) => candle.close));
+    if (latest.close < recentHighClose) {
+      return `fragile entry: close ${price(latest.close)} has not cleared recent close high ${price(recentHighClose)}`;
+    }
+    return "";
   }
-  if (latest.close <= prior.close || prior.close < priorTwo.close) {
-    return `fragile entry: 1m momentum is weakening (${price(priorTwo.close)} -> ${price(prior.close)} -> ${price(latest.close)})`;
+  if (latestBody > 0 && latest.close >= prior.close) {
+    return `fragile entry: latest 1m candle is green and above prior close (${price(latest.open)} to ${price(latest.close)})`;
   }
-  const recentLow = Math.min(...recent.slice(0, -1).map((candle) => candle.low));
-  const lowCushion = latest.close - recentLow;
-  const requiredLowCushion = Math.max(0.5, stopDistance * 1.25);
-  if (lowCushion < requiredLowCushion) {
-    return `fragile entry: only ${price(lowCushion)} above recent low; need ${price(requiredLowCushion)}`;
+  if (latest.close > prior.close || prior.close > priorTwo.close) {
+    return `fragile entry: 1m downside momentum is weakening (${price(priorTwo.close)} -> ${price(prior.close)} -> ${price(latest.close)})`;
   }
-  const recentHighClose = Math.max(...recent.slice(0, -1).map((candle) => candle.close));
-  if (latest.close < recentHighClose) {
-    return `fragile entry: close ${price(latest.close)} has not cleared recent close high ${price(recentHighClose)}`;
+  const recentHigh = Math.max(...recent.slice(0, -1).map((candle) => candle.high));
+  const highCushion = recentHigh - latest.close;
+  const requiredHighCushion = Math.max(0.12, entryCushion * 1.25);
+  if (highCushion < requiredHighCushion) {
+    return `fragile entry: only ${price(highCushion)} below recent high; need ${price(requiredHighCushion)}`;
+  }
+  const recentLowClose = Math.min(...recent.slice(0, -1).map((candle) => candle.close));
+  if (latest.close > recentLowClose) {
+    return `fragile entry: close ${price(latest.close)} has not cleared recent close low ${price(recentLowClose)}`;
   }
   return "";
 }
@@ -12094,6 +16850,7 @@ function renderWeightedDefaultSizingSection(settings: TradingSettings) {
           ${renderWeightedTradingSettingInput("minimumSignalEdge", "Minimum signal edge", settings.minimumSignalEdge, 0, 1, 0.01)}
           ${renderWeightedTradingSettingInput("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0.01, 10, 0.01)}
           ${renderWeightedTradingSettingInput("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0.1, 100, 0.1)}
+          ${renderWeightedTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
           ${renderWeightedTradingSettingInput("atrStopMultiplier", "ATR stop multiplier", settings.atrStopMultiplier, 0.1, 10, 0.1)}
           ${renderWeightedTradingSettingInput("minimumStopDistancePercent", "Min stop distance %", settings.minimumStopDistancePercent, 0.001, 5, 0.001)}
           ${renderWeightedTradingSettingInput("maxParticipationPercent", "Max participation %", settings.maxParticipationPercent, 0.001, 10, 0.001)}
@@ -12166,6 +16923,7 @@ function renderTradingDefaultSizingSection(settings: TradingSettings) {
           ${renderTradingSettingInput("minimumSignalEdge", "Minimum signal edge", settings.minimumSignalEdge, 0, 1, 0.01)}
           ${renderTradingSettingInput("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0.01, 10, 0.01)}
           ${renderTradingSettingInput("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0.1, 100, 0.1)}
+          ${renderTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
           ${renderTradingSettingInput("atrStopMultiplier", "ATR stop multiplier", settings.atrStopMultiplier, 0.1, 10, 0.1)}
           ${renderTradingSettingInput("minimumStopDistancePercent", "Min stop distance %", settings.minimumStopDistancePercent, 0.001, 5, 0.001)}
           ${renderTradingSettingInput("maxParticipationPercent", "Max participation %", settings.maxParticipationPercent, 0.001, 10, 0.001)}
@@ -12314,7 +17072,7 @@ function executionGate(side: AlgoSignal): TradeLayerGate & { chart: ReturnType<t
     chart.confirmed && fiveMinuteConfirms
       ? `${chart.reason}; short-cycle 5m momentum confirms`
       : chart.confirmed
-        ? `${chart.reason}; waiting for short-cycle 5m momentum`
+        ? `waiting for short-cycle 5m momentum confirmation; 1m/VWAP condition passed`
         : chart.reason;
   return {
     layer: "1M/5M Execution",
@@ -12329,10 +17087,10 @@ function mlQualityGate(side: AlgoSignal, eventActive: boolean): TradeLayerGate {
   const settingsKey = tradingSettingsKey(state.tradingSettings);
   const artifactMatches = state.dynamicArtifactStatus === "ready" && state.dynamicArtifactSettingsKey === settingsKey;
   if (state.dynamicArtifactStatus === "loading") {
-    return { layer: "ML Quality", status: "fail", signal: "Running", detail: "Current settings are still running through ML replay" };
+    return { layer: "ML Quality", status: "caution", signal: "Running", detail: "Current settings are still running through ML replay; using 1m/5m live gates meanwhile" };
   }
   if (!artifactMatches || !state.dynamicArtifact) {
-    return { layer: "ML Quality", status: "fail", signal: "Not ready", detail: "Matching backtest and ML artifact is not ready" };
+    return { layer: "ML Quality", status: "caution", signal: "Not ready", detail: "Matching backtest and ML artifact is not ready; using 1m/5m live gates meanwhile" };
   }
   const relevantTimeframes = eventActive ? ["Event"] : ["1Min", "5Min"];
   const rows = (state.dynamicArtifact.mlComparison?.bestByTimeframe ?? []).filter((row) => relevantTimeframes.includes(row.timeframe));
@@ -12341,13 +17099,17 @@ function mlQualityGate(side: AlgoSignal, eventActive: boolean): TradeLayerGate {
     rows.find((row) => row.verdict === "Mixed") ??
     rows[0];
   if (!best) {
-    return { layer: "ML Quality", status: "fail", signal: "No row", detail: "No relevant ML quality row for this setup" };
+    return { layer: "ML Quality", status: "caution", signal: "No row", detail: "No relevant ML quality row for this setup; using 1m/5m live gates meanwhile" };
   }
   const detail = `${best.timeframe} ${best.bestVariant}: ${best.verdict}, ${signedCurrency(best.bestPnl)}, PF ${best.bestProfitFactor ?? "NA"}; side remains ${side}`;
-  if (best.verdict === "Worse" || best.verdict === "Inconclusive") {
-    return { layer: "ML Quality", status: "fail", signal: best.verdict, detail };
+  const profitable = best.bestPnl > 0 && (best.bestProfitFactor ?? 0) >= 1;
+  if (best.verdict === "Improved") {
+    return { layer: "ML Quality", status: "pass", signal: best.verdict, detail };
   }
-  return { layer: "ML Quality", status: best.verdict === "Mixed" ? "caution" : "pass", signal: best.verdict, detail };
+  if (best.verdict === "Mixed" || profitable) {
+    return { layer: "ML Quality", status: "caution", signal: best.verdict, detail };
+  }
+  return { layer: "ML Quality", status: "fail", signal: best.verdict, detail };
 }
 
 function applyTargetOrderOverrides(order: ManualOrderRecommendation): ManualOrderRecommendation {
@@ -12399,7 +17161,7 @@ function applyTargetOrderOverrides(order: ManualOrderRecommendation): ManualOrde
   return {
     ...nextOrder,
     summary: nextOrder.eligible && orderLine
-      ? `Order template: ${orderLine} Weekly/Daily permission, 1H direction, 1M/5M execution, and ML quality are aligned. Uses ${currency(nextOrder.orderNotional)} of the ${currency(nextOrder.orderLimitDollars)} per-order limit.`
+      ? `Order template: ${orderLine} 1M/5M execution, intraday event context, and ML quality are aligned. Uses ${currency(nextOrder.orderNotional)} of the ${currency(nextOrder.orderLimitDollars)} per-order limit.`
       : nextOrder.summary,
   };
 }
@@ -12423,8 +17185,6 @@ function manualOrderRecommendation(
   const structuralSide = eventProbe.active && eventProbe.signal !== "Watch" && eventProbe.signal !== "Inactive"
     ? (eventProbe.signal as AlgoSignal)
     : voteWinner;
-  const permission = marketPermissionGate(state.marketContext, structuralSide);
-  const direction = shortCycleDirectionGate(structuralSide);
   const event = eventModeGate(state.marketContext, structuralSide);
   const execution = executionGate(structuralSide);
   const mlQuality = mlQualityGate(structuralSide, event.active);
@@ -12435,14 +17195,24 @@ function manualOrderRecommendation(
     signal: historicalBias,
     detail: bestMatch ? `${bestMatch.timeframe || "NA"} match is ${historicalBias}; context only` : "No historical match; context only",
   };
-  const gates: TradeLayerGate[] = [permission, direction, execution, event, mlQuality, historicalGate];
+  const gates: TradeLayerGate[] = [execution, event, mlQuality, historicalGate];
   const failedGates = gates
     .filter((gate) => gate.status === "fail")
     .map((gate) => `${gate.layer}: ${gate.detail}`);
   const chart = execution.chart;
-  const latestForPosition = chart.latest?.close ?? currentCandle()?.close ?? 0;
+  const latestForPosition = chart.latest?.close ?? latestExecutionCandleForMode("ensemble")?.close ?? 0;
   const position = summarizePositionFromTradeHistory(latestForPosition, latestForPosition, "ensemble");
   const heldShares = Math.max(0, position.shares);
+  if (structuralSide === "Buy" && chart.latest) {
+    const safetyGates = [
+      lateSessionAboveAverageBuyGate("ensemble", chart.latest.close, chart.latest.timestamp),
+      ...forecastBuySafetyGates("ensemble", chart.latest.close, chart.latest.timestamp),
+    ].filter((gate): gate is TradeLayerGate => Boolean(gate));
+    safetyGates.forEach((gate) => {
+      gates.push(gate);
+      failedGates.push(`${gate.layer}: ${gate.detail}`);
+    });
+  }
   const accountBalance = settings.startingCapital;
   const orderLimitDollars = accountBalance * (settings.orderAllocationPercent / 100);
   const dailyLimitDollars = accountBalance * (settings.dailyAllocationPercent / 100);
@@ -12451,7 +17221,6 @@ function manualOrderRecommendation(
     ? accountBalance * (settings.baseRiskPercent / 100)
     : orderLimitDollars * (settings.riskBudgetPercentOfOrder / 100);
   const slippagePerSharePerSide = settings.slippagePerShare;
-  const stopPercent = settings.stopLossPercent / 100;
 
   if (structuralSide === "Sell" && heldShares <= 0) {
     failedGates.push("Sell recommendation blocked because there are no open shares to close");
@@ -12494,7 +17263,8 @@ function manualOrderRecommendation(
   const buySizing = structuralSide === "Buy"
     ? votingEnsembleBuyQuantitySizing(settings, triggerPrice, position)
     : null;
-  const riskPerShare = structuralSide === "Buy" && buySizing ? buySizing.stopDistance : triggerPrice * stopPercent;
+  const orderAtr = averageTrueRange(latestRegularSessionCandles(), 14) ?? 0;
+  const riskPerShare = structuralSide === "Buy" && buySizing ? buySizing.stopDistance : tradingSettingsStopDistance(settings, triggerPrice, orderAtr);
   const riskDollars = structuralSide === "Buy" && buySizing ? buySizing.riskDollars : baseRiskDollars;
   const allocationQuantity = Math.floor(availableOrderDollars / triggerPrice);
   const quantity = structuralSide === "Sell"
@@ -12684,6 +17454,23 @@ function dynamicArtifactStatusLabel() {
       : state.dynamicArtifactStatus === "error"
         ? "Error"
         : "Waiting";
+}
+
+function compactMlArtifactLabel(timeframe: BacktestResultTimeframe) {
+  const status = dynamicArtifactStatusLabel();
+  const settingsKey = tradingSettingsKey(state.tradingSettings);
+  const artifactMatches = state.dynamicArtifactStatus === "ready" && state.dynamicArtifactSettingsKey === settingsKey;
+  if (!artifactMatches || !state.dynamicArtifact?.mlComparison?.bestByTimeframe?.length) {
+    return status;
+  }
+  const rows = state.dynamicArtifact.mlComparison.bestByTimeframe;
+  const row =
+    rows.find((item) => item.timeframe === timeframe) ??
+    rows.find((item) => item.timeframe === "1Min") ??
+    rows.find((item) => item.verdict === "Improved") ??
+    rows[0];
+  const pf = row.bestProfitFactor === null || row.bestProfitFactor === undefined ? "NA" : row.bestProfitFactor;
+  return `${status} - ${row.timeframe} ${row.verdict}, ${row.bestVariant} ${signedCurrency(row.bestPnl)}, PF ${pf}`;
 }
 
 function renderOrderGate(gate: TradeLayerGate) {
@@ -12880,8 +17667,6 @@ function votingEnsembleBuyQuantitySizing(
   const maxPositionPct = useDefaults
     ? Math.max(0, settings.maxPositionPercent / 100)
     : Math.max(0, finitePositiveOrDefault(manualOrderLimitDollars, accountEquity * (settings.orderAllocationPercent / 100)) / Math.max(accountEquity, 0.01));
-  const atrStopMultiplier = useDefaults ? Math.max(0.01, settings.atrStopMultiplier) : Math.max(0.01, settings.stopLossPercent / 0.05);
-  const minimumStopDistancePct = useDefaults ? Math.max(0, settings.minimumStopDistancePercent / 100) : Math.max(0.0001, settings.stopLossPercent / 100);
   const maxParticipationRate = useDefaults ? Math.max(0, settings.maxParticipationPercent / 100) : 0.01;
   const maxAllowedShares = useDefaults
     ? Math.floor(settings.maxAllowedShares > 0 ? settings.maxAllowedShares : (accountEquity * maxPositionPct) / Math.max(latestPrice, 0.01))
@@ -12892,7 +17677,7 @@ function votingEnsembleBuyQuantitySizing(
   const signalEdge = buyScore - secondBestScore;
   const sessionCandles = latestRegularSessionCandles();
   const atr = averageTrueRange(sessionCandles, Math.min(14, sessionCandles.length - 1)) ?? 0;
-  const stopDistance = Math.max(atr * atrStopMultiplier, latestPrice * minimumStopDistancePct);
+  const stopDistance = tradingSettingsStopDistance(settings, latestPrice, atr);
   const sizeMultiplier = votingEnsembleSizeMultiplier(signalEdge);
   const riskDollars = accountEquity * baseRiskPct * (useDefaults ? Math.max(sizeMultiplier, 1) : sizeMultiplier);
   const maxOrderDollars = useDefaults
@@ -13018,59 +17803,19 @@ function renderAlgoResults(
   const totalTrades = backtest.totalTrades ?? backtest.trades.length;
   const winRate = totalTrades ? `${Math.round((backtest.winners / totalTrades) * 100)}%` : "NA";
   const rangeLabel = backtest.rangeLabel ?? backtest.dateLabel;
-  const riskConfig = backtest.riskConfig;
-  const allowedHourList = riskConfig?.allowedEntryHoursByTimeframe?.[backtest.timeframe];
-  const allowedHours = allowedHourList?.length ? allowedHourList.join(", ") : "all qualified hours";
-  const strategyDescription = backtest.strategyDescription ?? `${algoBacktestTimeframeLabel(backtest.timeframe)} direct execution`;
-  const hybridGate =
-    backtest.timeframe === "1Hour" && riskConfig?.hybridOneHour
-      ? `, ${riskConfig.hybridOneHour.label ?? "1h filter + 5m execution"}, ${riskConfig.hybridOneHour.takeProfitR ?? riskConfig.takeProfitR}R hybrid target, block ${riskConfig.hybridOneHour.blockedRegimes?.join("/") || "NA"} and ${riskConfig.hybridOneHour.blockedDirectionHours?.join("/") || "NA"} direction hour`
-      : "";
-  const swingConfig = riskConfig?.swing?.[backtest.timeframe];
-  const swingGate = swingConfig
-    ? `, ${swingConfig.label ?? "swing vote"}, ${swingConfig.takeProfitR ?? riskConfig?.takeProfitR}R target, max ${swingConfig.maxHoldingBars ?? "NA"} bars, ATR x${swingConfig.atrMultiplier ?? "NA"} stop`
-    : "";
-  const eventConfig = riskConfig?.openCloseEvents;
-  const eventGate =
-    backtest.timeframe === "Event" && eventConfig
-      ? `, opening ${eventConfig.minOpeningWeeklyDirectionalVotes ?? 3}+ weekly votes, closing ${eventConfig.enableClosingEvents ? `${eventConfig.minClosingWeeklyDirectionalVotes ?? 4}+ weekly votes` : "disabled"}, block ${eventConfig.blockedRegimes?.join("/") || "none"}`
-      : "";
-  const displayedTargetR =
-    backtest.timeframe === "1Hour" && riskConfig?.hybridOneHour?.takeProfitR
-      ? riskConfig.hybridOneHour.takeProfitR
-      : eventConfig?.takeProfitR ?? swingConfig?.takeProfitR ?? riskConfig?.takeProfitR;
   return `
     <span>Winner: ${finalSignal}</span>
     <span>Buy ${buyVotes} / Sell ${sellVotes} / Hold ${holdVotes}</span>
     <span>Highest-ranked strategy: ${escapeHtml(strongestLabel)}</span>
-    <span>Strategy universe: ${votes.length} project strategies</span>
-    <span>Starting capital: ${currency(backtest.startingCapital ?? riskConfig?.startingCapital ?? 0)}</span>
-    <span>Risk model: ${riskConfig ? `${riskConfig.riskPerTradePercent}% risk/trade, ${riskConfig.maxDailyLossPercent}% max daily loss, ${riskConfig.maxTradesPerDay} trades/day` : "NA"}</span>
-    <span>Session: ${riskConfig ? `${riskConfig.sessionStart}-${riskConfig.forceClose} ET, no new trades after ${riskConfig.newTradesUntil}` : "NA"}</span>
-    <span>Execution: ${riskConfig ? `${riskConfig.execution}, ${riskConfig.stopLossPercent}%/ATR stop, ${displayedTargetR}R target, ${currency(riskConfig.slippagePerShare)} slippage/share` : "NA"}</span>
-    <span>Estimated expenses: ${currency(backtest.totalExpenses ?? 0)} deducted from P/L${riskConfig?.expenseModel ? `, plus ${currency(riskConfig.expenseModel.additionalLiquidityCostPerSharePerSide ?? 0)}/share/side liquidity reserve` : ""}</span>
-    <span>Strategy mode: ${escapeHtml(strategyDescription)}</span>
-    <span>Quality gate: ${riskConfig ? `${riskConfig.entryConfirmationBars ?? "NA"}-candle confirmation, entries only ${allowedHours} ET, signal fade ${riskConfig.signalFadeExit ?? "NA"}${hybridGate}${swingGate}${eventGate}` : "NA"}</span>
     <span>Backtest status: <strong class="algo-backtest-status" data-status="${algoBacktestStatusKind()}">${escapeHtml(algoBacktestStatusLabel())}</strong></span>
-    ${renderMlComparison(backtest.timeframe)}
-    ${renderCandidateDataset(backtest.timeframe)}
-    ${renderMlDiagnostics(backtest.timeframe)}
-    ${renderDailyRefinement(backtest.timeframe)}
-    ${renderEventRefinement(backtest.timeframe)}
-    ${renderWeeklyRiskTuning(backtest.timeframe)}
+    <span>ML artifact: ${escapeHtml(compactMlArtifactLabel(backtest.timeframe))}</span>
     <span>Backtest timeframe: ${algoBacktestTimeframeLabel(backtest.timeframe)}</span>
     <span>Backtest range: ${escapeHtml(rangeLabel)}</span>
-    <span>Backtest bars: ${backtest.bars ?? "NA"} across ${backtest.sessions ?? "NA"} sessions</span>
     <span>Backtest trades: ${totalTrades}</span>
-    <span>Displayed trades: ${backtest.displayedTrades ?? backtest.trades.length}</span>
-    <span>Final equity: ${currency(backtest.finalEquity ?? 0)}</span>
     <span>Net backtest P/L: ${signedCurrency(backtest.totalPnl)} (${signed(backtest.totalReturnPercent)}%)</span>
     <span>Max drawdown: ${currency(backtest.maxDrawdown ?? 0)} (${signed(-(backtest.maxDrawdownPercent ?? 0))}%)</span>
     <span>Profit factor: ${backtest.profitFactor ?? "NA"}</span>
-    <span>Average win / loss: ${currency(backtest.averageWin ?? 0)} / ${currency(backtest.averageLoss ?? 0)}</span>
-    <span>Expectancy: ${currency(backtest.expectancy ?? 0)} per trade</span>
     <span>Win rate: ${winRate}</span>
-    ${renderBacktestDiagnostics(backtest)}
   `;
 }
 
@@ -13525,16 +18270,19 @@ function renderDiagnosticRow(row: BacktestDiagnosticRow) {
 }
 
 function updateAlgoBacktestControls() {
+  const intradayActive = state.algoBacktestTimeframe === "1Min" || state.algoBacktestTimeframe === "5Min";
+  algoIntradayTradesToggle.classList.toggle("active", intradayActive);
+  algoIntradayTradesToggle.setAttribute("aria-expanded", String(state.algoIntradayTradesExpanded));
+  algoIntradayTradesToggle.setAttribute("aria-pressed", String(intradayActive));
+  algoIntradayTradesToggleIcon.textContent = state.algoIntradayTradesExpanded ? "-" : "+";
+  algoIntradayTradesPanel.hidden = !state.algoIntradayTradesExpanded;
   const buttons: Array<[AlgoBacktestTimeframe, HTMLButtonElement]> = [
     ["1Min", algoBacktest1mButton],
     ["5Min", algoBacktest5mButton],
-    ["1Hour", algoBacktest1hButton],
-    ["1Day", algoBacktest1dButton],
-    ["1Week", algoBacktest1wButton],
-    ["Event", algoBacktestEventButton],
     ["Trading", algoBacktestTradingButton],
   ];
   buttons.forEach(([timeframe, button]) => {
+    button.hidden = timeframe === "Trading" || !FAST_INTRADAY_ALGO_TIMEFRAMES.has(timeframe);
     const active = state.algoBacktestTimeframe === timeframe;
     button.classList.toggle("active", active);
     button.setAttribute("aria-pressed", String(active));
@@ -13668,6 +18416,9 @@ async function maybeRunConfidenceDailyBacktest(reason: string) {
 }
 
 async function maybeRunDailyAlgorithmBacktests(reason: string) {
+  if (!AUTO_DAILY_ALGORITHM_BACKTESTS) {
+    return;
+  }
   if (dailyAlgorithmBacktestsInFlight || (state.marketStatus !== "closed" && state.marketStatus !== "holiday")) {
     return;
   }
@@ -13906,6 +18657,7 @@ async function runVotingEnsembleDailyBacktestRefresh() {
     await loadTradingRag();
     return;
   }
+  await loadTradingRag();
   await loadAlgoBacktestCandles();
 }
 
@@ -14102,7 +18854,7 @@ function backtestConfidenceAggregation(candles: Candle[]): BacktestResult {
       if (!openTrade && market && confidenceBacktestCanEnter(result, market, tradesToday, defaults.maxDailyTrades)) {
         const quantity = result.sizing.finalQuantity;
         const entryPrice = roundNumber(candle.close + settings.slippagePerShare, 2);
-        const riskPerShare = Math.max(result.sizing.stopDistance, entryPrice * (defaults.minimumStopDistancePercent / 100));
+        const riskPerShare = result.sizing.stopDistance;
         openTrade = {
           side: "Long",
           entryAt: candle.timestamp,
@@ -14257,7 +19009,7 @@ function confidenceBacktestPositionSizing(
   const dailyBuyingPowerDollars = accountEquity * (settings.dailyAllocationPercent / 100);
   const availableBuyingPower = Math.max(0, Math.min(maxPositionDollars, dailyBuyingPowerDollars) - currentPositionValue);
   const riskDollars = accountEquity * (defaults.baseRiskPercent / 100) * sizeMultiplier;
-  const stopDistance = Math.max(market.atr.stopDistance, priceValue * (defaults.minimumStopDistancePercent / 100));
+  const stopDistance = defaultSizingStopDistance(defaults, priceValue, market.atr.stopDistance / Math.max(defaults.atrStopMultiplier, 0.01));
   const sharesByRisk = stopDistance > 0 ? riskDollars / stopDistance : 0;
   const sharesByOrder = maxOrderDollars / priceValue;
   const sharesByCapital = maxPositionDollars / priceValue;
@@ -14265,6 +19017,18 @@ function confidenceBacktestPositionSizing(
   const sharesByParticipation =
     defaults.maxParticipationPercent > 0 ? (market.latest.volume * (defaults.maxParticipationPercent / 100)) : Number.POSITIVE_INFINITY;
   const sharesByMaxAllowed = defaults.maxAllowedShares > 0 ? defaults.maxAllowedShares : Number.POSITIVE_INFINITY;
+  const sizingCaps = [
+    { label: "risk budget", shares: sharesByRisk },
+    { label: "order limit", shares: sharesByOrder },
+    { label: "max position", shares: sharesByCapital },
+    { label: "buying power", shares: sharesByBuyingPower },
+    { label: "liquidity participation", shares: sharesByParticipation },
+    { label: "max shares", shares: sharesByMaxAllowed },
+  ].filter((cap) => Number.isFinite(cap.shares));
+  const limitingCap = sizingCaps.reduce(
+    (smallest, cap) => (cap.shares < smallest.shares ? cap : smallest),
+    { label: "sizing", shares: Number.POSITIVE_INFINITY },
+  );
   const rawQuantity = Math.min(sharesByRisk, sharesByOrder, sharesByCapital, sharesByBuyingPower, sharesByParticipation, sharesByMaxAllowed);
   const finalQuantity =
     signal === "Hold" || sizeMultiplier <= 0 || stopDistance <= 0 ? 0 : Math.max(0, Math.floor(Number.isFinite(rawQuantity) ? rawQuantity : 0));
@@ -14274,20 +19038,23 @@ function confidenceBacktestPositionSizing(
     riskDollars,
     stopDistance,
     sharesByRisk,
+    sharesByOrder,
     sharesByCapital,
     sharesByBuyingPower,
+    sharesByLiquidity: sharesByParticipation,
     finalQuantity,
     availableBuyingPower,
     accountEquity,
     maxPositionDollars,
     currentPositionValue,
+    limitingFactor: limitingCap.label,
     blockedReason:
       signal === "Hold"
         ? "final signal is Hold"
         : sizeMultiplier <= 0
           ? `signal strength ${formatProbability(signalStrength)} is below 50%`
           : finalQuantity < 1
-            ? "final quantity is below 1 share"
+            ? `${limitingCap.label} allows ${formatShareLimit(limitingCap.shares)}, below 1 share`
             : "",
   };
 }
@@ -15104,10 +19871,10 @@ function chartBounds(width: number, height: number) {
     left: 0,
     top: 18,
     right: width - rightAxisWidth,
-    bottom: height - 34,
-    volumeTop: height - 112,
+    bottom: height - 42,
+    volumeTop: height - 120,
     width: width - rightAxisWidth,
-    height: height - 52,
+    height: height - 60,
   };
 }
 
@@ -15840,6 +20607,14 @@ function loadConfidenceTradeHistory(): TradeHistoryRow[] {
   return loadTradeHistoryRows(CONFIDENCE_TRADE_HISTORY_STORAGE_KEY);
 }
 
+function loadRegimeTradeHistory(): TradeHistoryRow[] {
+  return loadTradeHistoryRows(REGIME_TRADE_HISTORY_STORAGE_KEY);
+}
+
+function loadMetaTradeHistory(): TradeHistoryRow[] {
+  return loadTradeHistoryRows(META_TRADE_HISTORY_STORAGE_KEY);
+}
+
 function saveTradeHistory() {
   window.localStorage.setItem(TRADE_HISTORY_STORAGE_KEY, JSON.stringify(state.tradeHistory.slice(0, 50)));
 }
@@ -15850,6 +20625,14 @@ function saveWeightedTradeHistory() {
 
 function saveConfidenceTradeHistory() {
   window.localStorage.setItem(CONFIDENCE_TRADE_HISTORY_STORAGE_KEY, JSON.stringify(state.confidenceTradeHistory.slice(0, 50)));
+}
+
+function saveRegimeTradeHistory() {
+  window.localStorage.setItem(REGIME_TRADE_HISTORY_STORAGE_KEY, JSON.stringify(state.regimeTradeHistory.slice(0, 50)));
+}
+
+function saveMetaTradeHistory() {
+  window.localStorage.setItem(META_TRADE_HISTORY_STORAGE_KEY, JSON.stringify(state.metaTradeHistory.slice(0, 50)));
 }
 
 function loadOrderControlModesFromStorage(storageKey: string): Record<string, SubmitOrderMode> {
@@ -15882,6 +20665,14 @@ function loadConfidenceOrderControlModes(): Record<string, SubmitOrderMode> {
   return loadOrderControlModesFromStorage(CONFIDENCE_ORDER_CONTROL_MODES_STORAGE_KEY);
 }
 
+function loadRegimeOrderControlModes(): Record<string, SubmitOrderMode> {
+  return loadOrderControlModesFromStorage(REGIME_ORDER_CONTROL_MODES_STORAGE_KEY);
+}
+
+function loadMetaOrderControlModes(): Record<string, SubmitOrderMode> {
+  return loadOrderControlModesFromStorage(META_ORDER_CONTROL_MODES_STORAGE_KEY);
+}
+
 function saveOrderControlModes() {
   window.localStorage.setItem(ORDER_CONTROL_MODES_STORAGE_KEY, JSON.stringify(state.orderControlModes));
 }
@@ -15892,6 +20683,14 @@ function saveWeightedOrderControlModes() {
 
 function saveConfidenceOrderControlModes() {
   window.localStorage.setItem(CONFIDENCE_ORDER_CONTROL_MODES_STORAGE_KEY, JSON.stringify(state.confidenceOrderControlModes));
+}
+
+function saveRegimeOrderControlModes() {
+  window.localStorage.setItem(REGIME_ORDER_CONTROL_MODES_STORAGE_KEY, JSON.stringify(state.regimeOrderControlModes));
+}
+
+function saveMetaOrderControlModes() {
+  window.localStorage.setItem(META_ORDER_CONTROL_MODES_STORAGE_KEY, JSON.stringify(state.metaOrderControlModes));
 }
 
 function loadOrderControlOverridesFromStorage(storageKey: string): Record<string, LotOrderOverride> {
@@ -15924,6 +20723,14 @@ function loadConfidenceOrderControlOverrides(): Record<string, LotOrderOverride>
   return loadOrderControlOverridesFromStorage(CONFIDENCE_ORDER_CONTROL_OVERRIDES_STORAGE_KEY);
 }
 
+function loadRegimeOrderControlOverrides(): Record<string, LotOrderOverride> {
+  return loadOrderControlOverridesFromStorage(REGIME_ORDER_CONTROL_OVERRIDES_STORAGE_KEY);
+}
+
+function loadMetaOrderControlOverrides(): Record<string, LotOrderOverride> {
+  return loadOrderControlOverridesFromStorage(META_ORDER_CONTROL_OVERRIDES_STORAGE_KEY);
+}
+
 function sanitizeLotOrderOverride(value: unknown): LotOrderOverride {
   if (!value || typeof value !== "object") {
     return {};
@@ -15949,6 +20756,14 @@ function saveWeightedOrderControlOverrides() {
 
 function saveConfidenceOrderControlOverrides() {
   window.localStorage.setItem(CONFIDENCE_ORDER_CONTROL_OVERRIDES_STORAGE_KEY, JSON.stringify(state.confidenceOrderControlOverrides));
+}
+
+function saveRegimeOrderControlOverrides() {
+  window.localStorage.setItem(REGIME_ORDER_CONTROL_OVERRIDES_STORAGE_KEY, JSON.stringify(state.regimeOrderControlOverrides));
+}
+
+function saveMetaOrderControlOverrides() {
+  window.localStorage.setItem(META_ORDER_CONTROL_OVERRIDES_STORAGE_KEY, JSON.stringify(state.metaOrderControlOverrides));
 }
 
 function formatTradeHistoryTime(value: string) {
@@ -16216,9 +21031,78 @@ function scheduleAutoRefresh() {
     return;
   }
   markRefresh(state.viewportOffset === 0 ? "waiting" : "paused");
-  refreshTimer = window.setInterval(() => {
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = undefined;
     void refreshWhenMarketIsOpen();
   }, state.refreshSeconds * 1000);
+}
+
+function sleepAppUntilMarketWake(status = "sleeping-market-closed") {
+  if (refreshTimer) {
+    window.clearTimeout(refreshTimer);
+    refreshTimer = undefined;
+  }
+  nextChartRefreshAt = 0;
+  markRefresh(status);
+}
+
+async function activateAppAfterWake(reason: string) {
+  if (appActivationInFlight) {
+    return;
+  }
+  appActivationInFlight = true;
+  let shouldResumeRefresh = false;
+  try {
+    markRefresh(reason);
+    backtestRangeCache = null;
+    await loadMarketStatus();
+    if (!marketAllowsTradingRefresh()) {
+      sleepAppUntilMarketWake(state.marketStatus === "unknown" ? "market-unknown" : "sleeping-market-closed");
+      if (reason === "wake") {
+        void requestSystemSleepIfMarketClosed("wake_market_closed");
+      }
+      return;
+    }
+    shouldResumeRefresh = true;
+    await startMarketForecastPredictionLedger(reason);
+    await loadLatestDynamicTradingArtifact();
+    await loadCandles({ showLoading: false, refresh: true });
+    void loadAlgoBacktestCandles();
+    void saveBrowserStorageSnapshot(`wake-${reason}`);
+  } catch {
+    markRefresh("wake-error");
+  } finally {
+    appActivationInFlight = false;
+    if (shouldResumeRefresh) {
+      scheduleAutoRefresh();
+    }
+  }
+}
+
+function startWakeActivationMonitor() {
+  if (wakeCheckTimer !== null) {
+    window.clearInterval(wakeCheckTimer);
+  }
+  lastWakeCheckAt = Date.now();
+  wakeCheckTimer = window.setInterval(() => {
+    const now = Date.now();
+    const gap = now - lastWakeCheckAt;
+    lastWakeCheckAt = now;
+    if (gap > WAKE_GAP_THRESHOLD_MS) {
+      void activateAppAfterWake("wake");
+    }
+  }, WAKE_CHECK_INTERVAL_MS);
+  window.addEventListener("focus", () => {
+    void activateAppAfterWake("focus");
+  });
+  window.addEventListener("online", () => {
+    void activateAppAfterWake("online");
+  });
+  window.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      void activateAppAfterWake("visible");
+    }
+  });
 }
 
 function millisecondsUntilNextOneMinuteBarRefresh() {
@@ -16260,12 +21144,12 @@ async function refreshWhenMarketIsOpen() {
     }
 
     if (status.status === "holiday" || status.status === "closed") {
-      markRefresh(status.status);
+      sleepAppUntilMarketWake("sleeping-market-closed");
     } else {
       markRefresh("market-unknown");
     }
   } finally {
-    if (state.refreshSeconds === BAR_CLOSE_REFRESH_MODE) {
+    if (marketAllowsTradingRefresh()) {
       scheduleAutoRefresh();
     }
   }
@@ -16288,12 +21172,15 @@ function markRefresh(status: string) {
     refreshStatus.textContent = nextChartRefreshAt ? `next 1m bar ${formatTimeWithSeconds(new Date(nextChartRefreshAt).toISOString())}` : "next 1m bar";
   } else if (status === "checking-bar") {
     refreshStatus.textContent = `checking 1m bar ${state.lastRefreshAt}`;
+  } else if (status === "failed") {
+    refreshStatus.textContent = `refresh failed ${state.lastRefreshAt}`;
   } else if (status === "waiting") {
     refreshStatus.textContent = `waiting ${state.lastRefreshAt}`;
   } else {
     refreshStatus.textContent = `${status} ${state.lastRefreshAt}`;
   }
   refreshStatus.dataset.status = status;
+  refreshStatus.title = status === "failed" && state.error ? state.error : "";
 }
 
 function updateMarketStatus(payload: MarketStatus) {
@@ -16425,6 +21312,9 @@ function strategyFitDisplayRows(sourceStrategies: StrategyFit[]) {
       .map(
         (name): StrategyFit => ({
           name,
+          role: metaStrategyCatalog.find((strategy) => strategy.name === name)?.role,
+          family: metaStrategyCatalog.find((strategy) => strategy.name === name)?.family,
+          strategy_family: metaStrategyCatalog.find((strategy) => strategy.name === name)?.family,
           status: "Watch",
           score: 45,
           matches: ["Used by algorithm", "Waiting for backend fit score"],
@@ -16440,6 +21330,8 @@ function allAlgorithmStrategyFitNames() {
       ...strategyVoteCatalog,
       ...weightedAlphaStrategies.map((strategy) => strategy.name),
       ...confidenceAggregationStrategies.map((strategy) => strategy.name),
+      ...regimeSelectionStrategies.map((strategy) => strategy.name),
+      ...metaStrategyCatalog.map((strategy) => strategy.name),
       "ADX Trend Strength Filter",
       "ATR Volatility Regime",
       "Breakout Strategy",
@@ -16467,7 +21359,6 @@ function skeletonStrategies() {
 }
 
 function renderDecision(context: MarketContext) {
-  const best = context.strategies[0];
   const tags = new Set([
     ...context.regime.strategyTags,
     ...context.session.strategyTags,
@@ -16477,25 +21368,18 @@ function renderDecision(context: MarketContext) {
     tags.has("liquidity-stress") ? "Liquidity stress" : "",
     tags.has("news-risk") ? "News risk" : "",
     tags.has("chop") ? "Choppy tape" : "",
-    tags.has("cash-filter") && !strategyOverridesCashFilter(best) ? "Cash filter" : "",
-    tags.has("cash-filter") && strategyOverridesCashFilter(best) ? "Cash filter overridden" : "",
+    tags.has("cash-filter") ? "Cash filter" : "",
   ].filter(Boolean);
-  const action = decisionActionLabel(context, best, tags);
-  const bias = decisionBiasLabel(context);
   const risk = riskFlags.length ? riskFlags.join(", ") : "Normal";
-  const reason = best
-    ? `${best.name}: ${best.matches[0] ?? "No strong confirming condition"}`
-    : "No strategy fit is available";
 
-  decisionAction.textContent = action;
-  decisionBias.textContent = bias;
+  decisionAction.textContent = "";
+  decisionBias.textContent = context.regime.label;
   decisionRisk.textContent = risk;
-  decisionReason.textContent = reason;
   decisionChecklist.innerHTML = [
-    ["Regime", context.regime.label],
     ["Session", context.session.label],
     ["Event", context.event.label],
-    ["Top Strategy", best ? `${best.status} ${best.score}%` : "NA"],
+    ["Regime Volatility", volatilityLabel(context.regime.volatility)],
+    ["Session Volatility", volatilityLabel(context.session.volatility)],
   ]
     .map(
       ([label, value]) => `
@@ -16506,61 +21390,145 @@ function renderDecision(context: MarketContext) {
       `,
     )
     .join("");
+  renderMarketForecastPanel();
 }
 
 function renderDecisionLoading() {
-  decisionAction.textContent = "Loading context";
+  decisionAction.textContent = "Loading forecast";
   decisionBias.textContent = "--";
   decisionRisk.textContent = "--";
-  decisionReason.textContent = "Waiting for market context";
   decisionChecklist.innerHTML = "";
+  renderMarketForecastPanel();
 }
 
 function renderDecisionUnavailable(message: string) {
-  decisionAction.textContent = "Decision unavailable";
+  decisionAction.textContent = "Forecast context unavailable";
   decisionBias.textContent = "--";
   decisionRisk.textContent = "Retry needed";
-  decisionReason.textContent = message || "Market context unavailable";
   decisionChecklist.innerHTML = "";
+  renderMarketForecastPanel();
 }
 
-function decisionActionLabel(context: MarketContext, best: StrategyFit | undefined, tags: Set<string>) {
-  if (!best || best.status === "Avoid" || tags.has("liquidity-stress")) {
-    return "Avoid / Wait";
-  }
-  if (tags.has("cash-filter") && !strategyOverridesCashFilter(best)) {
-    return "Avoid / Wait";
-  }
-  if (context.session.directionBias === "long" && context.regime.directionBias !== "short") {
-    return "Prefer Long Setup";
-  }
-  if (context.session.directionBias === "short" && context.regime.directionBias !== "long") {
-    return "Prefer Short Setup";
-  }
-  if (best.status === "Strong Fit") {
-    return "Trade Best Fit";
-  }
-  return "Wait For Confirmation";
+type MarketForecastImpact = "positive" | "negative" | "neutral";
+
+function renderMarketForecastItem(label: string, value: string, impact: MarketForecastImpact = "neutral") {
+  return `<span class="market-forecast-item" data-impact="${impact}"><b>${escapeHtml(label)}</b>${escapeHtml(value)}</span>`;
 }
 
-function strategyOverridesCashFilter(best: StrategyFit | undefined) {
-  return Boolean(best && best.status === "Strong Fit" && best.score >= 80);
+function thresholdImpact(value: number | null | undefined, threshold: number | null | undefined, higherIsBetter = true): MarketForecastImpact {
+  if (value == null || threshold == null) {
+    return "neutral";
+  }
+  const passes = higherIsBetter ? value >= threshold : value <= threshold;
+  return passes ? "positive" : "negative";
 }
 
-function decisionBiasLabel(context: MarketContext) {
-  const values = [context.regime.directionBias, context.session.directionBias, context.event.directionBias];
-  if (values.includes("cash")) {
-    return "Cash";
+function signedImpact(value: number | null | undefined): MarketForecastImpact {
+  if (value == null || Math.abs(value) < 0.0001) {
+    return "neutral";
   }
-  const longCount = values.filter((value) => value === "long").length;
-  const shortCount = values.filter((value) => value === "short").length;
-  if (longCount > shortCount) {
-    return "Long";
+  return value > 0 ? "positive" : "negative";
+}
+
+function renderMarketForecastPanel() {
+  if (state.marketForecastStatus === "loading" && !state.marketForecast) {
+    marketForecastPanel.dataset.status = "loading";
+    marketForecastPanel.innerHTML = `
+      <div class="market-forecast-head">
+        <span>Future Market Forecast</span>
+        <strong>Loading</strong>
+      </div>
+      <div class="market-forecast-note">Building isolated 5-minute forecast from 1m candles.</div>
+    `;
+    return;
   }
-  if (shortCount > longCount) {
-    return "Short";
+  if (state.marketForecastStatus === "error") {
+    marketForecastPanel.dataset.status = "error";
+    marketForecastPanel.innerHTML = `
+      <div class="market-forecast-head">
+        <span>Future Market Forecast</span>
+        <strong>Unavailable</strong>
+      </div>
+      <div class="market-forecast-note">${escapeHtml(state.marketForecastError || "Forecast endpoint unavailable.")}</div>
+    `;
+    return;
   }
-  return "Neutral";
+  const forecast = state.marketForecast;
+  if (!forecast) {
+    marketForecastPanel.dataset.status = "waiting";
+    marketForecastPanel.innerHTML = `
+      <div class="market-forecast-head">
+        <span>Future Market Forecast</span>
+        <strong>Waiting</strong>
+      </div>
+      <div class="market-forecast-note">Forecast will appear after 1m candles load.</div>
+    `;
+    return;
+  }
+  const buyProbabilityValue = forecast.probabilityBuySuccess ?? forecast.probabilitySuccess;
+  const sellProbabilityValue = forecast.probabilitySellSuccess ?? forecast.probabilityStop;
+  const buyProbability = buyProbabilityValue === null ? "NA" : formatProbability(buyProbabilityValue);
+  const sellProbability = sellProbabilityValue === null ? "NA" : formatProbability(sellProbabilityValue);
+  const timeoutProbability = forecast.probabilityTimeout === null ? "NA" : formatProbability(forecast.probabilityTimeout);
+  const expectedValue = forecast.expectedValue === null ? "NA" : `${forecast.expectedValue >= 0 ? "+" : ""}${currency(forecast.expectedValue)}/share`;
+  const targetDistance = forecast.barriers?.targetDistance == null ? "NA" : currency(forecast.barriers.targetDistance);
+  const stopDistance = forecast.barriers?.stopDistance == null ? "NA" : currency(forecast.barriers.stopDistance);
+  const regimeLabel = forecast.marketRegime
+    ? `${forecast.marketRegime.trend.replaceAll("_", " ")}, ${forecast.marketRegime.volatility.replaceAll("_", " ")}, ${forecast.marketRegime.session.replaceAll("_", " ")}`
+    : `${forecast.regime.trend}, ${forecast.regime.volatility}, ${forecast.regime.vwap}`;
+  const sizeLabel = forecast.decision.positionSizeMultiplier == null ? "NA" : `${Math.round(forecast.decision.positionSizeMultiplier * 100)}%`;
+  const algoScores = forecast.algorithmSignals?.weightedScores;
+  const algoScoreLabel = algoScores
+    ? `B ${formatProbability(algoScores.buy ?? 0)} / S ${formatProbability(algoScores.sell ?? 0)} / H ${formatProbability(algoScores.hold ?? 0)}`
+    : "NA";
+  const statusLabel = forecast.decision.action === "buy" ? "Buy edge" : forecast.decision.action === "sell" ? "Sell edge" : forecast.status === "insufficient_data" ? "Need data" : "No trade";
+  const modelLabel = forecast.model.status === "ready" ? forecast.model.kind : "Fallback";
+  const edgeGap = forecast.decision.edgeGap === null ? "NA" : formatProbability(forecast.decision.edgeGap);
+  const modelDisagreement = forecast.uncertainty?.modelDisagreement ?? forecast.decision.modelDisagreement;
+  const maxDisagreement = forecast.uncertainty?.maximumModelDisagreement ?? forecast.decision.maximumModelDisagreement ?? 0.1;
+  const uncertaintyLabel = modelDisagreement == null ? "NA" : `${formatProbability(modelDisagreement)} / max ${formatProbability(maxDisagreement)}`;
+  const targetStopImpact =
+    forecast.barriers?.targetDistance == null || forecast.barriers?.stopDistance == null
+      ? "neutral"
+      : forecast.barriers.targetDistance >= forecast.barriers.stopDistance
+        ? "positive"
+        : "negative";
+  const regimeImpact =
+    forecast.decision.action === "buy"
+      ? forecast.marketRegime?.allowedLong ? "positive" : "negative"
+      : forecast.decision.action === "sell"
+        ? forecast.marketRegime?.allowedShort ? "positive" : "negative"
+        : "negative";
+  const sizeImpact = forecast.decision.positionSizeMultiplier > 0 ? "positive" : "negative";
+  const modelImpact = forecast.model.status === "ready" ? "positive" : forecast.status === "fallback" ? "negative" : "neutral";
+  const algoScoresImpact = algoScores
+    ? forecast.decision.action === "buy"
+      ? (algoScores.buy ?? 0) > Math.max(algoScores.sell ?? 0, algoScores.hold ?? 0) ? "positive" : "negative"
+      : forecast.decision.action === "sell"
+        ? (algoScores.sell ?? 0) > Math.max(algoScores.buy ?? 0, algoScores.hold ?? 0) ? "positive" : "negative"
+        : "negative"
+    : "neutral";
+  marketForecastPanel.dataset.status = forecast.allowed ? "pass" : forecast.status === "insufficient_data" ? "info" : "blocked";
+  marketForecastPanel.innerHTML = `
+    <div class="market-forecast-head">
+      <span>Future Market Forecast</span>
+      <strong>${escapeHtml(statusLabel)}</strong>
+    </div>
+    <div class="market-forecast-grid">
+      ${renderMarketForecastItem("P(buy success)", `${buyProbability} / need ${formatProbability(forecast.threshold)}`, forecast.decision.action === "buy" ? thresholdImpact(buyProbabilityValue, forecast.threshold) : "neutral")}
+      ${renderMarketForecastItem("P(sell success)", sellProbability, forecast.decision.action === "sell" ? thresholdImpact(sellProbabilityValue, forecast.threshold) : "neutral")}
+      ${renderMarketForecastItem("P(no trade)", timeoutProbability, thresholdImpact(forecast.probabilityTimeout, 0.35, false))}
+      ${renderMarketForecastItem("Edge gap", `${edgeGap} / need ${formatProbability(forecast.minimumEdgeGap)}`, thresholdImpact(forecast.decision.edgeGap, forecast.minimumEdgeGap))}
+      ${renderMarketForecastItem("Target / Stop", `${targetDistance} / ${stopDistance}`, targetStopImpact)}
+      ${renderMarketForecastItem("Expected Value", expectedValue, signedImpact(forecast.expectedValue))}
+      ${renderMarketForecastItem("Uncertainty", uncertaintyLabel, thresholdImpact(modelDisagreement, maxDisagreement, false))}
+      ${renderMarketForecastItem("Regime", regimeLabel, regimeImpact)}
+      ${renderMarketForecastItem("Size", sizeLabel, sizeImpact)}
+      ${renderMarketForecastItem("Algo Scores", algoScoreLabel, algoScoresImpact)}
+      ${renderMarketForecastItem("Model", modelLabel, modelImpact)}
+    </div>
+    <div class="market-forecast-note">${escapeHtml(forecast.topDrivers.slice(0, 3).join(" | "))}</div>
+  `;
 }
 
 function biasLabel(value: MarketLayer["directionBias"]) {
@@ -16631,7 +21599,9 @@ function escapeHtml(value: string) {
 
 tickClock();
 setInterval(tickClock, 1000);
+startBrowserStorageDiskSnapshots();
 scheduleAutoRefresh();
+startWakeActivationMonitor();
 setMarketRailTab("summary");
 void loadMarketStatus();
 void loadMacroEvents();

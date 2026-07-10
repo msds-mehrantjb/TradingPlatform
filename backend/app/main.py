@@ -4,6 +4,7 @@ import asyncio
 import csv
 import ctypes
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -27,7 +28,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from .alpaca import AlpacaClient, demo_bars, local_market_status
 from .config import get_settings
 from .database import CandleStore
-from .market_context import compute_market_context
+from .market_forecast import (
+    FUTURE_MARKET_PREDICTION_LEDGER_NAME,
+    FUTURE_MARKET_PREDICTION_LEDGER_TITLE,
+    MODEL_VERSION as MARKET_FORECAST_MODEL_VERSION,
+    load_microstructure_rows_for_candles,
+    market_forecast_prediction,
+    market_forecast_artifact_path,
+    prediction_log_day,
+    read_market_forecast_prediction_log,
+    record_market_forecast_prediction,
+    resolve_market_forecast_prediction_day,
+)
+from .market_context import STRATEGY_CLASSIFICATION, compute_market_context
 
 
 settings = get_settings()
@@ -57,6 +70,28 @@ DAILY_BACKTEST_REFRESH_STATUS: dict = {
     "result": None,
 }
 
+MARKET_FORECAST_LEDGER_SYMBOL = "SPY"
+MARKET_FORECAST_LEDGER_FEED: Literal["iex", "sip", "otc"] = "iex"
+MARKET_FORECAST_LEDGER_TIMEFRAME: Literal["1Min"] = "1Min"
+MARKET_FORECAST_LEDGER_LIMIT = 240
+MARKET_FORECAST_LEDGER_POLL_SECONDS = 60
+MARKET_FORECAST_LEDGER_CLOSED_POLL_SECONDS = 5 * 60
+MARKET_FORECAST_LEDGER_STATUS: dict = {
+    "status": "idle",
+    "symbol": MARKET_FORECAST_LEDGER_SYMBOL,
+    "feed": MARKET_FORECAST_LEDGER_FEED,
+    "timeframe": MARKET_FORECAST_LEDGER_TIMEFRAME,
+    "lastRunAt": None,
+    "lastPredictionTimestamp": None,
+    "lastSaved": None,
+    "lastResult": None,
+    "nextRunAt": None,
+    "ledgerName": FUTURE_MARKET_PREDICTION_LEDGER_NAME,
+    "ledgerTitle": FUTURE_MARKET_PREDICTION_LEDGER_TITLE,
+    "message": "Future Market Prediction Ledger has not started yet.",
+}
+MARKET_FORECAST_LEDGER_TICK_LOCK = asyncio.Lock()
+
 DEFAULT_TRADING_SETTINGS: dict = {
     "startingCapital": 25000,
     "orderAllocationPercent": 10,
@@ -64,6 +99,7 @@ DEFAULT_TRADING_SETTINGS: dict = {
     "riskBudgetPercentOfOrder": 50,
     "maxTradesPerDay": 3,
     "stopLossPercent": 0.35,
+    "fixedStopDistanceDollars": 1.0,
     "takeProfitR": 1.5,
     "slippagePerShare": 0.02,
     "positionSizingMode": "allocation",
@@ -73,6 +109,7 @@ DEFAULT_TRADING_SETTINGS: dict = {
 @app.on_event("startup")
 async def start_daily_backtest_refresh_scheduler() -> None:
     asyncio.create_task(end_of_day_backtest_refresh_scheduler())
+    asyncio.create_task(market_forecast_ledger_scheduler())
 
 
 DEFAULT_LOOKBACKS = {
@@ -86,6 +123,9 @@ VIX_QUOTE_CSV_URL = "https://stooq.com/q/l/?s=^vix&f=sd2t2ohlcv&h&e=csv"
 ES_QUOTE_CSV_URL = "https://stooq.com/q/l/?s=es.f&f=sd2t2ohlcv&h&e=csv"
 BACKTEST_EXPORT_DIR = Path(__file__).resolve().parents[1] / "data" / "backtests"
 ARTIFACT_JOB_DIR = BACKTEST_EXPORT_DIR / "_artifact_jobs"
+BROWSER_STATE_DIR = Path(__file__).resolve().parents[1] / "data" / "browser_state"
+TRADE_HISTORY_ARCHIVE_DIR = Path(__file__).resolve().parents[1] / "data" / "trade_history_archives"
+DECISION_SNAPSHOT_DIR = Path(__file__).resolve().parents[1] / "data" / "decision_snapshots"
 ARTIFACT_JOB_EMPTY_LOG_STALE_AFTER = timedelta(minutes=20)
 ARTIFACT_JOB_STALE_AFTER = timedelta(hours=3)
 SPY_NEWS_FALLBACK = [
@@ -429,6 +469,1076 @@ def health() -> dict:
     }
 
 
+@app.post("/api/browser-state/snapshot")
+def save_browser_state_snapshot(payload: dict = Body(...)) -> dict:
+    items = payload.get("items")
+    if not isinstance(items, dict):
+        raise HTTPException(status_code=422, detail="items must be an object of browser storage keys and values")
+
+    clean_items: dict[str, str] = {}
+    for key, value in items.items():
+        if not isinstance(key, str):
+            continue
+        clean_items[key] = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+    snapshot = {
+        "version": 1,
+        "savedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "origin": str(payload.get("origin") or ""),
+        "userAgent": str(payload.get("userAgent") or ""),
+        "reason": str(payload.get("reason") or "manual"),
+        "itemCount": len(clean_items),
+        "items": clean_items,
+    }
+    encoded = json.dumps(snapshot, ensure_ascii=False)
+    if len(encoded.encode("utf-8")) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Browser state snapshot is larger than 10 MB")
+
+    BROWSER_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    snapshot_path = BROWSER_STATE_DIR / f"browser_state_{run_id}.json"
+    latest_path = BROWSER_STATE_DIR / "latest.json"
+    write_json(snapshot_path, snapshot)
+    write_json(latest_path, snapshot)
+    return {
+        "ok": True,
+        "path": str(snapshot_path),
+        "latestPath": str(latest_path),
+        "savedAt": snapshot["savedAt"],
+        "itemCount": snapshot["itemCount"],
+    }
+
+
+@app.get("/api/browser-state/latest")
+def latest_browser_state_snapshot() -> dict:
+    latest_path = BROWSER_STATE_DIR / "latest.json"
+    if not latest_path.exists():
+        raise HTTPException(status_code=404, detail="No browser state snapshot has been saved yet")
+    return json.loads(latest_path.read_text(encoding="utf-8"))
+
+
+@app.post("/api/decision-snapshots")
+def save_decision_snapshot(payload: dict = Body(...)) -> dict:
+    snapshot = payload.get("snapshot")
+    if not isinstance(snapshot, dict):
+        raise HTTPException(status_code=422, detail="snapshot must be an object")
+
+    encoded_snapshot = json.dumps(snapshot, ensure_ascii=False)
+    if len(encoded_snapshot.encode("utf-8")) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Decision snapshot is larger than 15 MB")
+
+    captured_at = str(snapshot.get("capturedAt") or datetime.now(UTC).isoformat().replace("+00:00", "Z"))
+    session_date = str(snapshot.get("sessionDate") or captured_at[:10] or "unknown")
+    safe_session = re.sub(r"[^0-9A-Za-z_-]+", "-", session_date).strip("-") or "unknown"
+    symbol = str(snapshot.get("symbol") or "UNKNOWN").upper()
+    safe_symbol = re.sub(r"[^0-9A-Za-z_-]+", "-", symbol).strip("-") or "UNKNOWN"
+
+    record = {
+        "version": 1,
+        "savedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "snapshot": snapshot,
+    }
+    DECISION_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    session_dir = DECISION_SNAPSHOT_DIR / safe_session
+    session_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = session_dir / f"{safe_symbol}_decision_snapshots.jsonl"
+    latest_path = DECISION_SNAPSHOT_DIR / "latest.json"
+
+    with jsonl_path.open("a", encoding="utf-8", newline="") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+        handle.write("\n")
+    write_json(latest_path, record)
+
+    return {
+        "ok": True,
+        "path": str(jsonl_path),
+        "latestPath": str(latest_path),
+        "sessionDate": safe_session,
+        "symbol": safe_symbol,
+        "savedAt": record["savedAt"],
+    }
+
+
+@app.post("/api/decision-snapshots/label")
+async def label_decision_snapshots_endpoint(payload: dict | None = Body(None)) -> dict:
+    request = payload or {}
+    symbol = str(request.get("symbol") or "SPY").upper()
+    feed = str(request.get("feed") or "iex")
+    session_date = str(request.get("sessionDate") or previous_completed_market_session_date())[:10]
+    market_status = await alpaca.get_market_status()
+    if market_status.get("isOpen") and end_of_day_refresh_target_date(market_status, datetime.now(UTC).astimezone(eastern_tz_for_date(datetime.now(UTC).year, datetime.now(UTC).month, datetime.now(UTC).day))) != session_date:
+        raise HTTPException(status_code=409, detail="Decision snapshots are labeled only after the market session is closed")
+    return label_decision_snapshots_for_session(symbol=symbol, feed=feed, session_date=session_date)
+
+
+@app.post("/api/meta-strategy/backfill-snapshots")
+async def backfill_meta_strategy_snapshots_endpoint(payload: dict | None = Body(None)) -> dict:
+    request = payload or {}
+    symbol = str(request.get("symbol") or "SPY").upper()
+    feed = str(request.get("feed") or "iex")
+    end_date = str(request.get("endDate") or previous_completed_market_session_date())[:10]
+    start_date = str(request.get("startDate") or "")[:10] or None
+    session_limit = int(request.get("sessionLimit") or 20)
+    interval_minutes = int(request.get("intervalMinutes") or 5)
+    warmup_minutes = int(request.get("warmupMinutes") or 120)
+    max_snapshots = int(request.get("maxSnapshots") or 1200)
+    overwrite_existing_dates = bool(request.get("overwriteExistingDates") or False)
+    buy_candidate_sampler = bool(request.get("buyCandidateSampler", True))
+    buy_candidate_min_score = float(request.get("buyCandidateMinScore") or 0.25)
+    buy_candidate_scan_minutes = int(request.get("buyCandidateScanMinutes") or 3)
+    buy_candidate_min_gap_minutes = int(request.get("buyCandidateMinGapMinutes") or 3)
+    max_buy_candidate_snapshots_per_session = int(request.get("maxBuyCandidateSnapshotsPerSession") or 30)
+    result = backfill_meta_strategy_decision_snapshots(
+        symbol=symbol,
+        feed=feed,
+        start_date=start_date,
+        end_date=end_date,
+        session_limit=session_limit,
+        interval_minutes=interval_minutes,
+        warmup_minutes=warmup_minutes,
+        max_snapshots=max_snapshots,
+        overwrite_existing_dates=overwrite_existing_dates,
+        buy_candidate_sampler=buy_candidate_sampler,
+        buy_candidate_min_score=buy_candidate_min_score,
+        buy_candidate_scan_minutes=buy_candidate_scan_minutes,
+        buy_candidate_min_gap_minutes=buy_candidate_min_gap_minutes,
+        max_buy_candidate_snapshots_per_session=max_buy_candidate_snapshots_per_session,
+    )
+    write_json(DECISION_SNAPSHOT_DIR / "latest_meta_strategy_backfill.json", result)
+    return result
+
+
+@app.post("/api/meta-strategy/train-baselines")
+async def train_meta_strategy_baselines_endpoint(payload: dict | None = Body(None)) -> dict:
+    request = payload or {}
+    symbol = str(request.get("symbol") or "SPY").upper()
+    session_date = str(request.get("sessionDate") or "").strip()[:10] or None
+    if session_date:
+        market_status = await safe_market_status()
+    else:
+        market_status = {"isOpen": False}
+    if session_date and market_status.get("isOpen"):
+        eastern_now = datetime.now(UTC).astimezone(eastern_tz_for_date(datetime.now(UTC).year, datetime.now(UTC).month, datetime.now(UTC).day))
+        if end_of_day_refresh_target_date(market_status, eastern_now) != session_date:
+            raise HTTPException(status_code=409, detail="Meta-strategy training uses only closed-session labels")
+    return run_meta_strategy_training(
+        symbol=symbol,
+        session_date=session_date,
+        min_rows=int(request.get("minRows") or 30),
+    )
+
+
+@app.get("/api/meta-strategy/training-status")
+async def meta_strategy_training_status_endpoint() -> dict:
+    latest_path = DECISION_SNAPSHOT_DIR / "latest_meta_strategy_training.json"
+    if not latest_path.exists():
+        return {
+            "status": "not_trained",
+            "trusted": False,
+            "message": "No Meta-Strategy training artifact has been created yet.",
+            "latestPath": str(latest_path),
+        }
+    try:
+        result = json.loads(latest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"Meta-Strategy training artifact is not valid JSON: {exc}") from exc
+    return {
+        **compact_meta_strategy_training_status(result),
+        "trainedAt": result.get("trainedAt"),
+        "symbol": result.get("symbol"),
+        "sessionDate": result.get("sessionDate"),
+        "labelCounts": result.get("labelCounts"),
+        "trainingLabelCounts": result.get("trainingLabelCounts"),
+        "validationLabelCounts": result.get("validationLabelCounts"),
+        "labelPolicy": result.get("labelPolicy"),
+        "metrics": result.get("metrics"),
+    }
+
+
+def label_decision_snapshots_for_session(*, symbol: str, feed: str, session_date: str) -> dict:
+    normalized_symbol = symbol.upper()
+    snapshot_path = decision_snapshot_jsonl_path(symbol=normalized_symbol, session_date=session_date)
+    if not snapshot_path.exists():
+        return {
+            "status": "no_snapshots",
+            "symbol": normalized_symbol,
+            "sessionDate": session_date,
+            "message": "No decision snapshots were recorded for this session.",
+            "rows": 0,
+        }
+
+    records = read_decision_snapshot_records(snapshot_path)
+    candles = decision_label_candles(symbol=normalized_symbol, feed=feed, session_date=session_date)
+    labeled_rows = [
+        labeled_decision_snapshot(record, candles)
+        for record in records
+    ]
+    labeled_rows = [row for row in labeled_rows if row is not None]
+    output_path = decision_label_jsonl_path(symbol=normalized_symbol, session_date=session_date)
+    write_jsonl(output_path, labeled_rows)
+    latest_path = DECISION_SNAPSHOT_DIR / "latest_labels.json"
+    summary = {
+        "status": "ready",
+        "symbol": normalized_symbol,
+        "sessionDate": session_date,
+        "rows": len(labeled_rows),
+        "labelCounts": {
+            "BUY": sum(1 for row in labeled_rows if row["label"] == "BUY"),
+            "SELL": sum(1 for row in labeled_rows if row["label"] == "SELL"),
+            "HOLD": sum(1 for row in labeled_rows if row["label"] == "HOLD"),
+        },
+        "trainingLabelCounts": {
+            "BUY": sum(1 for row in labeled_rows if row.get("trainingLabel") == "BUY"),
+            "SELL": sum(1 for row in labeled_rows if row.get("trainingLabel") == "SELL"),
+            "HOLD": sum(1 for row in labeled_rows if row.get("trainingLabel") == "HOLD"),
+        },
+        "path": str(output_path),
+        "latestPath": str(latest_path),
+        "labeledAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "policy": "Strict validation label plus ATR-friendly training label; labels are generated only after the session closes.",
+    }
+    summary["trainingStatus"] = compact_meta_strategy_training_status(
+        run_meta_strategy_training(
+            symbol=normalized_symbol,
+            session_date=None,
+            min_rows=30,
+        )
+    )
+    write_json(latest_path, summary)
+    return summary
+
+
+def compact_meta_strategy_training_status(result: dict) -> dict:
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    trusted = metrics.get("trusted")
+    if trusted is None:
+        trusted = result.get("trusted")
+    return {
+        "status": result.get("status"),
+        "rows": result.get("rows"),
+        "trainRows": result.get("trainRows"),
+        "testRows": result.get("testRows"),
+        "featureCount": result.get("featureCount"),
+        "artifactPath": result.get("artifactPath"),
+        "latestPath": result.get("latestPath"),
+        "bestModel": metrics.get("bestModel"),
+        "trusted": bool(trusted),
+        "bestBaselineMacroF1": metrics.get("bestBaselineMacroF1"),
+        "message": result.get("message"),
+    }
+
+
+def run_meta_strategy_training(*, symbol: str, session_date: str | None, min_rows: int) -> dict:
+    from . import meta_strategy_training
+
+    reloaded = importlib.reload(meta_strategy_training)
+    result = reloaded.train_meta_strategy_baselines(
+        decision_snapshot_dir=DECISION_SNAPSHOT_DIR,
+        symbol=symbol,
+        session_date=session_date,
+        min_rows=min_rows,
+    )
+    return {
+        **result,
+        "trainerSourcePath": str(Path(reloaded.__file__).resolve()),
+        "trainerVersion": "directional_trust_v2",
+    }
+
+
+def backfill_meta_strategy_decision_snapshots(
+    *,
+    symbol: str,
+    feed: str,
+    start_date: str | None,
+    end_date: str,
+    session_limit: int,
+    interval_minutes: int,
+    warmup_minutes: int,
+    max_snapshots: int,
+    overwrite_existing_dates: bool,
+    buy_candidate_sampler: bool = True,
+    buy_candidate_min_score: float = 0.25,
+    buy_candidate_scan_minutes: int = 3,
+    buy_candidate_min_gap_minutes: int = 3,
+    max_buy_candidate_snapshots_per_session: int = 30,
+) -> dict:
+    normalized_symbol = symbol.upper()
+    interval_minutes = max(1, min(interval_minutes, 60))
+    warmup_minutes = max(60, min(warmup_minutes, 390))
+    max_snapshots = max(1, min(max_snapshots, 10000))
+    buy_candidate_min_score = max(0.01, min(float(buy_candidate_min_score), 1.0))
+    buy_candidate_scan_minutes = max(1, min(int(buy_candidate_scan_minutes), interval_minutes))
+    buy_candidate_min_gap_minutes = max(1, min(int(buy_candidate_min_gap_minutes), 60))
+    max_buy_candidate_snapshots_per_session = max(0, min(int(max_buy_candidate_snapshots_per_session), 390))
+    historical = historical_meta_strategy_candles(
+        symbol=normalized_symbol,
+        feed=feed,
+        start_date=start_date,
+        end_date=end_date,
+        session_limit=max(1, min(session_limit, 252)),
+    )
+    session_summaries = []
+    written_sessions = []
+    total_written = 0
+    for session_date, session_candles in historical["sessions"].items():
+        if total_written >= max_snapshots:
+            break
+        snapshot_path = decision_snapshot_jsonl_path(symbol=normalized_symbol, session_date=session_date)
+        if snapshot_path.exists() and not overwrite_existing_dates:
+            session_summaries.append({
+                "sessionDate": session_date,
+                "status": "skipped_existing",
+                "path": str(snapshot_path),
+                "message": "Existing decision snapshots preserved; set overwriteExistingDates=true to replace this session.",
+            })
+            continue
+        records = historical_meta_strategy_records_for_session(
+            symbol=normalized_symbol,
+            session_date=session_date,
+            candles=session_candles,
+            interval_minutes=interval_minutes,
+            warmup_minutes=warmup_minutes,
+            max_records=max_snapshots - total_written,
+            buy_candidate_sampler=buy_candidate_sampler,
+            buy_candidate_min_score=buy_candidate_min_score,
+            buy_candidate_scan_minutes=buy_candidate_scan_minutes,
+            buy_candidate_min_gap_minutes=buy_candidate_min_gap_minutes,
+            max_buy_candidate_snapshots=max_buy_candidate_snapshots_per_session,
+        )
+        if not records:
+            session_summaries.append({
+                "sessionDate": session_date,
+                "status": "no_records",
+                "message": "Not enough candles to create historical Meta-Strategy snapshots.",
+            })
+            continue
+        write_jsonl(snapshot_path, records)
+        write_json(DECISION_SNAPSHOT_DIR / "latest.json", records[-1])
+        total_written += len(records)
+        label_result = label_decision_snapshots_for_session(symbol=normalized_symbol, feed=feed, session_date=session_date)
+        written_sessions.append(session_date)
+        session_summaries.append({
+            "sessionDate": session_date,
+            "status": "ready",
+            "snapshots": len(records),
+            "buyCandidateSnapshots": sum(1 for record in records if ((record.get("snapshot") or {}).get("backfillReason") or {}).get("type") == "buy_candidate_sampler"),
+            "path": str(snapshot_path),
+            "labelCounts": label_result.get("labelCounts"),
+            "labelPath": label_result.get("path"),
+        })
+    training = run_meta_strategy_training(
+        symbol=normalized_symbol,
+        session_date=None,
+        min_rows=30,
+    )
+    return {
+        "status": "ready",
+        "symbol": normalized_symbol,
+        "feed": feed,
+        "source": historical["source"],
+        "startDate": historical["startDate"],
+        "endDate": historical["endDate"],
+        "requestedSessionLimit": session_limit,
+        "intervalMinutes": interval_minutes,
+        "warmupMinutes": warmup_minutes,
+        "buyCandidateSampler": buy_candidate_sampler,
+        "buyCandidateMinScore": buy_candidate_min_score,
+        "buyCandidateScanMinutes": buy_candidate_scan_minutes,
+        "buyCandidateMinGapMinutes": buy_candidate_min_gap_minutes,
+        "maxBuyCandidateSnapshotsPerSession": max_buy_candidate_snapshots_per_session,
+        "overwriteExistingDates": overwrite_existing_dates,
+        "sessionsWritten": len(written_sessions),
+        "snapshotsWritten": total_written,
+        "sessions": session_summaries,
+        "trainingStatus": compact_meta_strategy_training_status(training),
+        "trainingPath": training.get("latestPath"),
+        "generatedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def historical_meta_strategy_candles(*, symbol: str, feed: str, start_date: str | None, end_date: str, session_limit: int) -> dict:
+    manifest = best_backtest_manifest_or_none(symbol) or latest_backtest_manifest_or_none(symbol)
+    candles: list[dict] = []
+    source = "store"
+    if manifest:
+        path = Path(str((manifest.get("files") or {}).get("continuous1mJsonl") or ""))
+        if path.exists():
+            candles = read_jsonl(path)
+            source = str(path)
+    if not candles:
+        search_start = start_date or (datetime.fromisoformat(end_date).date() - timedelta(days=max(session_limit * 3, 30))).isoformat()
+        start, _ = session_date_window_utc(search_start)
+        _, end = session_date_window_utc(end_date)
+        candles = store.range(symbol=symbol, timeframe="1Min", feed=feed, start=start, end=end)
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for candle in candles:
+        if str(candle.get("symbol") or symbol).upper() != symbol:
+            continue
+        session_date = candle_session_date(candle)
+        if start_date and session_date < start_date:
+            continue
+        if session_date > end_date:
+            continue
+        grouped[session_date].append(candle)
+    selected_dates = sorted(grouped)[-session_limit:]
+    return {
+        "source": source,
+        "startDate": selected_dates[0] if selected_dates else start_date,
+        "endDate": selected_dates[-1] if selected_dates else end_date,
+        "sessions": {
+            session_date: sorted(grouped[session_date], key=lambda candle: str(candle.get("timestamp") or ""))
+            for session_date in selected_dates
+        },
+    }
+
+
+def historical_meta_strategy_records_for_session(
+    *,
+    symbol: str,
+    session_date: str,
+    candles: list[dict],
+    interval_minutes: int,
+    warmup_minutes: int,
+    max_records: int,
+    buy_candidate_sampler: bool,
+    buy_candidate_min_score: float,
+    buy_candidate_scan_minutes: int,
+    buy_candidate_min_gap_minutes: int,
+    max_buy_candidate_snapshots: int,
+) -> list[dict]:
+    normalized = sorted(candles, key=lambda candle: str(candle.get("timestamp") or ""))
+    records = []
+    emitted_timestamps: set[str] = set()
+    last_regular_emitted: datetime | None = None
+    last_buy_candidate_emitted: datetime | None = None
+    last_buy_candidate_scan: datetime | None = None
+    buy_candidate_count = 0
+    max_horizon = max(META_LABEL_FAMILY_HORIZONS.values())
+    for index, candle in enumerate(normalized):
+        if len(records) >= max_records:
+            break
+        if index < warmup_minutes:
+            continue
+        timestamp = parse_market_datetime(str(candle.get("timestamp") or ""))
+        if timestamp is None:
+            continue
+        timestamp_key = str(candle.get("timestamp") or "")
+        regular_due = last_regular_emitted is None or timestamp >= last_regular_emitted + timedelta(minutes=interval_minutes)
+        sampler_scan_due = (
+            buy_candidate_sampler
+            and buy_candidate_count < max_buy_candidate_snapshots
+            and (last_buy_candidate_scan is None or timestamp >= last_buy_candidate_scan + timedelta(minutes=buy_candidate_scan_minutes))
+        )
+        if not regular_due and not sampler_scan_due:
+            continue
+        if not any(
+            (future_timestamp := parse_market_datetime(str(future.get("timestamp") or ""))) is not None
+            and timestamp < future_timestamp <= timestamp + timedelta(minutes=max_horizon)
+            for future in normalized[index + 1:]
+        ):
+            continue
+        if sampler_scan_due:
+            last_buy_candidate_scan = timestamp
+        forecast = market_forecast_prediction(normalized[: index + 1], microstructure_rows=[])
+        if forecast.get("status") == "insufficient_data":
+            continue
+        buy_candidate = buy_candidate_snapshot_reason(forecast, min_score=buy_candidate_min_score)
+        buy_candidate_due = (
+            bool(buy_candidate)
+            and buy_candidate_count < max_buy_candidate_snapshots
+            and (last_buy_candidate_emitted is None or timestamp >= last_buy_candidate_emitted + timedelta(minutes=buy_candidate_min_gap_minutes))
+        )
+        if not regular_due and not buy_candidate_due:
+            continue
+        if timestamp_key in emitted_timestamps:
+            continue
+        backfill_reason = (
+            {
+                "type": "buy_candidate_sampler",
+                **buy_candidate,
+                "minScore": buy_candidate_min_score,
+            }
+            if buy_candidate_due and not regular_due
+            else {"type": "regular_interval", "intervalMinutes": interval_minutes}
+        )
+        snapshot = historical_meta_strategy_snapshot(symbol=symbol, session_date=session_date, candles=normalized[: index + 1], forecast=forecast, backfill_reason=backfill_reason)
+        records.append({
+            "version": 1,
+            "savedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "snapshot": snapshot,
+        })
+        emitted_timestamps.add(timestamp_key)
+        if backfill_reason["type"] == "buy_candidate_sampler":
+            buy_candidate_count += 1
+            last_buy_candidate_emitted = timestamp
+        if regular_due:
+            last_regular_emitted = timestamp
+    return records
+
+
+def buy_candidate_snapshot_reason(forecast: dict, *, min_score: float) -> dict | None:
+    family_scores = normalized_family_aggregation(((forecast.get("algorithmSignals") or {}).get("familyScores") or {}))
+    weighted_scores = ((forecast.get("algorithmSignals") or {}).get("weightedScores") or {})
+    buy_scores = {
+        "trend_buy_score": float(family_scores.get("trend_buy_score") or 0.0),
+        "breakout_buy_score": float(family_scores.get("breakout_buy_score") or 0.0),
+        "mean_reversion_buy_score": float(family_scores.get("mean_reversion_buy_score") or 0.0),
+        "reversal_buy_score": float(family_scores.get("reversal_buy_score") or 0.0),
+        "weighted_buy_score": parse_float_value(weighted_scores.get("buy")) or 0.0,
+    }
+    sell_pressure = max(
+        float(family_scores.get("trend_sell_score") or 0.0),
+        float(family_scores.get("breakout_sell_score") or 0.0),
+        float(family_scores.get("mean_reversion_sell_score") or 0.0),
+        float(family_scores.get("reversal_sell_score") or 0.0),
+        parse_float_value(weighted_scores.get("sell")) or 0.0,
+    )
+    strongest_name, strongest_score = max(buy_scores.items(), key=lambda item: item[1])
+    weighted_buy = parse_float_value(weighted_scores.get("buy")) or 0.0
+    weighted_sell = parse_float_value(weighted_scores.get("sell")) or 0.0
+    family_buy_total = round(
+        float(family_scores.get("trend_buy_score") or 0.0)
+        + float(family_scores.get("breakout_buy_score") or 0.0)
+        + float(family_scores.get("mean_reversion_buy_score") or 0.0)
+        + float(family_scores.get("reversal_buy_score") or 0.0),
+        4,
+    )
+    family_sell_total = round(
+        float(family_scores.get("trend_sell_score") or 0.0)
+        + float(family_scores.get("breakout_sell_score") or 0.0)
+        + float(family_scores.get("mean_reversion_sell_score") or 0.0)
+        + float(family_scores.get("reversal_sell_score") or 0.0),
+        4,
+    )
+    if strongest_score < min_score and not (weighted_buy > weighted_sell and weighted_buy >= min_score * 0.8):
+        return None
+    if family_buy_total <= family_sell_total:
+        return None
+    if sell_pressure > strongest_score and weighted_sell >= weighted_buy:
+        return None
+    return {
+        "strongestBuyFeature": strongest_name,
+        "strongestBuyScore": round(strongest_score, 4),
+        "familyBuyTotal": family_buy_total,
+        "familySellTotal": family_sell_total,
+        "weightedBuyScore": round(weighted_buy, 4),
+        "weightedSellScore": round(weighted_sell, 4),
+        "sellPressure": round(sell_pressure, 4),
+    }
+
+
+def historical_meta_strategy_snapshot(*, symbol: str, session_date: str, candles: list[dict], forecast: dict, backfill_reason: dict | None = None) -> dict:
+    latest = candles[-1]
+    latest_close = float(latest["close"])
+    barriers = forecast.get("barriers") or {}
+    target_distance = parse_float_value(barriers.get("targetDistance")) or max(latest_close * 0.003, 0.25)
+    stop_distance = parse_float_value(barriers.get("stopDistance")) or max(latest_close * 0.002, 0.25)
+    decision = forecast.get("decision") or {}
+    candidate = str(decision.get("action") or decision.get("candidateAction") or "no_trade").lower()
+    meta_signal = "Buy" if candidate == "buy" else "Sell" if candidate == "sell" else "Hold"
+    family_aggregation = normalized_family_aggregation(((forecast.get("algorithmSignals") or {}).get("familyScores") or {}))
+    meta_family_scores = meta_family_scores_from_aggregation(family_aggregation)
+    weighted_scores = ((forecast.get("algorithmSignals") or {}).get("weightedScores") or {})
+    weighted_signal = weighted_signal_from_scores(weighted_scores)
+    net_score = round(
+        float(family_aggregation.get("trend_buy_score", 0))
+        + float(family_aggregation.get("breakout_buy_score", 0))
+        + float(family_aggregation.get("mean_reversion_buy_score", 0))
+        + float(family_aggregation.get("reversal_buy_score", 0))
+        - float(family_aggregation.get("trend_sell_score", 0))
+        - float(family_aggregation.get("breakout_sell_score", 0))
+        - float(family_aggregation.get("mean_reversion_sell_score", 0))
+        - float(family_aggregation.get("reversal_sell_score", 0)),
+        4,
+    )
+    return {
+        "capturedAt": str(latest.get("timestamp")),
+        "sessionDate": session_date,
+        "symbol": symbol,
+        "timeframe": "1Min",
+        "source": "historical_meta_strategy_backfill",
+        "backfillReason": backfill_reason or {"type": "regular_interval"},
+        "candles": {"session": candles[-120:]},
+        "indicators": {
+            "latest": latest,
+            "atr": {"stopDistance": round(stop_distance, 4), "targetDistance": round(target_distance, 4)},
+        },
+        "finalDecision": {
+            "activeMode": "meta",
+            "activeAlgorithmLabel": "Meta-Strategy",
+            "activeTargetOrder": historical_meta_target_order(symbol=symbol, latest_close=latest_close, side=meta_signal, target_distance=target_distance, stop_distance=stop_distance, eligible=meta_signal != "Hold"),
+            "voting": {"signal": weighted_signal, "scores": {"Buy": weighted_scores.get("buy"), "Sell": weighted_scores.get("sell"), "Hold": weighted_scores.get("hold")}},
+            "weighted": {
+                "signal": weighted_signal,
+                "buyScore": weighted_scores.get("buy"),
+                "sellScore": weighted_scores.get("sell"),
+                "holdScore": weighted_scores.get("hold"),
+                "margin": weighted_scores.get("winnerMargin"),
+            },
+            "confidence": {"signal": meta_signal, "decisionLabel": meta_signal, "normalizedNetScore": net_score},
+            "regime": {
+                "signal": meta_signal,
+                "aggregateSignal": meta_signal.lower(),
+                "confidence": decision.get("confidence"),
+                "scoreEdge": decision.get("edgeGap"),
+            },
+            "meta": {"signal": meta_signal, "decisionLabel": meta_signal, "netScore": net_score, "edge": abs(net_score)},
+        },
+        "familyScores": {"meta": family_aggregation, "forecast": family_aggregation},
+        "metaModelFeatures": {
+            "familyAggregation": family_aggregation,
+            "familyScores": meta_family_scores,
+            "contextMultiplier": 1,
+            "activeDirectionalCount": active_meta_family_count(meta_family_scores),
+            "safetyGates": [],
+            "forecastFeatures": forecast.get("features") or {},
+        },
+        "paperTradeResult": {"historicalBackfill": {"status": "synthetic_snapshot", "forecastStatus": forecast.get("status")}},
+    }
+
+
+def historical_meta_target_order(*, symbol: str, latest_close: float, side: str, target_distance: float, stop_distance: float, eligible: bool) -> dict:
+    if side == "Sell":
+        target_price = latest_close - target_distance
+        stop_price = latest_close + stop_distance
+    else:
+        target_price = latest_close + target_distance
+        stop_price = latest_close - stop_distance
+    return {
+        "eligible": eligible,
+        "side": side,
+        "orderType": f"{side} historical setup" if eligible else "No order",
+        "symbol": symbol,
+        "quantity": 0,
+        "triggerPrice": round(latest_close, 4),
+        "limitPrice": round(latest_close, 4),
+        "stopPrice": round(stop_price, 4),
+        "targetPrice": round(target_price, 4),
+        "orderLimitDollars": 0,
+        "dailyLimitDollars": 0,
+        "riskDollars": 0,
+        "orderNotional": 0,
+        "plannedStopRiskDollars": 0,
+        "estimatedSlippage": 0,
+        "submitMode": "Historical backfill",
+        "failedGates": [] if eligible else ["Historical Meta-Strategy signal is Hold"],
+        "summary": "Historical Meta-Strategy backfill target order.",
+    }
+
+
+def normalized_family_aggregation(source: dict) -> dict:
+    keys = [
+        "trend_buy_score",
+        "trend_sell_score",
+        "breakout_buy_score",
+        "breakout_sell_score",
+        "mean_reversion_buy_score",
+        "mean_reversion_sell_score",
+        "reversal_buy_score",
+        "reversal_sell_score",
+        "confirmation_score",
+        "regime_score",
+    ]
+    return {key: round(parse_float_value(source.get(key)) or 0.0, 4) for key in keys}
+
+
+def meta_family_scores_from_aggregation(family_aggregation: dict) -> dict:
+    return {
+        "trend": {"buy": family_aggregation["trend_buy_score"], "sell": family_aggregation["trend_sell_score"], "hold": 0, "capped": False},
+        "breakout": {"buy": family_aggregation["breakout_buy_score"], "sell": family_aggregation["breakout_sell_score"], "hold": 0, "capped": False},
+        "mean_reversion": {"buy": family_aggregation["mean_reversion_buy_score"], "sell": family_aggregation["mean_reversion_sell_score"], "hold": 0, "capped": False},
+        "reversal": {"buy": family_aggregation["reversal_buy_score"], "sell": family_aggregation["reversal_sell_score"], "hold": 0, "capped": False},
+        "volume_confirmation": {"buy": 0, "sell": 0, "hold": 0, "capped": False},
+        "market_regime": {"buy": 0, "sell": 0, "hold": 0, "capped": False},
+        "vwap": {"buy": 0, "sell": 0, "hold": 0, "capped": False},
+        "event": {"buy": 0, "sell": 0, "hold": 0, "capped": False},
+        "safety": {"buy": 0, "sell": 0, "hold": 0, "capped": False},
+    }
+
+
+def active_meta_family_count(family_scores: dict) -> int:
+    return sum(1 for score in family_scores.values() if isinstance(score, dict) and (float(score.get("buy") or 0) > 0.01 or float(score.get("sell") or 0) > 0.01))
+
+
+def weighted_signal_from_scores(scores: dict) -> str:
+    buy = parse_float_value(scores.get("buy")) or 0.0
+    sell = parse_float_value(scores.get("sell")) or 0.0
+    hold = parse_float_value(scores.get("hold")) or 0.0
+    if buy >= sell and buy >= hold and buy > 0:
+        return "Buy"
+    if sell >= buy and sell >= hold and sell > 0:
+        return "Sell"
+    return "Hold"
+
+
+def decision_snapshot_jsonl_path(*, symbol: str, session_date: str) -> Path:
+    safe_session = re.sub(r"[^0-9A-Za-z_-]+", "-", session_date).strip("-") or "unknown"
+    safe_symbol = re.sub(r"[^0-9A-Za-z_-]+", "-", symbol.upper()).strip("-") or "UNKNOWN"
+    return DECISION_SNAPSHOT_DIR / safe_session / f"{safe_symbol}_decision_snapshots.jsonl"
+
+
+def decision_label_jsonl_path(*, symbol: str, session_date: str) -> Path:
+    safe_session = re.sub(r"[^0-9A-Za-z_-]+", "-", session_date).strip("-") or "unknown"
+    safe_symbol = re.sub(r"[^0-9A-Za-z_-]+", "-", symbol.upper()).strip("-") or "UNKNOWN"
+    return DECISION_SNAPSHOT_DIR / safe_session / f"{safe_symbol}_decision_labels.jsonl"
+
+
+def read_decision_snapshot_records(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            snapshot = record.get("snapshot") if isinstance(record, dict) else None
+            if isinstance(snapshot, dict):
+                rows.append(record)
+    return rows
+
+
+def decision_label_candles(*, symbol: str, feed: str, session_date: str) -> list[dict]:
+    start, end = session_date_window_utc(session_date)
+    candles = store.range(symbol=symbol, timeframe="1Min", feed=feed, start=start, end=end)
+    if candles:
+        return sorted(candles, key=lambda candle: candle["timestamp"])
+    manifest = latest_backtest_manifest_or_none(symbol)
+    if not manifest:
+        return []
+    path = Path(str((manifest.get("files") or {}).get("continuous1mJsonl") or ""))
+    if not path.exists():
+        return []
+    return [
+        candle
+        for candle in read_jsonl(path)
+        if candle_session_date(candle) == session_date
+    ]
+
+
+META_LABEL_FAMILY_HORIZONS = {
+    "breakout": 5,
+    "vwap": 10,
+    "reversal": 10,
+    "mean_reversion": 15,
+    "trend": 20,
+    "event": 20,
+}
+DEFAULT_META_LABEL_HORIZON_MINUTES = 5
+
+
+def labeled_decision_snapshot(record: dict, candles: list[dict]) -> dict | None:
+    snapshot = record.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    entry = snapshot_entry(snapshot)
+    if not entry:
+        return None
+    entry_time = parse_market_datetime(str(entry.get("timestamp") or ""))
+    if entry_time is None:
+        return None
+    horizon = snapshot_label_horizon(snapshot)
+    future = [
+        candle for candle in candles
+        if (parsed := parse_market_datetime(str(candle.get("timestamp") or ""))) is not None
+        and entry_time < parsed <= entry_time + timedelta(minutes=int(horizon["minutes"]))
+    ]
+    stop_distance, target_distance = snapshot_barrier_distances(snapshot, float(entry["close"]))
+    outcome = horizon_barrier_label(
+        entry_price=float(entry["close"]),
+        future_candles=future,
+        stop_distance=stop_distance,
+        target_distance=target_distance,
+        horizon_minutes=int(horizon["minutes"]),
+    )
+    training_atr = snapshot_training_atr(snapshot, float(entry["close"]), stop_distance)
+    training_outcome = atr_friendly_training_label(
+        entry_price=float(entry["close"]),
+        future_candles=future,
+        atr_value=training_atr,
+        horizon_minutes=int(horizon["minutes"]),
+    )
+    return {
+        "version": 1,
+        "snapshotId": snapshot_identifier(snapshot),
+        "capturedAt": snapshot.get("capturedAt"),
+        "sessionDate": snapshot.get("sessionDate"),
+        "symbol": snapshot.get("symbol"),
+        "entry": entry,
+        "horizonMinutes": int(horizon["minutes"]),
+        "horizonMode": "family_aware",
+        "horizonFamily": horizon["primaryFamily"],
+        "horizonFamilies": horizon["families"],
+        "horizonReason": horizon["reason"],
+        "barriers": {
+            "stopDistance": round(stop_distance, 4),
+            "targetDistance": round(target_distance, 4),
+        },
+        "label": outcome["label"],
+        "validationLabel": outcome["label"],
+        "labelReason": outcome["reason"],
+        "longOutcome": outcome["longOutcome"],
+        "shortOutcome": outcome["shortOutcome"],
+        "trainingLabel": training_outcome["label"],
+        "trainingLabelMode": "atr_friendly",
+        "trainingLabelReason": training_outcome["reason"],
+        "trainingAtr": round(training_atr, 4),
+        "trainingBarriers": training_outcome["barriers"],
+        "trainingLongOutcome": training_outcome["longOutcome"],
+        "trainingShortOutcome": training_outcome["shortOutcome"],
+        "futureCandleCount": len(future),
+        "futureEndAt": future[-1]["timestamp"] if future else None,
+        "finalDecision": snapshot.get("finalDecision"),
+        "strategyOutputs": snapshot.get("strategyOutputs"),
+        "familyScores": snapshot.get("familyScores"),
+        "metaModelFeatures": snapshot.get("metaModelFeatures"),
+        "paperTradeResult": snapshot.get("paperTradeResult"),
+        "labeledAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def snapshot_label_horizon(snapshot: dict) -> dict:
+    side = snapshot_label_side(snapshot)
+    family_scores = (((snapshot.get("metaModelFeatures") or {}).get("familyScores") or {}))
+    candidates = []
+    if isinstance(family_scores, dict):
+        for family, minutes in META_LABEL_FAMILY_HORIZONS.items():
+            score = family_scores.get(family)
+            if not isinstance(score, dict):
+                continue
+            buy_score = parse_float_value(score.get("buy")) or 0.0
+            sell_score = parse_float_value(score.get("sell")) or 0.0
+            directional_score = buy_score if side == "buy" else sell_score if side == "sell" else max(buy_score, sell_score)
+            if directional_score > 0.01:
+                candidates.append({
+                    "family": family,
+                    "score": round(directional_score, 4),
+                    "horizonMinutes": minutes,
+                })
+    if not candidates:
+        return {
+            "minutes": DEFAULT_META_LABEL_HORIZON_MINUTES,
+            "primaryFamily": "default",
+            "families": [],
+            "reason": f"No active directional family found; using {DEFAULT_META_LABEL_HORIZON_MINUTES} minute default horizon.",
+        }
+    max_minutes = max(int(candidate["horizonMinutes"]) for candidate in candidates)
+    primary = max(candidates, key=lambda candidate: (float(candidate["score"]), int(candidate["horizonMinutes"])))
+    active_names = ", ".join(candidate["family"] for candidate in candidates if int(candidate["horizonMinutes"]) == max_minutes)
+    return {
+        "minutes": max_minutes,
+        "primaryFamily": primary["family"],
+        "families": candidates,
+        "reason": f"Family-aware horizon uses {max_minutes} minutes for active {active_names} directional context.",
+    }
+
+
+def snapshot_label_side(snapshot: dict) -> str | None:
+    meta_signal = str((((snapshot.get("finalDecision") or {}).get("meta") or {}).get("signal") or "")).lower()
+    if meta_signal == "buy":
+        return "buy"
+    if meta_signal == "sell":
+        return "sell"
+    active_side = str(((snapshot.get("finalDecision") or {}).get("activeTargetOrder") or {}).get("side") or "").lower()
+    if active_side.startswith("buy"):
+        return "buy"
+    if active_side.startswith("sell"):
+        return "sell"
+    return None
+
+
+def snapshot_identifier(snapshot: dict) -> str:
+    parts = [
+        str(snapshot.get("symbol") or ""),
+        str(snapshot.get("timeframe") or ""),
+        str(snapshot.get("capturedAt") or ""),
+        str(((snapshot.get("indicators") or {}).get("latest") or {}).get("timestamp") or ""),
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def snapshot_entry(snapshot: dict) -> dict | None:
+    latest = (snapshot.get("indicators") or {}).get("latest")
+    if isinstance(latest, dict) and latest.get("timestamp") and latest.get("close") is not None:
+        return {
+            "timestamp": latest["timestamp"],
+            "open": latest.get("open"),
+            "high": latest.get("high"),
+            "low": latest.get("low"),
+            "close": float(latest["close"]),
+        }
+    for group in ["weightedOneMinute", "session", "chart"]:
+        candles = (snapshot.get("candles") or {}).get(group)
+        if isinstance(candles, list) and candles:
+            candle = candles[-1]
+            if isinstance(candle, dict) and candle.get("timestamp") and candle.get("close") is not None:
+                return {
+                    "timestamp": candle["timestamp"],
+                    "open": candle.get("open"),
+                    "high": candle.get("high"),
+                    "low": candle.get("low"),
+                    "close": float(candle["close"]),
+                }
+    return None
+
+
+def snapshot_barrier_distances(snapshot: dict, entry_price: float) -> tuple[float, float]:
+    active_order = (snapshot.get("finalDecision") or {}).get("activeTargetOrder") or {}
+    stop_price = parse_float_value(active_order.get("stopPrice"))
+    target_price = parse_float_value(active_order.get("targetPrice"))
+    stop_distance = abs(entry_price - stop_price) if stop_price is not None else None
+    target_distance = abs(target_price - entry_price) if target_price is not None else None
+
+    atr = ((snapshot.get("indicators") or {}).get("atr") or {})
+    atr_stop = parse_float_value(atr.get("stopDistance")) if isinstance(atr, dict) else None
+    if stop_distance is None or stop_distance <= 0:
+        stop_distance = atr_stop if atr_stop and atr_stop > 0 else max(entry_price * 0.0035, 0.25)
+    if target_distance is None or target_distance <= 0:
+        target_distance = stop_distance * 1.5
+    return max(stop_distance, 0.01), max(target_distance, 0.01)
+
+
+def snapshot_training_atr(snapshot: dict, entry_price: float, fallback_distance: float) -> float:
+    atr = ((snapshot.get("indicators") or {}).get("atr") or {})
+    if isinstance(atr, dict):
+        for key in ["atr", "atrValue", "atr_1m", "averageTrueRange"]:
+            value = parse_float_value(atr.get(key))
+            if value and value > 0:
+                return value
+    volatility = (((snapshot.get("metaModelFeatures") or {}).get("forecastFeatures") or {}).get("volatility") or {})
+    if isinstance(volatility, dict):
+        value = parse_float_value(volatility.get("atr_1m"))
+        if value and value > 0:
+            return value
+    return max(float(fallback_distance or 0), entry_price * 0.0015, 0.05)
+
+
+def parse_float_value(value: object) -> float | None:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None
+
+
+def horizon_barrier_label(*, entry_price: float, future_candles: list[dict], stop_distance: float, target_distance: float, horizon_minutes: int) -> dict:
+    if not future_candles:
+        return {
+            "label": "HOLD",
+            "reason": "No future candles are available after this snapshot",
+            "longOutcome": "unknown",
+            "shortOutcome": "unknown",
+        }
+    long_target = entry_price + target_distance
+    long_stop = entry_price - stop_distance
+    short_target = entry_price - target_distance
+    short_stop = entry_price + stop_distance
+    long_outcome = barrier_outcome(future_candles, target=lambda candle: float(candle["high"]) >= long_target, stop=lambda candle: float(candle["low"]) <= long_stop)
+    short_outcome = barrier_outcome(future_candles, target=lambda candle: float(candle["low"]) <= short_target, stop=lambda candle: float(candle["high"]) >= short_stop)
+    if long_outcome["result"] == "target" and short_outcome["result"] != "target":
+        return {"label": "BUY", "reason": f"Long profit target hit first within {horizon_minutes} minutes", "longOutcome": long_outcome, "shortOutcome": short_outcome}
+    if short_outcome["result"] == "target" and long_outcome["result"] != "target":
+        return {"label": "SELL", "reason": f"Short profit target hit first within {horizon_minutes} minutes", "longOutcome": long_outcome, "shortOutcome": short_outcome}
+    return {"label": "HOLD", "reason": f"No clean {horizon_minutes}-minute target-before-stop edge", "longOutcome": long_outcome, "shortOutcome": short_outcome}
+
+
+def atr_friendly_training_label(*, entry_price: float, future_candles: list[dict], atr_value: float, horizon_minutes: int) -> dict:
+    atr_value = max(float(atr_value or 0), 0.01)
+    target_distance = atr_value * 0.25
+    stop_distance = atr_value * 0.15
+    if not future_candles:
+        return {
+            "label": "HOLD",
+            "reason": "No future candles are available after this snapshot",
+            "barriers": {
+                "atr": round(atr_value, 4),
+                "targetDistance": round(target_distance, 4),
+                "stopDistance": round(stop_distance, 4),
+            },
+            "longOutcome": "unknown",
+            "shortOutcome": "unknown",
+        }
+    long_target = entry_price + target_distance
+    long_stop = entry_price - stop_distance
+    short_target = entry_price - target_distance
+    short_stop = entry_price + stop_distance
+    long_outcome = barrier_outcome(future_candles, target=lambda candle: float(candle["high"]) >= long_target, stop=lambda candle: float(candle["low"]) <= long_stop)
+    short_outcome = barrier_outcome(future_candles, target=lambda candle: float(candle["low"]) <= short_target, stop=lambda candle: float(candle["high"]) >= short_stop)
+    barriers = {
+        "atr": round(atr_value, 4),
+        "targetDistance": round(target_distance, 4),
+        "stopDistance": round(stop_distance, 4),
+        "buyTrigger": round(long_target, 4),
+        "buyAdverse": round(long_stop, 4),
+        "sellTrigger": round(short_target, 4),
+        "sellAdverse": round(short_stop, 4),
+    }
+    long_target_first = long_outcome["result"] == "target"
+    short_target_first = short_outcome["result"] == "target"
+    if long_target_first and not short_target_first:
+        return {"label": "BUY", "reason": f"Future high moved +0.25 ATR before a -0.15 ATR adverse move within {horizon_minutes} minutes", "barriers": barriers, "longOutcome": long_outcome, "shortOutcome": short_outcome}
+    if short_target_first and not long_target_first:
+        return {"label": "SELL", "reason": f"Future low moved -0.25 ATR before a +0.15 ATR adverse move within {horizon_minutes} minutes", "barriers": barriers, "longOutcome": long_outcome, "shortOutcome": short_outcome}
+    if long_target_first and short_target_first:
+        long_bars = int(long_outcome.get("bars") or 0)
+        short_bars = int(short_outcome.get("bars") or 0)
+        if long_bars and short_bars and long_bars < short_bars:
+            return {"label": "BUY", "reason": f"BUY +0.25 ATR move resolved before SELL move within {horizon_minutes} minutes", "barriers": barriers, "longOutcome": long_outcome, "shortOutcome": short_outcome}
+        if long_bars and short_bars and short_bars < long_bars:
+            return {"label": "SELL", "reason": f"SELL -0.25 ATR move resolved before BUY move within {horizon_minutes} minutes", "barriers": barriers, "longOutcome": long_outcome, "shortOutcome": short_outcome}
+    return {"label": "HOLD", "reason": f"No clean ATR-friendly directional move within {horizon_minutes} minutes", "barriers": barriers, "longOutcome": long_outcome, "shortOutcome": short_outcome}
+
+
+def barrier_outcome(candles: list[dict], *, target, stop) -> dict:
+    for index, candle in enumerate(candles, start=1):
+        target_hit = target(candle)
+        stop_hit = stop(candle)
+        if target_hit and stop_hit:
+            return {"result": "ambiguous", "bars": index, "timestamp": candle.get("timestamp")}
+        if target_hit:
+            return {"result": "target", "bars": index, "timestamp": candle.get("timestamp")}
+        if stop_hit:
+            return {"result": "stop", "bars": index, "timestamp": candle.get("timestamp")}
+    return {"result": "timeout", "bars": len(candles), "timestamp": candles[-1].get("timestamp") if candles else None}
+
+
+@app.post("/api/trade-history/archive")
+def save_trade_history_archive(payload: dict = Body(...)) -> dict:
+    algorithms = payload.get("algorithms")
+    if not isinstance(algorithms, dict):
+        raise HTTPException(status_code=422, detail="algorithms must include trade history grouped by algorithm")
+
+    archive = {
+        "version": 1,
+        "savedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "sessionDate": str(payload.get("sessionDate") or ""),
+        "reason": str(payload.get("reason") or "market-close"),
+        "symbol": str(payload.get("symbol") or ""),
+        "marketStatus": str(payload.get("marketStatus") or ""),
+        "appContext": payload.get("appContext") if isinstance(payload.get("appContext"), dict) else {},
+        "algorithms": algorithms,
+    }
+    encoded = json.dumps(archive, ensure_ascii=False)
+    if len(encoded.encode("utf-8")) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Trade history archive is larger than 10 MB")
+
+    TRADE_HISTORY_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    safe_session = re.sub(r"[^0-9A-Za-z_-]+", "-", archive["sessionDate"] or "unknown").strip("-") or "unknown"
+    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    archive_path = TRADE_HISTORY_ARCHIVE_DIR / f"trade_history_{safe_session}_{run_id}.json"
+    latest_path = TRADE_HISTORY_ARCHIVE_DIR / "latest.json"
+    write_json(archive_path, archive)
+    write_json(latest_path, archive)
+    return {
+        "ok": True,
+        "path": str(archive_path),
+        "latestPath": str(latest_path),
+        "savedAt": archive["savedAt"],
+        "sessionDate": archive["sessionDate"],
+    }
+
+
 @app.get("/api/candles")
 async def candles(
     symbol: str = Query("SPY", min_length=1, max_length=12),
@@ -494,6 +1604,81 @@ async def candles(
     }
 
 
+@app.get("/api/market-forecast/prediction")
+async def market_forecast_prediction_endpoint(
+    symbol: str = Query("SPY", min_length=1, max_length=12),
+    feed: Literal["iex", "sip", "otc"] = "iex",
+    timeframe: Literal["1Min"] = "1Min",
+    limit: int = Query(240, ge=60, le=1000),
+    refresh: bool = False,
+) -> dict:
+    normalized_symbol = symbol.upper()
+    cached = store.latest(symbol=normalized_symbol, timeframe=timeframe, feed=feed, limit=limit)
+    candles_for_prediction = cached
+
+    if refresh or not candles_for_prediction:
+        try:
+            fresh = await alpaca.get_bars(
+                symbol=normalized_symbol,
+                timeframe=timeframe,
+                feed=feed,
+                limit=limit,
+                start=None,
+                end=None,
+                sort="asc",
+            )
+            store.upsert_many(fresh)
+            candles_for_prediction = fresh
+        except httpx.HTTPError:
+            candles_for_prediction = cached
+
+    microstructure_rows = load_microstructure_rows_for_candles(normalized_symbol, feed, candles_for_prediction)
+    forecast = market_forecast_prediction(candles_for_prediction, microstructure_rows=microstructure_rows)
+    forecast["performanceLog"] = record_market_forecast_prediction(
+        normalized_symbol,
+        feed,
+        timeframe,
+        candles_for_prediction,
+        forecast,
+    )
+    return forecast
+
+
+@app.get("/api/market-forecast/history")
+async def market_forecast_history_endpoint(
+    symbol: str = Query("SPY", min_length=1, max_length=12),
+    date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    feed: Literal["iex", "sip", "otc"] | None = None,
+    timeframe: Literal["1Min"] | None = None,
+    limit: int = Query(500, ge=1, le=5000),
+) -> dict:
+    return read_market_forecast_prediction_log(
+        symbol.upper(),
+        date=date,
+        feed=feed,
+        timeframe=timeframe,
+        limit=limit,
+    )
+
+
+@app.get("/api/market-forecast/ledger/status")
+async def market_forecast_ledger_status_endpoint() -> dict:
+    return dict(MARKET_FORECAST_LEDGER_STATUS)
+
+
+@app.post("/api/market-forecast/ledger/start")
+async def market_forecast_ledger_start_endpoint() -> dict:
+    market_status = await safe_market_status()
+    async with MARKET_FORECAST_LEDGER_TICK_LOCK:
+        wait_seconds = await run_market_forecast_ledger_tick(market_status)
+    return {
+        **dict(MARKET_FORECAST_LEDGER_STATUS),
+        "triggered": True,
+        "reason": "manual_or_wake_start",
+        "pollSeconds": wait_seconds,
+    }
+
+
 @app.get("/api/market-status")
 async def market_status() -> dict:
     try:
@@ -502,6 +1687,41 @@ async def market_status() -> dict:
         return local_market_status(warning=exc.response.text)
     except httpx.HTTPError as exc:
         return local_market_status(warning=str(exc))
+
+
+@app.post("/api/system/sleep-if-market-closed")
+async def sleep_if_market_closed(reason: str = Body("wake_market_closed", embed=True)) -> dict:
+    market = await safe_market_status()
+    if market.get("isOpen") or market.get("status") == "open":
+        return {
+            "sleepRequested": False,
+            "reason": "market_open",
+            "marketStatus": market,
+        }
+    if os.name != "nt":
+        return {
+            "sleepRequested": False,
+            "reason": "unsupported_os",
+            "marketStatus": market,
+        }
+    try:
+        subprocess.Popen(
+            ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except OSError as exc:
+        return {
+            "sleepRequested": False,
+            "reason": f"sleep_failed: {exc}",
+            "marketStatus": market,
+        }
+    return {
+        "sleepRequested": True,
+        "reason": reason,
+        "marketStatus": market,
+    }
 
 
 @app.post("/api/backtest-data/prepare")
@@ -619,6 +1839,15 @@ def backtest_daily_refresh_status() -> dict:
             if isinstance(status.get("result"), dict):
                 status["result"]["dynamicArtifactStatus"] = status["dynamicArtifactStatus"]
                 status["result"]["dynamicArtifactJob"] = latest_dynamic_job
+    forecast_job = result.get("forecastTrainingJob") if isinstance(result, dict) else status.get("forecastTrainingJob")
+    if isinstance(forecast_job, dict) and forecast_job.get("jobId"):
+        latest_forecast_job = read_artifact_job_status(str(forecast_job["jobId"]))
+        if latest_forecast_job:
+            status["forecastTrainingStatus"] = latest_forecast_job.get("status", status.get("forecastTrainingStatus"))
+            status["forecastTrainingJob"] = latest_forecast_job
+            if isinstance(status.get("result"), dict):
+                status["result"]["forecastTrainingStatus"] = status["forecastTrainingStatus"]
+                status["result"]["forecastTrainingJob"] = latest_forecast_job
     return status
 
 
@@ -848,6 +2077,15 @@ def latest_voting_ensemble_dynamic_artifact(
         end_date=end_date,
         config_hash=config_hash,
     )
+    latest_artifact_path_value = str((latest_job or {}).get("artifactPath") or "")
+    latest_artifact_path = Path(latest_artifact_path_value) if latest_artifact_path_value else None
+    if latest_artifact_path and latest_artifact_path.exists():
+        artifact = json.loads(latest_artifact_path.read_text(encoding="utf-8"))
+        return {
+            **artifact,
+            "artifactPath": str(latest_artifact_path),
+            "sourceManifest": artifact.get("sourceManifest") or manifest.get("manifest"),
+        }
     raise HTTPException(
         status_code=409,
         detail={
@@ -1096,6 +2334,151 @@ async def end_of_day_backtest_refresh_scheduler() -> None:
             await asyncio.sleep(5 * 60)
 
 
+async def market_forecast_ledger_scheduler() -> None:
+    while True:
+        wait_seconds = MARKET_FORECAST_LEDGER_CLOSED_POLL_SECONDS
+        try:
+            market_status = await safe_market_status()
+            async with MARKET_FORECAST_LEDGER_TICK_LOCK:
+                wait_seconds = await run_market_forecast_ledger_tick(market_status)
+        except Exception as exc:  # pragma: no cover - defensive scheduler guard
+            now = datetime.now(UTC)
+            wait_seconds = MARKET_FORECAST_LEDGER_CLOSED_POLL_SECONDS
+            MARKET_FORECAST_LEDGER_STATUS.update(
+                {
+                    "status": "error",
+                    "lastRunAt": now.isoformat().replace("+00:00", "Z"),
+                    "nextRunAt": (now + timedelta(seconds=wait_seconds)).isoformat().replace("+00:00", "Z"),
+                    "message": f"Future Market Prediction Ledger failed: {exc}",
+                }
+            )
+        await asyncio.sleep(max(15, wait_seconds))
+
+
+async def run_market_forecast_ledger_tick(market_status: dict) -> float:
+    now = datetime.now(UTC)
+    normalized_symbol = MARKET_FORECAST_LEDGER_SYMBOL.upper()
+    is_open = bool(market_status.get("isOpen"))
+    candles = await load_market_forecast_ledger_candles(normalized_symbol)
+    if not candles:
+        wait_seconds = MARKET_FORECAST_LEDGER_POLL_SECONDS if is_open else seconds_until_next_market_open(market_status, fallback=MARKET_FORECAST_LEDGER_CLOSED_POLL_SECONDS)
+        MARKET_FORECAST_LEDGER_STATUS.update(
+            {
+                "status": "waiting_for_data" if is_open else "waiting_for_open",
+                "lastRunAt": now.isoformat().replace("+00:00", "Z"),
+                "lastResult": None,
+                "nextRunAt": (now + timedelta(seconds=wait_seconds)).isoformat().replace("+00:00", "Z"),
+                "marketStatus": market_status,
+                "message": "No candles available for Future Market Prediction Ledger.",
+            }
+        )
+        return wait_seconds
+
+    if is_open:
+        microstructure_rows = load_microstructure_rows_for_candles(normalized_symbol, MARKET_FORECAST_LEDGER_FEED, candles)
+        forecast = market_forecast_prediction(candles, microstructure_rows=microstructure_rows)
+        result = record_market_forecast_prediction(
+            normalized_symbol,
+            MARKET_FORECAST_LEDGER_FEED,
+            MARKET_FORECAST_LEDGER_TIMEFRAME,
+            candles,
+            forecast,
+        )
+        wait_seconds = seconds_until_next_ledger_poll(now, market_status)
+        MARKET_FORECAST_LEDGER_STATUS.update(
+            {
+                "status": "recording",
+                "lastRunAt": now.isoformat().replace("+00:00", "Z"),
+                "lastPredictionTimestamp": (candles[-1] or {}).get("timestamp"),
+                "lastSaved": bool(result.get("saved")),
+                "lastResult": result,
+                "nextRunAt": (now + timedelta(seconds=wait_seconds)).isoformat().replace("+00:00", "Z"),
+                "marketStatus": market_status,
+                "message": "Future Market Prediction Ledger is recording 5-minute prediction rows while the market is open.",
+            }
+        )
+        return wait_seconds
+
+    resolve_result = resolve_market_forecast_ledger_pending(normalized_symbol, candles)
+    wait_seconds = seconds_until_next_market_open(market_status, fallback=MARKET_FORECAST_LEDGER_CLOSED_POLL_SECONDS)
+    MARKET_FORECAST_LEDGER_STATUS.update(
+        {
+            "status": "waiting_for_open",
+            "lastRunAt": now.isoformat().replace("+00:00", "Z"),
+            "lastPredictionTimestamp": (candles[-1] or {}).get("timestamp"),
+            "lastSaved": False,
+            "lastResult": resolve_result,
+            "nextRunAt": (now + timedelta(seconds=wait_seconds)).isoformat().replace("+00:00", "Z"),
+            "marketStatus": market_status,
+            "message": "Market is closed; Future Market Prediction Ledger is not creating new rows and has resolved pending records where possible.",
+        }
+    )
+    return wait_seconds
+
+
+async def safe_market_status() -> dict:
+    try:
+        return await alpaca.get_market_status()
+    except httpx.HTTPStatusError as exc:
+        return local_market_status(warning=exc.response.text)
+    except httpx.HTTPError as exc:
+        return local_market_status(warning=str(exc))
+
+
+async def load_market_forecast_ledger_candles(symbol: str) -> list[dict]:
+    cached = store.latest(
+        symbol=symbol,
+        timeframe=MARKET_FORECAST_LEDGER_TIMEFRAME,
+        feed=MARKET_FORECAST_LEDGER_FEED,
+        limit=MARKET_FORECAST_LEDGER_LIMIT,
+    )
+    try:
+        fresh = await alpaca.get_bars(
+            symbol=symbol,
+            timeframe=MARKET_FORECAST_LEDGER_TIMEFRAME,
+            feed=MARKET_FORECAST_LEDGER_FEED,
+            limit=MARKET_FORECAST_LEDGER_LIMIT,
+            start=None,
+            end=None,
+            sort="asc",
+        )
+        if fresh:
+            store.upsert_many(fresh)
+            return fresh
+    except httpx.HTTPError:
+        pass
+    return cached
+
+
+def resolve_market_forecast_ledger_pending(symbol: str, candles: list[dict]) -> dict:
+    days = sorted({prediction_log_day(str(candle.get("timestamp") or "")) for candle in candles if candle.get("timestamp")})
+    results = [resolve_market_forecast_prediction_day(symbol, day, candles) for day in days]
+    return {
+        "saved": False,
+        "mode": "resolve_only",
+        "days": days,
+        "updatedFiles": [str(result["path"]) for result in results if result.get("updated")],
+        "resolvedRecords": sum(int(result.get("resolved") or 0) for result in results),
+        "pendingRecords": sum(int(result.get("pending") or 0) for result in results),
+    }
+
+
+def seconds_until_next_ledger_poll(now: datetime, market_status: dict) -> float:
+    close_at = market_session_close_datetime_utc(market_status)
+    next_poll = now.replace(second=20, microsecond=0) + timedelta(minutes=1)
+    if close_at and next_poll > close_at + timedelta(minutes=6):
+        return MARKET_FORECAST_LEDGER_CLOSED_POLL_SECONDS
+    return max(15.0, (next_poll - now).total_seconds())
+
+
+def seconds_until_next_market_open(market_status: dict, *, fallback: float) -> float:
+    next_open = parse_market_datetime(str(market_status.get("nextOpen") or ""))
+    if not next_open:
+        return fallback
+    now = datetime.now(UTC)
+    return max(60.0, min((next_open - now).total_seconds(), fallback))
+
+
 async def maybe_run_end_of_day_backtest_refresh() -> None:
     if not settings.has_alpaca_credentials:
         DAILY_BACKTEST_REFRESH_STATUS.update(
@@ -1121,7 +2504,7 @@ async def maybe_run_end_of_day_backtest_refresh() -> None:
         return
     if DAILY_BACKTEST_REFRESH_STATUS.get("lastTargetDate") == target_date and DAILY_BACKTEST_REFRESH_STATUS.get("status") == "ready":
         return
-    await run_daily_backtest_refresh(
+    refresh_result = await run_daily_backtest_refresh(
         symbol="SPY",
         feed="iex",
         start_date="2020-07-28",
@@ -1129,6 +2512,10 @@ async def maybe_run_end_of_day_backtest_refresh() -> None:
         max_pages=25,
         force=False,
     )
+    label_result = label_decision_snapshots_for_session(symbol="SPY", feed="iex", session_date=target_date)
+    DAILY_BACKTEST_REFRESH_STATUS["decisionLabelStatus"] = label_result
+    if isinstance(refresh_result, dict):
+        DAILY_BACKTEST_REFRESH_STATUS["result"] = {**refresh_result, "decisionLabelStatus": label_result}
 
 
 async def next_end_of_day_refresh_schedule() -> tuple[float, str, datetime, dict]:
@@ -1256,22 +2643,29 @@ async def run_daily_backtest_refresh(
     latest_manifest = best_backtest_manifest_or_none(normalized_symbol)
     latest_end = str((latest_manifest or {}).get("requestedEndDate") or "")[:10]
     if latest_end and latest_end >= target_date and not force:
-        artifact_job = ensure_daily_ml_artifact_job(
+        artifact_job = passive_daily_ml_artifact_status(
             manifest=latest_manifest,
             symbol=normalized_symbol,
             start_date=start_date,
             end_date=latest_end,
             reason="daily_refresh_up_to_date",
         )
-        dynamic_job = ensure_daily_dynamic_artifact_job(
+        dynamic_job = passive_daily_dynamic_artifact_status(
             symbol=normalized_symbol,
+            start_date=start_date,
+            end_date=latest_end,
+            reason="daily_refresh_up_to_date",
+        )
+        forecast_job = ensure_daily_market_forecast_training_job(
+            symbol=normalized_symbol,
+            feed=feed,
             start_date=start_date,
             end_date=latest_end,
             reason="daily_refresh_up_to_date",
         )
         result = {
             "status": "up_to_date",
-            "message": f"Backtest dataset already covers {latest_end}; ML artifact status is {artifact_job.get('status')} and daily Trading Settings artifact is {dynamic_job.get('status')}.",
+            "message": f"Backtest dataset already covers {latest_end}; ML artifact status is {artifact_job.get('status')}, daily Trading Settings artifact is {dynamic_job.get('status')}, and future forecast training is {forecast_job.get('status')}.",
             "symbol": normalized_symbol,
             "targetDate": target_date,
             "manifest": latest_manifest,
@@ -1279,6 +2673,8 @@ async def run_daily_backtest_refresh(
             "artifactJob": artifact_job,
             "dynamicArtifactStatus": dynamic_job.get("status"),
             "dynamicArtifactJob": dynamic_job,
+            "forecastTrainingStatus": forecast_job.get("status"),
+            "forecastTrainingJob": forecast_job,
         }
         DAILY_BACKTEST_REFRESH_STATUS.update(
             {
@@ -1289,6 +2685,8 @@ async def run_daily_backtest_refresh(
                 "artifactJob": artifact_job,
                 "dynamicArtifactStatus": dynamic_job.get("status"),
                 "dynamicArtifactJob": dynamic_job,
+                "forecastTrainingStatus": forecast_job.get("status"),
+                "forecastTrainingJob": forecast_job,
                 "message": result["message"],
                 "result": result,
             }
@@ -1355,9 +2753,16 @@ async def run_daily_backtest_refresh(
         end_date=target_date,
         reason="daily_refresh",
     )
+    forecast_training_job = ensure_daily_market_forecast_training_job(
+        symbol=normalized_symbol,
+        feed=feed,
+        start_date=start_date,
+        end_date=target_date,
+        reason="daily_refresh",
+    )
     result = {
         "status": "ready",
-        "message": f"Daily dataset refreshed through {target_date}; ML artifact status is {artifact_job.get('status')} and Trading Settings artifact is {dynamic_artifact_job.get('status')}.",
+        "message": f"Daily dataset refreshed through {target_date}; ML artifact status is {artifact_job.get('status')}, Trading Settings artifact is {dynamic_artifact_job.get('status')}, and future forecast training is {forecast_training_job.get('status')}.",
         "symbol": normalized_symbol,
         "targetDate": target_date,
         "manifest": manifest,
@@ -1365,6 +2770,8 @@ async def run_daily_backtest_refresh(
         "artifactJob": artifact_job,
         "dynamicArtifactStatus": dynamic_artifact_job.get("status"),
         "dynamicArtifactJob": dynamic_artifact_job,
+        "forecastTrainingStatus": forecast_training_job.get("status"),
+        "forecastTrainingJob": forecast_training_job,
         "warnings": warnings,
     }
     DAILY_BACKTEST_REFRESH_STATUS.update(
@@ -1376,6 +2783,8 @@ async def run_daily_backtest_refresh(
             "artifactJob": artifact_job,
             "dynamicArtifactStatus": dynamic_artifact_job.get("status"),
             "dynamicArtifactJob": dynamic_artifact_job,
+            "forecastTrainingStatus": forecast_training_job.get("status"),
+            "forecastTrainingJob": forecast_training_job,
             "message": result["message"],
             "result": result,
         }
@@ -1777,9 +3186,12 @@ def latest_artifact_job_status() -> dict | None:
     jobs = sorted(ARTIFACT_JOB_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
     for path in jobs:
         try:
-            return enrich_artifact_job_status(json.loads(path.read_text(encoding="utf-8")))
+            job = enrich_artifact_job_status(json.loads(path.read_text(encoding="utf-8")))
         except json.JSONDecodeError:
             continue
+        if str(job.get("jobType") or "") in {"dynamic_trading_artifact", "market_forecast_training"}:
+            continue
+        return job
     return None
 
 
@@ -1829,6 +3241,46 @@ def latest_ml_artifact_job_status(*, symbol: str, start_date: str, end_date: str
     return None
 
 
+def latest_market_forecast_training_job_status(*, symbol: str, start_date: str, end_date: str) -> dict | None:
+    if not ARTIFACT_JOB_DIR.exists():
+        return None
+    jobs = sorted(ARTIFACT_JOB_DIR.glob("forecast-*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in jobs:
+        try:
+            job = enrich_artifact_job_status(json.loads(path.read_text(encoding="utf-8")))
+        except json.JSONDecodeError:
+            continue
+        if str(job.get("jobType") or "") != "market_forecast_training":
+            continue
+        if str(job.get("symbol") or "").upper() != symbol.upper():
+            continue
+        if str(job.get("startDate") or "") != start_date:
+            continue
+        if str(job.get("endDate") or "") != end_date:
+            continue
+        return job
+    return None
+
+
+def market_forecast_artifact_ready(*, symbol: str, end_date: str) -> tuple[bool, str, dict | None]:
+    artifact_path = market_forecast_artifact_path(symbol)
+    if not artifact_path.exists():
+        return False, f"{MARKET_FORECAST_MODEL_VERSION} artifact is missing.", None
+    try:
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"{MARKET_FORECAST_MODEL_VERSION} artifact cannot be read: {exc}", None
+    if artifact.get("version") != MARKET_FORECAST_MODEL_VERSION:
+        return False, f"Forecast artifact version is {artifact.get('version')}; expected {MARKET_FORECAST_MODEL_VERSION}.", artifact
+    artifact_end = str(((artifact.get("dateRange") or {}).get("endDate")) or "")[:10]
+    if artifact_end and artifact_end < end_date:
+        return False, f"Forecast artifact ends at {artifact_end}; needs {end_date}.", artifact
+    model_file = str(artifact.get("modelFile") or "")
+    if model_file and not Path(model_file).exists():
+        return False, f"Forecast model file is missing: {model_file}", artifact
+    return True, "Future market forecast model is ready.", artifact
+
+
 def required_daily_ml_artifact_paths(*, manifest: dict, symbol: str, start_date: str, end_date: str) -> list[Path]:
     cache_dir = backtest_cache_dir(manifest)
     normalized_symbol = symbol.upper()
@@ -1842,6 +3294,122 @@ def required_daily_ml_artifact_paths(*, manifest: dict, symbol: str, start_date:
         cache_dir / f"event_refinement_v1_{normalized_symbol}_{start_date}_{end_date}.json",
         cache_dir / f"weekly_risk_tuning_v1_{normalized_symbol}_{start_date}_{end_date}.json",
     ]
+
+
+def passive_daily_ml_artifact_status(*, manifest: dict, symbol: str, start_date: str, end_date: str, reason: str) -> dict:
+    normalized_symbol = symbol.upper()
+    required_paths = required_daily_ml_artifact_paths(
+        manifest=manifest,
+        symbol=normalized_symbol,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    missing_paths = [path for path in required_paths if not path.exists()]
+    if not missing_paths:
+        return {
+            "status": "ready",
+            "reason": reason,
+            "symbol": normalized_symbol,
+            "startDate": start_date,
+            "endDate": end_date,
+            "message": "Daily ML artifacts already exist.",
+            "artifacts": {path.stem: str(path) for path in required_paths},
+        }
+    latest_job = latest_ml_artifact_job_status(symbol=normalized_symbol, start_date=start_date, end_date=end_date)
+    if latest_job:
+        return latest_job
+    return {
+        "status": "not_queued",
+        "reason": reason,
+        "symbol": normalized_symbol,
+        "startDate": start_date,
+        "endDate": end_date,
+        "message": f"Daily ML artifacts are missing {len(missing_paths)} files; no worker started for passive status check.",
+        "missingArtifacts": [str(path) for path in missing_paths],
+    }
+
+
+def passive_daily_dynamic_artifact_status(*, symbol: str, start_date: str, end_date: str, reason: str) -> dict:
+    normalized_symbol = symbol.upper()
+    try:
+        manifest = backtest_data_manifest_for_range(symbol=normalized_symbol, start_date=start_date, end_date=end_date)
+    except HTTPException as exc:
+        return {
+            "status": "not_queued",
+            "reason": reason,
+            "symbol": normalized_symbol,
+            "startDate": start_date,
+            "endDate": end_date,
+            "message": str(exc.detail),
+        }
+    settings = dict(DEFAULT_TRADING_SETTINGS)
+    config_hash = risk_config_hash(dynamic_risk_config(settings))
+    artifact_path = backtest_cache_dir(manifest) / f"dynamic_trading_artifact_v1_{normalized_symbol}_{start_date}_{end_date}_{config_hash}.json"
+    if artifact_path.exists():
+        return {
+            "status": "ready",
+            "reason": reason,
+            "symbol": normalized_symbol,
+            "startDate": start_date,
+            "endDate": end_date,
+            "configHash": config_hash,
+            "artifactPath": str(artifact_path),
+            "message": "Daily Trading Settings artifact already exists.",
+        }
+    latest_job = latest_dynamic_artifact_job_status(
+        symbol=normalized_symbol,
+        start_date=start_date,
+        end_date=end_date,
+        config_hash=config_hash,
+    )
+    if latest_job:
+        return latest_job
+    return {
+        "status": "not_queued",
+        "reason": reason,
+        "symbol": normalized_symbol,
+        "startDate": start_date,
+        "endDate": end_date,
+        "configHash": config_hash,
+        "message": "Daily Trading Settings artifact is missing; no worker started for passive status check.",
+    }
+
+
+def ensure_daily_market_forecast_training_job(
+    *,
+    symbol: str,
+    feed: str,
+    start_date: str,
+    end_date: str,
+    reason: str,
+) -> dict:
+    normalized_symbol = symbol.upper()
+    ready, message, artifact = market_forecast_artifact_ready(symbol=normalized_symbol, end_date=end_date)
+    if ready:
+        return {
+            "status": "ready",
+            "reason": reason,
+            "jobType": "market_forecast_training",
+            "symbol": normalized_symbol,
+            "feed": feed,
+            "startDate": start_date,
+            "endDate": end_date,
+            "modelVersion": MARKET_FORECAST_MODEL_VERSION,
+            "artifactPath": str(market_forecast_artifact_path(normalized_symbol)),
+            "trainedAt": artifact.get("trainedAt") if isinstance(artifact, dict) else None,
+            "message": message,
+        }
+    latest_job = latest_market_forecast_training_job_status(symbol=normalized_symbol, start_date=start_date, end_date=end_date)
+    if latest_job and str(latest_job.get("status") or "").lower() in {"queued", "running", "ready"}:
+        return latest_job
+    return start_market_forecast_training_job(
+        symbol=normalized_symbol,
+        feed=feed,
+        start_date=start_date,
+        end_date=end_date,
+        reason=reason,
+        trigger=message,
+    )
 
 
 def ensure_daily_ml_artifact_job(*, manifest: dict, symbol: str, start_date: str, end_date: str, reason: str) -> dict:
@@ -2006,6 +3574,95 @@ def start_artifact_regeneration_job(
             **queued,
             "pid": process.pid,
             "message": "ML artifact regeneration worker started.",
+        },
+    )
+
+
+def start_market_forecast_training_job(
+    *,
+    symbol: str,
+    feed: str,
+    start_date: str,
+    end_date: str,
+    reason: str,
+    trigger: str,
+) -> dict:
+    job_id = f"forecast-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}"
+    project_root = Path(__file__).resolve().parents[2]
+    created_at = datetime.now(UTC).isoformat()
+    queued = write_artifact_job_status(
+        job_id,
+        {
+            "status": "queued",
+            "jobType": "market_forecast_training",
+            "reason": reason,
+            "trigger": trigger,
+            "symbol": symbol.upper(),
+            "feed": feed,
+            "startDate": start_date,
+            "endDate": end_date,
+            "modelVersion": MARKET_FORECAST_MODEL_VERSION,
+            "artifactPath": str(market_forecast_artifact_path(symbol)),
+            "logPath": str(ARTIFACT_JOB_DIR / f"{job_id}.log"),
+            "createdAt": created_at,
+            "startedAt": None,
+            "completedAt": None,
+            "pid": None,
+            "message": "Future market forecast retraining queued.",
+            "summary": None,
+            "error": None,
+        },
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "backend.app.market_forecast_worker",
+        "--job-id",
+        job_id,
+        "--symbol",
+        symbol.upper(),
+        "--feed",
+        feed,
+        "--start-date",
+        start_date,
+        "--end-date",
+        end_date,
+    ]
+    creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    log_path = ARTIFACT_JOB_DIR / f"{job_id}.log"
+    log_handle = log_path.open("a", encoding="utf-8")
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(project_root),
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=log_handle,
+            close_fds=True,
+            creationflags=creationflags,
+        )
+    except OSError as exc:
+        log_handle.close()
+        failed = write_artifact_job_status(
+            job_id,
+            {
+                **queued,
+                "status": "error",
+                "completedAt": datetime.now(UTC).isoformat(),
+                "message": f"Could not start future market forecast worker: {exc}",
+                "error": str(exc),
+            },
+        )
+        raise HTTPException(status_code=500, detail=failed["message"]) from exc
+
+    return write_artifact_job_status(
+        job_id,
+        {
+            **queued,
+            "status": "running",
+            "startedAt": datetime.now(UTC).isoformat(),
+            "pid": process.pid,
+            "message": "Future market forecast retraining worker started.",
         },
     )
 
@@ -2186,6 +3843,7 @@ VOTING_ENSEMBLE_RISK_CONFIG = {
     "forceClose": "15:55",
     "execution": "next candle open",
     "stopLossPercent": 0.35,
+    "fixedStopDistanceDollars": 1.0,
     "takeProfitR": 1.5,
     "slippagePerShare": 0.02,
     "expenseModel": {
@@ -2264,6 +3922,7 @@ VOTING_ENSEMBLE_RISK_CONFIG = {
         "forceClose": "15:55",
         "takeProfitR": 1.5,
         "stopLossPercent": 0.35,
+        "fixedStopDistanceDollars": 1.0,
         "maxTradesPerDay": 2,
         "minOpeningWeeklyDirectionalVotes": 3,
         "minClosingWeeklyDirectionalVotes": 4,
@@ -2308,6 +3967,7 @@ def dynamic_risk_config(settings_payload: dict) -> dict:
     allocation_trade_cap = max(1, int(config["dailyAllocationPercent"] // max(config["orderAllocationPercent"], 0.1)))
     config["maxTradesPerDay"] = min(requested_max_trades, allocation_trade_cap)
     config["stopLossPercent"] = number("stopLossPercent", 0.35, minimum=0.01, maximum=20.0)
+    config["fixedStopDistanceDollars"] = number("fixedStopDistanceDollars", 1.0, minimum=0.0, maximum=100.0)
     config["takeProfitR"] = number("takeProfitR", 1.5, minimum=0.1, maximum=20.0)
     config["slippagePerShare"] = number("slippagePerShare", 0.02, minimum=0.0, maximum=10.0)
     config["positionSizingMode"] = str(settings_dict.get("positionSizingMode") or "allocation")
@@ -2318,7 +3978,25 @@ def dynamic_risk_config(settings_payload: dict) -> dict:
     )
     config.setdefault("openCloseEvents", {})
     config["openCloseEvents"]["maxTradesPerDay"] = min(int(config["openCloseEvents"].get("maxTradesPerDay", 2)), config["maxTradesPerDay"])
+    config["openCloseEvents"].setdefault("fixedStopDistanceDollars", config["fixedStopDistanceDollars"])
     return config
+
+
+def configured_stop_distance(config: dict, entry_price: float, override: dict | None = None, percent_key: str = "stopLossPercent") -> float:
+    override = override or {}
+    fixed_value = override.get("fixedStopDistanceDollars", config.get("fixedStopDistanceDollars", 0))
+    try:
+        fixed_distance = float(fixed_value)
+    except (TypeError, ValueError):
+        fixed_distance = 0.0
+    if fixed_distance > 0:
+        return fixed_distance
+    percent_value = override.get(percent_key, config.get("stopLossPercent", 0.35))
+    try:
+        stop_percent = float(percent_value)
+    except (TypeError, ValueError):
+        stop_percent = float(config.get("stopLossPercent", 0.35))
+    return entry_price * (stop_percent / 100)
 
 
 def risk_config_hash(config: dict) -> str:
@@ -4966,7 +6644,7 @@ def open_event_risk_managed_trade(
     slippage = float(config["slippagePerShare"])
     raw_open = float(candle["open"])
     entry_price = raw_open + slippage if side == "Long" else raw_open - slippage
-    fixed_stop_distance = entry_price * (float(event_config.get("stopLossPercent", config["stopLossPercent"])) / 100)
+    fixed_stop_distance = configured_stop_distance(config, entry_price, event_config)
     if side == "Long":
         opening_stop = float(opening_range["low"])
         fixed_stop = entry_price - fixed_stop_distance
@@ -5357,7 +7035,7 @@ def open_swing_risk_managed_trade(
     slippage = float(config["slippagePerShare"])
     raw_open = float(candle["open"])
     entry_price = raw_open + slippage if side == "Long" else raw_open - slippage
-    fixed_stop_distance = entry_price * (float(swing_config.get("stopPercent", config["stopLossPercent"])) / 100)
+    fixed_stop_distance = configured_stop_distance(config, entry_price, swing_config, percent_key="stopPercent")
     atr_stop_distance = (atr or 0) * float(swing_config.get("atrMultiplier", 1.5))
     stop_distance = max(fixed_stop_distance, atr_stop_distance)
     if side == "Long":
@@ -5391,7 +7069,7 @@ def open_swing_risk_managed_trade(
         "positionValue": round(entry_price * shares, 2),
         "positionSizingMode": sizing_mode,
         "riskConfig": config,
-        "stopModel": f"max({swing_config.get('stopPercent', config['stopLossPercent'])}% fixed, ATR)",
+        "stopModel": f"max({configured_stop_distance(config, entry_price, swing_config, percent_key='stopPercent'):.2f} fixed dollars/share, ATR)",
     }
 
 
@@ -5485,7 +7163,7 @@ def open_hybrid_risk_managed_trade(
     slippage = float(config["slippagePerShare"])
     raw_open = float(candle["open"])
     entry_price = raw_open + slippage if side == "Long" else raw_open - slippage
-    fixed_stop_distance = entry_price * (float(config["stopLossPercent"]) / 100)
+    fixed_stop_distance = configured_stop_distance(config, entry_price)
     atr_stop_distance = (atr or 0) * float(hybrid_config.get("atrMultiplier", 0.75))
     dynamic_stop_distance = max(fixed_stop_distance, atr_stop_distance)
     if side == "Long":
@@ -5642,7 +7320,7 @@ def open_risk_managed_trade(
     slippage = float(config["slippagePerShare"])
     raw_open = float(candle["open"])
     entry_price = raw_open + slippage if side == "Long" else raw_open - slippage
-    fixed_stop_distance = entry_price * (float(config["stopLossPercent"]) / 100)
+    fixed_stop_distance = configured_stop_distance(config, entry_price)
     if side == "Long":
         fixed_stop = entry_price - fixed_stop_distance
         opening_stop = float(opening_range["low"])
@@ -5877,7 +7555,19 @@ def historical_strategy_fits(history: list[dict], prior_close: float, *, timefra
         if blocked and score > 64:
             score = 64
         status = "Strong Fit" if score >= 78 and not blocked else "Allowed" if score >= 62 and not blocked else "Watch" if score >= 45 else "Avoid"
-        scored.append({"name": strategy["name"], "status": status, "score": score, "matches": matched[:3], "risks": blocked[:3]})
+        classification = STRATEGY_CLASSIFICATION.get(strategy["name"], {"role": "directional", "family": "uncategorized"})
+        scored.append(
+            {
+                "name": strategy["name"],
+                "role": classification["role"],
+                "family": classification["family"],
+                "strategy_family": classification["family"],
+                "status": status,
+                "score": score,
+                "matches": matched[:3],
+                "risks": blocked[:3],
+            }
+        )
     return sorted(scored, key=lambda item: item["score"], reverse=True)
 
 

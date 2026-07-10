@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -20,17 +21,30 @@ class CandleStore:
         self.path = _sqlite_path(settings.database_url)
         self.using_memory = False
         self._memory_conn: sqlite3.Connection | None = None
+        self._memory_lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.init()
+
+    @staticmethod
+    def _is_disk_io_error(exc: sqlite3.OperationalError) -> bool:
+        return "disk I/O" in str(exc)
+
+    def _switch_to_memory(self) -> None:
+        self.using_memory = True
+        self._memory_conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self._memory_conn.row_factory = sqlite3.Row
+        self._create_schema()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         if self.using_memory:
-            if self._memory_conn is None:
-                self._memory_conn = sqlite3.connect(":memory:")
-                self._memory_conn.row_factory = sqlite3.Row
-            yield self._memory_conn
-            self._memory_conn.commit()
+            with self._memory_lock:
+                if self._memory_conn is None:
+                    self._memory_conn = sqlite3.connect(":memory:", check_same_thread=False)
+                    self._memory_conn.row_factory = sqlite3.Row
+                    self._create_schema()
+                yield self._memory_conn
+                self._memory_conn.commit()
             return
 
         conn = sqlite3.connect(self.path)
@@ -50,12 +64,9 @@ class CandleStore:
         try:
             self._create_schema()
         except sqlite3.OperationalError as exc:
-            if "disk I/O" not in str(exc):
+            if not self._is_disk_io_error(exc):
                 raise
-            self.using_memory = True
-            self._memory_conn = sqlite3.connect(":memory:")
-            self._memory_conn.row_factory = sqlite3.Row
-            self._create_schema()
+            self._switch_to_memory()
 
     def _create_schema(self) -> None:
         with self.connect() as conn:
@@ -89,6 +100,15 @@ class CandleStore:
     def upsert_many(self, candles: list[dict]) -> None:
         if not candles:
             return
+        try:
+            self._upsert_many(candles)
+        except sqlite3.OperationalError as exc:
+            if not self._is_disk_io_error(exc):
+                raise
+            self._switch_to_memory()
+            self._upsert_many(candles)
+
+    def _upsert_many(self, candles: list[dict]) -> None:
         with self.connect() as conn:
             conn.executemany(
                 """

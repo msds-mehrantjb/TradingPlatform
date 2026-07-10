@@ -66,6 +66,40 @@ EVENT_SIGNAL_NAMES = [
     "Gap direction",
 ]
 
+STRATEGY_CLASSIFICATION: dict[str, dict[str, str]] = {
+    "Multi-Timeframe Trend Alignment": {"role": "directional", "family": "trend"},
+    "First Pullback After Open": {"role": "directional", "family": "trend"},
+    "Failed Breakout Strategy": {"role": "directional", "family": "reversal"},
+    "Liquidity Sweep Reversal": {"role": "directional", "family": "reversal"},
+    "Bollinger Band Reversion": {"role": "directional", "family": "mean_reversion"},
+    "ATR Overextension Reversion": {"role": "directional", "family": "mean_reversion"},
+    "Moving Average Trend": {"role": "directional", "family": "trend"},
+    "Trend Pullback Strategy": {"role": "directional", "family": "trend"},
+    "RSI Mean Reversion": {"role": "directional", "family": "mean_reversion"},
+    "Bollinger Band Mean Reversion": {"role": "directional", "family": "mean_reversion"},
+    "Opening Range Breakout": {"role": "directional", "family": "breakout"},
+    "Intraday Breakout Strategy": {"role": "directional", "family": "breakout"},
+    "MACD Momentum": {"role": "directional", "family": "trend"},
+    "Market Structure Strategy": {"role": "directional", "family": "trend"},
+    "Gap Continuation / Gap Fade": {"role": "directional", "family": "event"},
+    "VWAP Trend Continuation": {"role": "directional", "family": "vwap"},
+    "VWAP Mean Reversion": {"role": "directional", "family": "mean_reversion"},
+    "Failed Breakout Reversal": {"role": "directional", "family": "reversal"},
+    "Bollinger/ATR Reversion": {"role": "directional", "family": "mean_reversion"},
+    "Volatility Breakout": {"role": "directional", "family": "breakout"},
+    "Relative Strength vs QQQ/IWM": {"role": "context", "family": "market_regime"},
+    "Market Breadth Momentum": {"role": "context", "family": "market_regime"},
+    "Economic Event Reaction Strategy": {"role": "context", "family": "event"},
+    "VWAP Position Strategy": {"role": "context", "family": "vwap"},
+    "Volume Confirmation": {"role": "context", "family": "volume_confirmation"},
+    "ADX Trend Strength Filter": {"role": "context", "family": "market_regime"},
+    "ATR Volatility Regime": {"role": "context", "family": "market_regime"},
+    "Ensemble Strategy Voting": {"role": "meta_safety", "family": "safety"},
+    "Cash / Avoid Trading Filter": {"role": "meta_safety", "family": "safety"},
+    "Breakout Strategy": {"role": "directional", "family": "breakout"},
+    "MACD Strategy": {"role": "directional", "family": "trend"},
+}
+
 
 @dataclass(frozen=True)
 class LayerResult:
@@ -695,9 +729,13 @@ def _score_strategies(regime: LayerResult, session: LayerResult, event: LayerRes
         if blocked and score > 64:
             score = 64
         status = "Strong Fit" if score >= 78 and not blocked else "Allowed" if score >= 62 and not blocked else "Watch" if score >= 45 else "Avoid"
+        classification = STRATEGY_CLASSIFICATION.get(strategy["name"], {"role": "directional", "family": "uncategorized"})
         scored.append(
             {
                 "name": strategy["name"],
+                "role": classification["role"],
+                "family": classification["family"],
+                "strategy_family": classification["family"],
                 "status": status,
                 "score": score,
                 "matches": _strategy_matches(matched, labels),
