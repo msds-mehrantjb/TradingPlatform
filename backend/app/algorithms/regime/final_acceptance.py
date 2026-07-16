@@ -1,0 +1,202 @@
+"""Final acceptance ledger for Regime V2 activation."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+
+REGIME_FINAL_ACCEPTANCE_VERSION = "regime_final_acceptance_v1"
+REGIME_ALGORITHM_ID = "regime"
+
+
+class RegimeAcceptanceStatus(str, Enum):
+    PASS = "pass"
+    PENDING = "pending"
+    FAIL = "fail"
+
+
+@dataclass(frozen=True)
+class RegimeAcceptanceItem:
+    statement: str
+    status: RegimeAcceptanceStatus
+    evidence: tuple[str, ...]
+    category: str = "Final acceptance"
+    limitations: tuple[str, ...] = ()
+    required_for_completion: bool = True
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "category": self.category,
+            "statement": self.statement,
+            "status": self.status.value,
+            "evidence": list(self.evidence),
+            "limitations": list(self.limitations),
+            "requiredForCompletion": self.required_for_completion,
+        }
+
+
+def build_regime_final_acceptance_report() -> dict[str, object]:
+    items = REGIME_FINAL_ACCEPTANCE_ITEMS
+    blocking = [
+        item
+        for item in items
+        if item.required_for_completion and item.status is not RegimeAcceptanceStatus.PASS
+    ]
+    counts = {
+        "pass": sum(1 for item in items if item.status is RegimeAcceptanceStatus.PASS),
+        "pending": sum(1 for item in items if item.status is RegimeAcceptanceStatus.PENDING),
+        "fail": sum(1 for item in items if item.status is RegimeAcceptanceStatus.FAIL),
+    }
+    return {
+        "algorithmId": REGIME_ALGORITHM_ID,
+        "version": REGIME_FINAL_ACCEPTANCE_VERSION,
+        "complete": not blocking,
+        "counts": counts,
+        "blockingStatements": [item.statement for item in blocking],
+        "items": [item.as_dict() for item in items],
+    }
+
+
+def regime_acceptance_is_complete() -> bool:
+    return bool(build_regime_final_acceptance_report()["complete"])
+
+
+REGIME_FINAL_ACCEPTANCE_ITEMS: tuple[RegimeAcceptanceItem, ...] = (
+    RegimeAcceptanceItem(
+        "Regime logic is isolated from main.ts.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/algorithms/regime", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Isolation",
+    ),
+    RegimeAcceptanceItem(
+        "Allowed Sell decisions remain Sell.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/algorithms/regime/order-intent.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Direction",
+    ),
+    RegimeAcceptanceItem(
+        "Regime no longer uses WCA sizing or order adapters.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/algorithms/regime/order-intent.ts", "frontend/src/algorithms/regime/position-sizing.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Isolation",
+    ),
+    RegimeAcceptanceItem(
+        "Directional, context, and safety roles are separated.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/algorithms/regime/strategy-catalog.ts", "frontend/src/algorithms/regime/family-aggregation.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Strategy roles",
+    ),
+    RegimeAcceptanceItem(
+        "Strategy aliases cannot double vote.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/algorithms/regime/strategy-catalog.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Strategy roles",
+    ),
+    RegimeAcceptanceItem(
+        "Regime classification is deterministic and explainable.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/algorithms/regime/classifier.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Classification",
+    ),
+    RegimeAcceptanceItem(
+        "Hysteresis is configurable and tested.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/algorithms/regime/hysteresis.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Classification",
+    ),
+    RegimeAcceptanceItem(
+        "Dynamic settings derive from immutable defaults.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/algorithms/regime/dynamic-profile.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Settings",
+    ),
+    RegimeAcceptanceItem(
+        "Dynamic risk cannot exceed permitted limits.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/algorithms/regime/dynamic-profile.ts", "frontend/src/algorithms/regime/position-sizing.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Settings",
+    ),
+    RegimeAcceptanceItem(
+        "Global account risk is enforced across all algorithms.",
+        RegimeAcceptanceStatus.PASS,
+        ("backend/app/risk", "backend/tests/test_global_account_risk_state.py", "backend/tests/test_algorithm_ownership_ledger.py"),
+        category="Risk",
+    ),
+    RegimeAcceptanceItem(
+        "Global evaluation is enforced server-side.",
+        RegimeAcceptanceStatus.PASS,
+        ("backend/app/risk/api.py", "backend/tests/test_global_portfolio_risk_manager_phase12.py"),
+        category="Risk",
+    ),
+    RegimeAcceptanceItem(
+        "Regime has a dedicated backtest.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/algorithms/regime/backtest/engine.ts", "backend/tests/test_regime_phase13_backtest_api.py", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Backtesting",
+    ),
+    RegimeAcceptanceItem(
+        "Daily backtesting includes Regime independently.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/main.ts", "frontend/src/algorithms/regime/backtest/engine.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Backtesting",
+    ),
+    RegimeAcceptanceItem(
+        "Regime archives reference Regime results.",
+        RegimeAcceptanceStatus.PASS,
+        ("backend/app/algorithms/regime/persistence.py", "backend/tests/test_regime_phase14_persistence.py", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="Persistence",
+    ),
+    RegimeAcceptanceItem(
+        "ML defaults to shadow mode.",
+        RegimeAcceptanceStatus.PASS,
+        ("backend/app/algorithms/regime/rollout.py", "backend/app/config.py", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="ML",
+    ),
+    RegimeAcceptanceItem(
+        "ML has no lookahead leakage.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/src/algorithms/regime/ml", "frontend/tests/V2DecisionPanel.test.ts"),
+        category="ML",
+    ),
+    RegimeAcceptanceItem(
+        "Other algorithms' outputs remain unchanged.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/tests/V2DecisionPanel.test.ts", "backend/tests/test_v1_ensemble_baseline.py", "backend/tests/test_weighted_voting_algorithm_isolation.py"),
+        category="Isolation",
+    ),
+    RegimeAcceptanceItem(
+        "Frontend build passes.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/package.json", "scripts/ci_quality_gates.py"),
+        category="Verification",
+    ),
+    RegimeAcceptanceItem(
+        "Backend tests pass.",
+        RegimeAcceptanceStatus.PASS,
+        ("backend/tests", "scripts/ci_quality_gates.py"),
+        category="Verification",
+    ),
+    RegimeAcceptanceItem(
+        "Frontend tests pass.",
+        RegimeAcceptanceStatus.PASS,
+        ("frontend/package.json", "frontend/tests/V2DecisionPanel.test.ts", "scripts/ci_quality_gates.py"),
+        category="Verification",
+    ),
+    RegimeAcceptanceItem(
+        "Paper-trading rollout is disabled by default or controlled through feature flags.",
+        RegimeAcceptanceStatus.PASS,
+        ("backend/app/algorithms/regime/rollout.py", "backend/tests/test_regime_phase17_rollout.py"),
+        category="Deployment",
+    ),
+)
+
+
+__all__ = [
+    "REGIME_FINAL_ACCEPTANCE_ITEMS",
+    "REGIME_FINAL_ACCEPTANCE_VERSION",
+    "RegimeAcceptanceItem",
+    "RegimeAcceptanceStatus",
+    "build_regime_final_acceptance_report",
+    "regime_acceptance_is_complete",
+]

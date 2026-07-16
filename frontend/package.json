@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --configLoader native",
+    "typecheck": "tsc --noEmit",
     "build": "tsc && vite build --configLoader native",
+    "build:ci": "tsc && node scripts/vite-build-ci.mjs",
+    "test": "node --experimental-strip-types tests/V2DecisionPanel.test.ts",
     "preview": "vite preview --host 127.0.0.1 --configLoader native"
   },
   "devDependencies": {

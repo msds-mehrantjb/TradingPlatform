@@ -1,4 +1,31 @@
 import "./styles.css";
+import { API_BASE, BACKTEST_API_CANDIDATES } from "./api/client";
+import { directionalSignal, isEligibleStrategyVote, winningVoteSignal } from "./domain/tradingSignals";
+import {
+  baseRegimeSettingsFromTradingSettings,
+  buildRegimeMarketContext,
+  buildRegimeProfileModifierBreakdown,
+  buildRegimeTargetOrder,
+  calculateRegimeDecision,
+  combineRegimeProfileModifiers,
+  regimeBacktestCacheKey,
+  resolveRegimeDecision,
+  runRegimeBacktest,
+} from "./algorithms/regime";
+import type { RegimeOrderIntent, RegimePositionSizingResult, RegimeSelectionResult as RegimeCoreSelectionResult, RegimeTargetOrder } from "./algorithms/regime";
+import type { RegimeBacktestResult } from "./algorithms/regime/backtest/types";
+import { fetchWcaBaselineSettings, fetchWcaConfiguration, fetchWcaStatus, updateWcaConfiguration } from "./features/wca/api";
+import {
+  createInitialWcaState,
+  withWcaConfigurationSaved,
+  withWcaConfigurationSaveError,
+  withWcaConfigurationSaving,
+  withWcaError,
+  withWcaLoading,
+  withWcaReady,
+} from "./features/wca/state";
+import { renderWcaPanel } from "./features/wca/WcaPanel";
+import type { WcaBacktestResult, WcaDecision } from "./features/wca/types";
 
 type Timeframe = "1Min" | "3Min" | "5Min" | "15Min" | "1Hour" | "1Day";
 
@@ -365,6 +392,52 @@ type AlgoVote = {
   score?: number;
 };
 
+type VotingEnsembleBackendVote = {
+  strategy: string;
+  role: "directional" | "context";
+  family: "trend" | "breakout" | "reversal" | "mean_reversion" | "event";
+  signal: AlgoSignal;
+  direction: -1 | 0 | 1;
+  confidence: number;
+  active: boolean;
+  eligible: boolean;
+  dataReady: boolean;
+  regimeFit: number;
+  reliability: number;
+  reason: string;
+  features: Record<string, number | boolean | string>;
+};
+
+type VotingEnsembleBackendResult = {
+  algorithm_id: "voting_ensemble";
+  service_version: string;
+  symbol: string;
+  evaluated_at: string;
+  data_timestamp: string;
+  final_signal: AlgoSignal;
+  votes: VotingEnsembleBackendVote[];
+  context_signals: VotingEnsembleBackendVote[];
+  context_confirmation?: {
+    outcome: "confirms" | "weakens" | "mixed" | "not_applicable";
+    detail: string;
+    evidence: string[];
+    confirmations: number;
+    conflicts: number;
+  };
+  counts: Record<AlgoSignal, number>;
+  eligible_counts: Record<AlgoSignal, number>;
+  family_scores?: Record<string, number>;
+  base_score?: number;
+  context_adjusted_score?: number;
+  context_agreements?: number;
+  context_conflicts?: number;
+  context_adjustment_reason?: string;
+  family_support?: Record<AlgoSignal, number>;
+  safety_gate_failed?: boolean;
+  removed_voters: string[];
+  reason_codes: string[];
+};
+
 type ConfidenceStrategyKey = string;
 
 type ConfidenceStrategy = {
@@ -400,6 +473,7 @@ type ConfidenceStrategySignal = "buy" | "sell" | "hold";
 type ConfidenceStrategyDirection = -1 | 0 | 1;
 
 type ConfidenceDecisionLabel = "Strong Buy" | "Buy" | "Hold" | "Sell" | "Strong Sell";
+type PositionEffect = "enter_long" | "exit_long" | "enter_short" | "cover_short" | "none";
 
 type ConfidenceAdxRegime = "range" | "mixed" | "bullish_trend" | "bearish_trend" | "very_strong_bullish_trend" | "very_strong_bearish_trend";
 
@@ -504,9 +578,53 @@ type RegimeSelectionFeature = {
   status: "ok" | "warn" | "block" | "na";
 };
 
+type RegimeStrategyRole = "directional" | "confirmation" | "regime_context" | "safety_gate";
+type RegimeStrategyFamily =
+  | "trend_momentum"
+  | "breakout"
+  | "mean_reversion"
+  | "reversal"
+  | "gap_session_event"
+  | "confirmation"
+  | "regime_context"
+  | "safety";
+type DirectionalStrategyResult = {
+  strategyId: string;
+  family: RegimeStrategyFamily;
+  role: "directional";
+  eligible: boolean;
+  signal: AlgoSignal;
+  confidence: number;
+  quality: number;
+  effectiveWeight: number;
+  signedContribution: number;
+  timestamp: string;
+  evidence: Record<string, number | string | boolean | null>;
+  reason: string;
+  invalidReason?: string;
+};
+
 type RegimeSelectedStrategy = ConfidenceStrategyResult & {
+  quality: number;
+  effectiveWeight: number;
+  role: RegimeStrategyRole;
+  family: RegimeStrategyFamily;
+  eligible: boolean;
+  passed?: boolean;
+  blockNewEntries?: boolean;
+  timestamp: string;
+  evidence: Record<string, number | string | boolean | null>;
+  invalidReason?: string;
+  signedContribution: number;
+  directionalResult?: DirectionalStrategyResult;
   selected: boolean;
   selectorReason: string;
+  rawConfidence?: number;
+  effectiveConfidence?: number;
+  compatibilityMultiplier?: number;
+  contextMultiplier?: number;
+  reliabilityMultiplier?: number;
+  correlationPenalty?: number;
 };
 
 type RegimeSelectionScores = {
@@ -539,8 +657,16 @@ type RegimeSelectionResult = {
   buyScore: number;
   sellScore: number;
   holdScore: number;
+  winningScore: number;
+  winningDirectionScore: number;
+  signedNetScore: number;
   secondBestScore: number;
   scoreEdge: number;
+  winningDirectionEdge: number;
+  winningDirection: ConfidenceStrategySignal;
+  directionalEdge: number;
+  activeFamilyCount: number;
+  abstentionRate: number;
   normalizedNetScore: number;
   tradeAllowed: boolean;
   tradeBlockers: string[];
@@ -549,6 +675,13 @@ type RegimeSelectionResult = {
   features: RegimeSelectionFeature[];
   selectedStrategies: RegimeSelectedStrategy[];
   skippedStrategies: Array<{ name: string; reason: string }>;
+  rawClassification?: RegimeCoreSelectionResult["rawClassification"];
+  confirmedState?: RegimeCoreSelectionResult["confirmedState"];
+  routing?: RegimeCoreSelectionResult["routing"];
+  familyScores?: RegimeCoreSelectionResult["familyScores"];
+  effectiveSettings?: RegimeCoreSelectionResult["effectiveSettings"];
+  ml?: RegimeCoreSelectionResult["ml"];
+  decisionSnapshot?: RegimeCoreSelectionResult["decisionSnapshot"];
   reasons: string[];
   noTradeReasons: string[];
 };
@@ -722,127 +855,7 @@ type WeightedAlphaKey = "S1" | "S2" | "S3" | "S4" | "S5" | "S6" | "S7" | "S8";
 type WeightedAlphaStrategy = {
   key: WeightedAlphaKey;
   name: string;
-  family: "breakout" | "trend" | "reversion" | "volatility";
-};
-
-type WeightedAlphaResult = WeightedAlphaStrategy & {
-  pBuy: number;
-  pSell: number;
-  pHold: number;
-  expectedReturn: number;
-  expectedReturnAfterCosts: number;
-  signalQuality: number;
-  strength: number;
-  tradeCount: number;
-  sampleSizeScore: number;
-  recentExpectancy: number | null;
-  recentDrawdown: number;
-  drawdownScore: number;
-  baseWeight: number;
-  adjustedWeight: number;
-  finalWeight: number;
-  smoothedWeight: number;
-  recalculatedWeight: number;
-  multipliers: Record<string, number>;
-  disabledReason: string;
-  detail: string;
-};
-
-type WeightedVotingWeightState = {
-  weights: Record<WeightedAlphaKey, number>;
-  lastUpdatedDate: string;
-  source: "default" | "backtest" | "daily";
-  seededAt?: string;
-};
-
-type WeightedStrategyPerformance = {
-  tradeCount: number;
-  liveOutcomeCount: number;
-  recentOutcomes: number[];
-  recentExpectancy: number | null;
-  recentDrawdown: number;
-  pendingSignal?: {
-    side: "Buy" | "Sell";
-    entryPrice: number;
-    timestamp: string;
-    cost: number;
-    targetReturn?: number;
-    stopReturn?: number;
-    horizonBars?: number;
-  };
-};
-
-type WeightedResolvedBarrierOutcome = {
-  outcome: number;
-  label: "target" | "stop" | "time";
-  barsHeld: number;
-};
-
-type WeightedTimeframeDirection = "up" | "down" | "neutral";
-
-type WeightedTimeframeSignal = {
-  direction: WeightedTimeframeDirection;
-  score: number;
-  source: string;
-};
-
-type WeightedTimeframeContext = {
-  fiveMinute: WeightedTimeframeSignal;
-};
-
-type WeightedTripleBarrierResult = {
-  passed: boolean;
-  label: "positive" | "negative" | "neutral";
-  targetReturn: number;
-  stopReturn: number;
-  horizonBars: number;
-  expectedPathReturn: number;
-  detail: string;
-};
-
-type WeightedInitialBacktestResult = {
-  weights: Record<WeightedAlphaKey, number>;
-  performance: Record<WeightedAlphaKey, WeightedStrategyPerformance>;
-};
-
-type WeightedVoteResult = {
-  signal: AlgoSignal;
-  rawWinner: AlgoSignal;
-  buyScore: number;
-  sellScore: number;
-  holdScore: number;
-  maxScore: number;
-  margin: number;
-  expectedReturnAfterCosts: number;
-  metaLabelProbability: number;
-  tripleBarrier: WeightedTripleBarrierResult;
-  positionSize: number;
-  confidenceMultiplier: number;
-  volatilityAdjustment: number;
-  gates: { label: string; status: "pass" | "fail" | "info"; detail: string }[];
-  strategies: WeightedAlphaResult[];
-  data: {
-    latest: Candle | null;
-    vwap: number | null;
-    atr: number | null;
-    bollinger: ReturnType<typeof bollingerBands>;
-    averageVolume: number;
-    relativeStrength: number;
-    relativeStrengthSource: string;
-    breadth: number;
-    breadthSource: string;
-    eventRisk: number;
-    eventRiskSource: string;
-    trendDirection: "up" | "down" | "neutral";
-    trendSource: string;
-    volatilityLevel: string;
-    rangeCondition: string;
-    sessionLabel: string;
-    timeframes: WeightedTimeframeContext;
-    weightSource: "default" | "backtest" | "daily";
-    weightSeededAt?: string;
-    updatePolicy: string;
-  };
+  family: "breakout" | "trend" | "mean_reversion" | "reversal";
 };
 
 type BacktestTrade = {
@@ -1190,6 +1203,35 @@ type TradingRagResponse = {
 };
 
 type TradingSettings = {
+  basePositionPercent: number;
+  baseOrderAllocationPercent: number;
+  baseDailyAllocationPercent: number;
+  baseAtrStopMultiplier: number;
+  baseMinimumStopPercent: number;
+  baseTargetR: number;
+  baseMaximumHoldingMinutes: number;
+  baseParticipationPercent: number;
+  baseEntryOffsetBps: number;
+  baseSlippagePerShare: number;
+  minimumExpectedValue: number;
+  minimumModelProbability: number;
+  maximumRiskPerTradePercent: number;
+  maximumOpenRiskPercent: number;
+  maximumOrderNotionalPercent: number;
+  maximumDailyNotionalPercent: number;
+  maximumVolumeParticipationPercent: number;
+  maximumConsecutiveLosses: number;
+  maximumSpreadBps: number;
+  allowPyramiding: boolean;
+  newEntryCutoff: string;
+  minimumRiskMultiplier: number;
+  maximumRiskMultiplier: number;
+  minimumTargetR: number;
+  maximumTargetR: number;
+  minimumHoldingMinutes: number;
+  maximumHoldingMinutes: number;
+  minimumAtrStopMultiplier: number;
+  maximumAtrStopMultiplier: number;
   startingCapital: number;
   orderAllocationPercent: number;
   dailyAllocationPercent: number;
@@ -1231,6 +1273,35 @@ const defaultTradingSettings = (): TradingSettings => ({
   minimumBuyScore: 0.6,
   minimumSignalEdge: 0.2,
   baseRiskPercent: 0.25,
+  basePositionPercent: 50,
+  baseOrderAllocationPercent: 10,
+  baseDailyAllocationPercent: 50,
+  baseAtrStopMultiplier: 2,
+  baseMinimumStopPercent: 0.05,
+  baseTargetR: 1.5,
+  baseMaximumHoldingMinutes: 30,
+  baseParticipationPercent: 0.3,
+  baseEntryOffsetBps: 0,
+  baseSlippagePerShare: 0.02,
+  minimumExpectedValue: 0,
+  minimumModelProbability: 0.55,
+  maximumRiskPerTradePercent: 1,
+  maximumOpenRiskPercent: 3,
+  maximumOrderNotionalPercent: 10,
+  maximumDailyNotionalPercent: 50,
+  maximumVolumeParticipationPercent: 1,
+  maximumConsecutiveLosses: 3,
+  maximumSpreadBps: 25,
+  allowPyramiding: false,
+  newEntryCutoff: "20:45:00",
+  minimumRiskMultiplier: 0,
+  maximumRiskMultiplier: 1,
+  minimumTargetR: 1,
+  maximumTargetR: 3,
+  minimumHoldingMinutes: 1,
+  maximumHoldingMinutes: 120,
+  minimumAtrStopMultiplier: 0.5,
+  maximumAtrStopMultiplier: 4,
   maxPositionPercent: 50,
   atrStopMultiplier: 2,
   minimumStopDistancePercent: 0.05,
@@ -1258,7 +1329,6 @@ const OPENING_GRACE_EMERGENCY_RISK_MULTIPLE = 1.5;
 const FORECAST_SAFETY_LOG_STORAGE_KEY = "market-forecast-safety-decision-log-v1";
 
 const weightedTradingSettingsStorageKey = "weighted-voting-trading-settings-v1";
-const weightedTargetOrderOverridesStorageKey = "weighted-voting-target-order-overrides-v1";
 const confidenceDecisionSettingsStorageKey = "weighted-confidence-decision-settings-v1";
 const confidenceTradingSettingsStorageKey = "weighted-confidence-trading-settings-v1";
 const confidenceTargetOrderOverridesStorageKey = "weighted-confidence-target-order-overrides-v1";
@@ -1294,6 +1364,35 @@ function sanitizeTradingSettings(input: Partial<TradingSettings>, maxOrderAlloca
     minimumBuyScore: finiteOrDefault(input.minimumBuyScore, defaults.minimumBuyScore),
     minimumSignalEdge: finiteOrDefault(input.minimumSignalEdge, defaults.minimumSignalEdge),
     baseRiskPercent: finiteOrDefault(input.baseRiskPercent, defaults.baseRiskPercent),
+    basePositionPercent: finiteOrDefault(input.basePositionPercent, defaults.basePositionPercent),
+    baseOrderAllocationPercent: finiteOrDefault(input.baseOrderAllocationPercent, defaults.baseOrderAllocationPercent),
+    baseDailyAllocationPercent: finiteOrDefault(input.baseDailyAllocationPercent, defaults.baseDailyAllocationPercent),
+    baseAtrStopMultiplier: finiteOrDefault(input.baseAtrStopMultiplier, defaults.baseAtrStopMultiplier),
+    baseMinimumStopPercent: finiteOrDefault(input.baseMinimumStopPercent, defaults.baseMinimumStopPercent),
+    baseTargetR: finiteOrDefault(input.baseTargetR, defaults.baseTargetR),
+    baseMaximumHoldingMinutes: Math.max(1, Math.round(finiteOrDefault(input.baseMaximumHoldingMinutes, defaults.baseMaximumHoldingMinutes))),
+    baseParticipationPercent: finiteOrDefault(input.baseParticipationPercent, defaults.baseParticipationPercent),
+    baseEntryOffsetBps: Math.max(0, finiteOrDefault(input.baseEntryOffsetBps, defaults.baseEntryOffsetBps)),
+    baseSlippagePerShare: Math.max(0, finiteOrDefault(input.baseSlippagePerShare, defaults.baseSlippagePerShare)),
+    minimumExpectedValue: finiteOrDefault(input.minimumExpectedValue, defaults.minimumExpectedValue),
+    minimumModelProbability: clampNumber(finiteOrDefault(input.minimumModelProbability, defaults.minimumModelProbability), 0, 1),
+    maximumRiskPerTradePercent: finiteOrDefault(input.maximumRiskPerTradePercent, defaults.maximumRiskPerTradePercent),
+    maximumOpenRiskPercent: finiteOrDefault(input.maximumOpenRiskPercent, defaults.maximumOpenRiskPercent),
+    maximumOrderNotionalPercent: finiteOrDefault(input.maximumOrderNotionalPercent, defaults.maximumOrderNotionalPercent),
+    maximumDailyNotionalPercent: finiteOrDefault(input.maximumDailyNotionalPercent, defaults.maximumDailyNotionalPercent),
+    maximumVolumeParticipationPercent: finiteOrDefault(input.maximumVolumeParticipationPercent, defaults.maximumVolumeParticipationPercent),
+    maximumConsecutiveLosses: Math.max(0, Math.round(finiteOrDefault(input.maximumConsecutiveLosses, defaults.maximumConsecutiveLosses))),
+    maximumSpreadBps: Math.max(0, finiteOrDefault(input.maximumSpreadBps, defaults.maximumSpreadBps)),
+    allowPyramiding: typeof input.allowPyramiding === "boolean" ? input.allowPyramiding : defaults.allowPyramiding,
+    newEntryCutoff: typeof input.newEntryCutoff === "string" && input.newEntryCutoff ? input.newEntryCutoff : defaults.newEntryCutoff,
+    minimumRiskMultiplier: Math.max(0, finiteOrDefault(input.minimumRiskMultiplier, defaults.minimumRiskMultiplier)),
+    maximumRiskMultiplier: Math.max(0, finiteOrDefault(input.maximumRiskMultiplier, defaults.maximumRiskMultiplier)),
+    minimumTargetR: Math.max(0.01, finiteOrDefault(input.minimumTargetR, defaults.minimumTargetR)),
+    maximumTargetR: Math.max(0.01, finiteOrDefault(input.maximumTargetR, defaults.maximumTargetR)),
+    minimumHoldingMinutes: Math.max(1, Math.round(finiteOrDefault(input.minimumHoldingMinutes, defaults.minimumHoldingMinutes))),
+    maximumHoldingMinutes: Math.max(1, Math.round(finiteOrDefault(input.maximumHoldingMinutes, defaults.maximumHoldingMinutes))),
+    minimumAtrStopMultiplier: Math.max(0.01, finiteOrDefault(input.minimumAtrStopMultiplier, defaults.minimumAtrStopMultiplier)),
+    maximumAtrStopMultiplier: Math.max(0.01, finiteOrDefault(input.maximumAtrStopMultiplier, defaults.maximumAtrStopMultiplier)),
     maxPositionPercent: finiteOrDefault(input.maxPositionPercent, defaults.maxPositionPercent),
     atrStopMultiplier: finiteOrDefault(input.atrStopMultiplier, defaults.atrStopMultiplier),
     minimumStopDistancePercent: finiteOrDefault(input.minimumStopDistancePercent, defaults.minimumStopDistancePercent),
@@ -1364,6 +1463,11 @@ function clampNumber(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
 
+function riskDollarsForSignalMultiplier(accountEquity: number, baseRiskPercent: number, sizeMultiplier: number) {
+  const baselineRiskDollars = Math.max(0, accountEquity) * (Math.max(0, baseRiskPercent) / 100);
+  return baselineRiskDollars * Math.max(0, sizeMultiplier);
+}
+
 function loadWeightedTradingSettings(): TradingSettings {
   try {
     const raw = window.localStorage.getItem(weightedTradingSettingsStorageKey);
@@ -1427,19 +1531,6 @@ function loadTradingSettings(): TradingSettings {
 
 function saveTradingSettings(settings: TradingSettings) {
   window.localStorage.setItem(tradingSettingsStorageKey, JSON.stringify(sanitizeTradingSettings(settings, VOTING_MAX_ORDER_ALLOCATION_PERCENT)));
-}
-
-function loadWeightedTargetOrderOverrides(): Partial<TargetOrderSettings> {
-  try {
-    const raw = window.localStorage.getItem(weightedTargetOrderOverridesStorageKey);
-    return raw ? (JSON.parse(raw) as Partial<TargetOrderSettings>) : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveWeightedTargetOrderOverrides(overrides: Partial<TargetOrderSettings>) {
-  window.localStorage.setItem(weightedTargetOrderOverridesStorageKey, JSON.stringify(overrides));
 }
 
 function loadConfidenceTargetOrderOverrides(): Partial<TargetOrderSettings> {
@@ -1573,6 +1664,12 @@ function saveConfidenceDecisionSettings(settings: ConfidenceDecisionSettings) {
 type TargetOrderSettings = {
   symbol: string;
   side: AlgoSignal;
+  signalDirection?: AlgoSignal;
+  positionEffect?: PositionEffect;
+  orderIntent?: RegimeOrderIntent | null;
+  effectiveProfileId?: string | null;
+  currentPosition?: number;
+  requestedResultingPosition?: number;
   orderType: string;
   quantity: number;
   triggerPrice: number | null;
@@ -1633,7 +1730,6 @@ type PersistedUiState = {
   tradingSettingsExpanded?: boolean;
   votingDefaultSizingExpanded?: boolean;
   weightedTradingSettingsExpanded?: boolean;
-  weightedDefaultSizingExpanded?: boolean;
   macroExpanded?: boolean;
   fedExpanded?: boolean;
   tradingAlertsExpanded?: boolean;
@@ -1694,7 +1790,6 @@ function saveUiState() {
     tradingSettingsExpanded: state.tradingSettingsExpanded,
     votingDefaultSizingExpanded: state.votingDefaultSizingExpanded,
     weightedTradingSettingsExpanded: state.weightedTradingSettingsExpanded,
-    weightedDefaultSizingExpanded: state.weightedDefaultSizingExpanded,
     macroExpanded: state.macroExpanded,
     fedExpanded: state.fedExpanded,
     tradingAlertsExpanded: state.tradingAlertsExpanded,
@@ -1833,6 +1928,13 @@ type TradeLayerGate = {
 type ManualOrderRecommendation = {
   eligible: boolean;
   side: AlgoSignal;
+  signalDirection?: AlgoSignal;
+  positionEffect?: PositionEffect;
+  orderIntent?: RegimeOrderIntent | null;
+  effectiveProfileId?: string | null;
+  currentPosition?: number;
+  requestedResultingPosition?: number;
+  regimeSizing?: RegimePositionSizingResult;
   orderType: string;
   symbol: string;
   quantity: number;
@@ -1914,10 +2016,6 @@ type BacktestRange = {
   endDate: string;
 };
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
-const BACKTEST_API_CANDIDATES = ["http://127.0.0.1:8020", API_BASE].filter(
-  (value, index, values) => values.indexOf(value) === index,
-);
 const BROWSER_STORAGE_SNAPSHOT_INTERVAL_MS = 5 * 60_000;
 const AUTO_DAILY_ALGORITHM_BACKTESTS = false;
 const WAKE_CHECK_INTERVAL_MS = 15_000;
@@ -2044,9 +2142,10 @@ function buildDecisionRecorderSnapshot(reason: string) {
   const latest = latestExecutionCandleForMode();
   const market = confidenceMarketSnapshot();
   const voting = votingEnsembleScoreSummary();
-  const weighted = calculateWeightedVote();
-  const confidence = calculateConfidenceAggregation();
+  const weighted = weightedVotingBackendSummary();
+  const confidence = wcaBackendDecisionAsConfidenceResult();
   const regime = calculateRegimeSelection();
+  const regimeTargetOrder = buildRegimeTargetOrderRecommendation(regime);
   const meta = calculateMetaStrategy();
   const activeMode = state.tradingWindowMode;
   const candles = latestRegularSessionCandles().length ? latestRegularSessionCandles() : state.candles.slice(-DECISION_SNAPSHOT_MAX_CANDLES);
@@ -2062,14 +2161,49 @@ function buildDecisionRecorderSnapshot(reason: string) {
     activeAlgorithmLabel: algorithmDisplayName(activeMode),
     activeTargetOrder: compactTargetOrder(targetOrder),
     voting: { signal: voting.winner, scores: voting.scores },
-    weighted: { signal: weighted.signal, buyScore: weighted.buyScore, sellScore: weighted.sellScore, holdScore: weighted.holdScore, margin: weighted.margin },
+    weighted: { signal: weighted.signal, buyScore: weighted.buyScore, sellScore: weighted.sellScore, holdScore: weighted.holdScore, margin: weighted.edge },
     confidence: { signal: confidence.signal, decisionLabel: confidence.decisionLabel, normalizedNetScore: confidence.normalizedNetScore },
     regime: { signal: regime.signal, aggregateSignal: regime.aggregateSignal, confidence: regime.confidence, scoreEdge: regime.scoreEdge },
     meta: { signal: meta.signal, decisionLabel: meta.decisionLabel, netScore: meta.netScore, edge: meta.edge },
   };
+  const regimeRecorder = {
+    decisionSnapshot: regime.decisionSnapshot ?? null,
+    algorithmId: "regime",
+    algorithmVersion: regime.decisionSnapshot?.algorithmVersion ?? "regime_algorithm_v2",
+    settingsVersion: regime.decisionSnapshot?.settingsVersion ?? "regime_base_settings_v1",
+    strategyVersion: regime.decisionSnapshot?.strategyVersion ?? "regime_strategy_catalog_v2",
+    profileVersion: regime.effectiveSettings?.profileVersion ?? regime.decisionSnapshot?.profileVersion ?? "regime_profile_matrix_v1",
+    modelVersion: regime.decisionSnapshot?.modelVersion ?? null,
+    decisionId: regimeTargetOrder.orderIntent?.decisionId ?? regime.decisionSnapshot?.decisionId ?? "",
+    orderId: regimeTargetOrder.orderIntent?.decisionId ?? null,
+    symbol: state.symbol,
+    timestamp: regime.confirmedState?.timestamp ?? regime.rawClassification?.timestamp ?? latest?.timestamp ?? new Date().toISOString(),
+    dataTimestamp: regime.confirmedState?.timestamp ?? regime.rawClassification?.timestamp ?? latest?.timestamp ?? "",
+    axes: regime.rawClassification?.axes ?? null,
+    missingInputs: regime.rawClassification?.missingInputs ?? [],
+    rawClassification: regime.rawClassification ?? null,
+    confirmedState: regime.confirmedState ?? null,
+    hysteresisState: regime.confirmedState ?? null,
+    selectedStrategies: regime.selectedStrategies,
+    skippedStrategies: regime.skippedStrategies,
+    contextResults: regime.routing?.contextResults ?? [],
+    safetyResults: regime.routing?.safetyResults ?? [],
+    familyAggregation: regime.familyScores ?? [],
+    baseSettings: state.regimeTradingSettings,
+    effectiveSettings: regime.effectiveSettings ?? null,
+    ml: regime.ml ?? null,
+    mlMode: regime.ml?.mode ?? ((state.regimeTradingSettings as typeof state.regimeTradingSettings & { mlMode?: string }).mlMode ?? "shadow"),
+    mlProbabilities: regime.ml?.prediction.probabilityVector ?? null,
+    targetOrder: compactTargetOrder(regimeTargetOrder),
+    orderIntent: regimeTargetOrder.orderIntent ?? null,
+    globalGateOutcome: null,
+    brokerReconciliationResult: null,
+    backtest: regimeBacktestResult ? compactRegimeBacktestEvidence(regimeBacktestResult) : null,
+  };
 
   return {
-    version: 1,
+    version: 2,
+    schemaVersion: "decision_recorder_snapshot_v2",
     reason,
     capturedAt: new Date().toISOString(),
     sessionDate: latest ? localDateKey(latest.timestamp) : localDateKey(new Date()),
@@ -2083,7 +2217,7 @@ function buildDecisionRecorderSnapshot(reason: string) {
     marketContext: state.marketContext,
     strategyOutputs: {
       voting: voting.votes,
-      weighted: weighted.strategies,
+      weighted: weightedVotingSignalRows(),
       confidence: confidence.strategies,
       regime: {
         selectedStrategies: regime.selectedStrategies,
@@ -2093,8 +2227,10 @@ function buildDecisionRecorderSnapshot(reason: string) {
     },
     familyScores: {
       meta: meta.familyAggregation,
+      regime: regime.familyScores ?? [],
       forecast: state.marketForecast?.algorithmSignals?.familyScores ?? null,
     },
+    regime: regimeRecorder,
     ensembleVotingResult: {
       signal: voting.winner,
       eligibleCount: voting.eligibleVotes.length,
@@ -2204,19 +2340,32 @@ const META_ORDER_CONTROL_OVERRIDES_STORAGE_KEY = "trading-dashboard.meta-strateg
 const TRADE_HISTORY_ROLLOVER_STORAGE_KEY = "trading-dashboard.trade-history-rollover.v1";
 const DEFAULT_SUBMIT_MODE: SubmitOrderMode = "Automatic";
 const CONFIDENCE_BACKTEST_RESULT_STORAGE_KEY = "trading-dashboard.confidence-backtest-result.v1";
+const REGIME_BACKTEST_RESULT_STORAGE_KEY = "trading-dashboard.regime-backtest-result.v1";
+const REGIME_BACKTEST_STATUS_API_ROUTE = "/api/regime/backtests/status";
 const DAILY_BACKTEST_COMPLETION_POPUP_STORAGE_KEY = "trading-dashboard.daily-backtest-completion-popup.v1";
 const CONFIDENCE_BACKTEST_MAX_SESSIONS = 3;
 let backtestRangeCache: BacktestRange | null = null;
 let algoBacktestLoadId = 0;
 const storedConfidenceBacktest = loadStoredConfidenceBacktest();
+const storedRegimeBacktest = loadStoredRegimeBacktest();
 let confidenceBacktestCache: { key: string; result: BacktestResult } | null = storedConfidenceBacktest
   ? { key: storedConfidenceBacktest.key, result: storedConfidenceBacktest.result }
+  : null;
+let regimeBacktestCache: { key: string; result: RegimeBacktestResult } | null = storedRegimeBacktest
+  ? { key: storedRegimeBacktest.key, result: storedRegimeBacktest.result }
   : null;
 let confidenceBacktestStatus: "idle" | "waiting" | "running" | "ready" | "error" = storedConfidenceBacktest ? "ready" : "idle";
 let confidenceBacktestResult: BacktestResult | null = storedConfidenceBacktest?.result ?? null;
 let confidenceBacktestError = "";
+let regimeBacktestStatus: "idle" | "waiting" | "running" | "ready" | "error" = storedRegimeBacktest ? "ready" : "idle";
+let regimeBacktestResult: RegimeBacktestResult | null = storedRegimeBacktest?.result ?? null;
+let regimeBacktestError = "";
+let wcaPresentationState = createInitialWcaState();
+let wcaPresentationRefreshInFlight = false;
+let latestWcaBackendBacktestResult: WcaBacktestResult | null = null;
 let lastConfirmedRegimeCondition: RegimeConditionSnapshot | null = null;
 let confidenceBacktestAutoRunKey = "";
+let regimeBacktestAutoRunKey = "";
 let confidenceBacktestDatasetCheckInFlight = false;
 let confidenceBacktestNextDatasetCheckAt = 0;
 let dailyAlgorithmBacktestsInFlight = false;
@@ -2488,11 +2637,11 @@ const weightedAlphaStrategies: WeightedAlphaStrategy[] = [
   { key: "S1", name: "Opening Range Breakout", family: "breakout" },
   { key: "S2", name: "First Pullback After Open", family: "trend" },
   { key: "S3", name: "VWAP Trend Continuation", family: "trend" },
-  { key: "S4", name: "VWAP Mean Reversion", family: "reversion" },
-  { key: "S5", name: "Failed Breakout Reversal", family: "reversion" },
-  { key: "S6", name: "Liquidity Sweep Reversal", family: "reversion" },
-  { key: "S7", name: "Bollinger/ATR Reversion", family: "reversion" },
-  { key: "S8", name: "Volatility Breakout", family: "volatility" },
+  { key: "S4", name: "VWAP Mean Reversion", family: "mean_reversion" },
+  { key: "S5", name: "Failed Breakout Reversal", family: "reversal" },
+  { key: "S6", name: "Liquidity Sweep Reversal", family: "reversal" },
+  { key: "S7", name: "Bollinger/ATR Reversion", family: "mean_reversion" },
+  { key: "S8", name: "Volatility Breakout", family: "breakout" },
 ];
 
 const confidenceBaseWeights = {
@@ -2563,29 +2712,14 @@ const metaStrategyCatalog: MetaStrategyDefinition[] = [
   { name: "Volume Confirmation", role: "context", family: "volume_confirmation", source: "confidence" },
   { name: "ADX Trend Strength Filter", role: "context", family: "market_regime", source: "confidence" },
   { name: "ATR Volatility Regime", role: "context", family: "market_regime", source: "confidence" },
-  { name: "Ensemble Strategy Voting", role: "meta_safety", family: "safety", source: "ensemble" },
   { name: "Cash / Avoid Trading Filter", role: "meta_safety", family: "safety", source: "confidence" },
 ];
 
-const weightedVotingStorageKey = "weighted-voting-daily-weights-short-cycle-v5";
-const weightedStrategyPerformanceStorageKey = "weighted-strategy-performance-short-cycle-v5";
-const WEIGHTED_BROWSER_BACKTEST_BOOTSTRAP_ENABLED = false;
-const weightedMinimumTradesForFullWeight = 40;
-const weightedVotingDefaultWeights: Record<WeightedAlphaKey, number> = {
-  S1: 0.125,
-  S2: 0.125,
-  S3: 0.125,
-  S4: 0.125,
-  S5: 0.125,
-  S6: 0.125,
-  S7: 0.125,
-  S8: 0.125,
-};
-
 const weightedRelativeStrengthSymbols = ["QQQ", "IWM"];
-const weightedSectorEtfSymbols: string[] = [];
+const weightedSectorEtfSymbols = ["XLK", "XLF", "XLV", "XLY", "XLP", "XLI", "XLE", "XLU", "XLB", "XLRE", "XLC"];
 const weightedSpyBasketSampleSymbols: string[] = [];
 const weightedAuxiliarySymbols = [...weightedRelativeStrengthSymbols, ...weightedSectorEtfSymbols, ...weightedSpyBasketSampleSymbols];
+const weightedBreadthProxySymbols = Array.from(new Set([...weightedSectorEtfSymbols, ...weightedSpyBasketSampleSymbols]));
 const weightedSpyContextTimeframes = ["1Min", "5Min"] as const;
 type WeightedSpyContextTimeframe = (typeof weightedSpyContextTimeframes)[number];
 
@@ -2623,6 +2757,10 @@ const state = {
   algoBacktestResult: null as BacktestResult | null,
   algoBacktestStatus: "loading",
   algoBacktestWarning: "",
+  votingEnsembleBackend: null as VotingEnsembleBackendResult | null,
+  votingEnsembleBackendStatus: "idle" as "idle" | "loading" | "ready" | "error",
+  votingEnsembleBackendWarning: "",
+  votingEnsembleBackendKey: "",
   algoIntradayTradesExpanded:
     persistedUiState.algoIntradayTradesExpanded ?? ["1Min", "5Min"].includes(visibleAlgoBacktestTimeframe(persistedUiState.algoBacktestTimeframe)),
   algoVotesExpanded: persistedUiState.algoVotesExpanded ?? false,
@@ -2680,8 +2818,6 @@ const state = {
   votingDefaultSizingExpanded: persistedUiState.votingDefaultSizingExpanded ?? false,
   weightedTradingSettings: loadWeightedTradingSettings(),
   weightedTradingSettingsExpanded: persistedUiState.weightedTradingSettingsExpanded ?? false,
-  weightedDefaultSizingExpanded: persistedUiState.weightedDefaultSizingExpanded ?? false,
-  weightedTargetOrderOverrides: loadWeightedTargetOrderOverrides(),
   confidenceTargetOrderOverrides: loadConfidenceTargetOrderOverrides(),
   regimeTargetOrderOverrides: loadRegimeTargetOrderOverrides(),
   metaTargetOrderOverrides: loadMetaTargetOrderOverrides(),
@@ -2841,7 +2977,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           </div>
           <div class="zoom-control" aria-label="Chart zoom">
             <button id="zoomOutButton" class="icon-button" title="Zoom out" aria-label="Zoom out">-</button>
-            <button id="zoomResetButton" class="icon-button reset-zoom-button" title="Reset zoom" aria-label="Reset zoom">⟲</button>
+            <button id="zoomResetButton" class="icon-button reset-zoom-button" title="Reset zoom" aria-label="Reset zoom">&#8635;</button>
             <span id="zoomLevel" class="zoom-level" aria-live="polite">100%</span>
             <button id="zoomInButton" class="icon-button" title="Zoom in" aria-label="Zoom in">+</button>
           </div>
@@ -2859,7 +2995,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
             <button id="rangeButton" class="tool-button" title="Load range">Load</button>
             <span class="range-actions">
               <button id="latestButton" class="icon-button" title="Latest" aria-label="Latest">>|</button>
-              <button id="refreshButton" class="icon-button reset-zoom-button" title="Refresh" aria-label="Refresh">⟲</button>
+              <button id="refreshButton" class="icon-button reset-zoom-button" title="Refresh" aria-label="Refresh">&#8635;</button>
             </span>
           </div>
           <div class="symbol-control">
@@ -3040,7 +3176,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
               <div class="section-title">SPY News</div>
               <strong id="newsFeedSummary">Loading headlines</strong>
             </div>
-            <button id="newsFeedRefreshButton" class="icon-button news-refresh" type="button" aria-label="Refresh SPY news">R</button>
+            <button id="newsFeedRefreshButton" class="icon-button news-refresh" type="button" aria-label="Refresh SPY news">&#8635;</button>
           </div>
           <div id="newsFeedList" class="news-feed-list" aria-live="polite"></div>
           <div id="newsFeedSources" class="news-source-list"></div>
@@ -3097,7 +3233,7 @@ leftRail.innerHTML = `
         </div>
         <div id="algoVoteCounts" class="algo-vote-grid"></div>
         <div id="algoResultsBody" class="algo-rule-list"></div>
-        <div id="algoTradePlanTitle" class="algo-section-title">Trades</div>
+        <div id="algoTradePlanTitle" class="algo-section-title">Trading Decision</div>
         <div id="algoTradePlan" class="algo-rule-list"></div>
         <div class="algo-table-wrap">
           <table class="algo-trade-table">
@@ -3183,6 +3319,7 @@ leftRail.innerHTML = `
         <div class="algo-header">
           <div id="confidenceFinalSignal" class="algo-final hold">Hold</div>
         </div>
+        <div id="wcaPresentationPanel" class="wca-presentation-mount"></div>
         <div id="confidenceScoreGrid" class="weighted-score-grid"></div>
         <div id="confidenceSummary" class="algo-rule-list weighted-summary"></div>
         <div id="confidenceTradingSettingsMount" class="algo-stable-settings"></div>
@@ -3225,7 +3362,32 @@ leftRail.innerHTML = `
         </div>
         <div id="regimeScoreGrid" class="weighted-score-grid"></div>
         <div id="regimeSummary" class="algo-rule-list weighted-summary"></div>
+        <div id="regimeConditionPanel" class="regime-detail-panel"></div>
+        <div id="regimeRoutingPanel" class="regime-detail-panel"></div>
+        <div id="regimeDecisionPanel" class="regime-detail-panel"></div>
         <div id="regimeTradingSettingsMount" class="algo-stable-settings"></div>
+        <div id="regimeMlPanel" class="regime-detail-panel"></div>
+        <div id="regimeGlobalGatesPanel" class="regime-detail-panel"></div>
+        <div class="confidence-backtest-panel">
+          <div class="confidence-backtest-head">
+            <div class="algo-section-title">Dedicated Regime Backtest</div>
+            <span id="regimeBacktestStatusLabel" class="confidence-backtest-status">Daily closed-market run</span>
+          </div>
+          <div id="regimeBacktestSummary" class="algo-rule-list confidence-backtest-summary"></div>
+          <div class="algo-table-wrap confidence-backtest-table-wrap">
+            <table class="algo-trade-table">
+              <thead>
+                <tr>
+                  <th>Side</th>
+                  <th>Entry</th>
+                  <th>Exit</th>
+                  <th>P/L</th>
+                </tr>
+              </thead>
+              <tbody id="regimeBacktestTradesTable"></tbody>
+            </table>
+          </div>
+        </div>
         <button id="regimeIndicatorsToggle" class="algo-expand-toggle regime-indicators-toggle" type="button" aria-expanded="true" aria-controls="regimeFeatureGrid">
           <span>Market Indicators</span>
           <strong id="regimeIndicatorsToggleMeta">0 indicators</strong>
@@ -3494,7 +3656,7 @@ summaryShell.innerHTML = `
         <div class="section-title">Summary</div>
         <strong id="tradeSummaryHeadline">Loading trade conclusion</strong>
       </div>
-      <button id="tradeSummaryRefreshButton" class="icon-button news-refresh" type="button" aria-label="Refresh trade summary">R</button>
+      <button id="tradeSummaryRefreshButton" class="icon-button news-refresh" type="button" aria-label="Refresh trade summary">&#8635;</button>
     </div>
     <div id="tradeSummaryStatus" class="summary-status"></div>
     <div id="tradeSummaryBody" class="summary-body" aria-live="polite"></div>
@@ -3671,6 +3833,7 @@ const confidenceFinalSignal = document.querySelector<HTMLDivElement>("#confidenc
 const confidenceScoreGrid = document.querySelector<HTMLDivElement>("#confidenceScoreGrid")!;
 const confidenceSummary = document.querySelector<HTMLDivElement>("#confidenceSummary")!;
 const confidenceTradingSettingsMount = document.querySelector<HTMLDivElement>("#confidenceTradingSettingsMount")!;
+const wcaPresentationPanel = document.querySelector<HTMLDivElement>("#wcaPresentationPanel")!;
 const confidenceBacktestStatusLabel = document.querySelector<HTMLSpanElement>("#confidenceBacktestStatusLabel")!;
 const confidenceBacktestSummary = document.querySelector<HTMLDivElement>("#confidenceBacktestSummary")!;
 const confidenceBacktestTradesTable = document.querySelector<HTMLTableSectionElement>("#confidenceBacktestTradesTable")!;
@@ -3685,7 +3848,15 @@ const confidenceStrategiesList = document.querySelector<HTMLDivElement>("#confid
 const regimeFinalSignal = document.querySelector<HTMLDivElement>("#regimeFinalSignal")!;
 const regimeScoreGrid = document.querySelector<HTMLDivElement>("#regimeScoreGrid")!;
 const regimeSummary = document.querySelector<HTMLDivElement>("#regimeSummary")!;
+const regimeConditionPanel = document.querySelector<HTMLDivElement>("#regimeConditionPanel")!;
+const regimeRoutingPanel = document.querySelector<HTMLDivElement>("#regimeRoutingPanel")!;
+const regimeDecisionPanel = document.querySelector<HTMLDivElement>("#regimeDecisionPanel")!;
 const regimeTradingSettingsMount = document.querySelector<HTMLDivElement>("#regimeTradingSettingsMount")!;
+const regimeMlPanel = document.querySelector<HTMLDivElement>("#regimeMlPanel")!;
+const regimeGlobalGatesPanel = document.querySelector<HTMLDivElement>("#regimeGlobalGatesPanel")!;
+const regimeBacktestStatusLabel = document.querySelector<HTMLSpanElement>("#regimeBacktestStatusLabel")!;
+const regimeBacktestSummary = document.querySelector<HTMLDivElement>("#regimeBacktestSummary")!;
+const regimeBacktestTradesTable = document.querySelector<HTMLTableSectionElement>("#regimeBacktestTradesTable")!;
 const regimeIndicatorsToggle = document.querySelector<HTMLButtonElement>("#regimeIndicatorsToggle")!;
 const regimeIndicatorsToggleMeta = document.querySelector<HTMLElement>("#regimeIndicatorsToggleMeta")!;
 const regimeIndicatorsToggleIcon = document.querySelector<HTMLElement>("#regimeIndicatorsToggleIcon")!;
@@ -4338,40 +4509,35 @@ function handleTradingSettingChange(event: Event) {
 document.addEventListener("input", handleTradingSettingChange);
 document.addEventListener("change", handleTradingSettingChange);
 
-function handleWeightedTradingSettingChange(event: Event) {
-  const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-weighted-trading-setting]");
-  if (!input) {
+async function handleWeightedConfigSettingChange(event: Event) {
+  const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-weighted-config-setting]");
+  if (!input || event.type === "input" || input.value.trim() === "") {
     return;
   }
-  const key = input.dataset.weightedTradingSetting as keyof TradingSettings | undefined;
-  if (!key || key === "positionSizingMode") {
-    return;
-  }
-  const shouldRerender = event.type !== "input" || input.type === "checkbox";
-  if (key === "useDefaultSizingSettings" || key === "pyramidingEnabled") {
-    state.weightedTradingSettings = sanitizeTradingSettings({ ...state.weightedTradingSettings, [key]: input.checked });
-    saveWeightedTradingSettings(state.weightedTradingSettings);
-    if (shouldRerender) {
-      updateWeightedVotingPanel();
-    }
-    return;
-  }
-  if (input.value.trim() === "") {
+  const key = input.dataset.weightedConfigSetting;
+  if (!key) {
     return;
   }
   const value = Number(input.value);
   if (!Number.isFinite(value)) {
     return;
   }
-  state.weightedTradingSettings = sanitizeTradingSettings({ ...state.weightedTradingSettings, [key]: value });
-  saveWeightedTradingSettings(state.weightedTradingSettings);
-  if (shouldRerender) {
+  try {
+    weightedVotingBackendState.status = "loading";
+    weightedVotingBackendState.config = await fetchWeightedVotingJson("/config", {
+      method: "PUT",
+      body: JSON.stringify({ [key]: value }),
+    });
+    weightedVotingBackendState.requestKey = "";
+    await refreshWeightedVotingBackendClient({ force: true });
+  } catch (error) {
+    weightedVotingBackendState.status = "error";
+    weightedVotingBackendState.warning = error instanceof Error ? error.message : "Weighted Voting config update failed";
     updateWeightedVotingPanel();
   }
 }
 
-document.addEventListener("input", handleWeightedTradingSettingChange);
-document.addEventListener("change", handleWeightedTradingSettingChange);
+document.addEventListener("change", handleWeightedConfigSettingChange);
 
 function handleConfidenceTradingSettingChange(event: Event) {
   const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-confidence-trading-setting]");
@@ -4457,6 +4623,18 @@ document.addEventListener("click", (event) => {
   if (regimeTradingSettingsToggle) {
     state.regimeTradingSettingsExpanded = !state.regimeTradingSettingsExpanded;
     saveUiState();
+    updateRegimeSelectionPanel();
+    return;
+  }
+  const regimeResetBaselineDefaults = (event.target as HTMLElement).closest<HTMLButtonElement>("#regimeResetBaselineDefaults");
+  if (regimeResetBaselineDefaults) {
+    state.regimeTradingSettings = sanitizeTradingSettings(defaultTradingSettings(), REGIME_MAX_ORDER_ALLOCATION_PERCENT);
+    saveRegimeTradingSettings(state.regimeTradingSettings);
+    updateRegimeSelectionPanel();
+    return;
+  }
+  const regimeResetProfileMatrixDefaults = (event.target as HTMLElement).closest<HTMLButtonElement>("#regimeResetProfileMatrixDefaults");
+  if (regimeResetProfileMatrixDefaults) {
     updateRegimeSelectionPanel();
     return;
   }
@@ -4552,48 +4730,6 @@ function clearRecommendedTargetOverrides() {
 
 document.addEventListener("input", handleTargetSettingInput);
 document.addEventListener("change", handleTargetSettingInput);
-
-function handleWeightedTargetSettingInput(event: Event) {
-  const input = (event.target as HTMLElement).closest<HTMLInputElement | HTMLSelectElement>("[data-weighted-target-setting]");
-  if (!input) {
-    return;
-  }
-  if (event.type === "input" && input instanceof HTMLInputElement) {
-    return;
-  }
-  const key = input.dataset.weightedTargetSetting as keyof TargetOrderSettings | undefined;
-  if (!key) {
-    return;
-  }
-  if (isRecommendedTargetSetting(key)) {
-    updateWeightedVotingPanel();
-    return;
-  }
-  const numericKeys = new Set<keyof TargetOrderSettings>([
-    "quantity",
-    "triggerPrice",
-    "limitPrice",
-    "stopPrice",
-    "targetPrice",
-    "accountBalance",
-    "orderLimitDollars",
-    "dailyLimitDollars",
-    "riskDollars",
-    "orderNotional",
-    "plannedStopRiskDollars",
-    "estimatedSlippage",
-  ]);
-  const nextValue = numericKeys.has(key) ? Number(input.value) : input.value;
-  if (numericKeys.has(key) && !Number.isFinite(nextValue as number)) {
-    return;
-  }
-  state.weightedTargetOrderOverrides = { ...state.weightedTargetOrderOverrides, [key]: nextValue };
-  saveWeightedTargetOrderOverrides(state.weightedTargetOrderOverrides);
-  updateWeightedVotingPanel();
-}
-
-document.addEventListener("input", handleWeightedTargetSettingInput);
-document.addEventListener("change", handleWeightedTargetSettingInput);
 
 function handleConfidenceTargetSettingInput(event: Event) {
   const input = (event.target as HTMLElement).closest<HTMLInputElement | HTMLSelectElement>("[data-confidence-target-setting]");
@@ -4826,16 +4962,6 @@ document.addEventListener("click", (event) => {
   updateWeightedVotingPanel();
 });
 
-document.addEventListener("click", (event) => {
-  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("#weightedDefaultSizingToggle");
-  if (!button) {
-    return;
-  }
-  state.weightedDefaultSizingExpanded = !state.weightedDefaultSizingExpanded;
-  saveUiState();
-  updateWeightedVotingPanel();
-});
-
 canvas.addEventListener("mousemove", (event) => {
   if (isDragging) {
     return;
@@ -5001,9 +5127,6 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
   drawChart();
   void loadMarketForecast({ refresh: false });
   void loadWeightedMarketData({ refresh: shouldRefresh });
-  if (WEIGHTED_BROWSER_BACKTEST_BOOTSTRAP_ENABLED) {
-    void ensureWeightedInitialWeightsFromBacktest();
-  }
   void maybeRunDailyAlgorithmBacktests("candles");
   if (state.algoBacktestTimeframe !== "Trading") {
     scheduleVisibleContextUpdate(0);
@@ -5254,14 +5377,15 @@ async function refreshVotingEnsembleTradingOnNewCandle(timestamp: string) {
 
 async function fetchTradingRag() {
   const range = await getBacktestRange();
+  await ensureVotingEnsembleBackendDecision();
   const votes = strategyEnsembleSignals(state.marketContext);
-  const eligibleVotes = votes.filter(isEligibleStrategyVote);
+  const eligibleCounts = state.votingEnsembleBackend?.eligible_counts;
   const voteCounts = {
-    buy: eligibleVotes.filter((vote) => vote.signal === "Buy").length,
-    sell: eligibleVotes.filter((vote) => vote.signal === "Sell").length,
-    hold: eligibleVotes.filter((vote) => vote.signal === "Hold").length,
+    buy: eligibleCounts?.Buy ?? 0,
+    sell: eligibleCounts?.Sell ?? 0,
+    hold: eligibleCounts?.Hold ?? 0,
   };
-  const winner = winningVoteSignal(voteCounts.buy, voteCounts.sell, voteCounts.hold);
+  const winner = state.votingEnsembleBackend?.final_signal ?? "Hold";
   const payload = {
     symbol: state.symbol,
     startDate: range.startDate,
@@ -6540,6 +6664,7 @@ async function loadMarketContext(options: { showLoading?: boolean; refresh?: boo
   }
 
   updateMarketContext();
+  void ensureVotingEnsembleBackendDecision({ force: true });
 }
 
 function updateSpyNews() {
@@ -7835,8 +7960,10 @@ function archiveRowsForMode(mode: TradingWindowMode) {
     backtest:
       mode === "meta"
         ? null
-        : mode === "confidence" || mode === "regime"
-        ? compactBacktestEvidence(confidenceBacktestResult, mode === "regime" ? "Regime backtest" : "WCA backtest")
+        : mode === "regime"
+        ? compactRegimeBacktestEvidence(regimeBacktestResult)
+        : mode === "confidence"
+        ? compactBacktestEvidence(confidenceBacktestResult, "WCA backtest")
         : mode === "weighted"
           ? null
           : compactBacktestEvidence(state.algoBacktestResult, "Voting Ensemble backtest"),
@@ -8340,7 +8467,7 @@ function dayAverageVwapExtension(latestPrice: number) {
 
 function forecastBuySafetyBlockers(mode: TradingWindowMode, latestPrice: number, timestamp?: string | null) {
   const forecast = activeReadyMarketForecast();
-  if (!forecast || !["ensemble", "weighted", "confidence", "regime", "meta"].includes(mode)) {
+  if (!forecast || !["ensemble", "weighted", "regime", "meta"].includes(mode)) {
     return [] as string[];
   }
   const blockers: string[] = [];
@@ -8389,7 +8516,7 @@ function forecastStopOverrideKeepReason(
   timestamp?: string | null,
 ) {
   const forecast = activeReadyMarketForecast();
-  if (!forecast || !["ensemble", "weighted", "confidence", "regime"].includes(mode)) {
+  if (!forecast || !["ensemble", "weighted", "regime"].includes(mode)) {
     return "";
   }
   const currentLoss = currentDailyLossDollars(mode, latestPrice, timestamp);
@@ -8599,86 +8726,8 @@ function maybeAutoSubmitTargetOrder() {
   }
 }
 
-function maybeAutoSubmitWeightedTargetOrder() {
-  if (automaticSubmitInFlight) {
-    return;
-  }
-  const latest = latestExecutionCandleForMode("weighted");
-  const order = state.currentWeightedTargetOrder;
-  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitTrades()) {
-    return;
-  }
-  if (order.side !== "Buy") {
-    return;
-  }
-  if (automaticTradeAlreadySubmittedForCandle("weighted", latest)) {
-    return;
-  }
-  const executionPrice = targetOrderExecutionPrice(order, latest.close);
-  const position = summarizePositionFromTradeHistory(latest.close, latest.close, "weighted");
-  const quantity = automaticOrderQuantity(order, position, "weighted");
-  const rejection = automaticOrderRejectionReason(order, position, quantity, executionPrice, "weighted");
-  if (rejection) {
-    return;
-  }
-  const key = automaticOrderKeyForMode("weighted", order, quantity, executionPrice);
-  if (state.autoSubmittedOrderKeys.includes(key)) {
-    return;
-  }
-
-  automaticSubmitInFlight = true;
-  try {
-    appendTradeHistory("Buy", quantity, executionPrice, undefined, "weighted", {
-      submitMode: "Automatic",
-      trigger: "Weighted Voting target order",
-    });
-    rememberAutoSubmittedOrderKey(key);
-    updateWeightedVotingPanel();
-    updateQuoteCard(latest);
-  } finally {
-    automaticSubmitInFlight = false;
-  }
-}
-
 function maybeAutoSubmitConfidenceTargetOrder() {
-  if (automaticSubmitInFlight) {
-    return;
-  }
-  const latest = latestExecutionCandleForMode("confidence");
-  const order = state.currentConfidenceTargetOrder;
-  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitTrades()) {
-    return;
-  }
-  if (order.side !== "Buy") {
-    return;
-  }
-  if (automaticTradeAlreadySubmittedForCandle("confidence", latest)) {
-    return;
-  }
-  const executionPrice = targetOrderExecutionPrice(order, latest.close);
-  const position = summarizePositionFromTradeHistory(latest.close, latest.close, "confidence");
-  const quantity = automaticOrderQuantity(order, position, "confidence");
-  const rejection = automaticOrderRejectionReason(order, position, quantity, executionPrice, "confidence");
-  if (rejection) {
-    return;
-  }
-  const key = automaticOrderKeyForMode("confidence", order, quantity, executionPrice);
-  if (state.autoSubmittedOrderKeys.includes(key)) {
-    return;
-  }
-
-  automaticSubmitInFlight = true;
-  try {
-    appendTradeHistory("Buy", quantity, executionPrice, undefined, "confidence", {
-      submitMode: "Automatic",
-      trigger: "WCA target order",
-    });
-    rememberAutoSubmittedOrderKey(key);
-    updateConfidenceAggregationPanel();
-    updateQuoteCard(latest);
-  } finally {
-    automaticSubmitInFlight = false;
-  }
+  return;
 }
 
 function maybeAutoSubmitRegimeTargetOrder() {
@@ -8727,7 +8776,6 @@ function maybeAutoSubmitAllAlgorithms() {
     return;
   }
   maybeAutoSubmitTargetOrder();
-  maybeAutoSubmitWeightedTargetOrder();
   maybeAutoSubmitConfidenceTargetOrder();
   maybeAutoSubmitRegimeTargetOrder();
   maybeAutoSubmitOpenOrderControls();
@@ -8788,13 +8836,9 @@ function specificLotRealizedPnl(mode: TradingWindowMode = state.tradingWindowMod
 function lotOrderTemplate(lot: OpenOrderLot, latestPrice: number, mode: TradingWindowMode = state.tradingWindowMode): LotOrderTemplate {
   const targetOrder = targetOrderForMode(mode);
   const settings = tradingSettingsForMode(mode);
-  const weightedDefaults = mode === "weighted" ? weightedDefaultSizingSettings() : null;
   const shouldSell = Boolean(targetOrder?.eligible && targetOrder.side === "Sell" && isActiveTargetOrder(targetOrder));
   const atr = mode === "weighted" ? averageTrueRange(latestRegularSessionCandles(), 14) ?? 0 : 0;
-  const weightedStopDistance = weightedDefaults
-    ? defaultSizingStopDistance(weightedDefaults, lot.entryPrice, atr)
-    : 0;
-  const riskPerShare = weightedDefaults ? weightedStopDistance : tradingSettingsStopDistance(settings, lot.entryPrice, atr);
+  const riskPerShare = tradingSettingsStopDistance(settings, lot.entryPrice, atr);
   const fallbackStop = roundNumber(lot.entryPrice - riskPerShare, 2);
   const fallbackTarget = roundNumber(lot.entryPrice + riskPerShare * settings.takeProfitR, 2);
   const triggerPrice = shouldSell && targetOrder?.triggerPrice !== null && targetOrder?.triggerPrice !== undefined
@@ -8809,13 +8853,8 @@ function lotOrderTemplate(lot: OpenOrderLot, latestPrice: number, mode: TradingW
   const targetPrice = shouldSell && targetOrder?.targetPrice !== null && targetOrder?.targetPrice !== undefined
     ? targetOrder.targetPrice
     : fallbackTarget;
-  const riskDollars = weightedDefaults ? settings.startingCapital * (weightedDefaults.baseRiskPercent / 100) : targetOrder?.riskDollars ?? 0;
-  const maxPositionShares = weightedDefaults ? Math.max(1, Math.floor((settings.startingCapital * (weightedDefaults.maxPositionPercent / 100)) / Math.max(lot.entryPrice, 0.01))) : lot.remainingQuantity;
-  const participationShares = weightedDefaults
-    ? Math.max(1, Math.floor((latestExecutionCandleForMode(mode)?.volume ?? 0) * (weightedDefaults.maxParticipationPercent / 100)))
-    : lot.remainingQuantity;
-  const maxAllowedShares = weightedDefaults?.maxAllowedShares ? weightedDefaults.maxAllowedShares : Number.MAX_SAFE_INTEGER;
-  const defaultQuantity = Math.max(0, Math.min(lot.remainingQuantity, maxPositionShares, participationShares, maxAllowedShares));
+  const riskDollars = targetOrder?.riskDollars ?? 0;
+  const defaultQuantity = Math.max(0, lot.remainingQuantity);
   const plannedStopRiskDollars = roundNumber(defaultQuantity * Math.max(0, lot.entryPrice - stopPrice), 2);
 
   const baseTemplate: LotOrderTemplate = {
@@ -9252,9 +9291,7 @@ function submitOpenOrderLot(lotId: string, automatic: boolean, mode: TradingWind
       ? regimeDefaultSizingSettings().maxDailyTrades
       : mode === "confidence"
       ? confidenceDefaultSizingSettings().maxDailyTrades
-      : mode === "weighted"
-        ? weightedDefaultSizingSettings().maxDailyTrades
-        : tradingSettingsForMode(mode).maxTradesPerDay;
+      : tradingSettingsForMode(mode).maxTradesPerDay;
   if (automatic && effectiveTodaysTradeCount(mode, maxTradesPerDay, latest.close) >= maxTradesPerDay) {
     return;
   }
@@ -9333,9 +9370,7 @@ function automaticOrderRejectionReason(
       ? regimeDefaultSizingSettings().pyramidingEnabled
       : mode === "confidence"
       ? confidenceDefaultSizingSettings().pyramidingEnabled
-      : mode === "weighted"
-        ? weightedDefaultSizingSettings().pyramidingEnabled
-        : state.tradingSettings.pyramidingEnabled;
+      : tradingSettingsForMode(mode).pyramidingEnabled;
   if (order.side === "Buy" && position.shares > 0 && !pyramidingEnabled) {
     return "Automatic buy blocked while a position is already open";
   }
@@ -9361,9 +9396,7 @@ function automaticOrderRejectionReason(
       ? regimeDefaultSizingSettings().maxDailyTrades
       : mode === "confidence"
       ? confidenceDefaultSizingSettings().maxDailyTrades
-      : mode === "weighted"
-        ? weightedDefaultSizingSettings().maxDailyTrades
-        : tradingSettingsForMode(mode).maxTradesPerDay;
+      : tradingSettingsForMode(mode).maxTradesPerDay;
   if (effectiveTodaysTradeCount(mode, maxTradesPerDay, executionPrice) >= maxTradesPerDay) {
     return "Max trades/day reached";
   }
@@ -9594,6 +9627,10 @@ function compactTargetOrder(order: ManualOrderRecommendation | null): Partial<Ma
   return {
     eligible: order.eligible,
     side: order.side,
+    signalDirection: order.signalDirection,
+    positionEffect: order.positionEffect,
+    orderIntent: order.orderIntent,
+    effectiveProfileId: order.effectiveProfileId,
     orderType: order.orderType,
     symbol: order.symbol,
     quantity: order.quantity,
@@ -9630,6 +9667,21 @@ function compactBacktestEvidence(backtest: BacktestResult | null, label: string)
   };
 }
 
+function compactRegimeBacktestEvidence(backtest: RegimeBacktestResult | null): OrderEvidenceSnapshot["backtest"] {
+  if (!backtest) {
+    return null;
+  }
+  return {
+    label: "Regime backtest",
+    timeframe: "1Min",
+    range: `${backtest.candles} candles`,
+    trades: backtest.trades.length,
+    pnl: roundNumber(backtest.totalPnl, 2),
+    profitFactor: null,
+    winRate: backtest.trades.length ? roundNumber(backtest.trades.filter((trade) => trade.pnl > 0).length / backtest.trades.length, 4) : 0,
+  };
+}
+
 function mlArtifactEvidence(): OrderEvidenceSnapshot["mlArtifact"] {
   const best = state.dynamicArtifact?.mlComparison?.bestByTimeframe?.[0] ?? state.mlComparison?.bestByTimeframe?.[0];
   return {
@@ -9656,26 +9708,35 @@ function decisionEvidence(mode: TradingWindowMode, order: ManualOrderRecommendat
     };
   }
   if (mode === "weighted") {
-    const result = calculateWeightedVote();
+    const result = weightedVotingBackendSummary();
+    const signals = weightedVotingSignalRows();
+    const gates = weightedVotingGateRows();
     return {
       winner: result.signal,
-      weighted: `${result.signal} score ${result.maxScore.toFixed(2)}, margin ${result.margin.toFixed(2)}, size ${formatProbability(result.positionSize)}`,
-      strategies: result.strategies
+      weighted: `${result.signal} score ${result.winnerScore.toFixed(2)}, edge ${result.edge.toFixed(2)} from backend`,
+      strategies: signals
         .slice(0, 5)
         .map(
-          (strategy) =>
-            `${strategy.name}: B ${formatProbability(strategy.pBuy)} / S ${formatProbability(strategy.pSell)} / H ${formatProbability(strategy.pHold)} strength ${formatProbability(strategy.strength)}`,
+          (strategy) => {
+            const probabilities = childRecord(strategy, "probabilities");
+            const name = stringFromUnknown(strategy.name ?? strategy.strategy_name ?? strategy.strategyName ?? strategy.strategy_id ?? strategy.strategyId, "Weighted strategy");
+            const buy = numberFromUnknown(strategy.buy_probability ?? strategy.buyProbability ?? probabilities?.buy, 0);
+            const sell = numberFromUnknown(strategy.sell_probability ?? strategy.sellProbability ?? probabilities?.sell, 0);
+            const hold = numberFromUnknown(strategy.hold_probability ?? strategy.holdProbability ?? probabilities?.hold, 0);
+            const strength = numberFromUnknown(strategy.signal_strength ?? strategy.signalStrength, 0);
+            return `${name}: B ${formatProbability(buy)} / S ${formatProbability(sell)} / H ${formatProbability(hold)} strength ${formatProbability(strength)}`;
+          },
         ),
-      gates: result.gates.map((gate) => `${gate.label}: ${gate.status} - ${gate.detail}`),
-      failedGates: result.gates.filter((gate) => gate.status === "fail").map((gate) => `${gate.label}: ${gate.detail}`),
-      summary: weightedTradingSettingsSummary(state.weightedTradingSettings, result),
+      gates: gates.map((gate) => `${gate.label}: ${gate.status} - ${gate.detail}`),
+      failedGates: gates.filter((gate) => gate.status === "fail").map((gate) => `${gate.label}: ${gate.detail}`),
+      summary: `Backend Weighted Voting ${result.signal}; edge ${formatProbability(result.edge)}.`,
     };
   }
   if (mode === "confidence") {
-    const result = calculateConfidenceAggregation();
+    const result = wcaBackendDecisionAsConfidenceResult();
     return {
       winner: result.signal,
-      confidence: `${result.decisionLabel} net ${result.normalizedNetScore.toFixed(2)}, active ${result.activeStrategyCount}/${confidenceAggregationStrategies.length}`,
+      confidence: `${result.decisionLabel} net ${result.normalizedNetScore.toFixed(2)}, active ${result.activeStrategyCount} backend strategies`,
       strategies: result.strategies.slice(0, 5).map((strategy) => `${strategy.name}: ${strategy.direction} confidence ${strategy.confidence.toFixed(2)}`),
       gates: result.hardFilters.map((filter) => `${filter.label}: ${filter.status} - ${filter.detail}`),
       failedGates: result.hardFilters.filter((filter) => filter.status === "fail").map((filter) => `${filter.label}: ${filter.detail}`),
@@ -9702,11 +9763,11 @@ function decisionEvidence(mode: TradingWindowMode, order: ManualOrderRecommendat
   }
   const votes = strategyEnsembleSignals(state.marketContext);
   const eligibleVotes = votes.filter(isEligibleStrategyVote);
-  const buyVotes = eligibleVotes.filter((vote) => vote.signal === "Buy").length;
-  const sellVotes = eligibleVotes.filter((vote) => vote.signal === "Sell").length;
-  const holdVotes = eligibleVotes.filter((vote) => vote.signal === "Hold").length;
+  const buyVotes = state.votingEnsembleBackend?.eligible_counts.Buy ?? eligibleVotes.filter((vote) => vote.signal === "Buy").length;
+  const sellVotes = state.votingEnsembleBackend?.eligible_counts.Sell ?? eligibleVotes.filter((vote) => vote.signal === "Sell").length;
+  const holdVotes = state.votingEnsembleBackend?.eligible_counts.Hold ?? eligibleVotes.filter((vote) => vote.signal === "Hold").length;
   return {
-    winner: winningVoteSignal(buyVotes, sellVotes, holdVotes),
+    winner: state.votingEnsembleBackend?.final_signal ?? "Hold",
     voteCounts: `${buyVotes}B / ${sellVotes}S / ${holdVotes}H`,
     strategies: eligibleVotes
       .filter((vote) => vote.signal !== "Hold")
@@ -9733,8 +9794,10 @@ function buildOrderEvidenceSnapshot(
   const backtest =
     mode === "meta"
       ? null
-      : mode === "confidence" || mode === "regime"
-      ? compactBacktestEvidence(confidenceBacktestResult, mode === "regime" ? "Regime backtest" : "WCA backtest")
+      : mode === "regime"
+      ? compactRegimeBacktestEvidence(regimeBacktestResult)
+      : mode === "confidence"
+      ? compactBacktestEvidence(confidenceBacktestResult, "WCA backtest")
       : mode === "weighted"
         ? null
         : compactBacktestEvidence(state.algoBacktestResult, "Voting Ensemble backtest");
@@ -10041,6 +10104,7 @@ function setAlgoTab(tab: AlgoTab) {
   }
   if (confidence) {
     updateConfidenceAggregationPanel();
+    void refreshWcaPresentationPanel();
   }
   if (regime) {
     scheduleRegimeSelectionPanelUpdate();
@@ -10051,12 +10115,17 @@ function setAlgoTab(tab: AlgoTab) {
 }
 
 function updateAlgorithmPanel(_candles: Candle[]) {
-  const votes = strategyEnsembleSignals(state.marketContext);
+  void ensureVotingEnsembleBackendDecision();
+  const localVotes = strategyEnsembleSignals(state.marketContext);
+  const votes = activeVotingEnsembleVotes(localVotes);
   const eligibleVotes = votes.filter(isEligibleStrategyVote);
-  const buyVotes = eligibleVotes.filter((vote) => vote.signal === "Buy").length;
-  const sellVotes = eligibleVotes.filter((vote) => vote.signal === "Sell").length;
-  const holdVotes = eligibleVotes.filter((vote) => vote.signal === "Hold").length;
-  const finalSignal = winningVoteSignal(buyVotes, sellVotes, holdVotes);
+  const directionalBuyVotes = votes.filter((vote) => vote.signal === "Buy").length;
+  const directionalSellVotes = votes.filter((vote) => vote.signal === "Sell").length;
+  const directionalHoldVotes = votes.filter((vote) => vote.signal === "Hold").length;
+  const buyVotes = state.votingEnsembleBackend?.eligible_counts.Buy ?? eligibleVotes.filter((vote) => vote.signal === "Buy").length;
+  const sellVotes = state.votingEnsembleBackend?.eligible_counts.Sell ?? eligibleVotes.filter((vote) => vote.signal === "Sell").length;
+  const holdVotes = state.votingEnsembleBackend?.eligible_counts.Hold ?? eligibleVotes.filter((vote) => vote.signal === "Hold").length;
+  const finalSignal = activeVotingEnsembleSignal(state.votingEnsembleBackend?.final_signal ?? "Hold");
 
   updateAlgoBacktestControls();
   algoFinalSignal.textContent = finalSignal;
@@ -10067,9 +10136,9 @@ function updateAlgorithmPanel(_candles: Candle[]) {
   updateRegimeSelectionPanel();
   updateMetaStrategyPanel();
   algoVoteCounts.innerHTML = [
-    ["Eligible Buy", buyVotes, "buy"],
-    ["Eligible Sell", sellVotes, "sell"],
-    ["Eligible Hold", holdVotes, "hold"],
+    ["Directional Buy", directionalBuyVotes, "buy"],
+    ["Directional Sell", directionalSellVotes, "sell"],
+    ["Directional Hold", directionalHoldVotes, "hold"],
   ]
     .map(
       ([label, value, signal]) => `
@@ -10081,7 +10150,10 @@ function updateAlgorithmPanel(_candles: Candle[]) {
     )
     .join("");
   algoVoteList.innerHTML = votes.map(renderAlgoVoteRow).join("");
-  algoVotesToggleMeta.textContent = `${eligibleVotes.length} eligible / ${votes.length} strategies · ${buyVotes}B/${sellVotes}S/${holdVotes}H · ${excludedVotes} excluded`;
+  algoVotesToggleMeta.textContent =
+    state.votingEnsembleBackendStatus === "ready"
+      ? `${directionalBuyVotes}B/${directionalSellVotes}S/${directionalHoldVotes}H total - actionable ${buyVotes}B/${sellVotes}S/${holdVotes}H - ${excludedVotes} watch/avoid`
+      : `Backend ${state.votingEnsembleBackendStatus}${state.votingEnsembleBackendWarning ? ` - ${state.votingEnsembleBackendWarning}` : ""}`;
   renderAlgoVotesExpandedState();
   if (state.algoBacktestTimeframe === "Trading") {
     algoTableWrap.hidden = true;
@@ -10124,6 +10196,14 @@ function updateAlgorithmPanel(_candles: Candle[]) {
   void maybeSaveDecisionSnapshot("algorithm-panel");
 }
 
+function activeVotingEnsembleSignal(fallback: AlgoSignal): AlgoSignal {
+  return fallback;
+}
+
+function activeVotingEnsembleVotes(fallback: AlgoVote[]): AlgoVote[] {
+  return fallback;
+}
+
 function renderAlgoIntradayTrades(backtest: BacktestResult) {
   if (state.algoBacktestTimeframe !== "1Min" && state.algoBacktestTimeframe !== "5Min") {
     algoIntradayTradesSummary.innerHTML = "";
@@ -10136,7 +10216,7 @@ function renderAlgoIntradayTrades(backtest: BacktestResult) {
   algoIntradayTradesSummary.innerHTML = `
     <span>Backtest: <strong>${escapeHtml(algoBacktestTimeframeLabel(backtest.timeframe))}</strong></span>
     <span>Range: ${escapeHtml(rangeLabel)}</span>
-    <span>Trades: ${totalTrades} · Win rate: ${winRate}</span>
+    <span>Trades: ${totalTrades} - Win rate: ${winRate}</span>
     <span>P/L: <strong class="${backtest.totalPnl >= 0 ? "positive" : "negative"}">${signedCurrency(backtest.totalPnl)}</strong> (${signed(backtest.totalReturnPercent)}%)</span>
   `;
   algoIntradayTradesTable.innerHTML = renderBacktestTrades(backtest.trades);
@@ -10147,10 +10227,6 @@ function setAlgoTradePlanContent(html: string) {
   algoTradePlanTitle.hidden = !hasContent;
   algoTradePlan.hidden = !hasContent;
   algoTradePlan.innerHTML = html;
-}
-
-function isEligibleStrategyVote(vote: AlgoVote) {
-  return vote.status === "Allowed" || vote.status === "Strong Fit";
 }
 
 function renderAlgoVotesExpandedState() {
@@ -10516,13 +10592,21 @@ function scheduleRegimeSelectionPanelUpdate() {
 
 function updateRegimeSelectionPanel() {
   const result = calculateRegimeSelection();
+  const targetOrder = buildRegimeTargetOrderRecommendation(result);
+  state.currentRegimeTargetOrder = targetOrder;
   regimeFinalSignal.textContent = result.signal;
   regimeFinalSignal.className = `algo-final ${regimeSignalClass(result.signal)}`;
   regimeScoreGrid.innerHTML = renderRegimeScoreGrid(result);
-  regimeSummary.innerHTML = renderRegimeSummary(result);
+  regimeSummary.innerHTML = renderRegimeSummary(result, targetOrder);
+  regimeConditionPanel.innerHTML = renderRegimeConditionPanel(result);
+  regimeRoutingPanel.innerHTML = renderRegimeRoutingPanel(result);
+  regimeDecisionPanel.innerHTML = renderRegimeDecisionPanel(result, targetOrder);
   if (!isEditingWithin(regimeTradingSettingsMount)) {
-    regimeTradingSettingsMount.innerHTML = renderRegimeTradingSettingsPanel(result);
+    regimeTradingSettingsMount.innerHTML = renderRegimeTradingSettingsPanel(result, targetOrder);
   }
+  regimeMlPanel.innerHTML = renderRegimeMlPanel(result);
+  regimeGlobalGatesPanel.innerHTML = renderRegimeGlobalGatesPanel(targetOrder);
+  renderRegimeBacktestState();
   if (state.regimeIndicatorsExpanded) {
     regimeFeatureGrid.innerHTML = renderRegimeFeatureGrid(result.features);
   }
@@ -10538,105 +10622,53 @@ function updateRegimeSelectionPanel() {
   maybeAutoSubmitOpenOrderControls();
 }
 
+function currentRegimeMarketContext() {
+  const oneMinuteCandles = state.weightedMarketData.timeframeCandles["1Min"]?.length ? state.weightedMarketData.timeframeCandles["1Min"]! : state.candles;
+  const primaryCandles = latestWeightedCalculationCandles();
+  const sessionCandles = primaryCandles.length ? primaryCandles : latestRegularSessionCandles();
+  const fiveMinuteCandles = state.weightedMarketData.timeframeCandles["5Min"]?.length
+    ? latestRegularSessionCandlesFrom(state.weightedMarketData.timeframeCandles["5Min"]!)
+    : aggregateCandlesToFiveMinute(sessionCandles);
+  return buildRegimeMarketContext(
+    {
+      symbol: state.symbol,
+      primaryCandles: sessionCandles.length ? sessionCandles : state.candles,
+      allCandles: oneMinuteCandles.length ? oneMinuteCandles : state.candles,
+      oneMinuteCandles,
+      fiveMinuteCandles,
+    },
+    state.regimeTradingSettings,
+  );
+}
+
 function calculateRegimeSelection(): RegimeSelectionResult {
-  const market = confidenceMarketSnapshot();
+  const market = currentRegimeMarketContext();
   if (!market) {
     return emptyRegimeSelectionResult("Waiting for regular-session candles");
   }
-
-  const rawCondition = rawRegimeConditionFromMarket(market);
-  const confirmation = confirmedRegimeCondition(market, rawCondition);
-  const features = rawCondition.features;
-  const noTradeReasons = rawCondition.noTradeReasons;
-  const primaryTrend = confirmation.condition.primaryTrend;
-  const volatility = confirmation.condition.volatility;
-  const opportunity = confirmation.condition.opportunity;
-  const selectedSlugs = regimeSelectedStrategySlugs(primaryTrend, volatility, opportunity);
-  const selectedSlugSet = new Set(selectedSlugs);
-  const selectedStrategies: RegimeSelectedStrategy[] = [];
-  const skippedStrategies: Array<{ name: string; reason: string }> = [];
-
-  regimeSelectionStrategies.forEach((strategy) => {
-    if (!selectedSlugSet.has(strategy.slug)) {
-      skippedStrategies.push({ name: strategy.name, reason: regimeStrategyAvoidReason(strategy.slug, primaryTrend, volatility, opportunity) });
-      return;
-    }
-
-    const raw = strategy.signal(market);
-    const confidence = clampNumber(raw.confidence, 0, 1);
-    const contractSignal = confidenceContractSignal(raw.signal);
-    const direction = confidenceSignalDirection(contractSignal);
-    const effectiveWeight = roundNumber(Math.max(0, strategy.baseWeight * confidenceSystemWeightMultiplier(strategy, contractSignal, market)), 4);
-    selectedStrategies.push({
-      strategy: strategy.slug,
-      signal: contractSignal,
-      confidence,
-      base_weight: strategy.baseWeight,
-      effective_weight: effectiveWeight,
-      direction,
-      reason: raw.reason,
-      key: strategy.key,
-      name: strategy.name,
-      contribution: roundNumber(direction * effectiveWeight * confidence, 4),
-      selected: true,
-      selectorReason: regimeStrategySelectorReason(strategy.slug, primaryTrend, volatility, opportunity),
-    });
+  const output = calculateRegimeDecision({
+    marketData: {
+      symbol: state.symbol,
+      primaryCandles: market.candles,
+      allCandles: market.allCandles,
+      oneMinuteCandles: market.oneMinuteCandles,
+      fiveMinuteCandles: market.fiveMinuteCandles,
+    },
+    settings: state.regimeTradingSettings,
+    sizingDefaults: regimeDefaultSizingSettings(),
+    currentPosition: regimeCurrentPositionSnapshot(market.latest.close),
+    hysteresis: lastConfirmedRegimeCondition,
   });
+  lastConfirmedRegimeCondition = output.hysteresis;
+  return output.result;
+}
 
-  const activeStrategies = selectedStrategies.filter((strategy) => strategy.confidence > 0);
-  const aggregation = aggregateRegimeStrategyScores(selectedStrategies);
-  const buyScore = aggregation.scores.buy;
-  const sellScore = aggregation.scores.sell;
-  const holdScore = aggregation.scores.hold;
-  const secondBestScore = Math.max(sellScore, holdScore);
-  const scoreEdge = roundNumber(buyScore - secondBestScore, 4);
-  const conditionConfidence = confirmation.condition.confidence;
-  const normalizedNetScore = roundNumber(buyScore - sellScore, 4);
-  const tradeBlockers = regimeTradeBlockers(aggregation.finalSignal, aggregation.scores, scoreEdge, conditionConfidence, opportunity, confirmation.held);
-  const tradeAllowed = tradeBlockers.length === 0;
-  const signal: RegimeDecisionSignal =
-    opportunity === "No-trade"
-      ? "No-trade"
-      : tradeAllowed && aggregation.finalSignal === "buy"
-        ? "Buy"
-        : aggregation.finalSignal === "sell"
-          ? "Sell"
-          : "Hold";
-
+function regimeCurrentPositionSnapshot(latestPrice: number) {
+  const position = summarizePositionFromTradeHistory(latestPrice, latestPrice, "regime");
   return {
-    signal,
-    rawCondition: rawCondition.key,
-    confirmedCondition: confirmation.condition.key,
-    confirmationCount: confirmation.confirmationCount,
-    conditionHeld: confirmation.held,
-    primaryTrend,
-    volatility,
-    opportunity,
-    confidence: conditionConfidence,
-    aggregateSignal: aggregation.finalSignal,
-    scores: aggregation.scores,
-    buyScore,
-    sellScore,
-    holdScore,
-    secondBestScore,
-    scoreEdge,
-    normalizedNetScore,
-    tradeAllowed,
-    tradeBlockers,
-    activeStrategyCount: activeStrategies.length,
-    selectedStrategyCount: selectedStrategies.length,
-    features: features.display,
-    selectedStrategies,
-    skippedStrategies,
-    reasons: [
-      `${primaryTrend} + ${volatility} + ${opportunity}`,
-      confirmation.held
-        ? `Raw condition ${rawCondition.key} is waiting for 2-of-3 confirmation or 65% confidence before switching`
-        : `Condition confirmed: ${confirmation.confirmationCount}/3 recent candles match or confidence is strong`,
-      `${selectedStrategies.length} strategies selected before voting; aggregate winner ${aggregation.finalSignal}`,
-      `Normalized scores buy ${buyScore.toFixed(2)}, sell ${sellScore.toFixed(2)}, hold ${holdScore.toFixed(2)}; edge ${scoreEdge.toFixed(2)}`,
-    ],
-    noTradeReasons,
+    shares: position.shares,
+    avgPrice: position.avgPrice,
+    marketValue: position.marketValue,
   };
 }
 
@@ -10656,8 +10688,16 @@ function emptyRegimeSelectionResult(reason: string): RegimeSelectionResult {
     buyScore: 0,
     sellScore: 0,
     holdScore: 1,
+    winningScore: 0,
+    winningDirectionScore: 0,
+    signedNetScore: 0,
     secondBestScore: 0,
     scoreEdge: 1,
+    winningDirectionEdge: 1,
+    winningDirection: "hold",
+    directionalEdge: 0,
+    activeFamilyCount: 0,
+    abstentionRate: 1,
     normalizedNetScore: 0,
     tradeAllowed: false,
     tradeBlockers: [reason],
@@ -10901,14 +10941,15 @@ function regimeTradeBlockers(
   if (conditionHeld) {
     blockers.push("Market condition switch is not confirmed yet");
   }
-  if (finalSignal !== "buy") {
-    blockers.push("Final aggregate signal is not Buy");
+  if (finalSignal !== "buy" && finalSignal !== "sell") {
+    blockers.push("Final aggregate signal is not Buy or Sell");
   }
-  if (scores.buy < 0.6) {
-    blockers.push(`Buy score ${formatProbability(scores.buy)} is below 60%`);
+  const winningScore = finalSignal === "buy" ? scores.buy : finalSignal === "sell" ? scores.sell : 0;
+  if (winningScore < 0.6) {
+    blockers.push(`Winning direction score ${formatProbability(winningScore)} is below 60%`);
   }
   if (scoreEdge < 0.2) {
-    blockers.push(`Buy edge ${formatProbability(scoreEdge)} is below 20%`);
+    blockers.push(`Winning direction edge ${formatProbability(scoreEdge)} is below 20%`);
   }
   if (conditionConfidence < 0.65) {
     blockers.push(`Market condition confidence ${formatProbability(conditionConfidence)} is below 65%`);
@@ -11261,7 +11302,7 @@ function renderRegimeScoreGrid(result: RegimeSelectionResult) {
     ["Buy", result.scores.buy.toFixed(2), "buy"],
     ["Sell", result.scores.sell.toFixed(2), "sell"],
     ["Hold", result.scores.hold.toFixed(2), "hold"],
-    ["Buy Edge", result.scoreEdge.toFixed(2), result.scoreEdge >= 0.2 ? "buy" : "no-trade"],
+    ["Winning Direction Edge", result.scoreEdge.toFixed(2), result.scoreEdge >= 0.2 ? "buy" : "no-trade"],
     ["Condition", formatProbability(result.confidence), result.confidence >= 0.65 ? "buy" : "no-trade"],
   ]
     .map(
@@ -11275,16 +11316,15 @@ function renderRegimeScoreGrid(result: RegimeSelectionResult) {
     .join("");
 }
 
-function renderRegimeSummary(result: RegimeSelectionResult) {
-  const adapted = regimeSelectionAsConfidenceResult(result);
-  const sizingBlocker = adapted.sizing.blockedReason ? `Sizing: ${adapted.sizing.blockedReason}` : "";
+function renderRegimeSummary(result: RegimeSelectionResult, targetOrder: ManualOrderRecommendation) {
+  const sizingBlocker = targetOrder.failedGates.find((gate) => gate.startsWith("Sizing:")) ?? "";
   const quantityBlockers = uniqueStrings([...result.tradeBlockers, sizingBlocker].filter(Boolean));
   const noTrade = result.noTradeReasons.length
     ? renderRegimeSummaryRow("No-trade checks", escapeHtml(result.noTradeReasons.join("; ")), "warn")
     : "";
   const blockers = quantityBlockers.length
     ? renderRegimeSummaryRow("Quantity gate", `0 - ${escapeHtml(quantityBlockers.join("; "))}`, "block")
-    : renderRegimeSummaryRow("Quantity gate", `${adapted.positionSize} shares - Buy score, edge, condition confidence, opportunity, and sizing passed.`, "pass");
+    : renderRegimeSummaryRow("Quantity gate", `${targetOrder.quantity} shares - Winning direction passed: score, edge, condition confidence, opportunity, and Regime sizing.`, "pass");
   const confirmation = result.conditionHeld
     ? `Raw ${escapeHtml(result.rawCondition)} has ${result.confirmationCount}/3 confirmation, keeping ${escapeHtml(result.confirmedCondition)}.`
     : `${result.confirmationCount}/3 recent candles support ${escapeHtml(result.confirmedCondition)}, or confidence is >= 65%.`;
@@ -11295,7 +11335,7 @@ function renderRegimeSummary(result: RegimeSelectionResult) {
       ${renderRegimeSummaryRow("Aggregate winner", `${escapeHtml(result.aggregateSignal)} (${result.activeStrategyCount} active strategy outputs)`, "info")}
       ${renderRegimeSummaryRow(
         "Trade decision",
-        `${escapeHtml(result.signal)}; target qty ${adapted.positionSize}; buy ${formatProbability(result.scores.buy)}, second best ${formatProbability(result.secondBestScore)}, edge ${formatProbability(result.scoreEdge)}`,
+        `${escapeHtml(result.signal)}; target qty ${targetOrder.quantity}; buy ${formatProbability(result.scores.buy)}, sell ${formatProbability(result.scores.sell)}, second best ${formatProbability(result.secondBestScore)}, edge ${formatProbability(result.scoreEdge)}`,
         quantityBlockers.length || result.signal === "No-trade" ? "block" : result.signal === "Hold" ? "warn" : "pass",
       )}
       ${blockers}
@@ -11303,6 +11343,194 @@ function renderRegimeSummary(result: RegimeSelectionResult) {
       ${noTrade}
     </div>
   `;
+}
+
+function renderRegimeConditionPanel(result: RegimeSelectionResult) {
+  const axes = result.rawClassification?.axes;
+  const confirmed = result.confirmedState;
+  const missingOrStale = uniqueStrings([
+    ...(result.rawClassification?.missingInputs ?? []),
+    ...result.noTradeReasons.filter((reason) => /stale|missing|quote|data/i.test(reason)),
+  ]);
+  return `
+    <section class="regime-section-card" aria-label="Market condition">
+      <div class="regime-section-head">
+        <strong>Market condition</strong>
+        <span>${escapeHtml(result.primaryTrend)} / ${escapeHtml(result.volatility)} / ${escapeHtml(result.opportunity)}</span>
+      </div>
+      <div class="regime-detail-grid">
+        ${renderRegimeDetailItem("Raw regime", result.rawClassification?.rawRegime ?? result.rawCondition)}
+        ${renderRegimeDetailItem("Confirmed regime", confirmed?.confirmedRegime ?? result.confirmedCondition)}
+        ${renderRegimeDetailItem("Direction axis", axes?.direction ?? "unknown")}
+        ${renderRegimeDetailItem("Volatility axis", axes?.volatility ?? "unknown")}
+        ${renderRegimeDetailItem("Structure axis", axes?.structure ?? "unknown")}
+        ${renderRegimeDetailItem("Liquidity axis", axes?.liquidity ?? "unknown")}
+        ${renderRegimeDetailItem("Session axis", axes?.session ?? "unknown")}
+        ${renderRegimeDetailItem("Event-risk axis", axes?.eventRisk ?? "unknown")}
+        ${renderRegimeDetailItem("Confidence", formatProbability(result.confidence))}
+        ${renderRegimeDetailItem("Confirmation count", String(confirmed?.candidateCount ?? result.confirmationCount))}
+        ${renderRegimeDetailItem("Regime dwell", `${confirmed?.dwellBars ?? 0} bars`)}
+        ${renderRegimeDetailItem("Transition reason", confirmed?.transitionReason ?? "No confirmed transition")}
+        ${renderRegimeDetailItem("Missing or stale inputs", missingOrStale.length ? missingOrStale.join("; ") : "None reported", "wide")}
+      </div>
+    </section>
+  `;
+}
+
+function renderRegimeRoutingPanel(result: RegimeSelectionResult) {
+  const selected = result.selectedStrategies.filter((strategy) => strategy.role === "directional");
+  const skipped = result.routing?.skippedStrategies ?? result.skippedStrategies.map((strategy) => ({ strategyId: strategy.name, reason: strategy.reason }));
+  return `
+    <section class="regime-section-card" aria-label="Strategy routing">
+      <div class="regime-section-head">
+        <strong>Strategy routing</strong>
+        <span>${selected.length} selected directional strategies / ${skipped.length} skipped</span>
+      </div>
+      <div class="regime-routing-columns">
+        <div>
+          <h4>Selected directional strategies</h4>
+          ${selected.length ? selected.map((strategy) => renderRegimeRoutingStrategy(strategy, result)).join("") : `<p class="regime-empty">No directional strategies selected.</p>`}
+        </div>
+        <div>
+          <h4>Skipped strategies and reasons</h4>
+          <div class="regime-skipped-list">
+            ${skipped.length ? skipped.slice(0, 12).map((strategy) => `<span>${escapeHtml(strategy.strategyId)} - ${escapeHtml(strategy.reason)}</span>`).join("") : `<span>None skipped.</span>`}
+          </div>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderRegimeRoutingStrategy(strategy: RegimeSelectedStrategy, result: RegimeSelectionResult) {
+  const familyScore = strategyFamilyScoreValue(strategy, result);
+  return `
+    <article class="regime-routing-card" data-signal="${strategy.signal}">
+      <div>
+        <strong>${escapeHtml(strategy.name)}</strong>
+        <span>Strategy role: ${escapeHtml(strategy.role)}</span>
+        <span>Strategy family: ${escapeHtml(strategy.family)}</span>
+        <span>Raw confidence: ${formatProbability(strategy.rawConfidence ?? strategy.directionalResult?.confidence ?? strategy.confidence)}</span>
+        <span>Effective confidence: ${formatProbability(strategy.effectiveConfidence ?? strategy.confidence)}</span>
+        <span>Correlation penalty: ${formatMultiplier(strategy.correlationPenalty ?? 1)}</span>
+        <span>Family score: ${familyScore}</span>
+      </div>
+      <b class="algo-signal-badge">${escapeHtml(strategy.signal === "buy" ? "Buy" : strategy.signal === "sell" ? "Sell" : "Hold")}</b>
+    </article>
+  `;
+}
+
+function renderRegimeDecisionPanel(result: RegimeSelectionResult, targetOrder: ManualOrderRecommendation) {
+  const blockers = uniqueStrings([...result.tradeBlockers, ...targetOrder.failedGates]);
+  return `
+    <section class="regime-section-card" aria-label="Decision">
+      <div class="regime-section-head">
+        <strong>Decision</strong>
+        <span>${escapeHtml(result.signal)} / ${escapeHtml(result.winningDirection)}</span>
+      </div>
+      <div class="regime-detail-grid">
+        ${renderRegimeDetailItem("Buy score", result.buyScore.toFixed(2))}
+        ${renderRegimeDetailItem("Sell score", result.sellScore.toFixed(2))}
+        ${renderRegimeDetailItem("Winning direction", result.winningDirection)}
+        ${renderRegimeDetailItem("Winning score", result.winningScore.toFixed(2))}
+        ${renderRegimeDetailItem("Directional edge", result.directionalEdge.toFixed(2))}
+        ${renderRegimeDetailItem("Active strategy count", String(result.activeStrategyCount))}
+        ${renderRegimeDetailItem("Independent family count", String(result.activeFamilyCount))}
+        ${renderRegimeDetailItem("Hold/abstention rate", formatProbability(result.abstentionRate))}
+        ${renderRegimeDetailItem("Trade blockers", blockers.length ? blockers.join("; ") : "None", "wide")}
+      </div>
+    </section>
+  `;
+}
+
+function renderRegimeMlPanel(result: RegimeSelectionResult) {
+  const ml = result.ml;
+  const prediction = ml?.prediction;
+  const probabilities = prediction?.probabilityVector ? Object.entries(prediction.probabilityVector) : [];
+  const trustedArtifactLoaded = Boolean(result.decisionSnapshot?.modelVersion && prediction?.enabled && !ml?.reasonCodes.some((reason) => /untrusted|unsupported|schema|hash|artifact/i.test(reason)));
+  const artifactStatus = trustedArtifactLoaded ? "Trusted compatible artifact loaded" : "No trusted compatible artifact loaded";
+  const agreement =
+    prediction?.predictedRegime && result.confirmedState?.confirmedRegime
+      ? prediction.predictedRegime === result.confirmedState.confirmedRegime
+        ? "Agreement"
+        : "Disagreement"
+      : "Not available";
+  return `
+    <section class="regime-section-card" aria-label="ML">
+      <div class="regime-section-head">
+        <strong>ML</strong>
+        <span>${escapeHtml(ml?.mode ?? "shadow")}</span>
+      </div>
+      <div class="regime-detail-grid">
+        ${renderRegimeDetailItem("ML mode", ml?.mode ?? "shadow")}
+        ${renderRegimeDetailItem("Artifact status", artifactStatus)}
+        ${renderRegimeDetailItem("Model version", result.decisionSnapshot?.modelVersion ?? "None")}
+        ${renderRegimeDetailItem("Predicted regime", prediction?.predictedRegime ?? "None")}
+        ${renderRegimeDetailItem("Rule/ML agreement", agreement)}
+        ${renderRegimeDetailItem("Transition probability", prediction?.transitionProbability === null || prediction?.transitionProbability === undefined ? "NA" : formatProbability(prediction.transitionProbability))}
+        ${renderRegimeDetailItem("Shadow result", ml?.appliedEffect === "shadow_only" ? "Shadow only; decision unchanged" : ml?.appliedEffect ?? "none")}
+        ${renderRegimeDetailItem("Promotion status", trustedArtifactLoaded ? "Compatible artifact loaded" : "Not promoted")}
+        ${renderRegimeDetailItem("Fallback reason", ml?.reasonCodes.length ? ml.reasonCodes.join("; ") : "Rule-based fallback remains authoritative", "wide")}
+        ${renderRegimeDetailItem(
+          "Probability vector",
+          probabilities.length ? probabilities.map(([key, value]) => `${key}: ${formatProbability(Number(value))}`).join("; ") : "None",
+          "wide",
+        )}
+      </div>
+    </section>
+  `;
+}
+
+function renderRegimeGlobalGatesPanel(targetOrder: ManualOrderRecommendation) {
+  const status = targetOrder.failedGates.length ? "denied" : "pending server evaluation";
+  const passed = targetOrder.gates.filter((gate) => gate.status === "pass");
+  const failed = targetOrder.gates.filter((gate) => gate.status === "fail");
+  const warnings = targetOrder.gates.filter((gate) => gate.status === "caution" || gate.status === "info");
+  return `
+    <section class="regime-section-card" aria-label="Global gates">
+      <div class="regime-section-head">
+        <strong>Global gates</strong>
+        <span>Approved/resized/denied: ${escapeHtml(status)}</span>
+      </div>
+      <div class="regime-detail-grid">
+        ${renderRegimeDetailItem("Requested quantity", targetOrder.regimeSizing?.requestedQuantityBeforeGlobalCapacity?.toLocaleString() ?? targetOrder.quantity.toLocaleString())}
+        ${renderRegimeDetailItem("Approved quantity", targetOrder.failedGates.length ? "0" : "Pending global manager")}
+        ${renderRegimeDetailItem("Requested risk", currency(targetOrder.riskDollars))}
+        ${renderRegimeDetailItem("Approved risk", targetOrder.failedGates.length ? currency(0) : "Pending global manager")}
+        ${renderRegimeDetailItem("Account snapshot time", targetOrder.levels.lastTime ?? "Unavailable")}
+        ${renderRegimeDetailItem("Reservation ID status", targetOrder.orderIntent ? "Intent created; reservation pending server gate" : "No reservation")}
+        ${renderRegimeDetailItem("Passed gates", passed.length ? passed.map((gate) => `${gate.layer}: ${gate.detail}`).join("; ") : "None", "wide")}
+        ${renderRegimeDetailItem("Failed gates", failed.length ? failed.map((gate) => `${gate.layer}: ${gate.detail}`).join("; ") : "None", "wide")}
+        ${renderRegimeDetailItem("Warnings", warnings.length ? warnings.map((gate) => `${gate.layer}: ${gate.detail}`).join("; ") : "None", "wide")}
+      </div>
+    </section>
+  `;
+}
+
+function renderRegimeDetailItem(label: string, value: string | number | boolean | null | undefined, layout: "normal" | "wide" = "normal") {
+  return `
+    <div class="regime-detail-item${layout === "wide" ? " wide" : ""}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(String(value ?? "NA"))}</strong>
+    </div>
+  `;
+}
+
+function strategyFamilyScoreValue(strategy: RegimeSelectedStrategy, result: RegimeSelectionResult) {
+  const scores = result.familyScores ?? [];
+  const familyScore = scores.find((score) => score.family === strategy.family);
+  if (!familyScore) {
+    return "NA";
+  }
+  return `${familyScore.buyScore.toFixed(2)} buy / ${familyScore.sellScore.toFixed(2)} sell`;
+}
+
+function formatMultiplier(value: number) {
+  return Number.isFinite(value) ? `${value.toFixed(2)}x` : "NA";
+}
+
+function startCase(value: string) {
+  return value.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function renderRegimeSummaryRow(label: string, value: string, tone: "info" | "pass" | "warn" | "block" | "neutral") {
@@ -11355,151 +11583,135 @@ function renderRegimeStrategyRow(strategy: RegimeSelectedStrategy) {
 }
 
 function updateConfidenceAggregationPanel() {
-  const result = calculateConfidenceAggregation();
+  const result = wcaBackendDecisionAsConfidenceResult();
+  renderWcaPresentationMount();
+  state.currentConfidenceTargetOrder = wcaBackendTargetOrderRecommendation();
   confidenceFinalSignal.textContent = result.decisionLabel;
   confidenceFinalSignal.className = `algo-final ${result.signal.toLowerCase()}`;
   confidenceScoreGrid.innerHTML = renderConfidenceScoreGrid(result);
   confidenceSummary.innerHTML = renderConfidenceSummary(result);
   if (!isEditingWithin(confidenceTradingSettingsMount)) {
-    confidenceTradingSettingsMount.innerHTML = renderConfidenceTradingSettingsPanel(result);
+    confidenceTradingSettingsMount.innerHTML = renderWcaBackendOnlyPanel(
+      "Backend WCA configuration",
+      "WCA settings, sizing, order proposals, and gate results are loaded from the backend WCA panel above.",
+    );
   }
   renderConfidenceBacktestState();
-  confidenceRequirementsToggleMeta.textContent = `${result.activeStrategyCount}/${state.confidenceDecisionSettings.minimumActiveStrategies} active · ${formatProbability(state.confidenceDecisionSettings.minimumDirectionalAgreement)} agree · ${formatProbability(state.confidenceDecisionSettings.minimumAverageConfidence)} avg`;
-  confidenceRequirementsPanel.innerHTML = renderConfidenceRequirementsPanel(result);
+  confidenceRequirementsToggleMeta.textContent = `${result.activeStrategyCount}/${state.confidenceDecisionSettings.minimumActiveStrategies} active - ${formatProbability(state.confidenceDecisionSettings.minimumDirectionalAgreement)} agree - ${formatProbability(state.confidenceDecisionSettings.minimumAverageConfidence)} avg`;
+  confidenceRequirementsPanel.innerHTML = renderWcaBackendOnlyPanel(
+    "Backend WCA requirements",
+    "The frontend no longer stores WCA thresholds or decision requirements as authoritative state.",
+  );
   renderConfidenceRequirementsExpandedState();
   confidenceStrategiesToggleMeta.textContent = `${result.strategies.filter((strategy) => strategy.signal !== "hold").length} active / ${result.strategies.length} strategies`;
   confidenceStrategiesList.innerHTML = renderConfidenceStrategies(result.strategies);
   renderConfidenceStrategiesExpandedState();
-  maybeAutoSubmitConfidenceTargetOrder();
 }
 
-function calculateConfidenceAggregation(): ConfidenceAggregationResult {
-  return calculateConfidenceAggregationFromMarket(confidenceMarketSnapshot());
-}
-
-function calculateConfidenceAggregationFromMarket(
-  market: ConfidenceMarket | null,
-  options: {
-    hardFilters?: (market: ConfidenceMarket, rawSignal: AlgoSignal) => ConfidenceAggregationResult["hardFilters"];
-    sizing?: (market: ConfidenceMarket, signal: AlgoSignal, normalizedNetScore: number) => ConfidencePositionSizing;
-  } = {},
-): ConfidenceAggregationResult {
-  if (!market) {
-    return {
-      signal: "Hold",
-      decisionLabel: "Hold",
-      buyScore: 0,
-      sellScore: 0,
-      netScore: 0,
-      activeWeight: 0,
-      normalizedNetScore: 0,
-      activeStrategyCount: 0,
-      buyWeight: 0,
-      sellWeight: 0,
-      buyAgreement: 0,
-      sellAgreement: 0,
-      buyAverageConfidence: 0,
-      sellAverageConfidence: 0,
-      buyThreshold: state.confidenceDecisionSettings.buyThreshold,
-      sellThreshold: state.confidenceDecisionSettings.sellThreshold,
-      strongBuyThreshold: state.confidenceDecisionSettings.strongBuyThreshold,
-      strongSellThreshold: state.confidenceDecisionSettings.strongSellThreshold,
-      strategies: confidenceAggregationStrategies.map((strategy) => ({
-        strategy: strategy.slug,
-        signal: "hold",
-        confidence: 0,
-        base_weight: strategy.baseWeight,
-        effective_weight: strategy.baseWeight,
-        direction: 0,
-        reason: "Waiting for session candles",
-        key: strategy.key,
-        name: strategy.name,
-        contribution: 0,
-      })),
-      stopDistance: 0,
-      positionSizeMultiplier: 0,
-      positionSize: 0,
-      sizing: confidenceEmptyPositionSizing("Waiting for session candles"),
-      hardFilters: [{ label: "Market data", status: "info", detail: "Waiting for session candles" }],
-      logs: ["Waiting for current regular-session candles before running WCA."],
-      detail: "Need current regular-session candles before aggregating confidence.",
-    };
-  }
-
-  const strategies = confidenceAggregationStrategies.map((strategy) => {
-    const raw = strategy.signal(market);
-    const confidence = clampNumber(raw.confidence, 0, 1);
-    const contractSignal = confidenceContractSignal(raw.signal);
-    const direction = confidenceSignalDirection(contractSignal);
-    const weightMultiplier = confidenceSystemWeightMultiplier(strategy, contractSignal, market);
-    const effectiveWeight = roundNumber(Math.max(0, strategy.baseWeight * weightMultiplier), 4);
-    const signedContribution = direction * effectiveWeight * confidence;
-    return {
-      strategy: strategy.slug,
-      signal: contractSignal,
-      confidence,
-      base_weight: strategy.baseWeight,
-      effective_weight: effectiveWeight,
-      direction,
-      reason: raw.reason,
-      key: strategy.key,
-      name: strategy.name,
-      contribution: roundNumber(signedContribution, 4),
-    };
+function renderWcaPresentationMount() {
+  renderWcaPanel(wcaPresentationPanel, wcaPresentationState, {
+    onConfigurationSubmit: submitWcaBaselineConfiguration,
   });
-  const buyScore = roundNumber(
-    strategies.filter((strategy) => strategy.direction === 1).reduce((sum, strategy) => sum + strategy.effective_weight * strategy.confidence, 0),
-    4,
+}
+
+async function submitWcaBaselineConfiguration(configuration: Parameters<typeof updateWcaConfiguration>[0]) {
+  wcaPresentationState = withWcaConfigurationSaving(wcaPresentationState);
+  renderWcaPresentationMount();
+  try {
+    const updated = await updateWcaConfiguration(configuration);
+    wcaPresentationState = withWcaConfigurationSaved(wcaPresentationState, updated);
+  } catch (error) {
+    wcaPresentationState = withWcaConfigurationSaveError(wcaPresentationState, error);
+  }
+  renderWcaPresentationMount();
+}
+
+async function refreshWcaPresentationPanel() {
+  if (wcaPresentationRefreshInFlight) {
+    return;
+  }
+  wcaPresentationRefreshInFlight = true;
+  wcaPresentationState = withWcaLoading(wcaPresentationState);
+  renderWcaPresentationMount();
+  try {
+    const [backendStatus, configuration, baselineSettings] = await Promise.all([
+      fetchWcaStatus(),
+      fetchWcaConfiguration(),
+      fetchWcaBaselineSettings(),
+    ]);
+    wcaPresentationState = withWcaReady(wcaPresentationState, {
+      backendStatus,
+      configuration,
+      baselineSettings,
+      latestBacktest: latestWcaBackendBacktestResult,
+    });
+  } catch (error) {
+    wcaPresentationState = withWcaError(wcaPresentationState, error);
+  } finally {
+    wcaPresentationRefreshInFlight = false;
+    renderWcaPresentationMount();
+  }
+}
+
+function wcaBackendDecisionAsConfidenceResult(): ConfidenceAggregationResult {
+  const decision = wcaPresentationState.latestDecision;
+  if (!decision || !isRecord(decision)) {
+    return wcaBackendEmptyConfidenceResult("Waiting for backend WCA decision snapshot");
+  }
+  const decisionRecord = decision as Record<string, unknown>;
+  const aggregation =
+    childRecord(decisionRecord, "aggregation") ??
+    childRecord(decisionRecord, "aggregationResult") ??
+    childRecord(decisionRecord, "aggregation_result") ??
+    decisionRecord;
+  const sizing =
+    childRecord(decisionRecord, "sizingResult") ??
+    childRecord(decisionRecord, "sizing_result") ??
+    childRecord(decisionRecord, "sizing") ??
+    null;
+  const proposedOrder =
+    childRecord(decisionRecord, "proposedOrder") ??
+    childRecord(decisionRecord, "proposed_order") ??
+    null;
+  const gates =
+    childRecord(decisionRecord, "localGateResult") ??
+    childRecord(decisionRecord, "local_gate_result") ??
+    childRecord(decisionRecord, "gateResult") ??
+    childRecord(decisionRecord, "gate_result") ??
+    null;
+  const signal = algoSignalFromUnknown(
+    decisionRecord.finalDecision ??
+      decisionRecord.final_decision ??
+      decisionRecord.effectiveDecision ??
+      decisionRecord.effective_decision ??
+      decisionRecord.signal ??
+      decisionRecord.direction,
   );
-  const sellScore = roundNumber(
-    strategies.filter((strategy) => strategy.direction === -1).reduce((sum, strategy) => sum + strategy.effective_weight * strategy.confidence, 0),
-    4,
+  const strategies = wcaBackendStrategyRows(decisionRecord, aggregation);
+  const buyScore = wcaNumberFromKeys(aggregation, ["buyScore", "buy_score", "buy"], 0);
+  const sellScore = wcaNumberFromKeys(aggregation, ["sellScore", "sell_score", "sell"], 0);
+  const activeWeight = wcaNumberFromKeys(aggregation, ["activeWeight", "active_weight"], strategies.reduce((sum, row) => sum + (row.direction === 0 ? 0 : row.effective_weight), 0));
+  const netScore = wcaNumberFromKeys(aggregation, ["netScore", "net_score", "normalizedNetScore", "normalized_net_score"], buyScore - sellScore);
+  const normalizedNetScore = wcaNumberFromKeys(aggregation, ["normalizedNetScore", "normalized_net_score"], activeWeight ? netScore / activeWeight : 0);
+  const buyWeight = wcaNumberFromKeys(aggregation, ["buyWeight", "buy_weight"], strategies.filter((row) => row.direction === 1).reduce((sum, row) => sum + row.effective_weight, 0));
+  const sellWeight = wcaNumberFromKeys(aggregation, ["sellWeight", "sell_weight"], strategies.filter((row) => row.direction === -1).reduce((sum, row) => sum + row.effective_weight, 0));
+  const activeStrategyCount = Math.floor(wcaNumberFromKeys(aggregation, ["activeStrategyCount", "active_strategy_count"], strategies.filter((row) => row.direction !== 0).length));
+  const buyAgreement = wcaNumberFromKeys(aggregation, ["buyAgreement", "buy_agreement", "agreement"], activeWeight ? buyWeight / activeWeight : 0);
+  const sellAgreement = wcaNumberFromKeys(aggregation, ["sellAgreement", "sell_agreement"], activeWeight ? sellWeight / activeWeight : 0);
+  const buyAverageConfidence = wcaNumberFromKeys(aggregation, ["buyAverageConfidence", "buy_average_confidence", "averageConfidence", "average_confidence"], buyWeight ? buyScore / buyWeight : 0);
+  const sellAverageConfidence = wcaNumberFromKeys(aggregation, ["sellAverageConfidence", "sell_average_confidence", "averageConfidence", "average_confidence"], sellWeight ? sellScore / sellWeight : 0);
+  const sizingResult = wcaSizingFromBackend(sizing, signal);
+  const detail = stringFromUnknown(
+    decisionRecord.explanation ??
+      decisionRecord.detail ??
+      aggregation?.detail ??
+      decisionRecord.reason ??
+      arrayFromUnknown(decisionRecord.reasonCodes ?? decisionRecord.reason_codes).join("; "),
+    "Backend WCA decision snapshot",
   );
-  const activeWeight = roundNumber(strategies.filter((strategy) => strategy.direction !== 0).reduce((sum, strategy) => sum + strategy.effective_weight, 0), 4);
-  const activeStrategyCount = strategies.filter((strategy) => strategy.direction !== 0).length;
-  const buyWeight = roundNumber(strategies.filter((strategy) => strategy.direction === 1).reduce((sum, strategy) => sum + strategy.effective_weight, 0), 4);
-  const sellWeight = roundNumber(strategies.filter((strategy) => strategy.direction === -1).reduce((sum, strategy) => sum + strategy.effective_weight, 0), 4);
-  const netScore = roundNumber(buyScore - sellScore, 4);
-  const normalizedNetScore = activeWeight ? roundNumber(netScore / activeWeight, 4) : 0;
-  const buyAgreement = activeWeight ? roundNumber(buyWeight / activeWeight, 4) : 0;
-  const sellAgreement = activeWeight ? roundNumber(sellWeight / activeWeight, 4) : 0;
-  const buyAverageConfidence = buyWeight ? roundNumber(buyScore / buyWeight, 4) : 0;
-  const sellAverageConfidence = sellWeight ? roundNumber(sellScore / sellWeight, 4) : 0;
-  const settings = state.confidenceDecisionSettings;
-  const enoughActiveStrategies = activeStrategyCount >= settings.minimumActiveStrategies;
-  const buyRequirementsMet =
-    enoughActiveStrategies && buyAgreement >= settings.minimumDirectionalAgreement && buyAverageConfidence >= settings.minimumAverageConfidence;
-  const sellRequirementsMet =
-    enoughActiveStrategies && sellAgreement >= settings.minimumDirectionalAgreement && sellAverageConfidence >= settings.minimumAverageConfidence;
-  const rawDecisionLabel: ConfidenceDecisionLabel =
-    normalizedNetScore >= settings.strongBuyThreshold && buyRequirementsMet
-      ? "Strong Buy"
-      : normalizedNetScore >= settings.buyThreshold && buyRequirementsMet
-        ? "Buy"
-        : normalizedNetScore <= settings.strongSellThreshold && sellRequirementsMet
-          ? "Strong Sell"
-          : normalizedNetScore <= settings.sellThreshold && sellRequirementsMet
-            ? "Sell"
-            : "Hold";
-  const rawSignal: AlgoSignal = rawDecisionLabel === "Strong Buy" || rawDecisionLabel === "Buy" ? "Buy" : rawDecisionLabel === "Strong Sell" || rawDecisionLabel === "Sell" ? "Sell" : "Hold";
-  const hardFilters = (options.hardFilters ?? confidenceHardFilters)(market, rawSignal);
-  const hardFilterBlocked = hardFilters.some((filter) => filter.status === "fail");
-  const signal = hardFilterBlocked ? "Hold" : rawSignal;
-  const decisionLabel: ConfidenceDecisionLabel = hardFilterBlocked ? "Hold" : rawDecisionLabel;
-  const sizing = (options.sizing ?? confidencePositionSizing)(market, signal, normalizedNetScore);
-  const positionSize = sizing.finalQuantity;
-  const logs = [
-    `Updated indicators: VWAP ${price(market.vwap)}, RSI ${market.rsi === null ? "NA" : market.rsi.toFixed(1)}, MACD histogram ${market.macd === null ? "NA" : market.macd.histogram.toFixed(4)}.`,
-    `Modifiers: ${confidenceModifierDetail(market)}`,
-    `Scores: net_score ${netScore.toFixed(4)} / active_weight ${activeWeight.toFixed(4)} = normalized_net_score ${normalizedNetScore.toFixed(4)}.`,
-    `Agreement: buy ${formatProbability(buyAgreement)}, sell ${formatProbability(sellAgreement)}, required ${formatProbability(settings.minimumDirectionalAgreement)}.`,
-    `Average confidence: buy ${formatProbability(buyAverageConfidence)}, sell ${formatProbability(sellAverageConfidence)}, required ${formatProbability(settings.minimumAverageConfidence)}.`,
-    `Active strategies: ${activeStrategyCount}/${settings.minimumActiveStrategies}. Thresholds: strong buy >= ${settings.strongBuyThreshold.toFixed(2)}, buy >= ${settings.buyThreshold.toFixed(2)}, sell <= ${settings.sellThreshold.toFixed(2)}, strong sell <= ${settings.strongSellThreshold.toFixed(2)}.`,
-    `Raw decision ${rawDecisionLabel}; hard filters ${hardFilterBlocked ? "blocked" : "passed"}; final decision ${decisionLabel}; position size ${positionSize} shares.`,
-  ];
   return {
     signal,
-    decisionLabel,
+    decisionLabel: wcaDecisionLabel(signal, normalizedNetScore),
     buyScore,
     sellScore,
     netScore,
@@ -11512,21 +11724,162 @@ function calculateConfidenceAggregationFromMarket(
     sellAgreement,
     buyAverageConfidence,
     sellAverageConfidence,
-    buyThreshold: settings.buyThreshold,
-    sellThreshold: settings.sellThreshold,
-    strongBuyThreshold: settings.strongBuyThreshold,
-    strongSellThreshold: settings.strongSellThreshold,
+    buyThreshold: wcaNumberFromBackendConfiguration("buyThreshold", "buy_threshold", 0),
+    sellThreshold: wcaNumberFromBackendConfiguration("sellThreshold", "sell_threshold", 0),
+    strongBuyThreshold: wcaNumberFromBackendConfiguration("strongBuyThreshold", "strong_buy_threshold", 0),
+    strongSellThreshold: wcaNumberFromBackendConfiguration("strongSellThreshold", "strong_sell_threshold", 0),
     strategies,
-    stopDistance: market.atr.stopDistance,
-    positionSizeMultiplier: sizing.sizeMultiplier,
-    positionSize,
-    sizing,
-    hardFilters,
-    logs,
-    detail: activeWeight
-      ? `Decision follows paper-trading thresholds, minimum active strategy count, agreement, average confidence, and hard filters. ${confidenceModifierDetail(market)}`
-      : `No active Buy/Sell strategy weight. ${confidenceModifierDetail(market)}`,
+    stopDistance: sizingResult.stopDistance,
+    positionSizeMultiplier: sizingResult.sizeMultiplier,
+    positionSize: sizingResult.finalQuantity,
+    sizing: sizingResult,
+    hardFilters: wcaBackendGateRows(gates),
+    logs: [
+      `Backend engine ${stringFromUnknown(decisionRecord.engineVersion ?? decisionRecord.engine_version, "unknown")}`,
+      `Configuration ${stringFromUnknown(decisionRecord.configurationVersion ?? decisionRecord.configuration_version, "unknown")}`,
+      proposedOrder ? `Backend proposed order quantity ${wcaNumberFromKeys(proposedOrder, ["quantity", "approvedQuantity", "approved_quantity"], 0)}` : "No backend proposed order",
+    ],
+    detail,
   };
+}
+
+function wcaBackendEmptyConfidenceResult(reason: string): ConfidenceAggregationResult {
+  return {
+    signal: "Hold",
+    decisionLabel: "Hold",
+    buyScore: 0,
+    sellScore: 0,
+    netScore: 0,
+    activeWeight: 0,
+    normalizedNetScore: 0,
+    activeStrategyCount: 0,
+    buyWeight: 0,
+    sellWeight: 0,
+    buyAgreement: 0,
+    sellAgreement: 0,
+    buyAverageConfidence: 0,
+    sellAverageConfidence: 0,
+    buyThreshold: 0,
+    sellThreshold: 0,
+    strongBuyThreshold: 0,
+    strongSellThreshold: 0,
+    strategies: [],
+    stopDistance: 0,
+    positionSizeMultiplier: 0,
+    positionSize: 0,
+    sizing: confidenceEmptyPositionSizing(reason),
+    hardFilters: [{ label: "Backend WCA", status: "info", detail: reason }],
+    logs: [reason],
+    detail: reason,
+  };
+}
+
+function wcaBackendStrategyRows(decision: Record<string, unknown>, aggregation: Record<string, unknown> | null): ConfidenceStrategyResult[] {
+  const rows =
+    arrayFromUnknown(decision.strategyEvaluations ?? decision.strategy_evaluations ?? decision.strategies).filter(isRecord) ??
+    [];
+  const contributions = arrayFromUnknown(aggregation?.contributions).filter(isRecord);
+  const source = rows.length ? rows : contributions;
+  return source.map((row, index) => {
+    const signal = algoSignalFromUnknown(row.direction ?? row.signal ?? row.finalDecision ?? row.final_decision);
+    const contractSignal = confidenceContractSignal(signal);
+    const confidence = wcaNumberFromKeys(row, ["calibratedConfidence", "calibrated_confidence", "confidence", "rawConfidence", "raw_confidence"], 0);
+    const effectiveWeight = wcaNumberFromKeys(row, ["effectiveWeight", "effective_weight", "finalWeight", "final_weight"], 0);
+    const baseWeight = wcaNumberFromKeys(row, ["baseWeight", "base_weight", "originalWeight", "original_weight"], effectiveWeight);
+    return {
+      strategy: stringFromUnknown(row.strategyId ?? row.strategy_id ?? row.strategy ?? row.slug, `wca_strategy_${index + 1}`),
+      signal: contractSignal,
+      confidence,
+      base_weight: baseWeight,
+      effective_weight: effectiveWeight,
+      direction: confidenceSignalDirection(contractSignal),
+      reason: stringFromUnknown(row.reason ?? row.explanation ?? arrayFromUnknown(row.reasonCodes ?? row.reason_codes).join("; "), "Backend WCA strategy output"),
+      key: stringFromUnknown(row.key ?? row.strategyId ?? row.strategy_id, `WCA${index + 1}`),
+      name: stringFromUnknown(row.name ?? row.strategyName ?? row.strategy_name ?? row.strategyId ?? row.strategy_id, `WCA Strategy ${index + 1}`),
+      contribution: wcaNumberFromKeys(row, ["contribution"], 0),
+    };
+  });
+}
+
+function wcaBackendGateRows(gates: Record<string, unknown> | null): ConfidenceAggregationResult["hardFilters"] {
+  const rows = arrayFromUnknown(gates?.evaluations ?? gates?.gates ?? gates?.gate_results ?? gates?.gateResults).filter(isRecord);
+  if (!rows.length && gates) {
+    const status = stringFromUnknown(gates.status ?? gates.decision, "pass").toLowerCase();
+    return [{ label: "Backend WCA gates", status: status.includes("fail") || status.includes("reject") ? "fail" : "info", detail: stringFromUnknown(gates.detail ?? gates.reason, "Backend gate result") }];
+  }
+  if (!rows.length) {
+    return [{ label: "Backend WCA gates", status: "info", detail: "No backend gate snapshot available" }];
+  }
+  return rows.map((row) => {
+    const rawStatus = stringFromUnknown(row.status, "info").toLowerCase();
+    return {
+      label: stringFromUnknown(row.gateId ?? row.gate_id ?? row.label, "Backend gate"),
+      status: rawStatus.includes("fail") || rawStatus.includes("reject") ? "fail" : rawStatus.includes("pass") || rawStatus.includes("allow") ? "pass" : "info",
+      detail: stringFromUnknown(row.detail ?? row.reason ?? row.reasonCode ?? row.reason_code, "Backend gate evaluation"),
+    };
+  });
+}
+
+function wcaSizingFromBackend(sizing: Record<string, unknown> | null, signal: AlgoSignal): ConfidencePositionSizing {
+  const finalQuantity = Math.max(0, Math.floor(wcaNumberFromKeys(sizing, ["finalQuantity", "final_quantity", "proposedQuantity", "proposed_quantity"], 0)));
+  const sizeMultiplier = wcaNumberFromKeys(sizing, ["sizeMultiplier", "size_multiplier", "confidenceSizeMultiplier", "confidence_size_multiplier"], finalQuantity > 0 ? 1 : 0);
+  const stopDistance = wcaNumberFromKeys(sizing, ["stopDistance", "stop_distance"], 0);
+  return {
+    signalStrength: Math.abs(wcaNumberFromKeys(sizing, ["signalStrength", "signal_strength"], 0)),
+    sizeMultiplier,
+    riskDollars: wcaNumberFromKeys(sizing, ["riskDollars", "risk_dollars"], 0),
+    stopDistance,
+    sharesByRisk: wcaNumberFromKeys(sizing, ["sharesByRisk", "shares_by_risk"], finalQuantity),
+    sharesByOrder: wcaNumberFromKeys(sizing, ["sharesByOrder", "shares_by_order"], finalQuantity),
+    sharesByCapital: wcaNumberFromKeys(sizing, ["sharesByCapital", "shares_by_capital"], finalQuantity),
+    sharesByBuyingPower: wcaNumberFromKeys(sizing, ["sharesByBuyingPower", "shares_by_buying_power"], finalQuantity),
+    sharesByLiquidity: wcaNumberFromKeys(sizing, ["sharesByLiquidity", "shares_by_liquidity"], finalQuantity),
+    finalQuantity: signal === "Hold" ? 0 : finalQuantity,
+    availableBuyingPower: wcaNumberFromKeys(sizing, ["availableBuyingPower", "available_buying_power"], 0),
+    accountEquity: wcaNumberFromKeys(sizing, ["accountEquity", "account_equity"], state.confidenceTradingSettings.startingCapital),
+    maxPositionDollars: wcaNumberFromKeys(sizing, ["maxPositionDollars", "max_position_dollars"], 0),
+    currentPositionValue: wcaNumberFromKeys(sizing, ["currentPositionValue", "current_position_value"], 0),
+    limitingFactor: stringFromUnknown(sizing?.limitingCap ?? sizing?.limiting_cap ?? sizing?.limitingFactor ?? sizing?.limiting_factor, "backend sizing"),
+    blockedReason: signal === "Hold" ? "backend WCA decision is Hold" : stringFromUnknown(sizing?.blockedReason ?? sizing?.blocked_reason, ""),
+  };
+}
+
+function wcaNumberFromBackendConfiguration(camelKey: string, snakeKey: string, fallback: number) {
+  const decisionSettings = (wcaPresentationState.configuration?.decisionSettings ?? wcaPresentationState.configuration?.decision_settings ?? {}) as Record<string, unknown>;
+  return numberFromUnknown(decisionSettings[camelKey] ?? decisionSettings[snakeKey], fallback);
+}
+
+function wcaNumberFromKeys(record: Record<string, unknown> | null | undefined, keys: string[], fallback: number) {
+  for (const key of keys) {
+    const number = numberFromUnknown(record?.[key], Number.NaN);
+    if (Number.isFinite(number)) {
+      return number;
+    }
+  }
+  return fallback;
+}
+
+function wcaDecisionLabel(signal: AlgoSignal, normalizedNetScore: number): ConfidenceDecisionLabel {
+  if (signal === "Buy") {
+    return normalizedNetScore >= 0.8 ? "Strong Buy" : "Buy";
+  }
+  if (signal === "Sell") {
+    return normalizedNetScore <= -0.8 ? "Strong Sell" : "Sell";
+  }
+  return "Hold";
+}
+
+function renderWcaBackendOnlyPanel(title: string, detail: string) {
+  return `
+    <div class="trading-settings-panel weighted-trading-settings-panel" data-status="ready" data-expanded="true">
+      <div class="trading-settings-body">
+        <div class="wca-empty">
+          <strong>${escapeHtml(title)}</strong>
+          <span>${escapeHtml(detail)}</span>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function confidenceMarketSnapshot(): ConfidenceMarket | null {
@@ -12574,9 +12927,9 @@ function renderConfidenceSummary(result: ConfidenceAggregationResult) {
       </article>
     </div>
     <div class="confidence-score-breakdown">
-      <span><b>Scores</b> Buy ${result.buyScore.toFixed(2)} · Sell ${result.sellScore.toFixed(2)} · Net ${result.netScore.toFixed(2)}</span>
-      <span><b>Weights</b> Buy ${result.buyWeight.toFixed(2)} · Sell ${result.sellWeight.toFixed(2)} · Active ${result.activeWeight.toFixed(2)}</span>
-      <span><b>Thresholds</b> Strong Buy ${result.strongBuyThreshold.toFixed(2)} · Buy ${result.buyThreshold.toFixed(2)} · Sell ${result.sellThreshold.toFixed(2)} · Strong Sell ${result.strongSellThreshold.toFixed(2)}</span>
+      <span><b>Scores</b> Buy ${result.buyScore.toFixed(2)} - Sell ${result.sellScore.toFixed(2)} - Net ${result.netScore.toFixed(2)}</span>
+      <span><b>Weights</b> Buy ${result.buyWeight.toFixed(2)} - Sell ${result.sellWeight.toFixed(2)} - Active ${result.activeWeight.toFixed(2)}</span>
+      <span><b>Thresholds</b> Strong Buy ${result.strongBuyThreshold.toFixed(2)} - Buy ${result.buyThreshold.toFixed(2)} - Sell ${result.sellThreshold.toFixed(2)} - Strong Sell ${result.strongSellThreshold.toFixed(2)}</span>
     </div>
     <div class="confidence-filter-row">
       ${result.hardFilters.map((filter) => `<span data-status="${filter.status}"><b>${escapeHtml(filter.label)}</b>${escapeHtml(filter.detail)}</span>`).join("")}
@@ -12622,12 +12975,9 @@ function renderConfidenceRequirementsPanel(result: ConfidenceAggregationResult) 
   `;
 }
 
-function renderRegimeTradingSettingsPanel(result: RegimeSelectionResult) {
-  const adapted = regimeSelectionAsConfidenceResult(result);
+function renderRegimeTradingSettingsPanel(result: RegimeSelectionResult, targetOrder: ManualOrderRecommendation) {
   const settings = state.regimeTradingSettings;
   const expanded = state.regimeTradingSettingsExpanded;
-  const targetOrder = confidenceTargetOrderRecommendation(adapted, "regime");
-  state.currentRegimeTargetOrder = targetOrder;
   return `
     <div class="trading-settings-panel weighted-trading-settings-panel" data-status="ready" data-expanded="${String(expanded)}">
       <button id="regimeTradingSettingsToggle" class="trading-settings-head" type="button" aria-expanded="${String(expanded)}" aria-controls="regimeTradingSettingsBody">
@@ -12635,95 +12985,343 @@ function renderRegimeTradingSettingsPanel(result: RegimeSelectionResult) {
           <b>${expanded ? "-" : "+"}</b>
           <strong>Strategy Settings</strong>
         </span>
-        <span class="trading-settings-summary">${escapeHtml(regimeTradingSettingsSummary(result, adapted))}</span>
+        <span class="trading-settings-summary">${escapeHtml(regimeTradingSettingsSummary(result, targetOrder))}</span>
       </button>
       <div id="regimeTradingSettingsBody" class="trading-settings-body" ${expanded ? "" : "hidden"}>
-        <div class="trading-settings-grid">
-          ${renderRegimeTradingSettingInput("startingCapital", "Total balance", settings.startingCapital, 1000, 10000000, 100)}
-          ${renderRegimeTradingSettingInput("orderAllocationPercent", "Order limit %", settings.orderAllocationPercent, 0.1, REGIME_MAX_ORDER_ALLOCATION_PERCENT, 0.1)}
-          ${renderRegimeTradingSettingInput("dailyAllocationPercent", "Buying power %", settings.dailyAllocationPercent, 0.1, 100, 0.1)}
-          ${renderRegimeTradingSettingInput("riskBudgetPercentOfOrder", "Risk budget %", settings.riskBudgetPercentOfOrder, 0.1, 100, 0.1)}
-          ${renderRegimeTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 1, 50, 1)}
-          ${renderRegimeTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
-          ${renderRegimeTradingSettingInput("stopLossPercent", "Stop %", settings.stopLossPercent, 0.01, 20, 0.01)}
-          ${renderRegimeTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
-          ${renderRegimeTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
+        <div class="regime-reset-actions">
+          <button id="regimeResetBaselineDefaults" class="secondary-action" type="button">Reset baseline to defaults</button>
+          <button id="regimeResetProfileMatrixDefaults" class="secondary-action" type="button">Reset profile matrix to defaults</button>
         </div>
+        ${renderRegimeProfileComparison(result)}
         ${renderConfidenceTargetOrderSettings(targetOrder, "Regime", "regime")}
-        ${renderRegimeDefaultSizingSection(settings, adapted)}
+        ${renderRegimeDefaultSizingSection(settings, targetOrder.regimeSizing ?? emptyRegimeSizingForUi(settings, "Regime sizing unavailable"))}
       </div>
     </div>
   `;
 }
 
-function regimeTradingSettingsSummary(result: RegimeSelectionResult, adapted: ConfidenceAggregationResult) {
-  return `Qty ${adapted.positionSize} · ${formatProbability(result.scores.buy)} buy · edge ${formatProbability(result.scoreEdge)} · ${formatProbability(result.confidence)} condition`;
+function regimeTradingSettingsSummary(result: RegimeSelectionResult, targetOrder: ManualOrderRecommendation) {
+  return `Qty ${targetOrder.quantity} - ${formatProbability(result.scores.buy)} buy / ${formatProbability(result.scores.sell)} sell - edge ${formatProbability(result.scoreEdge)} - ${formatProbability(result.confidence)} condition`;
 }
 
-function renderRegimeDefaultSizingSection(settings: TradingSettings, result: ConfidenceAggregationResult) {
-  return renderConfidenceDefaultSizingSection(settings, result, {
-    expanded: state.regimeDefaultSizingExpanded,
-    toggleId: "regimeDefaultSizingToggle",
-    bodyId: "regimeDefaultSizingBody",
-    inputRenderer: renderRegimeTradingSettingInput,
-    toggleRenderer: renderRegimeTradingSettingToggle,
-  });
+function renderRegimeProfileComparison(result: RegimeSelectionResult) {
+  const settings = state.regimeTradingSettings;
+  const base = baseRegimeSettingsFromTradingSettings(settings);
+  const effective = result.effectiveSettings;
+  const modifierBreakdown = regimeProfileModifierBreakdownForUi(result);
+  const combinedModifiers = modifierBreakdown ? combineRegimeProfileModifiers(Object.values(modifierBreakdown)) : null;
+  const noTradeReason = effective && !effective.newEntriesAllowed ? effective.reasons.join("; ") || "Effective profile blocks new entries" : "None";
+  return `
+    <div class="regime-profile-shell">
+      <div class="regime-profile-meta">
+        <span><b>Settings version</b> ${escapeHtml(effective?.baseSettingsVersion ?? "regime_base_settings_v1")}</span>
+        <span><b>Profile version</b> ${escapeHtml(effective?.profileVersion ?? "regime_profile_matrix_v1")}</span>
+        <span><b>Current profile ID</b> ${escapeHtml(effective?.profileId ?? "unavailable")}</span>
+        <span><b>Reason for no-trade profile</b> ${escapeHtml(noTradeReason)}</span>
+      </div>
+      <div class="regime-profile-columns">
+        <section>
+          <h4>Default baseline</h4>
+          <div class="trading-settings-grid">
+            ${renderRegimeTradingSettingInput("startingCapital", "Total balance", settings.startingCapital, 1000, 10000000, 100)}
+            ${renderRegimeTradingSettingInput("orderAllocationPercent", "Order allocation %", settings.orderAllocationPercent, 0.1, REGIME_MAX_ORDER_ALLOCATION_PERCENT, 0.1)}
+            ${renderRegimeTradingSettingInput("dailyAllocationPercent", "Daily allocation %", settings.dailyAllocationPercent, 0.1, 100, 0.1)}
+            ${renderRegimeTradingSettingInput("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0.01, 10, 0.01)}
+            ${renderRegimeTradingSettingInput("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0.1, 100, 0.1)}
+            ${renderRegimeTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 1, 50, 1)}
+            ${renderRegimeTradingSettingInput("minimumBuyScore", "Minimum winning score", settings.minimumBuyScore, 0, 1, 0.01)}
+            ${renderRegimeTradingSettingInput("minimumSignalEdge", "Minimum directional edge", settings.minimumSignalEdge, 0, 1, 0.01)}
+            ${renderRegimeTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
+            ${renderRegimeTradingSettingInput("atrStopMultiplier", "ATR stop multiplier", settings.atrStopMultiplier, 0.1, 10, 0.1)}
+            ${renderRegimeTradingSettingInput("minimumStopDistancePercent", "Minimum stop distance %", settings.minimumStopDistancePercent, 0.001, 5, 0.001)}
+            ${renderRegimeTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
+            ${renderRegimeTradingSettingInput("maxParticipationPercent", "Max participation %", settings.maxParticipationPercent, 0.001, 10, 0.001)}
+            ${renderRegimeTradingSettingInput("minimumOneMinuteVolume", "Minimum 1m volume", settings.minimumOneMinuteVolume, 0, 10000000, 1)}
+            ${renderRegimeTradingSettingInput("maxAllowedShares", "Max shares", settings.maxAllowedShares, 0, 1000000, 1)}
+            ${renderRegimeTradingSettingInput("maxDailyLossPercent", "Algorithm daily loss %", settings.maxDailyLossPercent, 0.1, 10, 0.1)}
+            ${renderRegimeTradingSettingInput("maximumHoldingMinutes", "Maximum holding minutes", settings.maximumHoldingMinutes, 1, 390, 1)}
+            ${renderRegimeTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
+            ${renderRegimeTradingSettingToggle("pyramidingEnabled", "Pyramiding", settings.pyramidingEnabled)}
+          </div>
+        </section>
+        <section>
+          <h4>Effective current profile</h4>
+          <div class="regime-effective-grid">
+            ${renderRegimeReadOnlyProfileValue("Risk percent", effective?.effectiveRiskPercent, "%")}
+            ${renderRegimeReadOnlyProfileValue("Order allocation percent", effective?.effectiveOrderAllocationPercent, "%")}
+            ${renderRegimeReadOnlyProfileValue("Max position percent", effective?.effectiveMaxPositionPercent, "%")}
+            ${renderRegimeReadOnlyProfileValue("ATR stop multiplier", effective?.effectiveAtrStopMultiplier, "x")}
+            ${renderRegimeReadOnlyProfileValue("Take profit R", effective?.effectiveTakeProfitR, "R")}
+            ${renderRegimeReadOnlyProfileValue("Maximum participation percent", effective?.effectiveMaximumParticipationPercent, "%")}
+            ${renderRegimeReadOnlyProfileValue("Minimum winning score", effective?.effectiveMinimumWinningScore)}
+            ${renderRegimeReadOnlyProfileValue("Minimum directional edge", effective?.effectiveMinimumDirectionalEdge)}
+            ${renderRegimeReadOnlyProfileValue("Minimum regime confidence", effective?.effectiveMinimumRegimeConfidence)}
+            ${renderRegimeReadOnlyProfileValue("Maximum trades", effective?.effectiveMaximumTrades)}
+            ${renderRegimeReadOnlyProfileValue("New entries allowed", effective ? (effective.newEntriesAllowed ? "Yes" : "No") : "NA")}
+            ${renderRegimeReadOnlyProfileValue("Pyramiding allowed", effective ? (effective.pyramidingAllowed ? "Yes" : "No") : "NA")}
+          </div>
+          <div class="regime-modifier-list">
+            <strong>Applied modifiers and reasons</strong>
+            ${renderRegimeCombinedModifierSummary(combinedModifiers)}
+            ${modifierBreakdown ? renderRegimeModifierBreakdown(modifierBreakdown) : `<span>Profile modifiers unavailable.</span>`}
+          </div>
+        </section>
+      </div>
+      <div class="regime-baseline-note">
+        <span>Effective current profile values are read-only. User edits apply only to the Default baseline and permitted profile configuration.</span>
+        <span>Baseline snapshot: risk ${base.baseRiskPercent}% / allocation ${base.orderAllocationPercent}% / max position ${base.maxPositionPercent}%.</span>
+      </div>
+    </div>
+  `;
 }
 
-function regimeSelectionAsConfidenceResult(result: RegimeSelectionResult): ConfidenceAggregationResult {
-  const market = confidenceMarketSnapshot();
-  const signal: AlgoSignal = result.tradeAllowed ? "Buy" : result.signal === "Sell" ? "Sell" : "Hold";
-  const normalizedNetScore = result.tradeAllowed ? result.scores.buy : 0;
-  const sizing = market ? confidencePositionSizing(market, signal, normalizedNetScore, { mode: "regime" }) : confidenceEmptyPositionSizing("Waiting for session candles");
-  const hardFilters: ConfidenceAggregationResult["hardFilters"] = [
+function renderRegimeReadOnlyProfileValue(label: string, value: string | number | boolean | null | undefined, suffix = "") {
+  const display = typeof value === "number" ? `${roundNumber(value, 4)}${suffix}` : String(value ?? "NA");
+  return `<span><b>${escapeHtml(label)}</b><strong>${escapeHtml(display)}</strong></span>`;
+}
+
+function regimeProfileModifierBreakdownForUi(result: RegimeSelectionResult) {
+  const market = currentRegimeMarketContext();
+  const confirmedRegime = result.confirmedState?.confirmedRegime ?? result.rawClassification?.rawRegime ?? "no_trade";
+  if (!confirmedRegime) {
+    return null;
+  }
+  return buildRegimeProfileModifierBreakdown({ market, result, settings: state.regimeTradingSettings }, confirmedRegime);
+}
+
+function renderRegimeCombinedModifierSummary(modifier: ReturnType<typeof combineRegimeProfileModifiers> | null) {
+  if (!modifier) {
+    return "";
+  }
+  return `
+    <span><b>Risk multiplier</b> ${formatMultiplier(modifier.riskMultiplier)}</span>
+    <span><b>Allocation multiplier</b> ${formatMultiplier(modifier.allocationMultiplier)}</span>
+    <span><b>Position multiplier</b> ${formatMultiplier(modifier.positionMultiplier)}</span>
+    <span><b>Liquidity participation multiplier</b> ${formatMultiplier(modifier.liquidityParticipationMultiplier)}</span>
+    <span><b>Signal size multiplier</b> ${formatMultiplier(modifier.signalSizeMultiplier)}</span>
+    <span><b>ATR stop adjustment</b> ${roundNumber(modifier.atrStopMultiplierAdjustment, 4)}</span>
+    <span><b>Target R multiplier</b> ${formatMultiplier(modifier.targetRMultiplier)}</span>
+    <span><b>Winning score adjustment</b> ${roundNumber(modifier.winningScoreAdjustment, 4)}</span>
+    <span><b>Directional edge adjustment</b> ${roundNumber(modifier.directionalEdgeAdjustment, 4)}</span>
+    <span><b>Regime confidence adjustment</b> ${roundNumber(modifier.regimeConfidenceAdjustment, 4)}</span>
+    <span><b>Maximum trades override</b> ${modifier.maximumTradesOverride ?? "None"}</span>
+    <span><b>Entry cutoff override</b> ${escapeHtml(modifier.entryCutoffOverride ?? "None")}</span>
+  `;
+}
+
+function renderRegimeModifierBreakdown(breakdown: NonNullable<ReturnType<typeof regimeProfileModifierBreakdownForUi>>) {
+  return Object.entries(breakdown)
+    .map(([name, modifier]) => {
+      const reasons = modifier.reasons.length ? modifier.reasons.join("; ") : "No modifier reason";
+      return `<span><b>${escapeHtml(startCase(name))}</b> ${escapeHtml(reasons)}</span>`;
+    })
+    .join("");
+}
+
+function renderRegimeDefaultSizingSection(settings: TradingSettings, sizing: RegimePositionSizingResult) {
+  const expanded = state.regimeDefaultSizingExpanded;
+  const defaults = regimeDefaultSizingSettings();
+  return `
+    <div class="trading-default-section weighted-default-section" data-expanded="${String(expanded)}">
+      <div class="trading-default-head">
+        <button id="regimeDefaultSizingToggle" class="trading-default-expand" type="button" aria-expanded="${String(expanded)}" aria-controls="regimeDefaultSizingBody">
+          <b>${expanded ? "-" : "+"}</b>
+          <strong>Default Settings</strong>
+        </button>
+        ${renderRegimeTradingSettingToggle("useDefaultSizingSettings", "On / Off", settings.useDefaultSizingSettings)}
+      </div>
+      <div id="regimeDefaultSizingBody" class="trading-default-body" ${expanded ? "" : "hidden"}>
+        <div class="trading-settings-grid trading-default-grid">
+          ${renderRegimeTradingSettingInput("minimumBuyScore", "Minimum winning score", settings.minimumBuyScore, 0, 1, 0.01)}
+          ${renderRegimeTradingSettingInput("minimumSignalEdge", "Minimum winning direction edge", settings.minimumSignalEdge, 0, 1, 0.01)}
+          ${renderRegimeTradingSettingInput("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0.01, 10, 0.01)}
+          ${renderRegimeTradingSettingInput("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0.1, 100, 0.1)}
+          ${renderRegimeTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
+          ${renderRegimeTradingSettingInput("atrStopMultiplier", "ATR stop multiplier", settings.atrStopMultiplier, 0.1, 10, 0.1)}
+          ${renderRegimeTradingSettingInput("minimumStopDistancePercent", "Min stop distance %", settings.minimumStopDistancePercent, 0.001, 5, 0.001)}
+          ${renderRegimeTradingSettingInput("maxParticipationPercent", "Max participation %", settings.maxParticipationPercent, 0.001, 10, 0.001)}
+          ${renderRegimeTradingSettingInput("minimumOneMinuteVolume", "Min 1m volume", settings.minimumOneMinuteVolume, 0, 10000000, 1)}
+          ${renderRegimeTradingSettingInput("maxAllowedShares", "Max shares (0 auto)", settings.maxAllowedShares, 0, 1000000, 1)}
+          ${renderRegimeTradingSettingInput("maxDailyLossPercent", "Max daily loss %", settings.maxDailyLossPercent, 0.1, 10, 0.1)}
+          ${renderRegimeTradingSettingToggle("pyramidingEnabled", "Pyramiding", settings.pyramidingEnabled)}
+        </div>
+        <div class="confidence-sizing-preview">
+          <span><b>Regime Strength</b> ${formatProbability(sizing.signalStrength)} -> ${formatProbability(sizing.sizeMultiplier)} size multiplier</span>
+          <span><b>Risk Dollars</b> ${currency(sizing.accountEquity)} x ${roundNumber(defaults.baseRiskPercent, 3)}% x ${formatProbability(sizing.sizeMultiplier)} = ${currency(sizing.riskDollars)}</span>
+          <span><b>Stop Distance</b> ${price(defaults.fixedStopDistanceDollars)} fixed $/share = ${price(sizing.stopDistance)}</span>
+          <span><b>Shares By Risk</b> ${Number.isFinite(sizing.sharesByRisk) ? Math.floor(sizing.sharesByRisk).toLocaleString() : "0"}</span>
+          <span><b>Shares By Order Limit</b> ${formatShareLimit(sizing.sharesByOrder)}</span>
+          <span><b>Shares By Capital</b> ${Math.floor(sizing.sharesByCapital).toLocaleString()}</span>
+          <span><b>Shares By Buying Power</b> ${Math.floor(sizing.sharesByBuyingPower).toLocaleString()}</span>
+          <span><b>Shares By Liquidity</b> ${formatShareLimit(sizing.sharesByLiquidity)}</span>
+          <span><b>Current Position Value</b> ${currency(sizing.currentPositionValue)} / ${currency(sizing.maxPositionDollars)} max</span>
+          <span><b>Final Quantity</b> ${sizing.finalQuantity.toLocaleString()}${sizing.blockedReason ? ` - ${escapeHtml(sizing.blockedReason)}` : ""}</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function buildRegimeTargetOrderRecommendation(result: RegimeSelectionResult): ManualOrderRecommendation {
+  const market = currentRegimeMarketContext();
+  const latest = market?.latest ?? latestExecutionCandleForMode("regime");
+  const target = buildRegimeTargetOrder(
+    result,
+    market,
+    state.symbol,
+    state.regimeTradingSettings,
+    regimeDefaultSizingSettings(),
+    latest ? regimeCurrentPositionSnapshot(latest.close) : { shares: 0, marketValue: 0 },
     {
-      label: "Regime Selector",
+      shortTradingEnabled: false,
+      accountShortPermission: false,
+      assetShortable: false,
+      borrowAvailable: false,
+      buyingPowerAvailable: targetBuyingPowerAvailable(state.regimeTradingSettings),
+      shortSaleRestrictionActive: false,
+    },
+  );
+  const order = regimeTargetOrderAsManualRecommendation(result, target, market, latest?.timestamp ?? null);
+  return applyConfidenceTargetOrderOverrides(order, "regime");
+}
+
+function regimeTargetOrderAsManualRecommendation(
+  result: RegimeSelectionResult,
+  target: RegimeTargetOrder,
+  market: ReturnType<typeof currentRegimeMarketContext>,
+  lastTime: string | null,
+): ManualOrderRecommendation {
+  const failedGates = regimeTargetOrderFailedGates(result, target);
+  const eligible = target.eligible && failedGates.length === 0;
+  return {
+    eligible,
+    side: eligible ? target.side : "Hold",
+    signalDirection: target.signalDirection,
+    positionEffect: target.positionEffect,
+    orderIntent: target.orderIntent,
+    effectiveProfileId: target.profileId,
+    currentPosition: target.currentPosition,
+    requestedResultingPosition: target.requestedResultingPosition,
+    orderType: eligible ? target.orderType : "No order",
+    symbol: target.symbol,
+    quantity: eligible ? target.quantity : 0,
+    triggerPrice: target.triggerPrice,
+    limitPrice: target.limitPrice,
+    stopPrice: target.stopPrice,
+    targetPrice: target.targetPrice,
+    accountBalance: target.accountBalance,
+    orderLimitDollars: target.orderLimitDollars,
+    dailyLimitDollars: target.dailyLimitDollars,
+    riskDollars: target.riskDollars,
+    orderNotional: target.orderNotional,
+    plannedStopRiskDollars: target.plannedStopRiskDollars,
+    estimatedSlippage: target.estimatedSlippage,
+    timeInForce: target.timeInForce,
+    cutoff: target.cutoff,
+    submitMode: (state.regimeTargetOrderOverrides.submitMode as SubmitOrderMode | undefined) ?? DEFAULT_SUBMIT_MODE,
+    failedGates,
+    gates: regimeTargetOrderGates(result, target),
+    levels: {
+      last: market?.latest.close ?? null,
+      vwap: market?.vwap ?? null,
+      openingHigh: market?.openingRange.high ?? null,
+      openingLow: market?.openingRange.low ?? null,
+      lastTime,
+    },
+    summary: eligible ? target.summary : `No order: ${uniqueStrings(failedGates).join(", ") || "Regime final signal is Hold"}.`,
+    regimeSizing: target.sizing,
+  };
+}
+
+function regimeTargetOrderFailedGates(result: RegimeSelectionResult, target: RegimeTargetOrder) {
+  const failed = target.failedGates.map((gate) => (gate.startsWith("regime.") ? regimeReasonLabel(gate) : gate));
+  if (target.sizing.blockedReason) {
+    failed.push(`Sizing: ${target.sizing.blockedReason}`);
+  }
+  const latest = latestExecutionCandleForMode("regime");
+  const resolved = resolveRegimeDecision(result);
+  if (latest && resolved.signal === "Buy") {
+    const lateSessionBlocker = lateSessionAboveAverageBuyBlocker("regime", latest.close, latest.timestamp);
+    if (lateSessionBlocker) {
+      failed.push(`Regime Late-session Buy Guard: ${lateSessionBlocker}`);
+    }
+    forecastBuySafetyBlockers("regime", latest.close, latest.timestamp).forEach((detail) => {
+      failed.push(`Regime Forecast Safety: ${detail}`);
+    });
+  }
+  return uniqueStrings(failed.filter(Boolean));
+}
+
+function regimeTargetOrderGates(result: RegimeSelectionResult, target: RegimeTargetOrder): TradeLayerGate[] {
+  return [
+    {
+      layer: "Regime Selector",
       status: result.tradeAllowed ? "pass" : "fail",
+      signal: result.signal === "No-trade" ? "Hold" : result.signal,
       detail: result.tradeBlockers.length ? result.tradeBlockers.join("; ") : "Regime score, edge, confidence, and opportunity passed",
     },
     {
-      label: "Market Condition",
-      status: result.confidence >= 0.65 ? "pass" : "fail",
-      detail: `${result.confirmedCondition}, confidence ${formatProbability(result.confidence)}`,
+      layer: "Regime Sizing",
+      status: target.sizing.finalQuantity > 0 ? "pass" : "fail",
+      signal: target.signalDirection,
+      detail: `Quantity ${target.sizing.finalQuantity}, limited by ${target.sizing.limitingFactor}`,
     },
     {
-      label: "Buy Score",
-      status: result.scores.buy >= 0.6 ? "pass" : "fail",
-      detail: `${formatProbability(result.scores.buy)} / required 60%`,
-    },
-    {
-      label: "Buy Edge",
-      status: result.scoreEdge >= 0.2 ? "pass" : "fail",
-      detail: `${formatProbability(result.scoreEdge)} / required 20%`,
+      layer: "Position Effect",
+      status: target.positionEffect === "none" ? "fail" : "pass",
+      signal: target.signalDirection,
+      detail: `${target.positionEffect}; current ${target.currentPosition}, requested ${target.requestedResultingPosition}`,
     },
   ];
+}
+
+function targetBuyingPowerAvailable(settings: TradingSettings) {
+  return settings.startingCapital > 0 && settings.dailyAllocationPercent > 0 && settings.orderAllocationPercent > 0;
+}
+
+function regimeReasonLabel(reason: string) {
+  return reason.replace(/^regime\./, "").replaceAll("_", " ").replaceAll(".", ": ");
+}
+
+function emptyRegimeSizingForUi(settings: TradingSettings, blockedReason: string): RegimePositionSizingResult {
   return {
-    signal,
-    decisionLabel: signal === "Buy" ? "Buy" : signal === "Sell" ? "Sell" : "Hold",
-    buyScore: result.scores.buy,
-    sellScore: result.scores.sell,
-    netScore: result.scores.buy - result.scores.sell,
-    activeWeight: 1,
-    normalizedNetScore,
-    activeStrategyCount: result.activeStrategyCount,
-    buyWeight: result.scores.buy,
-    sellWeight: result.scores.sell,
-    buyAgreement: result.scores.buy,
-    sellAgreement: result.scores.sell,
-    buyAverageConfidence: result.scores.buy,
-    sellAverageConfidence: result.scores.sell,
-    buyThreshold: 0.6,
-    sellThreshold: -0.6,
-    strongBuyThreshold: 0.8,
-    strongSellThreshold: -0.8,
-    strategies: result.selectedStrategies,
-    stopDistance: sizing.stopDistance,
-    positionSizeMultiplier: sizing.sizeMultiplier,
-    positionSize: sizing.finalQuantity,
-    sizing,
-    hardFilters,
-    logs: result.reasons,
-    detail: result.tradeAllowed ? "Regime Selector trade gates passed." : `Regime Selector blocked order: ${result.tradeBlockers.join("; ")}`,
+    signalStrength: 0,
+    signalStrengthMultiplier: 0,
+    sizeMultiplier: 0,
+    finalQuantity: 0,
+    requestedQuantityBeforeGlobalCapacity: 0,
+    riskDollars: 0,
+    stopDistance: 0,
+    effectiveTargetR: settings.takeProfitR,
+    targetDistance: 0,
+    riskBasedQuantity: 0,
+    allocationBasedQuantity: 0,
+    positionBasedQuantity: 0,
+    buyingPowerQuantity: 0,
+    liquidityBasedQuantity: 0,
+    shareLimitQuantity: 0,
+    globalRiskCapacityQuantity: null,
+    sharesByRisk: 0,
+    sharesByOrder: 0,
+    sharesByCapital: 0,
+    sharesByBuyingPower: 0,
+    sharesByLiquidity: 0,
+    availableBuyingPower: 0,
+    accountEquity: settings.startingCapital,
+    maxPositionDollars: 0,
+    currentPositionValue: 0,
+    limitingFactor: "sizing",
+    quantityCaps: [
+      { label: "risk", quantity: 0 },
+      { label: "allocation", quantity: 0 },
+      { label: "position", quantity: 0 },
+      { label: "buying_power", quantity: 0 },
+      { label: "liquidity", quantity: 0 },
+      { label: "share_limit", quantity: 0 },
+      { label: "global_risk_capacity", quantity: null },
+    ],
+    blockedReason,
+    blockerCodes: [blockedReason],
   };
 }
 
@@ -12761,7 +13359,7 @@ function renderConfidenceTradingSettingsPanel(result: ConfidenceAggregationResul
 }
 
 function confidenceTradingSettingsSummary(settings: TradingSettings, result: ConfidenceAggregationResult) {
-  return `Qty ${result.positionSize} · ${formatProbability(result.sizing.signalStrength)} strength · ${formatProbability(result.sizing.sizeMultiplier)} size · ${currency(settings.startingCapital)} account`;
+  return `Qty ${result.positionSize} - ${formatProbability(result.sizing.signalStrength)} strength - ${formatProbability(result.sizing.sizeMultiplier)} size - ${currency(settings.startingCapital)} account`;
 }
 
 function renderConfidenceDefaultSizingSection(
@@ -12773,6 +13371,8 @@ function renderConfidenceDefaultSizingSection(
     bodyId?: string;
     inputRenderer?: typeof renderConfidenceTradingSettingInput;
     toggleRenderer?: typeof renderConfidenceTradingSettingToggle;
+    minimumScoreLabel?: string;
+    minimumEdgeLabel?: string;
   } = {},
 ) {
   const expanded = options.expanded ?? state.confidenceDefaultSizingExpanded;
@@ -12780,6 +13380,8 @@ function renderConfidenceDefaultSizingSection(
   const bodyId = options.bodyId ?? "confidenceDefaultSizingBody";
   const inputRenderer = options.inputRenderer ?? renderConfidenceTradingSettingInput;
   const toggleRenderer = options.toggleRenderer ?? renderConfidenceTradingSettingToggle;
+  const minimumScoreLabel = options.minimumScoreLabel ?? "Minimum buy score";
+  const minimumEdgeLabel = options.minimumEdgeLabel ?? "Minimum signal edge";
   const defaults = defaultSizingSettingsFromTradingSettings(settings);
   const sizing = result.sizing;
   return `
@@ -12793,8 +13395,8 @@ function renderConfidenceDefaultSizingSection(
       </div>
       <div id="${bodyId}" class="trading-default-body" ${expanded ? "" : "hidden"}>
         <div class="trading-settings-grid trading-default-grid">
-          ${inputRenderer("minimumBuyScore", "Minimum buy score", settings.minimumBuyScore, 0, 1, 0.01)}
-          ${inputRenderer("minimumSignalEdge", "Minimum signal edge", settings.minimumSignalEdge, 0, 1, 0.01)}
+          ${inputRenderer("minimumBuyScore", minimumScoreLabel, settings.minimumBuyScore, 0, 1, 0.01)}
+          ${inputRenderer("minimumSignalEdge", minimumEdgeLabel, settings.minimumSignalEdge, 0, 1, 0.01)}
           ${inputRenderer("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0.01, 10, 0.01)}
           ${inputRenderer("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0.1, 100, 0.1)}
           ${inputRenderer("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
@@ -12817,14 +13419,84 @@ function renderConfidenceDefaultSizingSection(
           <span><b>Shares By Buying Power</b> ${Math.floor(sizing.sharesByBuyingPower).toLocaleString()}</span>
           <span><b>Shares By Liquidity</b> ${formatShareLimit(sizing.sharesByLiquidity)}</span>
           <span><b>Current Position Value</b> ${currency(sizing.currentPositionValue)} / ${currency(sizing.maxPositionDollars)} max</span>
-          <span><b>Final Quantity</b> ${sizing.finalQuantity.toLocaleString()}${sizing.blockedReason ? ` · ${escapeHtml(sizing.blockedReason)}` : ""}</span>
+          <span><b>Final Quantity</b> ${sizing.finalQuantity.toLocaleString()}${sizing.blockedReason ? ` - ${escapeHtml(sizing.blockedReason)}` : ""}</span>
         </div>
       </div>
     </div>
   `;
 }
 
+function wcaBackendTargetOrderRecommendation(): ManualOrderRecommendation {
+  const decision = wcaPresentationState.latestDecision;
+  const decisionRecord = isRecord(decision) ? (decision as Record<string, unknown>) : null;
+  const proposedOrder =
+    childRecord(decisionRecord, "proposedOrder") ??
+    childRecord(decisionRecord, "proposed_order") ??
+    null;
+  const sizing =
+    childRecord(decisionRecord, "sizingResult") ??
+    childRecord(decisionRecord, "sizing_result") ??
+    null;
+  const latest = latestExecutionCandleForMode("confidence");
+  const side = algoSignalFromUnknown(proposedOrder?.side ?? decisionRecord?.finalDecision ?? decisionRecord?.final_decision ?? decisionRecord?.signal);
+  const quantity = side === "Hold" ? 0 : Math.max(0, Math.floor(wcaNumberFromKeys(proposedOrder, ["approvedQuantity", "approved_quantity", "quantity"], wcaNumberFromKeys(sizing, ["finalQuantity", "final_quantity"], 0))));
+  const triggerPrice = wcaOptionalNumber(proposedOrder?.triggerPrice ?? proposedOrder?.trigger_price);
+  const limitPrice = wcaOptionalNumber(proposedOrder?.limitPrice ?? proposedOrder?.limit_price);
+  const stopPrice = wcaOptionalNumber(proposedOrder?.stopPrice ?? proposedOrder?.stop_price);
+  const targetPrice = wcaOptionalNumber(proposedOrder?.targetPrice ?? proposedOrder?.target_price);
+  const riskDollars = wcaNumberFromKeys(proposedOrder, ["plannedRisk", "planned_risk"], wcaNumberFromKeys(sizing, ["riskDollars", "risk_dollars"], 0));
+  const orderNotional = limitPrice !== null ? roundNumber(quantity * limitPrice, 2) : 0;
+  const eligible = side !== "Hold" && quantity > 0 && proposedOrder !== null;
+  const failedGates = eligible ? [] : ["Backend WCA has not produced an executable order proposal."];
+  return {
+    eligible,
+    side,
+    orderType: eligible ? `${side} backend proposal` : "No order",
+    symbol: state.symbol,
+    quantity,
+    triggerPrice,
+    limitPrice,
+    stopPrice,
+    targetPrice,
+    accountBalance: wcaNumberFromKeys(sizing, ["accountEquity", "account_equity"], state.confidenceTradingSettings.startingCapital),
+    orderLimitDollars: orderNotional,
+    dailyLimitDollars: wcaNumberFromKeys(sizing, ["availableBuyingPower", "available_buying_power"], 0),
+    riskDollars,
+    orderNotional,
+    plannedStopRiskDollars: riskDollars,
+    estimatedSlippage: 0,
+    timeInForce: "Day",
+    cutoff: "Backend WCA controls entry cutoff",
+    submitMode: "Manual",
+    failedGates,
+    gates: wcaBackendDecisionAsConfidenceResult().hardFilters.map((filter) => ({
+      layer: filter.label,
+      status: filter.status,
+      signal: side,
+      detail: filter.detail,
+    })),
+    levels: {
+      last: latest?.close ?? null,
+      vwap: null,
+      openingHigh: null,
+      openingLow: null,
+      lastTime: latest?.timestamp ?? null,
+    },
+    summary: eligible
+      ? `Backend WCA proposed ${side} ${quantity} shares${limitPrice !== null ? ` near ${price(limitPrice)}` : ""}.`
+      : "No WCA order: waiting for backend proposal.",
+  };
+}
+
+function wcaOptionalNumber(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
 function confidenceTargetOrderRecommendation(result: ConfidenceAggregationResult, mode: TradingWindowMode = "confidence"): ManualOrderRecommendation {
+  if (mode === "confidence") {
+    return wcaBackendTargetOrderRecommendation();
+  }
   const settings = tradingSettingsForMode(mode);
   const latest = latestExecutionCandleForMode(mode);
   const targetOverrides =
@@ -12835,7 +13507,7 @@ function confidenceTargetOrderRecommendation(result: ConfidenceAggregationResult
         : state.confidenceTargetOrderOverrides;
   const submitMode = (targetOverrides.submitMode as SubmitOrderMode | undefined) ?? DEFAULT_SUBMIT_MODE;
   const automaticShortCycleBuy = submitMode === "Automatic";
-  const useAutomaticSizingBoost = automaticShortCycleBuy && mode === "confidence";
+  const useAutomaticSizingBoost = false;
   const market = useAutomaticSizingBoost ? confidenceMarketSnapshot() : null;
   const sizing =
     useAutomaticSizingBoost && market
@@ -12844,6 +13516,16 @@ function confidenceTargetOrderRecommendation(result: ConfidenceAggregationResult
   const failedGates = confidenceTargetOrderFailedGates(result, useAutomaticSizingBoost, market, mode).map((filter) => `${filter.label}: ${filter.detail}`);
   if (sizing.blockedReason) {
     failedGates.push(`Sizing: ${sizing.blockedReason}`);
+  }
+  const currentPosition = latest ? summarizePositionFromTradeHistory(latest.close, latest.close, mode) : null;
+  const signalDirection = automaticShortCycleBuy ? "Buy" : result.signal;
+  const regimeShortTradingEnabled = false;
+  const regimePositionEffect =
+    mode === "regime"
+      ? regimePositionEffectForSignal(signalDirection, currentPosition?.shares ?? 0, regimeShortTradingEnabled)
+      : undefined;
+  if (mode === "regime" && signalDirection === "Sell" && regimePositionEffect === "none") {
+    failedGates.push("Short selling disabled: bearish Regime signal may exit an existing long but cannot open a short while flat");
   }
   const side = automaticShortCycleBuy ? "Buy" : failedGates.length ? "Hold" : result.signal;
   const priceValue = latest?.close ?? null;
@@ -12867,7 +13549,11 @@ function confidenceTargetOrderRecommendation(result: ConfidenceAggregationResult
       : pricingSide === "Sell" && triggerPrice !== null
         ? roundNumber(triggerPrice + sizing.stopDistance, 2)
         : null;
-  const quantity = side === "Hold" ? 0 : sizing.finalQuantity;
+  const rawQuantity = side === "Hold" ? 0 : sizing.finalQuantity;
+  const quantity =
+    mode === "regime" && regimePositionEffect === "exit_long"
+      ? Math.min(rawQuantity, Math.max(0, currentPosition?.shares ?? 0))
+      : rawQuantity;
   const targetDistance = targetProfitDistancePerShare(quantity, sizing.stopDistance, settings.takeProfitR);
   const targetPrice =
     pricingSide === "Buy" && triggerPrice !== null
@@ -12887,6 +13573,13 @@ function confidenceTargetOrderRecommendation(result: ConfidenceAggregationResult
   return applyConfidenceTargetOrderOverrides({
     eligible,
     side,
+    signalDirection: mode === "regime" ? signalDirection : undefined,
+    positionEffect: mode === "regime" ? regimePositionEffect : undefined,
+    currentPosition: mode === "regime" ? (currentPosition?.shares ?? 0) : undefined,
+    requestedResultingPosition:
+      mode === "regime"
+        ? requestedResultingPosition(currentPosition?.shares ?? 0, regimePositionEffect ?? "none", quantity)
+        : undefined,
     orderType,
     symbol: state.symbol,
     quantity,
@@ -12939,13 +13632,15 @@ function confidenceTargetOrderFailedGates(
         detail: lateSessionBlocker,
       });
     }
-    forecastBuySafetyBlockers(mode, latest.close, latest.timestamp).forEach((detail) => {
-      failed.push({
-        label: mode === "regime" ? "Regime Forecast Safety" : "WCA Forecast Safety",
-        status: "fail",
-        detail,
+    if (mode === "regime") {
+      forecastBuySafetyBlockers(mode, latest.close, latest.timestamp).forEach((detail) => {
+        failed.push({
+          label: "Regime Forecast Safety",
+          status: "fail",
+          detail,
+        });
       });
-    });
+    }
   }
   if (!automaticShortCycleBuy) {
     return failed;
@@ -13001,7 +13696,7 @@ function applyConfidenceTargetOrderOverrides(order: ManualOrderRecommendation, m
       ? Number(overrides.estimatedSlippage)
       : roundNumber(quantity * settings.slippagePerShare * 2, 2);
   const submitMode = (overrides.submitMode as SubmitOrderMode | undefined) ?? order.submitMode;
-  const side = submitMode === "Automatic" ? "Buy" : useDefaults ? order.side : (overrides.side as AlgoSignal | undefined) ?? order.side;
+  const side = mode !== "regime" && submitMode === "Automatic" ? "Buy" : useDefaults ? order.side : (overrides.side as AlgoSignal | undefined) ?? order.side;
   return {
     ...order,
     side,
@@ -13423,15 +14118,6 @@ function calculateMetaStrategy(): MetaStrategyResult {
   let sellScore = roundNumber(metaStrategyFamilies().reduce((sum, family) => sum + families[family].sell, 0) * sellContextMultiplier, 4);
   const holdScore = roundNumber(metaStrategyFamilies().reduce((sum, family) => sum + families[family].hold, 0), 4);
 
-  const ensembleFeature = rawFeatures.find((feature) => feature.name === "Ensemble Strategy Voting");
-  if (ensembleFeature && ensembleFeature.direction !== 0 && ensembleFeature.confidence >= 0.62) {
-    if (ensembleFeature.direction === 1) {
-      buyScore = roundNumber(buyScore + ensembleFeature.confidence * 0.08, 4);
-    } else {
-      sellScore = roundNumber(sellScore + ensembleFeature.confidence * 0.08, 4);
-    }
-  }
-
   const aggregateDirectionalTotal = buyScore + sellScore;
   const aggregateScale = aggregateDirectionalTotal > 1 ? 1 / aggregateDirectionalTotal : 1;
   if (aggregateScale < 1) {
@@ -13834,263 +14520,559 @@ function renderMetaStrategies(strategies: MetaStrategyFeature[]) {
   `;
 }
 
-function updateWeightedVotingPanel() {
-  const result = calculateWeightedVote();
-  weightedFinalSignal.textContent = result.signal;
-  weightedFinalSignal.className = `algo-final ${result.signal.toLowerCase()}`;
-  weightedScoreGrid.innerHTML = renderWeightedScoreGrid(result);
-  weightedSummary.innerHTML = renderWeightedSummary(result);
-  updateWeightedTradingSettingsMount(result);
-  weightedStrategiesToggleMeta.textContent = `${result.strategies.filter((strategy) => strategy.finalWeight > 0 && !strategy.disabledReason).length} active / ${result.strategies.length} strategies`;
-  weightedStrategiesList.innerHTML = renderWeightedStrategies(result.strategies);
-  weightedDataToggleMeta.textContent = `${result.data.timeframes.fiveMinute.direction.toUpperCase()} 5m / ${result.data.trendDirection.toUpperCase()} 1m`;
-  weightedDataGrid.innerHTML = renderWeightedDataGrid(result);
-  const failedGates = result.gates.filter((gate) => gate.status === "fail").length;
-  const infoGates = result.gates.filter((gate) => gate.status === "info").length;
-  weightedGatesToggleMeta.textContent = `${failedGates} fail / ${infoGates} info`;
-  weightedGateList.innerHTML = result.gates.map(renderWeightedGate).join("");
-  weightedControlRules.innerHTML = renderWeightedControlRules();
-  renderWeightedStrategiesExpandedState();
-  renderWeightedDataExpandedState();
-  renderWeightedGatesExpandedState();
-  renderWeightedControlsExpandedState();
-  maybeAutoSubmitWeightedTargetOrder();
+function regimePositionEffectForSignal(signal: AlgoSignal, currentShares: number, shortTradingEnabled: boolean): PositionEffect {
+  if (signal === "Buy") {
+    return currentShares < 0 ? "cover_short" : "enter_long";
+  }
+  if (signal === "Sell") {
+    if (currentShares > 0) {
+      return "exit_long";
+    }
+    return shortTradingEnabled ? "enter_short" : "none";
+  }
+  return "none";
 }
 
-function calculateWeightedVote(): WeightedVoteResult {
-  const sessionCandles = latestWeightedCalculationCandles();
-  const candles = sessionCandles.length ? sessionCandles : state.candles.slice(-240);
-  const latest = candles.at(-1) ?? null;
-  if (!latest || candles.length < 20) {
-    return emptyWeightedVote(latest);
+function requestedResultingPosition(currentShares: number, effect: PositionEffect, quantity: number) {
+  if (effect === "enter_long") {
+    return currentShares + quantity;
+  }
+  if (effect === "exit_long") {
+    return Math.max(0, currentShares - quantity);
+  }
+  if (effect === "enter_short") {
+    return currentShares - quantity;
+  }
+  if (effect === "cover_short") {
+    return Math.min(0, currentShares + quantity);
+  }
+  return currentShares;
+}
+
+type WeightedVotingBackendStatus = "idle" | "loading" | "ready" | "error";
+
+type WeightedVotingBackendSummary = {
+  signal: AlgoSignal;
+  rawWinner: AlgoSignal;
+  buyScore: number;
+  sellScore: number;
+  holdScore: number;
+  winnerScore: number;
+  edge: number;
+  activeStrategyCount: number;
+  failedGateCount: number;
+  infoGateCount: number;
+  marketConditionLabel: string;
+};
+
+const weightedVotingBackendState = {
+  status: "idle" as WeightedVotingBackendStatus,
+  warning: "",
+  serviceStatus: null as Record<string, unknown> | null,
+  config: null as Record<string, unknown> | null,
+  activeWeights: null as Record<string, unknown> | null,
+  weightHistory: [] as unknown[],
+  evaluation: null as Record<string, unknown> | null,
+  dailyUpdate: null as Record<string, unknown> | null,
+  updatedAt: "",
+  requestKey: "",
+};
+
+let weightedVotingBackendRequestInFlight = false;
+let votingEnsembleBackendRequestInFlight = false;
+
+async function ensureVotingEnsembleBackendDecision(options: { force?: boolean } = {}) {
+  const payload = votingEnsembleEvaluatePayload();
+  const requestKey = JSON.stringify({
+    symbol: state.symbol,
+    latest: payload?.data_timestamp ?? "no-candles",
+    count: payload?.candles.length ?? 0,
+    contextUpdatedAt: state.marketContext?.updatedAt ?? "",
+  });
+  if (
+    votingEnsembleBackendRequestInFlight ||
+    (!options.force &&
+      state.votingEnsembleBackendKey === requestKey &&
+      (state.votingEnsembleBackendStatus === "ready" || state.votingEnsembleBackendStatus === "error"))
+  ) {
+    return;
+  }
+  if (!payload) {
+    state.votingEnsembleBackend = null;
+    state.votingEnsembleBackendStatus = "idle";
+    state.votingEnsembleBackendWarning = "Waiting for candles before requesting backend Voting Ensemble.";
+    state.votingEnsembleBackendKey = requestKey;
+    return;
   }
 
-  const closes = candles.map((candle) => candle.close);
-  const vwap = sessionVwapValue(candles);
-  const atr = averageTrueRange(candles, Math.min(14, candles.length - 1));
-  const bands = bollingerBands(closes, 20, 2);
-  const openingRange = openingRangeValues(candles, Math.min(15, candles.length));
-  const priorRange = candles.slice(-21, -1);
-  const priorHigh = priorRange.length ? Math.max(...priorRange.map((candle) => candle.high)) : latest.high;
-  const priorLow = priorRange.length ? Math.min(...priorRange.map((candle) => candle.low)) : latest.low;
-  const averageVolume = simpleMovingAverage(candles.map((candle) => candle.volume), Math.min(20, candles.length)) ?? latest.volume;
-  const sma20 = simpleMovingAverage(closes, 20);
-  const sma50 = simpleMovingAverage(closes, 50);
-  const relativeStrengthScore = weightedRelativeStrengthScore(candles);
-  const breadthScore = weightedBreadthScore(candles);
-  const relativeStrength = relativeStrengthScore.value;
-  const breadth = breadthScore.value;
-  const eventRisk = 0;
-  const volatilityPercent = atr && latest.close ? atr / latest.close : 0;
-  const minutes = easternMinutes(latest.timestamp);
-  const regime = weightedMarketRegime({
-    candles,
-    closes,
-    latest,
-    vwap,
-    atr,
-    bands,
-    sma20,
-    sma50,
-    volatilityPercent,
-    minutes,
-  });
-  const timeframes = weightedTimeframeContext(candles);
-  const market = {
-    candles,
-    latest,
-    closes,
-    vwap,
-    atr,
-    bands,
-    openingRange,
-    priorHigh,
-    priorLow,
-    averageVolume,
-    sma20,
-    sma50,
-    relativeStrength,
-    breadth,
-    eventRisk,
-    volatilityPercent,
-    trendDirection: regime.trendDirection,
-    trendSource: regime.trendSource,
-    volatilityLevel: regime.volatilityLevel,
-    rangeCondition: regime.rangeCondition,
-    sessionLabel: regime.sessionLabel,
-    timeframes,
-    minutes,
-  };
+  votingEnsembleBackendRequestInFlight = true;
+  state.votingEnsembleBackendStatus = state.votingEnsembleBackendStatus === "ready" ? "ready" : "loading";
+  state.votingEnsembleBackendKey = requestKey;
+  try {
+    state.votingEnsembleBackend = await fetchVotingEnsembleDecision(payload);
+    state.votingEnsembleBackendStatus = "ready";
+    state.votingEnsembleBackendWarning = "";
+  } catch (error) {
+    state.votingEnsembleBackendStatus = "error";
+    state.votingEnsembleBackendWarning = error instanceof Error ? error.message : "Voting Ensemble backend request failed";
+  } finally {
+    votingEnsembleBackendRequestInFlight = false;
+    updateAlgorithmPanel(visibleCandles());
+  }
+}
 
-  const storedWeightState = loadWeightedVotingWeightState();
-  const oldWeights = storedWeightState.weights;
-  const previewSignals = weightedAlphaStrategies.map((strategy) => weightedAlphaSignal(strategy, market));
-  updateWeightedStrategyPerformanceFromSignals(previewSignals, market);
-  const alphaSignals = weightedAlphaStrategies.map((strategy) => weightedAlphaSignal(strategy, market));
-  const strengths = alphaSignals.map((strategy) => Math.max(0, strategy.strength));
-  const strengthSum = strengths.reduce((sum, value) => sum + value, 0) || 1;
-  const withBaseWeights = alphaSignals.map((strategy, index) => ({
-    ...strategy,
-    baseWeight: strategy.disabledReason ? 0 : strengths[index] / strengthSum,
-  }));
-  const withMultipliers = withBaseWeights.map((strategy) => {
-    const multipliers = weightedFilterMultipliers(strategy, withBaseWeights, market);
-    const multiplierValue = Object.values(multipliers).reduce((product, value) => product * value, 1);
-    return { ...strategy, multipliers, adjustedWeight: strategy.disabledReason ? 0 : strategy.baseWeight * multiplierValue * strategy.sampleSizeScore };
-  });
-  const adjustedWeights = normalizeWeightedValues(Object.fromEntries(withMultipliers.map((strategy) => [strategy.key, strategy.adjustedWeight])) as Record<WeightedAlphaKey, number>);
-  const cappedRecalculated = capNormalizeWeights(adjustedWeights, withMultipliers);
-  const smoothedWeights = capNormalizeWeights(
-    Object.fromEntries(
-      weightedAlphaStrategies.map((strategy) => [
-        strategy.key,
-        0.7 * (oldWeights[strategy.key] ?? weightedVotingDefaultWeights[strategy.key]) + 0.3 * cappedRecalculated[strategy.key],
-      ]),
-    ) as Record<WeightedAlphaKey, number>,
-    withMultipliers,
-  );
-  const activeWeights = resolveWeightedVotingActiveWeights(storedWeightState, smoothedWeights, withMultipliers, latest);
-  const strategies = withMultipliers.map((strategy) => ({
-    ...strategy,
-    recalculatedWeight: cappedRecalculated[strategy.key],
-    smoothedWeight: smoothedWeights[strategy.key],
-    finalWeight: activeWeights[strategy.key],
-  }));
+async function fetchVotingEnsembleDecision(payload: ReturnType<typeof votingEnsembleEvaluatePayload>) {
+  if (!payload) {
+    throw new Error("Voting Ensemble needs candles before evaluation.");
+  }
+  let lastMessage = "Voting Ensemble backend evaluate route unavailable";
+  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+    try {
+      const response = await fetchWithTimeout(`${baseUrl}/api/voting-ensemble/evaluate`, 15000, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (response.ok) {
+        return (await response.json()) as VotingEnsembleBackendResult;
+      }
+      const text = await response.text();
+      lastMessage =
+        response.status === 404
+          ? `Voting Ensemble backend route not loaded on ${baseUrl}; restart the FastAPI backend.`
+          : text || `Voting Ensemble backend unavailable (${response.status})`;
+      if (response.status !== 404) {
+        throw new Error(lastMessage);
+      }
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : lastMessage;
+    }
+  }
+  throw new Error(lastMessage);
+}
 
-  const buyScore = roundNumber(strategies.reduce((sum, strategy) => sum + strategy.finalWeight * strategy.pBuy, 0), 4);
-  const sellScore = roundNumber(strategies.reduce((sum, strategy) => sum + strategy.finalWeight * strategy.pSell, 0), 4);
-  const holdScore = roundNumber(strategies.reduce((sum, strategy) => sum + strategy.finalWeight * strategy.pHold, 0), 4);
-  const sortedScores = [
-    { signal: "Buy" as AlgoSignal, score: buyScore },
-    { signal: "Sell" as AlgoSignal, score: sellScore },
-    { signal: "Hold" as AlgoSignal, score: holdScore },
-  ].sort((left, right) => right.score - left.score);
-  const rawWinner = sortedScores[0].signal;
-  const maxScore = sortedScores[0].score;
-  const margin = roundNumber(sortedScores[0].score - sortedScores[1].score, 4);
-  const weightedDefaults = weightedDefaultSizingSettings();
-  const activeStrategyCount = strategies.filter((strategy) => strategy.finalWeight > 0 && !strategy.disabledReason).length;
-  const buyStrategyCount = strategies.filter((strategy) => strategy.finalWeight > 0 && strategy.pBuy > strategy.pSell && strategy.pBuy > strategy.pHold).length;
-  const sellStrategyCount = strategies.filter((strategy) => strategy.finalWeight > 0 && strategy.pSell > strategy.pBuy && strategy.pSell > strategy.pHold).length;
-  const directionalStrategyCount = rawWinner === "Buy" ? buyStrategyCount : rawWinner === "Sell" ? sellStrategyCount : 0;
-  const expectedReturnAfterCosts = roundNumber(strategies.reduce((sum, strategy) => sum + strategy.finalWeight * strategy.expectedReturnAfterCosts, 0), 5);
-  const tripleBarrier = weightedTripleBarrierFilter(rawWinner, expectedReturnAfterCosts, market, strategies);
-  const metaLabelProbability = weightedMetaLabelProbability(rawWinner, maxScore, margin, tripleBarrier, timeframes);
-  const confidenceMultiplier = maxScore < weightedDefaults.minimumBuyScore || margin < weightedDefaults.minimumSignalEdge ? 0 : Math.min(1.4, 0.7 + maxScore + margin);
-  const volatilityAdjustment = atr && latest.close ? Math.max(0.35, Math.min(1.2, 1 - (atr / latest.close) * 18)) : 0.75;
-  const baseSize = state.weightedTradingSettings.startingCapital * (weightedDefaults.maxPositionPercent / 100);
-  const positionSize = roundNumber(baseSize * confidenceMultiplier * metaLabelProbability * volatilityAdjustment, 2);
-  const dailyLoss = weightedDailyLossStatus(latest.close);
-  const fiveMinuteGate = weightedFiveMinuteConfirmationGate(rawWinner, maxScore, margin, timeframes.fiveMinute);
-  const spreadPercent = latest.close ? ((state.weightedTradingSettings.slippagePerShare * 2) / latest.close) * 100 : 0;
-  const weightedTradesToday = effectiveTodaysTradeCount("weighted", weightedDefaults.maxDailyTrades, latest.close);
-  const weightedOpenPosition = openOrderLots("weighted").some((lot) => lot.symbol === state.symbol);
-
-  const gates = [
-    {
-      label: "Confidence",
-      status: maxScore >= weightedDefaults.minimumBuyScore && margin >= weightedDefaults.minimumSignalEdge ? "pass" : "fail",
-      detail: `Max ${formatProbability(maxScore)}, margin ${formatProbability(margin)}`,
-    },
-    {
-      label: "Active Strategies",
-      status: activeStrategyCount >= weightedDefaults.minimumActiveStrategies ? "pass" : "fail",
-      detail: `${activeStrategyCount}/${weightedDefaults.minimumActiveStrategies} active`,
-    },
-    {
-      label: "Directional Strategy Count",
-      status: rawWinner === "Hold" || directionalStrategyCount >= weightedDefaults.minimumBuyStrategyCount ? "pass" : "fail",
-      detail: rawWinner === "Hold"
-        ? "Hold does not need directional strategy count"
-        : `${directionalStrategyCount}/${weightedDefaults.minimumBuyStrategyCount} ${rawWinner.toLowerCase()}-leaning strategies`,
-    },
-    {
-      label: "5m Confirmation",
-      status: fiveMinuteGate.status,
-      detail: fiveMinuteGate.detail,
-    },
-    {
-      label: "Expected Value",
-      status: expectedReturnAfterCosts > 0 ? "pass" : "fail",
-      detail: `${formatBasisPoints(expectedReturnAfterCosts)} after estimated costs`,
-    },
-    {
-      label: "Meta Label",
-      status: metaLabelProbability >= 0.6 ? "pass" : "fail",
-      detail: `${formatProbability(metaLabelProbability)} probability`,
-    },
-    {
-      label: "Triple Barrier",
-      status: tripleBarrier.passed ? "pass" : "fail",
-      detail: tripleBarrier.detail,
-    },
-    {
-      label: "Daily Loss",
-      status: dailyLoss.limitReached ? "fail" : "pass",
-      detail: `${signedCurrency(dailyLoss.pnl)} today, limit ${currency(dailyLoss.limit)}`,
-    },
-    {
-      label: "Spread/Slippage",
-      status: spreadPercent <= weightedDefaults.maxSpreadPercent ? "pass" : "fail",
-      detail: `${formatProbability(spreadPercent / 100)} round-trip estimate, max ${weightedDefaults.maxSpreadPercent}%`,
-    },
-    {
-      label: "1m Volume",
-      status: latest.volume >= weightedDefaults.minimumOneMinuteVolume ? "pass" : "fail",
-      detail: `${latest.volume.toLocaleString()} / ${weightedDefaults.minimumOneMinuteVolume.toLocaleString()} shares`,
-    },
-    {
-      label: "Max Daily Trades",
-      status: weightedTradesToday < weightedDefaults.maxDailyTrades ? "pass" : "fail",
-      detail: dailyTradeCountDetail("weighted", weightedDefaults.maxDailyTrades, latest.close),
-    },
-    {
-      label: "Pyramiding",
-      status: rawWinner !== "Buy" || weightedDefaults.pyramidingEnabled || !weightedOpenPosition ? "pass" : "fail",
-      detail: weightedDefaults.pyramidingEnabled ? "Additional entries allowed" : "Additional Buy blocked while position is open",
-    },
-  ] satisfies WeightedVoteResult["gates"];
-
-  const finalSignal = gates.some((gate) => gate.status === "fail") ? "Hold" : rawWinner;
+function votingEnsembleEvaluatePayload() {
+  const source = latestRegularSessionCandles().length ? latestRegularSessionCandles() : state.candles;
+  const candles = source.slice(-390).filter((candle) => candle.close > 0);
+  const latest = candles.at(-1);
+  if (!latest) {
+    return null;
+  }
   return {
-    signal: finalSignal,
+    symbol: state.symbol,
+    data_timestamp: latest.timestamp,
+    candles: candles.map(votingCandlePayload),
+    market_context: {
+      ...(state.marketContext ? compactMarketContext(state.marketContext) : {}),
+      ...votingEnsembleLevelContext(candles, state.candles),
+    },
+    external_breadth_feed: votingEnsembleExternalBreadthFeed(),
+    qqq_candles: (state.weightedMarketData.candlesBySymbol.QQQ ?? []).slice(-240).map(votingCandlePayload),
+    iwm_candles: (state.weightedMarketData.candlesBySymbol.IWM ?? []).slice(-240).map(votingCandlePayload),
+    breadth_components: Object.fromEntries(
+      weightedBreadthProxySymbols.map((symbol) => [symbol, (state.weightedMarketData.candlesBySymbol[symbol] ?? []).slice(-240).map(votingCandlePayload)]),
+    ),
+  };
+}
+
+function votingEnsembleExternalBreadthFeed() {
+  const context = state.marketContext as (MarketContext & Record<string, unknown>) | null;
+  const direct = context?.externalBreadthFeed ?? context?.breadthFeed ?? context?.marketBreadth;
+  return typeof direct === "object" && direct !== null ? direct : null;
+}
+
+function votingEnsembleLevelContext(sessionCandles: Candle[], allCandles: Candle[]) {
+  const latest = sessionCandles.at(-1);
+  if (!latest) {
+    return {};
+  }
+  const latestDay = easternDateString(latest.timestamp);
+  const openingRange = sessionCandles.length >= 15 ? openingRangeValues(sessionCandles, 15) : null;
+  const dayCandles = allCandles
+    .filter((candle) => easternDateString(candle.timestamp) === latestDay)
+    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
+  const premarketCandles = dayCandles.filter((candle) => isPremarketSession(candle.timestamp));
+  const priorRegularCandles = allCandles
+    .filter((candle) => easternDateString(candle.timestamp) < latestDay && isRegularSession(candle.timestamp))
+    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
+  const priorDay = priorRegularCandles.length ? easternDateString(priorRegularCandles.at(-1)!.timestamp) : null;
+  const priorDayCandles = priorDay ? priorRegularCandles.filter((candle) => easternDateString(candle.timestamp) === priorDay) : [];
+  return {
+    openingRange,
+    premarket: premarketCandles.length
+      ? {
+          high: Math.max(...premarketCandles.map((candle) => candle.high)),
+          low: Math.min(...premarketCandles.map((candle) => candle.low)),
+        }
+      : null,
+    priorDayOHLC: priorDayCandles.length
+      ? {
+          open: priorDayCandles[0].open,
+          high: Math.max(...priorDayCandles.map((candle) => candle.high)),
+          low: Math.min(...priorDayCandles.map((candle) => candle.low)),
+          close: priorDayCandles.at(-1)!.close,
+        }
+      : null,
+  };
+}
+
+function votingCandlePayload(candle: Candle) {
+  return {
+    timestamp: candle.timestamp,
+    open: candle.open,
+    high: candle.high,
+    low: candle.low,
+    close: candle.close,
+    volume: candle.volume,
+  };
+}
+
+function weightedVotingBackendSummary(): WeightedVotingBackendSummary {
+  const evaluation = weightedVotingBackendState.evaluation;
+  const decision = childRecord(evaluation, "decision");
+  const scores = childRecord(decision, "vote_scores") ?? childRecord(decision, "voteScores");
+  const signal = algoSignalFromUnknown(decision?.signal ?? decision?.proposed_side ?? decision?.proposedSide);
+  const rawWinner = algoSignalFromUnknown(decision?.raw_winner ?? decision?.rawWinner ?? decision?.proposed_side ?? decision?.proposedSide);
+  const buyScore = numberFromUnknown(scores?.buy_score ?? scores?.buyScore ?? decision?.buy_score ?? decision?.buyScore, 0);
+  const sellScore = numberFromUnknown(scores?.sell_score ?? scores?.sellScore ?? decision?.sell_score ?? decision?.sellScore, 0);
+  const holdScore = numberFromUnknown(scores?.hold_score ?? scores?.holdScore ?? decision?.hold_score ?? decision?.holdScore, signal === "Hold" ? 1 : 0);
+  const winnerScore = numberFromUnknown(scores?.winner_score ?? scores?.winnerScore, Math.max(buyScore, sellScore, holdScore));
+  const edge = numberFromUnknown(scores?.winner_edge ?? scores?.winnerEdge ?? decision?.winner_edge ?? decision?.winnerEdge, 0);
+  const gates = weightedVotingGateRows();
+  const signals = weightedVotingSignalRows();
+  return {
+    signal,
     rawWinner,
     buyScore,
     sellScore,
     holdScore,
-    maxScore,
-    margin,
-    expectedReturnAfterCosts,
-    metaLabelProbability,
-    tripleBarrier,
-    positionSize,
-    confidenceMultiplier,
-    volatilityAdjustment,
-    gates,
-    strategies,
-    data: {
-      latest,
-      vwap,
-      atr,
-      bollinger: bands,
-      averageVolume,
-      relativeStrength,
-      relativeStrengthSource: relativeStrengthScore.source,
-      breadth,
-      breadthSource: breadthScore.source,
-      eventRisk,
-      eventRiskSource: "Removed from short-cycle mode",
-      trendDirection: regime.trendDirection,
-      trendSource: regime.trendSource,
-      volatilityLevel: regime.volatilityLevel,
-      rangeCondition: regime.rangeCondition,
-      sessionLabel: regime.sessionLabel,
-      timeframes,
-      weightSource: storedWeightState.source,
-      weightSeededAt: storedWeightState.seededAt,
-      updatePolicy: "Weights update once per day after the close; live candles only update probabilities and gates.",
-    },
+    winnerScore,
+    edge,
+    activeStrategyCount: signals.filter((signalRow) => numberFromUnknown(signalRow.effective_weight ?? signalRow.effectiveWeight ?? signalRow.finalWeight, 0) > 0).length,
+    failedGateCount: gates.filter((gate) => gate.status === "fail").length,
+    infoGateCount: gates.filter((gate) => gate.status === "info").length,
+    marketConditionLabel: weightedVotingMarketConditionLabel(),
   };
+}
+
+async function refreshWeightedVotingBackendClient(options: { force?: boolean } = {}) {
+  const payload = weightedVotingEvaluatePayload();
+  const requestKey = JSON.stringify({
+    symbol: state.symbol,
+    latest: payload?.data_timestamp ?? "no-candles",
+    count: payload?.candles.length ?? 0,
+  });
+  if (weightedVotingBackendRequestInFlight || (!options.force && weightedVotingBackendState.requestKey === requestKey && weightedVotingBackendState.status === "ready")) {
+    return;
+  }
+  weightedVotingBackendRequestInFlight = true;
+  weightedVotingBackendState.status = weightedVotingBackendState.status === "ready" ? "ready" : "loading";
+  weightedVotingBackendState.requestKey = requestKey;
+  try {
+    const [serviceStatus, config, activeWeights, weightsHistory, dailyUpdate] = await Promise.all([
+      fetchWeightedVotingJson("/status"),
+      fetchWeightedVotingJson("/config"),
+      fetchWeightedVotingJson("/weights/active"),
+      fetchWeightedVotingJson("/weights/history"),
+      fetchWeightedVotingJson("/daily-update/status"),
+    ]);
+    weightedVotingBackendState.serviceStatus = serviceStatus;
+    weightedVotingBackendState.config = config;
+    weightedVotingBackendState.activeWeights = activeWeights;
+    weightedVotingBackendState.weightHistory = arrayFromUnknown(weightsHistory.history);
+    weightedVotingBackendState.dailyUpdate = dailyUpdate;
+    weightedVotingBackendState.evaluation = payload ? await fetchWeightedVotingJson("/evaluate", { method: "POST", body: JSON.stringify(payload) }) : null;
+    weightedVotingBackendState.status = "ready";
+    weightedVotingBackendState.warning = payload ? "" : "Waiting for candles before requesting a backend Weighted Voting evaluation.";
+    weightedVotingBackendState.updatedAt = new Date().toISOString();
+  } catch (error) {
+    weightedVotingBackendState.status = "error";
+    weightedVotingBackendState.warning = error instanceof Error ? error.message : "Weighted Voting API request failed";
+  } finally {
+    weightedVotingBackendRequestInFlight = false;
+    updateWeightedVotingPanel();
+  }
+}
+
+async function fetchWeightedVotingJson(path: string, init: RequestInit = {}) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/weighted-voting${path}`, 15000, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init.headers ?? {}),
+    },
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return (await response.json()) as Record<string, unknown>;
+}
+
+function weightedVotingEvaluatePayload() {
+  const source = latestRegularSessionCandlesFrom(state.weightedMarketData.timeframeCandles["1Min"] ?? []).length
+    ? latestRegularSessionCandlesFrom(state.weightedMarketData.timeframeCandles["1Min"] ?? [])
+    : latestRegularSessionCandles().length
+      ? latestRegularSessionCandles()
+      : state.candles.slice(-240);
+  const candles = source.slice(-240).filter((candle) => candle.close > 0);
+  const latest = candles.at(-1);
+  if (!latest) {
+    return null;
+  }
+  return {
+    symbol: state.symbol,
+    data_timestamp: latest.timestamp,
+    candles: candles.map((candle) => ({
+      timestamp: candle.timestamp,
+      open: candle.open,
+      high: candle.high,
+      low: candle.low,
+      close: candle.close,
+      volume: candle.volume,
+    })),
+    account_equity: state.weightedTradingSettings.startingCapital,
+    available_buying_power: state.weightedTradingSettings.startingCapital * (state.weightedTradingSettings.dailyAllocationPercent / 100),
+    capital_available: state.weightedTradingSettings.startingCapital * (state.weightedTradingSettings.orderAllocationPercent / 100),
+  };
+}
+
+function renderWeightedBackendScoreGrid(summary: WeightedVotingBackendSummary) {
+  return [
+    ["Buy", summary.buyScore, "buy"],
+    ["Sell", summary.sellScore, "sell"],
+    ["Hold", summary.holdScore, "hold"],
+  ]
+    .map(
+      ([label, value, kind]) => `
+        <div class="weighted-score-card ${kind}">
+          <span>${escapeHtml(String(label))}</span>
+          <strong>${formatProbability(Number(value))}</strong>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderWeightedBackendSummary(summary: WeightedVotingBackendSummary) {
+  const status = stringFromUnknown(weightedVotingBackendState.serviceStatus?.status, weightedVotingBackendState.status);
+  const version = stringFromUnknown(weightedVotingBackendState.serviceStatus?.serviceVersion, "backend");
+  const config = childRecord(weightedVotingBackendState.config, "configuration");
+  const settingsVersion = stringFromUnknown(config?.settings_version ?? config?.settingsVersion, "unversioned");
+  const decision = childRecord(weightedVotingBackendState.evaluation, "decision");
+  const decisionId = stringFromUnknown(decision?.decision_id ?? decision?.decisionId, "waiting");
+  return `
+    <span>Backend status: ${escapeHtml(status)} (${escapeHtml(version)}).</span>
+    <span>Decision: ${escapeHtml(decisionId)}; raw winner ${summary.rawWinner}; final signal ${summary.signal}.</span>
+    <span>Scores: B ${formatProbability(summary.buyScore)} / S ${formatProbability(summary.sellScore)} / H ${formatProbability(summary.holdScore)}; edge ${formatProbability(summary.edge)}.</span>
+    <span>Settings version: ${escapeHtml(settingsVersion)}.</span>
+    ${weightedVotingBackendState.warning ? `<span>${escapeHtml(weightedVotingBackendState.warning)}</span>` : ""}
+  `;
+}
+
+function renderWeightedBackendStrategies() {
+  const signalsById = new Map(weightedVotingSignalRows().map((signal) => [stringFromUnknown(signal.strategy_id ?? signal.strategyId, ""), signal]));
+  const weightRows = weightedVotingWeightRows();
+  const weightById = new Map(weightRows.map((row) => [stringFromUnknown(row.strategy_id ?? row.strategyId, ""), row]));
+  return `
+    <table class="weighted-strategy-table">
+      <tbody>
+        ${weightedAlphaStrategies.map((strategy, strategyIndex) => {
+          const signal = signalsById.get(strategy.key);
+          const weight = weightById.get(strategy.key);
+          const probabilities = childRecord(signal, "probabilities");
+          const buy = numberFromUnknown(signal?.buy_probability ?? signal?.buyProbability ?? probabilities?.buy, 0);
+          const sell = numberFromUnknown(signal?.sell_probability ?? signal?.sellProbability ?? probabilities?.sell, 0);
+          const hold = numberFromUnknown(signal?.hold_probability ?? signal?.holdProbability ?? probabilities?.hold, signal ? 0 : 1);
+          const effectiveWeight = numberFromUnknown(signal?.effective_weight ?? signal?.effectiveWeight ?? weight?.final_effective_weight ?? weight?.finalEffectiveWeight, 0);
+          const dataQuality = stringFromUnknown(signal?.data_quality_status ?? signal?.dataQualityStatus, "unavailable");
+          const explanation = stringFromUnknown(signal?.explanation, "Waiting for backend strategy output.");
+          return `
+            <tr class="weighted-strategy-name-row" data-tone="${strategyIndex % 4}" data-disabled="${String(effectiveWeight <= 0)}">
+              <td colspan="5">${escapeHtml(strategy.name)}</td>
+              <td>${formatProbability(effectiveWeight)}</td>
+            </tr>
+            <tr class="weighted-strategy-detail-row" data-tone="${strategyIndex % 4}" data-disabled="${String(effectiveWeight <= 0)}">
+              ${renderWeightedMetricCell("Buy", formatProbability(buy))}
+              ${renderWeightedMetricCell("Sell", formatProbability(sell))}
+              ${renderWeightedMetricCell("Hold", formatProbability(hold))}
+              ${renderWeightedMetricCell("Quality", dataQuality)}
+              ${renderWeightedMetricCell("Strength", formatProbability(numberFromUnknown(signal?.signal_strength ?? signal?.signalStrength, 0)))}
+              <td><small>${escapeHtml(strategy.family.replaceAll("_", " "))}</small><strong>${escapeHtml(explanation)}</strong></td>
+            </tr>
+          `;
+        }).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderWeightedBackendDataGrid() {
+  const condition = childRecord(weightedVotingBackendState.evaluation, "marketCondition");
+  const config = childRecord(weightedVotingBackendState.config, "configuration");
+  const effectiveSettings = childRecord(config, "effective_settings") ?? config;
+  const sizing = childRecord(weightedVotingBackendState.evaluation, "sizingResult");
+  const globalApplication = childRecord(weightedVotingBackendState.evaluation, "globalGateApplication");
+  const rows = [
+    ["Internal condition", weightedVotingMarketConditionLabel()],
+    ["Trend", stringFromUnknown(condition?.trend, "NA")],
+    ["Volatility", stringFromUnknown(condition?.volatility, "NA")],
+    ["Liquidity", stringFromUnknown(condition?.liquidity, "NA")],
+    ["Session", stringFromUnknown(condition?.session, "NA")],
+    ["Market quality", stringFromUnknown(condition?.market_quality ?? condition?.marketQuality, "NA")],
+    ["Dynamic multipliers", compactJsonLabel(config?.multipliers ?? effectiveSettings?.multipliers)],
+    ["Effective settings", compactJsonLabel(effectiveSettings)],
+    ["Sizing caps", compactJsonLabel(sizing?.caps ?? sizing?.cap_breakdown ?? sizing?.capBreakdown)],
+    ["Limiting factor", stringFromUnknown(sizing?.limiting_cap ?? sizing?.limitingCap ?? sizing?.limiting_factor ?? sizing?.limitingFactor, "NA")],
+    ["Global adjustment", compactJsonLabel(globalApplication)],
+  ];
+  return rows
+    .map(
+      ([label, value]) => `
+        <span>
+          <b>${escapeHtml(label)}</b>
+          ${escapeHtml(value)}
+        </span>
+      `,
+    )
+    .join("");
+}
+
+function renderWeightedBackendGates() {
+  const localGates = weightedVotingGateRows().map((gate) => renderWeightedGate({
+    label: gate.label,
+    status: gate.status,
+    detail: gate.detail,
+  }));
+  const globalApplication = childRecord(weightedVotingBackendState.evaluation, "globalGateApplication");
+  const globalResponse = childRecord(weightedVotingBackendState.evaluation, "globalGateResponse");
+  const globalGate = renderWeightedGate({
+    label: "Global adjustment",
+    status: stringFromUnknown(globalResponse?.status, "ALLOW").toLowerCase().includes("reject") ? "fail" : "info",
+    detail: compactJsonLabel(globalApplication ?? globalResponse),
+  });
+  return [...localGates, globalGate].join("");
+}
+
+function renderWeightedBackendControlRules() {
+  const activeWeights = childRecord(weightedVotingBackendState.activeWeights, "weightState");
+  const dailyUpdate = childRecord(weightedVotingBackendState.dailyUpdate, "dailyUpdate");
+  return `
+    <span>Authoritative calculations are served by /api/weighted-voting/evaluate.</span>
+    <span>Config edits are persisted through /api/weighted-voting/config; browser storage is display-only.</span>
+    <span>Active weights: ${escapeHtml(compactJsonLabel(activeWeights))}</span>
+    <span>Weight history rows: ${weightedVotingBackendState.weightHistory.length}</span>
+    <span>Daily update: ${escapeHtml(compactJsonLabel(dailyUpdate))}</span>
+    <span>Paper orders, positions, trades, and backtests are backend-owned artifacts.</span>
+  `;
+}
+
+function weightedVotingSignalRows() {
+  return arrayFromUnknown(weightedVotingBackendState.evaluation?.signals).filter(isRecord);
+}
+
+function weightedVotingWeightRows() {
+  const stateRecord = childRecord(weightedVotingBackendState.activeWeights, "weightState");
+  return arrayFromUnknown(stateRecord?.strategy_weights ?? stateRecord?.strategyWeights).filter(isRecord);
+}
+
+function weightedVotingGateRows() {
+  const gateResult = childRecord(weightedVotingBackendState.evaluation, "gateResult");
+  const rows = arrayFromUnknown(gateResult?.gate_results ?? gateResult?.gateResults).filter(isRecord);
+  return rows.map((row) => ({
+    label: stringFromUnknown(row.gate_name ?? row.gateName ?? row.label, "Weighted gate"),
+    status: gateStatusFromUnknown(row.status),
+    detail: stringFromUnknown(row.explanation ?? row.detail ?? row.reason_codes ?? row.reasonCodes, ""),
+  }));
+}
+
+function weightedVotingMarketConditionLabel() {
+  const condition = childRecord(weightedVotingBackendState.evaluation, "marketCondition");
+  if (!condition) {
+    return weightedVotingBackendState.status === "ready" ? "Backend ready / waiting for evaluation" : "Loading backend";
+  }
+  const trend = stringFromUnknown(condition.trend, "trend NA");
+  const volatility = stringFromUnknown(condition.volatility, "vol NA");
+  const liquidity = stringFromUnknown(condition.liquidity, "liquidity NA");
+  return `${trend} / ${volatility} / ${liquidity}`;
+}
+
+function childRecord(source: Record<string, unknown> | null | undefined, key: string): Record<string, unknown> | null {
+  const value = source?.[key];
+  return isRecord(value) ? value : null;
+}
+
+function numberFromUnknown(value: unknown, fallback: number): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function stringFromUnknown(value: unknown, fallback = ""): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => stringFromUnknown(item)).filter(Boolean).join(", ") || fallback;
+  }
+  return fallback;
+}
+
+function arrayFromUnknown(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function algoSignalFromUnknown(value: unknown): AlgoSignal {
+  const normalized = stringFromUnknown(value, "Hold").toLowerCase();
+  return normalized === "buy" ? "Buy" : normalized === "sell" ? "Sell" : "Hold";
+}
+
+function gateStatusFromUnknown(value: unknown): "pass" | "fail" | "info" {
+  const normalized = stringFromUnknown(value, "info").toLowerCase();
+  if (normalized.includes("pass") || normalized.includes("allow")) {
+    return "pass";
+  }
+  if (normalized.includes("fail") || normalized.includes("reject") || normalized.includes("block")) {
+    return "fail";
+  }
+  return "info";
+}
+
+function compactJsonLabel(value: unknown) {
+  if (value === null || value === undefined) {
+    return "NA";
+  }
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  try {
+    const text = JSON.stringify(value);
+    return text.length > 160 ? `${text.slice(0, 157)}...` : text;
+  } catch {
+    return "unavailable";
+  }
+}
+
+function updateWeightedVotingPanel() {
+  const summary = weightedVotingBackendSummary();
+  weightedFinalSignal.textContent = summary.signal;
+  weightedFinalSignal.className = `algo-final ${summary.signal.toLowerCase()}`;
+  weightedScoreGrid.innerHTML = renderWeightedBackendScoreGrid(summary);
+  weightedSummary.innerHTML = renderWeightedBackendSummary(summary);
+  updateWeightedTradingSettingsMount();
+  weightedStrategiesToggleMeta.textContent = `${summary.activeStrategyCount} active / ${weightedAlphaStrategies.length} strategies`;
+  weightedStrategiesList.innerHTML = renderWeightedBackendStrategies();
+  weightedDataToggleMeta.textContent = summary.marketConditionLabel;
+  weightedDataGrid.innerHTML = renderWeightedBackendDataGrid();
+  weightedGatesToggleMeta.textContent = `${summary.failedGateCount} fail / ${summary.infoGateCount} info`;
+  weightedGateList.innerHTML = renderWeightedBackendGates();
+  weightedControlRules.innerHTML = renderWeightedBackendControlRules();
+  renderWeightedStrategiesExpandedState();
+  renderWeightedDataExpandedState();
+  renderWeightedGatesExpandedState();
+  renderWeightedControlsExpandedState();
+  void refreshWeightedVotingBackendClient();
 }
 
 function latestWeightedCalculationCandles() {
@@ -14111,1206 +15093,6 @@ function latestWeightedCalculationCandles() {
       .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
   }
   return base;
-}
-
-function emptyWeightedVote(latest: Candle | null): WeightedVoteResult {
-  return {
-    signal: "Hold",
-    rawWinner: "Hold",
-    buyScore: 0,
-    sellScore: 0,
-    holdScore: 1,
-    maxScore: 1,
-    margin: 1,
-    expectedReturnAfterCosts: 0,
-    metaLabelProbability: 0,
-    tripleBarrier: emptyWeightedTripleBarrier(),
-    positionSize: 0,
-    confidenceMultiplier: 0,
-    volatilityAdjustment: 0,
-    gates: weightedWaitingGates(),
-    strategies: weightedAlphaStrategies.map((strategy) => ({
-      ...strategy,
-      pBuy: 0,
-      pSell: 0,
-      pHold: 1,
-      expectedReturn: 0,
-      expectedReturnAfterCosts: 0,
-      signalQuality: 0,
-      strength: 0,
-      tradeCount: weightedStrategyTradeCount(strategy.key),
-      sampleSizeScore: weightedStrategySampleSizeScore(weightedStrategyTradeCount(strategy.key)),
-      recentExpectancy: weightedStrategyRecentExpectancy(strategy.key),
-      recentDrawdown: weightedStrategyRecentDrawdown(strategy.key),
-      drawdownScore: weightedStrategyDrawdownScore(weightedStrategyRecentDrawdown(strategy.key)),
-      baseWeight: 0,
-      adjustedWeight: 0,
-      finalWeight: weightedVotingDefaultWeights[strategy.key],
-      smoothedWeight: weightedVotingDefaultWeights[strategy.key],
-      recalculatedWeight: weightedVotingDefaultWeights[strategy.key],
-      multipliers: {},
-      disabledReason: "Waiting for data",
-      detail: "Insufficient candles",
-    })),
-    data: {
-      latest,
-      vwap: null,
-      atr: null,
-      bollinger: null,
-      averageVolume: 0,
-      relativeStrength: 0,
-      relativeStrengthSource: "Waiting for QQQ/IWM candles",
-      breadth: 0,
-      breadthSource: "Waiting for sector ETF candles",
-      eventRisk: 0,
-      eventRiskSource: "Removed from short-cycle mode",
-      trendDirection: "neutral",
-      trendSource: "Waiting for at least 20 one-minute candles",
-      volatilityLevel: "unknown",
-      rangeCondition: "unknown",
-      sessionLabel: "Waiting",
-      timeframes: emptyWeightedTimeframeContext(),
-      weightSource: "default",
-      updatePolicy: "Weights update once per day after the close; live candles only update probabilities and gates.",
-    },
-  };
-}
-
-function weightedWaitingGates(): WeightedVoteResult["gates"] {
-  return [
-    { label: "Data", status: "fail", detail: "Waiting for at least 20 one-minute candles" },
-    { label: "Confidence", status: "info", detail: "Waiting for weighted Buy/Sell/Hold scores" },
-    { label: "5m Confirmation", status: "info", detail: "Waiting for a directional 1m setup" },
-    { label: "Expected Value", status: "info", detail: "Waiting for strategy probabilities and costs" },
-    { label: "Meta Label", status: "info", detail: "Waiting for final weighted signal" },
-    { label: "Triple Barrier", status: "info", detail: "Waiting for target/stop/time-barrier setup" },
-    { label: "Daily Loss", status: "info", detail: "Waiting for latest tradable price" },
-    { label: "Spread/Slippage", status: "info", detail: "Waiting for latest price and slippage estimate" },
-  ];
-}
-
-function weightedAlphaSignal(strategy: WeightedAlphaStrategy, market: ReturnType<typeof weightedMarketType>): WeightedAlphaResult {
-  const latest = market.latest;
-  const volumeExpansion = latest.volume > market.averageVolume * 1.15;
-  const failedHigh = latest.high > market.priorHigh && latest.close < market.priorHigh;
-  const failedLow = latest.low < market.priorLow && latest.close > market.priorLow;
-  const aboveVwap = latest.close > market.vwap;
-  const belowVwap = latest.close < market.vwap;
-  const trendUp = market.sma20 !== null && market.sma50 !== null && market.sma20 > market.sma50 && aboveVwap;
-  const trendDown = market.sma20 !== null && market.sma50 !== null && market.sma20 < market.sma50 && belowVwap;
-  const distanceFromVwap = (latest.close - market.vwap) / Math.max(market.vwap, 0.01);
-  const atrPercent = market.atr && latest.close ? market.atr / latest.close : 0.0035;
-  const costEstimate = latest.close ? (state.weightedTradingSettings.slippagePerShare * 2 + 0.02) / latest.close : 0.0001;
-  const recentMomentum = market.closes.length > 8 ? (latest.close - market.closes[Math.max(0, market.closes.length - 9)]) / Math.max(market.closes[Math.max(0, market.closes.length - 9)], 0.01) : 0;
-  let pBuy = 0.18;
-  let pSell = 0.18;
-  let pHold = 0.64;
-  let detail = "No active setup";
-  let setupActive = false;
-
-  if (strategy.key === "S1") {
-    if (latest.close > market.openingRange.high && volumeExpansion) {
-      pBuy = 0.66;
-      pSell = 0.08;
-      pHold = 0.26;
-      detail = "Opening range high broke with volume expansion";
-      setupActive = true;
-    } else if (latest.close < market.openingRange.low && volumeExpansion) {
-      pBuy = 0.08;
-      pSell = 0.66;
-      pHold = 0.26;
-      detail = "Opening range low broke with volume expansion";
-      setupActive = true;
-    }
-  } else if (strategy.key === "S2") {
-    const nearSma20 = market.sma20 !== null && Math.abs(latest.close - market.sma20) / latest.close < 0.0025;
-    if (trendUp && nearSma20) {
-      pBuy = 0.63;
-      pSell = 0.1;
-      pHold = 0.27;
-      detail = "Trend pullback is holding near 20 SMA";
-      setupActive = true;
-    } else if (trendDown && nearSma20) {
-      pBuy = 0.1;
-      pSell = 0.63;
-      pHold = 0.27;
-      detail = "Downtrend pullback is rejecting near 20 SMA";
-      setupActive = true;
-    }
-  } else if (strategy.key === "S3") {
-    if (trendUp && latest.close > market.openingRange.high) {
-      pBuy = 0.68;
-      pSell = 0.07;
-      pHold = 0.25;
-      detail = "VWAP and trend continuation agree above opening range";
-      setupActive = true;
-    } else if (trendUp && latest.close > market.vwap && recentMomentum > 0.001) {
-      pBuy = 0.64;
-      pSell = 0.09;
-      pHold = 0.27;
-      detail = "Bullish intraday continuation above VWAP";
-      setupActive = true;
-    } else if (trendDown && latest.close < market.openingRange.low) {
-      pBuy = 0.07;
-      pSell = 0.68;
-      pHold = 0.25;
-      detail = "VWAP and trend continuation agree below opening range";
-      setupActive = true;
-    } else if (trendDown && latest.close < market.vwap && recentMomentum < -0.001) {
-      pBuy = 0.09;
-      pSell = 0.64;
-      pHold = 0.27;
-      detail = "Bearish intraday continuation below VWAP";
-      setupActive = true;
-    }
-  } else if (strategy.key === "S4") {
-    if (distanceFromVwap < -0.003 && market.rangeCondition.toLowerCase().includes("chop")) {
-      pBuy = 0.61;
-      pSell = 0.13;
-      pHold = 0.26;
-      detail = "Price is stretched below VWAP during choppy trade";
-      setupActive = true;
-    } else if (distanceFromVwap > 0.003 && market.rangeCondition.toLowerCase().includes("chop")) {
-      pBuy = 0.13;
-      pSell = 0.61;
-      pHold = 0.26;
-      detail = "Price is stretched above VWAP during choppy trade";
-      setupActive = true;
-    }
-  } else if (strategy.key === "S5") {
-    if (failedHigh) {
-      pBuy = 0.08;
-      pSell = 0.7;
-      pHold = 0.22;
-      detail = "Prior high breakout failed back below range";
-      setupActive = true;
-    } else if (failedLow) {
-      pBuy = 0.7;
-      pSell = 0.08;
-      pHold = 0.22;
-      detail = "Prior low breakdown failed back above range";
-      setupActive = true;
-    }
-  } else if (strategy.key === "S6") {
-    if (failedHigh && volumeExpansion) {
-      pBuy = 0.07;
-      pSell = 0.72;
-      pHold = 0.21;
-      detail = "High-side liquidity sweep with expanded volume";
-      setupActive = true;
-    } else if (failedLow && volumeExpansion) {
-      pBuy = 0.72;
-      pSell = 0.07;
-      pHold = 0.21;
-      detail = "Low-side liquidity sweep with expanded volume";
-      setupActive = true;
-    }
-  } else if (strategy.key === "S7") {
-    if (market.bands && market.atr && latest.close < market.bands.lower - market.atr * 0.15) {
-      pBuy = 0.64;
-      pSell = 0.11;
-      pHold = 0.25;
-      detail = "Bollinger and ATR downside extension";
-      setupActive = true;
-    } else if (market.bands && market.atr && latest.close > market.bands.upper + market.atr * 0.15) {
-      pBuy = 0.11;
-      pSell = 0.64;
-      pHold = 0.25;
-      detail = "Bollinger and ATR upside extension";
-      setupActive = true;
-    }
-  } else if (strategy.key === "S8") {
-    if (market.volatilityLevel === "high" && volumeExpansion && latest.close > market.priorHigh) {
-      pBuy = 0.65;
-      pSell = 0.09;
-      pHold = 0.26;
-      detail = "Volatility expansion broke above prior range";
-      setupActive = true;
-    } else if (market.volatilityLevel === "high" && volumeExpansion && latest.close < market.priorLow) {
-      pBuy = 0.09;
-      pSell = 0.65;
-      pHold = 0.26;
-      detail = "Volatility expansion broke below prior range";
-      setupActive = true;
-    }
-  }
-
-  const maxDirectional = Math.max(pBuy, pSell);
-  const signalQuality = Math.max(0, maxDirectional - pHold * 0.35);
-  const directionalSide = pBuy > pSell && pBuy > pHold ? "Buy" : pSell > pBuy && pSell > pHold ? "Sell" : "Hold";
-  const directionalEdge =
-    directionalSide === "Buy"
-      ? pBuy - Math.max(pSell, pHold)
-      : directionalSide === "Sell"
-        ? pSell - Math.max(pBuy, pHold)
-        : 0;
-  const expectedReturn = Math.max(0, directionalEdge) * Math.max(atrPercent, 0.0015) * 0.6;
-  const expectedReturnAfterCosts = expectedReturn - costEstimate;
-  const tradeCount = weightedStrategyTradeCount(strategy.key);
-  const liveOutcomeCount = weightedStrategyLiveOutcomeCount(strategy.key);
-  const sampleSizeScore = weightedStrategySampleSizeScore(tradeCount);
-  const recentExpectancy = weightedStrategyRecentExpectancy(strategy.key);
-  const recentDrawdown = weightedStrategyRecentDrawdown(strategy.key);
-  const drawdownScore = weightedStrategyDrawdownScore(recentDrawdown);
-  const components = weightedStrengthComponents(strategy, signalQuality, expectedReturnAfterCosts, market, sampleSizeScore, drawdownScore);
-  const strength = roundNumber(
-    (0.25 * components.profitFactor +
-      0.2 * components.expectancy +
-      0.15 * components.precision +
-      0.15 * components.drawdown +
-      0.1 * components.recentPerformance +
-      0.1 * components.regimeMatch +
-      0.05 * components.sampleSize) * (setupActive ? 1 : 0.35),
-    4,
-  );
-  const disabledReason =
-    liveOutcomeCount >= weightedMinimumTradesForFullWeight && recentExpectancy !== null && recentExpectancy < 0
-      ? "Disabled: live triple-barrier expectancy negative"
-      : "";
-  return {
-    ...strategy,
-    pBuy,
-    pSell,
-    pHold,
-    expectedReturn,
-    expectedReturnAfterCosts,
-    signalQuality,
-    strength,
-    tradeCount,
-    sampleSizeScore,
-    recentExpectancy,
-    recentDrawdown,
-    drawdownScore,
-    baseWeight: 0,
-    adjustedWeight: 0,
-    finalWeight: 0,
-    smoothedWeight: 0,
-    recalculatedWeight: 0,
-    multipliers: {},
-    disabledReason,
-    detail,
-  };
-}
-
-function weightedMarketType() {
-  return {
-    candles: [] as Candle[],
-    latest: {} as Candle,
-    closes: [] as number[],
-    vwap: 0,
-    atr: null as number | null,
-    bands: null as ReturnType<typeof bollingerBands>,
-    openingRange: { high: 0, low: 0 },
-    priorHigh: 0,
-    priorLow: 0,
-    averageVolume: 0,
-    sma20: null as number | null,
-    sma50: null as number | null,
-    relativeStrength: 0,
-    breadth: 0,
-    eventRisk: 0,
-    volatilityPercent: 0,
-    trendDirection: "neutral" as "up" | "down" | "neutral",
-    trendSource: "",
-    volatilityLevel: "",
-    rangeCondition: "",
-    sessionLabel: "",
-    timeframes: emptyWeightedTimeframeContext(),
-    minutes: 0,
-  };
-}
-
-function emptyWeightedTimeframeContext(): WeightedTimeframeContext {
-  return {
-    fiveMinute: { direction: "neutral", score: 0, source: "5m confirmation: unavailable" },
-  };
-}
-
-function weightedMarketRegime(input: {
-  candles: Candle[];
-  closes: number[];
-  latest: Candle;
-  vwap: number;
-  atr: number | null;
-  bands: ReturnType<typeof bollingerBands>;
-  sma20: number | null;
-  sma50: number | null;
-  volatilityPercent: number;
-  minutes: number;
-}) {
-  const latest = input.latest;
-  const lookbackClose = input.closes[Math.max(0, input.closes.length - 11)] ?? latest.close;
-  const tenBarReturn = lookbackClose ? (latest.close - lookbackClose) / lookbackClose : 0;
-  const vwapDistance = (latest.close - input.vwap) / Math.max(input.vwap, 0.01);
-  const smaTrend =
-    input.sma20 !== null && input.sma50 !== null
-      ? input.sma20 > input.sma50 && latest.close > input.sma20 && latest.close > input.vwap
-        ? 1
-        : input.sma20 < input.sma50 && latest.close < input.sma20 && latest.close < input.vwap
-          ? -1
-          : 0
-      : 0;
-  const momentumTrend = tenBarReturn > 0.0015 && vwapDistance > 0.0008 ? 1 : tenBarReturn < -0.0015 && vwapDistance < -0.0008 ? -1 : 0;
-  const trendScore = smaTrend + momentumTrend;
-  const trendDirection: "up" | "down" | "neutral" = trendScore > 0 ? "up" : trendScore < 0 ? "down" : "neutral";
-  const trendSource =
-    trendDirection === "up"
-      ? "20/50 SMA, VWAP, and 10-bar momentum bullish"
-      : trendDirection === "down"
-        ? "20/50 SMA, VWAP, and 10-bar momentum bearish"
-        : "mixed SMA/VWAP/momentum";
-  const volatilityLevel =
-    input.volatilityPercent > 0.008 ? "high" : input.volatilityPercent > 0.004 ? "normal" : input.volatilityPercent > 0 ? "compressed" : "unknown";
-  const bandWidth = input.bands && latest.close ? (input.bands.upper - input.bands.lower) / latest.close : 0;
-  const recentHigh = Math.max(...input.candles.slice(-20).map((candle) => candle.high));
-  const recentLow = Math.min(...input.candles.slice(-20).map((candle) => candle.low));
-  const recentRangePercent = latest.close ? (recentHigh - recentLow) / latest.close : 0;
-  const isChop = Math.abs(vwapDistance) < 0.0015 && Math.abs(tenBarReturn) < 0.0018 && bandWidth < 0.012;
-  const isRange = recentRangePercent < Math.max(0.004, input.volatilityPercent * 2.2) && trendDirection === "neutral";
-  const rangeCondition = isChop ? "VWAP Chop" : isRange ? "Compressed Range" : trendDirection === "neutral" ? "Mixed/Transition" : "Directional";
-  return {
-    trendDirection,
-    trendSource,
-    volatilityLevel,
-    rangeCondition,
-    sessionLabel: sessionLabelForMinutes(input.minutes),
-  };
-}
-
-function weightedTimeframeContext(oneMinuteCandles: Candle[]): WeightedTimeframeContext {
-  const fiveMinuteCandles =
-    state.weightedMarketData.timeframeCandles["5Min"]?.length
-      ? state.weightedMarketData.timeframeCandles["5Min"]!
-      : aggregateCandlesToMinutes(oneMinuteCandles, 5, "5Min");
-  return {
-    fiveMinute: weightedDirectionalTimeframeSignal(fiveMinuteCandles, 6, 0.0008, "5m confirmation"),
-  };
-}
-
-function weightedDirectionalTimeframeSignal(candles: Candle[], lookback: number, threshold: number, label: string): WeightedTimeframeSignal {
-  const comparable = candles.filter((candle) => candle.close > 0);
-  if (comparable.length < 3) {
-    return { direction: "neutral", score: 0, source: `${label}: unavailable` };
-  }
-  const latest = comparable.at(-1)!;
-  const base = comparable[Math.max(0, comparable.length - 1 - lookback)];
-  const returns = base.close ? (latest.close - base.close) / base.close : 0;
-  const closes = comparable.map((candle) => candle.close);
-  const fast = simpleMovingAverage(closes, Math.min(5, closes.length));
-  const slow = simpleMovingAverage(closes, Math.min(Math.max(lookback, 8), closes.length));
-  const smaBias = fast !== null && slow !== null ? (fast > slow ? 1 : fast < slow ? -1 : 0) : 0;
-  const returnBias = returns > threshold ? 1 : returns < -threshold ? -1 : 0;
-  const combined = returnBias + smaBias;
-  const direction: WeightedTimeframeDirection = combined > 0 ? "up" : combined < 0 ? "down" : "neutral";
-  const score = roundNumber(Math.min(1, Math.abs(returns) / Math.max(threshold * 3, 0.0001)) * (smaBias && returnBias && smaBias === returnBias ? 1 : 0.65), 4);
-  return {
-    direction,
-    score,
-    source: `${label}: ${direction}, ${formatBasisPoints(returns)} over ${Math.min(lookback, comparable.length - 1)} bars`,
-  };
-}
-
-function weightedSignalTimeframeAlignment(signal: AlgoSignal, timeframe: WeightedTimeframeSignal) {
-  if (signal === "Hold" || timeframe.direction === "neutral") {
-    return 0;
-  }
-  const signalDirection = signal === "Buy" ? "up" : "down";
-  return timeframe.direction === signalDirection ? timeframe.score : -timeframe.score;
-}
-
-function weightedFiveMinuteConfirmationGate(signal: AlgoSignal, maxScore: number, margin: number, fiveMinute: WeightedTimeframeSignal) {
-  if (signal === "Hold") {
-    return { status: "pass" as const, detail: "Hold does not need 5m confirmation" };
-  }
-  if (fiveMinute.direction === "neutral") {
-    return { status: "info" as const, detail: fiveMinute.source };
-  }
-  const alignment = weightedSignalTimeframeAlignment(signal, fiveMinute);
-  if (alignment < -0.35 && (maxScore < 0.68 || margin < 0.18)) {
-    return { status: "fail" as const, detail: `${fiveMinute.source}; weak 1m ${signal} blocked` };
-  }
-  if (alignment < 0) {
-    return { status: "info" as const, detail: `${fiveMinute.source}; conflict noted` };
-  }
-  return { status: "pass" as const, detail: `${fiveMinute.source}; confirms ${signal}` };
-}
-
-function weightedStrengthComponents(
-  strategy: WeightedAlphaStrategy,
-  signalQuality: number,
-  expectedReturnAfterCosts: number,
-  market: ReturnType<typeof weightedMarketType>,
-  sampleSizeScore: number,
-  drawdownScore: number,
-) {
-  const familyBase = {
-    breakout: { profitFactor: 0.58, precision: 0.56 },
-    trend: { profitFactor: 0.62, precision: 0.58 },
-    reversion: { profitFactor: 0.6, precision: 0.57 },
-    volatility: { profitFactor: 0.55, precision: 0.54 },
-  }[strategy.family];
-  const regimeMatch =
-    strategy.family === "trend" && market.trendDirection !== "neutral"
-      ? 0.74
-      : strategy.family === "reversion" && market.rangeCondition.toLowerCase().includes("chop")
-        ? 0.78
-        : strategy.family === "breakout" && state.marketContext?.event.strategyTags.includes("orb")
-          ? 0.76
-          : strategy.family === "volatility" && market.volatilityLevel === "high"
-            ? 0.74
-            : 0.52;
-  const recentPerformance = Math.max(0.25, Math.min(0.88, 0.5 + signalQuality * 0.45 + market.breadth * 0.08));
-  const expectancy = Math.max(0.1, Math.min(0.9, 0.48 + expectedReturnAfterCosts * 280 + signalQuality * 0.18));
-  const drawdown = Math.max(0.15, Math.min(1, drawdownScore - Math.max(0, market.volatilityPercent - 0.004) * 8));
-  return {
-    profitFactor: familyBase.profitFactor,
-    expectancy,
-    precision: Math.min(0.9, familyBase.precision + signalQuality * 0.2),
-    drawdown,
-    recentPerformance,
-    regimeMatch,
-    sampleSize: sampleSizeScore,
-  };
-}
-
-function weightedFilterMultipliers(
-  strategy: WeightedAlphaResult,
-  strategies: WeightedAlphaResult[],
-  market: ReturnType<typeof weightedMarketType>,
-) {
-  const regimeDirectional = market.trendDirection === "up" ? "long" : market.trendDirection === "down" ? "short" : "neutral";
-  const sessionText = market.rangeCondition.toLowerCase();
-  const familyLeader = strategies
-    .filter((item) => item.family === strategy.family)
-    .sort((left, right) => right.strength - left.strength)[0];
-  const trendRegime = regimeDirectional === "long" || regimeDirectional === "short";
-  const regimeMultiplier =
-    strategy.family === "trend" && trendRegime
-      ? 1.15
-      : strategy.family === "reversion" && sessionText.includes("chop")
-        ? 1.2
-        : strategy.family === "volatility" && market.volatilityLevel === "high"
-            ? 1.1
-            : trendRegime && strategy.family === "reversion"
-              ? 0.85
-              : 1;
-  const timeOfDayMultiplier =
-    market.minutes < 10 * 60 + 30
-      ? strategy.key === "S1" || strategy.key === "S2" || strategy.key === "S8"
-        ? 1.14
-        : 0.95
-      : market.minutes >= 12 * 60 && market.minutes < 14 * 60
-        ? strategy.family === "reversion"
-          ? 1.08
-          : 0.92
-        : market.minutes >= 15 * 60
-          ? strategy.family === "breakout" || strategy.family === "trend"
-            ? 1.05
-            : 0.98
-          : 1;
-  const relativeStrengthMultiplier =
-    Math.abs(market.relativeStrength) > 0.006
-      ? strategy.family === "trend" || strategy.family === "breakout"
-        ? 1.08
-        : 0.94
-      : 1;
-  const side = weightedSignalSide(strategy);
-  const fiveMinuteAlignment = side ? weightedSignalTimeframeAlignment(side, market.timeframes.fiveMinute) : 0;
-  const fiveMinuteMultiplier = fiveMinuteAlignment > 0 ? 1.08 : fiveMinuteAlignment < -0.35 ? 0.78 : fiveMinuteAlignment < 0 ? 0.9 : 1;
-  const breadthMultiplier =
-    Math.abs(market.breadth) > 0.35
-      ? strategy.family === "trend" || strategy.family === "volatility"
-        ? 1.07
-        : 0.95
-      : 1;
-  const drawdownMultiplier = strategy.recentDrawdown > 0.006 ? 0.72 : strategy.recentDrawdown > 0.003 ? 0.86 : 1;
-  const correlationPenalty = familyLeader?.key === strategy.key ? 1 : strategy.family === familyLeader?.family ? 0.86 : 1;
-  return {
-    regime: regimeMultiplier,
-    timeOfDay: timeOfDayMultiplier,
-    fiveMinute: fiveMinuteMultiplier,
-    relativeStrength: relativeStrengthMultiplier,
-    breadth: breadthMultiplier,
-    drawdown: drawdownMultiplier,
-    correlation: correlationPenalty,
-  };
-}
-
-function loadWeightedVotingWeightState(): WeightedVotingWeightState {
-  try {
-    const raw = window.localStorage.getItem(weightedVotingStorageKey);
-    if (!raw) {
-      return { weights: { ...weightedVotingDefaultWeights }, lastUpdatedDate: "", source: "default" };
-    }
-    const parsed = JSON.parse(raw) as Partial<WeightedVotingWeightState> & Partial<Record<WeightedAlphaKey, number>>;
-    const sourceWeights = parsed.weights ?? parsed;
-    const source = parsed.source === "backtest" || parsed.source === "daily" ? parsed.source : "default";
-    return {
-      weights: normalizeWeightedValues(
-        Object.fromEntries(
-          weightedAlphaStrategies.map((strategy) => [strategy.key, Number(sourceWeights[strategy.key] ?? weightedVotingDefaultWeights[strategy.key])]),
-        ) as Record<WeightedAlphaKey, number>,
-      ),
-      lastUpdatedDate: typeof parsed.lastUpdatedDate === "string" ? parsed.lastUpdatedDate : "",
-      source,
-      seededAt: typeof parsed.seededAt === "string" ? parsed.seededAt : undefined,
-    };
-  } catch {
-    return { weights: { ...weightedVotingDefaultWeights }, lastUpdatedDate: "", source: "default" };
-  }
-}
-
-function saveWeightedVotingWeightState(weightState: WeightedVotingWeightState) {
-  window.localStorage.setItem(
-    weightedVotingStorageKey,
-    JSON.stringify({
-      weights: normalizeWeightedValues(weightState.weights),
-      lastUpdatedDate: weightState.lastUpdatedDate,
-      source: weightState.source,
-      seededAt: weightState.seededAt,
-    }),
-  );
-}
-
-function weightedVotingHasBacktestSeed() {
-  const weightState = loadWeightedVotingWeightState();
-  return weightState.source === "backtest" || weightState.source === "daily";
-}
-
-async function ensureWeightedInitialWeightsFromBacktest() {
-  if (!WEIGHTED_BROWSER_BACKTEST_BOOTSTRAP_ENABLED || weightedInitialWeightsInFlight || weightedVotingHasBacktestSeed() || state.symbol !== "SPY") {
-    return;
-  }
-  weightedInitialWeightsInFlight = true;
-  try {
-    const candles = await fetchWeightedInitialBacktestCandles();
-    const result = weightedInitialBacktestWeights(normalizeCandles(candles));
-    if (!result) {
-      return;
-    }
-    saveWeightedStrategyPerformance(result.performance);
-    saveWeightedVotingWeightState({
-      weights: result.weights,
-      lastUpdatedDate: "bootstrap",
-      source: "backtest",
-      seededAt: new Date().toISOString(),
-    });
-    updateWeightedVotingPanel();
-  } catch {
-    // Equal weights remain the safe bootstrap if historical 1m data is unavailable.
-  } finally {
-    weightedInitialWeightsInFlight = false;
-  }
-}
-
-async function fetchWeightedInitialBacktestCandles() {
-  try {
-    const params = await backtestRangeParams({ timeframe: "1Min" });
-    const response = await fetchWithTimeout(`${API_BASE}/api/backtest-data/candles?${params.toString()}`, 30000);
-    if (!response.ok) {
-      throw new Error(await response.text());
-    }
-    const payload = (await response.json()) as CandleResponse;
-    return payload.candles;
-  } catch {
-    return fetchAlgoBacktestCandles("1Min");
-  }
-}
-
-function weightedInitialBacktestWeights(candles: Candle[]): WeightedInitialBacktestResult | null {
-  const regularCandles = candles.filter((candle) => isRegularSession(candle.timestamp));
-  if (regularCandles.length < 80) {
-    return null;
-  }
-  const stats = Object.fromEntries(
-    weightedAlphaStrategies.map((strategy) => [
-      strategy.key,
-      {
-        trades: 0,
-        wins: 0,
-        grossProfit: 0,
-        grossLoss: 0,
-        outcomes: [] as number[],
-      },
-    ]),
-  ) as Record<WeightedAlphaKey, { trades: number; wins: number; grossProfit: number; grossLoss: number; outcomes: number[] }>;
-
-  for (let index = 50; index < regularCandles.length - 1; index += 1) {
-    const history = latestRegularSessionCandlesFrom(regularCandles.slice(0, index + 1));
-    const next = regularCandles[index + 1];
-    if (history.length < 30 || easternDateString(history.at(-1)!.timestamp) !== easternDateString(next.timestamp)) {
-      continue;
-    }
-    const market = weightedBacktestMarket(history);
-    if (!market) {
-      continue;
-    }
-    weightedAlphaStrategies.forEach((strategy) => {
-      const signal = weightedAlphaSignal(strategy, market);
-      const side = weightedSignalSide(signal);
-      if (!side) {
-        return;
-      }
-      const entry = market.latest.close;
-      const barrier = weightedBarrierSettings(entry, market.atr, market.minutes);
-      const futureCandles = regularCandles
-        .slice(index + 1, index + 1 + barrier.horizonBars + 1)
-        .filter((candle) => easternDateString(candle.timestamp) === easternDateString(market.latest.timestamp));
-      const resolved = weightedTripleBarrierOutcome(side, entry, weightedSignalCostEstimate(entry), futureCandles, barrier, true);
-      if (!resolved) {
-        return;
-      }
-      const outcome = resolved.outcome;
-      const row = stats[strategy.key];
-      row.trades += 1;
-      row.wins += outcome > 0 ? 1 : 0;
-      row.grossProfit += Math.max(0, outcome);
-      row.grossLoss += Math.abs(Math.min(0, outcome));
-      row.outcomes = [outcome, ...row.outcomes].slice(0, 50);
-    });
-  }
-
-  const performance = Object.fromEntries(
-    weightedAlphaStrategies.map((strategy) => {
-      const row = stats[strategy.key];
-      const recentExpectancy = row.outcomes.length ? roundNumber(row.outcomes.reduce((sum, value) => sum + value, 0) / row.outcomes.length, 5) : null;
-      return [
-        strategy.key,
-        {
-          tradeCount: row.trades,
-          liveOutcomeCount: 0,
-          recentOutcomes: row.outcomes,
-          recentExpectancy,
-          recentDrawdown: weightedDrawdownFromOutcomes(row.outcomes),
-        },
-      ];
-    }),
-  ) as Record<WeightedAlphaKey, WeightedStrategyPerformance>;
-
-  const pseudoStrategies = weightedAlphaStrategies.map((strategy) => {
-    const row = stats[strategy.key];
-    const expectancy = row.outcomes.length ? row.outcomes.reduce((sum, value) => sum + value, 0) / row.outcomes.length : 0;
-    const profitFactor = row.grossLoss ? row.grossProfit / row.grossLoss : row.grossProfit > 0 ? 3 : 0;
-    const profitFactorScore = Math.max(0, Math.min(1, profitFactor / 3));
-    const expectancyScore = Math.max(0, Math.min(1, 0.5 + expectancy * 250));
-    const precisionScore = row.trades ? row.wins / row.trades : 0;
-    const drawdownScore = weightedStrategyDrawdownScore(performance[strategy.key].recentDrawdown);
-    const recentPerformanceScore = Math.max(0, Math.min(1, 0.5 + (performance[strategy.key].recentExpectancy ?? 0) * 250));
-    const sampleSizeScore = weightedStrategySampleSizeScore(row.trades);
-    const strength = roundNumber(
-      0.25 * profitFactorScore +
-        0.2 * expectancyScore +
-        0.15 * precisionScore +
-        0.15 * drawdownScore +
-        0.1 * recentPerformanceScore +
-        0.1 * 0.6 +
-        0.05 * sampleSizeScore,
-      4,
-    );
-    return {
-      ...strategy,
-      pBuy: 0,
-      pSell: 0,
-      pHold: 1,
-      expectedReturn: expectancy,
-      expectedReturnAfterCosts: expectancy,
-      signalQuality: precisionScore,
-      strength,
-      tradeCount: row.trades,
-      sampleSizeScore,
-      recentExpectancy: performance[strategy.key].recentExpectancy,
-      recentDrawdown: performance[strategy.key].recentDrawdown,
-      drawdownScore,
-      baseWeight: 0,
-      adjustedWeight: strength * sampleSizeScore,
-      finalWeight: 0,
-      smoothedWeight: 0,
-      recalculatedWeight: 0,
-      multipliers: {},
-      disabledReason: "",
-      detail: "Initial 1m backtest bootstrap",
-    };
-  });
-  const activeStrength = pseudoStrategies.reduce((sum, strategy) => sum + (strategy.disabledReason ? 0 : strategy.adjustedWeight), 0);
-  if (!activeStrength) {
-    return null;
-  }
-  const rawWeights = normalizeWeightedValues(
-    Object.fromEntries(pseudoStrategies.map((strategy) => [strategy.key, strategy.disabledReason ? 0 : strategy.adjustedWeight])) as Record<WeightedAlphaKey, number>,
-  );
-  return {
-    weights: capNormalizeWeights(rawWeights, pseudoStrategies),
-    performance,
-  };
-}
-
-function weightedBacktestMarket(candles: Candle[]): ReturnType<typeof weightedMarketType> | null {
-  const latest = candles.at(-1) ?? null;
-  if (!latest || candles.length < 30) {
-    return null;
-  }
-  const closes = candles.map((candle) => candle.close);
-  const vwap = sessionVwapValue(candles);
-  const atr = averageTrueRange(candles, Math.min(14, candles.length - 1));
-  const bands = bollingerBands(closes, 20, 2);
-  const averageVolume = simpleMovingAverage(candles.map((candle) => candle.volume), Math.min(20, candles.length)) ?? latest.volume;
-  const sma20 = simpleMovingAverage(closes, 20);
-  const sma50 = simpleMovingAverage(closes, 50);
-  const priorRange = candles.slice(-21, -1);
-  const minutes = easternMinutes(latest.timestamp);
-  const volatilityPercent = atr && latest.close ? atr / latest.close : 0;
-  const regime = weightedMarketRegime({ candles, closes, latest, vwap, atr, bands, sma20, sma50, volatilityPercent, minutes });
-  return {
-    candles,
-    latest,
-    closes,
-    vwap,
-    atr,
-    bands,
-    openingRange: openingRangeValues(candles, Math.min(15, candles.length)),
-    priorHigh: priorRange.length ? Math.max(...priorRange.map((candle) => candle.high)) : latest.high,
-    priorLow: priorRange.length ? Math.min(...priorRange.map((candle) => candle.low)) : latest.low,
-    averageVolume,
-    sma20,
-    sma50,
-    relativeStrength: 0,
-    breadth: 0,
-    eventRisk: 0.2,
-    volatilityPercent,
-    trendDirection: regime.trendDirection,
-    trendSource: regime.trendSource,
-    volatilityLevel: regime.volatilityLevel,
-    rangeCondition: regime.rangeCondition,
-    sessionLabel: regime.sessionLabel,
-    timeframes: emptyWeightedTimeframeContext(),
-    minutes,
-  };
-}
-
-function loadWeightedStrategyPerformance(): Record<WeightedAlphaKey, WeightedStrategyPerformance> {
-  try {
-    const raw = window.localStorage.getItem(weightedStrategyPerformanceStorageKey);
-    const parsed = raw ? (JSON.parse(raw) as Partial<Record<WeightedAlphaKey, Partial<WeightedStrategyPerformance>>>) : {};
-    return Object.fromEntries(
-      weightedAlphaStrategies.map((strategy) => [
-        strategy.key,
-        {
-          tradeCount: Math.max(0, Math.floor(Number(parsed[strategy.key]?.tradeCount ?? 0))),
-          liveOutcomeCount: Math.max(0, Math.floor(Number(parsed[strategy.key]?.liveOutcomeCount ?? 0))),
-          recentOutcomes: Array.isArray(parsed[strategy.key]?.recentOutcomes)
-            ? parsed[strategy.key]!.recentOutcomes!.map((value) => Number(value)).filter(Number.isFinite).slice(0, 50)
-            : [],
-          recentExpectancy:
-            typeof parsed[strategy.key]?.recentExpectancy === "number" && Number.isFinite(parsed[strategy.key]?.recentExpectancy)
-              ? Number(parsed[strategy.key]?.recentExpectancy)
-              : null,
-          recentDrawdown:
-            typeof parsed[strategy.key]?.recentDrawdown === "number" && Number.isFinite(parsed[strategy.key]?.recentDrawdown)
-              ? Number(parsed[strategy.key]?.recentDrawdown)
-              : weightedDrawdownFromOutcomes(
-                  Array.isArray(parsed[strategy.key]?.recentOutcomes)
-                    ? parsed[strategy.key]!.recentOutcomes!.map((value) => Number(value)).filter(Number.isFinite).slice(0, 50)
-                    : [],
-                ),
-          ...(parsed[strategy.key]?.pendingSignal ? { pendingSignal: parsed[strategy.key]!.pendingSignal } : {}),
-        },
-      ]),
-    ) as Record<WeightedAlphaKey, WeightedStrategyPerformance>;
-  } catch {
-    return defaultWeightedStrategyPerformance();
-  }
-}
-
-function defaultWeightedStrategyPerformance(): Record<WeightedAlphaKey, WeightedStrategyPerformance> {
-  return Object.fromEntries(
-    weightedAlphaStrategies.map((strategy) => [
-      strategy.key,
-      { tradeCount: 0, liveOutcomeCount: 0, recentOutcomes: [], recentExpectancy: null, recentDrawdown: 0 },
-    ]),
-  ) as unknown as Record<
-    WeightedAlphaKey,
-    WeightedStrategyPerformance
-  >;
-}
-
-function saveWeightedStrategyPerformance(performance: Record<WeightedAlphaKey, WeightedStrategyPerformance>) {
-  window.localStorage.setItem(weightedStrategyPerformanceStorageKey, JSON.stringify(performance));
-}
-
-function weightedStrategyTradeCount(strategyKey: WeightedAlphaKey) {
-  return loadWeightedStrategyPerformance()[strategyKey]?.tradeCount ?? 0;
-}
-
-function weightedStrategyLiveOutcomeCount(strategyKey: WeightedAlphaKey) {
-  return loadWeightedStrategyPerformance()[strategyKey]?.liveOutcomeCount ?? 0;
-}
-
-function weightedStrategyRecentExpectancy(strategyKey: WeightedAlphaKey) {
-  return loadWeightedStrategyPerformance()[strategyKey]?.recentExpectancy ?? null;
-}
-
-function weightedStrategyRecentDrawdown(strategyKey: WeightedAlphaKey) {
-  return loadWeightedStrategyPerformance()[strategyKey]?.recentDrawdown ?? 0;
-}
-
-function weightedStrategyDrawdownScore(drawdown: number) {
-  return roundNumber(Math.max(0.15, Math.min(1, 1 - drawdown / 0.01)), 4);
-}
-
-function weightedStrategySampleSizeScore(tradeCount: number) {
-  return roundNumber(Math.max(0.2, Math.min(1, tradeCount / weightedMinimumTradesForFullWeight)), 4);
-}
-
-function updateWeightedStrategyPerformanceFromSignals(signals: WeightedAlphaResult[], market: ReturnType<typeof weightedMarketType>) {
-  const performance = loadWeightedStrategyPerformance();
-  let changed = false;
-  signals.forEach((signal) => {
-    const row = performance[signal.key] ?? { tradeCount: 0, liveOutcomeCount: 0, recentOutcomes: [], recentExpectancy: null, recentDrawdown: 0 };
-    const pending = row.pendingSignal;
-    if (pending && pending.timestamp !== market.latest.timestamp) {
-      const resolved = weightedResolvePendingSignalOutcome(pending, market);
-      if (resolved) {
-        const recentOutcomes = [resolved.outcome, ...(row.recentOutcomes ?? [])].slice(0, 50);
-        row.recentOutcomes = recentOutcomes;
-        row.recentExpectancy = roundNumber(recentOutcomes.reduce((sum, value) => sum + value, 0) / recentOutcomes.length, 5);
-        row.recentDrawdown = weightedDrawdownFromOutcomes(recentOutcomes);
-        row.tradeCount = Math.max(0, Math.floor(Number(row.tradeCount) || 0)) + 1;
-        row.liveOutcomeCount = Math.max(0, Math.floor(Number(row.liveOutcomeCount) || 0)) + 1;
-        delete row.pendingSignal;
-        changed = true;
-      } else if (easternDateString(pending.timestamp) !== easternDateString(market.latest.timestamp)) {
-        delete row.pendingSignal;
-        changed = true;
-      }
-    }
-
-    const side = weightedSignalSide(signal);
-    if (side && row.pendingSignal?.timestamp !== market.latest.timestamp) {
-      const barrier = weightedBarrierSettings(market.latest.close, market.atr, market.minutes);
-      row.pendingSignal = {
-        side,
-        entryPrice: market.latest.close,
-        timestamp: market.latest.timestamp,
-        cost: weightedSignalCostEstimate(market.latest.close),
-        targetReturn: barrier.targetReturn,
-        stopReturn: barrier.stopReturn,
-        horizonBars: barrier.horizonBars,
-      };
-      changed = true;
-    }
-    performance[signal.key] = row;
-  });
-  if (changed) {
-    saveWeightedStrategyPerformance(performance);
-  }
-}
-
-function weightedDrawdownFromOutcomes(outcomesNewestFirst: number[]) {
-  let equity = 0;
-  let peak = 0;
-  let maxDrawdown = 0;
-  outcomesNewestFirst
-    .slice()
-    .reverse()
-    .forEach((outcome) => {
-      equity += outcome;
-      peak = Math.max(peak, equity);
-      maxDrawdown = Math.max(maxDrawdown, peak - equity);
-    });
-  return roundNumber(maxDrawdown, 5);
-}
-
-function weightedSignalSide(signal: WeightedAlphaResult): "Buy" | "Sell" | null {
-  if (signal.pBuy >= 0.58 && signal.pBuy > signal.pSell && signal.pBuy > signal.pHold) {
-    return "Buy";
-  }
-  if (signal.pSell >= 0.58 && signal.pSell > signal.pBuy && signal.pSell > signal.pHold) {
-    return "Sell";
-  }
-  return null;
-}
-
-function weightedSignalCostEstimate(priceValue: number) {
-  return priceValue ? (state.weightedTradingSettings.slippagePerShare * 2 + 0.02) / priceValue : 0.0001;
-}
-
-function weightedBarrierSettings(priceValue: number, atr: number | null, minutes: number) {
-  const atrReturn = atr && priceValue ? atr / priceValue : 0.0025;
-  return {
-    targetReturn: Math.max(0.0015, atrReturn * 0.9),
-    stopReturn: Math.max(0.001, atrReturn * 0.65),
-    horizonBars: minutes < 10 * 60 + 30 ? 15 : minutes >= 15 * 60 ? 8 : 20,
-  };
-}
-
-function weightedTripleBarrierOutcome(
-  side: "Buy" | "Sell",
-  entryPrice: number,
-  cost: number,
-  futureCandles: Candle[],
-  barrier: { targetReturn: number; stopReturn: number; horizonBars: number },
-  forceCloseAtEnd = false,
-): WeightedResolvedBarrierOutcome | null {
-  if (!entryPrice || !futureCandles.length) {
-    return null;
-  }
-  const candles = futureCandles.slice(0, barrier.horizonBars);
-  for (let index = 0; index < candles.length; index += 1) {
-    const candle = candles[index];
-    const favorableReturn = side === "Buy" ? (candle.high - entryPrice) / entryPrice : (entryPrice - candle.low) / entryPrice;
-    const adverseReturn = side === "Buy" ? (entryPrice - candle.low) / entryPrice : (candle.high - entryPrice) / entryPrice;
-    const hitTarget = favorableReturn >= barrier.targetReturn;
-    const hitStop = adverseReturn >= barrier.stopReturn;
-    if (hitTarget && hitStop) {
-      const closeReturn = ((candle.close - entryPrice) / entryPrice) * (side === "Buy" ? 1 : -1);
-      const label = closeReturn >= 0 ? "target" : "stop";
-      return {
-        outcome: roundNumber((label === "target" ? barrier.targetReturn : -barrier.stopReturn) - cost, 5),
-        label,
-        barsHeld: index + 1,
-      };
-    }
-    if (hitTarget) {
-      return { outcome: roundNumber(barrier.targetReturn - cost, 5), label: "target", barsHeld: index + 1 };
-    }
-    if (hitStop) {
-      return { outcome: roundNumber(-barrier.stopReturn - cost, 5), label: "stop", barsHeld: index + 1 };
-    }
-  }
-  if (!forceCloseAtEnd && candles.length < barrier.horizonBars) {
-    return null;
-  }
-  const exitCandle = candles.at(-1);
-  if (!exitCandle) {
-    return null;
-  }
-  const direction = side === "Buy" ? 1 : -1;
-  return {
-    outcome: roundNumber(((exitCandle.close - entryPrice) / entryPrice) * direction - cost, 5),
-    label: "time",
-    barsHeld: candles.length,
-  };
-}
-
-function weightedResolvePendingSignalOutcome(
-  pending: NonNullable<WeightedStrategyPerformance["pendingSignal"]>,
-  market: ReturnType<typeof weightedMarketType>,
-): WeightedResolvedBarrierOutcome | null {
-  const entryIndex = market.candles.findIndex((candle) => candle.timestamp === pending.timestamp);
-  if (entryIndex < 0) {
-    return null;
-  }
-  const pendingDate = easternDateString(pending.timestamp);
-  const latestDate = easternDateString(market.latest.timestamp);
-  const fallbackBarrier = weightedBarrierSettings(pending.entryPrice, null, easternMinutes(pending.timestamp));
-  const barrier = {
-    targetReturn: pending.targetReturn ?? fallbackBarrier.targetReturn,
-    stopReturn: pending.stopReturn ?? fallbackBarrier.stopReturn,
-    horizonBars: pending.horizonBars ?? fallbackBarrier.horizonBars,
-  };
-  const futureCandles = market.candles
-    .slice(entryIndex + 1, entryIndex + 1 + barrier.horizonBars + 1)
-    .filter((candle) => easternDateString(candle.timestamp) === pendingDate);
-  return weightedTripleBarrierOutcome(pending.side, pending.entryPrice, pending.cost, futureCandles, barrier, latestDate !== pendingDate);
-}
-
-function resolveWeightedVotingActiveWeights(
-  storedWeightState: WeightedVotingWeightState,
-  smoothedWeights: Record<WeightedAlphaKey, number>,
-  strategies: WeightedAlphaResult[],
-  latest: Candle,
-) {
-  const latestDate = easternDateString(latest.timestamp);
-  const storedWeights = capNormalizeWeights(storedWeightState.weights, strategies);
-  if (!weightedVotingCanUpdateWeightsAfterClose(latest) || storedWeightState.lastUpdatedDate === latestDate) {
-    return storedWeights;
-  }
-  const nextWeights = capNormalizeWeights(smoothedWeights, strategies);
-  saveWeightedVotingWeightState({
-    weights: nextWeights,
-    lastUpdatedDate: latestDate,
-    source: "daily",
-    seededAt: storedWeightState.seededAt ?? new Date().toISOString(),
-  });
-  return nextWeights;
-}
-
-function weightedVotingCanUpdateWeightsAfterClose(latest: Candle) {
-  const latestDate = easternDateString(latest.timestamp);
-  const today = easternDateString(new Date().toISOString());
-  const nowMinutes = easternMinutes(new Date().toISOString());
-  return latestDate === today && state.marketStatus !== "open" && nowMinutes >= 16 * 60;
-}
-
-function normalizeWeightedValues(values: Record<WeightedAlphaKey, number>): Record<WeightedAlphaKey, number> {
-  const total = weightedAlphaStrategies.reduce((sum, strategy) => sum + Math.max(0, Number(values[strategy.key] ?? 0)), 0);
-  if (!total) {
-    return { ...weightedVotingDefaultWeights };
-  }
-  return Object.fromEntries(weightedAlphaStrategies.map((strategy) => [strategy.key, Math.max(0, values[strategy.key]) / total])) as Record<WeightedAlphaKey, number>;
-}
-
-function capNormalizeWeights(values: Record<WeightedAlphaKey, number>, strategies: WeightedAlphaResult[]): Record<WeightedAlphaKey, number> {
-  const activeKeys = new Set(strategies.filter((strategy) => !strategy.disabledReason).map((strategy) => strategy.key));
-  const next = Object.fromEntries(
-    weightedAlphaStrategies.map((strategy) => [strategy.key, activeKeys.has(strategy.key) ? Math.max(0, values[strategy.key]) : 0]),
-  ) as Record<WeightedAlphaKey, number>;
-  let activeTotal = weightedAlphaStrategies.reduce((sum, strategy) => sum + next[strategy.key], 0);
-  if (!activeTotal) {
-    return { ...weightedVotingDefaultWeights };
-  }
-  weightedAlphaStrategies.forEach((strategy) => {
-    next[strategy.key] = next[strategy.key] / activeTotal;
-  });
-  for (let pass = 0; pass < 3; pass += 1) {
-    const overweight = weightedAlphaStrategies.filter((strategy) => next[strategy.key] > 0.25);
-    if (!overweight.length) {
-      break;
-    }
-    const locked = new Set(overweight.map((strategy) => strategy.key));
-    let lockedTotal = 0;
-    overweight.forEach((strategy) => {
-      next[strategy.key] = 0.25;
-      lockedTotal += 0.25;
-    });
-    const remaining = weightedAlphaStrategies.filter((strategy) => activeKeys.has(strategy.key) && !locked.has(strategy.key));
-    const remainingTotal = remaining.reduce((sum, strategy) => sum + next[strategy.key], 0);
-    remaining.forEach((strategy) => {
-      next[strategy.key] = remainingTotal ? (next[strategy.key] / remainingTotal) * Math.max(0, 1 - lockedTotal) : 0;
-    });
-  }
-  weightedAlphaStrategies.forEach((strategy) => {
-    if (activeKeys.has(strategy.key) && next[strategy.key] > 0 && next[strategy.key] < 0.02) {
-      next[strategy.key] = 0.02;
-    }
-  });
-  activeTotal = weightedAlphaStrategies.reduce((sum, strategy) => sum + next[strategy.key], 0);
-  weightedAlphaStrategies.forEach((strategy) => {
-    next[strategy.key] = activeTotal ? next[strategy.key] / activeTotal : weightedVotingDefaultWeights[strategy.key];
-  });
-  return next;
-}
-
-function weightedTripleBarrierFilter(
-  signal: AlgoSignal,
-  expectedReturnAfterCosts: number,
-  market: ReturnType<typeof weightedMarketType>,
-  strategies: WeightedAlphaResult[],
-): WeightedTripleBarrierResult {
-  if (signal === "Hold" || !market.latest.close) {
-    return emptyWeightedTripleBarrier();
-  }
-  const { targetReturn, stopReturn, horizonBars } = weightedBarrierSettings(market.latest.close, market.atr, market.minutes);
-  const directionalQuality = strategies.reduce((sum, strategy) => {
-    const probability = signal === "Buy" ? strategy.pBuy : strategy.pSell;
-    return sum + strategy.finalWeight * probability;
-  }, 0);
-  const pathReturn = expectedReturnAfterCosts * horizonBars * Math.max(0.5, directionalQuality);
-  const oppositePressure = signal === "Buy" ? strategies.reduce((sum, strategy) => sum + strategy.finalWeight * strategy.pSell, 0) : strategies.reduce((sum, strategy) => sum + strategy.finalWeight * strategy.pBuy, 0);
-  const timeframeAdjustment =
-    weightedSignalTimeframeAlignment(signal, market.timeframes.fiveMinute) * 0.25;
-  const adjustedPathReturn = pathReturn + timeframeAdjustment * targetReturn;
-  const likelyTargetFirst = adjustedPathReturn >= targetReturn && directionalQuality - oppositePressure + timeframeAdjustment >= 0.12;
-  const likelyStopFirst = adjustedPathReturn <= -stopReturn || oppositePressure > directionalQuality + Math.max(0, timeframeAdjustment);
-  const label = likelyTargetFirst ? "positive" : likelyStopFirst ? "negative" : "neutral";
-  const passed = label === "positive";
-  return {
-    passed,
-    label,
-    targetReturn,
-    stopReturn,
-    horizonBars,
-    expectedPathReturn: roundNumber(adjustedPathReturn, 5),
-    detail: `${label}; path ${formatBasisPoints(adjustedPathReturn)}, target ${formatBasisPoints(targetReturn)}, stop ${formatBasisPoints(stopReturn)}, ${horizonBars} bars`,
-  };
-}
-
-function emptyWeightedTripleBarrier(): WeightedTripleBarrierResult {
-  return {
-    passed: false,
-    label: "neutral",
-    targetReturn: 0,
-    stopReturn: 0,
-    horizonBars: 0,
-    expectedPathReturn: 0,
-    detail: "No directional triple-barrier setup",
-  };
-}
-
-function weightedMetaLabelProbability(
-  signal: AlgoSignal,
-  maxScore: number,
-  margin: number,
-  tripleBarrier: WeightedTripleBarrierResult,
-  timeframes: WeightedTimeframeContext,
-) {
-  if (signal === "Hold") {
-    return 0.5;
-  }
-  const bestRows = state.dynamicArtifact?.mlComparison?.bestByTimeframe ?? state.mlComparison?.bestByTimeframe ?? [];
-  const row = bestRows.find((item) => item.timeframe === "5Min");
-  const artifactScore =
-    row?.verdict === "Improved" ? 0.65 : row?.verdict === "Mixed" ? 0.6 : row?.verdict === "Worse" ? 0.52 : row ? 0.56 : 0.58;
-  const tripleBarrierAdjustment = tripleBarrier.label === "positive" ? 0.04 : tripleBarrier.label === "negative" ? -0.08 : -0.03;
-  const timeframeAdjustment = weightedSignalTimeframeAlignment(signal, timeframes.fiveMinute) * 0.05;
-  return Math.max(0.35, Math.min(0.82, artifactScore + (maxScore - 0.58) * 0.25 + margin * 0.35 + tripleBarrierAdjustment + timeframeAdjustment));
-}
-
-function weightedRelativeStrengthScore(spyCandles: Candle[]) {
-  const spyReturn = candleReturnOverLookback(spyCandles, 20);
-  const qqqReturn = candleReturnOverLookback(state.weightedMarketData.candlesBySymbol.QQQ ?? [], 20);
-  const iwmReturn = candleReturnOverLookback(state.weightedMarketData.candlesBySymbol.IWM ?? [], 20);
-  const comparisonReturns = [qqqReturn, iwmReturn].filter((value): value is number => value !== null);
-  if (spyReturn !== null && comparisonReturns.length) {
-    const benchmarkReturn = comparisonReturns.reduce((sum, value) => sum + value, 0) / comparisonReturns.length;
-    return {
-      value: roundNumber(spyReturn - benchmarkReturn, 5),
-      source: comparisonReturns.length === 2 ? "SPY vs QQQ/IWM" : "SPY vs available QQQ/IWM",
-    };
-  }
-  const fallback = marketBreadthProxy();
-  return {
-    value: roundNumber(fallback * 0.003, 5),
-    source: "fallback ensemble proxy",
-  };
-}
-
-function weightedBreadthScore(spyCandles: Candle[]) {
-  const spyReturn = candleReturnOverLookback(spyCandles, 20);
-  const sectorReturns = weightedSectorEtfSymbols
-    .map((symbol) => candleReturnOverLookback(state.weightedMarketData.candlesBySymbol[symbol] ?? [], 20))
-    .filter((value): value is number => value !== null);
-  const spyBasketReturns = weightedSpyBasketSampleSymbols
-    .map((symbol) => candleReturnOverLookback(state.weightedMarketData.candlesBySymbol[symbol] ?? [], 20))
-    .filter((value): value is number => value !== null);
-  const qqqReturn = candleReturnOverLookback(state.weightedMarketData.candlesBySymbol.QQQ ?? [], 20);
-  const iwmReturn = candleReturnOverLookback(state.weightedMarketData.candlesBySymbol.IWM ?? [], 20);
-  const confirmationReturns = [qqqReturn, iwmReturn].filter((value): value is number => value !== null);
-  const components: { label: string; weight: number; value: number }[] = [];
-
-  if (spyReturn !== null && sectorReturns.length >= 3) {
-    components.push({ label: "sector ETF agreement", weight: 0.4, value: agreementScore(spyReturn, sectorReturns) });
-  }
-  if (spyReturn !== null && confirmationReturns.length) {
-    components.push({ label: "QQQ/IWM confirmation", weight: 0.3, value: agreementScore(spyReturn, confirmationReturns) });
-  }
-  if (spyReturn !== null && spyBasketReturns.length >= 3) {
-    components.push({ label: "SPY basket sample", weight: 0.3, value: agreementScore(spyReturn, spyBasketReturns) });
-  }
-
-  if (components.length) {
-    const totalWeight = components.reduce((sum, component) => sum + component.weight, 0);
-    const value = components.reduce((sum, component) => sum + component.value * component.weight, 0) / totalWeight;
-    return {
-      value: roundNumber(value, 4),
-      source: components.map((component) => component.label).join(" + "),
-    };
-  }
-
-  return {
-    value: marketBreadthProxy(),
-    source: "fallback ensemble directional proxy",
-  };
 }
 
 function candleReturnOverLookback(candles: Candle[], lookback: number) {
@@ -15377,42 +15159,6 @@ function agreementScore(referenceReturn: number, comparisonReturns: number[]) {
   return comparisonReturns.reduce((sum, value) => sum + (Math.sign(value) === direction ? 1 : -1), 0) / comparisonReturns.length;
 }
 
-function marketBreadthProxy() {
-  const votes = strategyEnsembleSignals(state.marketContext);
-  const eligible = votes.filter(isEligibleStrategyVote);
-  if (!eligible.length) {
-    return 0;
-  }
-  return (eligible.filter((vote) => vote.signal === "Buy").length - eligible.filter((vote) => vote.signal === "Sell").length) / eligible.length;
-}
-
-function weightedEventRiskScore() {
-  const context = state.marketContext;
-  const calendarRisk = scheduledEventRiskScore();
-  let source = calendarRisk.source;
-  if (!context) {
-    return calendarRisk;
-  }
-  const tags = new Set(context.event.strategyTags);
-  let score = tags.has("event-rules") ? 0.45 : 0.2;
-  if (tags.has("news-risk")) {
-    score += 0.18;
-  }
-  if (tags.has("liquidity-stress")) {
-    score += 0.18;
-  }
-  if (tags.has("gap-up") || tags.has("gap-down")) {
-    score += 0.1;
-  }
-  const contextRisk = Math.min(1, score + context.event.confidence * 0.1);
-  if (calendarRisk.source !== "no upcoming scheduled high-impact event") {
-    source = `${calendarRisk.source} + context tags`;
-  } else {
-    source = "market-context event tags";
-  }
-  return { value: Math.max(calendarRisk.value, contextRisk), source };
-}
-
 function scheduledEventRiskScore() {
   const now = Date.now();
   const events = [
@@ -15454,72 +15200,6 @@ function scheduledEventRiskScore() {
     return { value: 0.2, source: "no upcoming scheduled high-impact event" };
   }
   return { value: roundNumber(Math.min(1, top.value), 4), source: `scheduled calendar: ${top.title}` };
-}
-
-function weightedDailyLossStatus(latestPrice: number) {
-  const pnl = weightedTodayPnl(latestPrice);
-  const limit = weightedDailyLossLimitDollars();
-  return {
-    pnl,
-    limit,
-    limitReached: limit > 0 && pnl <= -limit,
-  };
-}
-
-function weightedDailyLossLimitDollars() {
-  const settings = state.weightedTradingSettings;
-  const weightedDefaults = weightedDefaultSizingSettings();
-  if (settings.useDefaultSizingSettings) {
-    return roundNumber(settings.startingCapital * (weightedDefaults.maxDailyLossPercent / 100), 2);
-  }
-  const orderRiskDollars =
-    settings.startingCapital *
-    (settings.orderAllocationPercent / 100) *
-    (settings.riskBudgetPercentOfOrder / 100) *
-    (settings.stopLossPercent / 100);
-  return roundNumber(Math.max(0, orderRiskDollars * settings.maxTradesPerDay), 2);
-}
-
-function weightedDefaultSizingSettings() {
-  const settings = state.weightedTradingSettings;
-  if (!settings.useDefaultSizingSettings) {
-    return {
-      minimumBuyScore: 0.58,
-      minimumSignalEdge: 0.12,
-      minimumActiveStrategies: 1,
-      minimumBuyStrategyCount: 1,
-      baseRiskPercent: Math.max(0, settings.orderAllocationPercent * (settings.riskBudgetPercentOfOrder / 100)),
-      maxPositionPercent: Math.max(0, settings.orderAllocationPercent),
-      maxDailyLossPercent: Math.max(0, settings.dailyAllocationPercent),
-      maxDailyTrades: Math.max(1, Math.round(settings.maxTradesPerDay)),
-      fixedStopDistanceDollars: fixedStopDistanceDollars(settings.fixedStopDistanceDollars),
-      atrStopMultiplier: Math.max(0.01, settings.stopLossPercent / 0.05),
-      minimumStopDistancePercent: Math.max(0.0001, settings.stopLossPercent),
-      maxSpreadPercent: latestManualSpreadPercent(settings),
-      minimumOneMinuteVolume: 0,
-      maxParticipationPercent: 1,
-      maxAllowedShares: 0,
-      pyramidingEnabled: true,
-    };
-  }
-  return {
-    minimumBuyScore: clampNumber(settings.minimumBuyScore, 0, 1),
-    minimumSignalEdge: clampNumber(settings.minimumSignalEdge, 0, 1),
-    minimumActiveStrategies: Math.max(1, Math.round(settings.minimumActiveStrategies)),
-    minimumBuyStrategyCount: Math.max(1, Math.round(settings.minimumBuyStrategyCount)),
-    baseRiskPercent: Math.max(0, settings.baseRiskPercent),
-    maxPositionPercent: Math.max(0, settings.maxPositionPercent),
-    maxDailyLossPercent: Math.max(0, settings.maxDailyLossPercent),
-    maxDailyTrades: Math.max(1, Math.round(settings.maxTradesPerDay)),
-    fixedStopDistanceDollars: fixedStopDistanceDollars(settings.fixedStopDistanceDollars),
-    atrStopMultiplier: Math.max(0.01, settings.atrStopMultiplier),
-    minimumStopDistancePercent: Math.max(0, settings.minimumStopDistancePercent),
-    maxSpreadPercent: Math.max(0, settings.maxSpreadPercent),
-    minimumOneMinuteVolume: Math.max(0, Math.round(settings.minimumOneMinuteVolume)),
-    maxParticipationPercent: Math.max(0, settings.maxParticipationPercent),
-    maxAllowedShares: Math.max(0, Math.floor(settings.maxAllowedShares)),
-    pyramidingEnabled: settings.pyramidingEnabled,
-  };
 }
 
 function confidenceDailyLossStatus(latestPrice: number) {
@@ -15671,21 +15351,6 @@ function latestManualSpreadPercent(settings: TradingSettings) {
   return latest?.close ? ((settings.slippagePerShare * 2) / latest.close) * 100 : 0.1;
 }
 
-function weightedTodayPnl(latestPrice: number) {
-  return roundNumber(weightedTodayRealizedPnl() + weightedTodayOpenPnl(latestPrice), 2);
-}
-
-function weightedTodayRealizedPnl() {
-  return todayRealizedPnlForMode("weighted");
-}
-
-function weightedTodayOpenPnl(latestPrice: number) {
-  const today = new Date().toDateString();
-  return openOrderLots("weighted")
-    .filter((lot) => lot.symbol === state.symbol && new Date(lot.recordedAt).toDateString() === today)
-    .reduce((total, lot) => total + (latestPrice - lot.entryPrice) * lot.remainingQuantity, 0);
-}
-
 function sessionLabelForMinutes(minutes: number) {
   if (minutes < 10 * 60 + 30) {
     return "Opening drive";
@@ -15710,63 +15375,6 @@ function formatBasisPoints(value: number) {
   return `${roundNumber(value * 10000, 1)} bps`;
 }
 
-function renderWeightedScoreGrid(result: WeightedVoteResult) {
-  return [
-    ["Buy", result.buyScore, "buy"],
-    ["Sell", result.sellScore, "sell"],
-    ["Hold", result.holdScore, "hold"],
-  ]
-    .map(
-      ([label, value, kind]) => `
-        <div class="weighted-score-card ${kind}">
-          <span>${escapeHtml(String(label))}</span>
-          <strong>${formatProbability(Number(value))}</strong>
-        </div>
-      `,
-    )
-    .join("");
-}
-
-function renderWeightedSummary(result: WeightedVoteResult) {
-  const weightSourceLabel =
-    result.data.weightSource === "backtest" ? "Initial weights: 1m backtest seeded." : result.data.weightSource === "daily" ? "Weights: daily smoothed from backtest seed." : "Weights: waiting for backtest seed.";
-  return `
-    <span>Raw winner: ${result.rawWinner}; final signal: ${result.signal}.</span>
-    <span>Confidence rule: max score ${formatProbability(result.maxScore)}, second-place margin ${formatProbability(result.margin)}.</span>
-    <span>Expected value: ${formatBasisPoints(result.expectedReturnAfterCosts)} after slippage/liquidity estimate.</span>
-    <span>Meta-label probability: ${formatProbability(result.metaLabelProbability)}.</span>
-    <span>${escapeHtml(weightSourceLabel)}</span>
-    <span>${escapeHtml(result.data.updatePolicy)}</span>
-  `;
-}
-
-function renderWeightedStrategies(strategies: WeightedAlphaResult[]) {
-  return `
-    <table class="weighted-strategy-table">
-      <tbody>
-        ${strategies
-          .map(
-            (strategy, strategyIndex) => `
-              <tr class="weighted-strategy-name-row" data-tone="${strategyIndex % 4}" data-disabled="${String(Boolean(strategy.disabledReason))}">
-                <td colspan="5">${escapeHtml(strategy.name)}</td>
-                <td>${formatProbability(strategy.finalWeight)}</td>
-              </tr>
-              <tr class="weighted-strategy-detail-row" data-tone="${strategyIndex % 4}" data-disabled="${String(Boolean(strategy.disabledReason))}">
-                ${renderWeightedMetricCell("Buy", formatProbability(strategy.pBuy))}
-                ${renderWeightedMetricCell("Sell", formatProbability(strategy.pSell))}
-                ${renderWeightedMetricCell("Hold", formatProbability(strategy.pHold))}
-                ${renderWeightedMetricCell("EV", `${formatBasisPoints(strategy.expectedReturnAfterCosts)} / ${strategy.recentExpectancy === null ? "new" : formatBasisPoints(strategy.recentExpectancy)}`)}
-                ${renderWeightedMetricCell("Quality", `${formatProbability(strategy.signalQuality)} / DD ${formatBasisPoints(strategy.recentDrawdown)}`)}
-                ${renderWeightedMetricCell("Strength", `${formatProbability(strategy.strength)} / ${strategy.tradeCount}/${weightedMinimumTradesForFullWeight}`)}
-              </tr>
-            `,
-          )
-          .join("")}
-      </tbody>
-    </table>
-  `;
-}
-
 function renderWeightedMetricCell(label: string, value: string) {
   return `
     <td>
@@ -15776,33 +15384,7 @@ function renderWeightedMetricCell(label: string, value: string) {
   `;
 }
 
-function renderWeightedDataGrid(result: WeightedVoteResult) {
-  const latest = result.data.latest;
-  const bands = result.data.bollinger;
-  return [
-    ["OHLCV", latest ? `O ${price(latest.open)} H ${price(latest.high)} L ${price(latest.low)} C ${price(latest.close)} V ${latest.volume.toLocaleString()}` : "NA"],
-    ["VWAP", result.data.vwap === null ? "NA" : price(result.data.vwap)],
-    ["ATR", result.data.atr === null ? "NA" : price(result.data.atr)],
-    ["Bollinger", bands ? `${price(bands.lower)} / ${price(bands.middle)} / ${price(bands.upper)}` : "NA"],
-    ["Relative Strength", `${formatBasisPoints(result.data.relativeStrength)} ${result.data.relativeStrengthSource}`],
-    ["Breadth", `${formatProbability((result.data.breadth + 1) / 2)} ${result.data.breadthSource}`],
-    ["Regime", `${result.data.trendDirection.toUpperCase()} / ${escapeHtml(result.data.volatilityLevel)} / ${escapeHtml(result.data.rangeCondition)}`],
-    ["5m Confirm", result.data.timeframes.fiveMinute.source],
-    ["Trend Source", result.data.trendSource],
-    ["Session", result.data.sessionLabel],
-  ]
-    .map(
-      ([label, value]) => `
-        <span>
-          <b>${escapeHtml(label)}</b>
-          ${escapeHtml(value)}
-        </span>
-      `,
-    )
-    .join("");
-}
-
-function renderWeightedGate(gate: WeightedVoteResult["gates"][number]) {
+function renderWeightedGate(gate: { label: string; status: "pass" | "fail" | "info"; detail: string }) {
   return `
     <span data-status="${gate.status}">
       <b>${escapeHtml(gate.label)}</b>
@@ -15811,82 +15393,58 @@ function renderWeightedGate(gate: WeightedVoteResult["gates"][number]) {
   `;
 }
 
-function renderWeightedControlRules() {
-  return `
-    <span>Daily update: active weights stay locked during market hours; save one smoothed update after the close.</span>
-    <span>Smoothing: new weight = 70% old weight + 30% recalculated weight.</span>
-    <span>Caps: maximum one-strategy weight 25%; minimum active weight 2%; disabled strategies receive 0%.</span>
-    <span>Eligibility: all strategies start live-eligible; require 40 live triple-barrier outcomes before disabling negative rolling expectancy.</span>
-    <span>Short-cycle flow: 1m generates signals and 5m confirms them.</span>
-    <span>Risk trims: reduce weight for observed drawdown, poor regime match, 5m conflict, and high correlation with a stronger strategy.</span>
-    <span>Final gates: confidence, 5m confirmation, expected value, meta-label, triple barrier, daily loss, and slippage must pass.</span>
-  `;
-}
-
 function strategyEnsembleSignals(context: MarketContext | null): AlgoVote[] {
-  const strategies = context?.strategies ?? [];
-  return strategyVoteCatalog.map((name) => {
-    const strategy = strategies.find((item) => item.name === name);
-    return strategyVote(name, strategy, context);
-  });
+  const backendVotes = state.votingEnsembleBackend?.votes;
+  if (backendVotes?.length) {
+    return backendVotes.map((vote) => ({
+      strategy: vote.strategy,
+      signal: vote.signal,
+      detail: vote.reason,
+      status: strategyStatusFromSignal(vote),
+      score: Math.round(clampNumber(vote.confidence, 0, 1) * 100),
+    }));
+  }
+  const status = state.votingEnsembleBackendStatus === "error" ? "Avoid" : "Watch";
+  const detail =
+    state.votingEnsembleBackendStatus === "error"
+      ? state.votingEnsembleBackendWarning || "Backend Voting Ensemble unavailable"
+      : "Waiting for backend Voting Ensemble evaluation";
+  return directionalVoteCatalog.map((name) => ({
+    strategy: name,
+    signal: "Hold",
+    detail,
+    status,
+    score: 0,
+  }));
 }
 
-const strategyVoteCatalog = [
+function strategyStatusFromSignal(vote: VotingEnsembleBackendVote): StrategyFit["status"] {
+  if (!vote.dataReady || !vote.active || !vote.eligible) {
+    return vote.dataReady ? "Watch" : "Avoid";
+  }
+  if (vote.confidence >= 0.78) {
+    return "Strong Fit";
+  }
+  if (vote.confidence >= 0.62) {
+    return "Allowed";
+  }
+  return "Watch";
+}
+
+const directionalVoteCatalog = [
   "Multi-Timeframe Trend Alignment",
   "First Pullback After Open",
   "Failed Breakout Strategy",
   "Liquidity Sweep Reversal",
   "Bollinger Band Reversion",
   "ATR Overextension Reversion",
-  "Relative Strength vs QQQ/IWM",
-  "Market Breadth Momentum",
   "Economic Event Reaction Strategy",
-  "Ensemble Strategy Voting",
 ] as const;
 
-function strategyVote(name: (typeof strategyVoteCatalog)[number], strategy: StrategyFit | undefined, context: MarketContext | null): AlgoVote {
-  const inactive = !strategy || strategy.status === "Avoid" || strategy.score < 45;
-  const watch = !strategy || strategy.status === "Watch" || strategy.score < 62;
-  const status = strategy?.status ?? "Avoid";
-  const score = strategy?.score ?? 0;
-  const hold = (detail: string): AlgoVote => ({ strategy: name, signal: "Hold", detail, status, score });
-  const vote = (signal: AlgoSignal, detail: string): AlgoVote => ({ strategy: name, signal, detail, status, score });
-
-  if (!context) {
-    return hold("Waiting for market context");
-  }
-  if (inactive) {
-    return hold(`${status} ${score}% is below action threshold`);
-  }
-  if (watch) {
-    return hold(`${status} ${score}% needs confirmation`);
-  }
-
-  switch (name) {
-    case "Multi-Timeframe Trend Alignment":
-      return vote(directionalSignal(context.session.directionBias, context.event.directionBias), `${status} ${score}% aligns intraday session and event trend`);
-    case "First Pullback After Open":
-      return vote(directionalSignal(context.session.directionBias, context.event.directionBias), `${status} ${score}% waits for first intraday trend pullback`);
-    case "Failed Breakout Strategy":
-      return vote(oppositeSignal(context.event.directionBias), `${status} ${score}% fades failed range expansion`);
-    case "Liquidity Sweep Reversal":
-      return vote(oppositeSignal(context.session.directionBias), `${status} ${score}% fades liquidity sweep`);
-    case "Bollinger Band Reversion":
-      return vote(oppositeSignal(context.session.directionBias), `${status} ${score}% fades band extension`);
-    case "ATR Overextension Reversion":
-      return vote(oppositeSignal(context.session.directionBias), `${status} ${score}% fades ATR overextension`);
-    case "Relative Strength vs QQQ/IWM":
-      return vote(directionalSignal(context.session.directionBias, context.event.directionBias), `${status} ${score}% follows intraday relative-strength proxy`);
-    case "Market Breadth Momentum":
-      return vote(directionalSignal(context.session.directionBias, context.event.directionBias), `${status} ${score}% follows intraday breadth-momentum proxy`);
-    case "Economic Event Reaction Strategy":
-      return vote(directionalSignal(context.event.directionBias, context.session.directionBias), `${status} ${score}% follows event reaction`);
-    case "Ensemble Strategy Voting": {
-      const directional = directionalSignal(context.session.directionBias, context.event.directionBias);
-      return vote(directional, `${status} ${score}% confirms ensemble alignment`);
-    }
-  }
-}
+const contextSignalCatalog = [
+  "Relative Strength vs QQQ/IWM",
+  "Market Breadth Momentum",
+] as const;
 
 function renderAlgoVoteRow(vote: AlgoVote) {
   const statusText = vote.status && typeof vote.score === "number" ? ` - ${vote.status} ${vote.score}%` : "";
@@ -15949,7 +15507,7 @@ function renderTradingRagResults() {
     <div class="trading-rag-card">
       <div class="trading-rag-head">
         <strong>${escapeHtml(answer.bias)} bias - ${escapeHtml(answer.confidence)} confidence</strong>
-        <span>${escapeHtml(state.tradingRag.source)} · ${state.tradingRag.corpus.documentCount} docs</span>
+        <span>${escapeHtml(state.tradingRag.source)} - ${state.tradingRag.corpus.documentCount} docs</span>
       </div>
       <p>${escapeHtml(answer.conclusion)}</p>
       <span>Best historical match: ${escapeHtml(answer.bestHistoricalMatch)}</span>
@@ -15995,10 +15553,10 @@ function localVotingEnsembleFallbackAnswer(): TradingRagResponse["answer"] {
 function renderTradingRagComparison(bestMatch: TradingRagResponse["retrieved"][number] | undefined, answer: TradingRagResponse["answer"]) {
   const votes = strategyEnsembleSignals(state.marketContext);
   const eligibleVotes = votes.filter(isEligibleStrategyVote);
-  const buyVotes = eligibleVotes.filter((vote) => vote.signal === "Buy").length;
-  const sellVotes = eligibleVotes.filter((vote) => vote.signal === "Sell").length;
-  const holdVotes = eligibleVotes.filter((vote) => vote.signal === "Hold").length;
-  const currentWinner = winningVoteSignal(buyVotes, sellVotes, holdVotes);
+  const buyVotes = state.votingEnsembleBackend?.eligible_counts.Buy ?? eligibleVotes.filter((vote) => vote.signal === "Buy").length;
+  const sellVotes = state.votingEnsembleBackend?.eligible_counts.Sell ?? eligibleVotes.filter((vote) => vote.signal === "Sell").length;
+  const holdVotes = state.votingEnsembleBackend?.eligible_counts.Hold ?? eligibleVotes.filter((vote) => vote.signal === "Hold").length;
+  const currentWinner = state.votingEnsembleBackend?.final_signal ?? "Hold";
   const historicalBias = bestMatch ? historicalBiasFromRagSource(bestMatch, answer.bias) : "Mixed";
   const alignment =
     historicalBias === "Mixed" || historicalBias === "Hold"
@@ -16019,7 +15577,7 @@ function renderTradingRagComparison(bestMatch: TradingRagResponse["retrieved"][n
       <div class="trading-rag-compare-grid">
         <span data-signal="${escapeHtml(currentWinner.toLowerCase())}">Current vote winner<b>${escapeHtml(currentWinner)}</b><small>${buyVotes}B / ${sellVotes}S / ${holdVotes}H</small></span>
         <span>Best historical timeframe<b>${escapeHtml(bestMatch?.timeframe || "NA")}</b><small>${escapeHtml(bestMatch?.title || answer.bestHistoricalMatch || "No match")}</small></span>
-        <span data-signal="${escapeHtml(historicalBias.toLowerCase())}">Historical bias<b>${escapeHtml(historicalBias)}</b><small>${metricParts.length ? escapeHtml(metricParts.join(" · ")) : "Metrics unavailable"}</small></span>
+        <span data-signal="${escapeHtml(historicalBias.toLowerCase())}">Historical bias<b>${escapeHtml(historicalBias)}</b><small>${metricParts.length ? escapeHtml(metricParts.join(" - ")) : "Metrics unavailable"}</small></span>
         <span>Comparison<b>${alignment}</b><small>${tradingRagAlignmentText(alignment, currentWinner, historicalBias)}</small></span>
       </div>
     </div>
@@ -16094,18 +15652,13 @@ function renderTradingSettingsPanel(order?: ManualOrderRecommendation) {
   `;
 }
 
-function updateWeightedTradingSettingsMount(result?: WeightedVoteResult) {
-  const order = result ? weightedTargetOrderRecommendation(result) : null;
-  state.currentWeightedTargetOrder = order;
+function updateWeightedTradingSettingsMount() {
+  state.currentWeightedTargetOrder = weightedBackendOrderRecommendation();
   const key = JSON.stringify({
     expanded: state.weightedTradingSettingsExpanded,
-    defaultSizingExpanded: state.weightedDefaultSizingExpanded,
-    settings: state.weightedTradingSettings,
-    overrides: state.weightedTargetOrderOverrides,
-    signal: result?.signal ?? "",
-    maxScore: result?.maxScore ?? 0,
-    margin: result?.margin ?? 0,
-    order,
+    config: weightedVotingBackendState.config,
+    evaluation: weightedVotingBackendState.evaluation,
+    order: state.currentWeightedTargetOrder,
   });
   if (key === weightedTradingSettingsMountKey) {
     return;
@@ -16114,12 +15667,13 @@ function updateWeightedTradingSettingsMount(result?: WeightedVoteResult) {
     return;
   }
   weightedTradingSettingsMountKey = key;
-  weightedTradingSettingsMount.innerHTML = renderWeightedTradingSettingsPanel(result, order);
+  weightedTradingSettingsMount.innerHTML = renderWeightedTradingSettingsPanel();
 }
 
-function renderWeightedTradingSettingsPanel(result?: WeightedVoteResult, order?: ManualOrderRecommendation | null) {
-  const settings = state.weightedTradingSettings;
+function renderWeightedTradingSettingsPanel() {
   const expanded = state.weightedTradingSettingsExpanded;
+  const config = childRecord(weightedVotingBackendState.config, "configuration");
+  const order = state.currentWeightedTargetOrder;
   return `
     <div class="trading-settings-panel weighted-trading-settings-panel" data-status="ready" data-expanded="${String(expanded)}">
       <button id="weightedTradingSettingsToggle" class="trading-settings-head" type="button" aria-expanded="${String(expanded)}" aria-controls="weightedTradingSettingsBody">
@@ -16127,571 +15681,114 @@ function renderWeightedTradingSettingsPanel(result?: WeightedVoteResult, order?:
           <b>${expanded ? "-" : "+"}</b>
           <strong>Trading Settings</strong>
         </span>
-        <span class="trading-settings-summary">${escapeHtml(weightedTradingSettingsSummary(settings, result))}</span>
+        <span class="trading-settings-summary">${escapeHtml(weightedBackendSettingsSummary(config))}</span>
       </button>
       <div id="weightedTradingSettingsBody" class="trading-settings-body" ${expanded ? "" : "hidden"}>
-        <div class="trading-settings-grid">
-          ${renderWeightedTradingSettingInput("startingCapital", "Total balance", settings.startingCapital, 1000, 10000000, 100)}
-          ${renderWeightedTradingSettingInput("orderAllocationPercent", "Order limit %", settings.orderAllocationPercent, 0.1, MAX_ORDER_ALLOCATION_PERCENT, 0.1)}
-          ${renderWeightedTradingSettingInput("dailyAllocationPercent", "Daily max %", settings.dailyAllocationPercent, 0.1, 100, 0.1)}
-          ${renderWeightedTradingSettingInput("riskBudgetPercentOfOrder", "Risk budget %", settings.riskBudgetPercentOfOrder, 0.1, 100, 0.1)}
-          ${renderWeightedTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 1, 50, 1)}
-          ${renderWeightedTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
-          ${renderWeightedTradingSettingInput("stopLossPercent", "Stop %", settings.stopLossPercent, 0.01, 20, 0.01)}
-          ${renderWeightedTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
-          ${renderWeightedTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
-        </div>
-        ${order ? renderWeightedTargetOrderSettings(order) : ""}
-        ${renderWeightedDefaultSizingSection(settings)}
+        ${renderWeightedBackendConfigEditor(config)}
+        ${order ? renderWeightedBackendOrderProposal(order) : ""}
       </div>
     </div>
   `;
 }
 
-function weightedTargetOrderRecommendation(result: WeightedVoteResult): ManualOrderRecommendation {
-  const settings = state.weightedTradingSettings;
-  const latest = result.data.latest ?? latestExecutionCandleForMode("weighted");
-  const submitMode = (state.weightedTargetOrderOverrides.submitMode as SubmitOrderMode | undefined) ?? DEFAULT_SUBMIT_MODE;
-  const automaticShortCycleBuy = submitMode === "Automatic";
-  const requestedSide: AlgoSignal = automaticShortCycleBuy ? weightedAutomaticTargetSide(result, latest) : result.signal;
-  const sizing =
-    latest && (requestedSide === "Buy" || requestedSide === "Sell")
-      ? weightedTargetSizing(result, latest, requestedSide, automaticShortCycleBuy)
-      : null;
-  const targetFailedGates = weightedTargetOrderFailedGates(result, automaticShortCycleBuy, requestedSide);
-  const side = targetFailedGates.length ? "Hold" : sizing?.side ?? "Hold";
-  const accountBalance = sizing?.accountEquity ?? settings.startingCapital;
-  const orderLimitDollars = accountBalance * (settings.orderAllocationPercent / 100);
-  const dailyLimitDollars = sizing?.availableBuyingPower ?? accountBalance * (settings.dailyAllocationPercent / 100);
-  const riskDollars = sizing?.riskDollars ?? orderLimitDollars * (settings.riskBudgetPercentOfOrder / 100);
-  const failedGates = targetFailedGates.map((gate) => `${gate.label}: ${gate.detail}`);
-  if (sizing?.blockedReason) {
-    failedGates.push(`Weighted sizing: ${sizing.blockedReason}`);
-  }
-  const levels = {
-    last: latest?.close ?? null,
-    vwap: result.data.vwap,
-    openingHigh: null,
-    openingLow: null,
-    lastTime: latest?.timestamp ?? null,
-  };
-  if (side === "Hold" || !latest || !sizing) {
-    const blockedCandidate =
-      latest && (requestedSide === "Buy" || requestedSide === "Sell")
-        ? weightedBlockedCandidateOrderLevels(result, latest, requestedSide)
-        : null;
-    return applyWeightedTargetOrderOverrides({
-      eligible: false,
-      side,
-      orderType: "No order",
-      symbol: state.symbol,
-      quantity: 0,
-      triggerPrice: blockedCandidate?.triggerPrice ?? null,
-      limitPrice: blockedCandidate?.limitPrice ?? null,
-      stopPrice: blockedCandidate?.stopPrice ?? null,
-      targetPrice: blockedCandidate?.targetPrice ?? null,
-      accountBalance,
-      orderLimitDollars,
-      dailyLimitDollars,
-      riskDollars,
-      orderNotional: 0,
-      plannedStopRiskDollars: 0,
-      estimatedSlippage: 0,
-      timeInForce: "Day",
-      cutoff: "No new trades after 15:30 ET",
-      submitMode,
-      failedGates: uniqueStrings(failedGates),
-      gates: weightedTargetOrderGates(result),
-      levels,
-      summary: `No order: ${latest ? "final signal is Hold or risk gates failed" : "latest price unavailable"}.`,
-    });
-  }
+function weightedBackendSettingsSummary(config: Record<string, unknown> | null) {
+  const version = stringFromUnknown(config?.settings_version ?? config?.settingsVersion, "backend default");
+  const hash = stringFromUnknown(config?.configuration_hash ?? config?.configurationHash, "hash pending");
+  return `${version} / ${hash}`;
+}
 
-  const directionalSizing = sizing;
-  const triggerPrice = directionalSizing.entryPrice;
-  const limitPrice =
-    side === "Buy"
-      ? roundNumber(directionalSizing.ask + settings.slippagePerShare, 2)
-      : roundNumber(Math.max(0, directionalSizing.bid - settings.slippagePerShare), 2);
-  const stopPrice =
-    side === "Buy"
-      ? roundNumber(directionalSizing.entryPrice - directionalSizing.stopDistance, 2)
-      : roundNumber(directionalSizing.entryPrice + directionalSizing.stopDistance, 2);
-  const quantity = directionalSizing.quantity;
-  const targetDistance = targetProfitDistancePerShare(quantity, directionalSizing.stopDistance, settings.takeProfitR);
-  const targetPrice =
-    side === "Buy"
-      ? roundNumber(directionalSizing.entryPrice + targetDistance, 2)
-      : roundNumber(Math.max(0, directionalSizing.entryPrice - targetDistance), 2);
-  const orderNotional = roundNumber(quantity * triggerPrice, 2);
-  const plannedStopRiskDollars = roundNumber(quantity * directionalSizing.stopDistance, 2);
-  const estimatedSlippage = roundNumber(quantity * (directionalSizing.ask - directionalSizing.bid), 2);
-  const nextFailedGates = [...failedGates];
-  if (quantity < 1) {
-    nextFailedGates.push("weighted sizing quantity below 1 share");
+function renderWeightedBackendConfigEditor(config: Record<string, unknown> | null) {
+  const field = (key: string, label: string, min: number, max: number, step: number) => `
+    <label>
+      <span>${escapeHtml(label)}</span>
+      <input data-weighted-config-setting="${escapeHtml(key)}" type="number" min="${min}" max="${max}" step="${step}" value="${escapeHtml(String(numberFromUnknown(config?.[key], 0)))}" />
+    </label>
+  `;
+  return `
+    <div class="trading-settings-grid">
+      ${field("base_risk_per_trade_percent", "Base risk %", 0, 100, 0.01)}
+      ${field("order_allocation_percent", "Order allocation %", 0, 100, 0.1)}
+      ${field("daily_allocation_percent", "Daily allocation %", 0, 100, 0.1)}
+      ${field("maximum_position_percent", "Max position %", 0, 100, 0.1)}
+      ${field("maximum_shares", "Max shares", 0, 1000000, 1)}
+      ${field("maximum_trades", "Max trades", 0, 100, 1)}
+      ${field("maximum_daily_loss_percent", "Max daily loss %", 0, 100, 0.1)}
+      ${field("maximum_participation_rate", "Max participation", 0, 1, 0.001)}
+      ${field("minimum_score", "Minimum score", 0, 1, 0.01)}
+      ${field("minimum_edge", "Minimum edge", 0, 1, 0.01)}
+      ${field("minimum_active_strategies", "Min active", 1, 8, 1)}
+      ${field("minimum_directional_strategies", "Min directional", 1, 8, 1)}
+      ${field("maximum_spread_percent", "Max spread", 0, 1, 0.0001)}
+      ${field("minimum_liquidity_volume", "Min liquidity", 0, 10000000, 1)}
+      ${field("atr_stop_multiplier", "ATR stop", 0, 20, 0.1)}
+      ${field("minimum_stop_distance_percent", "Min stop distance", 0, 1, 0.0001)}
+      ${field("target_r", "Target R", 0, 20, 0.1)}
+      ${field("entry_buffer_percent", "Entry buffer", 0, 1, 0.0001)}
+      ${field("break_even_trigger_r", "Break-even R", 0, 20, 0.1)}
+      ${field("trailing_stop_atr_multiplier", "Trail ATR", 0, 20, 0.1)}
+      ${field("time_stop_minutes", "Time stop", 0, 390, 1)}
+      ${field("session_cutoff_minutes", "Session cutoff", 0, 1440, 1)}
+    </div>
+  `;
+}
+
+function weightedBackendOrderRecommendation(): ManualOrderRecommendation | null {
+  const proposal = childRecord(weightedVotingBackendState.evaluation, "globalOrderProposal");
+  const application = childRecord(weightedVotingBackendState.evaluation, "globalGateApplication");
+  const quantity = Math.floor(numberFromUnknown(application?.allowed_quantity ?? application?.allowedQuantity ?? proposal?.quantity ?? proposal?.proposed_quantity ?? proposal?.proposedQuantity, 0));
+  const side = algoSignalFromUnknown(proposal?.side ?? proposal?.proposed_side ?? proposal?.proposedSide);
+  if (!proposal) {
+    return null;
   }
-  if (plannedStopRiskDollars > riskDollars) {
-    nextFailedGates.push(`planned stop risk exceeds ${directionalSizing.baseRiskPercent}% account risk budget`);
-  }
-  const eligible = nextFailedGates.length === 0;
-  const orderType = eligible ? `${side} stop-limit` : "No order";
-  const orderLine = `${side} stop-limit ${state.symbol}, ${quantity} shares, stop ${price(triggerPrice)}, limit ${price(limitPrice)}, protective stop ${price(stopPrice)}, target ${price(targetPrice)}.`;
-  return applyWeightedTargetOrderOverrides({
-    eligible,
+  return {
+    eligible: quantity > 0 && side !== "Hold",
     side,
-    orderType,
-    symbol: state.symbol,
+    orderType: side === "Hold" ? "No order" : `${side} backend proposal`,
+    symbol: stringFromUnknown(proposal.symbol, state.symbol),
     quantity,
-    triggerPrice,
-    limitPrice,
-    stopPrice,
-    targetPrice,
-    accountBalance,
-    orderLimitDollars,
-    dailyLimitDollars,
-    riskDollars,
-    orderNotional,
-    plannedStopRiskDollars,
-    estimatedSlippage,
+    triggerPrice: nullableBackendNumber(proposal.trigger_price ?? proposal.triggerPrice),
+    limitPrice: nullableBackendNumber(proposal.limit_price ?? proposal.limitPrice),
+    stopPrice: nullableBackendNumber(proposal.stop_price ?? proposal.stopPrice),
+    targetPrice: nullableBackendNumber(proposal.target_price ?? proposal.targetPrice),
+    accountBalance: state.weightedTradingSettings.startingCapital,
+    orderLimitDollars: numberFromUnknown(proposal.notional_dollars ?? proposal.notionalDollars, 0),
+    dailyLimitDollars: numberFromUnknown(proposal.maximum_daily_risk ?? proposal.maximumDailyRisk, 0),
+    riskDollars: numberFromUnknown(proposal.planned_risk ?? proposal.plannedRisk, 0),
+    orderNotional: numberFromUnknown(proposal.notional_dollars ?? proposal.notionalDollars, 0),
+    plannedStopRiskDollars: numberFromUnknown(proposal.planned_risk ?? proposal.plannedRisk, 0),
+    estimatedSlippage: numberFromUnknown(proposal.estimated_slippage ?? proposal.estimatedSlippage, 0),
     timeInForce: "Day",
-    cutoff: "No new trades after 15:30 ET",
-    submitMode,
-    failedGates: uniqueStrings(nextFailedGates),
-    gates: weightedTargetOrderGates(result),
-    levels,
-    summary: eligible
-      ? `Order template: ${orderLine} Uses ${currency(orderNotional)} of the ${currency(orderLimitDollars)} per-order limit.`
-      : `No order: Wait. Failed gates: ${uniqueStrings(nextFailedGates).join(", ")}.`,
-  });
-}
-
-function weightedBlockedCandidateOrderLevels(
-  result: WeightedVoteResult,
-  latest: Candle,
-  side: Exclude<AlgoSignal, "Hold">,
-) {
-  const settings = state.weightedTradingSettings;
-  const defaults = weightedDefaultSizingSettings();
-  const bid = roundNumber(Math.max(0, latest.close - settings.slippagePerShare), 2);
-  const ask = roundNumber(latest.close + settings.slippagePerShare, 2);
-  const triggerPrice = side === "Buy" ? ask : bid;
-  const limitPrice =
-    side === "Buy"
-      ? roundNumber(triggerPrice + settings.slippagePerShare, 2)
-      : roundNumber(Math.max(0, triggerPrice - settings.slippagePerShare), 2);
-  const stopDistance = defaultSizingStopDistance(defaults, latest.close, result.data.atr ?? 0);
-  const stopPrice =
-    side === "Buy"
-      ? roundNumber(Math.max(0, triggerPrice - stopDistance), 2)
-      : roundNumber(triggerPrice + stopDistance, 2);
-  const targetDistance = Math.max(stopDistance * settings.takeProfitR, MIN_TARGET_PROFIT_PER_SHARE);
-  const targetPrice =
-    side === "Buy"
-      ? roundNumber(triggerPrice + targetDistance, 2)
-      : roundNumber(Math.max(0, triggerPrice - targetDistance), 2);
-  return { triggerPrice, limitPrice, stopPrice, targetPrice };
-}
-
-function weightedTargetOrderFailedGates(result: WeightedVoteResult, automaticShortCycleBuy: boolean, requestedSide: AlgoSignal) {
-  const failed = result.gates.filter((gate) => gate.status === "fail");
-  if (!automaticShortCycleBuy) {
-    return failed;
-  }
-  const shortCycleContextGates = new Set([
-    "Confidence",
-    "Active Strategies",
-    "Directional Strategy Count",
-    "Buy Strategy Count",
-    "5m Confirmation",
-    "Expected Value",
-    "Meta Label",
-    "Triple Barrier",
-    "Event Risk",
-  ]);
-  const hardFailures = failed.filter((gate) => !shortCycleContextGates.has(gate.label));
-  if (requestedSide === "Hold") {
-    hardFailures.push({
-      label: "Weighted Decision",
-      status: "fail",
-      detail: "No automatic short-cycle Buy/Sell side is available",
-    });
-  }
-  const latest = result.data.latest;
-  const vwap = result.data.vwap;
-  if (latest && requestedSide === "Buy") {
-    const lateSessionBlocker = lateSessionAboveAverageBuyBlocker("weighted", latest.close, latest.timestamp);
-    if (lateSessionBlocker) {
-      hardFailures.push({
-        label: "Weighted Late-session Buy Guard",
-        status: "fail",
-        detail: lateSessionBlocker,
-      });
-    }
-    forecastBuySafetyBlockers("weighted", latest.close, latest.timestamp).forEach((detail) => {
-      hardFailures.push({
-        label: "Weighted Forecast Safety",
-        status: "fail",
-        detail,
-      });
-    });
-  }
-  if (!latest || vwap === null) {
-    hardFailures.push({
-      label: "Short-cycle VWAP",
-      status: "fail",
-      detail: "Waiting for live price and VWAP",
-    });
-  } else if (requestedSide === "Buy" && latest.close <= vwap) {
-    hardFailures.push({
-      label: "Short-cycle VWAP",
-      status: "fail",
-      detail: `Close ${price(latest.close)} is not above VWAP ${price(vwap)}`,
-    });
-  } else if (requestedSide === "Sell" && latest.close >= vwap) {
-    hardFailures.push({
-      label: "Short-cycle VWAP",
-      status: "fail",
-      detail: `Close ${price(latest.close)} is not below VWAP ${price(vwap)}`,
-    });
-  }
-  return hardFailures;
-}
-
-function weightedAutomaticTargetSide(result: WeightedVoteResult, latest: Candle | null): AlgoSignal {
-  const vwap = result.data.vwap;
-  if (latest && vwap !== null) {
-    if (latest.close > vwap) {
-      return "Buy";
-    }
-    if (latest.close < vwap) {
-      return "Sell";
-    }
-  }
-  return result.rawWinner === "Buy" || result.rawWinner === "Sell" ? result.rawWinner : "Hold";
-}
-
-function weightedTargetSizing(
-  result: WeightedVoteResult,
-  latest: Candle,
-  side: Exclude<AlgoSignal, "Hold">,
-  automaticShortCycleBuy = false,
-) {
-  const settings = state.weightedTradingSettings;
-  const defaults = weightedDefaultSizingSettings();
-  const totalScore = result.buyScore + result.holdScore + result.sellScore;
-  const accountEquity = settings.startingCapital;
-  const priceValue = latest.close;
-  const bid = roundNumber(Math.max(0, priceValue - settings.slippagePerShare), 2);
-  const ask = roundNumber(priceValue + settings.slippagePerShare, 2);
-  const currentPosition = summarizePositionFromTradeHistory(priceValue, priceValue, "weighted");
-  const currentPositionShares = currentPosition.shares;
-  const maxPositionDollars = accountEquity * (defaults.maxPositionPercent / 100);
-  const maxOrderDollars = accountEquity * (settings.orderAllocationPercent / 100);
-  const dailyBuyingPowerDollars = accountEquity * (settings.dailyAllocationPercent / 100);
-  const availableBuyingPower = Math.max(0, Math.min(maxPositionDollars, dailyBuyingPowerDollars) - currentPosition.marketValue);
-  const atrOneMinute = result.data.atr ?? 0;
-  const currentOneMinuteVolume = latest.volume;
-  const averageOneMinuteVolume = result.data.averageVolume;
-  const dailyRealizedPnl = weightedTodayRealizedPnl();
-  const tradesToday = effectiveTodaysTradeCount("weighted", defaults.maxDailyTrades, priceValue);
-  const activeStrategyCount = result.strategies.filter((strategy) => strategy.finalWeight > 0 && !strategy.disabledReason).length;
-  const directionalStrategyCount = result.strategies.filter((strategy) => strategy.finalWeight > 0 && weightedSignalSide(strategy) === side).length;
-
-  const hold = (blockedReason: string) => ({
-    side: "Hold" as AlgoSignal,
-    quantity: 0,
-    blockedReason,
-    accountEquity,
-    availableBuyingPower,
-    currentPositionShares,
-    price: priceValue,
-    bid,
-    ask,
-    atrOneMinute,
-    averageOneMinuteVolume: currentOneMinuteVolume,
-    dailyRealizedPnl,
-    tradesToday,
-    maxPositionDollars,
-    riskDollars: 0,
-    baseRiskPercent: defaults.baseRiskPercent,
-    stopDistance: 0,
-    entryPrice: ask,
-  });
-
-  if (totalScore <= 0) {
-    return hold("score total is zero");
-  }
-
-  const buyScore = result.buyScore / totalScore;
-  const holdScore = result.holdScore / totalScore;
-  const sellScore = result.sellScore / totalScore;
-  const sideScore = side === "Buy" ? buyScore : sellScore;
-  const oppositeScore = side === "Buy" ? sellScore : buyScore;
-  const sideIsWinner = sideScore > holdScore && sideScore > oppositeScore;
-  const secondBestScore = Math.max(holdScore, oppositeScore);
-  const signalEdge = sideScore - secondBestScore;
-  const vwap = result.data.vwap;
-  const shortCycleConfirmed =
-    automaticShortCycleBuy &&
-    vwap !== null &&
-    (side === "Buy" ? latest.close > vwap : latest.close < vwap);
-
-  if (automaticShortCycleBuy) {
-    if (!shortCycleConfirmed) {
-      return hold(
-        vwap === null
-          ? "Waiting for live VWAP"
-          : side === "Buy"
-            ? `short-cycle close ${price(latest.close)} is not above VWAP ${price(vwap)}`
-            : `short-cycle close ${price(latest.close)} is not below VWAP ${price(vwap)}`,
-      );
-    }
-  } else {
-    if (!sideIsWinner) {
-      return hold(`winner is not ${side} (${formatProbability(Math.max(buyScore, holdScore, sellScore))})`);
-    }
-    if (activeStrategyCount < defaults.minimumActiveStrategies) {
-      return hold(`active strategy count ${activeStrategyCount} is below ${defaults.minimumActiveStrategies}`);
-    }
-    if (directionalStrategyCount < defaults.minimumBuyStrategyCount) {
-      return hold(`${side.toLowerCase()} strategy count ${directionalStrategyCount} is below ${defaults.minimumBuyStrategyCount}`);
-    }
-    if (sideScore < defaults.minimumBuyScore) {
-      return hold(`${side} score ${formatProbability(sideScore)} is below ${formatProbability(defaults.minimumBuyScore)}`);
-    }
-    if (signalEdge < defaults.minimumSignalEdge) {
-      return hold(`signal edge ${formatProbability(signalEdge)} is below ${formatProbability(defaults.minimumSignalEdge)}`);
-    }
-  }
-
-  const spreadPct = priceValue ? (ask - bid) / priceValue : Number.POSITIVE_INFINITY;
-  if (spreadPct > defaults.maxSpreadPercent / 100) {
-    return hold(`spread ${formatProbability(spreadPct)} is above ${defaults.maxSpreadPercent}%`);
-  }
-  if (currentOneMinuteVolume < defaults.minimumOneMinuteVolume) {
-    return hold(`1m volume ${Math.round(currentOneMinuteVolume).toLocaleString()} is below ${defaults.minimumOneMinuteVolume.toLocaleString()}`);
-  }
-  if (atrOneMinute < 0.03) {
-    return hold(`ATR ${price(atrOneMinute)} is below 0.03`);
-  }
-  if (atrOneMinute > 1.5) {
-    return hold(`ATR ${price(atrOneMinute)} is above 1.50`);
-  }
-  const stopDistance = defaultSizingStopDistance(defaults, priceValue, atrOneMinute);
-  const entryQualityBlock = weightedEntryQualityBlockedReason(result, latest, side, stopDistance, automaticShortCycleBuy);
-  if (entryQualityBlock) {
-    return hold(entryQualityBlock);
-  }
-
-  if (dailyRealizedPnl <= -(accountEquity * (defaults.maxDailyLossPercent / 100))) {
-    return hold(`daily realized P&L ${signedCurrency(dailyRealizedPnl)} reached loss limit`);
-  }
-  if (tradesToday >= defaults.maxDailyTrades) {
-    return hold(`trades today ${tradesToday} reached max ${defaults.maxDailyTrades}`);
-  }
-  if (currentPositionShares > 0 && !defaults.pyramidingEnabled) {
-    return hold("pyramiding disabled while a weighted position is open");
-  }
-
-  const fiveMinuteConfirms = automaticShortCycleBuy
-    ? weightedAutomaticFiveMinuteConfirms(result, side)
-    : result.gates.find((gate) => gate.label === "5m Confirmation")?.status === "pass";
-  const contextSizeMultiplier =
-    signalEdge < 0.2
-      ? 0.25
-      : signalEdge < 0.35
-        ? 0.5
-        : signalEdge < 0.5
-          ? 0.75
-          : 1;
-  const sizeMultiplier = automaticShortCycleBuy
-    ? Math.min(1, contextSizeMultiplier + (fiveMinuteConfirms ? 0.25 : 0))
-    : signalEdge < 0.35
-      ? 0.25
-      : signalEdge < 0.5
-        ? 0.5
-        : signalEdge < 0.65
-          ? 0.75
-          : 1;
-  const riskDollars = accountEquity * (defaults.baseRiskPercent / 100) * sizeMultiplier;
-  const riskBasedShares = riskDollars / Math.max(stopDistance, 0.01);
-  const orderBasedShares = maxOrderDollars / Math.max(priceValue, 0.01);
-  const capitalBasedShares = maxPositionDollars / Math.max(priceValue, 0.01);
-  const buyingPowerShares = availableBuyingPower / Math.max(priceValue, 0.01);
-  const liquidityBasedShares = currentOneMinuteVolume * (defaults.maxParticipationPercent / 100);
-  const maxAllowedShares = defaults.maxAllowedShares > 0 ? defaults.maxAllowedShares : Number.MAX_SAFE_INTEGER;
-  const quantity = Math.floor(Math.min(riskBasedShares, orderBasedShares, capitalBasedShares, buyingPowerShares, liquidityBasedShares, maxAllowedShares));
-
-  if (quantity < 1) {
-    return hold(`final ${side.toLowerCase()} shares below 1`);
-  }
-
-  return {
-    side,
-    quantity,
-    blockedReason: "",
-    accountEquity,
-    availableBuyingPower,
-    currentPositionShares,
-    price: priceValue,
-    bid,
-    ask,
-    atrOneMinute,
-    averageOneMinuteVolume: currentOneMinuteVolume,
-    dailyRealizedPnl,
-    tradesToday,
-    maxPositionDollars,
-    riskDollars,
-    baseRiskPercent: defaults.baseRiskPercent,
-    stopDistance,
-    entryPrice: side === "Buy" ? ask : bid,
-    signalEdge,
-    sizeMultiplier,
-    riskBasedShares,
-    orderBasedShares,
-    capitalBasedShares,
-    buyingPowerShares,
-    liquidityBasedShares,
+    cutoff: "Backend session policy",
+    submitMode: "Manual",
+    failedGates: weightedVotingGateRows().filter((gate) => gate.status === "fail").map((gate) => `${gate.label}: ${gate.detail}`),
+    gates: weightedVotingGateRows().map((gate) => ({ layer: gate.label, status: gate.status, signal: side, detail: gate.detail })),
+    levels: { last: null, vwap: null, openingHigh: null, openingLow: null, lastTime: weightedVotingBackendState.updatedAt || null },
+    summary: compactJsonLabel(application ?? proposal),
   };
 }
 
-function weightedTargetOrderGates(result: WeightedVoteResult): TradeLayerGate[] {
-  return result.gates.map((gate) => ({
-    layer: gate.label,
-    status: gate.status === "pass" ? "pass" : gate.status === "info" ? "info" : "fail",
-    signal: result.rawWinner,
-    detail: gate.detail,
-  }));
+function renderWeightedBackendOrderProposal(order: ManualOrderRecommendation) {
+  return `
+    <div class="target-settings-panel weighted-target-settings-panel" data-side="${escapeHtml(order.side.toLowerCase())}">
+      <strong>Backend Order Proposal</strong>
+      ${renderTargetOrderBlockers(order)}
+      <div class="target-settings-grid">
+        <span><small>Side</small><b>${escapeHtml(order.side)}</b></span>
+        <span><small>Quantity</small><b>${order.quantity}</b></span>
+        <span><small>Trigger</small><b>${order.triggerPrice === null ? "NA" : price(order.triggerPrice)}</b></span>
+        <span><small>Limit</small><b>${order.limitPrice === null ? "NA" : price(order.limitPrice)}</b></span>
+        <span><small>Stop</small><b>${order.stopPrice === null ? "NA" : price(order.stopPrice)}</b></span>
+        <span><small>Target</small><b>${order.targetPrice === null ? "NA" : price(order.targetPrice)}</b></span>
+        <span><small>Planned risk</small><b>${currency(order.plannedStopRiskDollars)}</b></span>
+        <span><small>Global result</small><b>${escapeHtml(order.summary)}</b></span>
+      </div>
+    </div>
+  `;
 }
 
-function weightedEntryQualityBlockedReason(
-  result: WeightedVoteResult,
-  latest: Candle,
-  side: Exclude<AlgoSignal, "Hold">,
-  stopDistance: number,
-  automaticShortCycleBuy: boolean,
-) {
-  const vwap = result.data.vwap;
-  if (vwap === null) {
-    return automaticShortCycleBuy ? "Waiting for live VWAP" : "";
-  }
-  const entryCushion = automaticShortCycleBuy
-    ? weightedAutomaticEntryCushion(result, stopDistance)
-    : Math.max(0.05, stopDistance);
-  if (side === "Buy") {
-    const requiredEntry = vwap + entryCushion;
-    if (latest.close < requiredEntry) {
-      return `entry ${price(latest.close)} is too close to VWAP ${price(vwap)}; need ${price(requiredEntry)} or higher`;
-    }
-  } else {
-    const requiredEntry = vwap - entryCushion;
-    if (latest.close > requiredEntry) {
-      return `entry ${price(latest.close)} is too close to VWAP ${price(vwap)}; need ${price(requiredEntry)} or lower`;
-    }
-  }
-  const fragileEntryReason = automaticShortCycleBuy ? weightedFragileEntryBlockedReason(latest, entryCushion, side) : "";
-  if (fragileEntryReason) {
-    return fragileEntryReason;
-  }
-  if (automaticShortCycleBuy) {
-    const fiveMinute = result.data.timeframes.fiveMinute;
-    const alignment = weightedSignalTimeframeAlignment(side, fiveMinute);
-    if (alignment < 0) {
-      return `5m confirmation is not strong enough: ${fiveMinute.source}`;
-    }
-  }
-  return "";
-}
-
-function weightedAutomaticFiveMinuteConfirms(result: WeightedVoteResult, side: Exclude<AlgoSignal, "Hold">) {
-  return weightedSignalTimeframeAlignment(side, result.data.timeframes.fiveMinute) >= 0;
-}
-
-function weightedAutomaticEntryCushion(result: WeightedVoteResult, stopDistance: number) {
-  const atrCushion = (result.data.atr ?? stopDistance) * 0.5;
-  return Math.max(0.05, Math.min(0.25, stopDistance * 0.25, atrCushion));
-}
-
-function weightedFragileEntryBlockedReason(latest: Candle, entryCushion: number, side: Exclude<AlgoSignal, "Hold">) {
-  const sessionCandles = latestWeightedCalculationCandles();
-  const recent = sessionCandles.slice(-6);
-  if (recent.length < 4) {
-    return "fragile entry: waiting for more recent 1m candles";
-  }
-  const prior = recent.at(-2)!;
-  const priorTwo = recent.at(-3)!;
-  const latestBody = latest.close - latest.open;
-  if (side === "Buy") {
-    if (latestBody < 0 && latest.close <= prior.close) {
-      return `fragile entry: latest 1m candle is red and below prior close (${price(latest.open)} to ${price(latest.close)})`;
-    }
-    if (latest.close < prior.close || prior.close < priorTwo.close) {
-      return `fragile entry: 1m momentum is weakening (${price(priorTwo.close)} -> ${price(prior.close)} -> ${price(latest.close)})`;
-    }
-    const recentLow = Math.min(...recent.slice(0, -1).map((candle) => candle.low));
-    const lowCushion = latest.close - recentLow;
-    const requiredLowCushion = Math.max(0.12, entryCushion * 1.25);
-    if (lowCushion < requiredLowCushion) {
-      return `fragile entry: only ${price(lowCushion)} above recent low; need ${price(requiredLowCushion)}`;
-    }
-    const recentHighClose = Math.max(...recent.slice(0, -1).map((candle) => candle.close));
-    if (latest.close < recentHighClose) {
-      return `fragile entry: close ${price(latest.close)} has not cleared recent close high ${price(recentHighClose)}`;
-    }
-    return "";
-  }
-  if (latestBody > 0 && latest.close >= prior.close) {
-    return `fragile entry: latest 1m candle is green and above prior close (${price(latest.open)} to ${price(latest.close)})`;
-  }
-  if (latest.close > prior.close || prior.close > priorTwo.close) {
-    return `fragile entry: 1m downside momentum is weakening (${price(priorTwo.close)} -> ${price(prior.close)} -> ${price(latest.close)})`;
-  }
-  const recentHigh = Math.max(...recent.slice(0, -1).map((candle) => candle.high));
-  const highCushion = recentHigh - latest.close;
-  const requiredHighCushion = Math.max(0.12, entryCushion * 1.25);
-  if (highCushion < requiredHighCushion) {
-    return `fragile entry: only ${price(highCushion)} below recent high; need ${price(requiredHighCushion)}`;
-  }
-  const recentLowClose = Math.min(...recent.slice(0, -1).map((candle) => candle.close));
-  if (latest.close > recentLowClose) {
-    return `fragile entry: close ${price(latest.close)} has not cleared recent close low ${price(recentLowClose)}`;
-  }
-  return "";
-}
-
-function applyWeightedTargetOrderOverrides(order: ManualOrderRecommendation): ManualOrderRecommendation {
-  const overrides = state.weightedTargetOrderOverrides;
-  const quantity = order.quantity;
-  const triggerPrice = order.triggerPrice;
-  const stopPrice = order.stopPrice;
-  const orderNotional = triggerPrice !== null ? roundNumber(quantity * triggerPrice, 2) : order.orderNotional;
-  const plannedStopRiskDollars = triggerPrice !== null && stopPrice !== null ? roundNumber(quantity * Math.abs(triggerPrice - stopPrice), 2) : order.plannedStopRiskDollars;
-  const estimatedSlippage = roundNumber(quantity * state.weightedTradingSettings.slippagePerShare * 2, 2);
-  return {
-    ...order,
-    symbol: String(overrides.symbol ?? order.symbol).toUpperCase(),
-    orderType: String(overrides.orderType ?? order.orderType),
-    quantity,
-    triggerPrice,
-    limitPrice: order.limitPrice,
-    stopPrice,
-    targetPrice: order.targetPrice,
-    accountBalance: roundNumber(Number(overrides.accountBalance ?? order.accountBalance), 2),
-    orderLimitDollars: roundNumber(Number(overrides.orderLimitDollars ?? order.orderLimitDollars), 2),
-    dailyLimitDollars: roundNumberUp(Number(overrides.dailyLimitDollars ?? order.dailyLimitDollars), 2),
-    riskDollars: roundNumber(order.riskDollars, 2),
-    orderNotional,
-    plannedStopRiskDollars,
-    estimatedSlippage,
-    timeInForce: String(overrides.timeInForce ?? order.timeInForce),
-    cutoff: String(overrides.cutoff ?? order.cutoff),
-    submitMode: (overrides.submitMode as SubmitOrderMode | undefined) ?? order.submitMode,
-  };
-}
-
-function weightedTradingSettingsSummary(settings: TradingSettings, result?: WeightedVoteResult) {
-  const signalText = result ? ` · ${result.signal} ${formatProbability(result.maxScore)}` : "";
-  return `${currency(settings.startingCapital)} balance · ${settings.orderAllocationPercent}% order · ${settings.dailyAllocationPercent}% daily · ${settings.maxTradesPerDay}/day${signalText}`;
+function nullableBackendNumber(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function renderTargetOrderSettings(order: ManualOrderRecommendation) {
@@ -16769,101 +15866,6 @@ function renderTargetSettingSelect(
   `;
 }
 
-function renderWeightedTargetOrderSettings(order: ManualOrderRecommendation) {
-  return `
-    <div class="target-settings-panel weighted-target-settings-panel" data-side="${escapeHtml(order.side.toLowerCase())}">
-      <strong>Target Order</strong>
-      ${renderTargetOrderBlockers(order)}
-      <div class="target-settings-grid">
-        ${renderWeightedTargetSettingInput("accountBalance", "Total balance", order.accountBalance, "number", 0.01)}
-        ${renderWeightedTargetSettingInput("dailyLimitDollars", "Daily max allocation", order.dailyLimitDollars, "number", 0.01)}
-        ${renderWeightedTargetSettingInput("orderLimitDollars", "Order limit", order.orderLimitDollars, "number", 0.01)}
-        ${renderWeightedTargetSettingInput("orderNotional", "Order value", order.orderNotional, "number", 0.01)}
-        ${renderWeightedTargetSettingInput("symbol", "Symbol", order.symbol, "text")}
-        ${renderWeightedTargetSettingSelect("side", "Side", order.side, ["Buy", "Sell", "Hold"])}
-        ${renderWeightedTargetSettingSelect("orderType", "Order type", order.orderType, ["No order", "Buy stop-limit", "Sell stop-limit"])}
-        ${renderWeightedTargetSettingInput("quantity", "Quantity", order.quantity, "number", 1)}
-        ${renderWeightedTargetSettingInput("triggerPrice", "Trigger / stop price", order.triggerPrice, "number", 0.01)}
-        ${renderWeightedTargetSettingInput("limitPrice", "Limit price", order.limitPrice, "number", 0.01)}
-        ${renderWeightedTargetSettingInput("stopPrice", "Protective stop", order.stopPrice, "number", 0.01)}
-        ${renderWeightedTargetSettingInput("targetPrice", "Take profit", order.targetPrice, "number", 0.01)}
-        ${renderWeightedTargetSettingInput("riskDollars", "Risk budget", order.riskDollars, "number", 0.01)}
-        ${renderWeightedTargetSettingInput("plannedStopRiskDollars", "Planned stop risk", order.plannedStopRiskDollars, "number", 0.01)}
-        ${renderWeightedTargetSettingInput("estimatedSlippage", "Estimated slippage", order.estimatedSlippage, "number", 0.01)}
-        ${renderWeightedTargetSettingInput("timeInForce", "Time in force", order.timeInForce, "text", undefined, "half")}
-        ${renderWeightedTargetSettingInput("cutoff", "Cutoff", order.cutoff, "text", undefined, "half")}
-        ${renderWeightedTargetSettingSelect("submitMode", "Submit order", order.submitMode, ["Manual", "Automatic"], "half")}
-      </div>
-      <span class="trading-settings-warning">${escapeHtml(order.summary)}</span>
-    </div>
-  `;
-}
-
-function renderWeightedTargetSettingInput(
-  name: keyof TargetOrderSettings,
-  label: string,
-  value: string | number | null,
-  type: "number" | "text",
-  step?: number,
-  layout?: "wide" | "half",
-) {
-  const inputValue = value === null ? "" : String(value);
-  return `
-    <label class="${layout ?? ""}">
-      <span>${escapeHtml(label)}</span>
-      <input data-weighted-target-setting="${escapeHtml(name)}" type="${type}" ${step ? `step="${step}"` : ""} value="${escapeHtml(inputValue)}" />
-    </label>
-  `;
-}
-
-function renderWeightedTargetSettingSelect(
-  name: keyof TargetOrderSettings,
-  label: string,
-  value: string,
-  options: string[],
-  layout?: "wide" | "half",
-) {
-  return `
-    <label class="${layout ?? ""}">
-      <span>${escapeHtml(label)}</span>
-      <select data-weighted-target-setting="${escapeHtml(name)}">
-        ${options.map((option) => `<option value="${escapeHtml(option)}" ${option === value ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}
-      </select>
-    </label>
-  `;
-}
-
-function renderWeightedDefaultSizingSection(settings: TradingSettings) {
-  const expanded = state.weightedDefaultSizingExpanded;
-  return `
-    <div class="trading-default-section weighted-default-section" data-expanded="${String(expanded)}">
-      <div class="trading-default-head">
-        <button id="weightedDefaultSizingToggle" class="trading-default-expand" type="button" aria-expanded="${String(expanded)}" aria-controls="weightedDefaultSizingBody">
-          <b>${expanded ? "-" : "+"}</b>
-          <strong>Default Settings</strong>
-        </button>
-        ${renderWeightedTradingSettingToggle("useDefaultSizingSettings", "On / Off", settings.useDefaultSizingSettings)}
-      </div>
-      <div id="weightedDefaultSizingBody" class="trading-default-body" ${expanded ? "" : "hidden"}>
-        <div class="trading-settings-grid trading-default-grid">
-          ${renderWeightedTradingSettingInput("minimumBuyScore", "Minimum buy score", settings.minimumBuyScore, 0, 1, 0.01)}
-          ${renderWeightedTradingSettingInput("minimumSignalEdge", "Minimum signal edge", settings.minimumSignalEdge, 0, 1, 0.01)}
-          ${renderWeightedTradingSettingInput("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0.01, 10, 0.01)}
-          ${renderWeightedTradingSettingInput("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0.1, 100, 0.1)}
-          ${renderWeightedTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
-          ${renderWeightedTradingSettingInput("atrStopMultiplier", "ATR stop multiplier", settings.atrStopMultiplier, 0.1, 10, 0.1)}
-          ${renderWeightedTradingSettingInput("minimumStopDistancePercent", "Min stop distance %", settings.minimumStopDistancePercent, 0.001, 5, 0.001)}
-          ${renderWeightedTradingSettingInput("maxParticipationPercent", "Max participation %", settings.maxParticipationPercent, 0.001, 10, 0.001)}
-          ${renderWeightedTradingSettingInput("minimumOneMinuteVolume", "Min 1m volume", settings.minimumOneMinuteVolume, 0, 10000000, 1)}
-          ${renderWeightedTradingSettingInput("maxAllowedShares", "Max shares (0 auto)", settings.maxAllowedShares, 0, 1000000, 1)}
-          ${renderWeightedTradingSettingInput("maxDailyLossPercent", "Max daily loss %", settings.maxDailyLossPercent, 0.1, 10, 0.1)}
-          ${renderWeightedTradingSettingToggle("pyramidingEnabled", "Pyramiding", settings.pyramidingEnabled)}
-        </div>
-      </div>
-    </div>
-  `;
-}
-
 function renderTradingSettingInput(
   name: keyof TradingSettings,
   label: string,
@@ -16876,19 +15878,6 @@ function renderTradingSettingInput(
     <label>
       <span>${escapeHtml(label)}</span>
       <input data-trading-setting="${escapeHtml(name)}" type="number" min="${min}" max="${max}" step="${step}" value="${value}" />
-    </label>
-  `;
-}
-
-function renderWeightedTradingSettingToggle(
-  name: keyof TradingSettings,
-  label: string,
-  checked: boolean,
-) {
-  return `
-    <label class="trading-default-toggle">
-      <span>${escapeHtml(label)}</span>
-      <input data-weighted-trading-setting="${escapeHtml(name)}" type="checkbox" ${checked ? "checked" : ""} />
     </label>
   `;
 }
@@ -16933,22 +15922,6 @@ function renderTradingDefaultSizingSection(settings: TradingSettings) {
         </div>
       </div>
     </div>
-  `;
-}
-
-function renderWeightedTradingSettingInput(
-  name: keyof TradingSettings,
-  label: string,
-  value: number,
-  min: number,
-  max: number,
-  step: number,
-) {
-  return `
-    <label>
-      <span>${escapeHtml(label)}</span>
-      <input data-weighted-trading-setting="${escapeHtml(name)}" type="number" min="${min}" max="${max}" step="${step}" value="${value}" />
-    </label>
   `;
 }
 
@@ -17182,9 +16155,7 @@ function manualOrderRecommendation(
   const settings = state.tradingSettings;
   const voteWinner = votingEnsembleScoreSummary().winner;
   const eventProbe = eventModeGate(state.marketContext, "Hold");
-  const structuralSide = eventProbe.active && eventProbe.signal !== "Watch" && eventProbe.signal !== "Inactive"
-    ? (eventProbe.signal as AlgoSignal)
-    : voteWinner;
+  const structuralSide = voteWinner;
   const event = eventModeGate(state.marketContext, structuralSide);
   const execution = executionGate(structuralSide);
   const mlQuality = mlQualityGate(structuralSide, event.active);
@@ -17331,7 +16302,7 @@ function manualOrderRecommendation(
     gates,
     levels: chart.levels,
     summary: eligible
-      ? `Order template: ${orderLine} Weekly/Daily permission, 1H direction, 1M/5M execution, and ML quality are aligned. Uses ${currency(orderNotional)} of the ${currency(orderLimitDollars)} per-order limit.`
+      ? `Order template: ${orderLine} Displayed execution, event, ML, and historical checks are aligned. Uses ${currency(orderNotional)} of the ${currency(orderLimitDollars)} per-order limit.`
       : `No order: Wait. Failed gates: ${uniqueStrings(failedGates).join(", ")}.`,
   });
 }
@@ -17573,52 +16544,21 @@ function renderTradingRagSource(item: TradingRagResponse["retrieved"][number]) {
     <article class="trading-rag-source">
       <div>
         <strong>${escapeHtml(item.title)}</strong>
-        <span>${escapeHtml([item.timeframe || "", item.kind, `score ${item.score}`].filter(Boolean).join(" · "))}</span>
+        <span>${escapeHtml([item.timeframe || "", item.kind, `score ${item.score}`].filter(Boolean).join(" - "))}</span>
       </div>
       <p>${escapeHtml(item.text)}</p>
-      ${metricParts.length ? `<b>${escapeHtml(metricParts.join(" · "))}</b>` : ""}
+      ${metricParts.length ? `<b>${escapeHtml(metricParts.join(" - "))}</b>` : ""}
     </article>
   `;
-}
-
-function directionalSignal(primary: MarketLayer["directionBias"], fallback: MarketLayer["directionBias"]): AlgoSignal {
-  const direction = primary === "neutral" || primary === "cash" ? fallback : primary;
-  if (direction === "long") {
-    return "Buy";
-  }
-  if (direction === "short") {
-    return "Sell";
-  }
-  return "Hold";
-}
-
-function oppositeSignal(direction: MarketLayer["directionBias"]): AlgoSignal {
-  if (direction === "long") {
-    return "Sell";
-  }
-  if (direction === "short") {
-    return "Buy";
-  }
-  return "Hold";
-}
-
-function winningVoteSignal(buyVotes: number, sellVotes: number, holdVotes: number): AlgoSignal {
-  const maxVotes = Math.max(buyVotes, sellVotes, holdVotes);
-  const winners = [
-    buyVotes === maxVotes ? "Buy" : "",
-    sellVotes === maxVotes ? "Sell" : "",
-    holdVotes === maxVotes ? "Hold" : "",
-  ].filter(Boolean);
-  return winners.length === 1 ? (winners[0] as AlgoSignal) : "Hold";
 }
 
 function votingEnsembleScoreSummary() {
   const votes = strategyEnsembleSignals(state.marketContext);
   const eligibleVotes = votes.filter(isEligibleStrategyVote);
   const total = Math.max(eligibleVotes.length, 1);
-  const buyVotes = eligibleVotes.filter((vote) => vote.signal === "Buy").length;
-  const sellVotes = eligibleVotes.filter((vote) => vote.signal === "Sell").length;
-  const holdVotes = eligibleVotes.filter((vote) => vote.signal === "Hold").length;
+  const buyVotes = state.votingEnsembleBackend?.eligible_counts.Buy ?? eligibleVotes.filter((vote) => vote.signal === "Buy").length;
+  const sellVotes = state.votingEnsembleBackend?.eligible_counts.Sell ?? eligibleVotes.filter((vote) => vote.signal === "Sell").length;
+  const holdVotes = state.votingEnsembleBackend?.eligible_counts.Hold ?? eligibleVotes.filter((vote) => vote.signal === "Hold").length;
   const scores = {
     Buy: buyVotes / total,
     Sell: sellVotes / total,
@@ -17628,7 +16568,7 @@ function votingEnsembleScoreSummary() {
     votes,
     eligibleVotes,
     scores,
-    winner: winningVoteSignal(buyVotes, sellVotes, holdVotes),
+    winner: state.votingEnsembleBackend?.final_signal ?? "Hold",
     secondBestScore: Math.max(scores.Sell, scores.Hold),
   };
 }
@@ -17679,7 +16619,7 @@ function votingEnsembleBuyQuantitySizing(
   const atr = averageTrueRange(sessionCandles, Math.min(14, sessionCandles.length - 1)) ?? 0;
   const stopDistance = tradingSettingsStopDistance(settings, latestPrice, atr);
   const sizeMultiplier = votingEnsembleSizeMultiplier(signalEdge);
-  const riskDollars = accountEquity * baseRiskPct * (useDefaults ? Math.max(sizeMultiplier, 1) : sizeMultiplier);
+  const riskDollars = riskDollarsForSignalMultiplier(accountEquity, baseRiskPct * 100, sizeMultiplier);
   const maxOrderDollars = useDefaults
     ? accountEquity * (settings.orderAllocationPercent / 100)
     : finitePositiveOrDefault(manualOrderLimitDollars, accountEquity * (settings.orderAllocationPercent / 100));
@@ -17751,40 +16691,286 @@ function votingEnsembleBuyQuantitySizing(
 }
 
 function renderAlgoTradePlan(finalSignal: AlgoSignal, votes: AlgoVote[], backtest: ReturnType<typeof backtestVotingEnsembleLastDay>) {
+  const latest = currentCandle();
+  const evaluatedAt = formatTimeWithSeconds(new Date().toISOString());
+  const latestCandleAt = latest ? formatTimeWithSeconds(latest.timestamp) : "No candle";
+  const refreshState = state.lastRefreshStatus ? `${state.lastRefreshStatus} ${state.lastRefreshAt || ""}`.trim() : "not refreshed";
+  const eligibleVotes = votes.filter(isEligibleStrategyVote);
+  const directionalCounts = {
+    Buy: votes.filter((vote) => vote.signal === "Buy").length,
+    Sell: votes.filter((vote) => vote.signal === "Sell").length,
+    Hold: votes.filter((vote) => vote.signal === "Hold").length,
+  };
+  const eligibleCounts = {
+    Buy: eligibleVotes.filter((vote) => vote.signal === "Buy").length,
+    Sell: eligibleVotes.filter((vote) => vote.signal === "Sell").length,
+    Hold: eligibleVotes.filter((vote) => vote.signal === "Hold").length,
+  };
   const activeVotes = votes.filter((vote) => vote.signal === finalSignal && finalSignal !== "Hold");
   const timeframe = algoBacktestTimeframeLabel(backtest.timeframe);
   const strategyDescription = backtest.strategyDescription ?? `${timeframe} intraday backtest`;
-  if (backtest.timeframe === "Event") {
-    const config = backtest.riskConfig?.openCloseEvents;
-    return `
-      <span>Trade bias: Event.</span>
-      <span>${escapeHtml(strategyDescription)} uses the approved weekly vote filter.</span>
-      <span>Opening: ${escapeHtml(config?.openingWindow ?? "09:45-10:30")} post-opening-range breakout.</span>
-      <span>Closing: ${config?.enableClosingEvents ? `${escapeHtml(config?.closingWindow ?? "15:30-15:50")} continuation` : "disabled"}.</span>
-    `;
-  }
-  if (finalSignal === "Buy") {
-    return `
-      <span>Trade bias: Buy.</span>
-      <span>${escapeHtml(strategyDescription)} uses the Voting Ensemble winner.</span>
-      <span>Supporting strategies: ${escapeHtml(activeVotes.map((vote) => vote.strategy).join(", ") || "NA")}.</span>
-      <span>Invalidate if price loses VWAP or vote winner changes.</span>
-    `;
-  }
-  if (finalSignal === "Sell") {
-    return `
-      <span>Trade bias: Sell.</span>
-      <span>${escapeHtml(strategyDescription)} uses the Voting Ensemble winner.</span>
-      <span>Supporting strategies: ${escapeHtml(activeVotes.map((vote) => vote.strategy).join(", ") || "NA")}.</span>
-      <span>Invalidate if price reclaims VWAP or vote winner changes.</span>
-    `;
-  }
+  const supportingStrategies = activeVotes.map((vote) => vote.strategy).join(", ") || "None";
+  const topSupportingStrategies = activeVotes
+    .slice()
+    .sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
+    .slice(0, 3)
+    .map((vote) => `${vote.strategy}${typeof vote.score === "number" ? ` ${vote.score}%` : ""}`)
+    .join(", ") || "None";
+  const candidateSide = backtest.timeframe === "Event" ? "Event setup" : finalSignal;
+  const contextResult = tradingDecisionContextResult(finalSignal);
+  const gateResult = tradingDecisionGateResult(finalSignal);
+  const mlResult = tradingDecisionMlResult(finalSignal, backtest.timeframe);
+  const finalDecision = tradingDecisionFinalResult(finalSignal, gateResult, mlResult);
+
   return `
-    <span>Trade bias: Hold.</span>
-    <span>${escapeHtml(strategyDescription)} uses the Voting Ensemble winner.</span>
-    <span>No directional bucket has a clean winner.</span>
-    <span>Wait for more strategy alignment before opening a new trade.</span>
+    <div class="trading-decision-flow" aria-label="Normalized trading decision architecture">
+      <section class="trading-decision-final" data-status="${escapeHtml(finalDecision.status)}">
+        <span>Final decision</span>
+        <strong>${escapeHtml(finalDecision.label)}</strong>
+        <small>${escapeHtml(finalDecision.detail)}</small>
+        <div class="trading-decision-meta">
+          <b>Evaluated ${escapeHtml(evaluatedAt)}</b>
+          <b>Latest candle ${escapeHtml(latestCandleAt)}</b>
+          <b>Refresh ${escapeHtml(refreshState)}</b>
+        </div>
+      </section>
+      ${renderTradingDecisionStage(
+        "Directional strategies",
+        finalSignal,
+        `${directionalCounts.Buy} Buy / ${directionalCounts.Sell} Sell / ${directionalCounts.Hold} Hold`,
+        `Actionable subset: ${eligibleCounts.Buy}B / ${eligibleCounts.Sell}S / ${eligibleCounts.Hold}H; ${eligibleVotes.length} eligible of ${votes.length}; ${votes.length - eligibleVotes.length} watch/avoid.`,
+        `${strategyDescription}; independent strategy outputs only.`,
+        finalSignal === "Hold" ? "hold" : "pass",
+      )}
+      ${renderTradingDecisionStage(
+        "Context signals + regime",
+        contextResult.outcome,
+        contextResult.result,
+        contextResult.evidence,
+        "Context can confirm, weaken, or reduce eligibility; it does not invent direction.",
+        contextResult.status,
+      )}
+      ${renderTradingDecisionStage(
+        "Family-aware deterministic ensemble",
+        candidateSide,
+        finalSignal === "Hold" ? "No clean directional candidate." : `Candidate ${finalSignal} from directional evidence.`,
+        finalSignal === "Hold" ? `Top support: ${topSupportingStrategies}.` : `Supporting strategies: ${topSupportingStrategies}.`,
+        "Family-aware aggregation should not let one family dominate the decision.",
+        finalSignal === "Hold" ? "hold" : "pass",
+      )}
+      ${renderTradingDecisionStage(
+        "Safety / global gates",
+        gateResult.outcome,
+        gateResult.result,
+        gateResult.evidence,
+        "Gates may block, caution, resize, or allow; they must not flip Buy/Sell.",
+        gateResult.status,
+      )}
+      ${renderTradingDecisionStage(
+        "ML meta-model",
+        mlResult.outcome,
+        mlResult.result,
+        mlResult.evidence,
+        "ML may filter or reduce risk; it must not create or reverse trades.",
+        mlResult.status,
+      )}
+    </div>
   `;
+}
+
+type TradingDecisionStageStatus = "pass" | "caution" | "fail" | "hold" | "info";
+
+function renderTradingDecisionStage(
+  title: string,
+  outcome: string,
+  result: string,
+  evidence: string,
+  guardrail: string,
+  status: TradingDecisionStageStatus,
+) {
+  return `
+    <article class="trading-decision-stage" data-status="${escapeHtml(status)}">
+      <div>
+        <span>${escapeHtml(title)}</span>
+        <strong>${escapeHtml(outcome)}</strong>
+      </div>
+      <p>${escapeHtml(result)}</p>
+      <small>${escapeHtml(evidence)}</small>
+      <em>${escapeHtml(guardrail)}</em>
+    </article>
+  `;
+}
+
+function tradingDecisionContextResult(finalSignal: AlgoSignal): {
+  outcome: string;
+  result: string;
+  evidence: string;
+  status: TradingDecisionStageStatus;
+} {
+  const backendConfirmation = state.votingEnsembleBackend?.context_confirmation;
+  if (backendConfirmation) {
+    return {
+      outcome:
+        backendConfirmation.outcome === "confirms"
+          ? "Confirms candidate"
+          : backendConfirmation.outcome === "weakens"
+            ? "Weakens candidate"
+            : backendConfirmation.outcome === "not_applicable"
+              ? "No trade candidate"
+              : "Mixed context",
+      result: backendConfirmation.detail,
+      evidence: backendConfirmation.evidence.length ? backendConfirmation.evidence.join(" | ") : "No context confirmation signals available.",
+      status:
+        backendConfirmation.outcome === "confirms"
+          ? "pass"
+          : backendConfirmation.outcome === "weakens"
+            ? "caution"
+            : backendConfirmation.outcome === "not_applicable"
+              ? "hold"
+              : "info",
+    };
+  }
+  const context = state.marketContext;
+  if (!context) {
+    return {
+      outcome: "Unavailable",
+      result: "Market context has not loaded.",
+      evidence: "Regime/session/event data unavailable.",
+      status: "info",
+    };
+  }
+  const layers = [context.regime, context.session, context.event];
+  const directionalLayers = layers.map((layer) => `${layer.layer}: ${biasLabel(layer.directionBias)} ${Math.round(layer.confidence * 100)}%`);
+  if (finalSignal === "Hold") {
+    return {
+      outcome: "Neutral / waiting",
+      result: "No trade candidate for context to confirm.",
+      evidence: directionalLayers.join(" | "),
+      status: "hold",
+    };
+  }
+  const targetBias = finalSignal === "Buy" ? "long" : "short";
+  const oppositeBias = finalSignal === "Buy" ? "short" : "long";
+  const confirms = layers.filter((layer) => layer.directionBias === targetBias).length;
+  const conflicts = layers.filter((layer) => layer.directionBias === oppositeBias || layer.directionBias === "cash").length;
+  return {
+    outcome: conflicts ? "Weakens candidate" : confirms ? "Confirms candidate" : "Mixed context",
+    result: conflicts
+      ? `${conflicts} context layer${conflicts === 1 ? "" : "s"} conflict with ${finalSignal}.`
+      : confirms
+        ? `${confirms} context layer${confirms === 1 ? "" : "s"} confirm ${finalSignal}.`
+        : `No context layer strongly confirms or rejects ${finalSignal}.`,
+    evidence: directionalLayers.join(" | "),
+    status: conflicts ? "caution" : confirms ? "pass" : "info",
+  };
+}
+
+function tradingDecisionGateResult(finalSignal: AlgoSignal): {
+  outcome: string;
+  result: string;
+  evidence: string;
+  status: TradingDecisionStageStatus;
+  blocked: boolean;
+} {
+  if (finalSignal === "Hold") {
+    return {
+      outcome: "No trade candidate",
+      result: "Safety gates are not asked to permit a new trade.",
+      evidence: "Candidate side is Hold.",
+      status: "hold",
+      blocked: true,
+    };
+  }
+  const order = state.currentTargetOrder;
+  const gates = order?.gates ?? [];
+  const failed = gates.filter((gate) => gate.status === "fail");
+  const cautions = gates.filter((gate) => gate.status === "caution");
+  if (failed.length) {
+    return {
+      outcome: "Blocked",
+      result: `${failed.length} failed gate${failed.length === 1 ? "" : "s"} prevent trading.`,
+      evidence: failed.map((gate) => `${gate.layer}: ${gate.detail}`).join(" | "),
+      status: "fail",
+      blocked: true,
+    };
+  }
+  if (cautions.length) {
+    return {
+      outcome: "Caution",
+      result: `${cautions.length} caution gate${cautions.length === 1 ? "" : "s"}; candidate remains reviewable.`,
+      evidence: cautions.map((gate) => `${gate.layer}: ${gate.detail}`).join(" | "),
+      status: "caution",
+      blocked: false,
+    };
+  }
+  return {
+    outcome: order?.eligible ? "Allowed" : "Review",
+    result: order?.eligible ? `Candidate ${finalSignal} is tradable under current gates.` : "No blocking gate is visible, but no eligible order is staged.",
+    evidence: gates.length ? `${gates.length} gate${gates.length === 1 ? "" : "s"} checked.` : "No gate details available.",
+    status: order?.eligible ? "pass" : "info",
+    blocked: !order?.eligible,
+  };
+}
+
+function tradingDecisionMlResult(finalSignal: AlgoSignal, timeframe: BacktestResultTimeframe): {
+  outcome: string;
+  result: string;
+  evidence: string;
+  status: TradingDecisionStageStatus;
+  blocked: boolean;
+} {
+  if (finalSignal === "Hold") {
+    return {
+      outcome: "No trade candidate",
+      result: "No Buy/Sell candidate exists for ML filtering.",
+      evidence: compactMlArtifactLabel(timeframe),
+      status: "hold",
+      blocked: false,
+    };
+  }
+  const eventActive = eventModeGate(state.marketContext, finalSignal).active;
+  const gate = mlQualityGate(finalSignal, eventActive);
+  return {
+    outcome: gate.status === "fail" ? "Filtered" : gate.status === "caution" ? "Caution" : gate.status === "pass" ? "Accepted" : "Shadow / info",
+    result: gate.detail,
+    evidence: compactMlArtifactLabel(timeframe),
+    status: gate.status === "fail" ? "fail" : gate.status === "caution" ? "caution" : gate.status === "pass" ? "pass" : "info",
+    blocked: gate.status === "fail",
+  };
+}
+
+function tradingDecisionFinalResult(
+  finalSignal: AlgoSignal,
+  gateResult: ReturnType<typeof tradingDecisionGateResult>,
+  mlResult: ReturnType<typeof tradingDecisionMlResult>,
+) {
+  if (finalSignal === "Hold") {
+    return {
+      label: "Hold / no new trade",
+      detail: "Directional strategies do not have a clean Buy or Sell candidate.",
+      status: "hold",
+    };
+  }
+  if (gateResult.blocked) {
+    return {
+      label: `${finalSignal} blocked`,
+      detail: gateResult.result,
+      status: "fail",
+    };
+  }
+  if (mlResult.blocked) {
+    return {
+      label: `${finalSignal} filtered by ML`,
+      detail: mlResult.result,
+      status: "fail",
+    };
+  }
+  const order = state.currentTargetOrder;
+  return {
+    label: `${finalSignal} candidate ${order?.eligible ? "tradable" : "under review"}`,
+    detail: order?.eligible && order.quantity > 0 ? `${order.quantity} shares staged; ${order.summary}` : "Review order sizing and gates before submission.",
+    status: order?.eligible ? "pass" : "caution",
+  };
 }
 
 function renderAlgoResults(
@@ -17805,7 +16991,7 @@ function renderAlgoResults(
   const rangeLabel = backtest.rangeLabel ?? backtest.dateLabel;
   return `
     <span>Winner: ${finalSignal}</span>
-    <span>Buy ${buyVotes} / Sell ${sellVotes} / Hold ${holdVotes}</span>
+    <span>Actionable Buy ${buyVotes} / Sell ${sellVotes} / Hold ${holdVotes}</span>
     <span>Highest-ranked strategy: ${escapeHtml(strongestLabel)}</span>
     <span>Backtest status: <strong class="algo-backtest-status" data-status="${algoBacktestStatusKind()}">${escapeHtml(algoBacktestStatusLabel())}</strong></span>
     <span>ML artifact: ${escapeHtml(compactMlArtifactLabel(backtest.timeframe))}</span>
@@ -17908,7 +17094,7 @@ function renderWeeklyRiskTuning(timeframe: BacktestResultTimeframe) {
             ([label, row]) => `
               <span>
                 <b>${escapeHtml(label)}</b>
-                ${escapeHtml(row!.variant)} · ${row!.trades} trades · ${signedCurrency(row!.pnl)} · PF ${row!.profitFactor ?? "NA"} · DD ${currency(row!.maxDrawdown)} (${row!.maxDrawdownPercent.toFixed(2)}%) · Eff ${row!.capitalEfficiency?.toFixed(2) ?? "NA"}
+                ${escapeHtml(row!.variant)} - ${row!.trades} trades - ${signedCurrency(row!.pnl)} - PF ${row!.profitFactor ?? "NA"} - DD ${currency(row!.maxDrawdown)} (${row!.maxDrawdownPercent.toFixed(2)}%) - Eff ${row!.capitalEfficiency?.toFixed(2) ?? "NA"}
               </span>
             `,
           )
@@ -17955,12 +17141,12 @@ function renderEventRefinement(timeframe: BacktestResultTimeframe) {
       <span>Event-only model: ${refinement.model.trainingRows.toLocaleString()} trades, ${refinement.model.positiveRows.toLocaleString()} winners, ${refinement.model.featureCount} features.</span>
       ${
         profitBest
-          ? `<span>Profit-preserving: ${escapeHtml(profitBest.variant)} · ${profitBest.trades} trades · ${signedCurrency(profitBest.pnl)} · PF ${profitBest.profitFactor ?? "NA"} · DD ${currency(profitBest.maxDrawdown)} (${profitBest.maxDrawdownPercent.toFixed(2)}%).</span>`
+          ? `<span>Profit-preserving: ${escapeHtml(profitBest.variant)} - ${profitBest.trades} trades - ${signedCurrency(profitBest.pnl)} - PF ${profitBest.profitFactor ?? "NA"} - DD ${currency(profitBest.maxDrawdown)} (${profitBest.maxDrawdownPercent.toFixed(2)}%).</span>`
           : ""
       }
       ${
         qualityBest
-          ? `<span>Quality best: ${escapeHtml(qualityBest.variant)} · ${qualityBest.trades} trades · ${signedCurrency(qualityBest.pnl)} · PF ${qualityBest.profitFactor ?? "NA"} · Exp ${currency(qualityBest.expectancy)}.</span>`
+          ? `<span>Quality best: ${escapeHtml(qualityBest.variant)} - ${qualityBest.trades} trades - ${signedCurrency(qualityBest.pnl)} - PF ${qualityBest.profitFactor ?? "NA"} - Exp ${currency(qualityBest.expectancy)}.</span>`
           : ""
       }
       <div class="event-refinement-grid">
@@ -17968,7 +17154,7 @@ function renderEventRefinement(timeframe: BacktestResultTimeframe) {
           .map(
             (row) => `
               <span data-verdict="${escapeHtml((row.verdict ?? "mixed").toLowerCase())}">
-                ${escapeHtml(row.variant)} · ${row.trades} trades · ${signedCurrency(row.pnl)} · PF ${row.profitFactor ?? "NA"} · DD ${currency(row.maxDrawdown)}
+                ${escapeHtml(row.variant)} - ${row.trades} trades - ${signedCurrency(row.pnl)} - PF ${row.profitFactor ?? "NA"} - DD ${currency(row.maxDrawdown)}
               </span>
             `,
           )
@@ -18011,13 +17197,13 @@ function renderDailyRefinement(timeframe: BacktestResultTimeframe) {
     <div class="daily-refinement">
       <strong>Daily Refinement</strong>
       <span>${escapeHtml(refinement.recommendation)}</span>
-      <span>Best: ${escapeHtml(best.variant)} · ${best.trades} trades · ${signedCurrency(best.pnl)} · PF ${best.profitFactor ?? "NA"} · DD ${currency(best.maxDrawdown)} (${best.maxDrawdownPercent.toFixed(2)}%) · ${currency(best.expectancy)} expectancy.</span>
+      <span>Best: ${escapeHtml(best.variant)} - ${best.trades} trades - ${signedCurrency(best.pnl)} - PF ${best.profitFactor ?? "NA"} - DD ${currency(best.maxDrawdown)} (${best.maxDrawdownPercent.toFixed(2)}%) - ${currency(best.expectancy)} expectancy.</span>
       <div class="daily-refinement-grid">
         ${rows
           .map(
             (row) => `
               <span data-verdict="${escapeHtml((row.verdict ?? "mixed").toLowerCase())}">
-                ${escapeHtml(row.variant)} · ${row.trades} trades · ${signedCurrency(row.pnl)} · PF ${row.profitFactor ?? "NA"} · Exp ${currency(row.expectancy)}
+                ${escapeHtml(row.variant)} - ${row.trades} trades - ${signedCurrency(row.pnl)} - PF ${row.profitFactor ?? "NA"} - Exp ${currency(row.expectancy)}
               </span>
             `,
           )
@@ -18114,7 +17300,7 @@ function renderCandidateDataset(timeframe: BacktestResultTimeframe) {
   return `
     <div class="candidate-dataset">
       <strong>Candidate Dataset</strong>
-      <span>${dataset.rows.toLocaleString()} rows · ${dataset.candidateRows.toLocaleString()} candidates · ${dataset.labeledRows.toLocaleString()} labeled outcomes · ${dataset.skippedRows.toLocaleString()} skipped setups</span>
+      <span>${dataset.rows.toLocaleString()} rows - ${dataset.candidateRows.toLocaleString()} candidates - ${dataset.labeledRows.toLocaleString()} labeled outcomes - ${dataset.skippedRows.toLocaleString()} skipped setups</span>
       ${
         row
           ? `<span>${algoBacktestTimeframeLabel(row.timeframe)}: ${row.rows.toLocaleString()} rows, ${row.candidates.toLocaleString()} candidates, ${row.outcomes.toLocaleString()} outcomes, ${row.skipped.toLocaleString()} skipped, ${signedCurrency(row.pnl)} labeled P/L</span>`
@@ -18152,7 +17338,7 @@ function renderMlComparison(timeframe: BacktestResultTimeframe) {
   return `
     <div class="ml-comparison">
       <strong>ML Comparison</strong>
-      <span class="ml-comparison-note">${escapeHtml(comparison.model.name)} · ${comparison.model.rows} shared trades · ${comparison.model.trainingPolicy}</span>
+      <span class="ml-comparison-note">${escapeHtml(comparison.model.name)} - ${comparison.model.rows} shared trades - ${comparison.model.trainingPolicy}</span>
       <div class="ml-table-wrap">
         <table>
           <thead>
@@ -18195,7 +17381,7 @@ function renderMlComparison(timeframe: BacktestResultTimeframe) {
             (row) => `
               <span data-verdict="${escapeHtml(row.verdict.toLowerCase())}">
                 <b>${algoBacktestTimeframeLabel(row.timeframe)}</b>
-                ${escapeHtml(row.bestVariant)} · ${signedCurrency(row.bestPnl)} · PF ${row.bestProfitFactor ?? "NA"} · ${escapeHtml(row.verdict)}
+                ${escapeHtml(row.bestVariant)} - ${signedCurrency(row.bestPnl)} - PF ${row.bestProfitFactor ?? "NA"} - ${escapeHtml(row.verdict)}
               </span>
             `,
           )
@@ -18350,6 +17536,31 @@ function saveStoredConfidenceBacktest(key: string, result: BacktestResult, sessi
   );
 }
 
+function loadStoredRegimeBacktest(): { key: string; result: RegimeBacktestResult; ranAt: string; sessionDate: string } | null {
+  try {
+    const raw = window.localStorage.getItem(REGIME_BACKTEST_RESULT_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as { key?: string; result?: RegimeBacktestResult; ranAt?: string; sessionDate?: string };
+    return parsed.key && parsed.result ? { key: parsed.key, result: parsed.result, ranAt: parsed.ranAt ?? "", sessionDate: parsed.sessionDate ?? "" } : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredRegimeBacktest(key: string, result: RegimeBacktestResult, sessionDate: string) {
+  window.localStorage.setItem(
+    REGIME_BACKTEST_RESULT_STORAGE_KEY,
+    JSON.stringify({
+      key,
+      result,
+      sessionDate,
+      ranAt: new Date().toISOString(),
+    }),
+  );
+}
+
 async function maybeRunConfidenceDailyBacktest(reason: string) {
   if (confidenceBacktestStatus === "running" || confidenceBacktestDatasetCheckInFlight) {
     return;
@@ -18402,16 +17613,18 @@ async function maybeRunConfidenceDailyBacktest(reason: string) {
   confidenceBacktestError = `Daily WCA backtest started after market close (${reason}).`;
   renderConfidenceBacktestState();
   window.setTimeout(() => {
-    try {
-      const result = backtestConfidenceAggregation(state.candles);
-      confidenceBacktestResult = result;
-      confidenceBacktestStatus = "ready";
-      saveStoredConfidenceBacktest(cacheKey, result, latestSessionDate);
-    } catch (error) {
-      confidenceBacktestStatus = "error";
-      confidenceBacktestError = error instanceof Error ? error.message : "Unable to run WCA backtest";
-    }
-    renderConfidenceBacktestState();
+    void (async () => {
+      try {
+        const result = await runBackendConfidenceBacktest(state.candles, latestSessionDate);
+        confidenceBacktestResult = result;
+        confidenceBacktestStatus = "ready";
+        saveStoredConfidenceBacktest(cacheKey, result, latestSessionDate);
+      } catch (error) {
+        confidenceBacktestStatus = "error";
+        confidenceBacktestError = error instanceof Error ? error.message : "Unable to run WCA backtest";
+      }
+      renderConfidenceBacktestState();
+    })();
   }, 0);
 }
 
@@ -18426,7 +17639,10 @@ async function maybeRunDailyAlgorithmBacktests(reason: string) {
   if (!latestSessionDate) {
     confidenceBacktestStatus = "waiting";
     confidenceBacktestError = "Waiting for loaded regular-session candles before daily algorithm backtests.";
+    regimeBacktestStatus = "waiting";
+    regimeBacktestError = "Waiting for loaded regular-session candles before daily Regime backtest.";
     renderConfidenceBacktestState();
+    renderRegimeBacktestState();
     return;
   }
   if (Date.now() < dailyAlgorithmBacktestsNextCheckAt) {
@@ -18440,7 +17656,10 @@ async function maybeRunDailyAlgorithmBacktests(reason: string) {
     if (!dataset.ready) {
       confidenceBacktestStatus = "waiting";
       confidenceBacktestError = `Waiting for backtest dataset through ${latestSessionDate}; latest dataset is ${dataset.range.endDate}.`;
+      regimeBacktestStatus = "waiting";
+      regimeBacktestError = `Waiting for backtest dataset through ${latestSessionDate}; latest dataset is ${dataset.range.endDate}.`;
       renderConfidenceBacktestState();
+      renderRegimeBacktestState();
       return;
     }
     const dailyRunKey = `${latestSessionDate}:${dataset.range.startDate}:${dataset.range.endDate}:${state.symbol}`;
@@ -18448,13 +17667,35 @@ async function maybeRunDailyAlgorithmBacktests(reason: string) {
       return;
     }
     dailyAlgorithmBacktestsLastRunKey = dailyRunKey;
-    const artifactSummary = await waitForDailyBacktestArtifacts(latestSessionDate, dataset.refreshResult);
     const preparedOneMinuteCandles = normalizeCandles(await fetchPreparedBacktestCandles("1Min"));
-    const algorithmResults = await Promise.allSettled([
+    const weightedRefreshResultPromise = runWeightedDailyBacktestRefresh(preparedOneMinuteCandles, latestSessionDate).then(
+      (value): PromiseSettledResult<unknown> => ({ status: "fulfilled", value }),
+      (error): PromiseSettledResult<unknown> => ({ status: "rejected", reason: error }),
+    );
+    const confidenceRefreshResultPromise = runConfidenceDailyBacktestFromPreparedCandles(preparedOneMinuteCandles, latestSessionDate, reason).then(
+      (value): PromiseSettledResult<unknown> => ({ status: "fulfilled", value }),
+      (error): PromiseSettledResult<unknown> => ({ status: "rejected", reason: error }),
+    );
+    const regimeRefreshResultPromise = runRegimeDailyBacktestFromPreparedCandles(preparedOneMinuteCandles, latestSessionDate, reason).then(
+      (value): PromiseSettledResult<unknown> => ({ status: "fulfilled", value }),
+      (error): PromiseSettledResult<unknown> => ({ status: "rejected", reason: error }),
+    );
+    let artifactSummary: ReturnType<typeof dailyBacktestArtifactSummary>;
+    try {
+      artifactSummary = await waitForDailyBacktestArtifacts(latestSessionDate, dataset.refreshResult);
+    } catch (error) {
+      artifactSummary = {
+        ...dailyBacktestArtifactSummary(dataset.refreshResult),
+        message: error instanceof Error ? error.message : `Artifact status unavailable through ${latestSessionDate}.`,
+      };
+    }
+    const [votingResult] = await Promise.allSettled([
       runVotingEnsembleDailyBacktestRefresh(),
-      runWeightedDailyBacktestRefresh(preparedOneMinuteCandles, latestSessionDate),
-      runConfidenceDailyBacktestFromPreparedCandles(preparedOneMinuteCandles, latestSessionDate, reason),
     ]);
+    const weightedResult = await weightedRefreshResultPromise;
+    const confidenceResult = await confidenceRefreshResultPromise;
+    const regimeResult = await regimeRefreshResultPromise;
+    const algorithmResults = [votingResult, weightedResult, confidenceResult, regimeResult];
     showDailyBacktestCompletionPopup({
       key: dailyRunKey,
       sessionDate: latestSessionDate,
@@ -18466,7 +17707,10 @@ async function maybeRunDailyAlgorithmBacktests(reason: string) {
   } catch (error) {
     confidenceBacktestStatus = "waiting";
     confidenceBacktestError = error instanceof Error ? error.message : "Waiting for daily backtest dataset refresh.";
+    regimeBacktestStatus = "waiting";
+    regimeBacktestError = error instanceof Error ? error.message : "Waiting for daily backtest dataset refresh.";
     renderConfidenceBacktestState();
+    renderRegimeBacktestState();
   } finally {
     dailyAlgorithmBacktestsInFlight = false;
   }
@@ -18662,26 +17906,29 @@ async function runVotingEnsembleDailyBacktestRefresh() {
 }
 
 async function runWeightedDailyBacktestRefresh(preparedOneMinuteCandles: Candle[], latestSessionDate: string) {
-  if (weightedInitialWeightsInFlight || state.symbol !== "SPY") {
-    return;
-  }
-  const current = loadWeightedVotingWeightState();
-  if (current.source === "daily" && current.lastUpdatedDate === latestSessionDate) {
+  if (weightedInitialWeightsInFlight || state.symbol !== "SPY" || !preparedOneMinuteCandles.length) {
     return;
   }
   weightedInitialWeightsInFlight = true;
   try {
-    const result = weightedInitialBacktestWeights(preparedOneMinuteCandles);
-    if (!result) {
-      return;
-    }
-    saveWeightedStrategyPerformance(result.performance);
-    saveWeightedVotingWeightState({
-      weights: result.weights,
-      lastUpdatedDate: latestSessionDate,
-      source: "daily",
-      seededAt: new Date().toISOString(),
+    await fetchWeightedVotingJson("/daily-update/run", {
+      method: "POST",
+      body: JSON.stringify({
+        session_date: latestSessionDate,
+        symbol: state.symbol,
+        completed_at: new Date().toISOString(),
+        candles: preparedOneMinuteCandles.map((candle) => ({
+          timestamp: candle.timestamp,
+          open: candle.open,
+          high: candle.high,
+          low: candle.low,
+          close: candle.close,
+          volume: candle.volume,
+        })),
+      }),
     });
+    weightedVotingBackendState.requestKey = "";
+    await refreshWeightedVotingBackendClient({ force: true });
     updateWeightedVotingPanel();
   } finally {
     weightedInitialWeightsInFlight = false;
@@ -18705,7 +17952,7 @@ async function runConfidenceDailyBacktestFromPreparedCandles(preparedOneMinuteCa
   renderConfidenceBacktestState();
   await wait(0);
   try {
-    const result = backtestConfidenceAggregation(preparedOneMinuteCandles);
+    const result = await runBackendConfidenceBacktest(preparedOneMinuteCandles, latestSessionDate);
     confidenceBacktestResult = result;
     confidenceBacktestStatus = "ready";
     saveStoredConfidenceBacktest(cacheKey, result, latestSessionDate);
@@ -18716,7 +17963,183 @@ async function runConfidenceDailyBacktestFromPreparedCandles(preparedOneMinuteCa
   renderConfidenceBacktestState();
 }
 
+async function runRegimeDailyBacktestFromPreparedCandles(preparedOneMinuteCandles: Candle[], latestSessionDate: string, reason: string) {
+  const sorted = preparedOneMinuteCandles
+    .filter((candle) => candle.symbol === state.symbol || !candle.symbol)
+    .slice()
+    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
+  if (sorted.length < 2) {
+    regimeBacktestStatus = "waiting";
+    regimeBacktestError = "Waiting for at least two prepared candles before daily Regime backtest.";
+    renderRegimeBacktestState();
+    return;
+  }
+  const cacheKey = regimeBacktestCacheKey(state.symbol, sorted);
+  if (regimeBacktestCache?.key === cacheKey && regimeBacktestResult) {
+    regimeBacktestStatus = "ready";
+    renderRegimeBacktestState();
+    return;
+  }
+  const autoRunKey = `${latestSessionDate}:${cacheKey}`;
+  if (regimeBacktestAutoRunKey === autoRunKey) {
+    return;
+  }
+  regimeBacktestAutoRunKey = autoRunKey;
+  regimeBacktestStatus = "running";
+  regimeBacktestError = `Daily Regime backtest started after dataset refresh (${reason}).`;
+  renderRegimeBacktestState();
+  await wait(0);
+  try {
+    const regimeSettings = state.regimeTradingSettings as typeof state.regimeTradingSettings & {
+      mlMode?: "off" | "shadow" | "confirm_only" | "active";
+      shortEntriesEnabled?: boolean;
+    };
+    const result = runRegimeBacktest({
+      symbol: state.symbol,
+      candles: sorted,
+      settings: regimeSettings,
+      startingCapital: regimeSettings.startingCapital,
+      mlMode: regimeSettings.mlMode ?? "shadow",
+      shortEntriesEnabled: regimeSettings.shortEntriesEnabled ?? false,
+      costModel: {
+        slippagePerShare: regimeSettings.slippagePerShare,
+        orderDelayBars: 1,
+      },
+    });
+    regimeBacktestResult = result;
+    regimeBacktestCache = { key: cacheKey, result };
+    regimeBacktestStatus = "ready";
+    saveStoredRegimeBacktest(cacheKey, result, latestSessionDate);
+    void recordRegimeBacktestResult(result);
+  } catch (error) {
+    regimeBacktestStatus = "error";
+    regimeBacktestError = error instanceof Error ? error.message : "Unable to run Regime backtest";
+  }
+  renderRegimeBacktestState();
+}
+
+async function recordRegimeBacktestResult(result: RegimeBacktestResult) {
+  try {
+    await fetchWithTimeout(`${API_BASE}/api/regime/backtests/record`, 10000, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ result }),
+    });
+  } catch {
+    // Regime backtest persistence is best-effort; the local result remains available.
+  }
+}
+
+async function runBackendConfidenceBacktest(preparedOneMinuteCandles: Candle[], latestSessionDate: string): Promise<BacktestResult> {
+  const sorted = preparedOneMinuteCandles.slice().sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
+  if (sorted.length < 2) {
+    throw new Error("Backend WCA backtest requires at least two candles.");
+  }
+  const first = sorted[0];
+  const last = sorted.at(-1)!;
+  const settings = state.confidenceTradingSettings;
+  const defaults = confidenceDefaultSizingSettings();
+  const payload = {
+    configuration: {
+      run_id: `wca-daily-${state.symbol}-${latestSessionDate}`,
+      mode: "DAILY_SMOKE",
+      symbol: state.symbol,
+      start: first.timestamp,
+      end: last.timestamp,
+      configuration_version: "wca_frontend_backend_backtest_v1",
+      data_manifest_hash: confidenceBacktestCacheKey(sorted),
+      side_mode: "long_only",
+      starting_equity: settings.startingCapital,
+      slippage_per_share: settings.slippagePerShare,
+      fee_per_share: 0,
+      spread_bps: 2,
+      market_impact_bps: 1,
+      max_participation_percent: defaults.maxParticipationPercent,
+      allow_partial_fills: true,
+      smoke_sessions: 3,
+    },
+    candles: sorted.map((candle) => ({
+      timestamp: candle.timestamp,
+      open: candle.open,
+      high: candle.high,
+      low: candle.low,
+      close: candle.close,
+      volume: candle.volume,
+      vwap: null,
+    })),
+  };
+  const response = await fetchWithTimeout(`${API_BASE}/api/wca/backtests`, 30000, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw new Error(`Backend WCA backtest failed (${response.status}): ${await response.text()}`);
+  }
+  const backend = (await response.json()) as WcaBacktestResult;
+  latestWcaBackendBacktestResult = backend;
+  wcaPresentationState = withWcaReady(wcaPresentationState, {
+    latestBacktest: backend,
+  });
+  renderWcaPresentationMount();
+  return backendWcaBacktestToFrontendResult(backend);
+}
+
+function backendWcaBacktestToFrontendResult(backend: any): BacktestResult {
+  const config = backend.run_configuration ?? backend.runConfiguration ?? {};
+  const metrics = backend.metrics ?? {};
+  const trades = Array.isArray(backend.trades) ? backend.trades : [];
+  const startingCapital = Number(config.starting_equity ?? config.startingEquity ?? metrics.startingCapital ?? state.confidenceTradingSettings.startingCapital);
+  const totalPnl = Number(backend.total_pnl ?? backend.totalPnl ?? 0);
+  const winners = trades.filter((trade: any) => Number(trade.pnl ?? 0) > 0).length;
+  const losers = trades.length - winners;
+  return {
+    timeframe: "1Min",
+    dateLabel: config.end ? formatBacktestDate(config.end) : "Backend WCA",
+    rangeLabel: config.start && config.end ? `${formatBacktestDate(config.start)} to ${formatBacktestDate(config.end)} backend WCA replay` : "Backend WCA replay",
+    trades: trades.map((trade: any) => ({
+      side: trade.side === "SELL" ? "Short" : "Long",
+      entryAt: trade.entry_at ?? trade.entryAt,
+      exitAt: trade.exit_at ?? trade.exitAt ?? trade.entry_at ?? trade.entryAt,
+      entryPrice: Number(trade.entry_price ?? trade.entryPrice ?? 0),
+      exitPrice: Number(trade.exit_price ?? trade.exitPrice ?? 0),
+      shares: Number(trade.quantity ?? trade.shares ?? 0),
+      exitReason: trade.exit_reason ?? trade.exitReason ?? "",
+      pnl: Number(trade.pnl ?? 0),
+      returnPercent: startingCapital ? (Number(trade.pnl ?? 0) / startingCapital) * 100 : 0,
+    })),
+    totalTrades: trades.length,
+    displayedTrades: trades.length,
+    totalPnl,
+    totalReturnPercent: Number(backend.total_return_percent ?? backend.totalReturnPercent ?? 0),
+    startingCapital,
+    finalEquity: Number(metrics.finalEquity ?? startingCapital + totalPnl),
+    maxDrawdown: Number(backend.max_drawdown ?? backend.maxDrawdown ?? 0),
+    winners,
+    losers,
+    bars: Number(metrics.bars ?? 0),
+    startDate: config.start,
+    endDate: config.end,
+    strategyDescription: "Backend-authoritative WCA replay",
+    riskConfig: {
+      startingCapital,
+      riskPerTradePercent: confidenceDefaultSizingSettings().baseRiskPercent,
+      maxDailyLossPercent: confidenceDefaultSizingSettings().maxDailyLossPercent,
+      maxTradesPerDay: confidenceDefaultSizingSettings().maxDailyTrades,
+      sessionStart: "09:30 ET",
+      newTradesUntil: "15:30 ET",
+      forceClose: "15:59 ET",
+      execution: "Backend WCA next-bar simulation",
+      stopLossPercent: confidenceDefaultSizingSettings().minimumStopDistancePercent,
+      takeProfitR: state.confidenceTradingSettings.takeProfitR,
+      slippagePerShare: Number(config.slippage_per_share ?? 0),
+      positionSizing: "Backend WCA sizing service",
+    },
+  };
+}
+
 function renderConfidenceBacktestState() {
+  renderWcaPresentationMount();
   confidenceBacktestStatusLabel.textContent =
     confidenceBacktestStatus === "running"
       ? "Running after close"
@@ -18749,6 +18172,41 @@ function renderConfidenceBacktestState() {
   }
   confidenceBacktestSummary.innerHTML = renderConfidenceBacktestSummary(confidenceBacktestResult);
   confidenceBacktestTradesTable.innerHTML = renderBacktestTrades(confidenceBacktestResult.trades);
+}
+
+function renderRegimeBacktestState() {
+  regimeBacktestStatusLabel.textContent =
+    regimeBacktestStatus === "running"
+      ? "Running after close"
+      : regimeBacktestStatus === "ready"
+        ? "Daily result ready"
+        : regimeBacktestStatus === "waiting"
+          ? "Waiting for dataset"
+          : regimeBacktestStatus === "error"
+            ? "Backtest error"
+            : "Daily closed-market run";
+  if (regimeBacktestStatus === "running") {
+    regimeBacktestSummary.innerHTML = `<span>Backtest status: <strong>Running Regime replay after market close...</strong></span><span>${escapeHtml(regimeBacktestError || "Dataset is current; daily Regime backtest is running.")}</span>`;
+    regimeBacktestTradesTable.innerHTML = renderRegimeBacktestTrades([]);
+    return;
+  }
+  if (regimeBacktestStatus === "waiting") {
+    regimeBacktestSummary.innerHTML = `<span>Backtest status: <strong>Waiting</strong></span><span>${escapeHtml(regimeBacktestError || "Regime backtest runs after market close once the prepared candles are current.")}</span>`;
+    regimeBacktestTradesTable.innerHTML = regimeBacktestResult ? renderRegimeBacktestTrades(regimeBacktestResult.trades) : renderRegimeBacktestTrades([]);
+    return;
+  }
+  if (regimeBacktestStatus === "error") {
+    regimeBacktestSummary.innerHTML = `<span>Backtest status: <strong class="negative">${escapeHtml(regimeBacktestError || "Unable to run Regime backtest")}</strong></span>`;
+    regimeBacktestTradesTable.innerHTML = renderRegimeBacktestTrades([]);
+    return;
+  }
+  if (!regimeBacktestResult) {
+    regimeBacktestSummary.innerHTML = `<span>Backtest status: <strong>Scheduled</strong></span><span>Runs daily after market close as an isolated Regime replay.</span>`;
+    regimeBacktestTradesTable.innerHTML = renderRegimeBacktestTrades([]);
+    return;
+  }
+  regimeBacktestSummary.innerHTML = renderRegimeBacktestSummary(regimeBacktestResult);
+  regimeBacktestTradesTable.innerHTML = renderRegimeBacktestTrades(regimeBacktestResult.trades);
 }
 
 function latestRegularSessionDateForConfidenceBacktest(candles: Candle[]) {
@@ -18832,10 +18290,9 @@ function backtestConfidenceAggregation(candles: Candle[]): BacktestResult {
       const history = dayCandles.slice(0, index + 1);
       const market = confidenceMarketSnapshotFromCandles(history, allCandlesThroughNow);
       const currentPositionValue = openTrade ? openTrade.shares * candle.close : 0;
-      const result = calculateConfidenceAggregationFromMarket(market, {
-        hardFilters: confidenceBacktestHardFilters,
-        sizing: (snapshot, signal, normalizedNetScore) => confidenceBacktestPositionSizing(snapshot, signal, normalizedNetScore, currentPositionValue),
-      });
+      void market;
+      void currentPositionValue;
+      const result = wcaBackendEmptyConfidenceResult("Frontend WCA replay disabled; use backend WCA backtest.");
 
       if (openTrade) {
         const exit = confidenceBacktestExit(openTrade, candle, history, result);
@@ -19329,28 +18786,11 @@ function historicalStrategyVotes(history: Candle[], priorClose: number): AlgoVot
       detail: "Fades ATR distance from 20 SMA",
     },
     {
-      strategy: "Relative Strength vs QQQ/IWM",
-      signal: recentReturn > 1.2 && latest.close > vwap ? "Buy" : recentReturn < -1.2 && latest.close < vwap ? "Sell" : "Hold",
-      detail: "SPY-relative-strength proxy until QQQ/IWM feeds are attached",
-    },
-    {
-      strategy: "Market Breadth Momentum",
-      signal: trendUp && recentReturn > 0.6 ? "Buy" : trendDown && recentReturn < -0.6 ? "Sell" : "Hold",
-      detail: "SPY breadth-momentum proxy until breadth feed is attached",
-    },
-    {
       strategy: "Economic Event Reaction Strategy",
       signal: gapPercent > 0.15 && latest.close > openingRange.high ? "Buy" : gapPercent < -0.15 && latest.close < openingRange.low ? "Sell" : "Hold",
       detail: "Gap/opening-range event reaction",
     },
   ];
-  const buyVotes = rawVotes.filter((vote) => vote.signal === "Buy").length;
-  const sellVotes = rawVotes.filter((vote) => vote.signal === "Sell").length;
-  rawVotes.push({
-    strategy: "Ensemble Strategy Voting",
-    signal: buyVotes >= 3 && buyVotes > sellVotes ? "Buy" : sellVotes >= 3 && sellVotes > buyVotes ? "Sell" : "Hold",
-    detail: "Meta vote follows clear strategy majority",
-  });
   return rawVotes;
 }
 
@@ -19381,9 +18821,24 @@ function renderConfidenceBacktestSummary(backtest: BacktestResult) {
   return `
     <span>Backtest range: <strong>${escapeHtml(rangeLabel)}</strong></span>
     <span>Model: ${escapeHtml(backtest.strategyDescription ?? "WCA short-cycle backtest")}</span>
-    <span>Bars: ${backtest.bars ?? "NA"} · trades: ${totalTrades} · win rate: ${winRate}</span>
+    <span>Bars: ${backtest.bars ?? "NA"} - trades: ${totalTrades} - win rate: ${winRate}</span>
     <span>P/L: <strong class="${backtest.totalPnl >= 0 ? "positive" : "negative"}">${signedCurrency(backtest.totalPnl)}</strong> (${signed(backtest.totalReturnPercent)}% account)</span>
-    <span>Drawdown: ${currency(backtest.maxDrawdown ?? 0)} (${roundNumber(backtest.maxDrawdownPercent ?? 0, 2)}%) · profit factor: ${profitFactor}</span>
+    <span>Drawdown: ${currency(backtest.maxDrawdown ?? 0)} (${roundNumber(backtest.maxDrawdownPercent ?? 0, 2)}%) - profit factor: ${profitFactor}</span>
+  `;
+}
+
+function renderRegimeBacktestSummary(backtest: RegimeBacktestResult) {
+  const metrics = backtest.metrics;
+  const profitFactor = metrics.profitFactor === null ? "Open-ended" : metrics.profitFactor.toFixed(2);
+  const walkForward = backtest.walkForward[0];
+  return `
+    <span>Backtest range: <strong>${escapeHtml(backtest.symbol)} - ${backtest.candles} bars</strong></span>
+    <span>Model: Dedicated Regime replay (${escapeHtml(backtest.engineVersion)})</span>
+    <span>Decisions: ${backtest.decisions.length} - trades: ${metrics.tradeCount} - win rate: ${formatProbability(metrics.winRate)}</span>
+    <span>P/L: <strong class="${metrics.netProfit >= 0 ? "positive" : "negative"}">${signedCurrency(metrics.netProfit)}</strong> (${formatProbability(metrics.netReturn)} account)</span>
+    <span>Drawdown: ${currency(metrics.maximumDrawdown)} - profit factor: ${profitFactor} - no-trade: ${formatProbability(metrics.noTradePercentage)}</span>
+    <span>Artifact: ${escapeHtml(backtest.artifactPath)}${walkForward ? ` - walk-forward ${escapeHtml(walkForward.accepted ? "accepted" : "rejected")}` : ""}</span>
+    <span>API: ${escapeHtml(REGIME_BACKTEST_STATUS_API_ROUTE)}</span>
   `;
 }
 
@@ -19399,10 +18854,33 @@ function renderBacktestTrades(trades: BacktestTrade[]) {
     .map(
       (trade) => `
         <tr>
-          <td>${trade.side}${trade.shares ? ` · ${trade.shares} sh` : ""}</td>
+          <td>${trade.side}${trade.shares ? ` - ${trade.shares} sh` : ""}</td>
           <td>${formatTime(trade.entryAt)} @ ${price(trade.entryPrice)}</td>
-          <td>${formatTime(trade.exitAt)} @ ${price(trade.exitPrice)}${trade.exitReason ? ` · ${escapeHtml(trade.exitReason)}` : ""}</td>
+          <td>${formatTime(trade.exitAt)} @ ${price(trade.exitPrice)}${trade.exitReason ? ` - ${escapeHtml(trade.exitReason)}` : ""}</td>
           <td class="${trade.pnl >= 0 ? "positive" : "negative"}">${signedCurrency(trade.pnl)} (${signed(trade.returnPercent)}%, ${trade.rMultiple ?? "NA"}R)</td>
+        </tr>
+      `,
+    )
+    .join("");
+}
+
+function renderRegimeBacktestTrades(trades: RegimeBacktestResult["trades"]) {
+  if (!trades.length) {
+    return `
+      <tr>
+        <td colspan="4">No closed trades generated for the Regime backtest range.</td>
+      </tr>
+    `;
+  }
+  return trades
+    .slice(-20)
+    .map(
+      (trade) => `
+        <tr>
+          <td>${trade.side} - ${trade.quantity} sh</td>
+          <td>${formatTime(trade.entryAt)} @ ${price(trade.entryPrice)}</td>
+          <td>${formatTime(trade.exitAt)} @ ${price(trade.exitPrice)} - ${escapeHtml(trade.exitReason)}</td>
+          <td class="${trade.pnl >= 0 ? "positive" : "negative"}">${signedCurrency(trade.pnl)} (${trade.rMultiple.toFixed(2)}R)</td>
         </tr>
       `,
     )
@@ -21064,9 +20542,17 @@ async function activateAppAfterWake(reason: string) {
       return;
     }
     shouldResumeRefresh = true;
-    await startMarketForecastPredictionLedger(reason);
-    await loadLatestDynamicTradingArtifact();
     await loadCandles({ showLoading: false, refresh: true });
+    try {
+      await startMarketForecastPredictionLedger(reason);
+    } catch {
+      // Weighted Voting relies on loaded market candles, not forecast artifacts.
+    }
+    try {
+      await loadLatestDynamicTradingArtifact();
+    } catch {
+      // Dynamic artifacts are optional for Weighted Voting startup.
+    }
     void loadAlgoBacktestCandles();
     void saveBrowserStorageSnapshot(`wake-${reason}`);
   } catch {
@@ -21278,7 +20764,7 @@ function renderStrategies(context: MarketContext) {
   const visibleStrategies = strategyFitDisplayRows(context.strategies);
   const strong = visibleStrategies.filter((strategy) => strategy.status === "Strong Fit").length;
   strategySummary.textContent = strong
-    ? `${strong} strong fit${strong === 1 ? "" : "s"} · ${visibleStrategies.length} strategies`
+    ? `${strong} strong fit${strong === 1 ? "" : "s"} - ${visibleStrategies.length} strategies`
     : `${visibleStrategies.length} strategies ranked`;
   contextUpdatedAt.textContent = context.updatedAt ? `updated ${formatDate(context.updatedAt)}` : "updated --";
   strategyList.innerHTML = visibleStrategies
@@ -21287,13 +20773,13 @@ function renderStrategies(context: MarketContext) {
         <article class="strategy-card" data-status="${strategy.status.toLowerCase().replaceAll(" ", "-")}">
           <div class="strategy-main">
             <strong>${escapeHtml(strategy.name)}</strong>
-            <span>${strategy.status} · ${strategy.score}%</span>
+            <span>${strategy.status} - ${strategy.score}%</span>
           </div>
           <div class="strategy-detail">
-            <span>${strategy.matches.length ? escapeHtml(strategy.matches.join(" · ")) : "No strong confirming condition"}</span>
+            <span>${strategy.matches.length ? escapeHtml(strategy.matches.join(" - ")) : "No strong confirming condition"}</span>
             ${
               strategy.risks.length
-                ? `<span class="strategy-risk">${escapeHtml(strategy.risks.join(" · "))}</span>`
+                ? `<span class="strategy-risk">${escapeHtml(strategy.risks.join(" - "))}</span>`
                 : `<span class="strategy-clear">No major blocker</span>`
             }
           </div>
@@ -21327,7 +20813,8 @@ function strategyFitDisplayRows(sourceStrategies: StrategyFit[]) {
 function allAlgorithmStrategyFitNames() {
   return Array.from(
     new Set([
-      ...strategyVoteCatalog,
+      ...directionalVoteCatalog,
+      ...contextSignalCatalog,
       ...weightedAlphaStrategies.map((strategy) => strategy.name),
       ...confidenceAggregationStrategies.map((strategy) => strategy.name),
       ...regimeSelectionStrategies.map((strategy) => strategy.name),
@@ -21616,3 +21103,4 @@ void loadMarketContext();
 void loadCandles();
 void loadLatestDynamicTradingArtifact();
 void loadAlgoBacktestCandles();
+

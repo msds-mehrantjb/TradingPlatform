@@ -9,6 +9,8 @@ __pycache__/
 *.pyo
 .pycache-check/
 .pytest_cache/
+.pytest_tmp/
+pytest-cache-files-*/
 .mypy_cache/
 .ruff_cache/
 .venv/
@@ -29,6 +31,8 @@ dist/
 data/
 backend/data/
 backend/trading.db*
+backend/tests/tmp/
+backend/tests/.tmp_*/
 
 # Logs
 *.log

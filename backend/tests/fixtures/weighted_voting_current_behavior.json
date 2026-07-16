@@ -1,0 +1,365 @@
+{
+  "fixtureVersion": "weighted_voting_current_behavior_v1",
+  "source": {
+    "primaryFile": "frontend/src/main.ts",
+    "primaryFunction": "calculateWeightedVote",
+    "aggregationFormula": "buyScore/sellScore/holdScore = sum(strategy.finalWeight * strategy.pSide); rawWinner = highest score; finalSignal = Hold if any gate fails else rawWinner",
+    "notes": [
+      "These fixtures freeze current post-signal behavior only.",
+      "They are not a backend Weighted Voting implementation.",
+      "Representative candles are abbreviated context traces; strategyRows are the fixed inputs used to reproduce scores."
+    ]
+  },
+  "requiredCoverage": [
+    "trending_session",
+    "range_bound_session",
+    "high_volatility_session",
+    "low_volume_session",
+    "wide_spread_session",
+    "buy_result",
+    "sell_result",
+    "hold_result"
+  ],
+  "strategyCatalog": [
+    { "key": "S1", "name": "Opening Range Breakout", "family": "breakout" },
+    { "key": "S2", "name": "First Pullback After Open", "family": "trend" },
+    { "key": "S3", "name": "VWAP Trend Continuation", "family": "trend" },
+    { "key": "S4", "name": "VWAP Mean Reversion", "family": "mean_reversion" },
+    { "key": "S5", "name": "Failed Breakout Reversal", "family": "reversal" },
+    { "key": "S6", "name": "Liquidity Sweep Reversal", "family": "reversal" },
+    { "key": "S7", "name": "Bollinger/ATR Reversion", "family": "mean_reversion" },
+    { "key": "S8", "name": "Volatility Breakout", "family": "breakout" }
+  ],
+  "scenarios": [
+    {
+      "id": "trending_session_buy_result",
+      "coverage": ["trending_session", "buy_result"],
+      "description": "Trend and breakout rows carry capped weights; all current gates pass, so final signal remains Buy.",
+      "decisionTimestamp": "2026-01-05T15:05:00Z",
+      "sessionContext": {
+        "symbol": "SPY",
+        "timeframe": "1Min",
+        "marketShape": "trending_up",
+        "latestClose": 502.8,
+        "vwap": 501.9,
+        "atr": 0.42,
+        "averageVolume": 725000,
+        "latestVolume": 940000,
+        "spreadPercent": 0.00008,
+        "fiveMinuteDirection": "up"
+      },
+      "representativeCandles": [
+        { "timestamp": "2026-01-05T14:30:00Z", "open": 500.0, "high": 500.4, "low": 499.8, "close": 500.3, "volume": 780000 },
+        { "timestamp": "2026-01-05T14:45:00Z", "open": 500.3, "high": 501.2, "low": 500.2, "close": 501.0, "volume": 820000 },
+        { "timestamp": "2026-01-05T15:00:00Z", "open": 501.0, "high": 502.9, "low": 500.9, "close": 502.8, "volume": 940000 }
+      ],
+      "strategyRows": [
+        { "key": "S1", "finalWeight": 0.25, "pBuy": 0.66, "pSell": 0.08, "pHold": 0.26 },
+        { "key": "S2", "finalWeight": 0.25, "pBuy": 0.63, "pSell": 0.1, "pHold": 0.27 },
+        { "key": "S3", "finalWeight": 0.25, "pBuy": 0.68, "pSell": 0.07, "pHold": 0.25 },
+        { "key": "S4", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S5", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S6", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S7", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S8", "finalWeight": 0.25, "pBuy": 0.62, "pSell": 0.12, "pHold": 0.26 }
+      ],
+      "gates": [
+        { "label": "Confidence", "status": "pass" },
+        { "label": "Active Strategies", "status": "pass" },
+        { "label": "Directional Strategy Count", "status": "pass" },
+        { "label": "5m Confirmation", "status": "pass" },
+        { "label": "Expected Value", "status": "pass" },
+        { "label": "Triple Barrier", "status": "pass" },
+        { "label": "Daily Loss", "status": "pass" },
+        { "label": "Spread/Slippage", "status": "pass" },
+        { "label": "1m Volume", "status": "pass" },
+        { "label": "Max Daily Trades", "status": "pass" },
+        { "label": "Pyramiding", "status": "pass" }
+      ],
+      "expectedCurrentOutput": {
+        "buyScore": 0.6475,
+        "sellScore": 0.0925,
+        "holdScore": 0.26,
+        "rawWinner": "Buy",
+        "margin": 0.3875,
+        "finalSignal": "Buy",
+        "failedGates": []
+      }
+    },
+    {
+      "id": "sell_result_breakdown",
+      "coverage": ["sell_result"],
+      "description": "Trend and breakout rows carry capped bearish weights; all current gates pass, so final signal remains Sell.",
+      "decisionTimestamp": "2026-01-06T15:05:00Z",
+      "sessionContext": {
+        "symbol": "SPY",
+        "timeframe": "1Min",
+        "marketShape": "trending_down",
+        "latestClose": 496.1,
+        "vwap": 497.2,
+        "atr": 0.46,
+        "averageVolume": 760000,
+        "latestVolume": 970000,
+        "spreadPercent": 0.00008,
+        "fiveMinuteDirection": "down"
+      },
+      "representativeCandles": [
+        { "timestamp": "2026-01-06T14:30:00Z", "open": 499.5, "high": 499.7, "low": 498.8, "close": 499.0, "volume": 790000 },
+        { "timestamp": "2026-01-06T14:45:00Z", "open": 499.0, "high": 499.1, "low": 497.4, "close": 497.7, "volume": 840000 },
+        { "timestamp": "2026-01-06T15:00:00Z", "open": 497.7, "high": 497.9, "low": 496.0, "close": 496.1, "volume": 970000 }
+      ],
+      "strategyRows": [
+        { "key": "S1", "finalWeight": 0.25, "pBuy": 0.08, "pSell": 0.66, "pHold": 0.26 },
+        { "key": "S2", "finalWeight": 0.25, "pBuy": 0.1, "pSell": 0.63, "pHold": 0.27 },
+        { "key": "S3", "finalWeight": 0.25, "pBuy": 0.07, "pSell": 0.68, "pHold": 0.25 },
+        { "key": "S4", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S5", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S6", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S7", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S8", "finalWeight": 0.25, "pBuy": 0.12, "pSell": 0.62, "pHold": 0.26 }
+      ],
+      "gates": [
+        { "label": "Confidence", "status": "pass" },
+        { "label": "Active Strategies", "status": "pass" },
+        { "label": "Directional Strategy Count", "status": "pass" },
+        { "label": "5m Confirmation", "status": "pass" },
+        { "label": "Expected Value", "status": "pass" },
+        { "label": "Triple Barrier", "status": "pass" },
+        { "label": "Daily Loss", "status": "pass" },
+        { "label": "Spread/Slippage", "status": "pass" },
+        { "label": "1m Volume", "status": "pass" },
+        { "label": "Max Daily Trades", "status": "pass" },
+        { "label": "Pyramiding", "status": "pass" }
+      ],
+      "expectedCurrentOutput": {
+        "buyScore": 0.0925,
+        "sellScore": 0.6475,
+        "holdScore": 0.26,
+        "rawWinner": "Sell",
+        "margin": 0.3875,
+        "finalSignal": "Sell",
+        "failedGates": []
+      }
+    },
+    {
+      "id": "range_bound_session_hold_result",
+      "coverage": ["range_bound_session", "hold_result"],
+      "description": "All strategy rows remain no-setup rows with equal default weights; Hold wins.",
+      "decisionTimestamp": "2026-01-07T16:00:00Z",
+      "sessionContext": {
+        "symbol": "SPY",
+        "timeframe": "1Min",
+        "marketShape": "range_bound",
+        "latestClose": 500.1,
+        "vwap": 500.0,
+        "atr": 0.18,
+        "averageVolume": 520000,
+        "latestVolume": 510000,
+        "spreadPercent": 0.00008,
+        "fiveMinuteDirection": "neutral"
+      },
+      "representativeCandles": [
+        { "timestamp": "2026-01-07T14:30:00Z", "open": 500.0, "high": 500.3, "low": 499.8, "close": 500.1, "volume": 520000 },
+        { "timestamp": "2026-01-07T14:45:00Z", "open": 500.1, "high": 500.4, "low": 499.9, "close": 500.0, "volume": 505000 },
+        { "timestamp": "2026-01-07T15:00:00Z", "open": 500.0, "high": 500.3, "low": 499.8, "close": 500.1, "volume": 510000 }
+      ],
+      "strategyRows": [
+        { "key": "S1", "finalWeight": 0.125, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S2", "finalWeight": 0.125, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S3", "finalWeight": 0.125, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S4", "finalWeight": 0.125, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S5", "finalWeight": 0.125, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S6", "finalWeight": 0.125, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S7", "finalWeight": 0.125, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S8", "finalWeight": 0.125, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 }
+      ],
+      "gates": [
+        { "label": "Confidence", "status": "pass" },
+        { "label": "Active Strategies", "status": "pass" },
+        { "label": "Directional Strategy Count", "status": "pass" },
+        { "label": "5m Confirmation", "status": "info" },
+        { "label": "Expected Value", "status": "fail" },
+        { "label": "Triple Barrier", "status": "fail" },
+        { "label": "Daily Loss", "status": "pass" },
+        { "label": "Spread/Slippage", "status": "pass" },
+        { "label": "1m Volume", "status": "pass" },
+        { "label": "Max Daily Trades", "status": "pass" },
+        { "label": "Pyramiding", "status": "pass" }
+      ],
+      "expectedCurrentOutput": {
+        "buyScore": 0.18,
+        "sellScore": 0.18,
+        "holdScore": 0.64,
+        "rawWinner": "Hold",
+        "margin": 0.46,
+        "finalSignal": "Hold",
+        "failedGates": ["Expected Value", "Triple Barrier"]
+      }
+    },
+    {
+      "id": "high_volatility_session_buy_blocked",
+      "coverage": ["high_volatility_session", "buy_result"],
+      "description": "Buy score wins, but current gates block final signal because triple-barrier path quality fails in a high-volatility context.",
+      "decisionTimestamp": "2026-01-08T15:05:00Z",
+      "sessionContext": {
+        "symbol": "SPY",
+        "timeframe": "1Min",
+        "marketShape": "high_volatility",
+        "latestClose": 503.0,
+        "vwap": 501.6,
+        "atr": 1.82,
+        "averageVolume": 1150000,
+        "latestVolume": 1380000,
+        "spreadPercent": 0.00008,
+        "fiveMinuteDirection": "up"
+      },
+      "representativeCandles": [
+        { "timestamp": "2026-01-08T14:30:00Z", "open": 500.0, "high": 503.0, "low": 498.7, "close": 502.4, "volume": 1220000 },
+        { "timestamp": "2026-01-08T14:45:00Z", "open": 502.4, "high": 504.1, "low": 499.2, "close": 500.3, "volume": 1310000 },
+        { "timestamp": "2026-01-08T15:00:00Z", "open": 500.3, "high": 503.4, "low": 499.9, "close": 503.0, "volume": 1380000 }
+      ],
+      "strategyRows": [
+        { "key": "S1", "finalWeight": 0.25, "pBuy": 0.66, "pSell": 0.08, "pHold": 0.26 },
+        { "key": "S2", "finalWeight": 0.25, "pBuy": 0.63, "pSell": 0.1, "pHold": 0.27 },
+        { "key": "S3", "finalWeight": 0.25, "pBuy": 0.68, "pSell": 0.07, "pHold": 0.25 },
+        { "key": "S4", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S5", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S6", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S7", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S8", "finalWeight": 0.25, "pBuy": 0.62, "pSell": 0.12, "pHold": 0.26 }
+      ],
+      "gates": [
+        { "label": "Confidence", "status": "pass" },
+        { "label": "Active Strategies", "status": "pass" },
+        { "label": "Directional Strategy Count", "status": "pass" },
+        { "label": "5m Confirmation", "status": "pass" },
+        { "label": "Expected Value", "status": "pass" },
+        { "label": "Triple Barrier", "status": "fail" },
+        { "label": "Daily Loss", "status": "pass" },
+        { "label": "Spread/Slippage", "status": "pass" },
+        { "label": "1m Volume", "status": "pass" },
+        { "label": "Max Daily Trades", "status": "pass" },
+        { "label": "Pyramiding", "status": "pass" }
+      ],
+      "expectedCurrentOutput": {
+        "buyScore": 0.6475,
+        "sellScore": 0.0925,
+        "holdScore": 0.26,
+        "rawWinner": "Buy",
+        "margin": 0.3875,
+        "finalSignal": "Hold",
+        "failedGates": ["Triple Barrier"]
+      }
+    },
+    {
+      "id": "low_volume_session_buy_blocked",
+      "coverage": ["low_volume_session", "buy_result"],
+      "description": "Buy score wins, but current 1-minute volume gate blocks final signal.",
+      "decisionTimestamp": "2026-01-09T15:05:00Z",
+      "sessionContext": {
+        "symbol": "SPY",
+        "timeframe": "1Min",
+        "marketShape": "low_volume",
+        "latestClose": 501.2,
+        "vwap": 500.8,
+        "atr": 0.25,
+        "averageVolume": 95000,
+        "latestVolume": 42000,
+        "spreadPercent": 0.00008,
+        "fiveMinuteDirection": "up"
+      },
+      "representativeCandles": [
+        { "timestamp": "2026-01-09T14:30:00Z", "open": 500.0, "high": 500.3, "low": 499.9, "close": 500.2, "volume": 82000 },
+        { "timestamp": "2026-01-09T14:45:00Z", "open": 500.2, "high": 500.9, "low": 500.1, "close": 500.8, "volume": 56000 },
+        { "timestamp": "2026-01-09T15:00:00Z", "open": 500.8, "high": 501.3, "low": 500.7, "close": 501.2, "volume": 42000 }
+      ],
+      "strategyRows": [
+        { "key": "S1", "finalWeight": 0.25, "pBuy": 0.66, "pSell": 0.08, "pHold": 0.26 },
+        { "key": "S2", "finalWeight": 0.25, "pBuy": 0.63, "pSell": 0.1, "pHold": 0.27 },
+        { "key": "S3", "finalWeight": 0.25, "pBuy": 0.68, "pSell": 0.07, "pHold": 0.25 },
+        { "key": "S4", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S5", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S6", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S7", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S8", "finalWeight": 0.25, "pBuy": 0.62, "pSell": 0.12, "pHold": 0.26 }
+      ],
+      "gates": [
+        { "label": "Confidence", "status": "pass" },
+        { "label": "Active Strategies", "status": "pass" },
+        { "label": "Directional Strategy Count", "status": "pass" },
+        { "label": "5m Confirmation", "status": "pass" },
+        { "label": "Expected Value", "status": "pass" },
+        { "label": "Triple Barrier", "status": "pass" },
+        { "label": "Daily Loss", "status": "pass" },
+        { "label": "Spread/Slippage", "status": "pass" },
+        { "label": "1m Volume", "status": "fail" },
+        { "label": "Max Daily Trades", "status": "pass" },
+        { "label": "Pyramiding", "status": "pass" }
+      ],
+      "expectedCurrentOutput": {
+        "buyScore": 0.6475,
+        "sellScore": 0.0925,
+        "holdScore": 0.26,
+        "rawWinner": "Buy",
+        "margin": 0.3875,
+        "finalSignal": "Hold",
+        "failedGates": ["1m Volume"]
+      }
+    },
+    {
+      "id": "wide_spread_session_buy_blocked",
+      "coverage": ["wide_spread_session", "buy_result"],
+      "description": "Buy score wins, but current spread/slippage gate blocks final signal.",
+      "decisionTimestamp": "2026-01-12T15:05:00Z",
+      "sessionContext": {
+        "symbol": "SPY",
+        "timeframe": "1Min",
+        "marketShape": "wide_spread",
+        "latestClose": 502.0,
+        "vwap": 501.3,
+        "atr": 0.35,
+        "averageVolume": 620000,
+        "latestVolume": 750000,
+        "spreadPercent": 0.003,
+        "fiveMinuteDirection": "up"
+      },
+      "representativeCandles": [
+        { "timestamp": "2026-01-12T14:30:00Z", "open": 500.4, "high": 500.9, "low": 500.1, "close": 500.8, "volume": 640000 },
+        { "timestamp": "2026-01-12T14:45:00Z", "open": 500.8, "high": 501.7, "low": 500.6, "close": 501.5, "volume": 690000 },
+        { "timestamp": "2026-01-12T15:00:00Z", "open": 501.5, "high": 502.2, "low": 501.2, "close": 502.0, "volume": 750000 }
+      ],
+      "strategyRows": [
+        { "key": "S1", "finalWeight": 0.25, "pBuy": 0.66, "pSell": 0.08, "pHold": 0.26 },
+        { "key": "S2", "finalWeight": 0.25, "pBuy": 0.63, "pSell": 0.1, "pHold": 0.27 },
+        { "key": "S3", "finalWeight": 0.25, "pBuy": 0.68, "pSell": 0.07, "pHold": 0.25 },
+        { "key": "S4", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S5", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S6", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S7", "finalWeight": 0.0, "pBuy": 0.18, "pSell": 0.18, "pHold": 0.64 },
+        { "key": "S8", "finalWeight": 0.25, "pBuy": 0.62, "pSell": 0.12, "pHold": 0.26 }
+      ],
+      "gates": [
+        { "label": "Confidence", "status": "pass" },
+        { "label": "Active Strategies", "status": "pass" },
+        { "label": "Directional Strategy Count", "status": "pass" },
+        { "label": "5m Confirmation", "status": "pass" },
+        { "label": "Expected Value", "status": "pass" },
+        { "label": "Triple Barrier", "status": "pass" },
+        { "label": "Daily Loss", "status": "pass" },
+        { "label": "Spread/Slippage", "status": "fail" },
+        { "label": "1m Volume", "status": "pass" },
+        { "label": "Max Daily Trades", "status": "pass" },
+        { "label": "Pyramiding", "status": "pass" }
+      ],
+      "expectedCurrentOutput": {
+        "buyScore": 0.6475,
+        "sellScore": 0.0925,
+        "holdScore": 0.26,
+        "rawWinner": "Buy",
+        "margin": 0.3875,
+        "finalSignal": "Hold",
+        "failedGates": ["Spread/Slippage"]
+      }
+    }
+  ]
+}

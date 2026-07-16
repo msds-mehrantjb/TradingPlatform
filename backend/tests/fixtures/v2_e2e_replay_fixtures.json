@@ -1,0 +1,274 @@
+{
+  "schemaVersion": "v2_e2e_replay_fixture_v1",
+  "marketDataFeed": "sanitized_synthetic",
+  "sessionDate": "2026-01-05",
+  "generatorVersion": "sanitized_synthetic_replay_sessions_v1",
+  "dataPolicy": {
+    "containsCredentials": false,
+    "containsPrivateAccountInformation": false,
+    "requiresLiveFeed": false,
+    "explanation": "OHLCV bars are deterministic synthetic fixtures shaped to resemble historical replay regimes without storing broker/account identifiers or live-feed exports."
+  },
+  "fixtures": [
+    {
+      "id": "strong_uptrend",
+      "description": "Strong regular-session uptrend with persistent rising closes.",
+      "barsHash": "87879bc454fb124d",
+      "economicEventState": { "active": false, "importance": "low", "state": "none" },
+      "expected": {
+        "decisionTimestampUtc": "2026-01-05T14:59:00Z",
+        "featureStates": { "dataReady": true, "vwap": 102.6663, "atr14": 0.3583, "adx14": 100.0, "gapPercent": 0.0 },
+        "strategyOutputs": {
+          "multi_timeframe_trend_alignment": "BUY",
+          "first_pullback_after_open": "HOLD",
+          "vwap_trend_continuation": "HOLD",
+          "opening_range_breakout": "HOLD",
+          "volatility_breakout": "HOLD",
+          "failed_breakout_reversal": "HOLD",
+          "liquidity_sweep_reversal": "HOLD",
+          "vwap_mean_reversion": "HOLD",
+          "bollinger_atr_reversion": "HOLD",
+          "gap_continuation_gap_fade": "HOLD"
+        },
+        "familyScores": { "TREND": { "buyScore": 0.0, "sellScore": 0.0, "holdScore": 1.0 } },
+        "gateResults": { "status": "PASS", "hardBlockerIds": [] },
+        "policyResult": { "tradeAllowed": null, "quantity": null, "riskDollars": null },
+        "paperOrderResult": { "orderType": null, "quantity": null, "eligible": null }
+      }
+    },
+    {
+      "id": "strong_downtrend",
+      "description": "Strong regular-session downtrend with persistent falling closes.",
+      "barsHash": "d7d0e063fa32d67a",
+      "economicEventState": { "active": false, "importance": "low", "state": "none" },
+      "expected": {
+        "decisionTimestampUtc": "2026-01-05T14:59:00Z",
+        "featureStates": { "dataReady": true, "vwap": 97.3337, "atr14": 0.3583, "adx14": 100.0, "gapPercent": 0.0 },
+        "strategyOutputs": {
+          "multi_timeframe_trend_alignment": "SELL",
+          "first_pullback_after_open": "HOLD",
+          "vwap_trend_continuation": "HOLD",
+          "opening_range_breakout": "HOLD",
+          "volatility_breakout": "HOLD",
+          "failed_breakout_reversal": "HOLD",
+          "liquidity_sweep_reversal": "HOLD",
+          "vwap_mean_reversion": "HOLD",
+          "bollinger_atr_reversion": "HOLD",
+          "gap_continuation_gap_fade": "HOLD"
+        },
+        "familyScores": { "TREND": { "buyScore": 0.0, "sellScore": 0.0, "holdScore": 1.0 } },
+        "gateResults": { "status": "FAIL", "hardBlockerIds": [] },
+        "policyResult": { "tradeAllowed": null, "quantity": null, "riskDollars": null },
+        "paperOrderResult": { "orderType": null, "quantity": null, "eligible": null }
+      }
+    },
+    {
+      "id": "range_bound_session",
+      "description": "Range-bound session alternating around VWAP.",
+      "barsHash": "b203b734587c23dc",
+      "economicEventState": { "active": false, "importance": "low", "state": "none" },
+      "expected": {
+        "decisionTimestampUtc": "2026-01-05T14:59:00Z",
+        "featureStates": { "dataReady": true, "vwap": 100.0281, "atr14": 0.1521, "adx14": 28.5714, "gapPercent": 0.0 },
+        "strategyOutputs": {
+          "multi_timeframe_trend_alignment": "SELL",
+          "first_pullback_after_open": "HOLD",
+          "vwap_trend_continuation": "HOLD",
+          "opening_range_breakout": "HOLD",
+          "volatility_breakout": "HOLD",
+          "failed_breakout_reversal": "HOLD",
+          "liquidity_sweep_reversal": "HOLD",
+          "vwap_mean_reversion": "HOLD",
+          "bollinger_atr_reversion": "HOLD",
+          "gap_continuation_gap_fade": "HOLD"
+        },
+        "familyScores": { "TREND": { "buyScore": 0.0, "sellScore": 0.0, "holdScore": 1.0 } },
+        "gateResults": { "status": "PASS", "hardBlockerIds": [] },
+        "policyResult": { "tradeAllowed": null, "quantity": null, "riskDollars": null },
+        "paperOrderResult": { "orderType": null, "quantity": null, "eligible": null }
+      }
+    },
+    {
+      "id": "low_volatility_session",
+      "description": "Low-volatility session with narrow completed candle ranges.",
+      "barsHash": "23ee6a19ea3dbcdb",
+      "economicEventState": { "active": false, "importance": "low", "state": "none" },
+      "expected": {
+        "decisionTimestampUtc": "2026-01-05T14:59:00Z",
+        "featureStates": { "dataReady": true, "vwap": 100.0122, "atr14": 0.1077, "adx14": 28.5714, "gapPercent": 0.0 },
+        "strategyOutputs": {
+          "multi_timeframe_trend_alignment": "BUY",
+          "first_pullback_after_open": "HOLD",
+          "vwap_trend_continuation": "HOLD",
+          "opening_range_breakout": "HOLD",
+          "volatility_breakout": "HOLD",
+          "failed_breakout_reversal": "HOLD",
+          "liquidity_sweep_reversal": "HOLD",
+          "vwap_mean_reversion": "HOLD",
+          "bollinger_atr_reversion": "HOLD",
+          "gap_continuation_gap_fade": "HOLD"
+        },
+        "familyScores": { "TREND": { "buyScore": 0.0, "sellScore": 0.0, "holdScore": 1.0 } },
+        "gateResults": { "status": "PASS", "hardBlockerIds": [] },
+        "policyResult": { "tradeAllowed": null, "quantity": null, "riskDollars": null },
+        "paperOrderResult": { "orderType": null, "quantity": null, "eligible": null }
+      }
+    },
+    {
+      "id": "high_volatility_session",
+      "description": "High-volatility alternating session with large realized ranges.",
+      "barsHash": "0d5db35c3c48545e",
+      "economicEventState": { "active": false, "importance": "low", "state": "none" },
+      "expected": {
+        "decisionTimestampUtc": "2026-01-05T14:59:00Z",
+        "featureStates": { "dataReady": true, "vwap": 100.0635, "atr14": 0.665, "adx14": 28.5714, "gapPercent": 0.0 },
+        "strategyOutputs": {
+          "multi_timeframe_trend_alignment": "SELL",
+          "first_pullback_after_open": "HOLD",
+          "vwap_trend_continuation": "HOLD",
+          "opening_range_breakout": "HOLD",
+          "volatility_breakout": "HOLD",
+          "failed_breakout_reversal": "HOLD",
+          "liquidity_sweep_reversal": "HOLD",
+          "vwap_mean_reversion": "HOLD",
+          "bollinger_atr_reversion": "HOLD",
+          "gap_continuation_gap_fade": "HOLD"
+        },
+        "familyScores": { "TREND": { "buyScore": 0.0, "sellScore": 0.0, "holdScore": 1.0 } },
+        "gateResults": { "status": "PASS", "hardBlockerIds": [] },
+        "policyResult": { "tradeAllowed": null, "quantity": null, "riskDollars": null },
+        "paperOrderResult": { "orderType": null, "quantity": null, "eligible": null }
+      }
+    },
+    {
+      "id": "gap_continuation",
+      "description": "Opening gap that continues in the gap direction.",
+      "barsHash": "99cd959d7b8f11e5",
+      "economicEventState": { "active": false, "importance": "low", "state": "none" },
+      "expected": {
+        "decisionTimestampUtc": "2026-01-05T14:59:00Z",
+        "featureStates": { "dataReady": true, "vwap": 103.8334, "atr14": 0.18, "adx14": 100.0, "gapPercent": 2.2 },
+        "strategyOutputs": {
+          "multi_timeframe_trend_alignment": "BUY",
+          "first_pullback_after_open": "HOLD",
+          "vwap_trend_continuation": "HOLD",
+          "opening_range_breakout": "HOLD",
+          "volatility_breakout": "HOLD",
+          "failed_breakout_reversal": "HOLD",
+          "liquidity_sweep_reversal": "HOLD",
+          "vwap_mean_reversion": "HOLD",
+          "bollinger_atr_reversion": "HOLD",
+          "gap_continuation_gap_fade": "HOLD"
+        },
+        "familyScores": { "TREND": { "buyScore": 0.0, "sellScore": 0.0, "holdScore": 1.0 } },
+        "gateResults": { "status": "PASS", "hardBlockerIds": [] },
+        "policyResult": { "tradeAllowed": null, "quantity": null, "riskDollars": null },
+        "paperOrderResult": { "orderType": null, "quantity": null, "eligible": null }
+      }
+    },
+    {
+      "id": "gap_fade",
+      "description": "Opening gap that fades back toward prior value.",
+      "barsHash": "3a498b7003ea4fd9",
+      "economicEventState": { "active": false, "importance": "low", "state": "none" },
+      "expected": {
+        "decisionTimestampUtc": "2026-01-05T14:59:00Z",
+        "featureStates": { "dataReady": true, "vwap": 100.8536, "atr14": 0.15, "adx14": 100.0, "gapPercent": 2.4 },
+        "strategyOutputs": {
+          "multi_timeframe_trend_alignment": "SELL",
+          "first_pullback_after_open": "HOLD",
+          "vwap_trend_continuation": "HOLD",
+          "opening_range_breakout": "HOLD",
+          "volatility_breakout": "HOLD",
+          "failed_breakout_reversal": "HOLD",
+          "liquidity_sweep_reversal": "HOLD",
+          "vwap_mean_reversion": "HOLD",
+          "bollinger_atr_reversion": "HOLD",
+          "gap_continuation_gap_fade": "HOLD"
+        },
+        "familyScores": { "TREND": { "buyScore": 0.0, "sellScore": 0.0, "holdScore": 1.0 } },
+        "gateResults": { "status": "PASS", "hardBlockerIds": [] },
+        "policyResult": { "tradeAllowed": null, "quantity": null, "riskDollars": null },
+        "paperOrderResult": { "orderType": null, "quantity": null, "eligible": null }
+      }
+    },
+    {
+      "id": "failed_breakout",
+      "description": "Upside probe that fails and closes back inside the prior range.",
+      "barsHash": "79afb1b7e531fd2b",
+      "economicEventState": { "active": false, "importance": "low", "state": "none" },
+      "expected": {
+        "decisionTimestampUtc": "2026-01-05T14:59:00Z",
+        "featureStates": { "dataReady": true, "vwap": 99.7998, "atr14": 0.1257, "adx14": 92.8571, "gapPercent": 0.0 },
+        "strategyOutputs": {
+          "multi_timeframe_trend_alignment": "HOLD",
+          "first_pullback_after_open": "HOLD",
+          "vwap_trend_continuation": "HOLD",
+          "opening_range_breakout": "HOLD",
+          "volatility_breakout": "HOLD",
+          "failed_breakout_reversal": "HOLD",
+          "liquidity_sweep_reversal": "HOLD",
+          "vwap_mean_reversion": "HOLD",
+          "bollinger_atr_reversion": "HOLD",
+          "gap_continuation_gap_fade": "HOLD"
+        },
+        "familyScores": {},
+        "gateResults": { "status": "PASS", "hardBlockerIds": [] },
+        "policyResult": { "tradeAllowed": null, "quantity": null, "riskDollars": null },
+        "paperOrderResult": { "orderType": null, "quantity": null, "eligible": null }
+      }
+    },
+    {
+      "id": "liquidity_sweep",
+      "description": "Downside sweep and reclaim around a prior low.",
+      "barsHash": "4e901b2a140d179e",
+      "economicEventState": { "active": false, "importance": "low", "state": "none" },
+      "expected": {
+        "decisionTimestampUtc": "2026-01-05T14:59:00Z",
+        "featureStates": { "dataReady": true, "vwap": 100.5107, "atr14": 0.14, "adx14": 100.0, "gapPercent": 0.0 },
+        "strategyOutputs": {
+          "multi_timeframe_trend_alignment": "BUY",
+          "first_pullback_after_open": "HOLD",
+          "vwap_trend_continuation": "HOLD",
+          "opening_range_breakout": "HOLD",
+          "volatility_breakout": "HOLD",
+          "failed_breakout_reversal": "HOLD",
+          "liquidity_sweep_reversal": "HOLD",
+          "vwap_mean_reversion": "HOLD",
+          "bollinger_atr_reversion": "HOLD",
+          "gap_continuation_gap_fade": "HOLD"
+        },
+        "familyScores": { "TREND": { "buyScore": 0.0, "sellScore": 0.0, "holdScore": 1.0 } },
+        "gateResults": { "status": "PASS", "hardBlockerIds": [] },
+        "policyResult": { "tradeAllowed": null, "quantity": null, "riskDollars": null },
+        "paperOrderResult": { "orderType": null, "quantity": null, "eligible": null }
+      }
+    },
+    {
+      "id": "economic_event_shock",
+      "description": "Economic-event shock with late-session volatility expansion.",
+      "barsHash": "80b77d690b5304df",
+      "economicEventState": { "active": true, "importance": "high", "state": "shock" },
+      "expected": {
+        "decisionTimestampUtc": "2026-01-05T14:59:00Z",
+        "featureStates": { "dataReady": true, "vwap": 100.7572, "atr14": 1.1332, "adx14": 21.4286, "gapPercent": 0.0 },
+        "strategyOutputs": {
+          "multi_timeframe_trend_alignment": "BUY",
+          "first_pullback_after_open": "HOLD",
+          "vwap_trend_continuation": "HOLD",
+          "opening_range_breakout": "HOLD",
+          "volatility_breakout": "HOLD",
+          "failed_breakout_reversal": "HOLD",
+          "liquidity_sweep_reversal": "HOLD",
+          "vwap_mean_reversion": "HOLD",
+          "bollinger_atr_reversion": "HOLD",
+          "gap_continuation_gap_fade": "HOLD"
+        },
+        "familyScores": { "TREND": { "buyScore": 0.0, "sellScore": 0.0, "holdScore": 1.0 } },
+        "gateResults": { "status": "FAIL", "hardBlockerIds": [] },
+        "policyResult": { "tradeAllowed": null, "quantity": null, "riskDollars": null },
+        "paperOrderResult": { "orderType": null, "quantity": null, "eligible": null }
+      }
+    }
+  ]
+}

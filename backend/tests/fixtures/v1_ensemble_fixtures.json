@@ -1,0 +1,143 @@
+{
+  "fixtureVersion": 1,
+  "engineVersion": "voting_ensemble_v1",
+  "description": "Deterministic synthetic fixtures for the pre-V2 voting ensemble baseline.",
+  "candleFixture": {
+    "symbol": "SPY",
+    "feed": "iex",
+    "timeframe": "1Min",
+    "start": "2026-01-05T14:30:00Z",
+    "count": 60
+  },
+  "voteCases": [
+    {
+      "name": "buy_result",
+      "pattern": "buy",
+      "priorClose": 99,
+      "expected": {
+        "signal": "Buy",
+        "buyVotes": 4,
+        "sellVotes": 1,
+        "holdVotes": 0,
+        "voteStrength": "4 directional votes",
+        "regime": "Trend Up",
+        "votes": ["Buy", "Sell", "Buy", "Buy", "Buy"]
+      }
+    },
+    {
+      "name": "sell_result",
+      "pattern": "sell",
+      "priorClose": 101,
+      "expected": {
+        "signal": "Sell",
+        "buyVotes": 1,
+        "sellVotes": 4,
+        "holdVotes": 0,
+        "voteStrength": "4 directional votes",
+        "regime": "Trend Down",
+        "votes": ["Sell", "Buy", "Sell", "Sell", "Sell"]
+      }
+    },
+    {
+      "name": "hold_result",
+      "pattern": "hold",
+      "priorClose": 99,
+      "expected": {
+        "signal": "Hold",
+        "buyVotes": 0,
+        "sellVotes": 0,
+        "holdVotes": 5,
+        "voteStrength": "0 directional votes",
+        "regime": "VWAP Chop",
+        "votes": ["Hold", "Hold", "Hold", "Hold", "Hold"]
+      }
+    }
+  ],
+  "riskConfigInput": {
+    "positionSizingMode": "allocation",
+    "startingCapital": 25000,
+    "orderAllocationPercent": 10,
+    "dailyAllocationPercent": 30,
+    "riskBudgetPercentOfOrder": 50
+  },
+  "expectedRiskConfigHash": "931975fbffc6",
+  "sizedOrderCase": {
+    "pattern": "buy",
+    "priorClose": 99,
+    "side": "Long",
+    "equity": 25000,
+    "sessionDate": "2026-01-05",
+    "expected": {
+      "side": "Long",
+      "entryAt": "2026-01-05T15:29:00Z",
+      "entryHour": "10:00",
+      "entryPrice": 104.7,
+      "shares": 23,
+      "riskDollars": 23.0,
+      "plannedRiskPerShare": 1.0,
+      "stopPrice": 103.7,
+      "targetPrice": 106.2,
+      "positionValue": 2408.1,
+      "positionSizingMode": "allocation"
+    }
+  },
+  "blockedOrderCase": {
+    "pattern": "buy",
+    "priorClose": 99,
+    "side": "Long",
+    "equity": 25,
+    "sessionDate": "2026-01-05",
+    "expected": null
+  },
+  "positionSizingCases": [
+    {
+      "name": "sized_order",
+      "equity": 25000,
+      "entryPrice": 100,
+      "stopDistance": 1,
+      "expected": {
+        "shares": 25,
+        "plannedRisk": 25,
+        "mode": "allocation"
+      }
+    },
+    {
+      "name": "blocked_order",
+      "equity": 25,
+      "entryPrice": 100,
+      "stopDistance": 1,
+      "expected": {
+        "shares": 0,
+        "plannedRisk": 0,
+        "mode": "allocation"
+      }
+    }
+  ],
+  "decisionSnapshotCase": {
+    "payload": {
+      "version": 1,
+      "reason": "v1-fixture-replay",
+      "capturedAt": "2026-01-05T15:29:00.000Z",
+      "sessionDate": "2026-01-05",
+      "symbol": "SPY",
+      "feed": "iex",
+      "timeframe": "1Min",
+      "finalDecision": {
+        "activeMode": "ensemble",
+        "voting": {
+          "signal": "Buy"
+        }
+      },
+      "ensembleVotingResult": {
+        "signal": "Buy",
+        "eligibleCount": 5
+      }
+    },
+    "expected": {
+      "sessionDate": "2026-01-05",
+      "symbol": "SPY",
+      "latestFilename": "latest.json",
+      "jsonlFilename": "SPY_decision_snapshots.jsonl"
+    }
+  }
+}

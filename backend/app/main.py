@@ -26,8 +26,15 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from .alpaca import AlpacaClient, demo_bars, local_market_status
+from .algorithms.regime.api import router as regime_router
+from .algorithms.regime.api import REGIME_REPOSITORY
+from .algorithms.voting_ensemble.api import router as voting_ensemble_router
+from .algorithms.wca.api import router as wca_router
+from .algorithms.weighted_voting.api import router as weighted_voting_router
+from .api.v2 import router as api_v2_router
 from .config import get_settings
 from .database import CandleStore
+from .risk.api import router as risk_router
 from .market_forecast import (
     FUTURE_MARKET_PREDICTION_LEDGER_NAME,
     FUTURE_MARKET_PREDICTION_LEDGER_TITLE,
@@ -55,6 +62,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(api_v2_router)
+app.include_router(voting_ensemble_router)
+app.include_router(weighted_voting_router)
+app.include_router(wca_router)
+app.include_router(regime_router)
+app.include_router(risk_router)
 
 DAILY_BACKTEST_REFRESH_STATUS: dict = {
     "status": "idle",
@@ -469,6 +482,11 @@ def health() -> dict:
     }
 
 
+@app.get("/api/application-config")
+def application_config() -> dict:
+    return settings.application_config.as_dict()
+
+
 @app.post("/api/browser-state/snapshot")
 def save_browser_state_snapshot(payload: dict = Body(...)) -> dict:
     items = payload.get("items")
@@ -548,6 +566,7 @@ def save_decision_snapshot(payload: dict = Body(...)) -> dict:
         handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
         handle.write("\n")
     write_json(latest_path, record)
+    regime_recording = REGIME_REPOSITORY.record_decision_snapshot(snapshot)
 
     return {
         "ok": True,
@@ -556,6 +575,7 @@ def save_decision_snapshot(payload: dict = Body(...)) -> dict:
         "sessionDate": safe_session,
         "symbol": safe_symbol,
         "savedAt": record["savedAt"],
+        "regimePersistence": regime_recording,
     }
 
 
@@ -625,6 +645,7 @@ async def train_meta_strategy_baselines_endpoint(payload: dict | None = Body(Non
         symbol=symbol,
         session_date=session_date,
         min_rows=int(request.get("minRows") or 30),
+        v2=bool(request.get("v2") or str(request.get("modelVersion") or "").lower() == "v2"),
     )
 
 
@@ -652,6 +673,7 @@ async def meta_strategy_training_status_endpoint() -> dict:
         "validationLabelCounts": result.get("validationLabelCounts"),
         "labelPolicy": result.get("labelPolicy"),
         "metrics": result.get("metrics"),
+        "v2TrainingValidation": result.get("v2TrainingValidation"),
     }
 
 
@@ -702,6 +724,7 @@ def label_decision_snapshots_for_session(*, symbol: str, feed: str, session_date
             symbol=normalized_symbol,
             session_date=None,
             min_rows=30,
+            v2=False,
         )
     )
     write_json(latest_path, summary)
@@ -724,15 +747,17 @@ def compact_meta_strategy_training_status(result: dict) -> dict:
         "bestModel": metrics.get("bestModel"),
         "trusted": bool(trusted),
         "bestBaselineMacroF1": metrics.get("bestBaselineMacroF1"),
+        "v2TrainingValidation": result.get("v2TrainingValidation"),
         "message": result.get("message"),
     }
 
 
-def run_meta_strategy_training(*, symbol: str, session_date: str | None, min_rows: int) -> dict:
+def run_meta_strategy_training(*, symbol: str, session_date: str | None, min_rows: int, v2: bool = False) -> dict:
     from . import meta_strategy_training
 
     reloaded = importlib.reload(meta_strategy_training)
-    result = reloaded.train_meta_strategy_baselines(
+    trainer = reloaded.train_and_validate_meta_model_v2 if v2 else reloaded.train_meta_strategy_baselines
+    result = trainer(
         decision_snapshot_dir=DECISION_SNAPSHOT_DIR,
         symbol=symbol,
         session_date=session_date,
@@ -741,7 +766,7 @@ def run_meta_strategy_training(*, symbol: str, session_date: str | None, min_row
     return {
         **result,
         "trainerSourcePath": str(Path(reloaded.__file__).resolve()),
-        "trainerVersion": "directional_trust_v2",
+        "trainerVersion": "meta_model_v2" if v2 else "directional_trust_v2",
     }
 
 
@@ -3132,7 +3157,7 @@ def artifact_job_is_stale(job: dict) -> bool:
     if log_path.exists():
         try:
             if log_path.stat().st_size <= 0:
-                return True
+                return age >= ARTIFACT_JOB_STALE_AFTER
             log_updated = datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)
             if datetime.now(UTC) - log_updated < ARTIFACT_JOB_STALE_AFTER:
                 return False
