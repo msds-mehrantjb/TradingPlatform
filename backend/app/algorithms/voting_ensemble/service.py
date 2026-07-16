@@ -93,8 +93,10 @@ class VotingEnsembleService:
 def evaluate_multi_timeframe_trend(request: VotingEnsembleEvaluateRequest) -> VotingStrategyVote:
     candles = request.candles
     trend_1m, detail_1m = _timeframe_trend_state(candles[-80:], "1m")
-    trend_5m, detail_5m = _timeframe_trend_state(_aggregate(candles, 5)[-48:], "5m")
-    trend_15m, detail_15m = _timeframe_trend_state(_aggregate(candles, 15)[-32:], "15m")
+    five_minute = request.spy_5m_candles or tuple(_aggregate(candles, 5))
+    fifteen_minute = request.spy_15m_candles or tuple(_aggregate(candles, 15))
+    trend_5m, detail_5m = _timeframe_trend_state(five_minute[-48:], "5m")
+    trend_15m, detail_15m = _timeframe_trend_state(fifteen_minute[-32:], "15m")
     detail = f"{detail_1m}; {detail_5m}; {detail_15m}"
     if trend_1m == "up" and trend_5m == "up" and trend_15m != "down":
         return _vote(

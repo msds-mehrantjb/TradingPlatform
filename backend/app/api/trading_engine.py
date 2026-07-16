@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any, Protocol
 
+from backend.app.algorithms.voting_ensemble import VotingEnsembleBacktestConfig, VotingEnsembleBacktestRunner
 from backend.app.backtesting import EventDrivenReplayEngine, ReplayComponents, ReplayEngineConfig
 from backend.app.backtesting import v1 as backtesting_v1
 from backend.app.domain.feature_engine import MarketCandle, PriorDayOHLC
@@ -10,24 +11,15 @@ from backend.app.domain.models import Signal
 from backend.app.ensemble import v1 as ensemble_v1
 from backend.app.execution import v1 as execution_v1
 from backend.app.strategies.context import (
-    EconomicEventContext,
     MarketBreadthMomentumContext,
-    MarketStructureContext,
     RelativeStrengthQqqIwmContext,
-    VolumeConfirmationContext,
-    VwapPositionContext,
 )
 from backend.app.strategies.directional import (
     BollingerAtrReversionStrategy,
     FailedBreakoutReversalStrategy,
     FirstPullbackAfterOpenStrategy,
-    GapContinuationFadeStrategy,
     LiquiditySweepReversalStrategy,
     MultiTimeframeTrendAlignmentStrategy,
-    OpeningRangeBreakoutStrategy,
-    VolatilityBreakoutStrategy,
-    VwapMeanReversionStrategy,
-    VwapTrendContinuationStrategy,
 )
 from backend.app.strategies.regime import AdxAtrRegimeClassifier
 from backend.app.strategies import v1 as strategies_v1
@@ -90,22 +82,13 @@ class V2TradingEngine:
                 directionalStrategies=(
                     MultiTimeframeTrendAlignmentStrategy(),
                     FirstPullbackAfterOpenStrategy(),
-                    VwapTrendContinuationStrategy(),
-                    OpeningRangeBreakoutStrategy(),
-                    VolatilityBreakoutStrategy(),
                     FailedBreakoutReversalStrategy(),
                     LiquiditySweepReversalStrategy(),
-                    VwapMeanReversionStrategy(),
                     BollingerAtrReversionStrategy(),
-                    GapContinuationFadeStrategy(),
                 ),
                 contextModules=(
                     RelativeStrengthQqqIwmContext(),
                     MarketBreadthMomentumContext(),
-                    EconomicEventContext(),
-                    MarketStructureContext(),
-                    VolumeConfirmationContext(),
-                    VwapPositionContext(),
                 ),
                 regimeModule=AdxAtrRegimeClassifier(),
             ),
@@ -152,56 +135,15 @@ class V2TradingEngine:
 
     def run_backtest(self, candles: list[dict[str, Any]], *, timeframe: str, risk_config_override: dict[str, Any] | None = None) -> dict[str, Any]:
         starting_capital = float((risk_config_override or {}).get("startingCapital", 100_000.0))
-        if not candles:
-            return self._empty_backtest(starting_capital, timeframe)
-        market_candles = sorted(
-            (MarketCandle.model_validate(self._market_candle_payload(row)) for row in candles),
-            key=lambda candle: candle.timestamp,
+        config = VotingEnsembleBacktestConfig(
+            startingCapital=starting_capital,
+            includeDecisionRecords=False,
         )
-        sessions: dict[date, list[MarketCandle]] = {}
-        for candle in market_candles:
-            sessions.setdefault(candle.timestamp.date(), []).append(candle)
-
-        trades: list[dict[str, Any]] = []
-        decision_count = 0
-        for session_date, session_candles in sorted(sessions.items()):
-            prior_close = session_candles[0].open
-            replay = self.replay_engine.replay_session(
-                symbol=str(session_candles[-1].symbol or "SPY"),
-                sessionDate=session_date,
-                spy1mCandles=session_candles,
-                spy5mCandles=session_candles,
-                spy15mCandles=session_candles,
-                qqqCandles=session_candles,
-                iwmCandles=session_candles,
-                priorDayOHLC=PriorDayOHLC(
-                    sessionDate=session_date - timedelta(days=1),
-                    open=prior_close,
-                    high=prior_close,
-                    low=prior_close,
-                    close=prior_close,
-                ),
-                breadthComponents={},
-                economicEventState={"active": False, "source": "active_voting_ensemble_v2_backtest"},
-            )
-            decision_count += replay.decisionCount
-            trades.extend(self._display_trade(trade.model_dump(mode="json")) for trade in replay.trades)
-
-        result = self._backtest_metrics(
-            trades=trades,
-            bars=len(market_candles),
-            sessions=len(sessions),
-            starting_capital=starting_capital,
+        return VotingEnsembleBacktestRunner(config=config).run(
+            symbol=str(candles[-1].get("symbol") or "SPY") if candles else "SPY",
+            spy_1m_candles=candles,
             timeframe=timeframe,
-            date_label=f"{market_candles[0].timestamp.date()} to {market_candles[-1].timestamp.date()}",
         )
-        return {
-            **result,
-            "engineVersion": self.version,
-            "algorithmVersion": "family_aware_deterministic_ensemble_v1",
-            "decisionCount": decision_count,
-            "explanation": "Backtest used the same V2 event replay strategy, gate, policy, and execution simulation code as paper decisions.",
-        }
 
     def _decide(self, history: list[dict[str, Any]], prior_close: float):
         candles = [MarketCandle.model_validate(self._market_candle_payload(row)) for row in history]

@@ -38,6 +38,8 @@ class VotingEnsembleEvaluateRequest(BaseModel):
     symbol: str = Field(default="SPY", min_length=1)
     data_timestamp: datetime | None = None
     candles: tuple[VotingCandle, ...] = Field(min_length=1)
+    spy_5m_candles: tuple[VotingCandle, ...] = ()
+    spy_15m_candles: tuple[VotingCandle, ...] = ()
     market_context: dict[str, Any] | None = None
     qqq_candles: tuple[VotingCandle, ...] = ()
     iwm_candles: tuple[VotingCandle, ...] = ()

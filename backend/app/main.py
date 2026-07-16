@@ -136,6 +136,8 @@ VIX_QUOTE_CSV_URL = "https://stooq.com/q/l/?s=^vix&f=sd2t2ohlcv&h&e=csv"
 ES_QUOTE_CSV_URL = "https://stooq.com/q/l/?s=es.f&f=sd2t2ohlcv&h&e=csv"
 BACKTEST_EXPORT_DIR = Path(__file__).resolve().parents[1] / "data" / "backtests"
 ARTIFACT_JOB_DIR = BACKTEST_EXPORT_DIR / "_artifact_jobs"
+VOTING_RELATIVE_STRENGTH_SYMBOLS = ("QQQ", "IWM")
+VOTING_BREADTH_PROXY_SYMBOLS = ("XLK", "XLF", "XLV", "XLY", "XLP", "XLI", "XLE", "XLU", "XLB", "XLRE", "XLC")
 BROWSER_STATE_DIR = Path(__file__).resolve().parents[1] / "data" / "browser_state"
 TRADE_HISTORY_ARCHIVE_DIR = Path(__file__).resolve().parents[1] / "data" / "trade_history_archives"
 DECISION_SNAPSHOT_DIR = Path(__file__).resolve().parents[1] / "data" / "decision_snapshots"
@@ -1773,7 +1775,7 @@ async def prepare_backtest_data(
     daily_start = daily_start_datetime.isoformat().replace("+00:00", "Z")
     end = end_datetime.isoformat().replace("+00:00", "Z")
 
-    for timeframe, start in [("1Min", intraday_start), ("5Min", intraday_start), ("1Day", daily_start)]:
+    for timeframe, start in [("1Min", intraday_start), ("5Min", intraday_start), ("15Min", intraday_start), ("1Day", daily_start)]:
         try:
             fresh = await alpaca.get_bars_window(
                 symbol=normalized_symbol,
@@ -1788,10 +1790,19 @@ async def prepare_backtest_data(
                 warnings.append(f"No fresh Alpaca bars returned for {timeframe}. Cached data will be used if available.")
         except httpx.HTTPError as exc:
             warnings.append(f"{timeframe} Alpaca fetch failed: {exc}")
+    await fetch_voting_ensemble_auxiliary_bars(
+        feed=feed,
+        start=intraday_start,
+        end=end,
+        max_pages=max_pages,
+        warnings=warnings,
+    )
 
     continuous_1m = store.range(symbol=normalized_symbol, timeframe="1Min", feed=feed, start=intraday_start, end=end)
     continuous_5m = store.range(symbol=normalized_symbol, timeframe="5Min", feed=feed, start=intraday_start, end=end)
+    continuous_15m = store.range(symbol=normalized_symbol, timeframe="15Min", feed=feed, start=intraday_start, end=end)
     daily = store.range(symbol=normalized_symbol, timeframe="1Day", feed=feed, start=daily_start, end=end)
+    auxiliary_1m = voting_auxiliary_1m_from_store(feed=feed, start=intraday_start, end=end)
 
     if not continuous_5m and continuous_1m:
         continuous_5m = aggregate_candles(continuous_1m, timeframe="5Min", minutes=5)
@@ -1808,6 +1819,13 @@ async def prepare_backtest_data(
     files = {
         "continuous1mJsonl": write_jsonl(output_dir / "continuous_1m.jsonl", continuous_1m),
         "continuous5mJsonl": write_jsonl(output_dir / "continuous_5m.jsonl", continuous_5m),
+        "continuous15mJsonl": write_jsonl(output_dir / "continuous_15m.jsonl", continuous_15m),
+        "qqq1mJsonl": write_jsonl(output_dir / "qqq_1m.jsonl", auxiliary_1m.get("QQQ", [])),
+        "iwm1mJsonl": write_jsonl(output_dir / "iwm_1m.jsonl", auxiliary_1m.get("IWM", [])),
+        "breadthComponentsJsonl": {
+            symbol: write_jsonl(output_dir / f"breadth_{symbol.lower()}_1m.jsonl", auxiliary_1m.get(symbol, []))
+            for symbol in VOTING_BREADTH_PROXY_SYMBOLS
+        },
         "dailyJsonl": write_jsonl(output_dir / "daily_context.jsonl", daily),
         "latestDay1mCsv": write_csv(output_dir / "latest_day_1m_enriched.csv", enriched_latest_1m),
         "latestDay5mCsv": write_csv(output_dir / "latest_day_5m_enriched.csv", enriched_latest_5m),
@@ -1830,6 +1848,10 @@ async def prepare_backtest_data(
         "coverage": {
             "oneMinute": coverage_summary(continuous_1m),
             "fiveMinute": coverage_summary(continuous_5m),
+            "fifteenMinute": coverage_summary(continuous_15m),
+            "qqqOneMinute": coverage_summary(auxiliary_1m.get("QQQ", [])),
+            "iwmOneMinute": coverage_summary(auxiliary_1m.get("IWM", [])),
+            "breadthComponents": {symbol: coverage_summary(auxiliary_1m.get(symbol, [])) for symbol in VOTING_BREADTH_PROXY_SYMBOLS},
             "daily": coverage_summary(daily),
             "latestDayOneMinute": coverage_summary(latest_1m),
             "latestDayFiveMinute": coverage_summary(latest_5m),
@@ -2720,7 +2742,7 @@ async def run_daily_backtest_refresh(
 
     warnings: list[str] = []
     session_start, session_end = session_date_window_utc(target_date)
-    for timeframe in ["1Min", "5Min", "1Day"]:
+    for timeframe in ["1Min", "5Min", "15Min", "1Day"]:
         try:
             fresh = await alpaca.get_bars_window(
                 symbol=normalized_symbol,
@@ -2735,6 +2757,13 @@ async def run_daily_backtest_refresh(
                 warnings.append(f"No Alpaca bars returned for {timeframe} on {target_date}.")
         except httpx.HTTPError as exc:
             warnings.append(f"{timeframe} Alpaca fetch failed for {target_date}: {exc}")
+    await fetch_voting_ensemble_auxiliary_bars(
+        feed=feed,
+        start=session_start,
+        end=session_end,
+        max_pages=max_pages,
+        warnings=warnings,
+    )
 
     try:
         manifest = export_backtest_dataset_from_store(
@@ -2945,13 +2974,17 @@ def export_backtest_dataset_from_store(
     base_files = (base_manifest or {}).get("files", {})
     base_1m = read_jsonl_if_exists(Path(str(base_files.get("continuous1mJsonl", ""))))
     base_5m = read_jsonl_if_exists(Path(str(base_files.get("continuous5mJsonl", ""))))
+    base_15m = read_jsonl_if_exists(Path(str(base_files.get("continuous15mJsonl", ""))))
     base_daily = read_jsonl_if_exists(Path(str(base_files.get("dailyJsonl", ""))))
     fresh_1m = store.range(symbol=symbol, timeframe="1Min", feed=feed, start=intraday_start, end=end)
     fresh_5m = store.range(symbol=symbol, timeframe="5Min", feed=feed, start=intraday_start, end=end)
+    fresh_15m = store.range(symbol=symbol, timeframe="15Min", feed=feed, start=intraday_start, end=end)
     fresh_daily = store.range(symbol=symbol, timeframe="1Day", feed=feed, start=daily_start, end=end)
     continuous_1m = merge_candle_rows(base_1m, fresh_1m, start=intraday_start, end=end, symbol=symbol, timeframe="1Min", feed=feed)
     continuous_5m = merge_candle_rows(base_5m, fresh_5m, start=intraday_start, end=end, symbol=symbol, timeframe="5Min", feed=feed)
+    continuous_15m = merge_candle_rows(base_15m, fresh_15m, start=intraday_start, end=end, symbol=symbol, timeframe="15Min", feed=feed)
     daily = merge_candle_rows(base_daily, fresh_daily, start=daily_start, end=end, symbol=symbol, timeframe="1Day", feed=feed)
+    auxiliary_1m = merge_auxiliary_candle_rows(base_files=base_files, feed=feed, start=intraday_start, end=end)
     if not continuous_5m and continuous_1m:
         continuous_5m = aggregate_candles(continuous_1m, timeframe="5Min", minutes=5)
         warnings.append("5Min bars were aggregated from 1Min bars because native 5Min data was unavailable.")
@@ -2973,6 +3006,13 @@ def export_backtest_dataset_from_store(
     files = {
         "continuous1mJsonl": write_jsonl(output_dir / "continuous_1m.jsonl", continuous_1m),
         "continuous5mJsonl": write_jsonl(output_dir / "continuous_5m.jsonl", continuous_5m),
+        "continuous15mJsonl": write_jsonl(output_dir / "continuous_15m.jsonl", continuous_15m),
+        "qqq1mJsonl": write_jsonl(output_dir / "qqq_1m.jsonl", auxiliary_1m.get("QQQ", [])),
+        "iwm1mJsonl": write_jsonl(output_dir / "iwm_1m.jsonl", auxiliary_1m.get("IWM", [])),
+        "breadthComponentsJsonl": {
+            symbol: write_jsonl(output_dir / f"breadth_{symbol.lower()}_1m.jsonl", auxiliary_1m.get(symbol, []))
+            for symbol in VOTING_BREADTH_PROXY_SYMBOLS
+        },
         "dailyJsonl": write_jsonl(output_dir / "daily_context.jsonl", daily),
         "latestDay1mCsv": write_csv(output_dir / "latest_day_1m_enriched.csv", enriched_latest_1m),
         "latestDay5mCsv": write_csv(output_dir / "latest_day_5m_enriched.csv", enriched_latest_5m),
@@ -2994,6 +3034,10 @@ def export_backtest_dataset_from_store(
         "coverage": {
             "oneMinute": coverage_summary(continuous_1m),
             "fiveMinute": coverage_summary(continuous_5m),
+            "fifteenMinute": coverage_summary(continuous_15m),
+            "qqqOneMinute": coverage_summary(auxiliary_1m.get("QQQ", [])),
+            "iwmOneMinute": coverage_summary(auxiliary_1m.get("IWM", [])),
+            "breadthComponents": {symbol: coverage_summary(auxiliary_1m.get(symbol, [])) for symbol in VOTING_BREADTH_PROXY_SYMBOLS},
             "daily": coverage_summary(daily),
             "latestDayOneMinute": coverage_summary(latest_1m),
             "latestDayFiveMinute": coverage_summary(latest_5m),
@@ -3794,6 +3838,77 @@ def read_jsonl_if_exists(path: Path) -> list[dict]:
     return read_jsonl(path)
 
 
+async def fetch_voting_ensemble_auxiliary_bars(
+    *,
+    feed: str,
+    start: str,
+    end: str,
+    max_pages: int,
+    warnings: list[str],
+) -> None:
+    for symbol in (*VOTING_RELATIVE_STRENGTH_SYMBOLS, *VOTING_BREADTH_PROXY_SYMBOLS):
+        try:
+            fresh = await alpaca.get_bars_window(
+                symbol=symbol,
+                timeframe="1Min",
+                feed=feed,
+                start=start,
+                end=end,
+                max_pages=max_pages,
+            )
+            store.upsert_many(fresh)
+            if not fresh:
+                warnings.append(f"No fresh Alpaca 1Min bars returned for auxiliary symbol {symbol}.")
+        except httpx.HTTPError as exc:
+            warnings.append(f"Auxiliary 1Min Alpaca fetch failed for {symbol}: {exc}")
+
+
+def voting_auxiliary_1m_from_store(*, feed: str, start: str, end: str) -> dict[str, list[dict]]:
+    symbols = (*VOTING_RELATIVE_STRENGTH_SYMBOLS, *VOTING_BREADTH_PROXY_SYMBOLS)
+    return {
+        symbol: store.range(symbol=symbol, timeframe="1Min", feed=feed, start=start, end=end)
+        for symbol in symbols
+    }
+
+
+def read_manifest_breadth_components(files: dict) -> dict[str, list[dict]]:
+    raw = files.get("breadthComponentsJsonl")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(symbol).upper(): read_jsonl_if_exists(Path(str(path)))
+        for symbol, path in raw.items()
+        if path
+    }
+
+
+def merge_auxiliary_candle_rows(
+    *,
+    base_files: dict,
+    feed: str,
+    start: str,
+    end: str,
+) -> dict[str, list[dict]]:
+    base_auxiliary = {
+        "QQQ": read_jsonl_if_exists(Path(str(base_files.get("qqq1mJsonl", "")))),
+        "IWM": read_jsonl_if_exists(Path(str(base_files.get("iwm1mJsonl", "")))),
+        **read_manifest_breadth_components(base_files),
+    }
+    fresh_auxiliary = voting_auxiliary_1m_from_store(feed=feed, start=start, end=end)
+    return {
+        symbol: merge_candle_rows(
+            base_auxiliary.get(symbol, []),
+            fresh_auxiliary.get(symbol, []),
+            start=start,
+            end=end,
+            symbol=symbol,
+            timeframe="1Min",
+            feed=feed,
+        )
+        for symbol in (*VOTING_RELATIVE_STRENGTH_SYMBOLS, *VOTING_BREADTH_PROXY_SYMBOLS)
+    }
+
+
 def merge_candle_rows(
     base_rows: list[dict],
     fresh_rows: list[dict],
@@ -4214,9 +4329,21 @@ WEEKLY_DRAWDOWN_STOPS = [0.0, 4.0, 6.0]
 
 
 def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timeframe: str, start_date: str, end_date: str) -> dict:
-    cache_path = data_path.parent / f"voting_ensemble_risk_v16_{timeframe}_{start_date}_{end_date}.json"
+    cache_version = "voting_ensemble_dedicated_v1" if timeframe in {"1Min", "5Min"} else "voting_ensemble_risk_v16"
+    cache_path = data_path.parent / f"{cache_version}_{timeframe}_{start_date}_{end_date}.json"
     if cache_path.exists():
-        return json.loads(cache_path.read_text(encoding="utf-8"))
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if timeframe in {"1Min", "5Min"} and cached.get("stageResultsJsonl") and not cached.get("mlReplaySnapshots"):
+            cached["mlReplaySnapshots"] = materialize_voting_ensemble_replay_ml_snapshots(
+                stage_results_jsonl=Path(str(cached["stageResultsJsonl"])),
+                output_root=data_path.parent / f"voting_ensemble_ml_snapshots_{timeframe}_{start_date}_{end_date}",
+                manifest=manifest,
+                symbol=str(manifest.get("symbol") or "SPY"),
+                timeframe=timeframe,
+                data_quality=cached.get("dataQuality") if isinstance(cached.get("dataQuality"), dict) else {},
+            )
+            write_json(cache_path, cached)
+        return cached
 
     start = parse_backtest_start_datetime(start_date)
     end = parse_backtest_end_datetime(end_date)
@@ -4234,6 +4361,78 @@ def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timefram
         result = run_swing_voting_ensemble_backtest(candles, timeframe=timeframe)
     elif timeframe == "1Day":
         result = run_swing_voting_ensemble_backtest(candles, timeframe=timeframe)
+    elif timeframe in {"1Min", "5Min"}:
+        from backend.app.algorithms.voting_ensemble import VotingEnsembleBacktestConfig, VotingEnsembleBacktestRunner
+
+        files = manifest.get("files") or {}
+        one_minute_path = Path(str(files.get("continuous1mJsonl", "")))
+        five_minute_path = Path(str(files.get("continuous5mJsonl", "")))
+        fifteen_minute_path = Path(str(files.get("continuous15mJsonl", "")))
+        qqq_path = Path(str(files.get("qqq1mJsonl", "")))
+        iwm_path = Path(str(files.get("iwm1mJsonl", "")))
+        one_minute = [
+            candle
+            for candle in read_jsonl(one_minute_path)
+            if start <= parse_utc_datetime(str(candle["timestamp"])) <= end
+        ] if one_minute_path.exists() else candles
+        five_minute = [
+            candle
+            for candle in read_jsonl(five_minute_path)
+            if start <= parse_utc_datetime(str(candle["timestamp"])) <= end
+        ] if five_minute_path.exists() else []
+        fifteen_minute = [
+            candle
+            for candle in read_jsonl(fifteen_minute_path)
+            if start <= parse_utc_datetime(str(candle["timestamp"])) <= end
+        ] if fifteen_minute_path.exists() else []
+        qqq_candles = [
+            candle
+            for candle in read_jsonl(qqq_path)
+            if start <= parse_utc_datetime(str(candle["timestamp"])) <= end
+        ] if qqq_path.exists() else []
+        iwm_candles = [
+            candle
+            for candle in read_jsonl(iwm_path)
+            if start <= parse_utc_datetime(str(candle["timestamp"])) <= end
+        ] if iwm_path.exists() else []
+        breadth_components = {
+            symbol: [
+                candle
+                for candle in read_jsonl_if_exists(Path(str(path)))
+                if start <= parse_utc_datetime(str(candle["timestamp"])) <= end
+            ]
+            for symbol, path in ((files.get("breadthComponentsJsonl") or {}).items() if isinstance(files.get("breadthComponentsJsonl"), dict) else [])
+        }
+        result = VotingEnsembleBacktestRunner(
+            config=VotingEnsembleBacktestConfig(
+                startingCapital=float(VOTING_ENSEMBLE_RISK_CONFIG["startingCapital"]),
+                includeDecisionRecords=True,
+                maximumDecisionRecords=None,
+            )
+        ).run(
+            symbol=str(manifest.get("symbol") or "SPY"),
+            spy_1m_candles=one_minute,
+            spy_5m_candles=five_minute,
+            spy_15m_candles=fifteen_minute,
+            qqq_candles=qqq_candles,
+            iwm_candles=iwm_candles,
+            breadth_components=breadth_components,
+            timeframe=timeframe,
+        )
+        stage_results = result.pop("stageResults", [])
+        result.pop("decisionRecords", None)
+        stage_path = data_path.parent / f"voting_ensemble_stage_results_{timeframe}_{start_date}_{end_date}.jsonl"
+        result["stageResultsJsonl"] = write_jsonl(stage_path, stage_results)
+        result["stageResultCount"] = len(stage_results)
+        result["stageResultsStored"] = True
+        result["mlReplaySnapshots"] = materialize_voting_ensemble_replay_ml_snapshots(
+            stage_results=stage_results,
+            output_root=data_path.parent / f"voting_ensemble_ml_snapshots_{timeframe}_{start_date}_{end_date}",
+            manifest=manifest,
+            symbol=str(manifest.get("symbol") or "SPY"),
+            timeframe=timeframe,
+            data_quality=result.get("dataQuality") if isinstance(result.get("dataQuality"), dict) else {},
+        )
     else:
         result = run_voting_ensemble_backtest(candles, timeframe=timeframe)
     result["sourceManifest"] = manifest.get("manifest") or str(data_path.parent / "manifest.json")
@@ -4246,13 +4445,55 @@ def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timefram
     return result
 
 
+def materialize_voting_ensemble_replay_ml_snapshots(
+    *,
+    output_root: Path,
+    manifest: dict,
+    symbol: str,
+    timeframe: str,
+    data_quality: dict,
+    stage_results: list[dict] | None = None,
+    stage_results_jsonl: Path | None = None,
+) -> dict:
+    from backend.app.algorithms.voting_ensemble import write_voting_ensemble_replay_snapshot_labels
+
+    rows = stage_results
+    if rows is None and stage_results_jsonl and stage_results_jsonl.exists():
+        rows = read_jsonl(stage_results_jsonl)
+    return write_voting_ensemble_replay_snapshot_labels(
+        stage_results=rows or [],
+        output_root=output_root,
+        symbol=symbol,
+        timeframe=timeframe,
+        data_quality=data_quality,
+        market_data_feed=str(manifest.get("feed") or "alpaca_paper"),
+    )
+
+
 def cached_ml_comparison(*, manifest: dict, symbol: str, start_date: str, end_date: str) -> dict:
     cache_dir = backtest_cache_dir(manifest)
     cache_path = cache_dir / f"ml_comparison_v2_{symbol}_{start_date}_{end_date}.json"
     if cache_path.exists():
-        return json.loads(cache_path.read_text(encoding="utf-8"))
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if "purgedWalkForward" not in cached:
+            cached["purgedWalkForward"] = cached_voting_ensemble_purged_walk_forward_ml_comparison(
+                manifest=manifest,
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                base_results=load_ml_base_results(manifest=manifest, start_date=start_date, end_date=end_date),
+            )
+            write_json(cache_path, cached)
+        return cached
 
     base_results = load_ml_base_results(manifest=manifest, start_date=start_date, end_date=end_date)
+    purged_walk_forward = cached_voting_ensemble_purged_walk_forward_ml_comparison(
+        manifest=manifest,
+        symbol=symbol,
+        start_date=start_date,
+        end_date=end_date,
+        base_results=base_results,
+    )
     rows = sorted(
         [
             ml_trade_row(timeframe, trade)
@@ -4331,6 +4572,88 @@ def cached_ml_comparison(*, manifest: dict, symbol: str, start_date: str, end_da
         },
         "rows": comparison_rows,
         "bestByTimeframe": best_by_timeframe,
+        "purgedWalkForward": purged_walk_forward,
+    }
+    write_json(cache_path, result)
+    return result
+
+
+def cached_voting_ensemble_purged_walk_forward_ml_comparison(
+    *,
+    manifest: dict,
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    base_results: dict[str, dict],
+) -> dict:
+    cache_dir = backtest_cache_dir(manifest)
+    cache_path = cache_dir / f"voting_ensemble_purged_walk_forward_ml_v1_{symbol}_{start_date}_{end_date}.json"
+    if cache_path.exists():
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+
+    from backend.app.algorithms.voting_ensemble import merge_voting_ensemble_replay_snapshot_labels
+    from backend.app.meta_strategy_training import train_and_validate_meta_model_v2
+
+    source_roots = []
+    source_summaries = []
+    for timeframe in ("1Min", "5Min"):
+        summary = (base_results.get(timeframe) or {}).get("mlReplaySnapshots")
+        if not isinstance(summary, dict):
+            continue
+        root = Path(str(summary.get("snapshotRoot") or ""))
+        source_summaries.append({**summary, "timeframe": timeframe})
+        if root.exists():
+            source_roots.append(root)
+
+    training_root = cache_dir / f"voting_ensemble_purged_walk_forward_snapshots_{symbol}_{start_date}_{end_date}"
+    if not source_roots:
+        result = {
+            "version": "voting_ensemble_purged_walk_forward_ml_comparison_v1",
+            "status": "no_replay_snapshots",
+            "symbol": symbol.upper(),
+            "sourceSnapshotSummaries": source_summaries,
+            "snapshotRows": 0,
+            "eligibleRows": 0,
+            "trusted": False,
+            "message": "No Voting Ensemble replay candidate snapshots were available for purged walk-forward ML comparison.",
+        }
+        write_json(cache_path, result)
+        return result
+
+    merged = merge_voting_ensemble_replay_snapshot_labels(source_roots=source_roots, output_root=training_root, symbol=symbol)
+    if int(merged.get("eligibleRowCount") or 0) <= 0:
+        result = {
+            "version": "voting_ensemble_purged_walk_forward_ml_comparison_v1",
+            "status": "no_training_eligible_replay_snapshots",
+            "symbol": symbol.upper(),
+            "sourceSnapshotSummaries": source_summaries,
+            "mergedSnapshots": merged,
+            "snapshotRows": int(merged.get("rowCount") or 0),
+            "eligibleRows": int(merged.get("eligibleRowCount") or 0),
+            "trusted": False,
+            "message": "Replay snapshots were produced, but none were marked training-eligible because required real 5m/15m, QQQ/IWM, or breadth data was missing.",
+        }
+        write_json(cache_path, result)
+        return result
+
+    training = train_and_validate_meta_model_v2(
+        decision_snapshot_dir=training_root,
+        symbol=symbol,
+        min_rows=30,
+    )
+    result = {
+        "version": "voting_ensemble_purged_walk_forward_ml_comparison_v1",
+        "status": training.get("status"),
+        "symbol": symbol.upper(),
+        "source": "Voting Ensemble replay stage snapshots converted to DecisionSnapshotV2 label rows",
+        "policy": "Purged nested chronological walk-forward validation; ML may filter/reduce risk but does not create or reverse trades.",
+        "sourceSnapshotSummaries": source_summaries,
+        "mergedSnapshots": merged,
+        "snapshotRows": int(merged.get("rowCount") or 0),
+        "eligibleRows": int(merged.get("eligibleRowCount") or 0),
+        "training": training,
+        "trusted": bool(training.get("trusted")),
+        "message": training.get("message"),
     }
     write_json(cache_path, result)
     return result

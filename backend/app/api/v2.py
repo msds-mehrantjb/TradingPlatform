@@ -54,12 +54,8 @@ from backend.app.ml.features import MLFeatureSet
 from backend.app.ml.inference import SafeMLInferenceConfig, apply_safe_ml_inference
 from backend.app.strategies import StrategyEvaluationContext, resolve_strategy
 from backend.app.strategies.context import (
-    EconomicEventContext,
     MarketBreadthMomentumContext,
-    MarketStructureContext,
     RelativeStrengthQqqIwmContext,
-    VolumeConfirmationContext,
-    VwapPositionContext,
 )
 from backend.app.strategies.directional import (
     BollingerAtrReversionStrategy,
@@ -79,6 +75,13 @@ from backend.app.trading_policy import DynamicPolicyInputs, DynamicTradingPolicy
 
 API_V2_VERSION = "api_v2"
 PAPER_DECISION_ENDPOINT_VERSION = "paper_decision_evaluate_v1"
+APPROVED_VOTING_ENSEMBLE_DIRECTIONAL_IDS = (
+    "multi_timeframe_trend_alignment",
+    "first_pullback_after_open",
+    "failed_breakout_reversal",
+    "liquidity_sweep_reversal",
+    "bollinger_atr_reversion",
+)
 
 router = APIRouter(prefix="/api/v2", tags=["api-v2"])
 BACKTEST_RESULTS: dict[str, dict[str, Any]] = {}
@@ -321,8 +324,8 @@ def run_backtest(request: BacktestRunRequest) -> ApiV2Envelope:
         spy1mCandles=request.spy1mCandles,
         spy5mCandles=request.spy5mCandles or request.spy1mCandles,
         spy15mCandles=request.spy15mCandles or request.spy1mCandles,
-        qqqCandles=request.qqqCandles or request.spy1mCandles,
-        iwmCandles=request.iwmCandles or request.spy1mCandles,
+        qqqCandles=request.qqqCandles,
+        iwmCandles=request.iwmCandles,
         priorDayOHLC=request.priorDayOHLC,
         premarket=request.premarket,
         openingRange=request.openingRange,
@@ -351,8 +354,8 @@ def evaluate_paper_shadow(request: PaperShadowEvaluateRequest) -> ApiV2Envelope:
         spy1mCandles=request.spy1mCandles,
         spy5mCandles=request.spy5mCandles,
         spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles or request.spy1mCandles,
-        iwmCandles=request.iwmCandles or request.spy1mCandles,
+        qqqCandles=request.qqqCandles,
+        iwmCandles=request.iwmCandles,
         priorDayOHLC=request.priorDayOHLC,
         premarket=request.premarket,
         openingRange=request.openingRange,
@@ -381,8 +384,8 @@ def evaluate_deterministic_v2_activation(request: DeterministicV2ActivationEvalu
         spy1mCandles=request.spy1mCandles,
         spy5mCandles=request.spy5mCandles,
         spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles or request.spy1mCandles,
-        iwmCandles=request.iwmCandles or request.spy1mCandles,
+        qqqCandles=request.qqqCandles,
+        iwmCandles=request.iwmCandles,
         priorDayOHLC=request.priorDayOHLC,
         premarket=request.premarket,
         openingRange=request.openingRange,
@@ -414,8 +417,8 @@ def evaluate_ml_filter_rollout(request: MLFilterRolloutEvaluateRequest) -> ApiV2
         spy1mCandles=request.spy1mCandles,
         spy5mCandles=request.spy5mCandles,
         spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles or request.spy1mCandles,
-        iwmCandles=request.iwmCandles or request.spy1mCandles,
+        qqqCandles=request.qqqCandles,
+        iwmCandles=request.iwmCandles,
         priorDayOHLC=request.priorDayOHLC,
         premarket=request.premarket,
         openingRange=request.openingRange,
@@ -433,8 +436,8 @@ def evaluate_ml_filter_rollout(request: MLFilterRolloutEvaluateRequest) -> ApiV2
         spy1mCandles=request.spy1mCandles,
         spy5mCandles=request.spy5mCandles,
         spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles or request.spy1mCandles,
-        iwmCandles=request.iwmCandles or request.spy1mCandles,
+        qqqCandles=request.qqqCandles,
+        iwmCandles=request.iwmCandles,
         priorDayOHLC=request.priorDayOHLC,
         premarket=request.premarket,
         openingRange=request.openingRange,
@@ -473,8 +476,8 @@ def evaluate_dynamic_policy_shadow(request: DynamicPolicyShadowEvaluateRequest) 
         spy1mCandles=request.spy1mCandles,
         spy5mCandles=request.spy5mCandles,
         spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles or request.spy1mCandles,
-        iwmCandles=request.iwmCandles or request.spy1mCandles,
+        qqqCandles=request.qqqCandles,
+        iwmCandles=request.iwmCandles,
         priorDayOHLC=request.priorDayOHLC,
         premarket=request.premarket,
         openingRange=request.openingRange,
@@ -505,8 +508,8 @@ def evaluate_dynamic_policy_activation(request: DynamicPolicyActivationEvaluateR
         spy1mCandles=request.spy1mCandles,
         spy5mCandles=request.spy5mCandles,
         spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles or request.spy1mCandles,
-        iwmCandles=request.iwmCandles or request.spy1mCandles,
+        qqqCandles=request.qqqCandles,
+        iwmCandles=request.iwmCandles,
         priorDayOHLC=request.priorDayOHLC,
         premarket=request.premarket,
         openingRange=request.openingRange,
@@ -542,8 +545,8 @@ def evaluate_ml_risk_modifier_experiment(request: MLRiskModifierExperimentEvalua
         spy1mCandles=request.spy1mCandles,
         spy5mCandles=request.spy5mCandles,
         spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles or request.spy1mCandles,
-        iwmCandles=request.iwmCandles or request.spy1mCandles,
+        qqqCandles=request.qqqCandles,
+        iwmCandles=request.iwmCandles,
         priorDayOHLC=request.priorDayOHLC,
         premarket=request.premarket,
         openingRange=request.openingRange,
@@ -576,8 +579,8 @@ def run_historical_shadow_comparison(request: HistoricalShadowComparisonRequest)
         spy1mCandles=request.spy1mCandles,
         spy5mCandles=request.spy5mCandles or request.spy1mCandles,
         spy15mCandles=request.spy15mCandles or request.spy1mCandles,
-        qqqCandles=request.qqqCandles or request.spy1mCandles,
-        iwmCandles=request.iwmCandles or request.spy1mCandles,
+        qqqCandles=request.qqqCandles,
+        iwmCandles=request.iwmCandles,
         priorDayOHLC=request.priorDayOHLC,
         premarket=request.premarket,
         openingRange=request.openingRange,
@@ -660,8 +663,8 @@ def evaluate_paper_decision(request: ReplayDecisionEvaluateRequest) -> ApiV2Enve
         spy1mCandles=request.spy1mCandles,
         spy5mCandles=request.spy5mCandles,
         spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles or request.spy1mCandles,
-        iwmCandles=request.iwmCandles or request.spy1mCandles,
+        qqqCandles=request.qqqCandles,
+        iwmCandles=request.iwmCandles,
         priorDayOHLC=request.priorDayOHLC,
         premarket=request.premarket,
         openingRange=request.openingRange,
@@ -687,10 +690,6 @@ def build_replay_engine(
             contextModules=(
                 RelativeStrengthQqqIwmContext(),
                 MarketBreadthMomentumContext(),
-                EconomicEventContext(),
-                MarketStructureContext(),
-                VolumeConfirmationContext(),
-                VwapPositionContext(),
             ),
             regimeModule=AdxAtrRegimeClassifier(),
             mlConfig=ml_config or SafeMLInferenceConfig(),
@@ -713,7 +712,7 @@ def build_directional_strategies(strategy_ids: list[str] | None) -> list[Any]:
         "bollinger_atr_reversion": BollingerAtrReversionStrategy,
         "gap_continuation_gap_fade": GapContinuationFadeStrategy,
     }
-    ids = strategy_ids or list(factories)
+    ids = strategy_ids or list(APPROVED_VOTING_ENSEMBLE_DIRECTIONAL_IDS)
     return [factories[resolve_strategy(strategy_id).strategyId]() for strategy_id in ids]
 
 

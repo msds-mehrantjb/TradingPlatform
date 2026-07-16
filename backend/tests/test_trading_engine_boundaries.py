@@ -116,8 +116,9 @@ class TradingEngineBoundariesTest(unittest.TestCase):
         result = engine.run_backtest(candles, timeframe="1Min")
 
         self.assertEqual(result["engineVersion"], "voting_ensemble_v2")
-        self.assertEqual(result["algorithmVersion"], "family_aware_deterministic_ensemble_v1")
-        self.assertIn("event replay", result["explanation"])
+        self.assertEqual(result["algorithmVersion"], "voting_ensemble_backend_v1")
+        self.assertEqual(result["backtestVersion"], "voting_ensemble_dedicated_backtest_v1")
+        self.assertIn("Dedicated Voting Ensemble", result["explanation"])
         self.assertIn("decisionCount", result)
 
 
