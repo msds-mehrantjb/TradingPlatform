@@ -33,6 +33,7 @@ def strategy_signal(
     eligible: bool = True,
     data_ready: bool = True,
     active: bool = True,
+    features: dict | None = None,
 ) -> StrategySignal:
     entry = resolve_strategy(strategy_id)
     direction = {Signal.BUY: Direction.LONG, Signal.SELL: Direction.SHORT, Signal.HOLD: Direction.FLAT}[signal]
@@ -54,7 +55,7 @@ def strategy_signal(
         structuralInvalidationPrice=None,
         reasonCodes=[f"test.{signal.value.lower()}"],
         explanation="Synthetic ensemble test signal.",
-        features={},
+        features=features or {},
         requiredInputs=list(entry.requiredInputs),
         inputTimestamps={},
         evaluatedAt=NOW,
@@ -194,6 +195,67 @@ class FamilyAwareDeterministicEnsembleTest(unittest.TestCase):
 
         self.assertAlmostEqual(base.rawScore, duplicated.rawScore, places=4)
         self.assertAlmostEqual(base.finalScore, duplicated.finalScore, places=4)
+
+    def test_same_opening_continuation_event_is_capped_inside_trend_family(self) -> None:
+        event_id = "SPY|2026-01-05|opening-continuation|09:37|BUY"
+        result = aggregate(
+            [
+                strategy_signal(
+                    "multi_timeframe_trend_alignment",
+                    Signal.BUY,
+                    confidence=0.9,
+                    features={"eventCorrelationId": event_id, "trendEvidenceRole": "timeframe_agreement"},
+                ),
+                strategy_signal(
+                    "first_pullback_after_open",
+                    Signal.BUY,
+                    confidence=0.9,
+                    features={"eventCorrelationId": event_id, "trendEvidenceRole": "pattern_first_pullback"},
+                ),
+                strategy_signal(
+                    "vwap_trend_continuation",
+                    Signal.BUY,
+                    confidence=0.9,
+                    features={"eventCorrelationId": event_id, "trendEvidenceRole": "anchor_behavior"},
+                ),
+                strategy_signal("opening_range_breakout", Signal.BUY, confidence=0.8),
+            ],
+            config=FamilyAwareEnsembleConfig(minimumFinalScore=0.20),
+        )
+
+        trend_score = next(score for score in result.familyScores if score.family == StrategyFamily.TREND.value)
+        trend_signal = next(signal for signal in result.strategySignals if signal.strategyId == "multi_timeframe_trend_alignment")
+        overlap = trend_signal.features["trendOverlapControl"]
+        self.assertAlmostEqual(trend_score.buyScore, 0.85, places=4)
+        self.assertEqual(overlap["eventCorrelationId"], event_id)
+        self.assertEqual(overlap["adjustment"], "same_direction_confidence_aggregation")
+        self.assertEqual(overlap["trendFamilyVoteCap"], 0.85)
+        self.assertEqual(set(overlap["evidenceRoles"]), {"timeframe_agreement", "pattern_first_pullback", "anchor_behavior"})
+        self.assertIn("first_pullback_after_open", overlap["leaveOneStrategyOutGroupValue"])
+        self.assertAlmostEqual(result.rawScore, 0.825, places=4)
+
+    def test_distinct_trend_events_are_not_collapsed_into_one_correlation_group(self) -> None:
+        result = aggregate(
+            [
+                strategy_signal(
+                    "multi_timeframe_trend_alignment",
+                    Signal.BUY,
+                    confidence=0.8,
+                    features={"eventCorrelationId": "SPY|2026-01-05|mtf-trigger|09:35|BUY"},
+                ),
+                strategy_signal(
+                    "first_pullback_after_open",
+                    Signal.BUY,
+                    confidence=0.6,
+                    features={"eventCorrelationId": "SPY|2026-01-05|first-pullback|09:42|BUY"},
+                ),
+                strategy_signal("opening_range_breakout", Signal.BUY, confidence=0.7),
+            ]
+        )
+
+        trend_score = next(score for score in result.familyScores if score.family == StrategyFamily.TREND.value)
+        self.assertAlmostEqual(trend_score.buyScore, 0.7, places=4)
+        self.assertAlmostEqual(result.rawScore, 0.7, places=4)
 
     def test_buy_requires_independent_family_support(self) -> None:
         only_trend = aggregate(

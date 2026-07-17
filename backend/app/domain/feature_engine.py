@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from enum import Enum
 from math import sqrt
 from statistics import mean, pstdev
@@ -8,11 +8,13 @@ from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
+from backend.app.domain.exchange_calendar import ExchangeCalendarService, ExchangeSession, NEW_YORK
+from backend.app.domain.indicator_service import PointInTimeIndicatorService
 from backend.app.domain.models import DomainModel, _require_utc
 
 
-MARKET_OPEN = time(9, 30)
-MARKET_CLOSE = time(16, 0)
+INDICATORS = PointInTimeIndicatorService()
+EXCHANGE_CALENDAR = ExchangeCalendarService()
 
 
 class FeatureQuality(str, Enum):
@@ -125,10 +127,16 @@ class PointInTimeFeatureRequest(DomainModel):
     breadthComponents: dict[str, list[MarketCandle]] = Field(default_factory=dict)
     externalBreadthFeed: dict[str, Any] = Field(default_factory=dict)
     maxAuxiliaryAgeSeconds: int = Field(default=300, ge=0)
+    finalizationLagSeconds: int = Field(default=1, ge=0)
+    allowExtendedHours: bool = False
+    exchangeSession: ExchangeSession | None = None
+    exchangeCalendarOverrides: dict[str, Any] = Field(default_factory=dict)
+    consumedTrendTriggerIds: list[str] = Field(default_factory=list)
+    trendTriggerCooldownUntil: datetime | None = None
     executionStyle: Literal["live", "replay", "decision_recording", "ml", "backtest"] = "live"
     forModelTraining: bool = False
 
-    @field_validator("evaluationTimestamp", "sessionVwapTimestamp")
+    @field_validator("evaluationTimestamp", "sessionVwapTimestamp", "trendTriggerCooldownUntil")
     @classmethod
     def timestamp_must_be_utc(cls, value: datetime | None) -> datetime | None:
         return _require_utc(value) if value else None
@@ -139,6 +147,13 @@ class PointInTimeFeatureSnapshot(DomainModel):
     evaluationTimestamp: datetime
     sessionDate: date
     anchorTimestamp: datetime | None
+    corePriceDataReady: bool = False
+    strategyRequiredFeaturesReady: bool = False
+    strategyRequiredDataReady: bool = False
+    auxiliaryMarketContextReady: bool = False
+    auxiliaryContextReady: bool = False
+    executionDataReady: bool = False
+    globalSnapshotReady: bool = False
     dataReady: bool
     eligibleForTraining: bool
     reasonCodes: list[str]
@@ -158,13 +173,31 @@ class PointInTimeFeatureEngine:
         reason_codes: list[str] = []
         features: dict[str, FeatureValue] = {}
         local_eval = _new_york_datetime(request.evaluationTimestamp)
-        session_matches = local_eval.date() == request.sessionDate
+        exchange_session = request.exchangeSession or EXCHANGE_CALENDAR.session_for_date(
+            request.sessionDate,
+            overrides=request.exchangeCalendarOverrides,
+        )
+        session_matches = exchange_session.sessionDate == request.sessionDate
+        if exchange_session.can_trade:
+            session_matches = session_matches and exchange_session.contains_timestamp(request.evaluationTimestamp)
+        else:
+            session_matches = session_matches and local_eval.date() == request.sessionDate
         if not session_matches:
             reason_codes.append("session_date_mismatch")
+        if not exchange_session.can_trade:
+            reason_codes.append("exchange_session_closed")
 
-        spy_1m = _completed_candles(request.spy1mCandles, request.evaluationTimestamp)
-        spy_5m = _completed_candles(request.spy5mCandles, request.evaluationTimestamp)
-        spy_15m = _completed_candles(request.spy15mCandles, request.evaluationTimestamp)
+        spy_1m = _completed_candles(request.spy1mCandles, request.evaluationTimestamp, request.finalizationLagSeconds)
+        spy_5m = _completed_candles(request.spy5mCandles, request.evaluationTimestamp, request.finalizationLagSeconds)
+        spy_15m = _completed_candles(request.spy15mCandles, request.evaluationTimestamp, request.finalizationLagSeconds)
+        timeframe_quality = {
+            "1m": _timeframe_quality("1m", request.spy1mCandles, spy_1m, request.evaluationTimestamp, request.finalizationLagSeconds, allow_extended_hours=request.allowExtendedHours),
+            "5m": _timeframe_quality("5m", request.spy5mCandles, spy_5m, request.evaluationTimestamp, request.finalizationLagSeconds, allow_extended_hours=request.allowExtendedHours),
+            "15m": _timeframe_quality("15m", request.spy15mCandles, spy_15m, request.evaluationTimestamp, request.finalizationLagSeconds, allow_extended_hours=request.allowExtendedHours),
+        }
+        for label, quality in timeframe_quality.items():
+            for reason in quality["reason_codes"]:
+                reason_codes.append(f"spy_{label}_{reason}")
         anchor = spy_1m[-1] if spy_1m else None
         anchor_timestamp = anchor.timestamp if anchor else None
         if not anchor:
@@ -173,8 +206,8 @@ class PointInTimeFeatureEngine:
         if request.forModelTraining and _contains_demo_data(spy_1m + spy_5m + spy_15m):
             reason_codes.append("demo_data_rejected_for_training")
 
-        qqq, qqq_quality = _aligned_auxiliary(request.qqqAlignedCandles, anchor_timestamp, request.maxAuxiliaryAgeSeconds)
-        iwm, iwm_quality = _aligned_auxiliary(request.iwmAlignedCandles, anchor_timestamp, request.maxAuxiliaryAgeSeconds)
+        qqq, qqq_quality = _aligned_auxiliary(request.qqqAlignedCandles, anchor_timestamp, request.maxAuxiliaryAgeSeconds, request.finalizationLagSeconds)
+        iwm, iwm_quality = _aligned_auxiliary(request.iwmAlignedCandles, anchor_timestamp, request.maxAuxiliaryAgeSeconds, request.finalizationLagSeconds)
         if qqq_quality != FeatureQuality.READY:
             reason_codes.append(f"qqq_{qqq_quality.value.lower()}")
         if iwm_quality != FeatureQuality.READY:
@@ -185,7 +218,7 @@ class PointInTimeFeatureEngine:
         if not request.breadthComponents and not request.externalBreadthFeed:
             reason_codes.append("missing_breadth_components")
         for name, candles in request.breadthComponents.items():
-            latest, quality = _aligned_auxiliary(candles, anchor_timestamp, request.maxAuxiliaryAgeSeconds)
+            latest, quality = _aligned_auxiliary(candles, anchor_timestamp, request.maxAuxiliaryAgeSeconds, request.finalizationLagSeconds)
             if latest:
                 breadth_latest[name] = latest
             if quality != FeatureQuality.READY:
@@ -246,8 +279,18 @@ class PointInTimeFeatureEngine:
             features["spreadDollars"] = _feature(None, None, FeatureQuality.MISSING, "Bid/ask quote unavailable.")
             features["spreadBasisPoints"] = _feature(None, None, FeatureQuality.MISSING, "Bid/ask quote unavailable.")
 
-        features["timeSinceMarketOpenMinutes"] = _feature(_minutes_since(local_eval, MARKET_OPEN), request.evaluationTimestamp, FeatureQuality.READY, "Minutes since 09:30 New York time.")
-        features["timeUntilMarketCloseMinutes"] = _feature(_minutes_until(local_eval, MARKET_CLOSE), request.evaluationTimestamp, FeatureQuality.READY, "Minutes until 16:00 New York time.")
+        features["timeSinceMarketOpenMinutes"] = _feature(
+            exchange_session.minutes_after_open(request.evaluationTimestamp) if exchange_session.can_trade else None,
+            request.evaluationTimestamp,
+            FeatureQuality.READY if exchange_session.can_trade else FeatureQuality.MISSING,
+            "Minutes since official exchange session open.",
+        )
+        features["timeUntilMarketCloseMinutes"] = _feature(
+            ((exchange_session.closeTimestamp - request.evaluationTimestamp).total_seconds() / 60) if exchange_session.closeTimestamp else None,
+            request.evaluationTimestamp,
+            FeatureQuality.READY if exchange_session.closeTimestamp else FeatureQuality.MISSING,
+            "Minutes until official exchange session close.",
+        )
         features["qqqClose"] = _feature(qqq.close if qqq else None, qqq.timestamp if qqq else None, qqq_quality, "Aligned QQQ close.")
         features["iwmClose"] = _feature(iwm.close if iwm else None, iwm.timestamp if iwm else None, iwm_quality, "Aligned IWM close.")
         features["relativeStrengthQqq"] = _feature(_relative_strength(latest, qqq), latest_at if qqq else None, qqq_quality, "SPY close divided by aligned QQQ close.")
@@ -262,10 +305,22 @@ class PointInTimeFeatureEngine:
             features["openingRangeHigh"] = _feature(request.openingRange.high, request.openingRange.endTimestamp, _quality_for_value(request.openingRange.high), "Opening range high.")
             features["openingRangeLow"] = _feature(request.openingRange.low, request.openingRange.endTimestamp, _quality_for_value(request.openingRange.low), "Opening range low.")
 
+        timeframe_data_ready = all(not quality["reason_codes"] for quality in timeframe_quality.values())
+        core_price_data_ready = bool(anchor and spy_5m and spy_15m and session_matches and timeframe_data_ready)
+        strategy_required_data_ready = bool(anchor and session_matches)
+        strategy_required_features_ready = bool(
+            core_price_data_ready and _features_ready(features, _multi_timeframe_required_feature_names())
+        )
+        auxiliary_market_context_ready = bool(
+            qqq_quality == FeatureQuality.READY
+            and iwm_quality == FeatureQuality.READY
+            and (breadth_quality == FeatureQuality.READY or request.externalBreadthFeed is not None)
+        )
+        execution_data_ready = bool(request.quote and "quote_stale" not in reason_codes)
         stale_or_missing_required = any(
             code
             for code in reason_codes
-            if code.startswith(("qqq_", "iwm_", "breadth_", "missing_spy", "missing_prior", "session_date", "quote_stale"))
+            if code.startswith(("qqq_", "iwm_", "breadth_", "missing_spy", "missing_prior", "session_date", "exchange_session", "quote_stale"))
         )
         demo_rejected = "demo_data_rejected_for_training" in reason_codes
         data_ready = bool(anchor and not stale_or_missing_required and session_matches)
@@ -278,11 +333,39 @@ class PointInTimeFeatureEngine:
             evaluationTimestamp=request.evaluationTimestamp,
             sessionDate=request.sessionDate,
             anchorTimestamp=anchor_timestamp,
+            corePriceDataReady=core_price_data_ready,
+            strategyRequiredFeaturesReady=strategy_required_features_ready,
+            strategyRequiredDataReady=strategy_required_data_ready,
+            auxiliaryMarketContextReady=auxiliary_market_context_ready,
+            auxiliaryContextReady=auxiliary_market_context_ready,
+            executionDataReady=execution_data_ready,
+            globalSnapshotReady=data_ready,
             dataReady=data_ready,
             eligibleForTraining=eligible_for_training,
             reasonCodes=_unique(reason_codes),
             features=features,
-            rawInputs=_raw_inputs(request, spy_1m, spy_5m, spy_15m, qqq, iwm, breadth_latest, anchor_timestamp),
+            rawInputs=_raw_inputs(
+                request,
+                spy_1m,
+                spy_5m,
+                spy_15m,
+                qqq,
+                iwm,
+                breadth_latest,
+                anchor_timestamp,
+                timeframe_quality,
+                exchange_session,
+                readiness={
+                    "corePriceDataReady": core_price_data_ready,
+                    "strategyRequiredFeaturesReady": strategy_required_features_ready,
+                    "strategyRequiredDataReady": strategy_required_data_ready,
+                    "auxiliaryMarketContextReady": auxiliary_market_context_ready,
+                    "auxiliaryContextReady": auxiliary_market_context_ready,
+                    "executionDataReady": execution_data_ready,
+                    "globalSnapshotReady": data_ready,
+                    "aggregateDataReady": data_ready,
+                },
+            ),
         )
 
 
@@ -290,33 +373,156 @@ def compute_point_in_time_features(request: PointInTimeFeatureRequest) -> PointI
     return PointInTimeFeatureEngine().compute(request)
 
 
-def _nth_sunday(year: int, month: int, nth: int) -> int:
-    first = datetime(year, month, 1)
-    first_sunday = 1 + ((6 - first.weekday()) % 7)
-    return first_sunday + ((nth - 1) * 7)
-
-
 def _new_york_datetime(value: datetime) -> datetime:
-    utc_value = _require_utc(value)
-    year = utc_value.year
-    dst_start_utc = datetime(year, 3, _nth_sunday(year, 3, 2), 7, 0, tzinfo=UTC)
-    dst_end_utc = datetime(year, 11, _nth_sunday(year, 11, 1), 6, 0, tzinfo=UTC)
-    offset_hours = -4 if dst_start_utc <= utc_value < dst_end_utc else -5
-    return utc_value.astimezone(timezone(timedelta(hours=offset_hours), "America/New_York"))
+    return _require_utc(value).astimezone(NEW_YORK)
 
 
-def _completed_candles(candles: list[MarketCandle], evaluation_timestamp: datetime) -> list[MarketCandle]:
-    return sorted((candle for candle in candles if candle.timestamp <= evaluation_timestamp), key=lambda candle: candle.timestamp)
+def _completed_candles(candles: list[MarketCandle], evaluation_timestamp: datetime | None, finalization_lag_seconds: int = 0) -> list[MarketCandle]:
+    if evaluation_timestamp is None:
+        return []
+    cutoff = evaluation_timestamp - timedelta(seconds=finalization_lag_seconds)
+    return sorted(
+        (candle for candle in candles if _bar_end_timestamp(candle) <= cutoff),
+        key=lambda candle: candle.timestamp,
+    )
+
+
+def _timeframe_quality(
+    label: str,
+    input_candles: list[MarketCandle],
+    completed_candles: list[MarketCandle],
+    evaluation_timestamp: datetime,
+    finalization_lag_seconds: int,
+    *,
+    allow_extended_hours: bool,
+) -> dict[str, Any]:
+    duration = _label_duration(label)
+    expected_last_bar_end = _expected_last_bar_end(evaluation_timestamp, duration, finalization_lag_seconds)
+    last_bar = completed_candles[-1] if completed_candles else None
+    last_bar_end = _bar_end_timestamp(last_bar) if last_bar else None
+    age_seconds = (evaluation_timestamp - last_bar_end).total_seconds() if last_bar_end else None
+    required_history = _required_history_count(label)
+    completed_timestamps = [candle.timestamp for candle in completed_candles]
+    input_timestamps = [candle.timestamp for candle in input_candles if _bar_end_timestamp(candle) <= evaluation_timestamp - timedelta(seconds=finalization_lag_seconds)]
+    is_ordered = all(left < right for left, right in zip(input_timestamps, input_timestamps[1:]))
+    has_duplicates = len(set(input_timestamps)) != len(input_timestamps)
+    has_gaps = _has_timeframe_gaps(completed_candles, duration)
+    is_boundary_aligned = all(_boundary_aligned(candle.timestamp, duration) for candle in completed_candles)
+    has_required_history = len(completed_candles) >= required_history
+    is_fresh = bool(last_bar_end and last_bar_end >= expected_last_bar_end)
+    is_complete = bool(completed_candles and all(_bar_end_timestamp(candle) <= evaluation_timestamp - timedelta(seconds=finalization_lag_seconds) for candle in completed_candles))
+    has_extended_hours = any(not _regular_hours_candle(candle) for candle in completed_candles)
+    has_regular_hours = any(_regular_hours_candle(candle) for candle in completed_candles)
+    reason_codes: list[str] = []
+    if not is_complete:
+        reason_codes.append("incomplete")
+    if not is_fresh:
+        reason_codes.append("stale_or_missing_recent")
+    if not is_boundary_aligned:
+        reason_codes.append("misaligned_boundary")
+    if not has_required_history:
+        reason_codes.append("insufficient_history")
+    if has_gaps:
+        reason_codes.append("has_gaps")
+    if has_duplicates:
+        reason_codes.append("has_duplicates")
+    if not is_ordered:
+        reason_codes.append("out_of_order")
+    if has_extended_hours and not allow_extended_hours:
+        reason_codes.append("extended_hours_not_allowed")
+    if has_extended_hours and has_regular_hours and not allow_extended_hours:
+        reason_codes.append("mixed_regular_extended_hours")
+    quality_score = 1.0
+    for penalty in (
+        0.20 if not is_complete else 0.0,
+        0.25 if not is_fresh else 0.0,
+        0.25 if not is_boundary_aligned else 0.0,
+        0.20 if not has_required_history else 0.0,
+        0.20 if has_gaps else 0.0,
+        0.25 if has_duplicates else 0.0,
+        0.15 if not is_ordered else 0.0,
+        0.20 if has_extended_hours and not allow_extended_hours else 0.0,
+        0.10 if has_extended_hours and has_regular_hours and not allow_extended_hours else 0.0,
+    ):
+        quality_score -= penalty
+    return {
+        "timeframe": label,
+        "is_complete": is_complete,
+        "is_fresh": is_fresh,
+        "is_boundary_aligned": is_boundary_aligned,
+        "is_ordered": is_ordered,
+        "has_required_history": has_required_history,
+        "has_gaps": has_gaps,
+        "has_duplicates": has_duplicates,
+        "last_bar_start": last_bar.timestamp.isoformat().replace("+00:00", "Z") if last_bar else None,
+        "last_bar_end": last_bar_end.isoformat().replace("+00:00", "Z") if last_bar_end else None,
+        "expected_last_bar_end": expected_last_bar_end.isoformat().replace("+00:00", "Z"),
+        "age_seconds": age_seconds,
+        "quality_score": round(max(0.0, min(1.0, quality_score)), 4),
+        "reason_codes": reason_codes,
+    }
+
+
+def _required_history_count(label: str) -> int:
+    return {"1m": 30, "5m": 30, "15m": 30}.get(label, 30)
+
+
+def _label_duration(label: str) -> timedelta:
+    if label == "5m":
+        return timedelta(minutes=5)
+    if label == "15m":
+        return timedelta(minutes=15)
+    return timedelta(minutes=1)
+
+
+def _expected_last_bar_end(evaluation_timestamp: datetime, duration: timedelta, finalization_lag_seconds: int) -> datetime:
+    cutoff = evaluation_timestamp - timedelta(seconds=finalization_lag_seconds)
+    midnight = cutoff.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed_seconds = int((cutoff - midnight).total_seconds())
+    duration_seconds = int(duration.total_seconds())
+    completed_intervals = elapsed_seconds // duration_seconds
+    return midnight + timedelta(seconds=completed_intervals * duration_seconds)
+
+
+def _has_timeframe_gaps(candles: list[MarketCandle], duration: timedelta) -> bool:
+    if len(candles) < 2:
+        return False
+    for left, right in zip(candles, candles[1:]):
+        if right.timestamp - left.timestamp != duration:
+            return True
+    return False
+
+
+def _boundary_aligned(timestamp: datetime, duration: timedelta) -> bool:
+    midnight = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((timestamp - midnight).total_seconds()) % int(duration.total_seconds()) == 0
+
+
+def _regular_hours_candle(candle: MarketCandle) -> bool:
+    session = EXCHANGE_CALENDAR.session_for_date(_new_york_datetime(candle.timestamp).date())
+    return session.contains_timestamp(candle.timestamp) and session.contains_timestamp(_bar_end_timestamp(candle) - timedelta(microseconds=1))
+
+
+def _bar_end_timestamp(candle: MarketCandle) -> datetime:
+    return candle.timestamp + _timeframe_duration(candle.timeframe)
+
+
+def _timeframe_duration(timeframe: str | None) -> timedelta:
+    if timeframe == "5Min":
+        return timedelta(minutes=5)
+    if timeframe == "15Min":
+        return timedelta(minutes=15)
+    return timedelta(minutes=1)
 
 
 def _contains_demo_data(candles: list[MarketCandle]) -> bool:
     return any(candle.provider.lower() in {"demo", "fallback"} for candle in candles)
 
 
-def _aligned_auxiliary(candles: list[MarketCandle], anchor_timestamp: datetime | None, max_age_seconds: int) -> tuple[MarketCandle | None, FeatureQuality]:
+def _aligned_auxiliary(candles: list[MarketCandle], anchor_timestamp: datetime | None, max_age_seconds: int, finalization_lag_seconds: int = 0) -> tuple[MarketCandle | None, FeatureQuality]:
     if anchor_timestamp is None:
         return None, FeatureQuality.MISSING
-    completed = [candle for candle in candles if candle.timestamp <= anchor_timestamp]
+    completed = _completed_candles(candles, anchor_timestamp, finalization_lag_seconds)
     if not completed:
         return None, FeatureQuality.MISSING
     latest = max(completed, key=lambda candle: candle.timestamp)
@@ -336,11 +542,11 @@ def _add_timeframe_features(features: dict[str, FeatureValue], label: str, candl
     volumes = [candle.volume for candle in candles]
     latest_at = candles[-1].timestamp if candles else None
 
-    ema9_series = _ema_series(closes, 9)
-    ema20_series = _ema_series(closes, 20)
+    ema9_series = INDICATORS.ema_series(closes, 9)
+    ema20_series = INDICATORS.ema_series(closes, 20)
     sma20 = _sma(closes, 20)
     sma50 = _sma(closes, 50)
-    atr14 = _atr(candles, 14)
+    atr14 = _last(INDICATORS.atr_series(candles, 14))
     adx14 = _adx(candles, 14)
     rsi14 = _rsi(closes, 14)
     macd = _macd(closes)
@@ -388,22 +594,27 @@ def _quality_for_value(value: Any) -> FeatureQuality:
     return FeatureQuality.MISSING if value is None else FeatureQuality.READY
 
 
-def _ema_series(values: list[float], period: int) -> list[float | None]:
-    if not values:
-        return []
-    alpha = 2 / (period + 1)
-    result: list[float | None] = []
-    ema_value: float | None = None
-    for index, value in enumerate(values):
-        if index + 1 < period:
-            result.append(None)
-            continue
-        if ema_value is None:
-            ema_value = mean(values[index + 1 - period : index + 1])
-        else:
-            ema_value = (value * alpha) + (ema_value * (1 - alpha))
-        result.append(ema_value)
-    return result
+def _features_ready(features: dict[str, FeatureValue], names: tuple[str, ...]) -> bool:
+    return all(features.get(name) is not None and features[name].quality == FeatureQuality.READY.value for name in names)
+
+
+def _multi_timeframe_required_feature_names() -> tuple[str, ...]:
+    names: list[str] = ["sessionVwap", "sessionVwapSlope", "distanceFromVwapAtr"]
+    for timeframe in ("1m", "5m", "15m"):
+        prefix = f"spy{timeframe}"
+        names.extend(
+            [
+                f"{prefix}Ema9",
+                f"{prefix}Ema20",
+                f"{prefix}Atr14",
+                f"{prefix}Adx14",
+                f"{prefix}HigherHighHigherLow",
+                f"{prefix}LowerHighLowerLow",
+                f"{prefix}RollingHigh20",
+                f"{prefix}RollingLow20",
+            ]
+        )
+    return tuple(names)
 
 
 def _sma(values: list[float], period: int) -> float | None:
@@ -421,17 +632,6 @@ def _slope(values: list[float | None], lookback: int) -> float | None:
     if previous == 0:
         return None
     return (latest - previous) / previous
-
-
-def _atr(candles: list[MarketCandle], period: int) -> float | None:
-    if len(candles) <= period:
-        return None
-    true_ranges = []
-    for index in range(len(candles) - period, len(candles)):
-        current = candles[index]
-        previous_close = candles[index - 1].close
-        true_ranges.append(max(current.high - current.low, abs(current.high - previous_close), abs(current.low - previous_close)))
-    return mean(true_ranges)
 
 
 def _adx(candles: list[MarketCandle], period: int) -> float | None:
@@ -475,13 +675,13 @@ def _rsi(values: list[float], period: int) -> float | None:
 
 
 def _macd(values: list[float]) -> dict[str, float] | None:
-    ema12 = [value for value in _ema_series(values, 12) if value is not None]
-    ema26 = [value for value in _ema_series(values, 26) if value is not None]
+    ema12 = [value for value in INDICATORS.ema_series(values, 12) if value is not None]
+    ema26 = [value for value in INDICATORS.ema_series(values, 26) if value is not None]
     if not ema12 or not ema26:
         return None
     aligned = min(len(ema12), len(ema26))
     macd_series = [ema12[-aligned + index] - ema26[-aligned + index] for index in range(aligned)]
-    signal_series = [value for value in _ema_series(macd_series, 9) if value is not None]
+    signal_series = [value for value in INDICATORS.ema_series(macd_series, 9) if value is not None]
     if not signal_series:
         return None
     macd_value = macd_series[-1]
@@ -551,10 +751,7 @@ def _market_structure(highs: list[float], lows: list[float]) -> dict[str, bool] 
 
 
 def _session_vwap(candles: list[MarketCandle]) -> float | None:
-    volume = sum(candle.volume for candle in candles)
-    if volume <= 0:
-        return None
-    return sum(((candle.high + candle.low + candle.close) / 3) * candle.volume for candle in candles) / volume
+    return _last(INDICATORS.vwap_series(candles))
 
 
 def _relative_strength(spy: MarketCandle | None, other: MarketCandle | None) -> float | None:
@@ -566,16 +763,6 @@ def _relative_strength(spy: MarketCandle | None, other: MarketCandle | None) -> 
 def _breadth_proxy_return(candles: dict[str, MarketCandle]) -> float | None:
     returns = [(candle.close - candle.open) / candle.open for candle in candles.values() if candle.open > 0]
     return mean(returns) if returns else None
-
-
-def _minutes_since(local_dt: datetime, marker: time) -> float:
-    marker_dt = local_dt.replace(hour=marker.hour, minute=marker.minute, second=0, microsecond=0)
-    return (local_dt - marker_dt).total_seconds() / 60
-
-
-def _minutes_until(local_dt: datetime, marker: time) -> float:
-    marker_dt = local_dt.replace(hour=marker.hour, minute=marker.minute, second=0, microsecond=0)
-    return (marker_dt - local_dt).total_seconds() / 60
 
 
 def _last(values: list[Any]) -> Any:
@@ -599,19 +786,31 @@ def _raw_inputs(
     iwm: MarketCandle | None,
     breadth: dict[str, MarketCandle],
     anchor_timestamp: datetime | None,
+    timeframe_quality: dict[str, dict[str, Any]],
+    exchange_session: ExchangeSession,
+    readiness: dict[str, bool],
 ) -> dict[str, Any]:
-    qqq_completed = _completed_candles(request.qqqAlignedCandles, anchor_timestamp) if anchor_timestamp else []
-    iwm_completed = _completed_candles(request.iwmAlignedCandles, anchor_timestamp) if anchor_timestamp else []
+    qqq_completed = _completed_candles(request.qqqAlignedCandles, anchor_timestamp, request.finalizationLagSeconds) if anchor_timestamp else []
+    iwm_completed = _completed_candles(request.iwmAlignedCandles, anchor_timestamp, request.finalizationLagSeconds) if anchor_timestamp else []
     breadth_component_candles = {
-        name: [candle.model_dump(mode="json") for candle in _completed_candles(candles, anchor_timestamp)]
+        name: [candle.model_dump(mode="json") for candle in _completed_candles(candles, anchor_timestamp, request.finalizationLagSeconds)]
         for name, candles in request.breadthComponents.items()
     } if anchor_timestamp else {}
     return {
         "executionStyle": request.executionStyle,
         "evaluationTimestamp": request.evaluationTimestamp.isoformat().replace("+00:00", "Z"),
+        "finalizationLagSeconds": request.finalizationLagSeconds,
+        "allowExtendedHours": request.allowExtendedHours,
+        "exchangeSession": exchange_session.model_dump(mode="json"),
+        "exchangeCalendarOverrides": request.exchangeCalendarOverrides,
         "spy1mCandles": [candle.model_dump(mode="json") for candle in spy_1m],
         "spy5mCandles": [candle.model_dump(mode="json") for candle in spy_5m],
         "spy15mCandles": [candle.model_dump(mode="json") for candle in spy_15m],
+        "spy1mBarWindows": [_bar_window(candle) for candle in spy_1m],
+        "spy5mBarWindows": [_bar_window(candle) for candle in spy_5m],
+        "spy15mBarWindows": [_bar_window(candle) for candle in spy_15m],
+        "timeframeQuality": timeframe_quality,
+        "readiness": readiness,
         "sessionVwap": request.sessionVwap,
         "qqqAlignedCandle": qqq.model_dump(mode="json") if qqq else None,
         "iwmAlignedCandle": iwm.model_dump(mode="json") if iwm else None,
@@ -626,5 +825,15 @@ def _raw_inputs(
         "breadthComponentCandles": breadth_component_candles,
         "externalBreadthFeed": request.externalBreadthFeed,
         "maxAuxiliaryAgeSeconds": request.maxAuxiliaryAgeSeconds,
+        "allowExtendedHours": request.allowExtendedHours,
+        "consumedTrendTriggerIds": request.consumedTrendTriggerIds,
+        "trendTriggerCooldownUntil": request.trendTriggerCooldownUntil.isoformat().replace("+00:00", "Z") if request.trendTriggerCooldownUntil else None,
         "forModelTraining": request.forModelTraining,
+    }
+
+
+def _bar_window(candle: MarketCandle) -> dict[str, str]:
+    return {
+        "barStartTimestamp": candle.timestamp.isoformat().replace("+00:00", "Z"),
+        "barEndTimestamp": _bar_end_timestamp(candle).isoformat().replace("+00:00", "Z"),
     }

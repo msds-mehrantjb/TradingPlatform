@@ -55,7 +55,7 @@ class DirectionalStrategyRunner(Protocol):
 class FamilyAwareEnsembleConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    configVersion: str = "family_aware_deterministic_ensemble_v1"
+    configVersion: str = "family_aware_deterministic_ensemble_v2"
     minimumFinalScore: float = Field(default=0.20, ge=0, le=1)
     minimumIndependentSupportingFamilies: int = Field(default=2, ge=1)
     minimumFamilyAgreement: float = Field(default=0.10, ge=0, le=1)
@@ -65,6 +65,11 @@ class FamilyAwareEnsembleConfig(BaseModel):
     reliabilityMode: OperatingMode = OperatingMode.SHADOW
     neutralReliability: float = Field(default=0.50, ge=0, le=1)
     familyWeights: dict[StrategyFamily, float] = Field(default_factory=lambda: {family: 1.0 for family in FAMILY_ORDER})
+    enableTrendOverlapControl: bool = True
+    sameEventAdditionalStrategyWeight: float = Field(default=0.25, ge=0.0, le=1.0)
+    trendCorrelatedEventCap: float = Field(default=0.85, ge=0.0, le=1.0)
+    trendDiversityBonusPerRole: float = Field(default=0.06, ge=0.0, le=0.25)
+    maximumTrendDiversityBonus: float = Field(default=0.18, ge=0.0, le=0.50)
 
     @field_validator("familyWeights")
     @classmethod
@@ -198,6 +203,13 @@ class FamilyAggregate:
     confidence: float
     reliability: float
     eligibleSignals: list[StrategySignal]
+    diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ControlledSignalContribution:
+    signal: StrategySignal
+    value: float
 
 
 class FamilyAwareDeterministicEnsemble:
@@ -257,6 +269,7 @@ class FamilyAwareDeterministicEnsemble:
         context_conflict = sum(abs(float(row["adjustment"])) for row in context_adjustments if float(row["adjustment"]) < 0)
         final_score = _clamp_signed(raw_score + context_delta)
         supporting_families, opposing_families = self._family_support(family_aggregates, final_score)
+        diagnostic_signals = self._signals_with_family_diagnostics(scored_signals, family_aggregates)
         signal, reason_codes = self._decision_signal(
             raw_score=raw_score,
             final_score=final_score,
@@ -289,7 +302,7 @@ class FamilyAwareDeterministicEnsemble:
             opposingFamilies=opposing_families,
             eligibleStrategyCount=len(eligible_signals),
             familyScores=[self._family_score(row) for row in family_aggregates],
-            strategySignals=scored_signals,
+            strategySignals=diagnostic_signals,
             contextAdjustments=context_adjustments,
             safetyStatus=safety_status,
             reasonCodes=reason_codes,
@@ -388,7 +401,8 @@ class FamilyAwareDeterministicEnsemble:
             family_signals = [signal for signal in signals if signal.family == family.value]
             if not family_signals:
                 continue
-            values = [_strategy_value(signal) for signal in family_signals]
+            contributions, diagnostics = self._family_contributions(family, family_signals)
+            values = [row.value for row in contributions]
             family_regime_fit = _family_regime_fit(regime_state, family)
             value = _clamp_signed((sum(values) / len(values)) * family_regime_fit)
             aggregates.append(
@@ -397,10 +411,103 @@ class FamilyAwareDeterministicEnsemble:
                     value=value,
                     confidence=abs(value),
                     reliability=sum(float(signal.reliability) for signal in family_signals) / len(family_signals),
-                    eligibleSignals=family_signals,
+                    eligibleSignals=[row.signal for row in contributions],
+                    diagnostics=diagnostics,
                 )
             )
         return aggregates
+
+    def _signals_with_family_diagnostics(
+        self,
+        scored_signals: list[StrategySignal],
+        family_aggregates: list[FamilyAggregate],
+    ) -> list[StrategySignal]:
+        replacements: dict[str, StrategySignal] = {}
+        for aggregate in family_aggregates:
+            for signal in aggregate.eligibleSignals:
+                if "trendOverlapControl" in signal.features:
+                    replacements[signal.strategyId] = signal
+        if not replacements:
+            return scored_signals
+        return [replacements.get(signal.strategyId, signal) for signal in scored_signals]
+
+    def _family_contributions(
+        self,
+        family: StrategyFamily,
+        family_signals: list[StrategySignal],
+    ) -> tuple[list[ControlledSignalContribution], dict[str, Any]]:
+        if not self.config.enableTrendOverlapControl or family != StrategyFamily.TREND:
+            return [ControlledSignalContribution(signal=signal, value=_strategy_value(signal)) for signal in family_signals], {
+                "overlapControlApplied": False,
+                "reason": "not_trend_family" if family != StrategyFamily.TREND else "disabled",
+            }
+        grouped: dict[str, list[StrategySignal]] = {}
+        for signal in family_signals:
+            grouped.setdefault(_event_correlation_id(signal), []).append(signal)
+
+        contributions: list[ControlledSignalContribution] = []
+        groups: list[dict[str, Any]] = []
+        for event_id, group in grouped.items():
+            values = [_strategy_value(signal) for signal in group]
+            signs = {1 if value > 0 else -1 if value < 0 else 0 for value in values}
+            same_direction = len(signs - {0}) <= 1
+            roles = sorted({_trend_evidence_role(signal) for signal in group})
+            unique_strategy_count = len({signal.strategyId for signal in group})
+            diversity_bonus = min(
+                self.config.maximumTrendDiversityBonus,
+                max(0, len(roles) - 1) * self.config.trendDiversityBonusPerRole,
+            )
+            if len(group) == 1 or unique_strategy_count == 1 or not same_direction:
+                group_value = sum(values) / len(values)
+                adjustment = "duplicate_strategy_deduplicated" if unique_strategy_count == 1 and len(group) > 1 else "none"
+            else:
+                side = 1 if values[0] > 0 else -1
+                magnitudes = sorted((abs(value) for value in values), reverse=True)
+                primary = magnitudes[0]
+                secondary = sum(magnitudes[1:]) / len(magnitudes[1:]) if len(magnitudes) > 1 else 0.0
+                capped_magnitude = min(
+                    self.config.trendCorrelatedEventCap,
+                    primary + (secondary * self.config.sameEventAdditionalStrategyWeight) + diversity_bonus,
+                )
+                group_value = side * capped_magnitude
+                adjustment = "same_direction_confidence_aggregation"
+            leave_one_out = {
+                signal.strategyId: round(_leave_one_strategy_out_group_value(signal, group, self.config), 4)
+                for signal in group
+            }
+            groups.append(
+                {
+                    "eventCorrelationId": event_id,
+                    "strategyIds": [signal.strategyId for signal in group],
+                    "evidenceRoles": roles,
+                    "sameDirection": same_direction,
+                    "rawValues": [round(value, 4) for value in values],
+                    "groupValue": round(group_value, 4),
+                    "trendFamilyVoteCap": self.config.trendCorrelatedEventCap,
+                    "diversityBonus": round(diversity_bonus, 4),
+                    "adjustment": adjustment,
+                    "leaveOneStrategyOutGroupValue": leave_one_out,
+                }
+            )
+            representative = max(group, key=lambda signal: abs(_strategy_value(signal)))
+            features = {
+                **representative.features,
+                "eventCorrelationId": event_id,
+                "trendOverlapControl": groups[-1],
+            }
+            reason_codes = list(dict.fromkeys([*representative.reasonCodes, "ensemble.trend_overlap_control_applied"]))
+            contributions.append(
+                ControlledSignalContribution(
+                    signal=representative.model_copy(update={"features": features, "reasonCodes": reason_codes}),
+                    value=_clamp_signed(group_value),
+                )
+            )
+        return contributions, {
+            "overlapControlApplied": True,
+            "eventGroupCount": len(groups),
+            "groups": groups,
+            "method": "event_correlation_id_plus_trend_family_vote_cap",
+        }
 
     def _weighted_family_mean(self, aggregates: list[FamilyAggregate]) -> float:
         weighted_sum = 0.0
@@ -546,6 +653,116 @@ class FamilyAwareDeterministicEnsemble:
             f"finalScore={final_score:.4f}, supportingFamilies={support}, opposingFamilies={opposition}; "
             f"reasons={', '.join(reason_codes)}."
         )
+
+
+def _event_correlation_id(signal: StrategySignal) -> str:
+    direct = _first_string(
+        signal.features,
+        (
+            "eventCorrelationId",
+            "trendEventCorrelationId",
+            "correlationId",
+            "setupCorrelationId",
+        ),
+    )
+    if direct:
+        return direct
+    setup_id = _strategy_setup_id(signal)
+    if setup_id:
+        return f"{signal.family}:{signal.direction}:{setup_id}"
+    timestamp = _first_nested_string(
+        signal.features,
+        (
+            ("firstPullbackConfirmationBar", "barEndTimestamp"),
+            ("firstPullbackConfirmationBar", "barStartTimestamp"),
+            ("vwapContinuation", "confirmationTimestamp"),
+            ("vwapContinuation", "pullbackTimestamp"),
+            ("multiTimeframeBarEvidence", "roles", "longSetup", "triggerTimestamp"),
+            ("multiTimeframeBarEvidence", "roles", "shortSetup", "triggerTimestamp"),
+        ),
+    )
+    if timestamp:
+        return f"{signal.family}:{signal.direction}:{timestamp}"
+    return f"{signal.strategyId}:{signal.direction}:{signal.evaluatedAt.isoformat()}"
+
+
+def _strategy_setup_id(signal: StrategySignal) -> str | None:
+    if setup_id := _first_string(signal.features, ("setupId", "eventId")):
+        return setup_id
+    first_pullback_state = signal.features.get("firstPullbackPersistentState")
+    if isinstance(first_pullback_state, dict):
+        if setup_id := _first_string(first_pullback_state, ("setupId", "eventId")):
+            return setup_id
+    mtf_evidence = signal.features.get("multiTimeframeBarEvidence")
+    if isinstance(mtf_evidence, dict):
+        roles = mtf_evidence.get("roles")
+        if isinstance(roles, dict):
+            for key in ("longSetup", "shortSetup"):
+                setup = roles.get(key)
+                if isinstance(setup, dict) and setup.get("setupId"):
+                    return str(setup["setupId"])
+    return None
+
+
+def _trend_evidence_role(signal: StrategySignal) -> str:
+    explicit = _first_string(signal.features, ("trendEvidenceRole", "evidenceRole", "strategyEvidenceRole"))
+    if explicit:
+        return explicit
+    if signal.strategyId == "first_pullback_after_open":
+        return "pattern_first_pullback"
+    if signal.strategyId == "multi_timeframe_trend_alignment":
+        return "timeframe_agreement"
+    if signal.strategyId == "vwap_trend_continuation":
+        return "anchor_behavior"
+    return signal.strategyId
+
+
+def _leave_one_strategy_out_group_value(
+    omitted_signal: StrategySignal,
+    group: list[StrategySignal],
+    config: FamilyAwareEnsembleConfig,
+) -> float:
+    remaining = [signal for signal in group if signal.strategyId != omitted_signal.strategyId]
+    if not remaining:
+        return 0.0
+    values = [_strategy_value(signal) for signal in remaining]
+    signs = {1 if value > 0 else -1 if value < 0 else 0 for value in values}
+    if len(remaining) == 1 or len(signs - {0}) > 1:
+        return _clamp_signed(sum(values) / len(values))
+    side = 1 if values[0] > 0 else -1
+    magnitudes = sorted((abs(value) for value in values), reverse=True)
+    primary = magnitudes[0]
+    secondary = sum(magnitudes[1:]) / len(magnitudes[1:]) if len(magnitudes) > 1 else 0.0
+    roles = sorted({_trend_evidence_role(signal) for signal in remaining})
+    diversity_bonus = min(config.maximumTrendDiversityBonus, max(0, len(roles) - 1) * config.trendDiversityBonusPerRole)
+    return _clamp_signed(
+        side
+        * min(
+            config.trendCorrelatedEventCap,
+            primary + (secondary * config.sameEventAdditionalStrategyWeight) + diversity_bonus,
+        )
+    )
+
+
+def _first_string(source: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = source.get(key)
+        if value is not None and str(value):
+            return str(value)
+    return None
+
+
+def _first_nested_string(source: dict[str, Any], paths: tuple[tuple[str, ...], ...]) -> str | None:
+    for path in paths:
+        value: Any = source
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
+                value = None
+                break
+            value = value[key]
+        if value is not None and str(value):
+            return str(value)
+    return None
 
 
 def _strategy_value(signal: StrategySignal) -> float:

@@ -9,6 +9,8 @@ from backend.app.algorithms.voting_ensemble import (
     VotingEnsembleBacktestConfig,
     VotingEnsembleBacktestRunner,
 )
+from backend.app.algorithms.voting_ensemble.models import VotingCandle, VotingEnsembleEvaluateRequest
+from backend.app.algorithms.voting_ensemble.service import evaluate_first_pullback_after_open
 from backend.app.algorithms.voting_ensemble.ml_snapshots import stage_result_to_v2_training_row
 from backend.app.api.trading_engine import V2TradingEngine
 from backend.app.meta_strategy_training import DEFAULT_META_LABEL_VERSION, v2_training_compatibility_report
@@ -18,6 +20,23 @@ START = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
 
 
 class VotingEnsembleBacktestRunnerTest(unittest.TestCase):
+    def test_first_pullback_helper_can_fire_before_twenty_two_session_candles(self) -> None:
+        rows = (
+            voting_candle(0, 100.00, 100.10, 99.90, 100.00, 100000),
+            voting_candle(1, 100.00, 100.50, 99.95, 100.45, 230000),
+            voting_candle(2, 100.45, 101.05, 100.35, 100.95, 240000),
+            voting_candle(3, 100.95, 101.45, 100.90, 101.35, 260000),
+            voting_candle(4, 101.35, 101.40, 100.95, 101.05, 120000),
+            voting_candle(5, 101.05, 101.10, 100.80, 100.90, 110000),
+            voting_candle(6, 100.90, 101.50, 100.85, 101.45, 150000),
+        )
+
+        vote = evaluate_first_pullback_after_open(VotingEnsembleEvaluateRequest(candles=rows, data_timestamp=rows[-1].timestamp))
+
+        self.assertEqual(vote.signal, "Buy")
+        self.assertTrue(vote.eligible)
+        self.assertEqual(vote.features["reasonCode"], "voting_ensemble.first_pullback.completed_buy")
+
     def test_runner_uses_only_voting_ensemble_catalog(self) -> None:
         runner = VotingEnsembleBacktestRunner(config=VotingEnsembleBacktestConfig(warmupCandles=5, includeDecisionRecords=True))
 
@@ -261,6 +280,17 @@ def candles(count: int, *, minutes: int = 1, symbol: str = "SPY") -> list[dict[s
         )
         price = close
     return rows
+
+
+def voting_candle(index: int, open_: float, high: float, low: float, close: float, volume: float) -> VotingCandle:
+    return VotingCandle(
+        timestamp=START + timedelta(minutes=index),
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+    )
 
 
 if __name__ == "__main__":

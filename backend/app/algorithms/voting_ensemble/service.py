@@ -9,6 +9,7 @@ from typing import Callable
 
 from backend.app.algorithms.voting_ensemble.models import (
     AlgoSignal,
+    FeatureValue,
     VotingContextConfirmation,
     VotingCandle,
     VotingEnsembleEvaluateRequest,
@@ -97,38 +98,55 @@ def evaluate_multi_timeframe_trend(request: VotingEnsembleEvaluateRequest) -> Vo
     fifteen_minute = request.spy_15m_candles or tuple(_aggregate(candles, 15))
     trend_5m, detail_5m = _timeframe_trend_state(five_minute[-48:], "5m")
     trend_15m, detail_15m = _timeframe_trend_state(fifteen_minute[-32:], "15m")
+    long_permission = trend_15m == "up" or (trend_15m == "neutral" and not _confirmed_component_direction(fifteen_minute[-32:], "down"))
+    short_permission = trend_15m == "down" or (trend_15m == "neutral" and not _confirmed_component_direction(fifteen_minute[-32:], "up"))
+    long_confirmation = trend_5m == "up"
+    short_confirmation = trend_5m == "down"
+    long_trigger = trend_1m == "up" and _explicit_one_minute_trigger(candles[-20:], "up")
+    short_trigger = trend_1m == "down" and _explicit_one_minute_trigger(candles[-20:], "down")
     detail = f"{detail_1m}; {detail_5m}; {detail_15m}"
-    if trend_1m == "up" and trend_5m == "up" and trend_15m != "down":
+    if long_permission and long_confirmation and long_trigger:
         return _vote(
             "Multi-Timeframe Trend Alignment",
             "trend",
             "Buy",
             82,
-            f"1m trigger is bullish, 5m confirms, and 15m permission is {trend_15m}: {detail}.",
+            f"1m fresh trigger is bullish, 5m confirms, and 15m permission is {trend_15m}: {detail}.",
             "voting_ensemble.multi_timeframe.buy_trigger_confirmed",
+            features={"hierarchy": "1m_trigger_5m_confirmation_15m_permission", "long_permission": True, "long_confirmation": True, "long_trigger": True},
         )
-    if trend_1m == "down" and trend_5m == "down" and trend_15m != "up":
+    if short_permission and short_confirmation and short_trigger:
         return _vote(
             "Multi-Timeframe Trend Alignment",
             "trend",
             "Sell",
             82,
-            f"1m trigger is bearish, 5m confirms, and 15m permission is {trend_15m}: {detail}.",
+            f"1m fresh trigger is bearish, 5m confirms, and 15m permission is {trend_15m}: {detail}.",
             "voting_ensemble.multi_timeframe.sell_trigger_confirmed",
+            features={"hierarchy": "1m_trigger_5m_confirmation_15m_permission", "short_permission": True, "short_confirmation": True, "short_trigger": True},
         )
     return _vote(
         "Multi-Timeframe Trend Alignment",
         "trend",
         "Hold",
         54,
-        f"No trigger/confirmation/regime permission setup: 1m {trend_1m}, 5m {trend_5m}, 15m {trend_15m}. {detail}.",
+        f"No role-complete trigger/confirmation/permission setup: 1m trigger {long_trigger or short_trigger}, 5m confirmation {trend_5m}, 15m permission {trend_15m}. {detail}.",
         "voting_ensemble.multi_timeframe.no_trigger_confirmation",
+        features={
+            "hierarchy": "1m_trigger_5m_confirmation_15m_permission",
+            "long_permission": long_permission,
+            "long_confirmation": long_confirmation,
+            "long_trigger": long_trigger,
+            "short_permission": short_permission,
+            "short_confirmation": short_confirmation,
+            "short_trigger": short_trigger,
+        },
     )
 
 
 def evaluate_first_pullback_after_open(request: VotingEnsembleEvaluateRequest) -> VotingStrategyVote:
     session = request.candles
-    if len(session) < 22:
+    if len(session) < 7:
         return _vote("First Pullback After Open", "trend", "Hold", 20, "Need opening impulse, pullback, and confirmation candles.", "voting_ensemble.first_pullback.insufficient_data")
     impulse = _opening_impulse(session)
     if impulse is None:
@@ -429,7 +447,7 @@ CONTEXT_STRATEGIES: tuple[StrategyEvaluator, ...] = (
 )
 
 
-def _vote(strategy: str, family: str, signal: AlgoSignal, score: int, detail: str, reason_code: str) -> VotingStrategyVote:
+def _vote(strategy: str, family: str, signal: AlgoSignal, score: int, detail: str, reason_code: str, features: dict[str, FeatureValue] | None = None) -> VotingStrategyVote:
     confidence = _confidence_from_score(score)
     data_ready = _data_ready_from_reason(reason_code, score)
     reliability = 0.5
@@ -452,6 +470,7 @@ def _vote(strategy: str, family: str, signal: AlgoSignal, score: int, detail: st
             "setupScore": score,
             "legacyStatus": _status(score),
             "reasonCode": reason_code,
+            **(features or {}),
         },
     )
 
@@ -1124,6 +1143,41 @@ def _timeframe_trend_state(candles: tuple[VotingCandle, ...] | list[VotingCandle
     trend_confirmed = volume_confirmed and trend_quality_confirmed
     state = "up" if score >= 2 and trend_confirmed else "down" if score <= -2 and trend_confirmed else "neutral"
     return state, f"{label} {state} ({ema_detail}, {vwap_detail}, {structure_detail}, {volume_detail}, {trend_quality_detail})"
+
+
+def _confirmed_component_direction(candles: tuple[VotingCandle, ...] | list[VotingCandle], direction: str) -> bool:
+    if len(candles) < 10:
+        return False
+    closes = [candle.close for candle in candles]
+    ema_direction, _ = _ema_slope_state(closes)
+    _, _ = _price_vwap_state(candles)
+    structure_direction, _ = _market_structure_state(candles)
+    trend_quality_confirmed, _ = _trend_quality_state(candles)
+    return trend_quality_confirmed and ema_direction == direction and structure_direction == direction
+
+
+def _explicit_one_minute_trigger(candles: tuple[VotingCandle, ...] | list[VotingCandle], direction: str, lookback: int = 3) -> bool:
+    if len(candles) <= lookback:
+        return False
+    latest = candles[-1]
+    previous = candles[-2]
+    prior = candles[-lookback - 1 : -1]
+    closes = [candle.close for candle in candles]
+    ema9 = _ema(closes, min(9, max(3, len(closes) // 2)))
+    ema20 = _ema(closes, min(20, max(4, len(closes) - 1)))
+    if ema9 is None or ema20 is None:
+        return False
+    if direction == "up":
+        ema_reclaim = previous.close <= ema9 and latest.close > ema9 and ema9 > ema20 and latest.close > previous.high
+        pullback_continuation = min(candle.low for candle in prior) <= ema9 and latest.close > ema9 and latest.close > max(candle.high for candle in prior[-3:])
+        higher_low_break = prior[-1].low > prior[-2].low and latest.close > max(candle.high for candle in prior[-3:])
+        return ema_reclaim or pullback_continuation or higher_low_break
+    if direction == "down":
+        ema_reclaim = previous.close >= ema9 and latest.close < ema9 and ema9 < ema20 and latest.close < previous.low
+        pullback_continuation = max(candle.high for candle in prior) >= ema9 and latest.close < ema9 and latest.close < min(candle.low for candle in prior[-3:])
+        lower_high_break = prior[-1].high < prior[-2].high and latest.close < min(candle.low for candle in prior[-3:])
+        return ema_reclaim or pullback_continuation or lower_high_break
+    return False
 
 
 def _ema_slope_state(values: list[float]) -> tuple[str, str]:
