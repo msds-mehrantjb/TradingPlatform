@@ -7,6 +7,20 @@ from datetime import UTC, datetime, timedelta
 from pydantic import ValidationError
 
 from backend.app.algorithms.weighted_voting.aggregation import aggregate_weighted_signals
+from backend.app.algorithms.weighted_voting.config import WEIGHTED_VOTING_CONFIG_VERSION
+from backend.app.algorithms.weighted_voting.identity import (
+    WEIGHTED_VOTING_ACTIVE_WEIGHT_VERSION,
+    WEIGHTED_VOTING_ALGORITHM_ID,
+    WEIGHTED_VOTING_API_NAMESPACE,
+    WEIGHTED_VOTING_API_VERSION,
+    WEIGHTED_VOTING_CONFIGURATION_VERSION,
+    WEIGHTED_VOTING_REASON_CODE_PREFIX,
+    WEIGHTED_VOTING_SERVICE_VERSION,
+    WEIGHTED_VOTING_STRATEGY_VERSION,
+    is_weighted_voting_reason_code,
+    weighted_voting_reason_code,
+    weighted_voting_service_boundary,
+)
 from backend.app.algorithms.weighted_voting.models import (
     ALGORITHM_ID,
     WeightedArtifactManifest,
@@ -39,12 +53,35 @@ from backend.app.algorithms.weighted_voting.models import (
     WeightedVolatilityLevel,
     WeightedWeightState,
 )
+from backend.app.algorithms.weighted_voting.service import WeightedVotingService
 
 
 TS = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
 
 
 class WeightedVotingContractsTest(unittest.TestCase):
+    def test_weighted_voting_identity_contract_is_complete_and_dedicated(self) -> None:
+        boundary = weighted_voting_service_boundary()
+
+        self.assertEqual(boundary.algorithm_id, "weighted_voting")
+        self.assertEqual(WEIGHTED_VOTING_ALGORITHM_ID, "weighted_voting")
+        self.assertEqual(ALGORITHM_ID, "weighted_voting")
+        self.assertEqual(boundary.service_version, WEIGHTED_VOTING_SERVICE_VERSION)
+        self.assertEqual(WeightedVotingService.version, WEIGHTED_VOTING_SERVICE_VERSION)
+        self.assertEqual(boundary.api_namespace, "/api/weighted-voting")
+        self.assertEqual(boundary.api_namespace, WEIGHTED_VOTING_API_NAMESPACE)
+        self.assertEqual(boundary.api_version, WEIGHTED_VOTING_API_VERSION)
+        self.assertEqual(boundary.configuration_version, WEIGHTED_VOTING_CONFIGURATION_VERSION)
+        self.assertEqual(WEIGHTED_VOTING_CONFIG_VERSION, WEIGHTED_VOTING_CONFIGURATION_VERSION)
+        self.assertEqual(boundary.strategy_version, WEIGHTED_VOTING_STRATEGY_VERSION)
+        self.assertEqual(boundary.active_weight_version, WEIGHTED_VOTING_ACTIVE_WEIGHT_VERSION)
+        self.assertIn("WeightedVotingEvaluateRequest", boundary.input_models)
+        self.assertIn("WeightedVotingDecision", boundary.output_models)
+        self.assertEqual(boundary.reason_code_namespace, WEIGHTED_VOTING_REASON_CODE_PREFIX)
+        self.assertEqual(weighted_voting_reason_code("api.ready"), "weighted_voting.api.ready")
+        self.assertTrue(is_weighted_voting_reason_code("weighted_voting.api.ready"))
+        self.assertFalse(is_weighted_voting_reason_code("voting_ensemble.api.ready"))
+
     def test_invalid_strategy_probabilities_fail_validation(self) -> None:
         with self.assertRaises(ValidationError):
             strategy_signal(p_buy=0.7, p_sell=0.2, p_hold=0.2)

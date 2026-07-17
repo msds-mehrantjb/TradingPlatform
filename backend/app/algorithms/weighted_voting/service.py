@@ -9,11 +9,18 @@ from typing import Any
 
 from backend.app.algorithms.weighted_voting.aggregation import aggregate_weighted_signals
 from backend.app.algorithms.weighted_voting.backtest.engine import WeightedBacktestEngineConfig, WeightedBacktestResult, run_weighted_voting_backtest
+from backend.app.algorithms.weighted_voting.catalog import weighted_voting_dedicated_strategy_inventory
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedFiveMinuteAlignment, WeightedVotingLocalGateInputs, evaluate_local_decision_gates
 from backend.app.algorithms.weighted_voting.dynamic_settings import default_dynamic_envelope, default_hard_limits, default_weighted_settings, resolve_effective_settings
 from backend.app.algorithms.weighted_voting.final_acceptance import build_weighted_voting_final_acceptance_report
 from backend.app.algorithms.weighted_voting.global_interface import build_weighted_voting_global_order_proposal, apply_global_response_to_weighted_voting_proposal
+from backend.app.algorithms.weighted_voting.identity import (
+    WEIGHTED_VOTING_ALGORITHM_ID,
+    WEIGHTED_VOTING_SERVICE_VERSION,
+    weighted_voting_reason_code,
+    weighted_voting_service_boundary,
+)
 from backend.app.algorithms.weighted_voting.market_condition import classify_market_condition
 from backend.app.algorithms.weighted_voting.market_snapshot import WeightedVotingMarketSnapshot
 from backend.app.algorithms.weighted_voting.models import WeightedCandle, WeightedSide, WeightedVotingDecision, WeightedVotingSignal, WeightedWeightState
@@ -34,10 +41,6 @@ from backend.app.algorithms.weighted_voting.weight_engine import create_unseeded
 from backend.app.gates import GlobalGateResponse
 
 
-WEIGHTED_VOTING_SERVICE_VERSION = "weighted_voting_service_v2"
-WEIGHTED_VOTING_ALGORITHM_ID = "weighted_voting"
-
-
 class WeightedVotingService:
     """Thin orchestrator for future backend-authoritative Weighted Voting."""
 
@@ -54,12 +57,14 @@ class WeightedVotingService:
         return {
             "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
             "serviceVersion": self.version,
+            "serviceBoundary": asdict(weighted_voting_service_boundary()),
+            "strategyInventory": [asdict(item) for item in weighted_voting_dedicated_strategy_inventory()],
             "status": "ready",
             "mode": "backtesting_and_paper_trading_only",
             "isolated": True,
             "rollout": rollout_status(),
             "finalAcceptance": build_weighted_voting_final_acceptance_report(),
-            "reasonCodes": ("weighted_voting.api.ready",),
+            "reasonCodes": (weighted_voting_reason_code("api.ready"),),
             "explanation": "Weighted Voting API is backend-authoritative and isolated from other algorithms.",
         }
 
@@ -106,7 +111,7 @@ class WeightedVotingService:
         return {
             "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
             "configuration": effective.model_dump(mode="json"),
-            "reasonCodes": ("weighted_voting.config.updated",),
+            "reasonCodes": (weighted_voting_reason_code("config.updated"),),
         }
 
     def active_weight_state(self) -> WeightedWeightState:

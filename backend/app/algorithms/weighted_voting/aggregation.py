@@ -7,6 +7,7 @@ from datetime import datetime
 
 from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_CATALOG_VERSION
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
+from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ACTIVE_WEIGHT_VERSION
 from backend.app.algorithms.weighted_voting.models import WeightedStrategyOutcome, WeightedVoteScores, WeightedVotingDecision, WeightedVotingSide, WeightedVotingSignal
 from backend.app.algorithms.weighted_voting.weight_engine import apply_weight_controls
 
@@ -53,7 +54,7 @@ def aggregate_weighted_signals(
             decision_id=f"weighted-voting-{data_timestamp.isoformat()}",
             configuration_version=active_config.config_version,
             strategy_catalog_version=WEIGHTED_VOTING_CATALOG_VERSION,
-            weight_version="weighted_weights_v1",
+            weight_version=WEIGHTED_VOTING_ACTIVE_WEIGHT_VERSION,
             data_timestamp=data_timestamp,
             settings_version=active_config.config_version,
             proposed_side=WeightedVotingSide.HOLD,
@@ -128,7 +129,7 @@ def aggregate_weighted_signals(
         decision_id=f"weighted-voting-{data_timestamp.isoformat()}",
         configuration_version=active_config.config_version,
         strategy_catalog_version=WEIGHTED_VOTING_CATALOG_VERSION,
-        weight_version="weighted_weights_v1",
+        weight_version=WEIGHTED_VOTING_ACTIVE_WEIGHT_VERSION,
         data_timestamp=data_timestamp,
         settings_version=active_config.config_version,
         proposed_side=final_side,

@@ -6,13 +6,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
-from pydantic import Field
-
+from backend.app.algorithms.voting_ensemble.backtest_config import VotingEnsembleBacktestConfig, backtest_config_reason_codes
 from backend.app.algorithms.voting_ensemble.models import AlgoSignal, VotingCandle
+from backend.app.algorithms.voting_ensemble.exit_policy import VotingEnsembleExecutionSimulator, exit_policy_reason_codes
+from backend.app.algorithms.voting_ensemble.profit_target_policy import initial_target_price, profit_target_reason_codes
 from backend.app.algorithms.voting_ensemble.service import VotingEnsembleService
+from backend.app.algorithms.voting_ensemble.stop_loss_policy import initial_stop_price, stop_loss_reason_codes
 from backend.app.domain.feature_engine import MarketCandle
-from backend.app.domain.models import DomainModel, OrderPlan, Signal
-from backend.app.execution.simulation import ExecutionSimulationConfig, RealisticExecutionSimulator
+from backend.app.domain.models import OrderPlan, Signal
 
 
 VOTING_ENSEMBLE_BACKTEST_VERSION = "voting_ensemble_dedicated_backtest_v1"
@@ -34,18 +35,6 @@ VOTING_ENSEMBLE_CONTEXT_CATALOG = (
 class VotingBacktestService(Protocol):
     def evaluate(self, payload: dict[str, Any]) -> dict[str, Any]:
         ...
-
-
-class VotingEnsembleBacktestConfig(DomainModel):
-    startingCapital: float = Field(default=100_000.0, gt=0)
-    warmupCandles: int = Field(default=40, ge=2)
-    targetDistance: float = Field(default=1.0, gt=0)
-    stopDistance: float = Field(default=0.75, gt=0)
-    quantity: int = Field(default=1, ge=1)
-    maximumHoldingMinutes: int = Field(default=30, ge=1)
-    includeDecisionRecords: bool = True
-    maximumDecisionRecords: int | None = Field(default=None, ge=0)
-    execution: ExecutionSimulationConfig = Field(default_factory=ExecutionSimulationConfig)
 
 
 @dataclass
@@ -82,7 +71,7 @@ class VotingEnsembleBacktestRunner:
         stage_results: list[dict[str, Any]] = []
         decision_count = 0
         active_until: datetime | None = None
-        simulator = RealisticExecutionSimulator(self.config.execution)
+        simulator = VotingEnsembleExecutionSimulator(self.config.execution)
         sessions = _group_by_session(one_minute)
         for session_date, session_candles in sorted(sessions.items()):
             for index, candle in enumerate(session_candles):
@@ -144,6 +133,8 @@ class VotingEnsembleBacktestRunner:
             ),
             "engineVersion": "voting_ensemble_v2",
             "backtestVersion": VOTING_ENSEMBLE_BACKTEST_VERSION,
+            "backtestConfigVersion": self.config.configVersion,
+            "backtestConfigReasonCodes": list(backtest_config_reason_codes()),
             "algorithmVersion": "voting_ensemble_backend_v1",
             "strategyCatalog": {
                 "directional": list(VOTING_ENSEMBLE_DIRECTIONAL_CATALOG),
@@ -194,11 +185,11 @@ class VotingEnsembleBacktestRunner:
         side = Signal.BUY if final_signal == "Buy" else Signal.SELL
         entry = candle.close
         if side == Signal.BUY:
-            stop = entry - self.config.stopDistance
-            target = entry + self.config.targetDistance
+            stop = initial_stop_price(side=side, entry_price=entry, stop_distance=self.config.stopDistance)
+            target = initial_target_price(side=side, entry_price=entry, target_distance=self.config.targetDistance)
         else:
-            stop = entry + self.config.stopDistance
-            target = entry - self.config.targetDistance
+            stop = initial_stop_price(side=side, entry_price=entry, stop_distance=self.config.stopDistance)
+            target = initial_target_price(side=side, entry_price=entry, target_distance=self.config.targetDistance)
         return OrderPlan(
             orderPlanId=f"voting-ensemble-order-{int(candle.timestamp.timestamp())}",
             candidateId=f"voting-ensemble-candidate-{int(candle.timestamp.timestamp())}",
@@ -212,10 +203,10 @@ class VotingEnsembleBacktestRunner:
             maximumHoldingMinutes=self.config.maximumHoldingMinutes,
             timeInForce="DAY",
             eligible=True,
-            explanation="Dedicated Voting Ensemble backtest market order generated from deterministic candidate.",
+            explanation="Dedicated Voting Ensemble backtest market order generated with Voting Ensemble stop-loss policy.",
             generatedAt=candle.timestamp,
             sessionDate=session_date,
-            configurationHash=VOTING_ENSEMBLE_BACKTEST_VERSION,
+            configurationHash=f"{VOTING_ENSEMBLE_BACKTEST_VERSION}:{self.config.configVersion}:{','.join((*backtest_config_reason_codes(), *stop_loss_reason_codes(), *profit_target_reason_codes(), *exit_policy_reason_codes()))}",
         )
 
     def _input_stage(
@@ -364,6 +355,8 @@ class VotingEnsembleBacktestRunner:
             **self._metrics(trades=[], bars=0, sessions=0, timeframe=timeframe, date_label="No candles"),
             "engineVersion": "voting_ensemble_v2",
             "backtestVersion": VOTING_ENSEMBLE_BACKTEST_VERSION,
+            "backtestConfigVersion": self.config.configVersion,
+            "backtestConfigReasonCodes": list(backtest_config_reason_codes()),
             "algorithmVersion": "voting_ensemble_backend_v1",
             "symbol": symbol.upper(),
             "strategyCatalog": {

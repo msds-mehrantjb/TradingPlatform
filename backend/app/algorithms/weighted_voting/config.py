@@ -6,8 +6,9 @@ from dataclasses import dataclass
 import hashlib
 import json
 
+from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_CONFIGURATION_VERSION
 
-WEIGHTED_VOTING_CONFIG_VERSION = "weighted_voting_config_v1"
+WEIGHTED_VOTING_CONFIG_VERSION = WEIGHTED_VOTING_CONFIGURATION_VERSION
 
 
 @dataclass(frozen=True)

@@ -4,7 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
-from typing import Any, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from pydantic import Field
 
@@ -199,6 +199,34 @@ class ReplaySessionState:
             if trade.symbol == symbol.upper() and (trade.exitAt is None or trade.exitAt > timestamp)
         ]
 
+    def record_trade(self, trade: ReplayTrade, *, setup_key: str, stopped_out: bool) -> None:
+        self.trades.append(trade)
+        self.lastEntryAt = trade.filledAt
+        if stopped_out:
+            self.lastStopAt = trade.exitAt
+        self.setupEntryCounts[setup_key] = self.setupEntryCounts.get(setup_key, 0) + 1
+
+    def total_trades(self) -> int:
+        return len(self.trades)
+
+    def setup_entry_count(self, setup_key: str) -> int:
+        return self.setupEntryCounts.get(setup_key, 0)
+
+    def entry_cooldown_active(self, timestamp: datetime, cooldown_seconds: int) -> bool:
+        return bool(self.lastEntryAt and (timestamp - self.lastEntryAt).total_seconds() < cooldown_seconds)
+
+    def stop_cooldown_active(self, timestamp: datetime, cooldown_seconds: int) -> bool:
+        return bool(self.lastStopAt and (timestamp - self.lastStopAt).total_seconds() < cooldown_seconds)
+
+    def duplicate_order_seen(self, order_key: str) -> bool:
+        return order_key in self.seenOrderKeys
+
+    def remember_order_key(self, order_key: str) -> None:
+        self.seenOrderKeys.add(order_key)
+
+    def realized_pnl_today(self, observed_at: datetime) -> float:
+        return sum(trade.pnl for trade in self.trades if trade.exitAt and trade.exitAt.date() == observed_at.date())
+
 
 @dataclass(frozen=True)
 class ReplayComponents:
@@ -215,6 +243,7 @@ class ReplayComponents:
     orderValidator: OrderValidator = field(default_factory=lambda: DefaultReplayOrderValidator())
     executionSimulator: RealisticExecutionSimulator | None = None
     featureBuilder: CandidateFeatureBuilder | None = None
+    sessionStateFactory: Callable[[], ReplaySessionState] = field(default_factory=lambda: ReplaySessionState)
 
 
 class EventDrivenReplayEngine:
@@ -240,7 +269,7 @@ class EventDrivenReplayEngine:
     ) -> ReplayResult:
         ordered = sorted(spy1mCandles, key=lambda candle: candle.timestamp)
         snapshots: list[ReplayDecisionSnapshot] = []
-        state = ReplaySessionState()
+        state = self.components.sessionStateFactory()
         execution_simulator = self.components.executionSimulator or RealisticExecutionSimulator(self.config.execution)
         for index, candle in enumerate(ordered):
             if index + 1 < self.config.minWarmupCandles:
@@ -308,11 +337,11 @@ class EventDrivenReplayEngine:
                     exitStatus=execution.exit.status if execution.exit else None,
                     reasonCodes=["trade.linked_to_decision_snapshot", *execution.reasonCodes],
                 )
-                state.trades.append(trade)
-                state.lastEntryAt = trade.filledAt
-                if trade.exitStatus == "EXITED" and execution.exit and execution.exit.exitReason == "protective_stop":
-                    state.lastStopAt = trade.exitAt
-                state.setupEntryCounts[setup_key(decision)] = state.setupEntryCounts.get(setup_key(decision), 0) + 1
+                state.record_trade(
+                    trade,
+                    setup_key=setup_key(decision),
+                    stopped_out=bool(trade.exitStatus == "EXITED" and execution.exit and execution.exit.exitReason == "protective_stop"),
+                )
         return ReplayResult(
             engineVersion=self.config.engineVersion,
             symbol=symbol.upper(),
@@ -879,21 +908,21 @@ def apply_session_rules(
         reason_codes.append("session.max_concurrent_positions")
     if len(active_positions) >= rules.maxSymbolExposure:
         reason_codes.append("session.global_symbol_exposure_limit")
-    if len(state.trades) >= rules.maxTradesPerDay:
+    if state.total_trades() >= rules.maxTradesPerDay:
         reason_codes.append("session.max_trades_per_day")
-    if state.lastEntryAt and (timestamp - state.lastEntryAt).total_seconds() < rules.cooldownAfterEntrySeconds:
+    if state.entry_cooldown_active(timestamp, rules.cooldownAfterEntrySeconds):
         reason_codes.append("session.cooldown_after_entry")
-    if state.lastStopAt and (timestamp - state.lastStopAt).total_seconds() < rules.cooldownAfterStopSeconds:
+    if state.stop_cooldown_active(timestamp, rules.cooldownAfterStopSeconds):
         reason_codes.append("session.cooldown_after_stop")
     key = setup_key(decision)
-    if state.setupEntryCounts.get(key, 0) >= rules.maxEntriesPerSetup:
+    if state.setup_entry_count(key) >= rules.maxEntriesPerSetup:
         reason_codes.append("session.max_entries_per_setup")
     order_key = duplicate_order_key(order_plan, timestamp)
-    if rules.duplicateOrderPrevention and order_key in state.seenOrderKeys:
+    if rules.duplicateOrderPrevention and state.duplicate_order_seen(order_key):
         reason_codes.append("session.duplicate_order_prevented")
     if reason_codes:
         return blocked_order_plan(order_plan, reason_codes, timestamp), reason_codes
-    state.seenOrderKeys.add(order_key)
+    state.remember_order_key(order_key)
     return order_plan, ["session.new_entry_rules_passed"]
 
 
@@ -1019,11 +1048,11 @@ def replay_broker_snapshot(
         accountId="paper-replay-account",
         equity=equity,
         buyingPower=equity,
-        realizedPnlToday=sum(trade.pnl for trade in state.trades if trade.exitAt and trade.exitAt.date() == observed_at.date()),
+        realizedPnlToday=state.realized_pnl_today(observed_at),
         intradayEquityHigh=equity,
         positions=[
             BrokerPositionState(
-                algorithmId="meta_strategy",
+                algorithmId=getattr(state, "algorithmId", "meta_strategy"),
                 symbol=trade.symbol,
                 side=trade.side,
                 quantity=trade.quantity,

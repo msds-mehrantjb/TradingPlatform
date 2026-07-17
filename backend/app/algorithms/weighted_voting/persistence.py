@@ -11,11 +11,11 @@ from pathlib import Path
 import re
 from typing import Protocol
 
+from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ALGORITHM_ID
 from backend.app.algorithms.weighted_voting.models import WeightedEffectiveSettings
 
 
 WEIGHTED_VOTING_PERSISTENCE_VERSION = "weighted_voting_persistence_v3"
-WEIGHTED_VOTING_ALGORITHM_ID = "weighted_voting"
 WEIGHTED_VOTING_SETTINGS_KEY = "weighted_voting.settings.effective"
 WEIGHTED_VOTING_STORAGE_ROOT = Path("data") / "algorithms" / "weighted_voting"
 WEIGHTED_VOTING_ARTIFACT_CATEGORIES = frozenset(

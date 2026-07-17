@@ -9,8 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ALGORITHM_ID
+
 WEIGHTED_VOTING_FINAL_ACCEPTANCE_VERSION = "weighted_voting_final_acceptance_v1"
-WEIGHTED_VOTING_ALGORITHM_ID = "weighted_voting"
 
 
 class WeightedVotingAcceptanceStatus(str, Enum):

@@ -8,15 +8,20 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.app.algorithms.weighted_voting.identity import (
+    WEIGHTED_VOTING_ALGORITHM_ID,
+    WEIGHTED_VOTING_API_NAMESPACE,
+    WEIGHTED_VOTING_API_TAG,
+    WEIGHTED_VOTING_API_VERSION,
+)
 from backend.app.algorithms.weighted_voting.service import WeightedVotingService
 
-WEIGHTED_VOTING_API_VERSION = "weighted_voting_api_v2"
-router = APIRouter(prefix="/api/weighted-voting", tags=["weighted-voting"])
+router = APIRouter(prefix=WEIGHTED_VOTING_API_NAMESPACE, tags=[WEIGHTED_VOTING_API_TAG])
 WEIGHTED_VOTING_API_SERVICE = WeightedVotingService()
 
 
 class WeightedVotingErrorResponse(BaseModel):
-    algorithm_id: str = "weighted_voting"
+    algorithm_id: str = WEIGHTED_VOTING_ALGORITHM_ID
     error_code: str
     message: str
     reason_codes: tuple[str, ...] = ()
@@ -94,6 +99,8 @@ class WeightedVotingDailyUpdateRequest(BaseModel):
 def router_status() -> dict[str, str]:
     return {
         "apiVersion": WEIGHTED_VOTING_API_VERSION,
+        "apiNamespace": WEIGHTED_VOTING_API_NAMESPACE,
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
         "status": "registered",
         "explanation": "Dedicated Weighted Voting API routes are registered and isolated from other algorithm APIs.",
     }

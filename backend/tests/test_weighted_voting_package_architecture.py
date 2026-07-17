@@ -12,6 +12,7 @@ PACKAGE_PATH = Path(__file__).parents[1] / "app" / "algorithms" / "weighted_voti
 
 EXPECTED_FILES = {
     "__init__.py",
+    "identity.py",
     "api.py",
     "service.py",
     "models.py",

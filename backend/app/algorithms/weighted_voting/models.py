@@ -10,8 +10,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ALGORITHM_ID, WEIGHTED_VOTING_ACTIVE_WEIGHT_VERSION
 
-ALGORITHM_ID = "weighted_voting"
+ALGORITHM_ID = WEIGHTED_VOTING_ALGORITHM_ID
 PROBABILITY_SUM_TOLERANCE = 1e-6
 
 
@@ -282,7 +283,7 @@ class WeightedPerformanceWeightMetric(WeightedContractModel):
 class WeightedWeightState(WeightedContractModel):
     contract_version: str = "weighted_weight_state_v1"
     algorithm_id: Literal["weighted_voting"] = ALGORITHM_ID
-    weight_version: str = "weighted_weights_v1"
+    weight_version: str = WEIGHTED_VOTING_ACTIVE_WEIGHT_VERSION
     state_status: WeightedWeightStateStatus = WeightedWeightStateStatus.UNSEEDED_EQUAL_WEIGHTS
     strategy_weights: dict[str, float]
     active_session_date: str | None = None

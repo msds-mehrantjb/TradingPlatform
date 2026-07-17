@@ -3,18 +3,32 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any, Protocol
 
-from backend.app.algorithms.voting_ensemble import VotingEnsembleBacktestConfig, VotingEnsembleBacktestRunner
+from backend.app.algorithms.voting_ensemble import settings as voting_ensemble_settings
+from backend.app.algorithms.voting_ensemble.backtesting_adapter import run_voting_ensemble_backtest
+from backend.app.algorithms.voting_ensemble.candidate_dataset import (
+    VOTING_ENSEMBLE_CANDIDATE_FEATURE_SCHEMA_HASH,
+    VotingEnsembleCandidateDatasetBuilder,
+)
+from backend.app.algorithms.voting_ensemble.ensemble import FamilyAwareDeterministicEnsemble
+from backend.app.algorithms.voting_ensemble.entry_policy import VotingEnsembleOrderValidator, VotingEnsembleReplayPolicyEngine
+from backend.app.algorithms.voting_ensemble.exit_policy import VotingEnsembleExecutionSimulator
+from backend.app.algorithms.voting_ensemble.gates import VotingEnsembleLocalGateEngine
+from backend.app.algorithms.voting_ensemble.ml_model import voting_ensemble_ml_config
+from backend.app.algorithms.voting_ensemble.profit_target_policy import VOTING_ENSEMBLE_DEFAULT_TARGET_DISTANCE
+from backend.app.algorithms.voting_ensemble.risk_budget import position_size_for_config as voting_ensemble_position_size_for_config
+from backend.app.algorithms.voting_ensemble.stop_loss_policy import VOTING_ENSEMBLE_DEFAULT_STOP_DISTANCE
+from backend.app.algorithms.voting_ensemble.trade_counter_state import VotingEnsembleTradeCounterState
 from backend.app.backtesting import EventDrivenReplayEngine, ReplayComponents, ReplayEngineConfig
 from backend.app.backtesting import v1 as backtesting_v1
 from backend.app.domain.feature_engine import MarketCandle, PriorDayOHLC
 from backend.app.domain.models import Signal
 from backend.app.ensemble import v1 as ensemble_v1
 from backend.app.execution import v1 as execution_v1
-from backend.app.strategies.context import (
+from backend.app.algorithms.voting_ensemble.strategies.context import (
     MarketBreadthMomentumContext,
     RelativeStrengthQqqIwmContext,
 )
-from backend.app.strategies.directional import (
+from backend.app.algorithms.voting_ensemble.strategies.directional import (
     BollingerAtrReversionStrategy,
     FailedBreakoutReversalStrategy,
     FirstPullbackAfterOpenStrategy,
@@ -91,8 +105,22 @@ class V2TradingEngine:
                     MarketBreadthMomentumContext(),
                 ),
                 regimeModule=AdxAtrRegimeClassifier(),
+                familyEnsemble=FamilyAwareDeterministicEnsemble(),
+                globalGateEngine=VotingEnsembleLocalGateEngine(),
+                mlConfig=voting_ensemble_ml_config(),
+                policyEngine=VotingEnsembleReplayPolicyEngine(),
+                orderValidator=VotingEnsembleOrderValidator(),
+                executionSimulator=VotingEnsembleExecutionSimulator(),
+                sessionStateFactory=VotingEnsembleTradeCounterState,
+                featureBuilder=VotingEnsembleCandidateDatasetBuilder(),
             ),
-            ReplayEngineConfig(minWarmupCandles=1, configurationHash="active_voting_ensemble_v2"),
+            ReplayEngineConfig(
+                minWarmupCandles=1,
+                defaultTargetDistance=VOTING_ENSEMBLE_DEFAULT_TARGET_DISTANCE,
+                defaultStopDistance=VOTING_ENSEMBLE_DEFAULT_STOP_DISTANCE,
+                featureSchemaHash=VOTING_ENSEMBLE_CANDIDATE_FEATURE_SCHEMA_HASH,
+                configurationHash="active_voting_ensemble_v2",
+            ),
         )
 
     def strategy_votes(self, history: list[dict[str, Any]], prior_close: float, *, timeframe: str = "") -> list[str]:
@@ -123,26 +151,16 @@ class V2TradingEngine:
         }
 
     def dynamic_risk_config(self, settings_payload: dict[str, Any]) -> dict[str, Any]:
-        return trading_policy_v1.dynamic_risk_config(settings_payload)
+        return voting_ensemble_settings.dynamic_risk_config(settings_payload)
 
     def position_size_for_config(self, config: dict[str, Any], *, equity: float, entry_price: float, stop_distance: float) -> tuple[int, float, str]:
-        return execution_v1.position_size_for_config(
-            config,
-            equity=equity,
-            entry_price=entry_price,
-            stop_distance=stop_distance,
-        )
+        return voting_ensemble_position_size_for_config(config, equity=equity, entry_price=entry_price, stop_distance=stop_distance)
 
     def run_backtest(self, candles: list[dict[str, Any]], *, timeframe: str, risk_config_override: dict[str, Any] | None = None) -> dict[str, Any]:
-        starting_capital = float((risk_config_override or {}).get("startingCapital", 100_000.0))
-        config = VotingEnsembleBacktestConfig(
-            startingCapital=starting_capital,
-            includeDecisionRecords=False,
-        )
-        return VotingEnsembleBacktestRunner(config=config).run(
-            symbol=str(candles[-1].get("symbol") or "SPY") if candles else "SPY",
-            spy_1m_candles=candles,
+        return run_voting_ensemble_backtest(
+            candles,
             timeframe=timeframe,
+            risk_config_override=risk_config_override,
         )
 
     def _decide(self, history: list[dict[str, Any]], prior_close: float):
