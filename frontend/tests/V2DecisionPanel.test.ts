@@ -10,7 +10,10 @@ import {
   buildRegimeMarketContext,
   buildRegimeMarketSnapshot,
   buildRawRegimeCondition,
+  activeDirectionalRegimeOutputs,
+  applyRegimeFamilyContributionCap,
   calculateRegimeDecision,
+  cappedRegimeStrategyContribution,
   buildDirectionalStrategyResult,
   buildRegimeFeatureSnapshot,
   buildOfflineRegimeLabel,
@@ -43,6 +46,8 @@ import {
   REGIME_TOTAL_STRATEGY_DEFINITION_COUNT,
   canonicalRegimeRoutingStrategyId,
   permittedDirectionForRegime,
+  regimeDecisionGateSettings,
+  regimeTradeBlockers,
   runRegimeBacktest,
   regimeSelectionStrategies,
   representedRegimeFamilies,
@@ -698,6 +703,69 @@ test("Regime owns dedicated strategy routing inventory and outputs", () => {
     { alias: "bollinger_atr_reversion", canonicalStrategyId: "bollinger_band_mean_reversion", alreadyVoted: false },
     { alias: "failed_breakout_strategy", canonicalStrategyId: "failed_breakout_reversal", alreadyVoted: false },
   ]);
+});
+
+test("Regime owns dedicated aggregation and decision inventory", () => {
+  assert.deepEqual(directoryFiles("decision"), [
+    "abstention-policy.ts",
+    "contribution-caps.ts",
+    "decision-engine.ts",
+    "decision-evidence.ts",
+    "decision-gates.ts",
+    "family-aggregation.ts",
+  ]);
+  assert.equal(cappedRegimeStrategyContribution(1, 1), 0.15);
+  assert.deepEqual(applyRegimeFamilyContributionCap({
+    family: "trend",
+    buyScore: 0.5,
+    sellScore: 0.2,
+    activeStrategyCount: 3,
+  }), {
+    family: "trend",
+    buyScore: 0.25,
+    sellScore: 0.1,
+    activeStrategyCount: 3,
+  });
+  assert.deepEqual(activeDirectionalRegimeOutputs([
+    strategyOutput({ strategy: "moving_average_trend", role: "directional", eligible: true, signal: "buy" }),
+    strategyOutput({ strategy: "volume_confirmation", role: "confirmation", eligible: true, signal: "hold" }),
+    strategyOutput({ strategy: "disabled_directional", role: "directional", eligible: false, signal: "sell" }),
+  ]).map((output) => output.strategy), ["moving_average_trend"]);
+
+  const gateSettings = {
+    ...liquidRegimeSettings(),
+    minimumWinningScore: 0.7,
+    minimumDirectionalEdge: 0.25,
+    minimumRegimeConfidence: 0.8,
+    minimumActiveStrategies: 4,
+    minimumIndependentFamilies: 3,
+    maximumAbstentionRate: 0.4,
+  };
+  const gates = regimeDecisionGateSettings(gateSettings);
+  assert.deepEqual(gates, {
+    minimumWinningScore: 0.7,
+    minimumDirectionalEdge: 0.25,
+    minimumRegimeConfidence: 0.8,
+    minimumActiveStrategies: 4,
+    minimumIndependentFamilies: 3,
+    maximumAbstentionRate: 0.4,
+  });
+
+  const blockers = regimeTradeBlockers({
+    finalSignal: "sell",
+    scores: { buy: 0.1, sell: 0.9, hold: 0 },
+    buyScore: 0.1,
+    sellScore: 0.9,
+    winningDirection: "sell",
+    winningScore: 0.9,
+    secondBestScore: 0.1,
+    directionalEdge: 0.8,
+    activeStrategyCount: 4,
+    activeFamilyCount: 3,
+    abstentionRate: 0.2,
+    familyScores: [],
+  }, 0.9, "Trend continuation", false, gateSettings, "strong_downtrend");
+  assert.deepEqual(blockers, []);
 });
 
 test("Regime non-directional modules cannot emit Buy or Sell votes", () => {

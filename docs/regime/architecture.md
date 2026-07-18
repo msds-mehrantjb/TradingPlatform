@@ -16,6 +16,7 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | Regime market boundary | `frontend/src/algorithms/regime/market/*` | Immutable Regime market snapshots, read-only feature snapshots, context-feed adapters, quote freshness, indicators, and session context. |
 | Regime strategies | `frontend/src/algorithms/regime/strategies/*` | Dedicated strategy inventory for directional strategies, confirmation modules, context modules, safety gates, and aliases. |
 | Regime routing | `frontend/src/algorithms/regime/routing/*` | Dedicated compatibility matrix, strategy eligibility, family mapping, conflict resolution, and alias deduplication. |
+| Regime decision | `frontend/src/algorithms/regime/decision/*` | Dedicated family aggregation, contribution caps, decision gates, abstention policy, evidence, and decision orchestration. |
 | Regime ML | `frontend/src/algorithms/regime/ml/*` | Point-in-time feature building, artifact validation/loading, conservative prediction, offline labels, validation, and promotion policy. |
 | Regime backtest | `frontend/src/algorithms/regime/backtest/*` | Dedicated Regime replay engine, execution simulation, metrics, diagnostics, walk-forward summaries, and runner integration. |
 | Backend Regime API | `backend/app/algorithms/regime/*` | Persistence, API routes, and staged paper rollout status. |
@@ -89,6 +90,35 @@ The Regime algorithm owns the mapping between classified regimes and eligible st
 | `routing/alias-deduplication.ts` | Alias canonicalization and duplicate-vote prevention. |
 
 The routing output records selected strategies, incompatible strategies, permitted direction, represented families, alias deduplication status, independent-family participation, abstentions, disabled strategies, unhealthy strategies, context results, and safety results.
+
+## Decision Boundary
+
+The Regime algorithm owns family aggregation, contribution limits, abstention policy, local decision gates, decision evidence, and final Buy/Sell/Hold resolution.
+
+| Component | Dedicated responsibility |
+| --- | --- |
+| `decision/family-aggregation.ts` | Family-level Buy/Sell score aggregation. |
+| `decision/contribution-caps.ts` | Individual strategy and family contribution caps. |
+| `decision/decision-engine.ts` | Authoritative Regime decision workflow. |
+| `decision/decision-gates.ts` | Regime-local decision blockers and gate settings. |
+| `decision/abstention-policy.ts` | Active directional output and abstention-rate policy. |
+| `decision/decision-evidence.ts` | Decision snapshot/evidence creation boundary. |
+
+The decision sequence is:
+
+```text
+Immutable market snapshot
+  -> raw regime classification
+  -> hysteresis and confirmed regime
+  -> strategy routing
+  -> directional strategy evaluations
+  -> confirmation and context adjustments
+  -> family-level aggregation
+  -> Regime-local decision gates
+  -> Buy / Sell / Hold decision
+```
+
+The decision path preserves valid Sell decisions and contains no WCA sizing or WCA order adapters.
 
 ## Authoritative Flow
 

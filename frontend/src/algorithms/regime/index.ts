@@ -59,14 +59,26 @@ export {
   strategyIdsForConfirmedRegime,
 } from "./router.ts";
 export {
+  buildRegimeDecisionEvidence,
   calculateRegimeDecision,
   buildRegimeMarketContext,
   emptyRegimeSelectionResult,
+  regimeDecisionGateSettings,
+  regimeTradeBlockers,
   resolveRegimeDecision,
   secondBestScoreForDirection,
   signedRegimeNetScore,
   winningDirectionScore,
 } from "./decision-engine.ts";
+export {
+  activeDirectionalRegimeOutputs,
+  aggregateRegimeStrategyScores,
+  applyRegimeFamilyContributionCap,
+  cappedRegimeStrategyContribution,
+  regimeAbstentionRate,
+  regimeSystemWeightMultiplier,
+  votingDirectionalRegimeOutputs,
+} from "./family-aggregation.ts";
 export { resolveRegimeDynamicProfile } from "./dynamic-profile.ts";
 export {
   baseRegimeSettingsFromTradingSettings,
