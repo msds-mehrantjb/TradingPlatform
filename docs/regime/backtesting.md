@@ -6,6 +6,20 @@ Regime has a dedicated backtest engine in `frontend/src/algorithms/regime/backte
 
 Daily refresh uses independent Regime state, cache key, storage key, result object, failure message, API path, artifact path, and UI panel.
 
+The dedicated inventory is:
+
+| File | Responsibility |
+| --- | --- |
+| `engine.ts` | Authoritative Regime replay loop and result assembly. |
+| `execution-simulator.ts` | Entry, exit, cost, slippage, volume participation, global-cap, position-ledger, and trade-ledger simulation helpers. |
+| `metrics.ts` | Regime metrics, reports, and strategy-family attribution summaries. |
+| `diagnostics.ts` | Backtest diagnostics and executable inventory status. |
+| `walk-forward.ts` | Walk-forward runner wrapper. |
+| `runner.ts` | Node runner adapter for Regime backtests. |
+| `types.ts` | Backtest inputs, decisions, trades, metrics, reports, comparisons, folds, and inventory contracts. |
+
+The inventory explicitly owns Regime replay, warm-up handling, point-in-time classification, hysteresis replay, strategy routing, dynamic-profile reconstruction, family aggregation, entry and exit simulation, costs and slippage, position and trade ledgers, Regime-segmented performance, strategy-family attribution, walk-forward validation, untouched holdout testing, and daily independent backtests.
+
 ## Replay Flow
 
 For each historical timestamp:

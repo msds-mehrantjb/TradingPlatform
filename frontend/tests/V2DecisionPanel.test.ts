@@ -37,6 +37,8 @@ import {
   minutesBetween,
   REGIME_ALGORITHM_ID,
   REGIME_ALGORITHM_VERSION,
+  REGIME_BACKTEST_FILE_INVENTORY,
+  REGIME_BACKTEST_OWNED_CAPABILITIES,
   REGIME_COMPATIBILITY_MATRIX,
   REGIME_COMPOSITE_REGIME_IDS,
   REGIME_IDENTITY_CONTRACT_FILES,
@@ -56,6 +58,7 @@ import {
   canonicalRegimeRoutingStrategyId,
   permittedDirectionForRegime,
   regimeDecisionGateSettings,
+  regimeBacktestInventoryStatus,
   regimeLiquidityCap,
   regimePositionAndBuyingPowerCaps,
   regimeRiskBudget,
@@ -63,6 +66,8 @@ import {
   regimeTargetDistance,
   regimeTradeBlockers,
   runRegimeBacktest,
+  simulateRegimeGlobalGate,
+  simulateRegimeNextBarEntry,
   regimeSelectionStrategies,
   representedRegimeFamilies,
   resolveEffectiveRegimeSettings,
@@ -2274,6 +2279,68 @@ test("Regime backtest stays isolated from WCA evidence and exposes required comp
   ] as const) {
     assert.ok(Array.isArray(result.reports[key]), `${key} report exists`);
   }
+});
+
+test("Regime dedicated backtest inventory exposes owned files capabilities and simulator rules", () => {
+  const status = regimeBacktestInventoryStatus();
+
+  assert.deepEqual(REGIME_BACKTEST_FILE_INVENTORY, [
+    "engine.ts",
+    "execution-simulator.ts",
+    "metrics.ts",
+    "diagnostics.ts",
+    "walk-forward.ts",
+    "runner.ts",
+    "types.ts",
+  ]);
+  assert.deepEqual(status.files, REGIME_BACKTEST_FILE_INVENTORY);
+  assert.deepEqual(REGIME_BACKTEST_OWNED_CAPABILITIES, [
+    "Regime replay",
+    "Warm-up handling",
+    "Point-in-time classification",
+    "Hysteresis replay",
+    "Strategy routing",
+    "Dynamic-profile reconstruction",
+    "Family aggregation",
+    "Entry and exit simulation",
+    "Costs and slippage",
+    "Position ledger",
+    "Trade ledger",
+    "Regime-segmented performance",
+    "Strategy-family attribution",
+    "Walk-forward validation",
+    "Untouched holdout testing",
+    "Daily independent backtests",
+  ]);
+  assert.deepEqual(status.ownedCapabilities, REGIME_BACKTEST_OWNED_CAPABILITIES);
+  assert.equal(status.algorithmId, "regime");
+  assert.equal(status.authoritativeEngine, "frontend/src/algorithms/regime/backtest/engine.ts");
+  assert.equal(status.isolatedFromWca, true);
+
+  const gate = simulateRegimeGlobalGate(100, 500, 20, {
+    maximumApprovedQuantity: 80,
+    maximumRiskDollars: 250,
+    maximumNotionalDollars: 1200,
+  });
+  assert.equal(gate.quantity, 50);
+  assert.deepEqual(gate.blockers, ["regime.backtest.global_gate_capacity_reduced_quantity"]);
+
+  const entry = simulateRegimeNextBarEntry(
+    { signalDirection: "Buy" },
+    100,
+    { ...deterministicRegimeCandles()[1], open: 100, volume: 1000 },
+    {
+      spreadPercent: 0.0002,
+      slippagePerShare: 0.01,
+      feePerShare: 0.0002,
+      maximumVolumeParticipationPercent: 0.03,
+      orderDelayBars: 1,
+      rejectWhenParticipationQuantityZero: true,
+    },
+  );
+  assert.equal(entry.filledQuantity, 30);
+  assert.equal(entry.entryPrice, 100.02);
+  assert.equal(entry.reason, "regime.backtest.partial_fill");
 });
 
 function deterministicRegimeCandles(): MarketCandle[] {

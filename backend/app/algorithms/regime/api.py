@@ -19,6 +19,34 @@ from backend.app.algorithms.regime.rollout import regime_rollout_status
 REGIME_API_VERSION = "regime_api_v1"
 REGIME_BACKTEST_ENGINE_VERSION = "regime_backtest_v2"
 REGIME_BACKTEST_ARTIFACT_ROOT = "frontend/data/regime-backtests"
+REGIME_BACKTEST_AUTHORITATIVE_CORE = "frontend/src/algorithms/regime/backtest/engine.ts"
+REGIME_BACKTEST_FILE_INVENTORY = (
+    "engine.ts",
+    "execution-simulator.ts",
+    "metrics.ts",
+    "diagnostics.ts",
+    "walk-forward.ts",
+    "runner.ts",
+    "types.ts",
+)
+REGIME_BACKTEST_OWNED_CAPABILITIES = (
+    "Regime replay",
+    "Warm-up handling",
+    "Point-in-time classification",
+    "Hysteresis replay",
+    "Strategy routing",
+    "Dynamic-profile reconstruction",
+    "Family aggregation",
+    "Entry and exit simulation",
+    "Costs and slippage",
+    "Position ledger",
+    "Trade ledger",
+    "Regime-segmented performance",
+    "Strategy-family attribution",
+    "Walk-forward validation",
+    "Untouched holdout testing",
+    "Daily independent backtests",
+)
 
 router = APIRouter(prefix="/api/regime", tags=["regime"])
 REGIME_REPOSITORY = RegimeSqliteRepository()
@@ -34,7 +62,10 @@ def regime_backtest_status() -> dict[str, Any]:
         "artifactRoot": REGIME_BACKTEST_ARTIFACT_ROOT,
         "storageKeyPrefix": "regime-backtest:",
         "cacheKeySource": "symbol:first_timestamp:last_timestamp:candle_count",
-        "authoritativeCore": "frontend/src/algorithms/regime/backtest/engine.ts",
+        "authoritativeCore": REGIME_BACKTEST_AUTHORITATIVE_CORE,
+        "fileInventory": REGIME_BACKTEST_FILE_INVENTORY,
+        "ownedCapabilities": REGIME_BACKTEST_OWNED_CAPABILITIES,
+        "isolatedFromWca": True,
         "message": "Regime daily backtests run through the isolated TypeScript core and publish independent result metadata.",
     }
 

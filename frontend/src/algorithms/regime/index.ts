@@ -143,6 +143,17 @@ export {
 } from "./strategies/registry.ts";
 export { REGIME_STRATEGY_ALIAS_INVENTORY, REGIME_STRATEGY_ALIAS_MAP } from "./strategies/alias-map.ts";
 export { regimeBacktestCacheKey, runRegimeBacktest } from "./backtest/engine.ts";
+export { REGIME_BACKTEST_FILE_INVENTORY, REGIME_BACKTEST_OWNED_CAPABILITIES } from "./backtest/types.ts";
+export {
+  DEFAULT_REGIME_BACKTEST_COSTS,
+  DEFAULT_REGIME_BACKTEST_GLOBAL_GATE,
+  closeRegimeBacktestTrade,
+  evaluateRegimeOpenPositionExit,
+  simulateRegimeGlobalGate,
+  simulateRegimeNextBarEntry,
+  updateRegimeExcursion,
+} from "./backtest/execution-simulator.ts";
+export { regimeBacktestDiagnostics, regimeBacktestInventoryStatus } from "./backtest/diagnostics.ts";
 export { runNodeRegimeBacktest } from "./backtest/runner.ts";
 export { runRegimeWalkForward } from "./backtest/walk-forward.ts";
 export {

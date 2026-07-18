@@ -17,7 +17,42 @@ class RegimePhase13BacktestApiTest(unittest.TestCase):
         self.assertEqual(payload["algorithmId"], "regime")
         self.assertEqual(payload["engineVersion"], "regime_backtest_v2")
         self.assertIn("frontend/src/algorithms/regime/backtest/engine.ts", payload["authoritativeCore"])
-        self.assertNotIn("wca", str(payload).lower())
+        self.assertEqual(
+            payload["fileInventory"],
+            [
+                "engine.ts",
+                "execution-simulator.ts",
+                "metrics.ts",
+                "diagnostics.ts",
+                "walk-forward.ts",
+                "runner.ts",
+                "types.ts",
+            ],
+        )
+        self.assertEqual(
+            payload["ownedCapabilities"],
+            [
+                "Regime replay",
+                "Warm-up handling",
+                "Point-in-time classification",
+                "Hysteresis replay",
+                "Strategy routing",
+                "Dynamic-profile reconstruction",
+                "Family aggregation",
+                "Entry and exit simulation",
+                "Costs and slippage",
+                "Position ledger",
+                "Trade ledger",
+                "Regime-segmented performance",
+                "Strategy-family attribution",
+                "Walk-forward validation",
+                "Untouched holdout testing",
+                "Daily independent backtests",
+            ],
+        )
+        self.assertTrue(payload["isolatedFromWca"])
+        self.assertNotIn("/api/wca/", str(payload).lower())
+        self.assertNotIn("wca/backtest", payload["authoritativeCore"].lower())
 
     def test_regime_backtest_route_discovery_does_not_expose_wca_routes(self) -> None:
         client = TestClient(app)
@@ -32,4 +67,3 @@ class RegimePhase13BacktestApiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

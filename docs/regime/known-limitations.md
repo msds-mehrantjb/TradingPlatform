@@ -9,7 +9,6 @@
 ## Backtest Fidelity
 
 - The backtest fill model is deterministic and conservative but simplified.
-- `execution-simulator.ts` remains a placeholder; the current implementation is embedded in the dedicated engine.
 - Partial fills use volume participation; full broker microstructure, queue priority, and venue-specific behavior are not modeled.
 - External feeds must be aligned by callers before they are used in historical simulation.
 - Walk-forward summaries are lightweight and should be expanded before promotion decisions.

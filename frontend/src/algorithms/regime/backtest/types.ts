@@ -12,6 +12,46 @@ import type {
 } from "../types.ts";
 import type { RegimeMlArtifact, RegimeMlMode } from "../ml/types.ts";
 
+export const REGIME_BACKTEST_FILE_INVENTORY = [
+  "engine.ts",
+  "execution-simulator.ts",
+  "metrics.ts",
+  "diagnostics.ts",
+  "walk-forward.ts",
+  "runner.ts",
+  "types.ts",
+] as const;
+
+export const REGIME_BACKTEST_OWNED_CAPABILITIES = [
+  "Regime replay",
+  "Warm-up handling",
+  "Point-in-time classification",
+  "Hysteresis replay",
+  "Strategy routing",
+  "Dynamic-profile reconstruction",
+  "Family aggregation",
+  "Entry and exit simulation",
+  "Costs and slippage",
+  "Position ledger",
+  "Trade ledger",
+  "Regime-segmented performance",
+  "Strategy-family attribution",
+  "Walk-forward validation",
+  "Untouched holdout testing",
+  "Daily independent backtests",
+] as const;
+
+export type RegimeBacktestInventoryFile = typeof REGIME_BACKTEST_FILE_INVENTORY[number];
+export type RegimeBacktestOwnedCapability = typeof REGIME_BACKTEST_OWNED_CAPABILITIES[number];
+
+export type RegimeBacktestInventoryStatus = {
+  algorithmId: "regime";
+  authoritativeEngine: "frontend/src/algorithms/regime/backtest/engine.ts";
+  files: readonly RegimeBacktestInventoryFile[];
+  ownedCapabilities: readonly RegimeBacktestOwnedCapability[];
+  isolatedFromWca: true;
+};
+
 export type RegimeBacktestVariantId =
   | "rule_static"
   | "rule_dynamic"
