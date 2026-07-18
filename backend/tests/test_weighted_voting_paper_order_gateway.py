@@ -4,11 +4,19 @@ import unittest
 from datetime import UTC, date, datetime, timedelta
 
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedGateEvaluationMode, WeightedVotingGatePipelineResult
-from backend.app.algorithms.weighted_voting.execution_gateway import submit_weighted_voting_paper_order
+from backend.app.algorithms.weighted_voting.execution_gateway import (
+    WEIGHTED_VOTING_BROKER_CONNECTION_BOUNDARY,
+    WEIGHTED_VOTING_EXECUTION_NAMESPACE,
+    build_weighted_voting_broker_command,
+    execution_gateway_status,
+    reconcile_weighted_voting_broker_result,
+    record_weighted_voting_rejection,
+    submit_weighted_voting_paper_order,
+)
 from backend.app.algorithms.weighted_voting.models import WeightedGateResult, WeightedGateStatus
 from backend.app.algorithms.weighted_voting.rollout import WeightedVotingRolloutFlags, WeightedVotingRolloutValidation
 from backend.app.domain.models import Signal
-from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill, PaperOrderGateway
+from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill, PaperOrderGateway, PaperOrderGatewayResult
 from backend.app.gates import AppliedGlobalGateDecision, GlobalGateResponse, GlobalOrderProposal, apply_global_gate_response
 
 
@@ -228,6 +236,111 @@ class WeightedVotingPaperOrderGatewayTest(unittest.TestCase):
         self.assertEqual(results[0].submitted, results[1].submitted)
         self.assertEqual(results[0].status, results[1].status)
         self.assertEqual(results[0].reasonCodes, results[1].reasonCodes)
+
+    def test_dedicated_execution_command_converts_accepted_proposal_for_shared_broker(self) -> None:
+        proposal = global_proposal()
+        application = global_application(proposal)
+
+        command = build_weighted_voting_broker_command(
+            proposal=proposal,
+            global_application=application,
+            accepted_at=NOW,
+            mode="automatic",
+        )
+        repeated = build_weighted_voting_broker_command(
+            proposal=proposal,
+            global_application=application,
+            accepted_at=NOW + timedelta(seconds=5),
+            mode="automatic",
+        )
+        broker_payload = command.as_shared_broker_command()
+
+        self.assertEqual(command.algorithm_id, "weighted_voting")
+        self.assertEqual(command.client_order_id, repeated.client_order_id)
+        self.assertEqual(command.quantity, application.globallyAllowedQuantity)
+        self.assertEqual(broker_payload["brokerConnection"], WEIGHTED_VOTING_BROKER_CONNECTION_BOUNDARY)
+        self.assertTrue(broker_payload["preserveAlgorithmOwnership"])
+        self.assertFalse(broker_payload["ownershipMutationAllowed"])
+
+    def test_dedicated_execution_reconciliation_records_fill_and_position_ownership(self) -> None:
+        store = MemoryStore()
+        proposal = global_proposal()
+        application = global_application(proposal)
+        command = build_weighted_voting_broker_command(proposal=proposal, global_application=application, accepted_at=NOW)
+        result = PaperOrderGatewayResult(
+            algorithmId="weighted_voting",
+            orderIntentId=proposal.orderIntentId,
+            clientOrderId=command.client_order_id,
+            mode="automatic",
+            submitted=True,
+            duplicate=False,
+            status="FILLED",
+            brokerAck=PaperGatewayBrokerAck(
+                clientOrderId=command.client_order_id,
+                brokerOrderId="broker-wv-1",
+                status="ACCEPTED",
+                acceptedAt=NOW,
+            ),
+            fill=PaperGatewayFill(
+                clientOrderId=command.client_order_id,
+                algorithmId="weighted_voting",
+                orderIntentId=proposal.orderIntentId,
+                symbol="SPY",
+                side=Signal.BUY,
+                filledQuantity=7,
+                averageFillPrice=100.05,
+                status="FILLED",
+                filledAt=NOW,
+            ),
+            cancelReplacePolicy="cancel_stale_unfilled_orders_replace_requires_new_intent",
+            reasonCodes=("paper_gateway.submitted",),
+            explanation="Synthetic fill.",
+            evaluatedAt=NOW,
+            configurationHash="filled-config",
+        )
+
+        reconciliation = reconcile_weighted_voting_broker_result(
+            store=store,
+            command=command,
+            broker_result=result,
+            reconciled_at=NOW,
+        )
+
+        self.assertEqual(reconciliation.algorithm_id, "weighted_voting")
+        self.assertIsNotNone(reconciliation.fill)
+        self.assertIsNotNone(reconciliation.position)
+        self.assertEqual(reconciliation.fill.decision_id, proposal.decisionId)
+        self.assertEqual(reconciliation.position.algorithm_id, "weighted_voting")
+        self.assertIn(f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.command.{command.client_order_id}", store.snapshots)
+        self.assertIn(f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.submission.{command.client_order_id}", store.snapshots)
+        self.assertEqual(store.snapshots[f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.position.{reconciliation.position.position_id}"]["algorithmId"], "weighted_voting")
+
+    def test_dedicated_execution_rejection_is_recorded_without_position(self) -> None:
+        store = MemoryStore()
+        proposal = global_proposal()
+        command = build_weighted_voting_broker_command(proposal=proposal, global_application=global_application(proposal), accepted_at=NOW)
+
+        rejection = record_weighted_voting_rejection(
+            store=store,
+            command=command,
+            rejected_at=NOW,
+            broker_status="REJECTED",
+            rejection_reason="broker rejected",
+            reason_codes=("broker.reject",),
+        )
+
+        self.assertEqual(rejection.command.algorithm_id, "weighted_voting")
+        self.assertIn("weighted_voting.execution.rejected", rejection.reason_codes)
+        self.assertIn(f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.rejection.{command.client_order_id}", store.snapshots)
+        self.assertFalse(any(key.startswith(f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.position.") for key in store.snapshots))
+
+    def test_dedicated_execution_status_inventory_declares_owned_boundary(self) -> None:
+        status = execution_gateway_status()
+
+        self.assertEqual(status["algorithmId"], "weighted_voting")
+        self.assertEqual(status["brokerConnectionBoundary"], WEIGHTED_VOTING_BROKER_CONNECTION_BOUNDARY)
+        self.assertIn("deterministic_client_order_id", status["ownedResponsibilities"])
+        self.assertEqual(status["sharedServices"], ["broker_connection"])
 
 
 def validated_rollout_flags() -> WeightedVotingRolloutFlags:

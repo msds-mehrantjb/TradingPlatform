@@ -27,6 +27,38 @@ WEIGHTED_VOTING_OBSERVABILITY_VERSION = "weighted_voting_observability_v1"
 DECISION_OBSERVABILITY_PREFIX = "weighted_voting.observability.decisions."
 EXECUTION_OBSERVABILITY_PREFIX = "weighted_voting.observability.executions."
 METRICS_KEY = "weighted_voting.observability.metrics"
+WEIGHTED_VOTING_OBSERVABILITY_NAMESPACE = "data/algorithms/weighted_voting/observability/"
+WEIGHTED_VOTING_OBSERVABILITY_REQUIRED_FIELDS = (
+    "decision_id",
+    "market_snapshot_hash",
+    "strategy_outputs",
+    "active_weights",
+    "aggregated_scores",
+    "market_condition",
+    "local_gate_outcomes",
+    "sizing_result",
+    "global_gate_result",
+    "final_proposal",
+    "stage_timings",
+    "exceptions",
+    "data_quality_warnings",
+    "configuration_versions",
+    "explanation",
+    "reason_codes",
+)
+WEIGHTED_VOTING_OBSERVABILITY_STAGES = (
+    "market_snapshot",
+    "active_weight_load",
+    "market_condition",
+    "strategy_evaluation",
+    "weighted_aggregation",
+    "dynamic_settings",
+    "local_gates",
+    "position_sizing",
+    "order_proposal",
+    "global_gate_interface",
+    "observability_persistence",
+)
 
 
 class WeightedVotingObservabilityStore(Protocol):
@@ -35,6 +67,24 @@ class WeightedVotingObservabilityStore(Protocol):
 
     def write_snapshot(self, key: str, snapshot: dict) -> None:
         ...
+
+
+def observability_status() -> dict[str, Any]:
+    return {
+        "observabilityVersion": WEIGHTED_VOTING_OBSERVABILITY_VERSION,
+        "algorithmId": "weighted_voting",
+        "authoritativeSource": WEIGHTED_VOTING_OBSERVABILITY_NAMESPACE,
+        "dashboardVisibility": "shared_dashboard_read_only",
+        "requiredFields": WEIGHTED_VOTING_OBSERVABILITY_REQUIRED_FIELDS,
+        "stageTimingContract": WEIGHTED_VOTING_OBSERVABILITY_STAGES,
+        "isolation": {
+            "ownsNamespace": True,
+            "recordsOnlyWeightedVotingState": True,
+            "sharedDashboardsMayDisplay": True,
+            "sharedDashboardsMayMutate": False,
+        },
+        "reasonCodes": ("weighted_voting.observability.ready",),
+    }
 
 
 def record_decision_observability(
@@ -51,6 +101,9 @@ def record_decision_observability(
     global_order_proposal: Any,
     global_gate_response: Any,
     global_gate_application: Any,
+    stage_timings: dict[str, Any] | None = None,
+    exceptions: tuple[Any, ...] = (),
+    data_quality_warnings: tuple[str, ...] = (),
     recorded_at: datetime | None = None,
 ) -> dict[str, Any]:
     recorded_at = recorded_at or _now()
@@ -66,6 +119,9 @@ def record_decision_observability(
         global_order_proposal=global_order_proposal,
         global_gate_response=global_gate_response,
         global_gate_application=global_gate_application,
+        stage_timings=stage_timings,
+        exceptions=exceptions,
+        data_quality_warnings=data_quality_warnings,
         recorded_at=recorded_at,
     )
     snapshot["snapshotHash"] = _hash_payload(snapshot)
@@ -126,6 +182,9 @@ def _decision_snapshot(
     global_order_proposal: Any,
     global_gate_response: Any,
     global_gate_application: Any,
+    stage_timings: dict[str, Any] | None,
+    exceptions: tuple[Any, ...],
+    data_quality_warnings: tuple[str, ...],
     recorded_at: datetime,
 ) -> dict[str, Any]:
     proposal = _json_ready(global_order_proposal)
@@ -134,15 +193,21 @@ def _decision_snapshot(
     decision_payload = decision.model_dump(mode="json")
     signal_payloads = [signal.model_dump(mode="json") for signal in signals]
     data_freshness = _data_freshness(market_snapshot, signals)
+    quality_warnings = _data_quality_warnings(market_snapshot, signals, data_quality_warnings)
     rejection_reasons = _rejection_reasons(decision_payload, _json_ready(local_gate_result), sizing, _json_ready(global_gate_response), gate_application)
+    reason_codes = _reason_codes(decision_payload, signal_payloads, _json_ready(local_gate_result), sizing, _json_ready(global_gate_response), gate_application, rejection_reasons)
     return {
         "observabilityVersion": WEIGHTED_VOTING_OBSERVABILITY_VERSION,
         "immutable": True,
         "algorithmId": "weighted_voting",
+        "authoritativeSource": WEIGHTED_VOTING_OBSERVABILITY_NAMESPACE,
+        "dashboardVisibility": "shared_dashboard_read_only",
         "decisionId": decision.decision_id,
         "recordedAt": recorded_at.isoformat(),
         "dataTimestamp": market_snapshot.data_timestamp.isoformat(),
+        "marketSnapshotHash": market_snapshot.data_manifest_hash,
         "dataFreshness": data_freshness,
+        "strategyOutputs": signal_payloads,
         "strategySignals": signal_payloads,
         "strategyProbabilities": {
             signal.strategy_id: {
@@ -153,11 +218,13 @@ def _decision_snapshot(
             }
             for signal in signals
         },
+        "activeWeights": active_weight_state.model_dump(mode="json"),
         "weightStages": {
             "activeWeightState": active_weight_state.model_dump(mode="json"),
             "adjustments": [adjustment.model_dump(mode="json") for adjustment in decision.weight_adjustments],
         },
         "familyContributions": decision.vote_scores.family_contributions,
+        "aggregatedScores": decision.vote_scores.model_dump(mode="json"),
         "scoreTotals": decision.vote_scores.model_dump(mode="json"),
         "winner": decision.signal,
         "rawWinner": decision.raw_winner,
@@ -168,17 +235,30 @@ def _decision_snapshot(
             "dynamicMultipliers": _dynamic_multipliers(effective_settings),
             "effectiveSettings": effective_settings.model_dump(mode="json"),
         },
+        "configurationVersions": _configuration_versions(decision, signals, active_weight_state, effective_settings, proposal),
+        "localGateOutcomes": _json_ready(local_gate_result),
         "localGateResults": _json_ready(local_gate_result),
         "sizingResult": sizing,
         "proposedQuantity": sizing.get("quantity", decision.proposed_quantity),
         "globalGateResult": _json_ready(global_gate_response),
         "executableQuantity": gate_application.get("globallyAllowedQuantity", 0),
+        "finalProposal": {
+            "proposal": proposal,
+            "globalGateApplication": gate_application,
+            "acceptedQuantity": gate_application.get("globallyAllowedQuantity", 0),
+            "action": gate_application.get("action"),
+        },
         "orderLevels": {
             "entry": proposal.get("triggerPrice"),
             "limit": proposal.get("limitPrice"),
             "stop": proposal.get("stopPrice"),
             "target": proposal.get("targetPrice"),
         },
+        "stageTimings": _stage_timings(stage_timings, recorded_at),
+        "exceptions": [_json_ready(exception) for exception in exceptions],
+        "dataQualityWarnings": quality_warnings,
+        "reasonCodes": reason_codes,
+        "explanation": decision.explanation,
         "rejectionReason": rejection_reasons,
         "eventualOutcome": {
             "status": "pending",
@@ -191,6 +271,10 @@ def _decision_snapshot(
             "decisionId": decision.decision_id,
             "orderIntentId": proposal.get("orderIntentId"),
             "capitalPartitionId": proposal.get("capitalPartitionId"),
+            "configurationVersion": decision.configuration_version,
+            "strategyCatalogVersion": decision.strategy_catalog_version,
+            "settingsVersion": decision.settings_version,
+            "weightVersion": decision.weight_version,
         },
     }
 
@@ -220,6 +304,101 @@ def _dynamic_multipliers(effective_settings: WeightedEffectiveSettings) -> dict[
         adjustment.setting_name: adjustment.condition_multiplier
         for adjustment in effective_settings.dynamic_adjustments
     }
+
+
+def _configuration_versions(
+    decision: WeightedDecision,
+    signals: tuple[WeightedVotingSignal, ...],
+    active_weight_state: WeightedWeightState,
+    effective_settings: WeightedEffectiveSettings,
+    proposal: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "decisionVersion": decision.decision_version,
+        "configurationVersion": decision.configuration_version,
+        "configurationHash": decision.configuration_hash,
+        "strategyCatalogVersion": decision.strategy_catalog_version,
+        "strategyVersions": {signal.strategy_id: signal.strategy_version for signal in signals},
+        "weightVersion": active_weight_state.weight_version,
+        "decisionWeightVersion": decision.weight_version,
+        "settingsVersion": effective_settings.settings_version,
+        "decisionSettingsVersion": decision.settings_version,
+        "effectiveConfigurationVersion": effective_settings.configuration_version,
+        "baselineConfigurationVersion": effective_settings.baseline_configuration_version,
+        "dynamicProfileVersion": effective_settings.dynamic_profile_version,
+        "proposalSettingsVersion": proposal.get("settingsVersion") or proposal.get("settings_version"),
+        "proposalWeightVersion": proposal.get("weightVersion") or proposal.get("weight_version"),
+        "dataManifestHash": decision.data_manifest_hash,
+    }
+
+
+def _stage_timings(stage_timings: dict[str, Any] | None, recorded_at: datetime) -> dict[str, Any]:
+    provided = _json_ready(stage_timings or {})
+    stages: dict[str, Any] = {}
+    for stage in WEIGHTED_VOTING_OBSERVABILITY_STAGES:
+        value = provided.get(stage, {}) if isinstance(provided, dict) else {}
+        if isinstance(value, dict):
+            stages[stage] = {
+                "status": value.get("status", "recorded"),
+                "startedAt": value.get("startedAt"),
+                "completedAt": value.get("completedAt", recorded_at.isoformat()),
+                "elapsedMs": float(value.get("elapsedMs", 0.0)),
+            }
+        else:
+            stages[stage] = {
+                "status": "recorded",
+                "startedAt": None,
+                "completedAt": recorded_at.isoformat(),
+                "elapsedMs": 0.0,
+            }
+    if isinstance(provided, dict):
+        for stage, value in provided.items():
+            if stage not in stages:
+                stages[str(stage)] = value
+    return stages
+
+
+def _data_quality_warnings(
+    market_snapshot: WeightedMarketSnapshot,
+    signals: tuple[WeightedVotingSignal, ...],
+    explicit_warnings: tuple[str, ...],
+) -> list[str]:
+    warnings = [str(warning) for warning in explicit_warnings if warning]
+    if not market_snapshot.one_minute_candles:
+        warnings.append("weighted_voting.data_quality.no_one_minute_candles")
+    if market_snapshot.data_manifest_hash is None:
+        warnings.append("weighted_voting.data_quality.missing_market_snapshot_hash")
+    for signal in signals:
+        if str(signal.data_quality_status) not in ("ready", "WeightedDataQualityStatus.READY"):
+            warnings.append(f"weighted_voting.data_quality.{signal.strategy_id}.{signal.data_quality_status}")
+        if signal.actual_data_freshness_seconds is not None and signal.actual_data_freshness_seconds > signal.required_data_freshness_seconds:
+            warnings.append(f"weighted_voting.data_quality.{signal.strategy_id}.stale_signal_data")
+    return sorted(dict.fromkeys(warnings))
+
+
+def _reason_codes(
+    decision: dict[str, Any],
+    signals: list[dict[str, Any]],
+    local_gate: dict[str, Any],
+    sizing: dict[str, Any],
+    global_response: dict[str, Any],
+    global_application: dict[str, Any],
+    rejection_reasons: list[str],
+) -> list[str]:
+    codes: list[str] = ["weighted_voting.observability.decision_recorded"]
+    codes.extend(str(code) for code in decision.get("reason_codes", ()))
+    for signal in signals:
+        codes.extend(str(code) for code in signal.get("reason_codes", ()))
+    codes.extend(str(code) for code in local_gate.get("reason_codes", ()))
+    for gate in local_gate.get("gate_results", ()):
+        codes.extend(str(code) for code in gate.get("reason_codes", ()))
+    codes.extend(str(code) for code in sizing.get("reason_codes", ()))
+    codes.extend(str(code) for code in global_response.get("reasonCodes", ()))
+    codes.extend(str(code) for code in global_response.get("rejectionReasons", ()))
+    codes.extend(str(code) for code in global_application.get("reasonCodes", ()))
+    codes.extend(str(code) for code in global_application.get("rejectionReasons", ()))
+    codes.extend(rejection_reasons)
+    return sorted(dict.fromkeys(code for code in codes if code))
 
 
 def _rejection_reasons(decision: dict[str, Any], local_gate: dict[str, Any], sizing: dict[str, Any], global_response: dict[str, Any], global_application: dict[str, Any]) -> list[str]:

@@ -18,6 +18,32 @@ from backend.app.algorithms.weighted_voting.service import WeightedVotingService
 
 router = APIRouter(prefix=WEIGHTED_VOTING_API_NAMESPACE, tags=[WEIGHTED_VOTING_API_TAG])
 WEIGHTED_VOTING_API_SERVICE = WeightedVotingService()
+WEIGHTED_VOTING_API_INVENTORY = (
+    ("GET", "/status"),
+    ("GET", "/config"),
+    ("PUT", "/config"),
+    ("POST", "/evaluate"),
+    ("GET", "/decisions/{decision_id}"),
+    ("GET", "/signals/{decision_id}"),
+    ("GET", "/weights/active"),
+    ("GET", "/weights/history"),
+    ("POST", "/weights/recalculate"),
+    ("POST", "/weights/rollback"),
+    ("GET", "/performance"),
+    ("GET", "/performance/strategies"),
+    ("GET", "/performance/market-conditions"),
+    ("POST", "/backtests"),
+    ("GET", "/backtests/{run_id}"),
+    ("GET", "/backtests/{run_id}/trades"),
+    ("GET", "/backtests/{run_id}/decisions"),
+    ("GET", "/backtests/{run_id}/equity"),
+    ("GET", "/backtests/{run_id}/strategy-performance"),
+    ("GET", "/daily-update/status"),
+    ("POST", "/daily-update/run"),
+    ("GET", "/positions"),
+    ("GET", "/trades"),
+    ("GET", "/observability/{decision_id}"),
+)
 
 
 class WeightedVotingErrorResponse(BaseModel):
@@ -96,11 +122,46 @@ class WeightedVotingDailyUpdateRequest(BaseModel):
     candles: tuple[WeightedVotingCandleRequest, ...] = Field(min_length=1)
 
 
-def router_status() -> dict[str, str]:
+class WeightedVotingWeightRecalculateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_date: str | None = Field(default=None)
+    update_timestamp: datetime | None = None
+    regime_label: str | None = None
+    outcomes: tuple[dict[str, Any], ...] = ()
+
+
+class WeightedVotingWeightRollbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_weight_version: str = Field(min_length=1)
+    rollback_timestamp: datetime | None = None
+
+
+def api_inventory() -> dict[str, Any]:
     return {
         "apiVersion": WEIGHTED_VOTING_API_VERSION,
         "apiNamespace": WEIGHTED_VOTING_API_NAMESPACE,
         "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "endpoints": [
+            {
+                "method": method,
+                "path": f"{WEIGHTED_VOTING_API_NAMESPACE}{path}",
+                "relativePath": path,
+            }
+            for method, path in WEIGHTED_VOTING_API_INVENTORY
+        ],
+        "isolated": True,
+        "reasonCodes": ("weighted_voting.api.inventory.ready",),
+    }
+
+
+def router_status() -> dict[str, Any]:
+    return {
+        "apiVersion": WEIGHTED_VOTING_API_VERSION,
+        "apiNamespace": WEIGHTED_VOTING_API_NAMESPACE,
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "apiInventory": api_inventory(),
         "status": "registered",
         "explanation": "Dedicated Weighted Voting API routes are registered and isolated from other algorithm APIs.",
     }
@@ -118,7 +179,9 @@ def evaluate(payload: WeightedVotingEvaluateRequest) -> dict[str, Any]:
 
 @router.get("/status", summary="Weighted Voting status", description="Return isolated Weighted Voting API and service status.")
 def status() -> dict[str, Any]:
-    return WEIGHTED_VOTING_API_SERVICE.status()
+    payload = WEIGHTED_VOTING_API_SERVICE.status()
+    payload["apiInventory"] = api_inventory()
+    return payload
 
 
 @router.get("/config", summary="Get Weighted Voting config", description="Return backend-authoritative Weighted Voting settings/configuration.")
@@ -145,6 +208,41 @@ def weights_active() -> dict[str, Any]:
 @router.get("/weights/history", summary="Get weight history", description="Return historical Weighted Voting weight states recorded by the backend.")
 def weights_history() -> dict[str, Any]:
     return _call(lambda: WEIGHTED_VOTING_API_SERVICE.weights_history())
+
+
+@router.post("/weights/recalculate", responses={400: {"model": WeightedVotingErrorResponse}}, summary="Recalculate active weights")
+def weights_recalculate(payload: WeightedVotingWeightRecalculateRequest) -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.weights_recalculate(payload.model_dump(exclude_none=True, mode="json")))
+
+
+@router.post("/weights/rollback", responses={400: {"model": WeightedVotingErrorResponse}}, summary="Rollback active weights")
+def weights_rollback(payload: WeightedVotingWeightRollbackRequest) -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.weights_rollback(payload.model_dump(exclude_none=True, mode="json")))
+
+
+@router.get("/decisions/{decision_id}", responses={404: {"model": WeightedVotingErrorResponse}}, summary="Get decision")
+def get_decision(decision_id: str = Path(..., min_length=1)) -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.get_decision(decision_id), not_found="weighted_voting.decision.not_found")
+
+
+@router.get("/signals/{decision_id}", responses={404: {"model": WeightedVotingErrorResponse}}, summary="Get decision signals")
+def get_signals(decision_id: str = Path(..., min_length=1)) -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.get_signals(decision_id), not_found="weighted_voting.signals.not_found")
+
+
+@router.get("/performance", summary="Get algorithm performance")
+def performance() -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.performance())
+
+
+@router.get("/performance/strategies", summary="Get strategy performance")
+def performance_strategies() -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.performance_strategies())
+
+
+@router.get("/performance/market-conditions", summary="Get market-condition performance")
+def performance_market_conditions() -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.performance_market_conditions())
 
 
 @router.post(
@@ -177,6 +275,11 @@ def get_backtest_decisions(run_id: str = Path(..., min_length=1)) -> dict[str, A
     return _call(lambda: WEIGHTED_VOTING_API_SERVICE.get_backtest_collection(run_id, "decisions"), not_found="weighted_voting.backtest.not_found")
 
 
+@router.get("/backtests/{run_id}/equity", responses={404: {"model": WeightedVotingErrorResponse}}, summary="Get backtest equity curve")
+def get_backtest_equity(run_id: str = Path(..., min_length=1)) -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.get_backtest_collection(run_id, "equity"), not_found="weighted_voting.backtest.not_found")
+
+
 @router.get("/backtests/{run_id}/strategy-performance", responses={404: {"model": WeightedVotingErrorResponse}}, summary="Get strategy performance")
 def get_backtest_strategy_performance(run_id: str = Path(..., min_length=1)) -> dict[str, Any]:
     return _call(lambda: WEIGHTED_VOTING_API_SERVICE.get_backtest_collection(run_id, "strategyPerformance"), not_found="weighted_voting.backtest.not_found")
@@ -195,6 +298,21 @@ def daily_update_status() -> dict[str, Any]:
 )
 def daily_update_run(payload: WeightedVotingDailyUpdateRequest) -> dict[str, Any]:
     return _call(lambda: WEIGHTED_VOTING_API_SERVICE.run_daily_update(payload.model_dump(mode="json")))
+
+
+@router.get("/positions", summary="Get Weighted Voting positions")
+def positions() -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.positions())
+
+
+@router.get("/trades", summary="Get Weighted Voting trades")
+def trades() -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.trades())
+
+
+@router.get("/observability/{decision_id}", responses={404: {"model": WeightedVotingErrorResponse}}, summary="Get decision observability")
+def observability(decision_id: str = Path(..., min_length=1)) -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.observability(decision_id), not_found="weighted_voting.observability.not_found")
 
 
 def _call(handler, *, not_found: str | None = None):

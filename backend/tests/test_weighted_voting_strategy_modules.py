@@ -4,8 +4,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
+from backend.app.algorithms.weighted_voting.market_condition import classify_market_condition
 from backend.app.algorithms.weighted_voting.market_snapshot import WeightedMarketSnapshot
-from backend.app.algorithms.weighted_voting.models import WeightedCandle, WeightedDataQualityStatus, WeightedSide
+from backend.app.algorithms.weighted_voting.models import WeightedCandle, WeightedDataQualityStatus, WeightedSide, WeightedWeightState
 from backend.app.algorithms.weighted_voting.strategies.bollinger_atr_reversion import BollingerAtrReversionStrategy
 from backend.app.algorithms.weighted_voting.strategies.failed_breakout_reversal import FailedBreakoutReversalStrategy
 from backend.app.algorithms.weighted_voting.strategies.first_pullback_after_open import FirstPullbackAfterOpenStrategy
@@ -79,6 +80,45 @@ class WeightedVotingStrategyModulesTest(unittest.TestCase):
         self.assertEqual([signal.strategy_id for signal in signals], ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"])
         self.assertEqual(len(signals), 8)
 
+    def test_signal_engine_standardizes_strategy_results_and_attaches_active_weight(self) -> None:
+        market_snapshot = s3_buy_snapshot()
+        condition = classify_market_condition(market_snapshot)
+        weights = WeightedWeightState(
+            strategy_weights={"S1": 0.10, "S2": 0.10, "S3": 0.25, "S4": 0.10, "S5": 0.10, "S6": 0.10, "S7": 0.10, "S8": 0.15},
+            last_updated_at=market_snapshot.data_timestamp,
+            data_timestamp=market_snapshot.data_timestamp,
+            explanation="Synthetic active weights for signal-engine contract coverage.",
+        )
+
+        signals = evaluate_signals(market_snapshot, active_weight_state=weights, market_condition=condition)
+        s3 = next(signal for signal in signals if signal.strategy_id == "S3")
+
+        self.assertEqual(s3.strategy_version, "weighted_strategy_S3_v1")
+        self.assertEqual(s3.direction, s3.signal)
+        self.assertEqual(s3.buy_probability, s3.p_buy)
+        self.assertEqual(s3.sell_probability, s3.p_sell)
+        self.assertEqual(s3.hold_probability, s3.p_hold)
+        self.assertEqual(s3.confidence, s3.directional_confidence)
+        self.assertEqual(s3.expected_return_before_costs, s3.expected_return)
+        self.assertEqual(s3.base_weight, 0.125)
+        self.assertEqual(s3.active_weight, 0.25)
+        self.assertTrue(s3.eligible)
+        self.assertTrue(s3.active)
+        self.assertTrue(s3.data_ready)
+        self.assertGreater(s3.market_condition_fit, 0)
+        self.assertGreater(s3.final_weight, 0)
+        self.assertIn("weighted_voting.signal_engine.strategy_active", s3.reason_codes)
+        self.assertEqual(s3.feature_snapshot["strategy_id"], "S3")
+        self.assertEqual(s3.feature_snapshot["signal_engine_version"], "weighted_voting_signal_engine_v1")
+        self.assertIn("market_quality", s3.feature_snapshot)
+
+        for signal in signals:
+            with self.subTest(strategy=signal.strategy_id):
+                self.assertEqual(signal.algorithm_id, "weighted_voting")
+                self.assertAlmostEqual(signal.buy_probability + signal.sell_probability + signal.hold_probability, 1.0, delta=0.000001)
+                self.assertIn("completed_one_minute_candles", signal.feature_snapshot)
+                self.assertNotIn("voting_ensemble", str(signal.model_dump(mode="json")))
+
     def test_strategy_pairs_have_distinct_triggers(self) -> None:
         s1_snapshot = s1_buy_snapshot()
         s8_snapshot = s8_buy_snapshot()
@@ -102,6 +142,124 @@ class WeightedVotingStrategyModulesTest(unittest.TestCase):
 
         self.assertIn("vwap", VwapMeanReversionStrategy().evaluate(s4_buy_snapshot()).reason_codes[0])
         self.assertIn("bollinger", BollingerAtrReversionStrategy().evaluate(s7_buy_snapshot()).reason_codes[0])
+
+
+class DedicatedStrategySuiteMixin:
+    strategy_factory: Callable
+    buy_snapshot: Callable[[], WeightedMarketSnapshot]
+    sell_snapshot: Callable[[], WeightedMarketSnapshot]
+    hold_snapshot: Callable[[], WeightedMarketSnapshot]
+    boundary_snapshot: Callable[[], WeightedMarketSnapshot]
+
+    def test_buy_case(self) -> None:
+        signal = self.strategy_factory().evaluate(self.buy_snapshot())
+
+        self.assertEqual(signal.signal, WeightedSide.BUY.value)
+        self.assertTrue(signal.data_ready)
+        self.assertGreater(signal.directional_confidence, 0)
+
+    def test_sell_case(self) -> None:
+        signal = self.strategy_factory().evaluate(self.sell_snapshot())
+
+        self.assertEqual(signal.signal, WeightedSide.SELL.value)
+        self.assertTrue(signal.data_ready)
+        self.assertGreater(signal.directional_confidence, 0)
+
+    def test_hold_case(self) -> None:
+        signal = self.strategy_factory().evaluate(self.hold_snapshot())
+
+        self.assertEqual(signal.signal, WeightedSide.HOLD.value)
+        self.assertEqual((signal.p_buy, signal.p_sell, signal.p_hold), (0.0, 0.0, 1.0))
+
+    def test_missing_data_case(self) -> None:
+        signal = self.strategy_factory().evaluate(insufficient_snapshot(self.buy_snapshot()))
+
+        self.assertEqual(signal.signal, WeightedSide.HOLD.value)
+        self.assertFalse(signal.data_ready)
+        self.assertEqual(signal.data_quality_status, WeightedDataQualityStatus.UNAVAILABLE.value)
+
+    def test_stale_data_case(self) -> None:
+        signal = self.strategy_factory().evaluate(stale_snapshot(self.buy_snapshot()))
+
+        self.assertEqual(signal.signal, WeightedSide.HOLD.value)
+        self.assertFalse(signal.data_ready)
+        self.assertEqual(signal.data_quality_status, WeightedDataQualityStatus.UNAVAILABLE.value)
+
+    def test_boundary_threshold_case(self) -> None:
+        signal = self.strategy_factory().evaluate(self.boundary_snapshot())
+
+        self.assertEqual(signal.signal, WeightedSide.HOLD.value)
+
+    def test_no_lookahead_case(self) -> None:
+        base = self.buy_snapshot()
+        future = make_candle(base.data_timestamp + timedelta(minutes=1), 120.0, 121.0, 80.0, 80.5, 900000)
+        with_future = snapshot(base.one_minute_candles + (future,), data_timestamp=base.data_timestamp, bid=base.bid, ask=base.ask)
+
+        self.assertEqual(self.strategy_factory().evaluate(with_future).deterministic_json(), self.strategy_factory().evaluate(base).deterministic_json())
+
+
+class OpeningRangeBreakoutStrategySuite(DedicatedStrategySuiteMixin, unittest.TestCase):
+    strategy_factory = OpeningRangeBreakoutStrategy
+    buy_snapshot = staticmethod(lambda: s1_buy_snapshot())
+    sell_snapshot = staticmethod(lambda: s1_sell_snapshot())
+    hold_snapshot = staticmethod(lambda: s1_hold_snapshot())
+    boundary_snapshot = staticmethod(lambda: s1_borderline_snapshot())
+
+
+class FirstPullbackAfterOpenStrategySuite(DedicatedStrategySuiteMixin, unittest.TestCase):
+    strategy_factory = FirstPullbackAfterOpenStrategy
+    buy_snapshot = staticmethod(lambda: s2_buy_snapshot())
+    sell_snapshot = staticmethod(lambda: s2_sell_snapshot())
+    hold_snapshot = staticmethod(lambda: s2_hold_snapshot())
+    boundary_snapshot = staticmethod(lambda: s2_borderline_snapshot())
+
+
+class VwapTrendContinuationStrategySuite(DedicatedStrategySuiteMixin, unittest.TestCase):
+    strategy_factory = VwapTrendContinuationStrategy
+    buy_snapshot = staticmethod(lambda: s3_buy_snapshot())
+    sell_snapshot = staticmethod(lambda: s3_sell_snapshot())
+    hold_snapshot = staticmethod(lambda: s3_hold_snapshot())
+    boundary_snapshot = staticmethod(lambda: s3_borderline_snapshot())
+
+
+class VwapMeanReversionStrategySuite(DedicatedStrategySuiteMixin, unittest.TestCase):
+    strategy_factory = VwapMeanReversionStrategy
+    buy_snapshot = staticmethod(lambda: s4_buy_snapshot())
+    sell_snapshot = staticmethod(lambda: s4_sell_snapshot())
+    hold_snapshot = staticmethod(lambda: s4_hold_snapshot())
+    boundary_snapshot = staticmethod(lambda: s4_borderline_snapshot())
+
+
+class FailedBreakoutReversalStrategySuite(DedicatedStrategySuiteMixin, unittest.TestCase):
+    strategy_factory = FailedBreakoutReversalStrategy
+    buy_snapshot = staticmethod(lambda: s5_buy_snapshot())
+    sell_snapshot = staticmethod(lambda: s5_sell_snapshot())
+    hold_snapshot = staticmethod(lambda: s5_hold_snapshot())
+    boundary_snapshot = staticmethod(lambda: s5_borderline_snapshot())
+
+
+class LiquiditySweepReversalStrategySuite(DedicatedStrategySuiteMixin, unittest.TestCase):
+    strategy_factory = LiquiditySweepReversalStrategy
+    buy_snapshot = staticmethod(lambda: s6_buy_snapshot())
+    sell_snapshot = staticmethod(lambda: s6_sell_snapshot())
+    hold_snapshot = staticmethod(lambda: s6_hold_snapshot())
+    boundary_snapshot = staticmethod(lambda: s6_borderline_snapshot())
+
+
+class BollingerAtrReversionStrategySuite(DedicatedStrategySuiteMixin, unittest.TestCase):
+    strategy_factory = BollingerAtrReversionStrategy
+    buy_snapshot = staticmethod(lambda: s7_buy_snapshot())
+    sell_snapshot = staticmethod(lambda: s7_sell_snapshot())
+    hold_snapshot = staticmethod(lambda: s7_hold_snapshot())
+    boundary_snapshot = staticmethod(lambda: s7_borderline_snapshot())
+
+
+class VolatilityBreakoutStrategySuite(DedicatedStrategySuiteMixin, unittest.TestCase):
+    strategy_factory = VolatilityBreakoutStrategy
+    buy_snapshot = staticmethod(lambda: s8_buy_snapshot())
+    sell_snapshot = staticmethod(lambda: s8_sell_snapshot())
+    hold_snapshot = staticmethod(lambda: s8_hold_snapshot())
+    boundary_snapshot = staticmethod(lambda: s8_borderline_snapshot())
 
 
 class StrategySpec:

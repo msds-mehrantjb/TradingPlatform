@@ -8,6 +8,7 @@ from backend.app.algorithms.weighted_voting.dynamic_settings import default_dyna
 from backend.app.algorithms.weighted_voting.exit_policy import (
     WeightedExitAction,
     WeightedVotingExitInputs,
+    exit_policy_status,
     evaluate_exit_lifecycle,
     open_exit_lifecycle,
 )
@@ -30,9 +31,53 @@ class WeightedVotingExitPolicyTest(unittest.TestCase):
         lifecycle = lifecycle_for(settings=settings)
 
         self.assertEqual(lifecycle.protective_stop, 99.0)
+        self.assertEqual(lifecycle.structural_invalidation, 99.0)
+        self.assertIsNone(lifecycle.atr_fallback_stop)
         self.assertEqual(lifecycle.original_effective_settings, settings)
         self.assertEqual(lifecycle.profit_target, 102.5)
+        self.assertEqual(lifecycle.risk_reward_requirement, settings.target_r)
         self.assertEqual(lifecycle.original_quantity, lifecycle.remaining_quantity)
+
+    def test_structural_invalidation_atr_fallback_and_risk_reward_are_owned_by_policy(self) -> None:
+        lifecycle = open_exit_lifecycle(
+            trade_id="trade-atr",
+            symbol="SPY",
+            side=WeightedSide.BUY,
+            quantity=100,
+            entry_price=100.0,
+            entry_timestamp=TS,
+            stop_price=99.0,
+            structural_invalidation=98.75,
+            atr_fallback_stop=99.2,
+            minimum_risk_reward=2.0,
+            effective_settings=effective_settings(target_r=2.5),
+        )
+        decision = evaluate_exit_lifecycle(
+            WeightedVotingExitInputs(
+                lifecycle=lifecycle,
+                current_price=100.1,
+                current_timestamp=TS + timedelta(minutes=1),
+                current_condition_quality=WeightedMarketQuality.CLEAN,
+                partial_profit_enabled=False,
+            )
+        )
+
+        self.assertEqual(decision.structural_invalidation, 98.75)
+        self.assertEqual(decision.atr_fallback_stop, 99.2)
+        self.assertEqual(decision.risk_reward_requirement, 2.0)
+
+        with self.assertRaises(ValueError):
+            open_exit_lifecycle(
+                trade_id="trade-bad-rr",
+                symbol="SPY",
+                side=WeightedSide.BUY,
+                quantity=100,
+                entry_price=100.0,
+                entry_timestamp=TS,
+                stop_price=99.0,
+                minimum_risk_reward=2.0,
+                effective_settings=effective_settings(target_r=1.5),
+            )
 
     def test_no_stop_widening_or_risk_increase_is_possible(self) -> None:
         lifecycle = lifecycle_for(stop=99.0)
@@ -120,7 +165,53 @@ class WeightedVotingExitPolicyTest(unittest.TestCase):
 
         self.assertEqual(decision.action, WeightedExitAction.EXIT.value)
         self.assertEqual(decision.exit_reason, WeightedExitReason.RISK_GATE.value)
+        self.assertTrue(decision.emergency_exit)
+        self.assertTrue(decision.global_emergency_override)
         self.assertIn("weighted_voting.exit.global_emergency_exit", decision.reason_codes)
+
+    def test_partial_profit_rule_reduces_but_does_not_close_position(self) -> None:
+        decision = evaluate_exit_lifecycle(
+            WeightedVotingExitInputs(
+                lifecycle=lifecycle_for(),
+                current_price=101.1,
+                current_timestamp=TS + timedelta(minutes=2),
+                current_condition_quality=WeightedMarketQuality.MIXED,
+                partial_profit_fraction=0.5,
+            )
+        )
+
+        self.assertEqual(decision.action, WeightedExitAction.PARTIAL_EXIT.value)
+        self.assertEqual(decision.partial_exit_quantity, 50)
+        self.assertEqual(decision.exit_quantity, 50)
+        self.assertEqual(decision.updated_lifecycle.remaining_quantity, 50)
+        self.assertTrue(decision.updated_lifecycle.partial_profit_taken)
+        self.assertIn("weighted_voting.exit.partial_profit", decision.reason_codes)
+
+    def test_signal_decay_and_opposing_weight_exit_after_persistence(self) -> None:
+        first = evaluate_exit_lifecycle(
+            WeightedVotingExitInputs(
+                lifecycle=lifecycle_for(),
+                current_price=100.2,
+                current_timestamp=TS + timedelta(minutes=3),
+                current_condition_quality=WeightedMarketQuality.CLEAN,
+                signal_decay_exit=True,
+                deterioration_required_count=2,
+            )
+        )
+        second = evaluate_exit_lifecycle(
+            WeightedVotingExitInputs(
+                lifecycle=first.updated_lifecycle,
+                current_price=100.2,
+                current_timestamp=TS + timedelta(minutes=4),
+                current_condition_quality=WeightedMarketQuality.CLEAN,
+                opposing_weight_exit=True,
+                deterioration_required_count=2,
+            )
+        )
+
+        self.assertEqual(first.action, WeightedExitAction.HOLD.value)
+        self.assertEqual(second.action, WeightedExitAction.EXIT.value)
+        self.assertIn("weighted_voting.exit.persistent_deterioration", second.reason_codes)
 
     def test_weighted_voting_closes_only_its_own_allocation(self) -> None:
         decision = evaluate_exit_lifecycle(
@@ -136,6 +227,12 @@ class WeightedVotingExitPolicyTest(unittest.TestCase):
 
         self.assertEqual(decision.action, WeightedExitAction.HOLD.value)
         self.assertEqual(decision.exit_quantity, 0)
+
+    def test_status_documents_global_emergency_as_reduce_or_close_only(self) -> None:
+        status = exit_policy_status()
+
+        self.assertEqual(status["ownership"], "weighted_voting_positions_only")
+        self.assertEqual(status["globalEmergencyOverride"], "global controls may force reduction_or_closure_only")
 
 
 def lifecycle_for(*, settings=None, stop: float = 99.0, weighted_allocation_id: str = "weighted_voting"):

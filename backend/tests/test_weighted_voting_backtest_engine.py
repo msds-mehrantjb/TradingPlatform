@@ -4,7 +4,15 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from backend.app.algorithms.weighted_voting.backtest.engine import WeightedBacktestEngineConfig, run_weighted_voting_backtest
+from backend.app.algorithms.weighted_voting.backtest.engine import (
+    WEIGHTED_VOTING_BACKTEST_OWNED_CAPABILITIES,
+    WEIGHTED_VOTING_BACKTEST_PRODUCTION_CALLS,
+    WEIGHTED_VOTING_BACKTEST_REQUIRED_STRUCTURE,
+    WeightedBacktestEngineConfig,
+    backtest_engine_status,
+    run_weighted_voting_backtest,
+)
+from backend.app.algorithms.weighted_voting.backtest.execution_simulator import WeightedBacktestExecutionCostModel, simulator_status
 from backend.app.algorithms.weighted_voting.market_snapshot import WeightedVotingCandle, WeightedVotingMarketSnapshot
 from backend.app.algorithms.weighted_voting.models import WeightedDataQualityStatus, WeightedSide, WeightedStrategyFamily, WeightedVotingSignal
 
@@ -34,14 +42,19 @@ class WeightedVotingBacktestEngineTest(unittest.TestCase):
             return synthetic_signals(snapshot, WeightedSide.BUY)
 
         with patch("backend.app.algorithms.weighted_voting.backtest.engine.evaluate_signals", side_effect=evaluator):
-            result = run_weighted_voting_backtest(candles=candles, config=WeightedBacktestEngineConfig(symbol="SPY"), created_at=CREATED_AT)
+            result = run_weighted_voting_backtest(candles=candles, config=trade_path_config(), created_at=CREATED_AT)
 
         self.assertEqual(result.run.data_manifest_hash, result.manifest.manifest_hash)
         self.assertGreater(len(result.trades), 0)
         self.assertTrue(any(trade.partial_fill for trade in result.trades))
         self.assertGreater(result.algorithm_results.turnover, 0.0)
         self.assertGreater(result.algorithm_results.cost_ratio, 0.0)
+        self.assertEqual(len(result.algorithm_results.drawdown_curve), len(result.algorithm_results.equity_curve))
         self.assertNotEqual(result.trades[0].gross_pnl, result.trades[0].net_pnl)
+        self.assertEqual(result.configuration_manifest.manifest_hash, result.configuration_manifest.manifest_hash)
+        self.assertEqual(result.configuration_manifest.run_id, result.run.run_id)
+        self.assertEqual(result.configuration_manifest.cost_model["regulatoryFeePerShare"], 0.0)
+        self.assertEqual(len(result.reproducibility_hash), 64)
         self.assertIn("evaluate_signals", result.production_function_calls)
         self.assertIn("classify_market_condition", result.production_function_calls)
         self.assertIn("aggregate_weighted_signals", result.production_function_calls)
@@ -49,6 +62,18 @@ class WeightedVotingBacktestEngineTest(unittest.TestCase):
         self.assertIn("calculate_weighted_voting_position_size", result.production_function_calls)
         self.assertIn("evaluate_entry_policy", result.production_function_calls)
         self.assertIn("evaluate_exit_lifecycle", result.production_function_calls)
+        for required_call in (
+            "classify_market_condition",
+            "evaluate_signals",
+            "aggregate_weighted_signals",
+            "evaluate_local_decision_gates",
+            "calculate_weighted_voting_position_size",
+            "evaluate_entry_policy",
+            "simulate_entry_fill",
+            "open_exit_lifecycle",
+            "evaluate_exit_lifecycle",
+        ):
+            self.assertIn(required_call, result.production_function_calls)
         self.assertTrue(all(max(candle.timestamp for candle in snapshot.one_minute_candles) <= snapshot.data_timestamp for snapshot in seen_snapshots))
 
     def test_no_lookahead_and_next_candle_entry_are_enforced(self) -> None:
@@ -62,7 +87,7 @@ class WeightedVotingBacktestEngineTest(unittest.TestCase):
             return synthetic_signals(snapshot, WeightedSide.BUY)
 
         with patch("backend.app.algorithms.weighted_voting.backtest.engine.evaluate_signals", side_effect=evaluator):
-            result = run_weighted_voting_backtest(candles=candles, config=WeightedBacktestEngineConfig(symbol="SPY"), created_at=CREATED_AT)
+            result = run_weighted_voting_backtest(candles=candles, config=trade_path_config(), created_at=CREATED_AT)
 
         self.assertTrue(result.decisions)
         self.assertTrue(all(trace.completed_candle_count == trace.candle_index + 1 for trace in result.decisions))
@@ -77,7 +102,7 @@ class WeightedVotingBacktestEngineTest(unittest.TestCase):
             "backend.app.algorithms.weighted_voting.backtest.engine.evaluate_signals",
             side_effect=lambda snapshot, _config=None: synthetic_signals(snapshot, WeightedSide.BUY),
         ):
-            result = run_weighted_voting_backtest(candles=candles, config=WeightedBacktestEngineConfig(symbol="SPY"), created_at=CREATED_AT)
+            result = run_weighted_voting_backtest(candles=candles, config=trade_path_config(), created_at=CREATED_AT)
 
         self.assertGreater(len(result.trades), 0)
         self.assertEqual(result.trades[0].exit_reason, "stop_hit")
@@ -90,12 +115,63 @@ class WeightedVotingBacktestEngineTest(unittest.TestCase):
             side = WeightedSide.BUY if len(snapshot.one_minute_candles) >= 387 else WeightedSide.HOLD
             return synthetic_signals(snapshot, side)
 
-        config = WeightedBacktestEngineConfig(symbol="SPY", session_cutoff_eastern_minutes=958, force_close_eastern_minutes=959)
+        config = trade_path_config(session_cutoff_eastern_minutes=958, force_close_eastern_minutes=959)
         with patch("backend.app.algorithms.weighted_voting.backtest.engine.evaluate_signals", side_effect=evaluator):
             result = run_weighted_voting_backtest(candles=candles, config=config, created_at=CREATED_AT)
 
         self.assertGreater(len(result.trades), 0)
         self.assertEqual(result.trades[-1].exit_reason, "end_of_day")
+
+    def test_backtesting_inventory_declares_owned_structure_and_critical_rule(self) -> None:
+        status = backtest_engine_status()
+        simulator = simulator_status()
+
+        self.assertEqual(tuple(status["requiredStructure"]), WEIGHTED_VOTING_BACKTEST_REQUIRED_STRUCTURE)
+        for capability in (
+            "weighted_voting_data_validation",
+            "warm_up_handling",
+            "real_strategy_invocation",
+            "historical_weight_state_loading",
+            "point_in_time_market_snapshot",
+            "decision_replay",
+            "local_gate_replay",
+            "position_sizing",
+            "entry_simulation",
+            "stop_target_simulation",
+            "slippage",
+            "spread",
+            "fees_and_regulatory_costs",
+            "partial_fills",
+            "session_close",
+            "position_ownership",
+            "trade_recording",
+            "strategy_attribution",
+            "algorithm_metrics",
+            "strategy_metrics",
+            "equity_curve",
+            "drawdown_curve",
+            "walk_forward_folds",
+            "configuration_manifest",
+            "data_manifest",
+            "reproducibility_hashes",
+        ):
+            self.assertIn(capability, status["ownedCapabilities"])
+            self.assertIn(capability, WEIGHTED_VOTING_BACKTEST_OWNED_CAPABILITIES)
+        self.assertEqual(status["criticalRule"], "call_same_weighted_voting_logic_used_in_paper_trading")
+        self.assertIn("evaluate_signals", WEIGHTED_VOTING_BACKTEST_PRODUCTION_CALLS)
+        self.assertIn("regulatory_costs", simulator["ownedCosts"])
+
+    def test_reproducibility_hash_uses_configuration_and_data_manifests(self) -> None:
+        candles = trending_session()
+
+        with patch("backend.app.algorithms.weighted_voting.backtest.engine.evaluate_signals", side_effect=lambda snapshot, _config=None: synthetic_signals(snapshot, WeightedSide.BUY)):
+            first = run_weighted_voting_backtest(candles=candles, config=trade_path_config(run_id="repro"), created_at=CREATED_AT)
+        with patch("backend.app.algorithms.weighted_voting.backtest.engine.evaluate_signals", side_effect=lambda snapshot, _config=None: synthetic_signals(snapshot, WeightedSide.BUY)):
+            second = run_weighted_voting_backtest(candles=candles, config=trade_path_config(run_id="repro"), created_at=CREATED_AT)
+
+        self.assertEqual(first.manifest.manifest_hash, second.manifest.manifest_hash)
+        self.assertEqual(first.configuration_manifest.manifest_hash, second.configuration_manifest.manifest_hash)
+        self.assertEqual(first.reproducibility_hash, second.reproducibility_hash)
 
 
 def synthetic_signals(snapshot: WeightedVotingMarketSnapshot, side: WeightedSide) -> tuple[WeightedVotingSignal, ...]:
@@ -132,6 +208,20 @@ def synthetic_signals(snapshot: WeightedVotingMarketSnapshot, side: WeightedSide
             )
         )
     return tuple(signals)
+
+
+def trade_path_config(**overrides) -> WeightedBacktestEngineConfig:
+    values = {
+        "symbol": "SPY",
+        "cost_model": WeightedBacktestExecutionCostModel(
+            entry_slippage_per_share=0.0001,
+            exit_slippage_per_share=0.0001,
+            fee_per_share=0.005,
+            regulatory_fee_per_share=0.0,
+        ),
+    }
+    values.update(overrides)
+    return WeightedBacktestEngineConfig(**values)
 
 
 def trending_session() -> tuple[WeightedVotingCandle, ...]:

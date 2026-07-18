@@ -7,7 +7,12 @@ from pydantic import ValidationError
 
 from backend.app.algorithms.weighted_voting.aggregation import aggregate_weighted_signals
 from backend.app.algorithms.weighted_voting.dynamic_settings import default_dynamic_envelope, default_hard_limits, default_weighted_settings, resolve_effective_settings
-from backend.app.algorithms.weighted_voting.global_interface import build_weighted_voting_global_order_proposal, apply_global_response_to_weighted_voting_proposal
+from backend.app.algorithms.weighted_voting.global_interface import (
+    WEIGHTED_VOTING_CAPITAL_PARTITION_ID,
+    apply_global_response_to_weighted_voting_proposal,
+    build_weighted_voting_global_order_proposal,
+    global_interface_status,
+)
 from backend.app.algorithms.weighted_voting.models import WeightedDataQualityStatus, WeightedSide, WeightedStrategyFamily, WeightedVotingSignal
 from backend.app.algorithms.weighted_voting.position_sizing import WeightedVotingSizingCap, WeightedVotingSizingResult
 from backend.app.gates import GlobalGateResponse, GlobalOrderProposal, apply_global_gate_response
@@ -126,6 +131,76 @@ class GlobalDecisionInterfaceTest(unittest.TestCase):
         self.assertEqual(applied.globallyAllowedQuantity, 0)
         self.assertTrue(applied.quantityReduced)
         self.assertIn("global_gate.strategy_state_not_modified", applied.immutableChecks)
+
+    def test_weighted_voting_adapter_rejects_global_quantity_or_risk_increase(self) -> None:
+        proposal = build_weighted_voting_global_order_proposal(
+            decision=weighted_decision(),
+            sizing=sizing_result(quantity=10, risk=200.0),
+            effective_settings=effective_settings(),
+            symbol="SPY",
+            trigger_price=100.05,
+            limit_price=100.05,
+            stop_price=99.55,
+            target_price=101.05,
+            proposed_at=NOW,
+        )
+
+        with self.assertRaises(ValueError):
+            apply_global_response_to_weighted_voting_proposal(
+                proposal,
+                GlobalGateResponse(
+                    action="ALLOW",
+                    maximumAllowedQuantity=11,
+                    maximumAdditionalRiskDollars=200.0,
+                    evaluatedAt=NOW,
+                    configurationHash="global-response-quantity-increase",
+                ),
+            )
+        with self.assertRaises(ValueError):
+            apply_global_response_to_weighted_voting_proposal(
+                proposal,
+                GlobalGateResponse(
+                    action="ALLOW",
+                    maximumAllowedQuantity=10,
+                    maximumAdditionalRiskDollars=201.0,
+                    evaluatedAt=NOW,
+                    configurationHash="global-response-risk-increase",
+                ),
+            )
+
+    def test_weighted_voting_adapter_rejects_bad_ownership_and_documents_allowed_actions(self) -> None:
+        proposal = build_weighted_voting_global_order_proposal(
+            decision=weighted_decision(),
+            sizing=sizing_result(quantity=10, risk=200.0),
+            effective_settings=effective_settings(),
+            symbol="SPY",
+            trigger_price=100.05,
+            limit_price=100.05,
+            stop_price=99.55,
+            target_price=101.05,
+            proposed_at=NOW,
+        )
+        status = global_interface_status()
+
+        self.assertEqual(status["algorithmId"], "weighted_voting")
+        self.assertEqual(status["capitalPartitionId"], WEIGHTED_VOTING_CAPITAL_PARTITION_ID)
+        self.assertIn("EMERGENCY_LIQUIDATE", status["allowedActions"])
+        self.assertIn("weighted_voting.global_interface.active_weights_not_mutated", status["immutabilityChecks"])
+
+        tampered_payload = proposal.model_dump(mode="json")
+        tampered_payload["capitalPartitionId"] = "wca.paper.default"
+        tampered = GlobalOrderProposal.model_validate(tampered_payload)
+        with self.assertRaises(ValueError):
+            apply_global_response_to_weighted_voting_proposal(
+                tampered,
+                GlobalGateResponse(
+                    action="REJECT_NEW_ENTRY",
+                    maximumAllowedQuantity=0,
+                    maximumAdditionalRiskDollars=0.0,
+                    evaluatedAt=NOW,
+                    configurationHash="global-response-reject",
+                ),
+            )
 
 
 def order_proposal(quantity: int = 10, planned_risk: float = 100.0) -> GlobalOrderProposal:

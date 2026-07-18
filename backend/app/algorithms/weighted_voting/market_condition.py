@@ -13,6 +13,7 @@ from backend.app.algorithms.weighted_voting.models import (
     WeightedMarketQuality,
     WeightedRangeCondition,
     WeightedSessionPhase,
+    WeightedStrategyFamily,
     WeightedTrendDirection,
     WeightedVolatilityLevel,
 )
@@ -20,6 +21,24 @@ from backend.app.algorithms.weighted_voting.strategies.common import average_tru
 
 
 WEIGHTED_VOTING_MARKET_CONDITION_VERSION = "weighted_voting_market_condition_v2"
+WEIGHTED_VOTING_MARKET_CONDITION_INFLUENCE_SCOPE = (
+    "weighted_voting.strategy_eligibility",
+    "weighted_voting.regime_fit_multiplier",
+    "weighted_voting.weight_adjustment",
+    "weighted_voting.position_sizing",
+    "weighted_voting.local_gates",
+)
+
+TAG_TRENDING_UP = "weighted_voting.market_condition.trending_up"
+TAG_TRENDING_DOWN = "weighted_voting.market_condition.trending_down"
+TAG_WEAK_TREND = "weighted_voting.market_condition.weak_trend"
+TAG_RANGE_BOUND = "weighted_voting.market_condition.range_bound"
+TAG_HIGH_VOLATILITY = "weighted_voting.market_condition.high_volatility"
+TAG_LOW_VOLATILITY = "weighted_voting.market_condition.low_volatility"
+TAG_OPENING_IMPULSE = "weighted_voting.market_condition.opening_impulse"
+TAG_BREAKOUT_ENVIRONMENT = "weighted_voting.market_condition.breakout_environment"
+TAG_MEAN_REVERSION_ENVIRONMENT = "weighted_voting.market_condition.mean_reversion_environment"
+TAG_AVOID_TRADING = "weighted_voting.market_condition.avoid_trading"
 
 
 @dataclass(frozen=True)
@@ -33,6 +52,8 @@ class WeightedConditionCandidate:
     market_quality: WeightedMarketQuality
     confidence: float
     condition_inputs: dict[str, float | str | bool | None]
+    condition_tags: tuple[str, ...]
+    regime_fit_multipliers: dict[str, float]
     reason_codes: tuple[str, ...]
 
     @property
@@ -64,6 +85,9 @@ def classify_market_condition(
             trend_direction=WeightedTrendDirection.UNKNOWN,
             volatility_level=WeightedVolatilityLevel.UNKNOWN,
             range_condition=WeightedRangeCondition.UNKNOWN,
+            condition_tags=(TAG_AVOID_TRADING,),
+            influence_scope=WEIGHTED_VOTING_MARKET_CONDITION_INFLUENCE_SCOPE,
+            regime_fit_multipliers=_avoid_regime_fit_multipliers(),
             liquidity_level=WeightedLiquidityLevel.UNKNOWN,
             session_phase=WeightedSessionPhase.UNKNOWN,
             event_risk=WeightedEventRiskLevel.UNKNOWN,
@@ -94,6 +118,7 @@ def _candidate(snapshot, candles, config: WeightedVotingConfig) -> WeightedCondi
     relative_volume = _relative_volume(session_candles)
     spread_percent = _spread_percent(snapshot)
     gap_percent = _gap_percent(session_candles)
+    opening_impulse_percent = _opening_impulse_percent(session_candles)
     reason_codes: list[str] = []
 
     trend_direction = _trend_direction(trend_slope, short_slope, vwap_slope, config)
@@ -103,9 +128,29 @@ def _candidate(snapshot, candles, config: WeightedVotingConfig) -> WeightedCondi
     event_risk = _event_risk(gap_percent, volatility_level, config)
     market_quality = _market_quality(volatility_level, liquidity_level, event_risk, spread_percent)
     range_condition = _range_condition(trend_direction, volatility_level)
+    condition_tags = _condition_tags(
+        trend_direction=trend_direction,
+        volatility_level=volatility_level,
+        range_condition=range_condition,
+        liquidity_level=liquidity_level,
+        session_phase=session_phase,
+        event_risk=event_risk,
+        market_quality=market_quality,
+        opening_impulse_percent=opening_impulse_percent,
+        config=config,
+    )
+    regime_fit_multipliers = _regime_fit_multipliers(condition_tags)
 
     if trend_direction in (WeightedTrendDirection.STRONG_UPTREND, WeightedTrendDirection.STRONG_DOWNTREND):
         reason_codes.append("weighted_voting.market_condition.strong_trend")
+    if TAG_OPENING_IMPULSE in condition_tags:
+        reason_codes.append("weighted_voting.market_condition.opening_impulse")
+    if TAG_BREAKOUT_ENVIRONMENT in condition_tags:
+        reason_codes.append("weighted_voting.market_condition.breakout_environment")
+    if TAG_MEAN_REVERSION_ENVIRONMENT in condition_tags:
+        reason_codes.append("weighted_voting.market_condition.mean_reversion_environment")
+    if TAG_AVOID_TRADING in condition_tags:
+        reason_codes.append("weighted_voting.market_condition.avoid_trading")
     if volatility_level == WeightedVolatilityLevel.EXTREME:
         reason_codes.append("weighted_voting.market_condition.extreme_volatility")
     if liquidity_level == WeightedLiquidityLevel.POOR:
@@ -124,6 +169,7 @@ def _candidate(snapshot, candles, config: WeightedVotingConfig) -> WeightedCondi
         "relative_volume": round(relative_volume, 10) if relative_volume is not None else None,
         "spread_percent": round(spread_percent, 10) if spread_percent is not None else None,
         "gap_percent": round(gap_percent, 10) if gap_percent is not None else None,
+        "opening_impulse_percent": round(opening_impulse_percent, 10) if opening_impulse_percent is not None else None,
         "latest_close": round(latest.close, 10),
     }
     confidence = _confidence(inputs, market_quality, len(session_candles))
@@ -137,6 +183,8 @@ def _candidate(snapshot, candles, config: WeightedVotingConfig) -> WeightedCondi
         market_quality=market_quality,
         confidence=confidence,
         condition_inputs=inputs,
+        condition_tags=condition_tags,
+        regime_fit_multipliers=regime_fit_multipliers,
         reason_codes=tuple(reason_codes),
     )
 
@@ -175,6 +223,8 @@ def _apply_hysteresis(
                 "pending_candidate_key": candidate.condition_key,
                 "pending_confirmation_count": float(pending_count),
             },
+            condition_tags=tuple(previous_condition.condition_tags),
+            regime_fit_multipliers=dict(previous_condition.regime_fit_multipliers),
             reason_codes=tuple(previous_condition.reason_codes) + ("weighted_voting.market_condition.hysteresis_hold",),
         )
         return held
@@ -197,6 +247,9 @@ def _condition_from_candidate(
         trend_direction=candidate.trend_direction,
         volatility_level=candidate.volatility_level,
         range_condition=candidate.range_condition,
+        condition_tags=candidate.condition_tags,
+        influence_scope=WEIGHTED_VOTING_MARKET_CONDITION_INFLUENCE_SCOPE,
+        regime_fit_multipliers=candidate.regime_fit_multipliers,
         liquidity_level=candidate.liquidity_level,
         session_phase=candidate.session_phase,
         event_risk=candidate.event_risk,
@@ -300,6 +353,99 @@ def _range_condition(trend_direction: WeightedTrendDirection, volatility_level: 
     return WeightedRangeCondition.CHOPPY
 
 
+def _condition_tags(
+    *,
+    trend_direction: WeightedTrendDirection,
+    volatility_level: WeightedVolatilityLevel,
+    range_condition: WeightedRangeCondition,
+    liquidity_level: WeightedLiquidityLevel,
+    session_phase: WeightedSessionPhase,
+    event_risk: WeightedEventRiskLevel,
+    market_quality: WeightedMarketQuality,
+    opening_impulse_percent: float | None,
+    config: WeightedVotingConfig,
+) -> tuple[str, ...]:
+    tags: list[str] = []
+    if trend_direction in (WeightedTrendDirection.STRONG_UPTREND, WeightedTrendDirection.WEAK_UPTREND, WeightedTrendDirection.UP):
+        tags.append(TAG_TRENDING_UP)
+    if trend_direction in (WeightedTrendDirection.STRONG_DOWNTREND, WeightedTrendDirection.WEAK_DOWNTREND, WeightedTrendDirection.DOWN):
+        tags.append(TAG_TRENDING_DOWN)
+    if trend_direction in (WeightedTrendDirection.WEAK_UPTREND, WeightedTrendDirection.WEAK_DOWNTREND):
+        tags.append(TAG_WEAK_TREND)
+    if range_condition == WeightedRangeCondition.RANGE_BOUND:
+        tags.append(TAG_RANGE_BOUND)
+    if volatility_level in (WeightedVolatilityLevel.HIGH, WeightedVolatilityLevel.EXTREME):
+        tags.append(TAG_HIGH_VOLATILITY)
+    if volatility_level in (WeightedVolatilityLevel.VERY_LOW, WeightedVolatilityLevel.LOW):
+        tags.append(TAG_LOW_VOLATILITY)
+    if opening_impulse_percent is not None and abs(opening_impulse_percent) >= max(config.market_condition_trend_weak_slope, 0.0015):
+        tags.append(TAG_OPENING_IMPULSE)
+    if range_condition == WeightedRangeCondition.BREAKOUT or (
+        volatility_level == WeightedVolatilityLevel.HIGH
+        and trend_direction in (WeightedTrendDirection.STRONG_UPTREND, WeightedTrendDirection.STRONG_DOWNTREND)
+    ):
+        tags.append(TAG_BREAKOUT_ENVIRONMENT)
+    if range_condition == WeightedRangeCondition.RANGE_BOUND and volatility_level in (
+        WeightedVolatilityLevel.VERY_LOW,
+        WeightedVolatilityLevel.LOW,
+        WeightedVolatilityLevel.NORMAL,
+    ):
+        tags.append(TAG_MEAN_REVERSION_ENVIRONMENT)
+    if (
+        market_quality in (WeightedMarketQuality.UNSTABLE, WeightedMarketQuality.UNKNOWN)
+        or volatility_level == WeightedVolatilityLevel.EXTREME
+        or liquidity_level == WeightedLiquidityLevel.POOR
+        or event_risk == WeightedEventRiskLevel.BLOCKED
+        or session_phase == WeightedSessionPhase.OUTSIDE_SESSION
+    ):
+        tags.append(TAG_AVOID_TRADING)
+    return tuple(dict.fromkeys(tags or (TAG_AVOID_TRADING,)))
+
+
+def _regime_fit_multipliers(tags: tuple[str, ...]) -> dict[str, float]:
+    if TAG_AVOID_TRADING in tags:
+        return _avoid_regime_fit_multipliers()
+    multipliers = {
+        WeightedStrategyFamily.BREAKOUT.value: 1.0,
+        WeightedStrategyFamily.TREND.value: 1.0,
+        WeightedStrategyFamily.MEAN_REVERSION.value: 1.0,
+        WeightedStrategyFamily.REVERSAL.value: 1.0,
+    }
+    if TAG_TRENDING_UP in tags or TAG_TRENDING_DOWN in tags:
+        multipliers[WeightedStrategyFamily.TREND.value] *= 1.15
+        multipliers[WeightedStrategyFamily.BREAKOUT.value] *= 1.08
+        multipliers[WeightedStrategyFamily.MEAN_REVERSION.value] *= 0.82
+    if TAG_WEAK_TREND in tags:
+        multipliers[WeightedStrategyFamily.TREND.value] *= 0.95
+        multipliers[WeightedStrategyFamily.REVERSAL.value] *= 1.05
+    if TAG_RANGE_BOUND in tags:
+        multipliers[WeightedStrategyFamily.MEAN_REVERSION.value] *= 1.18
+        multipliers[WeightedStrategyFamily.REVERSAL.value] *= 1.10
+        multipliers[WeightedStrategyFamily.BREAKOUT.value] *= 0.90
+    if TAG_BREAKOUT_ENVIRONMENT in tags or TAG_OPENING_IMPULSE in tags:
+        multipliers[WeightedStrategyFamily.BREAKOUT.value] *= 1.18
+        multipliers[WeightedStrategyFamily.TREND.value] *= 1.08
+    if TAG_MEAN_REVERSION_ENVIRONMENT in tags:
+        multipliers[WeightedStrategyFamily.MEAN_REVERSION.value] *= 1.20
+        multipliers[WeightedStrategyFamily.REVERSAL.value] *= 1.08
+    if TAG_HIGH_VOLATILITY in tags:
+        multipliers[WeightedStrategyFamily.REVERSAL.value] *= 1.05
+        multipliers[WeightedStrategyFamily.MEAN_REVERSION.value] *= 0.90
+    if TAG_LOW_VOLATILITY in tags:
+        multipliers[WeightedStrategyFamily.BREAKOUT.value] *= 0.92
+        multipliers[WeightedStrategyFamily.MEAN_REVERSION.value] *= 1.05
+    return {family: round(max(0.0, min(1.5, value)), 6) for family, value in multipliers.items()}
+
+
+def _avoid_regime_fit_multipliers() -> dict[str, float]:
+    return {
+        WeightedStrategyFamily.BREAKOUT.value: 0.0,
+        WeightedStrategyFamily.TREND.value: 0.0,
+        WeightedStrategyFamily.MEAN_REVERSION.value: 0.0,
+        WeightedStrategyFamily.REVERSAL.value: 0.0,
+    }
+
+
 def _relative_volume(candles) -> float | None:
     if len(candles) < 5:
         return None
@@ -332,6 +478,17 @@ def _gap_percent(candles) -> float | None:
     if previous_close <= 0:
         return None
     return (first_session_candle.open - previous_close) / previous_close
+
+
+def _opening_impulse_percent(candles) -> float | None:
+    session = regular_session_candles(tuple(candles))
+    if len(session) < 3:
+        return None
+    opening = session[: min(15, len(session))]
+    first_open = opening[0].open
+    if first_open <= 0:
+        return None
+    return (opening[-1].close - first_open) / first_open
 
 
 def _confidence(inputs: dict[str, float | str | bool | None], market_quality: WeightedMarketQuality, candle_count: int) -> float:
@@ -396,6 +553,8 @@ def _exposure_score_from_condition(condition: WeightedMarketCondition) -> int:
             market_quality=WeightedMarketQuality(condition.market_quality),
             confidence=condition.confidence,
             condition_inputs={},
+            condition_tags=tuple(condition.condition_tags),
+            regime_fit_multipliers=dict(condition.regime_fit_multipliers),
             reason_codes=(),
         )
     )
@@ -427,6 +586,8 @@ def _with_reason(candidate: WeightedConditionCandidate, reason_code: str) -> Wei
         market_quality=candidate.market_quality,
         confidence=candidate.confidence,
         condition_inputs=candidate.condition_inputs,
+        condition_tags=candidate.condition_tags,
+        regime_fit_multipliers=candidate.regime_fit_multipliers,
         reason_codes=tuple(dict.fromkeys(candidate.reason_codes + (reason_code,))),
     )
 

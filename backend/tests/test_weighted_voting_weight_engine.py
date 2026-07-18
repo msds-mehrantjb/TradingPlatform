@@ -15,9 +15,13 @@ from backend.app.algorithms.weighted_voting.models import (
     WeightedWeightStateStatus,
 )
 from backend.app.algorithms.weighted_voting.weight_engine import (
+    WEIGHTED_VOTING_WEIGHT_UPDATE_RULES,
+    append_weight_history,
     apply_weight_controls,
     create_unseeded_equal_weight_state,
+    rollback_weight_state,
     update_performance_weight_state,
+    weight_engine_status,
 )
 
 
@@ -110,6 +114,18 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
         self.assertTrue(all(weight == 0.125 for weight in state.strategy_weights.values()))
         self.assertAlmostEqual(sum(state.strategy_weights.values()), 1.0, delta=0.0000001)
 
+    def test_weight_engine_status_exposes_owned_rules_and_bounds(self) -> None:
+        status = weight_engine_status()
+
+        self.assertEqual(status.algorithm_id, "weighted_voting")
+        self.assertEqual(status.baseline_weights, {strategy_id: 0.125 for strategy_id in FAMILY_BY_STRATEGY})
+        self.assertEqual(status.minimum_weight, 0.02)
+        self.assertEqual(status.maximum_weight, 0.25)
+        self.assertEqual(status.maximum_daily_weight_change, 0.025)
+        self.assertEqual(status.update_rules, WEIGHTED_VOTING_WEIGHT_UPDATE_RULES)
+        self.assertIn("use_only_weighted_voting_attributed_strategy_outcomes", status.update_rules)
+        self.assertIn("voting_ensemble", status.forbidden_inputs)
+
     def test_same_session_update_preserves_frozen_active_weights(self) -> None:
         state = create_unseeded_equal_weight_state(timestamp=TS)
         seeded = update_performance_weight_state(
@@ -172,6 +188,59 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
         self.assertEqual(failed.state_status, WeightedWeightStateStatus.VALIDATION_FAILED.value)
         self.assertEqual(failed.strategy_weights, state.strategy_weights)
         self.assertIn("weighted_voting.weights.validation_failed", failed.reason_codes)
+
+    def test_foreign_algorithm_outcomes_cannot_update_weights(self) -> None:
+        state = create_unseeded_equal_weight_state(timestamp=TS)
+        foreign = outcome("S1", 0, 0.05).model_copy(update={"algorithm_id": "voting_ensemble"})
+
+        failed = update_performance_weight_state(
+            state,
+            (foreign,),
+            update_timestamp=TS,
+            session_date="2026-01-09",
+        )
+
+        self.assertEqual(failed.state_status, WeightedWeightStateStatus.VALIDATION_FAILED.value)
+        self.assertEqual(failed.strategy_weights, state.strategy_weights)
+        self.assertIn("weighted_voting.weights.validation_failed", failed.reason_codes)
+
+    def test_new_catalog_strategy_missing_from_previous_state_is_initialized(self) -> None:
+        state = create_unseeded_equal_weight_state(timestamp=TS)
+        legacy_weights = {strategy_id: 1.0 / 7.0 for strategy_id in FAMILY_BY_STRATEGY if strategy_id != "S8"}
+        legacy = state.model_copy(update={"strategy_weights": legacy_weights})
+
+        updated = update_performance_weight_state(
+            legacy,
+            performance_outcomes({"S1": [0.02] * 45}),
+            update_timestamp=TS,
+            session_date="2026-01-10",
+        )
+
+        self.assertIn("S8", updated.strategy_weights)
+        self.assertGreater(updated.strategy_weights["S8"], 0.0)
+        self.assertAlmostEqual(sum(updated.strategy_weights.values()), 1.0, delta=0.0000001)
+
+    def test_weight_history_and_rollback_are_weighted_voting_owned(self) -> None:
+        state = create_unseeded_equal_weight_state(timestamp=TS)
+        updated = update_performance_weight_state(
+            state,
+            performance_outcomes({"S1": [0.02] * 45, "S2": [-0.01] * 45}),
+            update_timestamp=TS,
+            session_date="2026-01-11",
+        )
+        history = append_weight_history(append_weight_history((), state), updated)
+
+        rolled_back = rollback_weight_state(
+            updated,
+            history,
+            target_weight_version=state.weight_version,
+            rollback_timestamp=TS + timedelta(days=1),
+        )
+
+        self.assertEqual(rolled_back.algorithm_id, "weighted_voting")
+        self.assertEqual(rolled_back.weight_version, state.weight_version)
+        self.assertEqual(rolled_back.strategy_weights, state.strategy_weights)
+        self.assertIn("weighted_voting.weights.rollback_applied", rolled_back.reason_codes)
 
 
 FAMILY_BY_STRATEGY = {

@@ -30,15 +30,26 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
             "/api/weighted-voting/evaluate",
             "/api/weighted-voting/status",
             "/api/weighted-voting/config",
+            "/api/weighted-voting/decisions/{decision_id}",
+            "/api/weighted-voting/signals/{decision_id}",
             "/api/weighted-voting/weights/active",
             "/api/weighted-voting/weights/history",
+            "/api/weighted-voting/weights/recalculate",
+            "/api/weighted-voting/weights/rollback",
+            "/api/weighted-voting/performance",
+            "/api/weighted-voting/performance/strategies",
+            "/api/weighted-voting/performance/market-conditions",
             "/api/weighted-voting/backtests",
             "/api/weighted-voting/backtests/{run_id}",
             "/api/weighted-voting/backtests/{run_id}/trades",
             "/api/weighted-voting/backtests/{run_id}/decisions",
+            "/api/weighted-voting/backtests/{run_id}/equity",
             "/api/weighted-voting/backtests/{run_id}/strategy-performance",
             "/api/weighted-voting/daily-update/status",
             "/api/weighted-voting/daily-update/run",
+            "/api/weighted-voting/positions",
+            "/api/weighted-voting/trades",
+            "/api/weighted-voting/observability/{decision_id}",
         }
 
         self.assertTrue(expected.issubset(paths))
@@ -53,6 +64,12 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
 
         self.assertEqual(status.status_code, 200)
         self.assertEqual(status.json()["algorithmId"], "weighted_voting")
+        self.assertEqual(status.json()["apiInventory"]["apiNamespace"], "/api/weighted-voting")
+        self.assertEqual(len(status.json()["apiInventory"]["endpoints"]), 24)
+        self.assertEqual(status.json()["sharedServiceBoundary"]["algorithmId"], "weighted_voting")
+        self.assertIn("raw_candle_and_quote_service", {item["serviceId"] for item in status.json()["sharedServiceBoundary"]["allowedSharedServices"]})
+        self.assertIn("reverse_trade_direction", status.json()["sharedServiceBoundary"]["forbiddenSharedServiceActions"])
+        self.assertFalse(status.json()["sharedServiceBoundary"]["sharedServicesMayGenerateSignal"])
         self.assertEqual(status.json()["serviceBoundary"]["algorithm_id"], "weighted_voting")
         self.assertEqual(status.json()["serviceBoundary"]["api_namespace"], "/api/weighted-voting")
         self.assertEqual(status.json()["serviceBoundary"]["reason_code_namespace"], "weighted_voting.")
@@ -91,12 +108,47 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
 
         self.assertEqual(update.status_code, 200, update.text)
         self.assertEqual(evaluation.status_code, 200, evaluation.text)
+        decision_id = evaluation.json()["decision"]["decision_id"]
+        decision = self.client.get(f"/api/weighted-voting/decisions/{decision_id}")
+        signals = self.client.get(f"/api/weighted-voting/signals/{decision_id}")
+        observability = self.client.get(f"/api/weighted-voting/observability/{decision_id}")
         self.assertEqual(evaluation.json()["algorithmId"], "weighted_voting")
         self.assertIn("decision", evaluation.json())
         self.assertIn("globalOrderProposal", evaluation.json())
         self.assertIn("globalGateApplication", evaluation.json())
+        self.assertEqual(decision.status_code, 200)
+        self.assertEqual(decision.json()["decision"]["decision_id"], decision_id)
+        self.assertEqual(signals.status_code, 200)
+        self.assertEqual(len(signals.json()["signals"]), 8)
+        self.assertEqual(observability.status_code, 200)
+        self.assertEqual(observability.json()["observability"]["decisionId"], decision_id)
         self.assertEqual(evaluation.json()["globalGateApplication"]["proposedQuantity"], evaluation.json()["globalOrderProposal"]["quantity"])
         self.assertLessEqual(evaluation.json()["globalGateApplication"]["globallyAllowedQuantity"], evaluation.json()["globalGateApplication"]["proposedQuantity"])
+        self.assertTrue(all(key.startswith("weighted_voting.") for key in self.store.snapshots))
+
+    def test_weight_recalculate_rollback_and_read_only_inventory_endpoints_are_dedicated(self) -> None:
+        recalculate = self.client.post("/api/weighted-voting/weights/recalculate", json={"session_date": "2026-07-14"})
+        active = self.client.get("/api/weighted-voting/weights/active")
+        rollback = self.client.post(
+            "/api/weighted-voting/weights/rollback",
+            json={"target_weight_version": recalculate.json()["weightState"]["weight_version"]},
+        )
+        performance = self.client.get("/api/weighted-voting/performance")
+        strategy_performance = self.client.get("/api/weighted-voting/performance/strategies")
+        market_performance = self.client.get("/api/weighted-voting/performance/market-conditions")
+        positions = self.client.get("/api/weighted-voting/positions")
+        trades = self.client.get("/api/weighted-voting/trades")
+
+        self.assertEqual(recalculate.status_code, 200, recalculate.text)
+        self.assertEqual(recalculate.json()["algorithmId"], "weighted_voting")
+        self.assertEqual(active.status_code, 200)
+        self.assertEqual(rollback.status_code, 200, rollback.text)
+        self.assertEqual(rollback.json()["algorithmId"], "weighted_voting")
+        self.assertEqual(performance.status_code, 200)
+        self.assertEqual(strategy_performance.status_code, 200)
+        self.assertEqual(market_performance.status_code, 200)
+        self.assertEqual(positions.json()["positions"], [])
+        self.assertEqual(trades.json()["trades"], [])
         self.assertTrue(all(key.startswith("weighted_voting.") for key in self.store.snapshots))
 
     def test_backtest_endpoints_store_and_return_run_collections(self) -> None:
@@ -106,6 +158,7 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         run = self.client.get("/api/weighted-voting/backtests/api-run-1")
         trades = self.client.get("/api/weighted-voting/backtests/api-run-1/trades")
         decisions = self.client.get("/api/weighted-voting/backtests/api-run-1/decisions")
+        equity = self.client.get("/api/weighted-voting/backtests/api-run-1/equity")
         performance = self.client.get("/api/weighted-voting/backtests/api-run-1/strategy-performance")
         missing = self.client.get("/api/weighted-voting/backtests/missing-run")
 
@@ -115,6 +168,8 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertIn("trades", trades.json())
         self.assertEqual(decisions.status_code, 200)
         self.assertIn("decisions", decisions.json())
+        self.assertEqual(equity.status_code, 200)
+        self.assertIn("equity", equity.json())
         self.assertEqual(performance.status_code, 200)
         self.assertIn("strategyPerformance", performance.json())
         self.assertEqual(missing.status_code, 404)

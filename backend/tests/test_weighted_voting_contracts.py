@@ -13,13 +13,19 @@ from backend.app.algorithms.weighted_voting.identity import (
     WEIGHTED_VOTING_ALGORITHM_ID,
     WEIGHTED_VOTING_API_NAMESPACE,
     WEIGHTED_VOTING_API_VERSION,
+    WEIGHTED_VOTING_EXCLUDED_COMPONENTS,
+    WEIGHTED_VOTING_ALLOWED_SHARED_SERVICES,
+    WEIGHTED_VOTING_SHARED_SERVICE_ALLOWED_ACTIONS,
+    WEIGHTED_VOTING_SHARED_SERVICE_FORBIDDEN_ACTIONS,
     WEIGHTED_VOTING_CONFIGURATION_VERSION,
     WEIGHTED_VOTING_REASON_CODE_PREFIX,
     WEIGHTED_VOTING_SERVICE_VERSION,
     WEIGHTED_VOTING_STRATEGY_VERSION,
     is_weighted_voting_reason_code,
+    weighted_voting_exclusion_inventory,
     weighted_voting_reason_code,
     weighted_voting_service_boundary,
+    weighted_voting_shared_service_boundary,
 )
 from backend.app.algorithms.weighted_voting.models import (
     ALGORITHM_ID,
@@ -75,12 +81,63 @@ class WeightedVotingContractsTest(unittest.TestCase):
         self.assertEqual(WEIGHTED_VOTING_CONFIG_VERSION, WEIGHTED_VOTING_CONFIGURATION_VERSION)
         self.assertEqual(boundary.strategy_version, WEIGHTED_VOTING_STRATEGY_VERSION)
         self.assertEqual(boundary.active_weight_version, WEIGHTED_VOTING_ACTIVE_WEIGHT_VERSION)
+        self.assertEqual(boundary.algorithm_class, "rule_based_statistical_weighted_ensemble")
+        self.assertEqual(boundary.excluded_components, tuple(component_id for component_id, _ in WEIGHTED_VOTING_EXCLUDED_COMPONENTS))
+        self.assertEqual(boundary.allowed_shared_services, tuple(service_id for service_id, _ in WEIGHTED_VOTING_ALLOWED_SHARED_SERVICES))
         self.assertIn("WeightedVotingEvaluateRequest", boundary.input_models)
         self.assertIn("WeightedVotingDecision", boundary.output_models)
         self.assertEqual(boundary.reason_code_namespace, WEIGHTED_VOTING_REASON_CODE_PREFIX)
         self.assertEqual(weighted_voting_reason_code("api.ready"), "weighted_voting.api.ready")
         self.assertTrue(is_weighted_voting_reason_code("weighted_voting.api.ready"))
         self.assertFalse(is_weighted_voting_reason_code("voting_ensemble.api.ready"))
+
+    def test_explicitly_excluded_components_are_not_part_of_weighted_voting_inventory(self) -> None:
+        inventory = weighted_voting_exclusion_inventory()
+        excluded = {item["componentId"]: item["displayName"] for item in inventory["excludedComponents"]}
+
+        self.assertEqual(inventory["algorithmId"], "weighted_voting")
+        self.assertEqual(inventory["algorithmClass"], "rule_based_statistical_weighted_ensemble")
+        self.assertFalse(inventory["mlDriven"])
+        self.assertFalse(inventory["authoritativeFrontendLogicAllowed"])
+        self.assertFalse(inventory["sharedAlgorithmStateAllowed"])
+        self.assertEqual(tuple(excluded.items()), WEIGHTED_VOTING_EXCLUDED_COMPONENTS)
+        for required in (
+            "machine_learning_selector",
+            "meta_label_model",
+            "market_price_forecast_model",
+            "voting_ensemble_output",
+            "wca_output",
+            "regime_based_trading_output",
+            "meta_strategy_output",
+            "shared_strategy_weights",
+            "shared_confidence_thresholds",
+            "shared_algorithm_trade_state",
+            "shared_algorithm_backtest_results",
+            "shared_mutable_performance_state",
+            "frontend_calculated_authoritative_signal",
+            "frontend_calculated_authoritative_quantity",
+        ):
+            self.assertIn(required, excluded)
+
+    def test_shared_services_boundary_allows_only_platform_facts_limits_and_execution(self) -> None:
+        boundary = weighted_voting_shared_service_boundary()
+        services = {item["serviceId"]: item["weightedVotingAccess"] for item in boundary["allowedSharedServices"]}
+
+        self.assertEqual(boundary["algorithmId"], "weighted_voting")
+        self.assertEqual(tuple(services.items()), WEIGHTED_VOTING_ALLOWED_SHARED_SERVICES)
+        self.assertEqual(boundary["allowedSharedServiceActions"], WEIGHTED_VOTING_SHARED_SERVICE_ALLOWED_ACTIONS)
+        self.assertEqual(boundary["forbiddenSharedServiceActions"], WEIGHTED_VOTING_SHARED_SERVICE_FORBIDDEN_ACTIONS)
+        self.assertTrue(boundary["ownershipRequiredForPositionMutation"])
+        self.assertTrue(boundary["globalLimitsMayOnlyReduceRisk"])
+        self.assertFalse(boundary["sharedServicesMayGenerateSignal"])
+        self.assertFalse(boundary["sharedServicesMayMutateWeights"])
+        self.assertFalse(boundary["sharedServicesMayMutateLocalSettings"])
+        self.assertFalse(boundary["sharedServicesMayUseForeignPerformanceForWeightedVoting"])
+        self.assertEqual(services["raw_candle_and_quote_service"], "read_only")
+        self.assertEqual(services["alpaca_broker_connection"], "through_execution_adapter")
+        self.assertEqual(services["global_account_risk_gates"], "controlled_proposal_response")
+        self.assertEqual(services["database_connection"], "namespaced_records")
+        self.assertEqual(services["monitoring_dashboard"], "read_only_presentation")
 
     def test_invalid_strategy_probabilities_fail_validation(self) -> None:
         with self.assertRaises(ValidationError):
@@ -147,6 +204,20 @@ class WeightedVotingContractsTest(unittest.TestCase):
         self.assertEqual(left.deterministic_json(), right.deterministic_json())
         self.assertEqual(left.deterministic_hash(), right.deterministic_hash())
         self.assertEqual(left.deterministic_json(), json.dumps(left.model_dump(mode="json", exclude_none=True), sort_keys=True, separators=(",", ":")))
+
+    def test_market_snapshot_contract_forbids_foreign_algorithm_outputs(self) -> None:
+        candle = WeightedCandle(timestamp=TS, open=100.0, high=100.2, low=99.9, close=100.1, volume=100000)
+        with self.assertRaises(ValidationError):
+            WeightedMarketSnapshot(
+                symbol="SPY",
+                data_timestamp=TS,
+                one_minute_candles=(candle,),
+                bid=100.0,
+                ask=100.02,
+                spread=0.02,
+                votingEnsemble={"decision": "Sell"},
+                explanation="Foreign algorithm outputs are not part of the Weighted Voting market contract.",
+            )
 
     def test_all_canonical_models_include_version_fields(self) -> None:
         canonical_models = [

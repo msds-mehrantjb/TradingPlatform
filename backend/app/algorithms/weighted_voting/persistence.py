@@ -15,28 +15,55 @@ from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ALGO
 from backend.app.algorithms.weighted_voting.models import WeightedEffectiveSettings
 
 
-WEIGHTED_VOTING_PERSISTENCE_VERSION = "weighted_voting_persistence_v3"
+WEIGHTED_VOTING_PERSISTENCE_VERSION = "weighted_voting_persistence_v4"
 WEIGHTED_VOTING_SETTINGS_KEY = "weighted_voting.settings.effective"
 WEIGHTED_VOTING_STORAGE_ROOT = Path("data") / "algorithms" / "weighted_voting"
-WEIGHTED_VOTING_ARTIFACT_CATEGORIES = frozenset(
-    {
-        "configurations",
-        "settings",
-        "active_weights",
-        "historical_weights",
-        "strategy_outcomes",
-        "strategy_statistics",
-        "decisions",
-        "order_proposals",
-        "gate_results",
-        "positions",
-        "trades",
-        "backtest_runs",
-        "walk_forward_folds",
-        "equity_curves",
-        "daily_update_status",
-        "snapshots",
-    }
+WEIGHTED_VOTING_REQUIRED_COLLECTIONS = (
+    "configurations",
+    "dynamic_settings",
+    "market_snapshots",
+    "strategy_signals",
+    "active_weights",
+    "weight_history",
+    "strategy_outcomes",
+    "strategy_statistics",
+    "market_condition_statistics",
+    "decisions",
+    "local_gate_results",
+    "sizing_results",
+    "order_proposals",
+    "global_gate_applications",
+    "orders",
+    "fills",
+    "positions",
+    "trades",
+    "performance",
+    "backtest_runs",
+    "walk_forward_folds",
+    "equity_curves",
+    "daily_updates",
+    "observability",
+    "migrations",
+)
+WEIGHTED_VOTING_COLLECTION_ALIASES = {
+    "settings": "dynamic_settings",
+    "historical_weights": "weight_history",
+    "gate_results": "local_gate_results",
+    "daily_update_status": "daily_updates",
+    "snapshots": "observability",
+}
+WEIGHTED_VOTING_ARTIFACT_CATEGORIES = frozenset((*WEIGHTED_VOTING_REQUIRED_COLLECTIONS, *WEIGHTED_VOTING_COLLECTION_ALIASES))
+WEIGHTED_VOTING_REQUIRED_RECORD_FIELDS = (
+    "algorithm_id",
+    "record_id",
+    "created_at",
+    "data_timestamp",
+    "configuration_version",
+    "settings_version",
+    "strategy_version",
+    "weight_version",
+    "data_hash",
+    "configuration_hash",
 )
 
 
@@ -51,13 +78,19 @@ class WeightedVotingStateStore(Protocol):
 @dataclass(frozen=True)
 class WeightedVotingArtifactMetadata:
     artifact_id: str
+    record_id: str
     category: str
     run_id: str
     algorithm_id: str
     algorithm_version: str
     data_hash: str
     config_hash: str
+    configuration_hash: str
+    configuration_version: str
+    settings_version: str
+    strategy_version: str
     weight_version: str
+    data_timestamp: datetime
     created_at: datetime
     payload_hash: str
 
@@ -77,13 +110,15 @@ class WeightedVotingFilesystemStateStore:
         self.algorithm_version = algorithm_version
 
     def read_snapshot(self, key: str) -> dict:
-        envelope = self.read_artifact("snapshots", key)
+        category, artifact_id = snapshot_collection_for_key(key)
+        envelope = self.read_artifact(category, artifact_id)
         return dict(envelope["payload"])
 
     def write_snapshot(self, key: str, snapshot: dict) -> None:
+        category, artifact_id = snapshot_collection_for_key(key)
         self.write_artifact(
-            "snapshots",
-            key,
+            category,
+            artifact_id,
             snapshot,
             run_id=_value(snapshot, "run_id", key),
             data_hash=_value(snapshot, "data_hash", _hash_payload(snapshot)),
@@ -107,23 +142,43 @@ class WeightedVotingFilesystemStateStore:
         self._validate_category(category)
         payload_json = _json_ready(payload)
         payload_hash = _hash_payload(payload_json)
+        canonical_category = canonical_weighted_voting_collection(category)
+        created = created_at or datetime.now(timezone.utc)
+        data_timestamp = _datetime_value(payload_json, "data_timestamp", _datetime_value(payload_json, "dataTimestamp", created))
+        configuration_hash = _value(payload_json, "configuration_hash", _value(payload_json, "configurationHash", config_hash))
         metadata = WeightedVotingArtifactMetadata(
             artifact_id=artifact_id,
-            category=category,
+            record_id=artifact_id,
+            category=canonical_category,
             run_id=run_id,
             algorithm_id=WEIGHTED_VOTING_ALGORITHM_ID,
             algorithm_version=self.algorithm_version,
             data_hash=data_hash,
             config_hash=config_hash,
+            configuration_hash=configuration_hash,
+            configuration_version=_value(payload_json, "configuration_version", _value(payload_json, "configurationVersion", "")),
+            settings_version=_value(payload_json, "settings_version", _value(payload_json, "settingsVersion", "")),
+            strategy_version=_value(payload_json, "strategy_version", _value(payload_json, "strategyVersion", "")),
             weight_version=weight_version,
-            created_at=created_at or datetime.now(timezone.utc),
+            data_timestamp=data_timestamp,
+            created_at=created,
             payload_hash=payload_hash,
         )
         envelope = {
+            "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+            "record_id": artifact_id,
+            "created_at": metadata.created_at.isoformat(),
+            "data_timestamp": metadata.data_timestamp.isoformat(),
+            "configuration_version": metadata.configuration_version,
+            "settings_version": metadata.settings_version,
+            "strategy_version": metadata.strategy_version,
+            "weight_version": metadata.weight_version,
+            "data_hash": metadata.data_hash,
+            "configuration_hash": metadata.configuration_hash,
             "metadata": _json_ready(metadata.__dict__),
             "payload": payload_json,
         }
-        path = self._artifact_path(category, artifact_id)
+        path = self._artifact_path(canonical_category, artifact_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(envelope, sort_keys=True, separators=(",", ":"), indent=2), encoding="utf-8")
         return metadata
@@ -138,6 +193,11 @@ class WeightedVotingFilesystemStateStore:
         payload = envelope.get("payload", {})
         if metadata.get("algorithm_id") != WEIGHTED_VOTING_ALGORITHM_ID:
             raise ValueError("artifact does not belong to Weighted Voting")
+        if envelope.get("algorithm_id", WEIGHTED_VOTING_ALGORITHM_ID) != WEIGHTED_VOTING_ALGORITHM_ID:
+            raise ValueError("artifact envelope does not belong to Weighted Voting")
+        missing = [field for field in WEIGHTED_VOTING_REQUIRED_RECORD_FIELDS if field not in envelope]
+        if missing:
+            raise ValueError(f"Weighted Voting artifact missing required record fields: {missing}")
         if metadata.get("payload_hash") != _hash_payload(payload):
             raise ValueError("Weighted Voting artifact payload hash mismatch")
         return envelope
@@ -146,7 +206,7 @@ class WeightedVotingFilesystemStateStore:
         return self._artifact_path(category, artifact_id)
 
     def _artifact_path(self, category: str, artifact_id: str) -> Path:
-        safe_category = self._safe_component(category)
+        safe_category = self._safe_component(canonical_weighted_voting_collection(category))
         safe_id = self._safe_component(artifact_id)
         root = self.root.resolve()
         path = (root / safe_category / f"{safe_id}.json").resolve()
@@ -160,7 +220,7 @@ class WeightedVotingFilesystemStateStore:
 
     @staticmethod
     def _validate_category(category: str) -> None:
-        if category not in WEIGHTED_VOTING_ARTIFACT_CATEGORIES:
+        if category not in WEIGHTED_VOTING_ARTIFACT_CATEGORIES and canonical_weighted_voting_collection(category) not in WEIGHTED_VOTING_REQUIRED_COLLECTIONS:
             raise ValueError(f"unsupported Weighted Voting artifact category: {category}")
 
     @staticmethod
@@ -195,6 +255,60 @@ def persist_authoritative_artifact(
     )
 
 
+def canonical_weighted_voting_collection(category: str) -> str:
+    return WEIGHTED_VOTING_COLLECTION_ALIASES.get(category, category)
+
+
+def snapshot_collection_for_key(key: str) -> tuple[str, str]:
+    if key == WEIGHTED_VOTING_SETTINGS_KEY or key.startswith("weighted_voting.settings."):
+        return "dynamic_settings", key
+    if key.startswith("weighted_voting.market_snapshots."):
+        return "market_snapshots", key
+    if key.startswith("weighted_voting.strategy_signals."):
+        return "strategy_signals", key
+    if key == "weighted_voting.weights.active":
+        return "active_weights", key
+    if key.startswith("weighted_voting.weights.history") or key.startswith("weighted_voting.weights.published_for_session.") or key.startswith("weighted_voting.weight_history."):
+        return "weight_history", key
+    if key.startswith("weighted_voting.outcomes.") or key.startswith("weighted_voting.strategy_outcomes."):
+        return "strategy_outcomes", key
+    if key.startswith("weighted_voting.statistics.") or key.startswith("weighted_voting.strategy_statistics."):
+        return "strategy_statistics", key
+    if key.startswith("weighted_voting.market_condition_statistics."):
+        return "market_condition_statistics", key
+    if key.startswith("weighted_voting.decisions."):
+        return "decisions", key
+    if key.startswith("weighted_voting.local_gate_results.") or key.startswith("weighted_voting.gate_results."):
+        return "local_gate_results", key
+    if key.startswith("weighted_voting.sizing_results."):
+        return "sizing_results", key
+    if key.startswith("weighted_voting.order_proposals."):
+        return "order_proposals", key
+    if key.startswith("weighted_voting.global_gate_applications."):
+        return "global_gate_applications", key
+    if key.startswith("weighted_voting.execution_gateway.command.") or key.startswith("weighted_voting.execution_gateway.submission.") or key.startswith("weighted_voting.execution_gateway.rejection.") or key.startswith("weighted_voting.position_trade_state.order."):
+        return "orders", key
+    if key.startswith("weighted_voting.execution_gateway.fill."):
+        return "fills", key
+    if key.startswith("weighted_voting.execution_gateway.position.") or key.startswith("weighted_voting.position_trade_state.position."):
+        return "positions", key
+    if key.startswith("weighted_voting.trades."):
+        return "trades", key
+    if key.startswith("weighted_voting.performance_tracker.") or key.startswith("weighted_voting.performance."):
+        return "performance", key
+    if key.startswith("weighted_voting.backtests."):
+        return "backtest_runs", key
+    if key.startswith("weighted_voting.walk_forward."):
+        return "walk_forward_folds", key
+    if key.startswith("weighted_voting.equity_curves."):
+        return "equity_curves", key
+    if key.startswith("weighted_voting.daily_update.") or key.startswith("weighted_voting.scheduler.daily_update.") or key.startswith("weighted_voting.scheduler.status.") or key.startswith("weighted_voting.scheduler.audit."):
+        return "daily_updates", key
+    if key.startswith("weighted_voting.migration."):
+        return "migrations", key
+    return "observability", key
+
+
 def persist_effective_settings(
     store: WeightedVotingStateStore,
     settings: WeightedEffectiveSettings,
@@ -215,6 +329,15 @@ def load_effective_settings(
 def _value(payload: dict, key: str, default: str) -> str:
     value = payload.get(key, default)
     return "" if value is None else str(value)
+
+
+def _datetime_value(payload: dict, key: str, default: datetime) -> datetime:
+    value = payload.get(key)
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return default
 
 
 def _hash_payload(payload: dict) -> str:

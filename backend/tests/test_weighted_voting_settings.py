@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pydantic import ValidationError
 
+from backend.app.algorithms.weighted_voting.config import (
+    WEIGHTED_VOTING_BASELINE_CONFIGURATION_KEY,
+    WEIGHTED_VOTING_CONFIGURATION_NAMESPACE,
+    WeightedVotingConfig,
+)
 from backend.app.algorithms.weighted_voting.dynamic_settings import (
     DynamicSettingsResolver,
+    WEIGHTED_VOTING_DYNAMIC_PROFILE_VERSION,
+    WEIGHTED_VOTING_DYNAMIC_SETTINGS_TTL_SECONDS,
     default_dynamic_envelope,
     default_hard_limits,
     default_weighted_settings,
@@ -34,6 +41,43 @@ TS = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
 
 
 class WeightedVotingSettingsTest(unittest.TestCase):
+    def test_baseline_configuration_is_versioned_and_owned_by_weighted_voting(self) -> None:
+        config = WeightedVotingConfig()
+        baseline = config.baseline_configuration()
+
+        self.assertEqual(baseline["configurationNamespace"], WEIGHTED_VOTING_CONFIGURATION_NAMESPACE)
+        self.assertEqual(baseline["configurationKey"], WEIGHTED_VOTING_BASELINE_CONFIGURATION_KEY)
+        self.assertEqual(baseline["configVersion"], config.config_version)
+        self.assertEqual(len(baseline["strategyEnablement"]), 8)
+        self.assertEqual(set(baseline["strategyEnablement"]), set(baseline["strategyBaselineWeights"]))
+        self.assertAlmostEqual(sum(baseline["strategyBaselineWeights"].values()), 1.0)
+        self.assertEqual(baseline["decisionThresholds"]["minimumWinningScore"], config.minimum_score)
+        self.assertEqual(baseline["decisionThresholds"]["minimumSignalEdge"], config.minimum_edge)
+        self.assertEqual(baseline["dataFreshnessLimits"]["marketDataSeconds"], config.data_freshness_limit_seconds)
+        self.assertEqual(baseline["localGateLimits"]["spreadLimitPercent"], config.local_max_spread_percent)
+        self.assertEqual(baseline["transactionCostAssumptions"]["entrySlippagePerShare"], config.entry_slippage_per_share)
+        self.assertEqual(baseline["riskBudget"]["riskPerTradeBaselinePercent"], config.risk_per_trade_baseline_percent)
+        self.assertEqual(baseline["riskBudget"]["dailyRiskBaselinePercent"], config.daily_risk_baseline_percent)
+        self.assertEqual(baseline["positionLimits"]["maximumPositionPercent"], config.maximum_position_percent)
+        self.assertEqual(baseline["tradeLimits"]["maximumTrades"], config.maximum_weighted_daily_trades)
+        self.assertEqual(baseline["stopRules"]["atrStopMultiplier"], config.atr_stop_multiplier)
+        self.assertEqual(baseline["targetRules"]["targetR"], config.target_r)
+        self.assertEqual(baseline["exitRules"]["timeStopMinutes"], config.time_stop_minutes)
+        self.assertEqual(baseline["backtestSettings"]["startingCash"], config.backtest_starting_cash)
+        self.assertEqual(baseline["weightUpdateSettings"]["maximumDailyWeightChange"], config.maximum_daily_weight_change)
+        self.assertEqual(baseline["marketConditionThresholds"]["trendStrongSlope"], config.market_condition_trend_strong_slope)
+        self.assertEqual(baseline["configurationHash"], config.configuration_hash)
+        self.assertIn("weighted_voting.config.baseline_owned", baseline["reasonCodes"])
+
+    def test_baseline_configuration_hash_changes_with_baseline_policy(self) -> None:
+        config = WeightedVotingConfig()
+        disabled_s1 = dict(config.strategy_enablement)
+        disabled_s1["S1"] = False
+
+        updated = WeightedVotingConfig(strategy_enablement=disabled_s1)
+
+        self.assertNotEqual(config.configuration_hash, updated.configuration_hash)
+
     def test_defaults_remain_available_and_visible_in_effective_settings(self) -> None:
         defaults = default_weighted_settings(timestamp=TS)
         effective = resolve_effective_settings(default_settings=defaults, timestamp=TS)
@@ -43,6 +87,93 @@ class WeightedVotingSettingsTest(unittest.TestCase):
         self.assertEqual(effective.minimum_score, defaults.minimum_score)
         self.assertEqual(effective.target_r, defaults.target_r)
         self.assertIn("weighted_voting.settings.defaults_visible", effective.reason_codes)
+
+    def test_dynamic_settings_begin_from_weighted_voting_baseline(self) -> None:
+        disabled = dict(WeightedVotingConfig().strategy_enablement)
+        disabled["S1"] = False
+        config = WeightedVotingConfig(
+            risk_per_trade_baseline_percent=0.75,
+            order_allocation_percent=12.5,
+            maximum_weighted_daily_trades=7,
+            entry_slippage_per_share=0.02,
+            strategy_enablement=disabled,
+        )
+
+        defaults = default_weighted_settings(timestamp=TS, baseline_config=config)
+        effective = resolve_effective_settings(default_settings=defaults, baseline_config=config, timestamp=TS)
+
+        self.assertEqual(defaults.base_risk_per_trade_percent, config.risk_per_trade_baseline_percent)
+        self.assertEqual(defaults.order_allocation_percent, config.order_allocation_percent)
+        self.assertEqual(defaults.maximum_trades, config.maximum_weighted_daily_trades)
+        self.assertEqual(defaults.slippage_allowance_per_share, config.entry_slippage_per_share)
+        self.assertFalse(defaults.strategy_eligibility["S1"])
+        self.assertEqual(effective.baseline_configuration_version, config.config_version)
+        self.assertEqual(effective.dynamic_profile_version, WEIGHTED_VOTING_DYNAMIC_PROFILE_VERSION)
+        self.assertEqual(effective.hard_limit_version, effective.hard_limits.limits_version)
+        self.assertEqual(effective.expiration_timestamp, TS + timedelta(seconds=WEIGHTED_VOTING_DYNAMIC_SETTINGS_TTL_SECONDS))
+        self.assertEqual(effective.strategy_eligibility["S1"], defaults.strategy_eligibility["S1"])
+
+    def test_dynamic_settings_adjust_only_allowed_local_fields_and_strategy_maps(self) -> None:
+        config = WeightedVotingConfig()
+        defaults = default_weighted_settings(timestamp=TS, baseline_config=config)
+        envelope = WeightedDynamicEnvelope(
+            settings_timestamp=TS,
+            enabled=True,
+            base_risk_per_trade_percent_delta=1.0,
+            order_allocation_percent_delta=20.0,
+            maximum_position_percent_delta=10.0,
+            maximum_trades_delta=5,
+            minimum_score_delta=0.2,
+            minimum_edge_delta=0.1,
+            atr_stop_multiplier_delta=1.0,
+            target_r_delta=1.0,
+            maximum_participation_rate_delta=0.02,
+            slippage_allowance_per_share_delta=0.02,
+            cooldown_seconds_delta=120,
+            strategy_risk_multiplier_delta=0.5,
+        )
+
+        effective = resolve_effective_settings(
+            default_settings=defaults,
+            dynamic_envelope=envelope,
+            hard_limits=default_hard_limits(timestamp=TS),
+            dynamic_values={
+                "base_risk_per_trade_percent": 1.2,
+                "order_allocation_percent": 20.0,
+                "maximum_position_percent": 15.0,
+                "maximum_trades": 12,
+                "minimum_score": 0.7,
+                "minimum_edge": 0.2,
+                "atr_stop_multiplier": 2.0,
+                "target_r": 2.5,
+                "maximum_participation_rate": 0.02,
+                "slippage_allowance_per_share": 0.03,
+                "cooldown_seconds": 420,
+                "strategy_eligibility": {"S1": False},
+                "strategy_risk_multipliers": {"S2": 1.4},
+            },
+            baseline_config=config,
+            timestamp=TS,
+            source_evidence=("weighted_voting.market_condition.clean",),
+            market_condition_input={"market_quality": "clean"},
+        )
+
+        self.assertEqual(effective.base_risk_per_trade_percent, 1.2)
+        self.assertEqual(effective.maximum_trades, 12)
+        self.assertEqual(effective.slippage_allowance_per_share, 0.03)
+        self.assertEqual(effective.cooldown_seconds, 420)
+        self.assertFalse(effective.strategy_eligibility["S1"])
+        self.assertEqual(effective.strategy_risk_multipliers["S2"], 1.4)
+        self.assertEqual(effective.source_evidence, ("weighted_voting.market_condition.clean",))
+        self.assertEqual(effective.market_condition_input, {"market_quality": "clean"})
+        self.assertTrue(effective.configuration_hash)
+
+    def test_dynamic_settings_reject_foreign_algorithm_payloads(self) -> None:
+        with self.assertRaises(ValueError):
+            resolve_effective_settings(
+                dynamic_values={"algorithm_id": "voting_ensemble", "base_risk_per_trade_percent": 1.0},
+                timestamp=TS,
+            )
 
     def test_dynamic_settings_are_clamped_by_envelope_and_hard_limits(self) -> None:
         defaults = default_weighted_settings(timestamp=TS)

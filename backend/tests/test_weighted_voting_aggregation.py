@@ -57,6 +57,12 @@ class WeightedVotingAggregationTest(unittest.TestCase):
         self.assertEqual(decision.vote_scores.second_best_score, decision.vote_scores.normalized_sell_score)
         self.assertEqual(decision.vote_scores.active_strategy_count, 8)
         self.assertEqual(decision.vote_scores.directional_strategy_count, 8)
+        self.assertEqual(decision.vote_scores.total_active_weight, decision.vote_scores.active_weight)
+        self.assertEqual(decision.vote_scores.total_directional_weight, 1.0)
+        self.assertEqual(decision.vote_scores.final_provisional_signal, WeightedSide.BUY.value)
+        self.assertGreater(decision.vote_scores.strategy_agreement, 0.0)
+        self.assertGreater(decision.vote_scores.family_concentration, 0.0)
+        self.assertEqual(decision.vote_scores.effective_weight_coverage, 1.0)
         self.assertAlmostEqual(sum(family["weight"] for family in decision.vote_scores.family_contributions.values()), 1.0, delta=0.0000001)
         self.assertEqual(decision.deterministic_json(), aggregate_weighted_signals(strategy_signals(p_buy=0.70, p_sell=0.20, p_hold=0.10, side=WeightedSide.BUY), decision_timestamp=TS).deterministic_json())
 
@@ -91,6 +97,22 @@ class WeightedVotingAggregationTest(unittest.TestCase):
         self.assertEqual(decision.signal, WeightedSide.HOLD.value)
         self.assertEqual(decision.vote_scores.active_weight, 0.0)
         self.assertIn("weighted_voting.insufficient_active_weight", decision.reason_codes)
+
+    def test_aggregation_rejects_foreign_algorithm_inputs(self) -> None:
+        contaminated_signal = strategy_signals(
+            p_buy=0.70,
+            p_sell=0.20,
+            p_hold=0.10,
+            side=WeightedSide.BUY,
+            reason_code="voting_ensemble.family_score",
+        )
+        with self.assertRaises(ValueError):
+            aggregate_weighted_signals(contaminated_signal, decision_timestamp=TS)
+
+        foreign_algorithm_signal = strategy_signals(p_buy=0.70, p_sell=0.20, p_hold=0.10, side=WeightedSide.BUY)
+        foreign_algorithm_signal[0] = foreign_algorithm_signal[0].model_copy(update={"algorithm_id": "wca"})
+        with self.assertRaises(ValueError):
+            aggregate_weighted_signals(foreign_algorithm_signal, decision_timestamp=TS)
 
 
 FAMILY_BY_STRATEGY = {

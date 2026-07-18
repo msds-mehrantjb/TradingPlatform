@@ -11,11 +11,13 @@ from backend.app.algorithms.weighted_voting.rollout import (
     WEIGHTED_VOTING_DYNAMIC_REDUCTION_ENABLED,
     WEIGHTED_VOTING_SHADOW_MODE,
     WEIGHTED_VOTING_V2_ENABLED,
+    WEIGHTED_VOTING_ROLLOUT_STATES,
     ROLLOUT_STAGES,
     WeightedVotingRolloutFlags,
     WeightedVotingRolloutValidation,
     automatic_submission_allowed,
     evaluate_rollout_stage,
+    evaluate_weighted_voting_rollout_control,
     record_valid_rollout_state,
     rollback_weighted_voting_rollout,
     rollout_feature_flags,
@@ -39,6 +41,9 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertTrue(status["stages"][0]["enabled"])
         self.assertFalse(status["automatic_submission_allowed"])
         self.assertFalse(status["live_trading_allowed"])
+        self.assertEqual(tuple(status["allowed_states"]), WEIGHTED_VOTING_ROLLOUT_STATES)
+        self.assertEqual(status["control"]["algorithm_id"], "weighted_voting")
+        self.assertEqual(status["control"]["namespace"], "data/algorithms/weighted_voting/rollout/")
 
     def test_feature_flags_are_independent_and_default_auto_submit_is_disabled(self) -> None:
         flags = rollout_feature_flags(
@@ -57,6 +62,76 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertFalse(flags.dynamic_increase_enabled)
         self.assertFalse(flags.auto_submit_enabled)
         self.assertFalse(automatic_submission_allowed(flags=flags, validation=fully_validated_rollout()))
+
+    def test_rollout_control_declares_requested_lifecycle_states(self) -> None:
+        self.assertEqual(
+            WEIGHTED_VOTING_ROLLOUT_STATES,
+            (
+                "disabled",
+                "backtest_only",
+                "shadow",
+                "paper_trading",
+                "limited_paper",
+                "production_ready",
+                "paused",
+                "emergency_disabled",
+            ),
+        )
+        validated_flags = WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=True, auto_submit_enabled=True)
+        validated = fully_validated_rollout()
+
+        disabled = evaluate_weighted_voting_rollout_control("disabled", flags=validated_flags, validation=validated)
+        backtest_only = evaluate_weighted_voting_rollout_control("backtest_only", flags=validated_flags, validation=validated)
+        shadow = evaluate_weighted_voting_rollout_control("shadow", flags=validated_flags, validation=validated)
+        limited = evaluate_weighted_voting_rollout_control("limited_paper", flags=validated_flags, validation=validated)
+        paper = evaluate_weighted_voting_rollout_control("paper_trading", flags=validated_flags, validation=validated)
+        production_ready = evaluate_weighted_voting_rollout_control("production_ready", flags=validated_flags, validation=validated)
+        paused = evaluate_weighted_voting_rollout_control("paused", flags=validated_flags, validation=validated)
+        emergency = evaluate_weighted_voting_rollout_control("emergency_disabled", flags=validated_flags, validation=validated)
+
+        self.assertFalse(disabled.trading_allowed)
+        self.assertFalse(backtest_only.trading_allowed)
+        self.assertFalse(shadow.trading_allowed)
+        self.assertTrue(limited.paper_trading_allowed)
+        self.assertFalse(limited.automatic_submission_allowed)
+        self.assertTrue(paper.automatic_submission_allowed)
+        self.assertTrue(production_ready.production_ready)
+        self.assertFalse(paused.trading_allowed)
+        self.assertFalse(emergency.trading_allowed)
+
+    def test_disabling_other_algorithm_does_not_disable_weighted_voting(self) -> None:
+        flags = WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=True, auto_submit_enabled=True)
+        validation = fully_validated_rollout()
+
+        control = evaluate_weighted_voting_rollout_control(
+            "paper_trading",
+            disabled_algorithm_ids=("voting_ensemble", "wca", "regime"),
+            flags=flags,
+            validation=validation,
+        )
+        emergency = evaluate_weighted_voting_rollout_control(
+            "paper_trading",
+            account_wide_emergency_shutdown=True,
+            disabled_algorithm_ids=("voting_ensemble",),
+            flags=flags,
+            validation=validation,
+        )
+        self_disabled = evaluate_weighted_voting_rollout_control(
+            "paper_trading",
+            disabled_algorithm_ids=("weighted_voting",),
+            flags=flags,
+            validation=validation,
+        )
+
+        self.assertEqual(control.effective_state, "paper_trading")
+        self.assertTrue(control.trading_allowed)
+        self.assertEqual(control.ignored_external_algorithm_disables, ("regime", "voting_ensemble", "wca"))
+        self.assertIn("weighted_voting.rollout.external_algorithm_disable_ignored", control.reason_codes)
+        self.assertEqual(emergency.effective_state, "emergency_disabled")
+        self.assertFalse(emergency.trading_allowed)
+        self.assertIn("weighted_voting.rollout.account_wide_emergency_shutdown", emergency.reason_codes)
+        self.assertEqual(self_disabled.effective_state, "disabled")
+        self.assertFalse(self_disabled.trading_allowed)
 
     def test_stages_require_prior_acceptance_metrics_before_enablement(self) -> None:
         flags = WeightedVotingRolloutFlags(v2_enabled=True, shadow_mode=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=True, auto_submit_enabled=True)

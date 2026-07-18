@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
+import json
 from math import sqrt
 
 from backend.app.algorithms.weighted_voting.aggregation import aggregate_weighted_signals
@@ -61,6 +63,55 @@ from backend.app.algorithms.weighted_voting.weight_engine import create_unseeded
 
 
 WEIGHTED_VOTING_BACKTEST_ENGINE_VERSION = "weighted_voting_backtest_engine_v2"
+WEIGHTED_VOTING_BACKTEST_REQUIRED_STRUCTURE = (
+    "weighted_voting/backtest/__init__.py",
+    "weighted_voting/backtest/data_validation.py",
+    "weighted_voting/backtest/engine.py",
+    "weighted_voting/backtest/execution_simulator.py",
+    "weighted_voting/backtest/walk_forward.py",
+)
+WEIGHTED_VOTING_BACKTEST_OWNED_CAPABILITIES = (
+    "weighted_voting_data_validation",
+    "warm_up_handling",
+    "real_strategy_invocation",
+    "historical_weight_state_loading",
+    "point_in_time_market_snapshot",
+    "decision_replay",
+    "local_gate_replay",
+    "position_sizing",
+    "entry_simulation",
+    "stop_target_simulation",
+    "slippage",
+    "spread",
+    "fees_and_regulatory_costs",
+    "partial_fills",
+    "session_close",
+    "position_ownership",
+    "trade_recording",
+    "strategy_attribution",
+    "algorithm_metrics",
+    "strategy_metrics",
+    "equity_curve",
+    "drawdown_curve",
+    "walk_forward_folds",
+    "configuration_manifest",
+    "data_manifest",
+    "reproducibility_hashes",
+)
+WEIGHTED_VOTING_BACKTEST_PRODUCTION_CALLS = (
+    "create_unseeded_equal_weight_state",
+    "update_performance_weight_state",
+    "classify_market_condition",
+    "DynamicSettingsResolver.resolve",
+    "evaluate_signals",
+    "aggregate_weighted_signals",
+    "evaluate_local_decision_gates",
+    "calculate_weighted_voting_position_size",
+    "evaluate_entry_policy",
+    "simulate_entry_fill",
+    "open_exit_lifecycle",
+    "evaluate_exit_lifecycle",
+)
 
 
 @dataclass(frozen=True)
@@ -83,6 +134,56 @@ class WeightedBacktestEngineConfig:
     dynamic_envelope: WeightedDynamicEnvelope | None = None
     hard_limits: WeightedHardLimits | None = None
     initial_weight_state: WeightedWeightState | None = None
+
+
+@dataclass(frozen=True)
+class WeightedBacktestConfigurationManifest:
+    run_id: str
+    symbol: str
+    engine_version: str
+    config_version: str
+    strategy_catalog_version: str
+    account_equity: float
+    starting_cash: float
+    allow_short: bool
+    session_cutoff_eastern_minutes: int
+    force_close_eastern_minutes: int
+    decision_start_index: int
+    use_performance_weights: bool
+    use_dynamic_settings: bool
+    cost_model: dict[str, float]
+    initial_weight_version: str | None
+    calibration_outcome_count: int
+    source: str
+
+    def deterministic_json(self) -> str:
+        return json.dumps(
+            {
+                "runId": self.run_id,
+                "symbol": self.symbol,
+                "engineVersion": self.engine_version,
+                "configVersion": self.config_version,
+                "strategyCatalogVersion": self.strategy_catalog_version,
+                "accountEquity": self.account_equity,
+                "startingCash": self.starting_cash,
+                "allowShort": self.allow_short,
+                "sessionCutoffEasternMinutes": self.session_cutoff_eastern_minutes,
+                "forceCloseEasternMinutes": self.force_close_eastern_minutes,
+                "decisionStartIndex": self.decision_start_index,
+                "usePerformanceWeights": self.use_performance_weights,
+                "useDynamicSettings": self.use_dynamic_settings,
+                "costModel": self.cost_model,
+                "initialWeightVersion": self.initial_weight_version,
+                "calibrationOutcomeCount": self.calibration_outcome_count,
+                "source": self.source,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @property
+    def manifest_hash(self) -> str:
+        return hashlib.sha256(self.deterministic_json().encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -155,6 +256,7 @@ class WeightedBacktestAlgorithmResult:
     cost_ratio: float
     gate_rejection_counts: dict[str, int]
     equity_curve: tuple[tuple[datetime, float], ...]
+    drawdown_curve: tuple[tuple[datetime, float], ...]
     position_size_distribution: dict[str, float]
 
 
@@ -162,12 +264,14 @@ class WeightedBacktestAlgorithmResult:
 class WeightedBacktestResult:
     run: WeightedBacktestRun
     manifest: WeightedBacktestDataManifest
+    configuration_manifest: WeightedBacktestConfigurationManifest
     decisions: tuple[WeightedBacktestDecisionTrace, ...]
     trades: tuple[WeightedBacktestTrade, ...]
     strategy_results: dict[str, WeightedBacktestStrategyResult]
     algorithm_results: WeightedBacktestAlgorithmResult
     historical_outcomes: tuple[WeightedStrategyOutcome, ...]
     production_function_calls: tuple[str, ...]
+    reproducibility_hash: str
     reason_codes: tuple[str, ...]
     explanation: str
 
@@ -186,10 +290,14 @@ class _OpenBacktestPosition:
     adverse_excursion: float = 0.0
 
 
-def backtest_engine_status() -> dict[str, str]:
+def backtest_engine_status() -> dict[str, object]:
     return {
         "version": WEIGHTED_VOTING_BACKTEST_ENGINE_VERSION,
         "status": "implemented",
+        "requiredStructure": WEIGHTED_VOTING_BACKTEST_REQUIRED_STRUCTURE,
+        "ownedCapabilities": WEIGHTED_VOTING_BACKTEST_OWNED_CAPABILITIES,
+        "criticalRule": "call_same_weighted_voting_logic_used_in_paper_trading",
+        "productionCalls": WEIGHTED_VOTING_BACKTEST_PRODUCTION_CALLS,
         "explanation": "Weighted Voting backtests call the same production strategy, condition, weighting, aggregation, gate, settings, sizing, entry, and exit functions used by paper trading.",
     }
 
@@ -210,6 +318,7 @@ def run_weighted_voting_backtest(
         fill_policy="none",
     )
     manifest = validation.manifest
+    configuration_manifest = _configuration_manifest(config, created_at)
     if data_manifest_hash is not None and data_manifest_hash != manifest.manifest_hash:
         raise ValueError("supplied data manifest hash does not match immutable Weighted Voting manifest")
     if validation.blocks_run:
@@ -450,14 +559,49 @@ def run_weighted_voting_backtest(
     return WeightedBacktestResult(
         run=run,
         manifest=manifest,
+        configuration_manifest=configuration_manifest,
         decisions=tuple(decisions),
         trades=tuple(trades),
         strategy_results=strategy_results,
         algorithm_results=algorithm_results,
         historical_outcomes=tuple(outcomes),
         production_function_calls=tuple(production_calls),
-        reason_codes=("weighted_voting.backtest.production_parity", "weighted_voting.backtest.no_lookahead_next_candle_entry"),
+        reproducibility_hash=_reproducibility_hash(configuration_manifest, manifest, tuple(production_calls)),
+        reason_codes=(
+            "weighted_voting.backtest.production_parity",
+            "weighted_voting.backtest.no_lookahead_next_candle_entry",
+            "weighted_voting.backtest.configuration_manifest",
+            "weighted_voting.backtest.reproducibility_hash",
+        ),
         explanation="Backtest decisions use completed candles only and route through production Weighted Voting functions before simulating historical fills and exits.",
+    )
+
+
+def _configuration_manifest(config: WeightedBacktestEngineConfig, created_at: datetime) -> WeightedBacktestConfigurationManifest:
+    return WeightedBacktestConfigurationManifest(
+        run_id=config.run_id,
+        symbol=config.symbol,
+        engine_version=WEIGHTED_VOTING_BACKTEST_ENGINE_VERSION,
+        config_version=config.weighted_config.config_version,
+        strategy_catalog_version=WEIGHTED_VOTING_CATALOG_VERSION,
+        account_equity=config.account_equity,
+        starting_cash=config.starting_cash,
+        allow_short=config.allow_short,
+        session_cutoff_eastern_minutes=config.session_cutoff_eastern_minutes,
+        force_close_eastern_minutes=config.force_close_eastern_minutes,
+        decision_start_index=config.decision_start_index,
+        use_performance_weights=config.use_performance_weights,
+        use_dynamic_settings=config.use_dynamic_settings,
+        cost_model={
+            "entrySlippagePerShare": config.cost_model.entry_slippage_per_share,
+            "exitSlippagePerShare": config.cost_model.exit_slippage_per_share,
+            "feePerShare": config.cost_model.fee_per_share,
+            "regulatoryFeePerShare": config.cost_model.regulatory_fee_per_share,
+            "minimumFee": config.cost_model.minimum_fee,
+        },
+        initial_weight_version=config.initial_weight_state.weight_version if config.initial_weight_state is not None else None,
+        calibration_outcome_count=len(config.calibration_outcomes),
+        source=config.source,
     )
 
 
@@ -599,6 +743,7 @@ def _algorithm_results(
     turnover = sum(abs(trade.entry_price * trade.quantity) + abs(trade.exit_price * trade.quantity) for trade in trades) / config.account_equity
     total_costs = sum(trade.total_costs for trade in trades)
     gross_abs = sum(abs(trade.gross_pnl) for trade in trades)
+    drawdown_curve = _drawdown_curve(equity_curve, config.starting_cash)
     return WeightedBacktestAlgorithmResult(
         net_pnl=round(net_pnl, 10),
         return_percent=round(net_pnl / config.account_equity * 100.0, 10),
@@ -615,6 +760,7 @@ def _algorithm_results(
         cost_ratio=round(total_costs / gross_abs if gross_abs > 0 else 0.0, 10),
         gate_rejection_counts=dict(sorted(gate_rejections.items())),
         equity_curve=tuple(equity_curve),
+        drawdown_curve=drawdown_curve,
         position_size_distribution=_position_size_distribution(position_sizes),
     )
 
@@ -761,6 +907,15 @@ def _drawdown(equity_values: list[float], starting_cash: float) -> float:
     return drawdown
 
 
+def _drawdown_curve(equity_curve: list[tuple[datetime, float]], starting_cash: float) -> tuple[tuple[datetime, float], ...]:
+    peak = starting_cash
+    curve: list[tuple[datetime, float]] = []
+    for timestamp, value in equity_curve:
+        peak = max(peak, value)
+        curve.append((timestamp, round(max(0.0, peak - value), 10)))
+    return tuple(curve)
+
+
 def _sharpe(values: list[float]) -> float:
     if len(values) < 2:
         return 0.0
@@ -822,3 +977,17 @@ def _pearson(left: list[float], right: list[float]) -> float | None:
     right_denominator = sqrt(sum((value - right_mean) ** 2 for value in right_values))
     denominator = left_denominator * right_denominator
     return numerator / denominator if denominator > 0 else None
+
+
+def _reproducibility_hash(
+    configuration_manifest: WeightedBacktestConfigurationManifest,
+    data_manifest: WeightedBacktestDataManifest,
+    production_calls: tuple[str, ...],
+) -> str:
+    payload = {
+        "engineVersion": WEIGHTED_VOTING_BACKTEST_ENGINE_VERSION,
+        "configurationManifestHash": configuration_manifest.manifest_hash,
+        "dataManifestHash": data_manifest.manifest_hash,
+        "productionCalls": production_calls,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

@@ -12,10 +12,14 @@ from backend.app.algorithms.weighted_voting.dynamic_settings import resolve_effe
 from backend.app.algorithms.weighted_voting.persistence import (
     WEIGHTED_VOTING_ALGORITHM_ID,
     WEIGHTED_VOTING_ARTIFACT_CATEGORIES,
+    WEIGHTED_VOTING_REQUIRED_COLLECTIONS,
+    WEIGHTED_VOTING_REQUIRED_RECORD_FIELDS,
     WeightedVotingFilesystemStateStore,
+    canonical_weighted_voting_collection,
     load_effective_settings,
     persist_authoritative_artifact,
     persist_effective_settings,
+    snapshot_collection_for_key,
 )
 from backend.app.algorithms.weighted_voting.weight_engine import create_unseeded_equal_weight_state
 
@@ -68,21 +72,32 @@ class WeightedVotingPersistenceTest(unittest.TestCase):
     def test_all_weighted_voting_artifact_categories_are_isolated_and_metadata_rich(self) -> None:
         required_categories = {
             "configurations",
-            "settings",
+            "dynamic_settings",
+            "market_snapshots",
+            "strategy_signals",
             "active_weights",
-            "historical_weights",
+            "weight_history",
             "strategy_outcomes",
             "strategy_statistics",
+            "market_condition_statistics",
             "decisions",
+            "local_gate_results",
+            "sizing_results",
             "order_proposals",
-            "gate_results",
+            "global_gate_applications",
+            "orders",
+            "fills",
             "positions",
             "trades",
+            "performance",
             "backtest_runs",
             "walk_forward_folds",
             "equity_curves",
-            "daily_update_status",
+            "daily_updates",
+            "observability",
+            "migrations",
         }
+        self.assertEqual(set(WEIGHTED_VOTING_REQUIRED_COLLECTIONS), required_categories)
         self.assertTrue(required_categories.issubset(WEIGHTED_VOTING_ARTIFACT_CATEGORIES))
         with workspace_temp_dir() as temp_dir:
             store = WeightedVotingFilesystemStateStore(root=Path(temp_dir) / "data" / "algorithms" / "weighted_voting")
@@ -92,7 +107,16 @@ class WeightedVotingPersistenceTest(unittest.TestCase):
                     store,
                     category=category,
                     artifact_id=f"{category}-artifact",
-                    payload={"category": category, "run_id": "run-1", "weight_version": "weights-v1"},
+                    payload={
+                        "category": category,
+                        "run_id": "run-1",
+                        "weight_version": "weights-v1",
+                        "data_timestamp": TS,
+                        "configuration_version": "config-v1",
+                        "settings_version": "settings-v1",
+                        "strategy_version": "strategy-v1",
+                        "configuration_hash": "config-hash",
+                    },
                     run_id="run-1",
                     data_hash="data-hash",
                     config_hash="config-hash",
@@ -106,9 +130,70 @@ class WeightedVotingPersistenceTest(unittest.TestCase):
                 self.assertEqual(envelope["metadata"]["algorithm_version"], store.algorithm_version)
                 self.assertEqual(envelope["metadata"]["data_hash"], "data-hash")
                 self.assertEqual(envelope["metadata"]["config_hash"], "config-hash")
+                self.assertEqual(envelope["metadata"]["configuration_hash"], "config-hash")
+                self.assertEqual(envelope["metadata"]["record_id"], f"{category}-artifact")
+                self.assertEqual(envelope["metadata"]["data_timestamp"], TS.isoformat())
+                self.assertEqual(envelope["metadata"]["configuration_version"], "config-v1")
+                self.assertEqual(envelope["metadata"]["settings_version"], "settings-v1")
+                self.assertEqual(envelope["metadata"]["strategy_version"], "strategy-v1")
                 self.assertEqual(envelope["metadata"]["weight_version"], "weights-v1")
                 self.assertEqual(envelope["metadata"]["created_at"], TS.isoformat())
+                for field in WEIGHTED_VOTING_REQUIRED_RECORD_FIELDS:
+                    self.assertIn(field, envelope)
                 self.assertTrue(str(store.artifact_path(category, f"{category}-artifact")).startswith(str(store.root.resolve())))
+
+    def test_legacy_category_aliases_write_to_required_collections(self) -> None:
+        self.assertEqual(canonical_weighted_voting_collection("settings"), "dynamic_settings")
+        self.assertEqual(canonical_weighted_voting_collection("historical_weights"), "weight_history")
+        self.assertEqual(canonical_weighted_voting_collection("gate_results"), "local_gate_results")
+        self.assertEqual(canonical_weighted_voting_collection("daily_update_status"), "daily_updates")
+
+        with workspace_temp_dir() as temp_dir:
+            store = WeightedVotingFilesystemStateStore(root=Path(temp_dir) / "data" / "algorithms" / "weighted_voting")
+            store.write_artifact(
+                "historical_weights",
+                "weights-alias",
+                {"record_id": "weights-alias", "data_timestamp": TS, "configuration_hash": "config", "weight_version": "weights-v1"},
+                run_id="run",
+                data_hash="data",
+                config_hash="config",
+                weight_version="weights-v1",
+                created_at=TS,
+            )
+
+            self.assertTrue((store.root / "weight_history" / "weights-alias.json").is_file())
+            self.assertFalse((store.root / "historical_weights" / "weights-alias.json").exists())
+            self.assertEqual(store.read_artifact("historical_weights", "weights-alias")["metadata"]["category"], "weight_history")
+
+    def test_snapshot_keys_route_to_required_collections(self) -> None:
+        expected = {
+            "weighted_voting.settings.effective": "dynamic_settings",
+            "weighted_voting.decisions.decision-1": "decisions",
+            "weighted_voting.order_proposals.proposal-1": "order_proposals",
+            "weighted_voting.global_gate_applications.decision-1": "global_gate_applications",
+            "weighted_voting.execution_gateway.command.client-1": "orders",
+            "weighted_voting.execution_gateway.fill.fill-1": "fills",
+            "weighted_voting.execution_gateway.position.position-1": "positions",
+            "weighted_voting.performance_tracker.latest": "performance",
+            "weighted_voting.backtests.run-1": "backtest_runs",
+            "weighted_voting.daily_update.latest": "daily_updates",
+            "weighted_voting.migration.record": "migrations",
+        }
+        for key, category in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(snapshot_collection_for_key(key)[0], category)
+
+        with workspace_temp_dir() as temp_dir:
+            store = WeightedVotingFilesystemStateStore(root=Path(temp_dir) / "data" / "algorithms" / "weighted_voting")
+            store.write_snapshot(
+                "weighted_voting.global_gate_applications.decision-1",
+                {"record_id": "global-gate", "data_timestamp": TS, "configuration_hash": "config", "weight_version": "weights-v1"},
+            )
+
+            self.assertTrue((store.root / "global_gate_applications" / "weighted_voting.global_gate_applications.decision-1.json").is_file())
+            envelope = store.read_artifact("global_gate_applications", "weighted_voting.global_gate_applications.decision-1")
+            self.assertEqual(envelope["algorithm_id"], WEIGHTED_VOTING_ALGORITHM_ID)
+            self.assertEqual(envelope["record_id"], "weighted_voting.global_gate_applications.decision-1")
 
     def test_other_algorithms_cannot_write_weighted_voting_artifacts(self) -> None:
         with workspace_temp_dir() as temp_dir:

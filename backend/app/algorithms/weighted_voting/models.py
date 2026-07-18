@@ -163,15 +163,48 @@ class WeightedCandle(WeightedContractModel):
         return self
 
 
+class WeightedReferenceLevels(WeightedContractModel):
+    contract_version: str = "weighted_reference_levels_v1"
+    high: float | None = Field(default=None, gt=0)
+    low: float | None = Field(default=None, gt=0)
+    close: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_levels(self) -> WeightedReferenceLevels:
+        if self.high is not None and self.low is not None and self.high < self.low:
+            raise ValueError("reference high must be greater than or equal to low")
+        return self
+
+
+class WeightedSnapshotInputSet(WeightedContractModel):
+    contract_version: str = "weighted_snapshot_input_set_v1"
+    source: str = Field(min_length=1)
+    fields: tuple[str, ...] = ()
+    lookback: int | None = Field(default=None, ge=0)
+    values: tuple[float, ...] = ()
+    metadata: tuple[str, ...] = ()
+
+
 class WeightedMarketSnapshot(WeightedContractModel):
     contract_version: str = "weighted_market_snapshot_v1"
     algorithm_id: Literal["weighted_voting"] = ALGORITHM_ID
     symbol: str = Field(min_length=1)
+    decision_timestamp: datetime | None = None
     data_timestamp: datetime
     one_minute_candles: tuple[WeightedCandle, ...]
     five_minute_candles: tuple[WeightedCandle, ...] = ()
     bid: float | None = Field(default=None, gt=0)
     ask: float | None = Field(default=None, gt=0)
+    spread: float | None = Field(default=None, ge=0)
+    session_date: str | None = None
+    session_label: str = "unknown"
+    session_phase: WeightedSessionPhase = WeightedSessionPhase.UNKNOWN
+    opening_range_levels: WeightedReferenceLevels | None = None
+    previous_day_levels: WeightedReferenceLevels | None = None
+    vwap_inputs: WeightedSnapshotInputSet | None = None
+    volume_inputs: WeightedSnapshotInputSet | None = None
+    atr_inputs: WeightedSnapshotInputSet | None = None
+    data_freshness_seconds: float | None = Field(default=None, ge=0)
     data_manifest_hash: str | None = None
     explanation: str = Field(min_length=1)
 
@@ -179,6 +212,10 @@ class WeightedMarketSnapshot(WeightedContractModel):
     def validate_quote(self) -> WeightedMarketSnapshot:
         if self.bid is not None and self.ask is not None and self.ask < self.bid:
             raise ValueError("ask must be greater than or equal to bid")
+        if self.spread is not None and self.bid is not None and self.ask is not None:
+            quoted_spread = self.ask - self.bid
+            if abs(self.spread - quoted_spread) > 1e-9:
+                raise ValueError("spread must equal ask minus bid when bid and ask are supplied")
         return self
 
 
@@ -190,31 +227,65 @@ class WeightedStrategySignal(WeightedContractModel):
     strategy_version: str = Field(min_length=1)
     family: WeightedStrategyFamily
     signal: WeightedSide
+    direction: WeightedSide = WeightedSide.HOLD
     p_buy: float = Field(ge=0, le=1)
     p_sell: float = Field(ge=0, le=1)
     p_hold: float = Field(ge=0, le=1)
+    buy_probability: float = Field(default=0.0, ge=0, le=1)
+    sell_probability: float = Field(default=0.0, ge=0, le=1)
+    hold_probability: float = Field(default=1.0, ge=0, le=1)
+    confidence: float = Field(default=0.0, ge=0, le=1)
     directional_confidence: float = Field(default=0.0, ge=0, le=1)
     signal_strength: float = Field(default=0.0, ge=0)
     expected_raw_movement: float = 0.0
+    expected_return_before_costs: float = 0.0
     expected_return: float = 0.0
     expected_return_after_costs: float = 0.0
     strength: float = Field(ge=0)
+    base_weight: float = Field(default=0.0, ge=0, le=1)
+    active_weight: float = Field(default=0.0, ge=0, le=1)
     final_weight: float = Field(ge=0, le=1)
     eligible: bool
+    active: bool = False
     data_ready: bool
+    market_condition_fit: float = Field(default=1.0, ge=0, le=1.5)
     required_data_freshness_seconds: float = Field(default=300.0, gt=0)
     actual_data_freshness_seconds: float | None = Field(default=None, ge=0)
     data_quality_status: WeightedDataQualityStatus = WeightedDataQualityStatus.UNAVAILABLE
     invalidation_level: float | None = Field(default=None, gt=0)
     data_timestamp: datetime
     reason_codes: tuple[str, ...] = ()
+    feature_snapshot: dict[str, float | str | bool | None] = Field(default_factory=dict)
     explanation: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_standardized_aliases(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        values = dict(data)
+        signal = values.get("signal", WeightedSide.HOLD)
+        values.setdefault("direction", signal)
+        values.setdefault("buy_probability", values.get("p_buy", 0.0))
+        values.setdefault("sell_probability", values.get("p_sell", 0.0))
+        values.setdefault("hold_probability", values.get("p_hold", 1.0))
+        values.setdefault("confidence", values.get("directional_confidence", values.get("strength", 0.0)))
+        values.setdefault("expected_return_before_costs", values.get("expected_return", values.get("expected_raw_movement", 0.0)))
+        values.setdefault("base_weight", values.get("final_weight", 0.0))
+        values.setdefault("active_weight", values.get("final_weight", 0.0))
+        values.setdefault("active", bool(values.get("eligible", False) and values.get("data_ready", False) and values.get("final_weight", 0.0)))
+        return values
 
     @model_validator(mode="after")
     def validate_probabilities_sum_to_one(self) -> WeightedStrategySignal:
         total = self.p_buy + self.p_sell + self.p_hold
         if abs(total - 1.0) > PROBABILITY_SUM_TOLERANCE:
             raise ValueError("strategy probabilities must sum to one")
+        alias_total = self.buy_probability + self.sell_probability + self.hold_probability
+        if abs(alias_total - 1.0) > PROBABILITY_SUM_TOLERANCE:
+            raise ValueError("standardized strategy probabilities must sum to one")
+        if self.direction != self.signal:
+            raise ValueError("strategy signal direction must match signal")
         return self
 
     @model_validator(mode="after")
@@ -263,10 +334,16 @@ class WeightedPerformanceWeightMetric(WeightedContractModel):
     sample_size: int = Field(ge=0)
     net_expectancy_after_costs: float = 0.0
     profit_factor: float = Field(default=0.0, ge=0)
+    win_rate: float = Field(default=0.0, ge=0, le=1)
     average_win: float = Field(default=0.0, ge=0)
     average_loss: float = Field(default=0.0, ge=0)
     win_loss_ratio: float = Field(default=0.0, ge=0)
     maximum_drawdown: float = Field(default=0.0, ge=0)
+    drawdown_contribution: float = Field(default=0.0, ge=0)
+    confidence_calibration_score: float = Field(default=1.0, ge=0, le=1)
+    transaction_cost_adjustment: float = Field(default=1.0, ge=0, le=1)
+    recent_degradation: float = Field(default=0.0, ge=0)
+    market_condition_sample_size: int = Field(default=0, ge=0)
     outcome_stability: float = Field(default=0.0, ge=0, le=1)
     recent_performance: float = 0.0
     regime_specific_performance: float = 0.0
@@ -326,6 +403,9 @@ class WeightedMarketCondition(WeightedContractModel):
     trend_direction: WeightedTrendDirection
     volatility_level: WeightedVolatilityLevel
     range_condition: WeightedRangeCondition
+    condition_tags: tuple[str, ...] = ()
+    influence_scope: tuple[str, ...] = ()
+    regime_fit_multipliers: dict[str, float] = Field(default_factory=dict)
     session_label: str = Field(min_length=1)
     liquidity_level: WeightedLiquidityLevel = WeightedLiquidityLevel.UNKNOWN
     session_phase: WeightedSessionPhase = WeightedSessionPhase.UNKNOWN
@@ -368,6 +448,10 @@ class WeightedDefaultSettings(WeightedContractModel):
     trailing_stop_atr_multiplier: float = Field(default=1.0, ge=0)
     time_stop_minutes: int = Field(default=120, ge=0)
     session_cutoff_minutes: int = Field(default=15, ge=0)
+    slippage_allowance_per_share: float = Field(default=0.01, ge=0)
+    cooldown_seconds: int = Field(default=300, ge=0)
+    strategy_eligibility: dict[str, bool] = Field(default_factory=dict)
+    strategy_risk_multipliers: dict[str, float] = Field(default_factory=dict)
     pyramiding_enabled: bool = False
     max_position_percent: float = Field(default=10.0, ge=0, le=100)
     max_daily_loss_percent: float = Field(default=3.0, ge=0, le=100)
@@ -404,6 +488,9 @@ class WeightedDynamicEnvelope(WeightedContractModel):
     trailing_stop_atr_multiplier_delta: float = Field(default=0.0, ge=0)
     time_stop_minutes_delta: int = Field(default=0, ge=0)
     session_cutoff_minutes_delta: int = Field(default=0, ge=0)
+    slippage_allowance_per_share_delta: float = Field(default=0.0, ge=0)
+    cooldown_seconds_delta: int = Field(default=0, ge=0)
+    strategy_risk_multiplier_delta: float = Field(default=0.0, ge=0, le=1)
     pyramiding_may_enable: bool = False
     reason_codes: tuple[str, ...] = ()
     explanation: str = Field(default="Dynamic settings are deterministic and disabled by default.", min_length=1)
@@ -442,6 +529,9 @@ class WeightedHardLimits(WeightedContractModel):
     maximum_trailing_stop_atr_multiplier: float = Field(default=5.0, ge=0)
     maximum_time_stop_minutes: int = Field(default=390, ge=0)
     maximum_session_cutoff_minutes: int = Field(default=120, ge=0)
+    maximum_slippage_allowance_per_share: float = Field(default=0.05, ge=0)
+    maximum_cooldown_seconds: int = Field(default=3600, ge=0)
+    maximum_strategy_risk_multiplier: float = Field(default=2.0, ge=0)
     pyramiding_allowed: bool = False
     max_order_quantity: int = Field(default=0, ge=0)
     max_notional: float = Field(default=0, ge=0)
@@ -509,7 +599,17 @@ class WeightedEffectiveSettings(WeightedContractModel):
     trailing_stop_atr_multiplier: float = Field(default=1.0, ge=0)
     time_stop_minutes: int = Field(default=120, ge=0)
     session_cutoff_minutes: int = Field(default=15, ge=0)
+    slippage_allowance_per_share: float = Field(default=0.01, ge=0)
+    cooldown_seconds: int = Field(default=300, ge=0)
+    strategy_eligibility: dict[str, bool] = Field(default_factory=dict)
+    strategy_risk_multipliers: dict[str, float] = Field(default_factory=dict)
     pyramiding_enabled: bool = False
+    expiration_timestamp: datetime | None = None
+    source_evidence: tuple[str, ...] = ()
+    market_condition_input: dict[str, Any] = Field(default_factory=dict)
+    baseline_configuration_version: str = Field(default="weighted_voting_config_v1", min_length=1)
+    dynamic_profile_version: str = Field(default="weighted_voting_dynamic_profile_v1", min_length=1)
+    hard_limit_version: str = Field(default="weighted_hard_limits_v1", min_length=1)
     configuration_version: str
     configuration_hash: str = Field(min_length=1)
     dynamic_adjustments: tuple[WeightedDynamicSettingAdjustment, ...] = ()
@@ -543,6 +643,9 @@ class WeightedEffectiveSettings(WeightedContractModel):
             (self.trailing_stop_atr_multiplier <= limits.maximum_trailing_stop_atr_multiplier, "trailing_stop_atr_multiplier exceeds hard limit"),
             (self.time_stop_minutes <= limits.maximum_time_stop_minutes, "time_stop_minutes exceeds hard limit"),
             (self.session_cutoff_minutes <= limits.maximum_session_cutoff_minutes, "session_cutoff_minutes exceeds hard limit"),
+            (self.slippage_allowance_per_share <= limits.maximum_slippage_allowance_per_share, "slippage_allowance_per_share exceeds hard limit"),
+            (self.cooldown_seconds <= limits.maximum_cooldown_seconds, "cooldown_seconds exceeds hard limit"),
+            (all(0 <= multiplier <= limits.maximum_strategy_risk_multiplier for multiplier in self.strategy_risk_multipliers.values()), "strategy_risk_multipliers outside hard limits"),
             (limits.pyramiding_allowed or not self.pyramiding_enabled, "pyramiding_enabled exceeds hard limit"),
         )
         for valid, message in checks:
@@ -569,6 +672,12 @@ class WeightedVoteScores(WeightedContractModel):
     active_strategy_count: int = Field(default=0, ge=0)
     directional_strategy_count: int = Field(default=0, ge=0)
     active_weight: float = Field(default=0.0, ge=0, le=1)
+    total_active_weight: float = Field(default=0.0, ge=0, le=1)
+    total_directional_weight: float = Field(default=0.0, ge=0, le=1)
+    strategy_agreement: float = Field(default=0.0, ge=0, le=1)
+    family_concentration: float = Field(default=0.0, ge=0, le=1)
+    effective_weight_coverage: float = Field(default=0.0, ge=0, le=1)
+    final_provisional_signal: WeightedSide = WeightedSide.HOLD
     family_contributions: dict[str, dict[str, float]] = Field(default_factory=dict)
     disagreement_score: float = Field(default=0.0, ge=0, le=1)
     max_score: float = Field(ge=0, le=1)

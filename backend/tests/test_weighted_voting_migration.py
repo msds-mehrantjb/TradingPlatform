@@ -12,7 +12,12 @@ from backend.app.algorithms.weighted_voting.migration import (
     LEGACY_WEIGHTED_SETTINGS_KEY,
     LEGACY_WEIGHTED_TRADE_HISTORY_KEY,
     WEIGHTED_VOTING_ACTIVE_WEIGHT_STATE_KEY,
+    WEIGHTED_VOTING_LEGACY_KEYS,
+    WEIGHTED_VOTING_MIGRATION_AUDIT_PREFIX,
     WEIGHTED_VOTING_MIGRATION_RECORD_KEY,
+    WEIGHTED_VOTING_MIGRATION_REQUIRED_ACTIONS,
+    WEIGHTED_VOTING_MIGRATION_RETIRED_LEGACY_PATHS_KEY,
+    migration_status,
     migrate_existing_weighted_voting_state,
 )
 from backend.app.algorithms.weighted_voting.persistence import WEIGHTED_VOTING_SETTINGS_KEY
@@ -32,8 +37,11 @@ class WeightedVotingMigrationTest(unittest.TestCase):
         self.assertTrue(result.untrusted_weight_history_archived)
         self.assertEqual(result.trade_records_migrated, 1)
         self.assertTrue(result.ui_preferences_migrated)
+        self.assertGreaterEqual(result.audit_records_preserved, 5)
+        self.assertTrue(result.legacy_paths_retired)
 
         settings = store.snapshots[WEIGHTED_VOTING_SETTINGS_KEY]
+        self.assertEqual(settings["algorithm_id"], "weighted_voting")
         self.assertEqual(settings["default_settings"]["base_risk_per_trade_percent"], 0.75)
         self.assertEqual(settings["default_settings"]["order_allocation_percent"], 8.0)
         self.assertEqual(settings["default_settings"]["maximum_shares"], 222)
@@ -49,6 +57,18 @@ class WeightedVotingMigrationTest(unittest.TestCase):
         self.assertEqual(len(archive_keys), 1)
         self.assertEqual(store.snapshots[archive_keys[0]]["trust_status"], "untrusted")
         self.assertIn("weighted_voting.migration.weight_history_missing_provenance", store.snapshots[archive_keys[0]]["reason_codes"])
+        audit_keys = [key for key in store.snapshots if key.startswith(WEIGHTED_VOTING_MIGRATION_AUDIT_PREFIX)]
+        self.assertGreaterEqual(len(audit_keys), 5)
+        self.assertTrue(all(store.snapshots[key]["algorithm_id"] == "weighted_voting" for key in audit_keys))
+        self.assertTrue(all("original_payload" in store.snapshots[key] for key in audit_keys))
+        retired = store.snapshots[WEIGHTED_VOTING_MIGRATION_RETIRED_LEGACY_PATHS_KEY]
+        self.assertEqual(retired["algorithm_id"], "weighted_voting")
+        self.assertEqual(retired["status"], "retired_after_validation")
+        self.assertEqual(tuple(retired["retired_legacy_keys"]), WEIGHTED_VOTING_LEGACY_KEYS)
+        completion = store.snapshots[WEIGHTED_VOTING_MIGRATION_RECORD_KEY]
+        self.assertEqual(completion["status"], "completed")
+        self.assertTrue(completion["legacy_paths_retired"])
+        self.assertIn("weighted_voting.migration.completed", completion["reason_codes"])
 
     def test_migration_is_idempotent_and_does_not_duplicate_promotions(self) -> None:
         store = MemoryStore()
@@ -60,6 +80,17 @@ class WeightedVotingMigrationTest(unittest.TestCase):
         self.assertEqual(second.status, "idempotent_noop")
         self.assertEqual(store.write_counts, write_count_after_first)
         self.assertEqual(store.write_counts[WEIGHTED_VOTING_MIGRATION_RECORD_KEY], 1)
+
+    def test_migration_inventory_declares_required_dedicated_actions(self) -> None:
+        status = migration_status()
+
+        self.assertEqual(status["algorithm_id"], "weighted_voting")
+        self.assertEqual(status["namespace"], "data/algorithms/weighted_voting/migrations/")
+        self.assertEqual(tuple(status["legacy_keys"]), WEIGHTED_VOTING_LEGACY_KEYS)
+        self.assertTrue(status["idempotent"])
+        self.assertIn("preserve_original_record_for_audit", WEIGHTED_VOTING_MIGRATION_REQUIRED_ACTIONS)
+        self.assertIn("retire_legacy_generic_paths_after_validation", status["required_actions"])
+        self.assertIn("voting-ensemble-", status["non_weighted_legacy_prefixes_rejected"])
 
     def test_other_algorithm_state_is_not_migrated_into_weighted_voting(self) -> None:
         state = legacy_browser_state()
@@ -80,6 +111,34 @@ class WeightedVotingMigrationTest(unittest.TestCase):
         self.assertNotIn("regime-selection", serialized)
         self.assertNotIn("meta-strategy", serialized)
         self.assertEqual(store.snapshots[WEIGHTED_VOTING_SETTINGS_KEY]["default_settings"]["base_risk_per_trade_percent"], 0.75)
+        self.assertIn("weighted_voting.migration.rejected_other_algorithm_record", store.snapshots[WEIGHTED_VOTING_MIGRATION_RECORD_KEY]["reason_codes"])
+
+    def test_declared_other_algorithm_owner_is_rejected_from_weighted_keys(self) -> None:
+        state = legacy_browser_state()
+        state["browserStorage"][LEGACY_WEIGHTED_SETTINGS_KEY] = json.dumps({"algorithm_id": "voting_ensemble", "baseRiskPercent": 99})
+        state["browserStorage"][LEGACY_WEIGHTED_TRADE_HISTORY_KEY] = json.dumps(
+            [
+                {
+                    "id": "foreign-weighted-key",
+                    "algorithm_id": "regime",
+                    "side": "Buy",
+                    "quantity": 1,
+                    "price": 1,
+                    "recordedAt": MIGRATED_AT.isoformat(),
+                }
+            ]
+        )
+        store = MemoryStore()
+
+        result = migrate_existing_weighted_voting_state(store=store, legacy_state=state, migrated_at=MIGRATED_AT)
+
+        self.assertFalse(result.settings_migrated)
+        self.assertEqual(result.trade_records_migrated, 0)
+        self.assertNotIn(WEIGHTED_VOTING_SETTINGS_KEY, store.snapshots)
+        self.assertNotIn("weighted_voting.trades.migrated.legacy-ui-foreign-weighted-key", store.snapshots)
+        self.assertIn("weighted_voting.migration.rejected_other_algorithm_record", store.snapshots[WEIGHTED_VOTING_MIGRATION_RECORD_KEY]["reason_codes"])
+        archive_payload = json.dumps({key: value for key, value in store.snapshots.items() if "rejected" in key}, sort_keys=True)
+        self.assertIn("foreign-weighted-key", archive_payload)
 
     def test_trustworthy_weight_history_is_preserved_but_not_activated(self) -> None:
         trustworthy = {

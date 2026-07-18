@@ -52,6 +52,22 @@ class WeightedVotingMlDecouplingTest(unittest.TestCase):
 
         self.assertNotRegex(serialized, r"Meta Label|Weighted Forecast Safety|Trading RAG readiness")
 
+    def test_service_status_declares_rule_based_non_ml_exclusions(self) -> None:
+        status = WeightedVotingService(store=MemoryStore()).status()
+        excluded = {item["componentId"] for item in status["excludedComponents"]["excludedComponents"]}
+
+        self.assertEqual(status["excludedComponents"]["algorithmClass"], "rule_based_statistical_weighted_ensemble")
+        self.assertFalse(status["excludedComponents"]["mlDriven"])
+        self.assertIn("machine_learning_selector", excluded)
+        self.assertIn("meta_label_model", excluded)
+        self.assertIn("market_price_forecast_model", excluded)
+        self.assertIn("frontend_calculated_authoritative_signal", excluded)
+        self.assertIn("frontend_calculated_authoritative_quantity", excluded)
+        self.assertIn("voting_ensemble_output", excluded)
+        self.assertIn("wca_output", excluded)
+        self.assertIn("regime_based_trading_output", excluded)
+        self.assertIn("meta_strategy_output", excluded)
+
     def test_weighted_frontend_has_no_ml_gate_or_forecast_blocker(self) -> None:
         self.assertNotIn("function calculateWeightedVote", self.frontend_source)
         self.assertNotIn("function weightedTargetOrderFailedGates", self.frontend_source)

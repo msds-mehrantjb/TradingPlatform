@@ -51,6 +51,10 @@ class WeightedVotingLocalGateInputs:
     weighted_daily_trade_count: int
     capital_available: float
     current_position: WeightedPositionState | None = None
+    minimum_candle_history: int = 1
+    market_condition_eligible: bool = True
+    cooldown_active: bool = False
+    remaining_weighted_capital_partition: float | None = None
     mode: WeightedGateEvaluationMode | str = WeightedGateEvaluationMode.MANUAL
     data_timestamp: datetime | None = None
 
@@ -71,27 +75,37 @@ def evaluate_local_decision_gates(
 ) -> WeightedVotingGatePipelineResult:
     active_config = config or WeightedVotingConfig()
     data_timestamp = inputs.data_timestamp or inputs.decision.data_timestamp
-    gates = (
+    mandatory_gates = (
+        _data_freshness(inputs, active_config, data_timestamp),
+        _minimum_candle_history(inputs, data_timestamp),
         _valid_weighted_winner(inputs, data_timestamp),
         _minimum_active_strategy_count(inputs, active_config, data_timestamp),
         _minimum_directional_strategy_count(inputs, active_config, data_timestamp),
+        _minimum_active_weight_coverage(inputs, active_config, data_timestamp),
         _minimum_winner_score(inputs, active_config, data_timestamp),
         _minimum_winner_edge(inputs, active_config, data_timestamp),
         _maximum_family_concentration(inputs, active_config, data_timestamp),
+        _maximum_conflicting_weight(inputs, active_config, data_timestamp),
         _acceptable_disagreement(inputs, active_config, data_timestamp),
         _acceptable_strategy_data_quality(inputs, data_timestamp),
         _five_minute_confirmation(inputs, data_timestamp),
+        _market_condition_eligibility(inputs, data_timestamp),
         _positive_expected_value(inputs, active_config, data_timestamp),
         _local_spread_threshold(inputs, active_config, data_timestamp),
+        _local_slippage_threshold(inputs, active_config, data_timestamp),
         _local_liquidity_threshold(inputs, active_config, data_timestamp),
         _valid_atr_range(inputs, active_config, data_timestamp),
         _entry_quality(inputs, active_config, data_timestamp),
         _allowed_session_window(inputs, data_timestamp),
         _weighted_daily_loss(inputs, active_config, data_timestamp),
         _weighted_trade_count_limit(inputs, active_config, data_timestamp),
+        _weighted_cooldown(inputs, data_timestamp),
+        _existing_position(inputs, active_config, data_timestamp),
         _weighted_capital_availability(inputs, active_config, data_timestamp),
+        _weighted_capital_partition_availability(inputs, active_config, data_timestamp),
         _weighted_pyramiding_rule(inputs, active_config, data_timestamp),
     )
+    gates = mandatory_gates + (_final_local_acceptance(mandatory_gates, data_timestamp),)
     failures = tuple(
         reason_code
         for gate in gates
@@ -145,6 +159,31 @@ def _valid_weighted_winner(inputs: WeightedVotingLocalGateInputs, data_timestamp
     )
 
 
+def _data_freshness(inputs: WeightedVotingLocalGateInputs, config: WeightedVotingConfig, data_timestamp: datetime) -> WeightedGateResult:
+    freshness = _data_freshness_seconds(inputs.market_snapshot, data_timestamp)
+    return _gate(
+        "data_freshness",
+        "Data Freshness",
+        freshness is not None and freshness <= config.stale_after_seconds,
+        data_timestamp,
+        "weighted_voting.gate.stale_market_data",
+        f"Market data freshness {freshness if freshness is not None else 'unavailable'} seconds must be within {config.stale_after_seconds} seconds.",
+    )
+
+
+def _minimum_candle_history(inputs: WeightedVotingLocalGateInputs, data_timestamp: datetime) -> WeightedGateResult:
+    actual = _completed_candle_count(inputs.market_snapshot, data_timestamp)
+    required = max(inputs.minimum_candle_history, _required_candle_history_from_signals(inputs.signals))
+    return _gate(
+        "minimum_candle_history",
+        "Minimum Candle History",
+        actual >= required,
+        data_timestamp,
+        "weighted_voting.gate.insufficient_candle_history",
+        f"Completed one-minute candle count {actual} must meet required history {required}.",
+    )
+
+
 def _minimum_active_strategy_count(inputs: WeightedVotingLocalGateInputs, config: WeightedVotingConfig, data_timestamp: datetime) -> WeightedGateResult:
     actual = inputs.decision.vote_scores.active_strategy_count
     return _gate(
@@ -166,6 +205,20 @@ def _minimum_directional_strategy_count(inputs: WeightedVotingLocalGateInputs, c
         data_timestamp,
         "weighted_voting.gate.insufficient_directional_strategy_count",
         f"Directional strategy count {actual} must meet {config.minimum_directional_strategies}.",
+    )
+
+
+def _minimum_active_weight_coverage(inputs: WeightedVotingLocalGateInputs, config: WeightedVotingConfig, data_timestamp: datetime) -> WeightedGateResult:
+    actual = inputs.decision.vote_scores.effective_weight_coverage
+    fallback = inputs.decision.vote_scores.active_weight
+    coverage = actual if actual > 0 else fallback
+    return _gate(
+        "minimum_active_weight_coverage",
+        "Minimum Active Weight Coverage",
+        coverage + config.aggregation_tie_tolerance >= config.minimum_active_weight,
+        data_timestamp,
+        "weighted_voting.gate.insufficient_active_weight_coverage",
+        f"Effective weight coverage {coverage:.4f} must meet {config.minimum_active_weight:.4f}.",
     )
 
 
@@ -194,7 +247,7 @@ def _minimum_winner_edge(inputs: WeightedVotingLocalGateInputs, config: Weighted
 
 
 def _maximum_family_concentration(inputs: WeightedVotingLocalGateInputs, config: WeightedVotingConfig, data_timestamp: datetime) -> WeightedGateResult:
-    maximum = max((family.get("weight", 0.0) for family in inputs.decision.vote_scores.family_contributions.values()), default=0.0)
+    maximum = inputs.decision.vote_scores.family_concentration or max((family.get("weight", 0.0) for family in inputs.decision.vote_scores.family_contributions.values()), default=0.0)
     return _gate(
         "maximum_family_concentration",
         "Maximum Family Concentration",
@@ -202,6 +255,18 @@ def _maximum_family_concentration(inputs: WeightedVotingLocalGateInputs, config:
         data_timestamp,
         "weighted_voting.gate.family_concentration_exceeded",
         f"Maximum family contribution {maximum:.4f} must not exceed {config.maximum_family_weight:.4f}.",
+    )
+
+
+def _maximum_conflicting_weight(inputs: WeightedVotingLocalGateInputs, config: WeightedVotingConfig, data_timestamp: datetime) -> WeightedGateResult:
+    actual = inputs.decision.vote_scores.disagreement_score
+    return _gate(
+        "maximum_conflicting_weight_percentage",
+        "Maximum Conflicting-Weight Percentage",
+        actual <= config.maximum_disagreement_score,
+        data_timestamp,
+        "weighted_voting.gate.conflicting_weight_too_high",
+        f"Conflicting weight percentage {actual:.4f} must not exceed {config.maximum_disagreement_score:.4f}.",
     )
 
 
@@ -257,6 +322,17 @@ def _five_minute_confirmation(inputs: WeightedVotingLocalGateInputs, data_timest
     )
 
 
+def _market_condition_eligibility(inputs: WeightedVotingLocalGateInputs, data_timestamp: datetime) -> WeightedGateResult:
+    return _gate(
+        "market_condition_eligibility",
+        "Market-Condition Eligibility",
+        inputs.market_condition_eligible,
+        data_timestamp,
+        "weighted_voting.gate.market_condition_not_eligible",
+        "Weighted Voting market-condition classifier must permit local evaluation.",
+    )
+
+
 def _positive_expected_value(inputs: WeightedVotingLocalGateInputs, config: WeightedVotingConfig, data_timestamp: datetime) -> WeightedGateResult:
     required = config.minimum_expected_value_after_costs + config.expected_value_safety_margin
     total_cost = inputs.spread_cost + inputs.slippage_cost + inputs.fee_cost + config.expected_value_safety_margin
@@ -279,6 +355,18 @@ def _local_spread_threshold(inputs: WeightedVotingLocalGateInputs, config: Weigh
         data_timestamp,
         "weighted_voting.gate.spread_too_wide",
         f"Spread percent {spread_percent if spread_percent is not None else 'unavailable'} must be at or below {config.local_max_spread_percent:.6f}.",
+    )
+
+
+def _local_slippage_threshold(inputs: WeightedVotingLocalGateInputs, config: WeightedVotingConfig, data_timestamp: datetime) -> WeightedGateResult:
+    maximum_slippage = max(config.expected_value_safety_margin, config.local_max_spread_percent)
+    return _gate(
+        "local_slippage_threshold",
+        "Local Slippage Threshold",
+        inputs.slippage_cost <= maximum_slippage,
+        data_timestamp,
+        "weighted_voting.gate.slippage_too_high",
+        f"Slippage cost {inputs.slippage_cost:.6f} must not exceed {maximum_slippage:.6f}.",
     )
 
 
@@ -350,6 +438,29 @@ def _weighted_trade_count_limit(inputs: WeightedVotingLocalGateInputs, config: W
     )
 
 
+def _weighted_cooldown(inputs: WeightedVotingLocalGateInputs, data_timestamp: datetime) -> WeightedGateResult:
+    return _gate(
+        "weighted_voting_cooldown",
+        "Weighted Voting Cooldown",
+        not inputs.cooldown_active,
+        data_timestamp,
+        "weighted_voting.gate.cooldown_active",
+        "Weighted Voting algorithm-local cooldown must be inactive before accepting a new entry.",
+    )
+
+
+def _existing_position(inputs: WeightedVotingLocalGateInputs, config: WeightedVotingConfig, data_timestamp: datetime) -> WeightedGateResult:
+    open_position = inputs.current_position is not None and inputs.current_position.quantity != 0
+    return _gate(
+        "existing_position",
+        "Existing Position",
+        config.allow_weighted_pyramiding or not open_position,
+        data_timestamp,
+        "weighted_voting.gate.existing_position_blocks_entry",
+        "Existing Weighted Voting position blocks a new entry unless Weighted Voting pyramiding is enabled.",
+    )
+
+
 def _weighted_capital_availability(inputs: WeightedVotingLocalGateInputs, config: WeightedVotingConfig, data_timestamp: datetime) -> WeightedGateResult:
     return _gate(
         "weighted_voting_capital_availability",
@@ -358,6 +469,18 @@ def _weighted_capital_availability(inputs: WeightedVotingLocalGateInputs, config
         data_timestamp,
         "weighted_voting.gate.insufficient_capital",
         f"Available capital {inputs.capital_available:.2f} must meet {config.minimum_capital_available:.2f}.",
+    )
+
+
+def _weighted_capital_partition_availability(inputs: WeightedVotingLocalGateInputs, config: WeightedVotingConfig, data_timestamp: datetime) -> WeightedGateResult:
+    available = inputs.remaining_weighted_capital_partition if inputs.remaining_weighted_capital_partition is not None else inputs.capital_available
+    return _gate(
+        "weighted_voting_capital_partition_availability",
+        "Weighted Voting Capital-Partition Availability",
+        available >= config.minimum_capital_available,
+        data_timestamp,
+        "weighted_voting.gate.insufficient_capital_partition",
+        f"Weighted Voting capital partition availability {available:.2f} must meet {config.minimum_capital_available:.2f}.",
     )
 
 
@@ -370,6 +493,18 @@ def _weighted_pyramiding_rule(inputs: WeightedVotingLocalGateInputs, config: Wei
         data_timestamp,
         "weighted_voting.gate.pyramiding_not_allowed",
         "Weighted Voting cannot add to an existing position unless pyramiding is explicitly enabled.",
+    )
+
+
+def _final_local_acceptance(gates: tuple[WeightedGateResult, ...], data_timestamp: datetime) -> WeightedGateResult:
+    passed = all_gates_pass(gates)
+    return _gate(
+        "final_local_acceptance",
+        "Final Local Acceptance",
+        passed,
+        data_timestamp,
+        "weighted_voting.gate.final_local_acceptance_failed",
+        "All mandatory Weighted Voting local gates must pass before routing to account-wide global gates.",
     )
 
 
@@ -390,3 +525,28 @@ def _latest_volume(snapshot: WeightedMarketSnapshot | None) -> float | None:
     if snapshot is None or not snapshot.one_minute_candles:
         return None
     return snapshot.one_minute_candles[-1].volume
+
+
+def _data_freshness_seconds(snapshot: WeightedMarketSnapshot | None, data_timestamp: datetime) -> float | None:
+    if snapshot is None:
+        return None
+    if snapshot.data_freshness_seconds is not None:
+        return snapshot.data_freshness_seconds
+    if not snapshot.one_minute_candles:
+        return None
+    return max(0.0, (data_timestamp - snapshot.one_minute_candles[-1].timestamp).total_seconds())
+
+
+def _completed_candle_count(snapshot: WeightedMarketSnapshot | None, data_timestamp: datetime) -> int:
+    if snapshot is None:
+        return 0
+    return sum(1 for candle in snapshot.one_minute_candles if candle.timestamp <= data_timestamp)
+
+
+def _required_candle_history_from_signals(signals: tuple[WeightedVotingSignal, ...]) -> int:
+    required = 1
+    for signal in signals:
+        value = signal.feature_snapshot.get("required_one_minute_candles")
+        if value is not None:
+            required = max(required, int(float(value)))
+    return required

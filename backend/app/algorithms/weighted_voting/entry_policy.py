@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 
 from backend.app.algorithms.weighted_voting.models import (
@@ -18,6 +18,7 @@ from backend.app.algorithms.weighted_voting.strategies.common import average_tru
 
 
 WEIGHTED_VOTING_ENTRY_POLICY_VERSION = "weighted_voting_entry_policy_v2"
+WEIGHTED_VOTING_ENTRY_POLICY_FRONTEND_MODE = "display_only_backend_authoritative"
 
 
 class WeightedEntryType(str, Enum):
@@ -27,18 +28,34 @@ class WeightedEntryType(str, Enum):
     REJECTED = "rejected"
 
 
+class WeightedEntryTiming(str, Enum):
+    IMMEDIATE = "immediate"
+    CONFIRMATION = "confirmation"
+    REJECTED = "rejected"
+
+
 @dataclass(frozen=True)
 class WeightedEntryPolicyResult:
     accepted: bool
     dominant_family: WeightedStrategyFamily | str
     entry_type: WeightedEntryType | str
+    entry_timing: WeightedEntryTiming | str
+    order_type: str
     side: WeightedSide | str
     trigger_price: float | None
     limit_price: float | None
     maximum_chase_distance: float
+    maximum_spread: float
+    confirmation_bar_count: int
+    confirmation_bar_interval: str
+    entry_expiration: datetime | None
     entry_timeout_seconds: int
     entry_buffer: float
     cancellation_condition: str
+    entry_cancellation_conditions: tuple[str, ...]
+    partial_entry_allowed: bool
+    re_entry_allowed: bool
+    frontend_calculation_allowed: bool
     reason_codes: tuple[str, ...]
     explanation: str
 
@@ -64,18 +81,22 @@ def evaluate_entry_policy(
     current_vwap = vwap(candles)
     atr = average_true_range(candles, 14) or max(latest.high - latest.low, entry_price * effective_settings.minimum_stop_distance_percent)
     spread = (snapshot.ask or entry_price) - (snapshot.bid or entry_price)
+    maximum_spread = entry_price * effective_settings.maximum_spread_percent
+    if spread > maximum_spread:
+        return _reject(dominant_family, side, "weighted_voting.entry.spread_reject", "Entry spread is above the effective maximum spread.")
     entry_buffer = max(entry_price * effective_settings.entry_buffer_percent, spread)
     maximum_chase_distance = max(entry_buffer, atr * 0.35)
     timeout_seconds = max(30, min(1800, effective_settings.time_stop_minutes * 60))
+    expiration = now + timedelta(seconds=timeout_seconds)
 
     if dominant_family == WeightedStrategyFamily.TREND.value:
-        return _trend_policy(side, entry_price, candles, current_vwap, atr, entry_buffer, maximum_chase_distance, timeout_seconds)
+        return _trend_policy(side, entry_price, candles, current_vwap, atr, entry_buffer, maximum_chase_distance, maximum_spread, timeout_seconds, expiration)
     if dominant_family == WeightedStrategyFamily.BREAKOUT.value:
-        return _breakout_policy(side, entry_price, candles, snapshot, atr, entry_buffer, maximum_chase_distance, timeout_seconds, effective_settings)
+        return _breakout_policy(side, entry_price, candles, snapshot, atr, entry_buffer, maximum_chase_distance, maximum_spread, timeout_seconds, expiration, effective_settings)
     if dominant_family == WeightedStrategyFamily.MEAN_REVERSION.value:
-        return _mean_reversion_policy(side, entry_price, candles, current_vwap, atr, entry_buffer, maximum_chase_distance, timeout_seconds)
+        return _mean_reversion_policy(side, entry_price, candles, current_vwap, atr, entry_buffer, maximum_chase_distance, maximum_spread, timeout_seconds, expiration)
     if dominant_family == WeightedStrategyFamily.REVERSAL.value:
-        return _reversal_policy(side, entry_price, candles, atr, entry_buffer, maximum_chase_distance, timeout_seconds)
+        return _reversal_policy(side, entry_price, candles, atr, entry_buffer, maximum_chase_distance, maximum_spread, timeout_seconds, expiration)
     return _reject(dominant_family, side, "weighted_voting.entry.unknown_family", "Dominant family could not be determined.")
 
 
@@ -83,11 +104,12 @@ def entry_policy_status() -> dict[str, str]:
     return {
         "version": WEIGHTED_VOTING_ENTRY_POLICY_VERSION,
         "status": "implemented",
+        "frontendMode": WEIGHTED_VOTING_ENTRY_POLICY_FRONTEND_MODE,
         "explanation": "Weighted Voting entry policies are deterministic and family-aware.",
     }
 
 
-def _trend_policy(side, entry_price, candles, current_vwap, atr, entry_buffer, maximum_chase_distance, timeout_seconds) -> WeightedEntryPolicyResult:
+def _trend_policy(side, entry_price, candles, current_vwap, atr, entry_buffer, maximum_chase_distance, maximum_spread, timeout_seconds, expiration) -> WeightedEntryPolicyResult:
     closes = [candle.close for candle in candles]
     trend_up = closes[-1] > closes[-2] > closes[-3]
     trend_down = closes[-1] < closes[-2] < closes[-3]
@@ -109,10 +131,10 @@ def _trend_policy(side, entry_price, candles, current_vwap, atr, entry_buffer, m
         entry_type = WeightedEntryType.STOP_LIMIT
         trigger = entry_price + entry_buffer if side == WeightedSide.BUY.value else entry_price - entry_buffer
         limit = trigger + entry_buffer if side == WeightedSide.BUY.value else max(0.01, trigger - entry_buffer)
-    return _accept(WeightedStrategyFamily.TREND, side, entry_type, trigger, limit, maximum_chase_distance, timeout_seconds, entry_buffer, "Cancel if VWAP or structure alignment fails before fill.", ("weighted_voting.entry.trend.confirmed",))
+    return _accept(WeightedStrategyFamily.TREND, side, entry_type, trigger, limit, maximum_chase_distance, maximum_spread, timeout_seconds, expiration, entry_buffer, "Cancel if VWAP or structure alignment fails before fill.", ("vwap_alignment_fails", "structure_alignment_fails", "entry_expires"), 1 if entry_type == WeightedEntryType.STOP_LIMIT else 0, True, True, ("weighted_voting.entry.trend.confirmed",))
 
 
-def _breakout_policy(side, entry_price, candles, snapshot, atr, entry_buffer, maximum_chase_distance, timeout_seconds, settings) -> WeightedEntryPolicyResult:
+def _breakout_policy(side, entry_price, candles, snapshot, atr, entry_buffer, maximum_chase_distance, maximum_spread, timeout_seconds, expiration, settings) -> WeightedEntryPolicyResult:
     previous = candles[:-1]
     level = max(candle.high for candle in previous[-20:]) if side == WeightedSide.BUY.value else min(candle.low for candle in previous[-20:])
     latest = candles[-1]
@@ -128,10 +150,10 @@ def _breakout_policy(side, entry_price, candles, snapshot, atr, entry_buffer, ma
         return _reject(WeightedStrategyFamily.BREAKOUT, side, "weighted_voting.entry.breakout.overextended", "Breakout entry is overextended beyond maximum chase distance.")
     trigger = level + entry_buffer if side == WeightedSide.BUY.value else level - entry_buffer
     limit = trigger + entry_buffer if side == WeightedSide.BUY.value else max(0.01, trigger - entry_buffer)
-    return _accept(WeightedStrategyFamily.BREAKOUT, side, WeightedEntryType.STOP_LIMIT, trigger, limit, maximum_chase_distance, timeout_seconds, entry_buffer, "Cancel if price closes back inside the breakout level before fill.", ("weighted_voting.entry.breakout.confirmed_level", "weighted_voting.entry.breakout.volume_expansion"))
+    return _accept(WeightedStrategyFamily.BREAKOUT, side, WeightedEntryType.STOP_LIMIT, trigger, limit, maximum_chase_distance, maximum_spread, timeout_seconds, expiration, entry_buffer, "Cancel if price closes back inside the breakout level before fill.", ("close_back_inside_breakout_level", "volume_confirmation_fails", "entry_expires"), 1, True, True, ("weighted_voting.entry.breakout.confirmed_level", "weighted_voting.entry.breakout.volume_expansion"))
 
 
-def _mean_reversion_policy(side, entry_price, candles, current_vwap, atr, entry_buffer, maximum_chase_distance, timeout_seconds) -> WeightedEntryPolicyResult:
+def _mean_reversion_policy(side, entry_price, candles, current_vwap, atr, entry_buffer, maximum_chase_distance, maximum_spread, timeout_seconds, expiration) -> WeightedEntryPolicyResult:
     if current_vwap is None:
         return _reject(WeightedStrategyFamily.MEAN_REVERSION, side, "weighted_voting.entry.mean_reversion.missing_vwap", "Mean reversion entry requires VWAP context.")
     distance_to_vwap = abs(entry_price - current_vwap)
@@ -144,10 +166,10 @@ def _mean_reversion_policy(side, entry_price, candles, current_vwap, atr, entry_
         return _reject(WeightedStrategyFamily.MEAN_REVERSION, side, "weighted_voting.entry.mean_reversion.no_reversal", "Mean reversion entry requires reversal confirmation.")
     trigger = entry_price
     limit = max(0.01, entry_price - entry_buffer) if side == WeightedSide.BUY.value else entry_price + entry_buffer
-    return _accept(WeightedStrategyFamily.MEAN_REVERSION, side, WeightedEntryType.LIMIT, trigger, limit, maximum_chase_distance, timeout_seconds, entry_buffer, "Cancel if price reaches VWAP before fill or extension accelerates away.", ("weighted_voting.entry.mean_reversion.range_extension", "weighted_voting.entry.mean_reversion.reversal_confirmed"))
+    return _accept(WeightedStrategyFamily.MEAN_REVERSION, side, WeightedEntryType.LIMIT, trigger, limit, maximum_chase_distance, maximum_spread, timeout_seconds, expiration, entry_buffer, "Cancel if price reaches VWAP before fill or extension accelerates away.", ("vwap_reached_before_fill", "extension_accelerates_away", "entry_expires"), 0, True, False, ("weighted_voting.entry.mean_reversion.range_extension", "weighted_voting.entry.mean_reversion.reversal_confirmed"))
 
 
-def _reversal_policy(side, entry_price, candles, atr, entry_buffer, maximum_chase_distance, timeout_seconds) -> WeightedEntryPolicyResult:
+def _reversal_policy(side, entry_price, candles, atr, entry_buffer, maximum_chase_distance, maximum_spread, timeout_seconds, expiration) -> WeightedEntryPolicyResult:
     latest = candles[-1]
     previous = candles[-2]
     if side == WeightedSide.BUY.value:
@@ -164,7 +186,7 @@ def _reversal_policy(side, entry_price, candles, atr, entry_buffer, maximum_chas
         return _reject(WeightedStrategyFamily.REVERSAL, side, "weighted_voting.entry.reversal.no_confirmed_failure", "Reversal entry requires confirmed failed level or sweep.")
     if abs(entry_price - trigger) > max(maximum_chase_distance, atr * 0.5):
         return _reject(WeightedStrategyFamily.REVERSAL, side, "weighted_voting.entry.reversal.overextended", "Reversal entry is overextended beyond maximum chase distance.")
-    return _accept(WeightedStrategyFamily.REVERSAL, side, WeightedEntryType.CONFIRMATION_LIMIT, trigger, limit, maximum_chase_distance, timeout_seconds, entry_buffer, f"Cancel if price trades beyond structural invalidation {invalidation:.4f}.", ("weighted_voting.entry.reversal.failed_level_confirmed", "weighted_voting.entry.reversal.structural_invalidation"))
+    return _accept(WeightedStrategyFamily.REVERSAL, side, WeightedEntryType.CONFIRMATION_LIMIT, trigger, limit, maximum_chase_distance, maximum_spread, timeout_seconds, expiration, entry_buffer, f"Cancel if price trades beyond structural invalidation {invalidation:.4f}.", (f"structural_invalidation_{invalidation:.4f}", "failed_level_confirmation_lost", "entry_expires"), 1, False, False, ("weighted_voting.entry.reversal.failed_level_confirmed", "weighted_voting.entry.reversal.structural_invalidation"))
 
 
 def _dominant_family(signals: tuple[WeightedVotingSignal, ...]) -> str:
@@ -186,20 +208,32 @@ def _quote_entry_price(snapshot: WeightedMarketSnapshot, side: WeightedSide | st
     return None
 
 
-def _accept(family, side, entry_type, trigger, limit, chase, timeout, buffer, cancellation, reason_codes) -> WeightedEntryPolicyResult:
+def _accept(family, side, entry_type, trigger, limit, chase, maximum_spread, timeout, expiration, buffer, cancellation, cancellation_conditions, confirmation_bars, partial_allowed, re_entry_allowed, reason_codes) -> WeightedEntryPolicyResult:
+    entry_type_value = entry_type.value if isinstance(entry_type, WeightedEntryType) else entry_type
+    timing = _entry_timing(entry_type_value)
     return WeightedEntryPolicyResult(
         accepted=True,
         dominant_family=family.value if isinstance(family, WeightedStrategyFamily) else family,
-        entry_type=entry_type.value if isinstance(entry_type, WeightedEntryType) else entry_type,
+        entry_type=entry_type_value,
+        entry_timing=timing,
+        order_type="stop_limit" if entry_type_value in (WeightedEntryType.STOP_LIMIT.value, WeightedEntryType.CONFIRMATION_LIMIT.value) else "limit",
         side=side,
         trigger_price=round(trigger, 10),
         limit_price=round(limit, 10),
         maximum_chase_distance=round(chase, 10),
+        maximum_spread=round(maximum_spread, 10),
+        confirmation_bar_count=confirmation_bars,
+        confirmation_bar_interval="1m",
+        entry_expiration=expiration,
         entry_timeout_seconds=timeout,
         entry_buffer=round(buffer, 10),
         cancellation_condition=cancellation,
+        entry_cancellation_conditions=tuple(cancellation_conditions),
+        partial_entry_allowed=partial_allowed,
+        re_entry_allowed=re_entry_allowed,
+        frontend_calculation_allowed=False,
         reason_codes=tuple(reason_codes),
-        explanation="Weighted Voting entry policy accepted the order without changing the weighted side.",
+        explanation="Weighted Voting backend entry policy accepted the order without changing the weighted side; frontend is display-only.",
     )
 
 
@@ -208,13 +242,31 @@ def _reject(family, side, reason_code, explanation) -> WeightedEntryPolicyResult
         accepted=False,
         dominant_family=family.value if isinstance(family, WeightedStrategyFamily) else family,
         entry_type=WeightedEntryType.REJECTED.value,
+        entry_timing=WeightedEntryTiming.REJECTED.value,
+        order_type="none",
         side=side,
         trigger_price=None,
         limit_price=None,
         maximum_chase_distance=0.0,
+        maximum_spread=0.0,
+        confirmation_bar_count=0,
+        confirmation_bar_interval="1m",
+        entry_expiration=None,
         entry_timeout_seconds=0,
         entry_buffer=0.0,
         cancellation_condition="No entry; rejected by local Weighted Voting entry policy.",
+        entry_cancellation_conditions=("policy_rejected",),
+        partial_entry_allowed=False,
+        re_entry_allowed=False,
+        frontend_calculation_allowed=False,
         reason_codes=(reason_code,),
         explanation=explanation,
     )
+
+
+def _entry_timing(entry_type: str) -> str:
+    if entry_type in (WeightedEntryType.STOP_LIMIT.value, WeightedEntryType.CONFIRMATION_LIMIT.value):
+        return WeightedEntryTiming.CONFIRMATION.value
+    if entry_type == WeightedEntryType.LIMIT.value:
+        return WeightedEntryTiming.IMMEDIATE.value
+    return WeightedEntryTiming.REJECTED.value

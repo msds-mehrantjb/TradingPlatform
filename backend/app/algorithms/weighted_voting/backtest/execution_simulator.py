@@ -18,6 +18,7 @@ class WeightedBacktestExecutionCostModel:
     entry_slippage_per_share: float = 0.01
     exit_slippage_per_share: float = 0.01
     fee_per_share: float = 0.005
+    regulatory_fee_per_share: float = 0.0
     minimum_fee: float = 0.0
 
 
@@ -45,10 +46,12 @@ class WeightedBacktestFill:
     explanation: str
 
 
-def simulator_status() -> dict[str, str]:
+def simulator_status() -> dict[str, object]:
     return {
         "version": WEIGHTED_VOTING_EXECUTION_SIMULATOR_VERSION,
         "status": "implemented",
+        "ownedCosts": ["slippage", "spread", "fees", "regulatory_costs"],
+        "ownedFillBehavior": ["next_candle_entry", "participation_limit", "partial_fills", "unfilled_orders"],
         "explanation": "Weighted Voting backtests simulate fills, slippage, fees, participation limits, partial fills, and unfilled orders.",
     }
 
@@ -100,7 +103,9 @@ def entry_fee(quantity: int, cost_model: WeightedBacktestExecutionCostModel) -> 
 
 
 def exit_fee(quantity: int, cost_model: WeightedBacktestExecutionCostModel) -> float:
-    return entry_fee(quantity, cost_model)
+    if quantity <= 0:
+        return 0.0
+    return max(cost_model.minimum_fee, quantity * (cost_model.fee_per_share + cost_model.regulatory_fee_per_share))
 
 
 def conservative_exit_price(*, side: WeightedSide | str, raw_exit_price: float, cost_model: WeightedBacktestExecutionCostModel, spread: float) -> float:

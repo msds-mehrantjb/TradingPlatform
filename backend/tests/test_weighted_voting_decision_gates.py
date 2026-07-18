@@ -57,6 +57,7 @@ class WeightedVotingDecisionGatesTest(unittest.TestCase):
         self.assertIn("weighted_voting.gate.session_window_closed", result.reason_codes)
         self.assertIn("weighted_voting.gate.daily_loss_limit_exceeded", result.reason_codes)
         self.assertIn("weighted_voting.gate.insufficient_capital", result.reason_codes)
+        self.assertIn("weighted_voting.gate.existing_position_blocks_entry", result.reason_codes)
         self.assertIn("weighted_voting.gate.pyramiding_not_allowed", result.reason_codes)
 
     def test_neutral_five_minute_alignment_is_informational_not_confirmed(self) -> None:
@@ -87,6 +88,67 @@ class WeightedVotingDecisionGatesTest(unittest.TestCase):
         self.assertNotIn("meta", text)
         self.assertNotIn("triple", text)
         self.assertNotIn("barrier", text)
+
+    def test_local_gate_inventory_is_dedicated_and_separate_from_global_gates(self) -> None:
+        result = evaluate_local_decision_gates(valid_gate_inputs())
+        gate_ids = {gate.gate_id for gate in result.gate_results}
+        expected = {
+            "data_freshness",
+            "minimum_candle_history",
+            "weighted_winner",
+            "minimum_active_strategy_count",
+            "minimum_directional_strategy_count",
+            "minimum_active_weight_coverage",
+            "minimum_winner_score",
+            "minimum_winner_edge",
+            "maximum_family_concentration",
+            "maximum_conflicting_weight_percentage",
+            "acceptable_disagreement",
+            "acceptable_strategy_data_quality",
+            "five_minute_confirmation",
+            "market_condition_eligibility",
+            "positive_expected_value_after_costs",
+            "local_spread_threshold",
+            "local_slippage_threshold",
+            "local_liquidity_threshold",
+            "valid_atr_range",
+            "entry_quality",
+            "allowed_weighted_voting_session_window",
+            "weighted_voting_daily_loss",
+            "weighted_voting_trade_count_limit",
+            "weighted_voting_cooldown",
+            "existing_position",
+            "weighted_voting_capital_availability",
+            "weighted_voting_capital_partition_availability",
+            "weighted_voting_pyramiding_rule",
+            "final_local_acceptance",
+        }
+
+        self.assertEqual(gate_ids, expected)
+        self.assertTrue(all(not gate.gate_id.startswith("global") for gate in result.gate_results))
+        self.assertTrue(result.permission_granted)
+
+    def test_new_local_operational_gates_fail_with_stable_reason_codes(self) -> None:
+        result = evaluate_local_decision_gates(
+            valid_gate_inputs(
+                market_snapshot=market_snapshot(stale=True, volume=100.0),
+                minimum_candle_history=5,
+                market_condition_eligible=False,
+                slippage_cost=0.01,
+                cooldown_active=True,
+                remaining_weighted_capital_partition=0.0,
+            )
+        )
+
+        self.assertFalse(result.permission_granted)
+        self.assertIn("weighted_voting.gate.stale_market_data", result.reason_codes)
+        self.assertIn("weighted_voting.gate.insufficient_candle_history", result.reason_codes)
+        self.assertIn("weighted_voting.gate.market_condition_not_eligible", result.reason_codes)
+        self.assertIn("weighted_voting.gate.slippage_too_high", result.reason_codes)
+        self.assertIn("weighted_voting.gate.insufficient_liquidity", result.reason_codes)
+        self.assertIn("weighted_voting.gate.cooldown_active", result.reason_codes)
+        self.assertIn("weighted_voting.gate.insufficient_capital_partition", result.reason_codes)
+        self.assertIn("weighted_voting.gate.final_local_acceptance_failed", result.reason_codes)
 
 
 def valid_gate_inputs(**overrides) -> WeightedVotingLocalGateInputs:
@@ -160,12 +222,13 @@ def strategy_signal(
     )
 
 
-def market_snapshot() -> WeightedMarketSnapshot:
+def market_snapshot(*, stale: bool = False, volume: float = 50000.0) -> WeightedMarketSnapshot:
+    candle_timestamp = TS if not stale else datetime(2026, 1, 5, 14, 0, tzinfo=timezone.utc)
     return WeightedMarketSnapshot(
         symbol="SPY",
         data_timestamp=TS,
         one_minute_candles=(
-            WeightedCandle(timestamp=TS, open=100.0, high=101.0, low=99.5, close=100.5, volume=50000.0),
+            WeightedCandle(timestamp=candle_timestamp, open=100.0, high=101.0, low=99.5, close=100.5, volume=volume),
         ),
         bid=100.0,
         ask=100.02,

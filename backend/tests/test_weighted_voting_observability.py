@@ -5,7 +5,14 @@ from datetime import UTC, date, datetime, timedelta, timezone
 
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedGateEvaluationMode, WeightedVotingGatePipelineResult
 from backend.app.algorithms.weighted_voting.execution_gateway import submit_weighted_voting_paper_order
-from backend.app.algorithms.weighted_voting.observability import DECISION_OBSERVABILITY_PREFIX, EXECUTION_OBSERVABILITY_PREFIX, METRICS_KEY
+from backend.app.algorithms.weighted_voting.observability import (
+    DECISION_OBSERVABILITY_PREFIX,
+    EXECUTION_OBSERVABILITY_PREFIX,
+    METRICS_KEY,
+    WEIGHTED_VOTING_OBSERVABILITY_REQUIRED_FIELDS,
+    WEIGHTED_VOTING_OBSERVABILITY_STAGES,
+    observability_status,
+)
 from backend.app.algorithms.weighted_voting.models import WeightedGateResult, WeightedGateStatus
 from backend.app.algorithms.weighted_voting.rollout import WeightedVotingRolloutFlags, WeightedVotingRolloutValidation
 from backend.app.algorithms.weighted_voting.service import WeightedVotingService
@@ -33,25 +40,50 @@ class WeightedVotingObservabilityTest(unittest.TestCase):
         self.assertEqual(datetime.fromisoformat(snapshot["dataTimestamp"]), datetime.fromisoformat(result["decision"]["data_timestamp"].replace("Z", "+00:00")))
         for required_key in (
             "dataFreshness",
+            "marketSnapshotHash",
+            "strategyOutputs",
             "strategySignals",
             "strategyProbabilities",
+            "activeWeights",
             "weightStages",
             "familyContributions",
+            "aggregatedScores",
             "scoreTotals",
             "winner",
             "edge",
             "marketCondition",
             "settings",
+            "configurationVersions",
+            "localGateOutcomes",
             "localGateResults",
             "proposedQuantity",
             "globalGateResult",
             "executableQuantity",
+            "finalProposal",
             "orderLevels",
+            "stageTimings",
+            "exceptions",
+            "dataQualityWarnings",
+            "reasonCodes",
+            "explanation",
             "rejectionReason",
             "eventualOutcome",
             "snapshotHash",
         ):
             self.assertIn(required_key, snapshot)
+        self.assertEqual(snapshot["authoritativeSource"], "data/algorithms/weighted_voting/observability/")
+        self.assertEqual(snapshot["marketSnapshotHash"], result["decision"]["data_manifest_hash"])
+        self.assertEqual(snapshot["strategyOutputs"], snapshot["strategySignals"])
+        self.assertEqual(snapshot["activeWeights"], snapshot["weightStages"]["activeWeightState"])
+        self.assertEqual(snapshot["aggregatedScores"], snapshot["scoreTotals"])
+        self.assertEqual(snapshot["localGateOutcomes"], snapshot["localGateResults"])
+        self.assertEqual(snapshot["finalProposal"]["acceptedQuantity"], snapshot["executableQuantity"])
+        self.assertEqual(set(snapshot["stageTimings"]), set(WEIGHTED_VOTING_OBSERVABILITY_STAGES))
+        self.assertIn("weighted_voting.observability.decision_recorded", snapshot["reasonCodes"])
+        self.assertEqual(snapshot["configurationVersions"]["configurationVersion"], result["decision"]["configuration_version"])
+        self.assertEqual(snapshot["configurationVersions"]["weightVersion"], result["decision"]["weight_version"])
+        self.assertEqual(snapshot["configurationVersions"]["settingsVersion"], result["decision"]["settings_version"])
+        self.assertEqual(snapshot["configurationVersions"]["dataManifestHash"], result["decision"]["data_manifest_hash"])
         self.assertEqual(snapshot["eventualOutcome"]["status"], "pending")
         self.assertIn("defaultSettings", snapshot["settings"])
         self.assertIn("dynamicMultipliers", snapshot["settings"])
@@ -62,6 +94,17 @@ class WeightedVotingObservabilityTest(unittest.TestCase):
         self.assertIn("gateRejectionFrequency", metrics)
         self.assertIn("sizingLimitingFactors", metrics)
         self.assertIn("schedulerStatus", metrics)
+
+    def test_observability_inventory_is_weighted_voting_authoritative(self) -> None:
+        status = observability_status()
+
+        self.assertEqual(status["algorithmId"], "weighted_voting")
+        self.assertEqual(status["authoritativeSource"], "data/algorithms/weighted_voting/observability/")
+        self.assertTrue(status["isolation"]["ownsNamespace"])
+        self.assertFalse(status["isolation"]["sharedDashboardsMayMutate"])
+        self.assertIn("final_proposal", WEIGHTED_VOTING_OBSERVABILITY_REQUIRED_FIELDS)
+        self.assertIn("exceptions", status["requiredFields"])
+        self.assertIn("observability_persistence", status["stageTimingContract"])
 
     def test_hold_or_rejected_decisions_are_explainable_and_quantities_are_distinct_fields(self) -> None:
         store = MemoryStore()

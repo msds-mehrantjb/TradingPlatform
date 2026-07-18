@@ -7,8 +7,14 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from math import sqrt
 
-from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_STRATEGY_CATALOG
+from backend.app.algorithms.weighted_voting.catalog import (
+    WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT,
+    WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT,
+    WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT,
+    WEIGHTED_VOTING_STRATEGY_CATALOG,
+)
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
+from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ALGORITHM_ID
 from backend.app.algorithms.weighted_voting.models import (
     WeightedDataQualityStatus,
     WeightedPerformanceWeightMetric,
@@ -23,12 +29,53 @@ from backend.app.algorithms.weighted_voting.models import (
 WEIGHTED_VOTING_WEIGHT_ENGINE_VERSION = "weighted_voting_weight_engine_v3"
 WEIGHTED_VOTING_STRATEGY_IDS = tuple(entry.strategy_id for entry in WEIGHTED_VOTING_STRATEGY_CATALOG)
 WEIGHTED_VOTING_STRATEGY_FAMILIES = {entry.strategy_id: entry.family for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
+WEIGHTED_VOTING_BASELINE_WEIGHTS = {entry.strategy_id: entry.baseline_weight for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
+WEIGHTED_VOTING_WEIGHT_HISTORY_KEY = "weighted_voting.weights.history"
+WEIGHTED_VOTING_WEIGHT_UPDATE_RULES = (
+    "use_only_weighted_voting_attributed_strategy_outcomes",
+    "score_out_of_sample_expectancy_after_costs",
+    "score_profit_factor_and_win_rate",
+    "penalize_drawdown_contribution",
+    "apply_confidence_calibration_proxy",
+    "shrink_to_equal_weights_for_insufficient_samples",
+    "penalize_recent_degradation",
+    "prefer_market_condition_specific_performance_when_labeled",
+    "apply_transaction_cost_adjustment",
+    "penalize_same_family_strategy_correlation",
+    "smooth_across_evaluation_windows",
+    "enforce_minimum_and_maximum_strategy_weights",
+    "limit_maximum_daily_weight_change",
+    "preserve_previous_weights_on_validation_failure",
+)
+FORBIDDEN_WEIGHT_INPUT_MARKERS = (
+    "voting_ensemble",
+    "wca",
+    "confidence_aggregation",
+    "regime_based_trading",
+    "regime_selection",
+    "meta_model",
+    "meta_strategy",
+    "portfolio_level",
+)
 
 
 @dataclass(frozen=True)
 class WeightedWeightResult:
     signals: tuple[WeightedVotingSignal, ...]
     adjustments: tuple[WeightedWeightAdjustment, ...]
+
+
+@dataclass(frozen=True)
+class WeightedVotingWeightEngineStatus:
+    algorithm_id: str
+    weight_engine_version: str
+    baseline_weights: dict[str, float]
+    minimum_weight: float
+    maximum_weight: float
+    maximum_daily_weight_change: float
+    update_rules: tuple[str, ...]
+    forbidden_inputs: tuple[str, ...]
+    historical_weight_key: str
 
 
 def normalize_weights(weights: dict[str, float]) -> dict[str, float]:
@@ -56,6 +103,60 @@ def create_unseeded_equal_weight_state(
     )
 
 
+def weight_engine_status(config: WeightedVotingConfig | None = None) -> WeightedVotingWeightEngineStatus:
+    active_config = config or WeightedVotingConfig()
+    return WeightedVotingWeightEngineStatus(
+        algorithm_id=WEIGHTED_VOTING_ALGORITHM_ID,
+        weight_engine_version=WEIGHTED_VOTING_WEIGHT_ENGINE_VERSION,
+        baseline_weights=dict(WEIGHTED_VOTING_BASELINE_WEIGHTS),
+        minimum_weight=active_config.minimum_enabled_strategy_weight,
+        maximum_weight=active_config.maximum_strategy_weight,
+        maximum_daily_weight_change=active_config.maximum_daily_weight_change,
+        update_rules=WEIGHTED_VOTING_WEIGHT_UPDATE_RULES,
+        forbidden_inputs=FORBIDDEN_WEIGHT_INPUT_MARKERS,
+        historical_weight_key=WEIGHTED_VOTING_WEIGHT_HISTORY_KEY,
+    )
+
+
+def append_weight_history(history: tuple[WeightedWeightState, ...], state: WeightedWeightState) -> tuple[WeightedWeightState, ...]:
+    _validate_weight_state_ownership(state)
+    retained = [item for item in history if item.weight_version != state.weight_version]
+    return tuple(retained + [state])
+
+
+def rollback_weight_state(
+    current_state: WeightedWeightState,
+    history: tuple[WeightedWeightState, ...],
+    *,
+    target_weight_version: str,
+    rollback_timestamp: datetime,
+) -> WeightedWeightState:
+    _validate_weight_state_ownership(current_state)
+    candidates = {state.weight_version: state for state in history if getattr(state, "algorithm_id", None) == WEIGHTED_VOTING_ALGORITHM_ID}
+    if target_weight_version not in candidates:
+        return _preserve_weight_state(
+            current_state,
+            status=WeightedWeightStateStatus.VALIDATION_FAILED,
+            update_timestamp=rollback_timestamp,
+            data_timestamp=rollback_timestamp,
+            active_session_date=current_state.active_session_date,
+            reason_codes=("weighted_voting.weights.rollback_target_not_found",),
+            explanation=f"Rollback target {target_weight_version} is not a known Weighted Voting weight version.",
+        )
+    target = candidates[target_weight_version]
+    return WeightedWeightState(
+        weight_version=target.weight_version,
+        state_status=target.state_status,
+        strategy_weights=dict(target.strategy_weights),
+        active_session_date=target.active_session_date,
+        performance_metrics=target.performance_metrics,
+        last_updated_at=rollback_timestamp,
+        data_timestamp=target.data_timestamp,
+        reason_codes=tuple(dict.fromkeys(target.reason_codes + ("weighted_voting.weights.rollback_applied",))),
+        explanation=f"Weighted Voting active weights rolled back to {target.weight_version}.",
+    )
+
+
 def update_performance_weight_state(
     previous_state: WeightedWeightState,
     outcomes: tuple[WeightedStrategyOutcome, ...],
@@ -74,8 +175,10 @@ def update_performance_weight_state(
 
     try:
         _validate_weight_update_config(active_config)
+        _validate_weight_state_ownership(previous_state)
         strategy_ids = _ordered_strategy_ids(previous_state.strategy_weights)
         previous_weights = _complete_weights(previous_state.strategy_weights, strategy_ids)
+        _validate_weight_update_inputs(outcomes, strategy_ids)
         qualified_outcomes = _qualified_outcomes(outcomes, strategy_ids)
         if not qualified_outcomes:
             return _preserve_weight_state(
@@ -215,14 +318,41 @@ def _validate_weight_update_config(config: WeightedVotingConfig) -> None:
         raise ValueError("maximum daily weight change must be between zero and one")
 
 
+def _validate_weight_state_ownership(state: WeightedWeightState) -> None:
+    if getattr(state, "algorithm_id", None) != WEIGHTED_VOTING_ALGORITHM_ID:
+        raise ValueError("active weight state does not belong to Weighted Voting")
+    unknown = sorted(set(state.strategy_weights) - set(WEIGHTED_VOTING_STRATEGY_IDS))
+    if unknown:
+        raise ValueError(f"active weight state contains non-Weighted Voting strategies: {unknown}")
+
+
+def _validate_weight_update_inputs(outcomes: tuple[WeightedStrategyOutcome, ...], strategy_ids: tuple[str, ...]) -> None:
+    strategy_id_set = set(strategy_ids)
+    for outcome in outcomes:
+        if getattr(outcome, "algorithm_id", None) != WEIGHTED_VOTING_ALGORITHM_ID:
+            raise ValueError("foreign algorithm outcome cannot update Weighted Voting weights")
+        if _has_forbidden_weight_marker(outcome):
+            raise ValueError("foreign algorithm marker cannot update Weighted Voting weights")
+        if outcome.strategy_id not in strategy_id_set:
+            raise ValueError(f"outcome {outcome.strategy_id} is not in the Weighted Voting strategy catalog")
+
+
+def _has_forbidden_weight_marker(outcome: WeightedStrategyOutcome) -> bool:
+    serialized = " ".join(str(item).lower() for item in outcome.reason_codes + (outcome.explanation,))
+    return any(marker in serialized for marker in FORBIDDEN_WEIGHT_INPUT_MARKERS)
+
+
 def _ordered_strategy_ids(previous_weights: dict[str, float]) -> tuple[str, ...]:
-    known = [strategy_id for strategy_id in WEIGHTED_VOTING_STRATEGY_IDS if strategy_id in previous_weights]
+    known = list(WEIGHTED_VOTING_STRATEGY_IDS)
     extras = sorted(strategy_id for strategy_id in previous_weights if strategy_id not in known)
     return tuple(known + extras)
 
 
 def _complete_weights(weights: dict[str, float], strategy_ids: tuple[str, ...]) -> dict[str, float]:
-    completed = {strategy_id: max(0.0, weights.get(strategy_id, 0.0)) for strategy_id in strategy_ids}
+    completed = {
+        strategy_id: max(0.0, weights.get(strategy_id, WEIGHTED_VOTING_BASELINE_WEIGHTS.get(strategy_id, 0.0)))
+        for strategy_id in strategy_ids
+    }
     normalized = normalize_weights(completed)
     if sum(normalized.values()) <= 0:
         return _equal_weights(strategy_ids)
@@ -234,7 +364,9 @@ def _qualified_outcomes(outcomes: tuple[WeightedStrategyOutcome, ...], strategy_
     return tuple(
         outcome
         for outcome in outcomes
-        if outcome.strategy_id in strategy_id_set and outcome.outcome_return is not None
+        if getattr(outcome, "algorithm_id", None) == WEIGHTED_VOTING_ALGORITHM_ID
+        and outcome.strategy_id in strategy_id_set
+        and outcome.outcome_return is not None
     )
 
 
@@ -260,6 +392,7 @@ def _performance_metrics(
         sample_size = len(returns)
         wins = [value for value in returns if value > 0]
         losses = [value for value in returns if value < 0]
+        win_rate = len(wins) / sample_size if sample_size else 0.0
         net_expectancy = sum(returns) / sample_size if sample_size else 0.0
         average_win = sum(wins) / len(wins) if wins else 0.0
         average_loss = abs(sum(losses) / len(losses)) if losses else 0.0
@@ -269,8 +402,11 @@ def _performance_metrics(
         outcome_stability = _outcome_stability(returns)
         recent_values = returns[-min(10, sample_size) :] if sample_size else []
         recent_performance = sum(recent_values) / len(recent_values) if recent_values else 0.0
+        recent_degradation = max(0.0, net_expectancy - recent_performance)
         regime_values = regime_returns[strategy_id]
         regime_specific_performance = sum(regime_values) / len(regime_values) if regime_values else net_expectancy
+        confidence_calibration_score = _confidence_calibration_score(win_rate, profit_factor, sample_size)
+        transaction_cost_adjustment = _transaction_cost_adjustment(net_expectancy, average_win, average_loss)
         raw_score = _performance_score(
             net_expectancy=net_expectancy,
             profit_factor=profit_factor,
@@ -281,6 +417,9 @@ def _performance_metrics(
             regime_specific_performance=regime_specific_performance,
             config=config,
         )
+        raw_score *= confidence_calibration_score
+        raw_score *= transaction_cost_adjustment
+        raw_score *= max(0.50, 1.0 - min(0.50, recent_degradation / 0.02))
         shrinkage = min(1.0, sample_size / config.minimum_qualified_outcomes_for_adaptation)
         metrics.append(
             WeightedPerformanceWeightMetric(
@@ -288,10 +427,16 @@ def _performance_metrics(
                 sample_size=sample_size,
                 net_expectancy_after_costs=round(net_expectancy, 10),
                 profit_factor=round(profit_factor, 10),
+                win_rate=round(win_rate, 10),
                 average_win=round(average_win, 10),
                 average_loss=round(average_loss, 10),
                 win_loss_ratio=round(win_loss_ratio, 10),
                 maximum_drawdown=round(maximum_drawdown, 10),
+                drawdown_contribution=round(maximum_drawdown, 10),
+                confidence_calibration_score=round(confidence_calibration_score, 10),
+                transaction_cost_adjustment=round(transaction_cost_adjustment, 10),
+                recent_degradation=round(recent_degradation, 10),
+                market_condition_sample_size=len(regime_values),
                 outcome_stability=round(outcome_stability, 10),
                 recent_performance=round(recent_performance, 10),
                 regime_specific_performance=round(regime_specific_performance, 10),
@@ -340,6 +485,22 @@ def _performance_score(
         + config.recent_performance_score_weight * _return_score(recent_performance)
         + config.regime_performance_score_weight * _return_score(regime_specific_performance),
     )
+
+
+def _confidence_calibration_score(win_rate: float, profit_factor: float, sample_size: int) -> float:
+    if sample_size <= 0:
+        return 0.50
+    reliability = min(1.0, sample_size / 100.0)
+    quality = (win_rate * 0.60) + (_bounded_score(profit_factor, 2.0) * 0.40)
+    return max(0.50, min(1.0, 0.50 + quality * 0.50 * reliability))
+
+
+def _transaction_cost_adjustment(net_expectancy_after_costs: float, average_win: float, average_loss: float) -> float:
+    if net_expectancy_after_costs > 0:
+        return 1.0
+    if average_win <= 0 and average_loss <= 0:
+        return 0.50
+    return 0.75
 
 
 def _return_score(value: float) -> float:

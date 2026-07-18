@@ -6,6 +6,11 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from backend.app.algorithms.weighted_voting.market_snapshot import (
+    FORBIDDEN_FOREIGN_ALGORITHM_FIELDS,
+    build_weighted_voting_market_snapshot,
+    payload_contains_foreign_algorithm_fields,
+)
 from backend.app.algorithms.weighted_voting.service import WeightedVotingService
 
 
@@ -66,6 +71,33 @@ class WeightedVotingAlgorithmIsolationTest(unittest.TestCase):
         changed = service.evaluate(changed_other_algorithms_payload)
 
         self.assertEqual(stable_json(changed), stable_json(baseline))
+
+    def test_market_snapshot_adapter_ignores_foreign_algorithm_outputs(self) -> None:
+        baseline_payload = evaluate_payload()
+        contaminated_payload = copy.deepcopy(baseline_payload)
+        contaminated_payload.update(
+            {
+                "votingEnsemble": {"decision": "Sell", "confidence": 1.0, "settings": {"enabled": False}},
+                "wcaDecision": {"decision": "Sell", "confidenceScore": 1.0},
+                "regimeBasedTrading": {"decision": "Sell", "position": {"quantity": 999}},
+                "metaModel": {"decision": "Sell", "thresholds": {"buy": 0.99}},
+                "otherAlgorithmConfidenceScores": {"voting_ensemble": 1.0, "wca": 1.0},
+                "otherAlgorithmPositions": {"meta_model": {"side": "Sell", "quantity": 999}},
+                "otherAlgorithmSettings": {"regime_based_trading": {"enabled": False}},
+                "dataManifestHash": "contaminated-by-other-algorithm-outputs",
+            }
+        )
+
+        baseline = build_weighted_voting_market_snapshot(baseline_payload)
+        contaminated = build_weighted_voting_market_snapshot(contaminated_payload)
+        serialized = stable_json(contaminated.model_dump(mode="json", exclude_none=True))
+
+        self.assertTrue(payload_contains_foreign_algorithm_fields(contaminated_payload))
+        self.assertEqual(contaminated, baseline)
+        self.assertEqual(contaminated.data_manifest_hash, baseline.data_manifest_hash)
+        for field in FORBIDDEN_FOREIGN_ALGORITHM_FIELDS:
+            with self.subTest(field=field):
+                self.assertNotIn(field, serialized)
 
     def test_weighted_backend_result_does_not_mutate_other_algorithm_payloads(self) -> None:
         service = WeightedVotingService(store=MemoryStore())

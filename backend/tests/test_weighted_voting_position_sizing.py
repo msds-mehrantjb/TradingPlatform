@@ -20,6 +20,7 @@ from backend.app.algorithms.weighted_voting.position_sizing import (
     WeightedVotingSizingContext,
     calculate_weighted_voting_position_size,
 )
+from backend.app.algorithms.weighted_voting.risk_budget import WeightedVotingRiskBudget
 
 
 TS = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
@@ -31,8 +32,63 @@ class WeightedVotingPositionSizingTest(unittest.TestCase):
 
         self.assertEqual({cap.cap_id for cap in result.caps}, {"risk", "order_allocation", "maximum_position", "available_buying_power", "liquidity_participation", "maximum_shares", "global_gates"})
         self.assertEqual(result.limiting_cap, "global_gates")
+        self.assertEqual(result.limiting_factor, "global_maximum_quantity")
         self.assertEqual(result.quantity, 3)
+        self.assertEqual(result.approved_local_quantity, result.requested_quantity)
         self.assertIn("weighted_voting.sizing.cap.global_gates", result.reason_codes)
+
+    def test_result_reports_requested_quantities_and_named_minimum_caps(self) -> None:
+        result = calculate_weighted_voting_position_size(base_context(global_max_shares=100000))
+
+        expected_requested = min(
+            result.risk_based_quantity,
+            result.capital_partition_quantity,
+            result.buying_power_quantity,
+            result.liquidity_quantity,
+            result.volume_participation_quantity,
+            result.algorithm_maximum_quantity,
+        )
+        expected_final = min(expected_requested, result.global_maximum_quantity)
+
+        self.assertEqual(result.requested_quantity, expected_requested)
+        self.assertEqual(result.approved_local_quantity, expected_requested)
+        self.assertEqual(result.quantity, expected_final)
+        self.assertEqual(result.risk_dollars, result.effective_risk_dollars)
+        self.assertGreater(result.stop_distance, 0)
+        self.assertGreater(result.size_multiplier, 0)
+        self.assertLessEqual(result.size_multiplier, 1)
+        self.assertIn(f"weighted_voting.sizing.limiting_factor.{result.limiting_factor}", result.reason_codes)
+
+    def test_weighted_voting_risk_budget_and_capital_partition_limit_quantity(self) -> None:
+        budget = WeightedVotingRiskBudget(
+            account_equity=100000.0,
+            risk_percent=2.0,
+            data_timestamp=TS,
+            pending_trade_risk=600.0,
+            capital_partition_percent=0.5,
+        )
+
+        result = calculate_weighted_voting_position_size(
+            base_context(
+                risk_budget=budget,
+                remaining_weighted_daily_risk=5000.0,
+                remaining_weighted_capital_partition=5000.0,
+                global_available_risk=5000.0,
+                global_max_shares=100000,
+            )
+        )
+
+        self.assertEqual(result.capital_partition_quantity, 4)
+        self.assertEqual(result.requested_quantity, 4)
+        self.assertEqual(result.limiting_factor, "capital_partition_quantity")
+
+    def test_global_risk_cap_can_only_reduce_final_quantity(self) -> None:
+        high_global = calculate_weighted_voting_position_size(base_context(global_available_risk=5000.0, global_max_shares=100000))
+        low_global = calculate_weighted_voting_position_size(base_context(global_available_risk=2.0, global_max_shares=100000))
+
+        self.assertGreater(high_global.global_maximum_quantity, low_global.global_maximum_quantity)
+        self.assertLess(low_global.quantity, high_global.quantity)
+        self.assertEqual(low_global.limiting_factor, "global_maximum_quantity")
 
     def test_spread_comes_from_actual_quote_and_slippage_is_separate(self) -> None:
         result = calculate_weighted_voting_position_size(base_context(slippage_per_share=0.07))
@@ -55,10 +111,10 @@ class WeightedVotingPositionSizingTest(unittest.TestCase):
     def test_wider_stops_produce_fewer_shares_and_do_not_increase_dollar_risk(self) -> None:
         high_cap_settings = effective_settings(order_allocation_percent=100.0, maximum_position_percent=100.0, maximum_shares=100000)
         tight = calculate_weighted_voting_position_size(
-            base_context(effective_settings=high_cap_settings, structural_invalidation_price=97.50, atr=0.1, average_one_minute_volume=1000000)
+            base_context(effective_settings=high_cap_settings, structural_invalidation_price=97.50, atr=0.1, average_one_minute_volume=1000000, remaining_weighted_capital_partition=100000.0)
         )
         wide = calculate_weighted_voting_position_size(
-            base_context(effective_settings=high_cap_settings, structural_invalidation_price=95.00, atr=0.1, average_one_minute_volume=1000000)
+            base_context(effective_settings=high_cap_settings, structural_invalidation_price=95.00, atr=0.1, average_one_minute_volume=1000000, remaining_weighted_capital_partition=100000.0)
         )
 
         self.assertGreater(wide.stop_distance, tight.stop_distance)

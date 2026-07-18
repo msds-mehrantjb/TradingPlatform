@@ -10,6 +10,7 @@ from typing import Literal, Mapping, Protocol
 
 
 WEIGHTED_VOTING_ROLLOUT_VERSION = "weighted_voting_rollout_v1"
+WEIGHTED_VOTING_ROLLOUT_NAMESPACE = "data/algorithms/weighted_voting/rollout/"
 
 WEIGHTED_VOTING_V2_ENABLED = "WEIGHTED_VOTING_V2_ENABLED"
 WEIGHTED_VOTING_SHADOW_MODE = "WEIGHTED_VOTING_SHADOW_MODE"
@@ -19,6 +20,28 @@ WEIGHTED_VOTING_AUTO_SUBMIT_ENABLED = "WEIGHTED_VOTING_AUTO_SUBMIT_ENABLED"
 
 ROLLOUT_STATE_KEY = "weighted_voting.rollout.active"
 ROLLBACK_STATE_KEY = "weighted_voting.rollout.previous_valid"
+
+WeightedVotingRolloutLifecycleState = Literal[
+    "disabled",
+    "backtest_only",
+    "shadow",
+    "paper_trading",
+    "limited_paper",
+    "production_ready",
+    "paused",
+    "emergency_disabled",
+]
+
+WEIGHTED_VOTING_ROLLOUT_STATES: tuple[WeightedVotingRolloutLifecycleState, ...] = (
+    "disabled",
+    "backtest_only",
+    "shadow",
+    "paper_trading",
+    "limited_paper",
+    "production_ready",
+    "paused",
+    "emergency_disabled",
+)
 
 WeightedVotingRolloutStage = Literal[
     "backend_shadow",
@@ -56,6 +79,38 @@ class WeightedVotingRolloutStore(Protocol):
 class RolloutPermission(str, Enum):
     ENABLED = "enabled"
     BLOCKED = "blocked"
+
+
+@dataclass(frozen=True)
+class WeightedVotingRolloutControl:
+    requested_state: WeightedVotingRolloutLifecycleState
+    effective_state: WeightedVotingRolloutLifecycleState
+    algorithm_id: Literal["weighted_voting"]
+    namespace: str
+    trading_allowed: bool
+    paper_trading_allowed: bool
+    automatic_submission_allowed: bool
+    production_ready: bool
+    account_wide_emergency_shutdown: bool
+    ignored_external_algorithm_disables: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+    explanation: str
+
+    def model_dump(self) -> dict[str, object]:
+        return {
+            "requested_state": self.requested_state,
+            "effective_state": self.effective_state,
+            "algorithm_id": self.algorithm_id,
+            "namespace": self.namespace,
+            "trading_allowed": self.trading_allowed,
+            "paper_trading_allowed": self.paper_trading_allowed,
+            "automatic_submission_allowed": self.automatic_submission_allowed,
+            "production_ready": self.production_ready,
+            "account_wide_emergency_shutdown": self.account_wide_emergency_shutdown,
+            "ignored_external_algorithm_disables": self.ignored_external_algorithm_disables,
+            "reason_codes": self.reason_codes,
+            "explanation": self.explanation,
+        }
 
 
 @dataclass(frozen=True)
@@ -131,6 +186,57 @@ def rollout_feature_flags(environ: Mapping[str, str] | None = None) -> WeightedV
     return WeightedVotingRolloutFlags.from_env(environ)
 
 
+def evaluate_weighted_voting_rollout_control(
+    requested_state: WeightedVotingRolloutLifecycleState = "shadow",
+    *,
+    account_wide_emergency_shutdown: bool = False,
+    disabled_algorithm_ids: tuple[str, ...] = (),
+    flags: WeightedVotingRolloutFlags | None = None,
+    validation: WeightedVotingRolloutValidation | None = None,
+) -> WeightedVotingRolloutControl:
+    if requested_state not in WEIGHTED_VOTING_ROLLOUT_STATES:
+        raise ValueError(f"unknown Weighted Voting rollout state: {requested_state}")
+    ignored_disables = tuple(sorted(algorithm_id for algorithm_id in disabled_algorithm_ids if algorithm_id != "weighted_voting"))
+    reason_codes: list[str] = ["weighted_voting.rollout.control_evaluated"]
+    effective_state = requested_state
+    if ignored_disables:
+        reason_codes.append("weighted_voting.rollout.external_algorithm_disable_ignored")
+    if account_wide_emergency_shutdown:
+        effective_state = "emergency_disabled"
+        reason_codes.append("weighted_voting.rollout.account_wide_emergency_shutdown")
+    elif "weighted_voting" in disabled_algorithm_ids:
+        effective_state = "disabled"
+        reason_codes.append("weighted_voting.rollout.weighted_voting_disabled")
+
+    stage_auto_allowed = automatic_submission_allowed(flags=flags, validation=validation)
+    paper_trading_allowed = effective_state in {"paper_trading", "limited_paper", "production_ready"}
+    trading_allowed = paper_trading_allowed and effective_state != "paused"
+    auto_allowed = stage_auto_allowed and effective_state in {"paper_trading", "production_ready"}
+    if effective_state in {"disabled", "backtest_only", "shadow", "paused", "emergency_disabled"}:
+        trading_allowed = False
+        paper_trading_allowed = False
+        auto_allowed = False
+        reason_codes.append(f"weighted_voting.rollout.{effective_state}.blocks_order_submission")
+    if effective_state == "limited_paper":
+        auto_allowed = False
+        reason_codes.append("weighted_voting.rollout.limited_paper_requires_manual_or_limited_submission")
+
+    return WeightedVotingRolloutControl(
+        requested_state=requested_state,
+        effective_state=effective_state,
+        algorithm_id="weighted_voting",
+        namespace=WEIGHTED_VOTING_ROLLOUT_NAMESPACE,
+        trading_allowed=trading_allowed,
+        paper_trading_allowed=paper_trading_allowed,
+        automatic_submission_allowed=auto_allowed,
+        production_ready=effective_state == "production_ready",
+        account_wide_emergency_shutdown=account_wide_emergency_shutdown,
+        ignored_external_algorithm_disables=ignored_disables,
+        reason_codes=tuple(dict.fromkeys(reason_codes)),
+        explanation="Weighted Voting rollout control is evaluated only from Weighted Voting state and account-wide emergency shutdown state.",
+    )
+
+
 def evaluate_rollout_stage(
     stage: WeightedVotingRolloutStage,
     *,
@@ -161,19 +267,41 @@ def rollout_status(
     *,
     flags: WeightedVotingRolloutFlags | None = None,
     validation: WeightedVotingRolloutValidation | None = None,
+    requested_state: WeightedVotingRolloutLifecycleState = "shadow",
+    account_wide_emergency_shutdown: bool = False,
+    disabled_algorithm_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     active_flags = flags or rollout_feature_flags()
     active_validation = validation or WeightedVotingRolloutValidation()
     stages = tuple(evaluate_rollout_stage(stage, flags=active_flags, validation=active_validation).model_dump() for stage in ROLLOUT_STAGES)
+    control = evaluate_weighted_voting_rollout_control(
+        requested_state=requested_state,
+        account_wide_emergency_shutdown=account_wide_emergency_shutdown,
+        disabled_algorithm_ids=disabled_algorithm_ids,
+        flags=active_flags,
+        validation=active_validation,
+    )
     return {
         "algorithm_id": "weighted_voting",
         "rollout_version": WEIGHTED_VOTING_ROLLOUT_VERSION,
+        "namespace": WEIGHTED_VOTING_ROLLOUT_NAMESPACE,
+        "allowed_states": WEIGHTED_VOTING_ROLLOUT_STATES,
+        "control": control.model_dump(),
+        "effective_state": control.effective_state,
         "feature_flags": active_flags.model_dump(),
         "validation": active_validation.model_dump(),
         "stages": stages,
         "automatic_submission_allowed": automatic_submission_allowed(flags=active_flags, validation=active_validation),
         "live_trading_allowed": False,
-        "reason_codes": ("weighted_voting.rollout.paper_only", "weighted_voting.rollout.automatic_submission_guarded"),
+        "reason_codes": tuple(
+            dict.fromkeys(
+                (
+                    "weighted_voting.rollout.paper_only",
+                    "weighted_voting.rollout.automatic_submission_guarded",
+                    *control.reason_codes,
+                )
+            )
+        ),
     }
 
 

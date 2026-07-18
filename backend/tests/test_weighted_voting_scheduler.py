@@ -9,10 +9,16 @@ from backend.app.algorithms.weighted_voting.market_snapshot import WeightedVotin
 from backend.app.algorithms.weighted_voting.models import WeightedDataQualityStatus, WeightedSide, WeightedStrategyFamily, WeightedVotingSignal
 from backend.app.algorithms.weighted_voting.scheduler import (
     ACTIVE_WEIGHT_STATE_KEY,
+    UPDATE_AUDIT_PREFIX,
     PUBLISHED_WEIGHT_PREFIX,
+    UPDATE_STATUS_KEY,
     UPDATE_RECORD_PREFIX,
+    WEIGHT_HISTORY_KEY,
+    WEIGHTED_VOTING_AFTER_MARKET_UPDATE_EASTERN_MINUTES,
     WeightedVotingDailySchedulerConfig,
+    rollback_to_previous_weight_version,
     run_after_market_daily_weight_update,
+    scheduler_status,
 )
 
 
@@ -104,6 +110,71 @@ class WeightedVotingSchedulerTest(unittest.TestCase):
         self.assertEqual(result.published_for_session_date, date(2026, 7, 15))
         self.assertIn(f"{PUBLISHED_WEIGHT_PREFIX}2026-07-15", store.snapshots)
         self.assertLess(AFTER_MARKET, datetime(2026, 7, 15, 13, 30, tzinfo=timezone.utc))
+
+    def test_scheduler_persists_status_audit_history_and_performance_window(self) -> None:
+        store = MemoryStore()
+        provider = StaticDatasetProvider(make_session())
+
+        with patch("backend.app.algorithms.weighted_voting.backtest.engine.evaluate_signals", side_effect=synthetic_signals):
+            result = run_after_market_daily_weight_update(
+                session_date=SESSION_DATE,
+                store=store,
+                dataset_provider=provider,
+                completed_at=AFTER_MARKET,
+                config=WeightedVotingDailySchedulerConfig(symbol="SPY"),
+            )
+
+        update = store.read_snapshot(f"{UPDATE_RECORD_PREFIX}{SESSION_DATE.isoformat()}")
+        status = store.read_snapshot(UPDATE_STATUS_KEY)
+        history = store.read_snapshot(WEIGHT_HISTORY_KEY)
+        audit = store.read_snapshot(str(result.audit_record_id))
+
+        self.assertTrue(result.dataset_complete)
+        self.assertEqual(result.performance_window_start, SESSION_DATE)
+        self.assertEqual(result.performance_window_end, SESSION_DATE)
+        self.assertEqual(update["after_market_update_eastern_minutes"], WEIGHTED_VOTING_AFTER_MARKET_UPDATE_EASTERN_MINUTES)
+        self.assertEqual(update["audit_record_id"], result.audit_record_id)
+        self.assertEqual(status["status"], "published")
+        self.assertEqual(status["audit_record_id"], result.audit_record_id)
+        self.assertGreaterEqual(len(history["items"]), 1)
+        self.assertIn(result.active_weight_version, {item["weight_version"] for item in history["items"]})
+        self.assertIn("weight_version_creation", audit["scheduler_owned_steps"])
+        self.assertEqual(audit["isolation"], "weighted_voting_update_ignores_other_algorithm_backtest_failures")
+
+    def test_previous_version_rollback_uses_weighted_voting_history(self) -> None:
+        store = MemoryStore()
+        provider = StaticDatasetProvider(make_session())
+
+        with patch("backend.app.algorithms.weighted_voting.backtest.engine.evaluate_signals", side_effect=synthetic_signals):
+            result = run_after_market_daily_weight_update(
+                session_date=SESSION_DATE,
+                store=store,
+                dataset_provider=provider,
+                completed_at=AFTER_MARKET,
+                config=WeightedVotingDailySchedulerConfig(symbol="SPY"),
+            )
+        rolled_back = rollback_to_previous_weight_version(
+            store=store,
+            target_weight_version=result.previous_weight_version,
+            rolled_back_at=AFTER_MARKET + timedelta(minutes=2),
+            session_date=SESSION_DATE,
+        )
+
+        active = store.read_snapshot(ACTIVE_WEIGHT_STATE_KEY)
+        self.assertEqual(rolled_back.weight_version, result.previous_weight_version)
+        self.assertEqual(active["weight_version"], result.previous_weight_version)
+        self.assertIn("weighted_voting.weights.rollback_applied", rolled_back.reason_codes)
+        rollback_audits = [key for key in store.snapshots if key.startswith(f"{UPDATE_AUDIT_PREFIX}{SESSION_DATE.isoformat()}.rollback")]
+        self.assertTrue(rollback_audits)
+
+    def test_scheduler_status_declares_owned_daily_update_boundary(self) -> None:
+        status = scheduler_status()
+
+        self.assertEqual(status["algorithmId"], "weighted_voting")
+        self.assertEqual(status["afterMarketUpdateEasternMinutes"], WEIGHTED_VOTING_AFTER_MARKET_UPDATE_EASTERN_MINUTES)
+        self.assertIn("dataset_completeness_validation", status["ownedResponsibilities"])
+        self.assertIn("previous_version_rollback", status["ownedResponsibilities"])
+        self.assertEqual(status["isolation"], "other_algorithm_backtests_or_daily_updates_do_not_block_weighted_voting")
 
 
 class MemoryStore:

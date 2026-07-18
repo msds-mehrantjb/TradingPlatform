@@ -5,7 +5,13 @@ from datetime import datetime, timedelta, timezone
 
 from backend.app.algorithms.weighted_voting.aggregation import aggregate_weighted_signals
 from backend.app.algorithms.weighted_voting.dynamic_settings import default_dynamic_envelope, default_hard_limits, default_weighted_settings, resolve_effective_settings
-from backend.app.algorithms.weighted_voting.entry_policy import WeightedEntryType, evaluate_entry_policy
+from backend.app.algorithms.weighted_voting.entry_policy import (
+    WEIGHTED_VOTING_ENTRY_POLICY_FRONTEND_MODE,
+    WeightedEntryTiming,
+    WeightedEntryType,
+    entry_policy_status,
+    evaluate_entry_policy,
+)
 from backend.app.algorithms.weighted_voting.models import (
     WeightedCandle,
     WeightedDataQualityStatus,
@@ -36,9 +42,32 @@ class WeightedVotingEntryPolicyTest(unittest.TestCase):
             self.assertTrue(result.reason_codes)
             self.assertIsNotNone(result.trigger_price)
             self.assertIsNotNone(result.limit_price)
+            self.assertGreater(result.maximum_spread, 0)
             self.assertGreater(result.entry_timeout_seconds, 0)
+            self.assertIsNotNone(result.entry_expiration)
             self.assertGreater(result.entry_buffer, 0)
             self.assertTrue(result.cancellation_condition)
+            self.assertTrue(result.entry_cancellation_conditions)
+            self.assertFalse(result.frontend_calculation_allowed)
+
+    def test_policy_contract_exposes_backend_authoritative_entry_controls(self) -> None:
+        settings = effective_settings()
+        immediate = evaluate_entry_policy(decision=decision_for(WeightedSide.BUY, WeightedStrategyFamily.MEAN_REVERSION), signals=signals_for(WeightedSide.BUY, WeightedStrategyFamily.MEAN_REVERSION), snapshot=mean_reversion_snapshot(), effective_settings=settings)
+        confirmation = evaluate_entry_policy(decision=decision_for(WeightedSide.BUY, WeightedStrategyFamily.BREAKOUT), signals=signals_for(WeightedSide.BUY, WeightedStrategyFamily.BREAKOUT), snapshot=breakout_snapshot(), effective_settings=settings)
+        status = entry_policy_status()
+
+        self.assertEqual(immediate.entry_timing, WeightedEntryTiming.IMMEDIATE.value)
+        self.assertEqual(immediate.order_type, "limit")
+        self.assertEqual(immediate.confirmation_bar_count, 0)
+        self.assertTrue(immediate.partial_entry_allowed)
+        self.assertFalse(immediate.re_entry_allowed)
+        self.assertEqual(confirmation.entry_timing, WeightedEntryTiming.CONFIRMATION.value)
+        self.assertEqual(confirmation.order_type, "stop_limit")
+        self.assertEqual(confirmation.confirmation_bar_count, 1)
+        self.assertTrue(confirmation.partial_entry_allowed)
+        self.assertTrue(confirmation.re_entry_allowed)
+        self.assertEqual(confirmation.entry_expiration, TS + timedelta(seconds=confirmation.entry_timeout_seconds))
+        self.assertEqual(status["frontendMode"], WEIGHTED_VOTING_ENTRY_POLICY_FRONTEND_MODE)
 
     def test_vwap_can_reject_but_never_change_side(self) -> None:
         result = evaluate_entry_policy(
@@ -51,6 +80,8 @@ class WeightedVotingEntryPolicyTest(unittest.TestCase):
         self.assertFalse(result.accepted)
         self.assertEqual(result.side, WeightedSide.BUY.value)
         self.assertEqual(result.entry_type, WeightedEntryType.REJECTED.value)
+        self.assertEqual(result.order_type, "none")
+        self.assertFalse(result.frontend_calculation_allowed)
         self.assertIn("weighted_voting.entry.trend.vwap_reject", result.reason_codes)
 
     def test_overextended_breakout_entries_are_rejected(self) -> None:

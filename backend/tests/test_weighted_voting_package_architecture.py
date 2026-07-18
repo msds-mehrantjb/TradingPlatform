@@ -27,6 +27,7 @@ EXPECTED_FILES = {
     "dynamic_settings.py",
     "risk_budget.py",
     "position_sizing.py",
+    "position_trade_state.py",
     "entry_policy.py",
     "exit_policy.py",
     "order_proposal.py",
