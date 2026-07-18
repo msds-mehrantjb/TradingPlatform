@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from backend.app.algorithms.regime.contracts import RegimeCandle, RegimeMarketSnapshot
+from backend.app.algorithms.regime.context_feeds import build_regime_context_feeds
 
 
 def build_regime_market_snapshot(payload: dict[str, Any]) -> RegimeMarketSnapshot:
@@ -19,7 +20,7 @@ def build_regime_market_snapshot(payload: dict[str, Any]) -> RegimeMarketSnapsho
         candles=tuple(sorted(candles, key=lambda candle: candle.timestamp)),
         one_minute_candles=tuple(sorted(one_minute, key=lambda candle: candle.timestamp)),
         five_minute_candles=tuple(sorted(five_minute, key=lambda candle: candle.timestamp)),
-        context_feeds=_context_feeds(payload.get("contextFeeds") or payload.get("context_feeds") or {}),
+        context_feeds=build_regime_context_feeds(payload.get("contextFeeds") or payload.get("context_feeds") or {}),
     )
 
 
@@ -33,16 +34,3 @@ def _candle(raw: dict[str, Any]) -> RegimeCandle:
         volume=float(raw.get("volume") or raw.get("v") or 0),
         vwap=float(raw["vwap"]) if raw.get("vwap") is not None else None,
     )
-
-
-def _context_feeds(raw: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "quoteFreshness": raw.get("quoteFreshness") or {"status": "unknown", "ageMs": None},
-        "qqqRelativeStrength": raw.get("qqqRelativeStrength") or {"state": "unknown", "relativeToPrimaryPercent": None},
-        "iwmRelativeStrength": raw.get("iwmRelativeStrength") or {"state": "unknown", "relativeToPrimaryPercent": None},
-        "marketBreadth": raw.get("marketBreadth") or {"state": "unknown", "advanceDeclineRatio": None},
-        "vix": raw.get("vix") or {"state": "unknown", "value": None},
-        "esFutures": raw.get("esFutures") or {"trend": "unknown", "changePercent": None},
-        "scheduledEconomicEvent": raw.get("scheduledEconomicEvent") or {"state": "unknown", "minutesUntilEvent": None},
-        "haltLuldCircuitBreaker": raw.get("haltLuldCircuitBreaker") or {"haltState": "unknown", "circuitBreakerState": "unknown", "newEntriesBlocked": False},
-    }
