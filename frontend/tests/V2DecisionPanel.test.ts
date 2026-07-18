@@ -41,14 +41,17 @@ import {
   REGIME_BACKTEST_OWNED_CAPABILITIES,
   REGIME_COMPATIBILITY_MATRIX,
   REGIME_COMPOSITE_REGIME_IDS,
+  REGIME_DIAGNOSTICS_FILE_INVENTORY,
   REGIME_IDENTITY_CONTRACT_FILES,
   REGIME_LEGACY_ALIASES,
   REGIME_ML_FILE_INVENTORY,
   REGIME_ML_INITIAL_MODE,
   REGIME_ML_SHADOW_FORBIDDEN_ACTIONS,
   REGIME_OPPORTUNITY_TAGS,
+  REGIME_FRONTEND_ROLLOUT_PHASES,
   REGIME_PROFILE_MATRIX,
   REGIME_PROFILE_VERSION,
+  REGIME_ROLLOUT_FILE_INVENTORY,
   REGIME_CONFIRMATION_MODULE_INVENTORY,
   REGIME_CONTEXT_MODULE_INVENTORY,
   REGIME_DIRECTIONAL_STRATEGY_INVENTORY,
@@ -62,6 +65,12 @@ import {
   permittedDirectionForRegime,
   regimeDecisionGateSettings,
   regimeBacktestInventoryStatus,
+  regimeDiagnosticsInventoryStatus,
+  buildRegimeDiagnosticsBundle,
+  compareRegimeShadowDecisions,
+  evaluateRegimeFrontendRolloutPolicy,
+  evaluateRegimePaperStability,
+  regimeFrontendRollbackPolicy,
   regimeMlInventoryStatus,
   regimeLiquidityCap,
   regimePositionAndBuyingPowerCaps,
@@ -657,6 +666,76 @@ test("Regime UI exposes dedicated Phase 15 diagnostics without WCA backtest rela
   const regimePanel = text.slice(regimePanelStart, regimePanelEnd);
   assert.match(regimePanel, /Dedicated Regime Backtest/);
   assert.doesNotMatch(regimePanel, /WCA Backtest/);
+});
+
+test("Regime owns dedicated diagnostics rollout and acceptance inventories", () => {
+  const output = calculateRegimeDecision({
+    marketData: {
+      symbol: "SPY",
+      primaryCandles: deterministicRegimeCandles(),
+      allCandles: deterministicRegimeCandles(),
+      oneMinuteCandles: deterministicRegimeCandles(),
+    },
+    settings: liquidRegimeSettings() as never,
+  });
+  const diagnostics = buildRegimeDiagnosticsBundle(output.result);
+  const diagnosticsStatus = regimeDiagnosticsInventoryStatus();
+
+  assert.deepEqual(REGIME_DIAGNOSTICS_FILE_INVENTORY, [
+    "diagnostics.ts",
+    "decision-trace.ts",
+    "classification-trace.ts",
+    "strategy-attribution.ts",
+    "profile-attribution.ts",
+  ]);
+  assert.deepEqual(diagnosticsStatus.files, REGIME_DIAGNOSTICS_FILE_INVENTORY);
+  assert.deepEqual(diagnosticsStatus.ownedTraceTypes, [
+    "decision_trace",
+    "classification_trace",
+    "strategy_attribution",
+    "profile_attribution",
+  ]);
+  assert.equal(diagnosticsStatus.readOnly, true);
+  assert.equal(diagnostics.decisionTrace.signal, output.result.signal);
+  assert.equal(diagnostics.classificationTrace.rawRegime, output.result.rawClassification?.rawRegime);
+  assert.equal(diagnostics.strategyAttribution.selectedStrategies.length, output.result.selectedStrategies.length);
+  assert.equal(diagnostics.profileAttribution.profileId, output.result.effectiveSettings?.profileId ?? null);
+
+  assert.deepEqual(REGIME_ROLLOUT_FILE_INVENTORY, [
+    "shadow-comparison.ts",
+    "paper-stability.ts",
+    "rollout-policy.ts",
+    "rollback-policy.ts",
+  ]);
+  assert.deepEqual(REGIME_FRONTEND_ROLLOUT_PHASES, [
+    "shadow_comparison",
+    "paper_stability",
+    "limited_paper_rollout",
+    "rollback_ready",
+  ]);
+  const rollout = evaluateRegimeFrontendRolloutPolicy({
+    shadowComparisonPassed: true,
+    paperStabilityPassed: true,
+    globalRiskAdapterReady: true,
+    brokerAdapterReady: true,
+    rollbackReady: true,
+  });
+  assert.equal(rollout.algorithmId, "regime");
+  assert.equal(rollout.limitedPaperAllowed, true);
+  assert.equal(rollout.liveTradingAllowed, false);
+  assert.equal(compareRegimeShadowDecisions(output.result, output.result).submitOrders, false);
+  assert.equal(evaluateRegimePaperStability({
+    decisions: 10,
+    rejectedOrders: 0,
+    duplicateOrderIntents: 0,
+    reconciliationBreaks: 0,
+    rollbackDrillsPassed: 1,
+  }).passed, true);
+  const rollback = regimeFrontendRollbackPolicy();
+  assert.equal(rollback.disableNewEntries, true);
+  assert.equal(rollback.preserveProtectiveExits, true);
+  assert.equal(rollback.deleteHistoricalRecords, false);
+  assert.equal(rollback.liveOrders, false);
 });
 
 test("Regime context and safety components cannot modify directional totals", () => {

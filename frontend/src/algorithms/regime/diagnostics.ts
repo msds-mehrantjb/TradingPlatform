@@ -1,4 +1,9 @@
 import type { RegimeSelectionResult } from "./types.ts";
+export * from "./diagnostics/diagnostics.ts";
+export * from "./diagnostics/decision-trace.ts";
+export * from "./diagnostics/classification-trace.ts";
+export * from "./diagnostics/strategy-attribution.ts";
+export * from "./diagnostics/profile-attribution.ts";
 
 export type RegimeDiagnosticSnapshot = {
   signal: string;

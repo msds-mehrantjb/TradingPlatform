@@ -52,6 +52,19 @@ export { evaluateRegimeMlPromotionPolicy } from "./ml/promotion-policy.ts";
 export { REGIME_ML_FILE_INVENTORY, REGIME_ML_INITIAL_MODE, REGIME_ML_SHADOW_FORBIDDEN_ACTIONS } from "./ml/types.ts";
 export { defaultRegimeMlValidationPlan, regimeMlInventoryStatus } from "./ml/validation.ts";
 export {
+  REGIME_DIAGNOSTICS_FILE_INVENTORY,
+  buildRegimeDiagnosticsBundle,
+  regimeDiagnosticsInventoryStatus,
+} from "./diagnostics/diagnostics.ts";
+export {
+  REGIME_FRONTEND_ROLLOUT_PHASES,
+  REGIME_ROLLOUT_FILE_INVENTORY,
+  evaluateRegimeFrontendRolloutPolicy,
+} from "./rollout/rollout-policy.ts";
+export { compareRegimeShadowDecisions } from "./rollout/shadow-comparison.ts";
+export { evaluateRegimePaperStability } from "./rollout/paper-stability.ts";
+export { regimeFrontendRollbackPolicy } from "./rollout/rollback-policy.ts";
+export {
   REGIME_COMPATIBILITY_MATRIX,
   REGIME_LEGACY_ROUTING_MATRIX,
   REGIME_NO_DIRECTIONAL_REGIMES,

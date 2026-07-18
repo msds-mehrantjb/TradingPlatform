@@ -22,9 +22,11 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | Regime risk sizing | `frontend/src/algorithms/regime/risk/*` | Dedicated position sizing, risk budget, stop/target distance, liquidity caps, and exposure caps. |
 | Regime trade management | `frontend/src/algorithms/regime/trade-management/*` | Dedicated entry, exit, stop, profit, time, regime-transition, and reconciliation policies. |
 | Regime execution | `frontend/src/algorithms/regime/execution/*` | Dedicated order intent, order validation, execution pipeline, idempotency, broker attribution, and reconciliation adapter. |
+| Regime diagnostics | `frontend/src/algorithms/regime/diagnostics/*` | Dedicated decision, classification, strategy-attribution, and profile-attribution traces. |
+| Regime rollout | `frontend/src/algorithms/regime/rollout/*` | Dedicated shadow-comparison, paper-stability, rollout-policy, and rollback-policy contracts. |
 | Regime ML | `frontend/src/algorithms/regime/ml/*` | Point-in-time feature building, artifact validation/loading, conservative prediction, offline labels, validation, and promotion policy. |
 | Regime backtest | `frontend/src/algorithms/regime/backtest/*` | Dedicated Regime replay engine, execution simulation, metrics, diagnostics, walk-forward summaries, and runner integration. |
-| Backend Regime API | `backend/app/algorithms/regime/*` | Regime-owned persistence, API routes, and staged paper rollout status. |
+| Backend Regime API | `backend/app/algorithms/regime/*` | Regime-owned service, repository, persistence, API routes, global-risk adapter, broker adapter, staged rollout, and acceptance status. |
 | Global risk | `backend/app/risk/*` | Backend-enforced global gates, portfolio/account snapshots, order integrity, reservations, and risk decisions shared across algorithms. |
 
 ## Identity And Contracts
@@ -200,6 +202,24 @@ The Regime algorithm owns immutable order-intent creation and validates the fina
 
 The order intent carries algorithm ID `regime`, algorithm version, decision ID, symbol, side, position effect, quantity, entry price, stop, target, requested risk amount, confirmed regime, and confidence. Shared order-side and position-effect types are the only accepted shared execution contracts here.
 
+## Diagnostics And Rollout
+
+The Regime algorithm owns its diagnostics and rollout inventories:
+
+| Component | Dedicated responsibility |
+| --- | --- |
+| `diagnostics/diagnostics.ts` | Diagnostic inventory and read-only bundle construction. |
+| `diagnostics/decision-trace.ts` | Final decision, score, blocker, and ML-mode trace. |
+| `diagnostics/classification-trace.ts` | Raw, confirmed, axis, missing-input, and transition trace. |
+| `diagnostics/strategy-attribution.ts` | Selected strategy, skipped strategy, family score, and active-family attribution. |
+| `diagnostics/profile-attribution.ts` | Effective-profile settings and blocker attribution. |
+| `rollout/shadow-comparison.ts` | Legacy-versus-candidate comparison without order submission. |
+| `rollout/paper-stability.ts` | Paper-run stability checks. |
+| `rollout/rollout-policy.ts` | Paper-only rollout sequence and limited-paper readiness. |
+| `rollout/rollback-policy.ts` | Safe rollback posture that disables entries, preserves exits, and keeps history. |
+
+Diagnostics are read-only views of Regime decisions. They must not recalculate strategy signals, mutate settings, resize orders, or alter exits. Rollout policy remains paper-only by default, and rollback must not delete historical Regime records.
+
 ## Persistence Boundary
 
 The backend Regime repository owns its durable SQLite schema and records under `backend/app/algorithms/regime/persistence.py`. Regime-owned tables are separated from shared account and broker tables in code through `REGIME_OWNED_TABLES` and `REGIME_SHARED_ATTRIBUTED_TABLES`.
@@ -223,6 +243,23 @@ Regime-owned tables:
 | `regime_ml_artifacts` | Regime ML artifact metadata. |
 
 Shared account and broker tables may remain portfolio-level infrastructure: `global_gate_evaluations`, `risk_reservations`, `broker_orders`, `fills`, and `positions`. Those tables must preserve Regime attribution with first-class columns for `algorithm_id = "regime"`, `decision_id`, `order_intent_id`, `position_id`, `trade_id`, `settings_version`, and `algorithm_version`. Shared tables may constrain or report Regime activity, but they must not become shared Regime state or rewrite Regime classifications, decisions, settings, strategy outputs, profiles, or artifacts.
+
+## Backend Boundary
+
+The backend package exposes explicit Regime boundaries:
+
+| Component | Dedicated responsibility |
+| --- | --- |
+| `__init__.py` | Regime backend exports. |
+| `api.py` | HTTP transport and route wiring. |
+| `service.py` | Regime application service boundary. |
+| `repository.py` | Regime-owned repository facade over the SQLite persistence implementation. |
+| `global_risk_adapter.py` | Adapter to shared global risk; may reduce or reject quantity only. |
+| `broker_adapter.py` | Broker-submission attribution adapter for globally approved Regime proposals only. |
+| `rollout.py` | Backend rollout, rollback, feature flags, and paper-only status. |
+| `final_acceptance.py` | Backend final-acceptance ledger. |
+
+`persistence.py` remains the internal SQLite implementation behind `repository.py`. The global-risk adapter must not rewrite signals, settings, or stops. The broker adapter must preserve Regime attribution and cannot own Regime signals or sizing.
 
 ## Authoritative Flow
 
