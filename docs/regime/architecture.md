@@ -19,6 +19,8 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | Regime routing | `frontend/src/algorithms/regime/routing/*` | Dedicated compatibility matrix, strategy eligibility, family mapping, conflict resolution, and alias deduplication. |
 | Regime decision | `frontend/src/algorithms/regime/decision/*` | Dedicated family aggregation, contribution caps, decision gates, abstention policy, evidence, and decision orchestration. |
 | Regime profile | `frontend/src/algorithms/regime/profile/*` | Dedicated baseline settings, regime profile matrix, bounded effective settings, validation, and versioning. |
+| Regime risk sizing | `frontend/src/algorithms/regime/risk/*` | Dedicated position sizing, risk budget, stop/target distance, liquidity caps, and exposure caps. |
+| Regime trade management | `frontend/src/algorithms/regime/trade-management/*` | Dedicated entry, exit, stop, profit, time, regime-transition, and reconciliation policies. |
 | Regime ML | `frontend/src/algorithms/regime/ml/*` | Point-in-time feature building, artifact validation/loading, conservative prediction, offline labels, validation, and promotion policy. |
 | Regime backtest | `frontend/src/algorithms/regime/backtest/*` | Dedicated Regime replay engine, execution simulation, metrics, diagnostics, walk-forward summaries, and runner integration. |
 | Backend Regime API | `backend/app/algorithms/regime/*` | Persistence, API routes, and staged paper rollout status. |
@@ -159,6 +161,28 @@ Regime baseline settings
 ```
 
 The effective profile controls entry-score threshold, minimum edge, minimum confidence, active strategy requirements, independent-family requirements, maximum abstention, risk percentage, position-allocation cap, daily allocation cap, stop distance, profit target, maximum hold time, trade count, spread and volume limits, participation rate, long/short permission, pyramiding permission, session restrictions, regime-specific size reduction, drawdown reduction, and extreme-volatility behavior. Dynamic profile adjustments preserve immutable defaults and are capped so risk, allocation, position exposure, participation, and trade count cannot exceed the baseline settings.
+
+## Sizing And Trade Management
+
+The Regime algorithm owns its sizing and open-position management policy. Root `position-sizing.ts` and `trade-management.ts` are compatibility facades over dedicated packages.
+
+| Component | Dedicated responsibility |
+| --- | --- |
+| `risk/position-sizing.ts` | Authoritative Regime quantity calculation. |
+| `risk/risk-budget.ts` | Signal-strength multiplier, risk-dollar budget, and sizing blockers. |
+| `risk/stop-calculation.ts` | Entry-to-stop distance calculation. |
+| `risk/target-calculation.ts` | Profit-target distance calculation. |
+| `risk/liquidity-cap.ts` | Volume participation cap. |
+| `risk/exposure-cap.ts` | Position, allocation, buying-power, and exposure caps. |
+| `trade-management/entry-policy.ts` | Open-position management orchestration and entry-side restrictions. |
+| `trade-management/exit-policy.ts` | Directional exits and event-risk reductions. |
+| `trade-management/stop-management.ts` | Protective stop and gap-through-stop exits. |
+| `trade-management/profit-management.ts` | Profit-target exits. |
+| `trade-management/time-exit.ts` | Maximum-hold and end-of-day exits. |
+| `trade-management/regime-transition-exit.ts` | Regime invalidation exits. |
+| `trade-management/position-reconciliation.ts` | Trade-history summary and pending-order lifecycle reconciliation. |
+
+Regime sizing uses only Regime decision strength, confirmed-regime confidence through the effective profile, entry and stop distance, Regime-specific risk allocation, available buying power, remaining algorithm risk budget, position cap, liquidity participation limit, and global-risk approval. The path contains no WCA sizing or WCA order adapters.
 
 ## Authoritative Flow
 

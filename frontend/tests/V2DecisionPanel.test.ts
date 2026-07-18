@@ -31,6 +31,7 @@ import {
   generateRegimeOrderIntentIdempotencyKey,
   loadRegimeMlArtifact,
   manageRegimeOpenPosition,
+  minutesBetween,
   REGIME_ALGORITHM_ID,
   REGIME_ALGORITHM_VERSION,
   REGIME_COMPATIBILITY_MATRIX,
@@ -51,6 +52,11 @@ import {
   canonicalRegimeRoutingStrategyId,
   permittedDirectionForRegime,
   regimeDecisionGateSettings,
+  regimeLiquidityCap,
+  regimePositionAndBuyingPowerCaps,
+  regimeRiskBudget,
+  regimeStopDistance,
+  regimeTargetDistance,
   regimeTradeBlockers,
   runRegimeBacktest,
   regimeSelectionStrategies,
@@ -61,6 +67,7 @@ import {
   recoverRegimeHysteresisState,
   signalStrengthMultiplierForWinningStrength,
   signedRegimeNetScore,
+  summarizeRegimeTradeHistory,
   validateDirectionalStrategyResult,
   validateEffectiveRegimeProfile,
   validateRegimeMlArtifact,
@@ -1773,6 +1780,43 @@ test("Regime position sizing uses the direction-neutral signal strength ladder",
   assert.equal(signalStrengthMultiplierForWinningStrength(0.95), 1);
 });
 
+test("Regime owns dedicated sizing risk inventory", () => {
+  assert.deepEqual(directoryFiles("risk"), [
+    "exposure-cap.ts",
+    "liquidity-cap.ts",
+    "position-sizing.ts",
+    "risk-budget.ts",
+    "stop-calculation.ts",
+    "target-calculation.ts",
+  ]);
+  const settings = regimeTradingSettingsFixture();
+  const defaults = {
+    baseRiskPercent: 1,
+    maxPositionPercent: 25,
+    fixedStopDistanceDollars: 0.5,
+    atrStopMultiplier: 2,
+    minimumStopDistancePercent: 0.1,
+    maxParticipationPercent: 0.5,
+    maxAllowedShares: 500,
+  };
+
+  assert.equal(regimeRiskBudget(100000, 1, 0.5), 500);
+  assert.equal(regimeStopDistance(100, 0.75, 2, defaults), 1.5);
+  assert.equal(regimeTargetDistance(1.5, 2), 3);
+  assert.equal(regimeLiquidityCap(10000, 0.5), 50);
+  const caps = regimePositionAndBuyingPowerCaps({
+    accountEquity: settings.startingCapital,
+    entryPrice: 100,
+    maxPositionPercent: 50,
+    orderAllocationPercent: 20,
+    dailyAllocationPercent: 30,
+    currentPosition: { marketValue: 1000 },
+  });
+  assert.equal(caps.maxPositionDollars, settings.startingCapital * 0.5);
+  assert.equal(caps.maxOrderDollars, settings.startingCapital * 0.2);
+  assert.equal(caps.availableBuyingPower, Math.min(settings.startingCapital * 0.5, settings.startingCapital * 0.3) - 1000);
+});
+
 test("Regime position sizing records every cap and limiting factor", () => {
   const candles = deterministicRegimeCandles();
   const market = buildRegimeMarketContext({
@@ -2003,6 +2047,27 @@ test("Regime Phase 16 integration flows cover trend range breakout choppy event 
   });
   assert.equal(invalidation.action, "exit_long");
   assert.equal("protectiveStopPrice" in invalidation, false);
+});
+
+test("Regime owns dedicated trade-management inventory", () => {
+  assert.deepEqual(directoryFiles("trade-management"), [
+    "entry-policy.ts",
+    "exit-policy.ts",
+    "position-reconciliation.ts",
+    "profit-management.ts",
+    "regime-transition-exit.ts",
+    "stop-management.ts",
+    "time-exit.ts",
+  ]);
+  assert.equal(minutesBetween("2026-01-05T15:00:00.000Z", "2026-01-05T15:07:30.000Z"), 7.5);
+  assert.deepEqual(
+    summarizeRegimeTradeHistory([
+      { id: "1", symbol: "SPY", side: "Buy", quantity: 10, price: 100, submittedAt: "2026-01-05T15:00:00.000Z" },
+      { id: "2", symbol: "SPY", side: "Sell", quantity: 4, price: 101, submittedAt: "2026-01-05T15:01:00.000Z" },
+      { id: "3", symbol: "QQQ", side: "Buy", quantity: 99, price: 400, submittedAt: "2026-01-05T15:02:00.000Z" },
+    ], "SPY"),
+    { tradeCount: 2, netQuantity: 6 },
+  );
 });
 
 test("Regime trade management exits do not depend on new-entry permission", () => {

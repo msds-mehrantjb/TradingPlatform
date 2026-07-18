@@ -99,8 +99,29 @@ export {
   validateRegimeProfileModifiers,
 } from "./dynamic-profile.ts";
 export { buildRegimeOrderIntent, buildRegimeTargetOrder, generateRegimeOrderIntentIdempotencyKey, resolveRegimePositionEffect } from "./order-intent.ts";
-export { calculateRegimePositionSize, calculateRegimePositionSizing, signalStrengthMultiplierForWinningStrength } from "./position-sizing.ts";
-export { manageRegimeOpenPosition } from "./trade-management.ts";
+export {
+  calculateRegimePositionSize,
+  calculateRegimePositionSizing,
+  regimeLiquidityCap,
+  regimePositionAndBuyingPowerCaps,
+  regimeRiskBudget,
+  regimeSizingBlockers,
+  regimeStopDistance,
+  regimeTargetDistance,
+  signalStrengthMultiplierForWinningStrength,
+} from "./position-sizing.ts";
+export {
+  directionalExitPolicy,
+  eventRiskReductionPolicy,
+  manageRegimeOpenPosition,
+  minutesBetween,
+  profitTargetExitPolicy,
+  protectiveStopExitPolicy,
+  reconcileRegimeOrderLifecycle,
+  regimeTransitionExitPolicy,
+  summarizeRegimeTradeHistory,
+  timeExitPolicy,
+} from "./trade-management.ts";
 export {
   REGIME_CONFIRMATION_MODULE_INVENTORY,
   REGIME_CONTEXT_MODULE_INVENTORY,
