@@ -12,9 +12,9 @@ from typing import Any, Iterator
 from backend.app.config import get_settings
 from backend.app.database import _sqlite_path
 
-REGIME_PERSISTENCE_MIGRATION_VERSION = "regime_persistence_phase14_001"
+REGIME_PERSISTENCE_MIGRATION_VERSION = "regime_persistence_phase14_002"
 REGIME_ALGORITHM_ID = "regime"
-REGIME_PERSISTENCE_TABLES = (
+REGIME_OWNED_TABLES = (
     "regime_decisions",
     "regime_classifications",
     "regime_transitions",
@@ -24,16 +24,29 @@ REGIME_PERSISTENCE_TABLES = (
     "regime_family_scores",
     "regime_effective_profiles",
     "regime_order_intents",
-    "global_gate_evaluations",
-    "risk_reservations",
-    "broker_orders",
-    "fills",
-    "positions",
     "regime_backtest_runs",
     "regime_backtest_trades",
     "regime_ml_predictions",
     "regime_ml_artifacts",
 )
+REGIME_SHARED_ATTRIBUTED_TABLES = (
+    "global_gate_evaluations",
+    "risk_reservations",
+    "broker_orders",
+    "fills",
+    "positions",
+)
+REGIME_SHARED_ATTRIBUTION_COLUMNS = (
+    "algorithm_id",
+    "decision_id",
+    "order_intent_id",
+    "position_id",
+    "trade_id",
+    "settings_version",
+    "algorithm_version",
+)
+REGIME_VERSION_COLUMNS = ("algorithm_version", "settings_version", "strategy_version", "profile_version")
+REGIME_PERSISTENCE_TABLES = REGIME_OWNED_TABLES + REGIME_SHARED_ATTRIBUTED_TABLES
 SECRET_KEY_PARTS = ("secret", "api_key", "apikey", "token", "password", "authorization", "alpaca_key")
 
 
@@ -55,6 +68,9 @@ def migrate_regime_sqlite_database(path: str | Path) -> None:
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_decision ON {table}(decision_id)")
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_symbol_time ON {table}(symbol, timestamp)")
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_order ON {table}(order_id)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_order_intent ON {table}(order_intent_id)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_position ON {table}(position_id)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_trade ON {table}(trade_id)")
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
             (REGIME_PERSISTENCE_MIGRATION_VERSION,),
@@ -76,6 +92,9 @@ def _table_ddl(table: str) -> str:
             data_timestamp TEXT NOT NULL,
             decision_id TEXT NOT NULL,
             order_id TEXT,
+            order_intent_id TEXT,
+            position_id TEXT,
+            trade_id TEXT,
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
@@ -97,6 +116,9 @@ def _ensure_regime_columns(conn: sqlite3.Connection, table: str) -> None:
         "data_timestamp": "TEXT NOT NULL DEFAULT ''",
         "decision_id": "TEXT NOT NULL DEFAULT ''",
         "order_id": "TEXT",
+        "order_intent_id": "TEXT",
+        "position_id": "TEXT",
+        "trade_id": "TEXT",
         "payload_json": "TEXT NOT NULL DEFAULT '{}'",
         "created_at": "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
     }
@@ -195,7 +217,29 @@ class RegimeSqliteRepository:
         with self.connect() as conn:
             return tuple(str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall())
 
+    def persistence_inventory(self) -> dict[str, Any]:
+        table_columns = {table: self.table_columns(table) for table in REGIME_PERSISTENCE_TABLES}
+        missing_shared_columns = {
+            table: tuple(column for column in REGIME_SHARED_ATTRIBUTION_COLUMNS if column not in table_columns[table])
+            for table in REGIME_SHARED_ATTRIBUTED_TABLES
+        }
+        missing_owned_version_columns = {
+            table: tuple(column for column in REGIME_VERSION_COLUMNS if column not in table_columns[table])
+            for table in REGIME_OWNED_TABLES
+        }
+        return {
+            "algorithmId": REGIME_ALGORITHM_ID,
+            "ownedTables": REGIME_OWNED_TABLES,
+            "sharedAttributedTables": REGIME_SHARED_ATTRIBUTED_TABLES,
+            "requiredSharedAttributionColumns": REGIME_SHARED_ATTRIBUTION_COLUMNS,
+            "ownedVersionColumns": REGIME_VERSION_COLUMNS,
+            "missingSharedAttributionColumns": missing_shared_columns,
+            "missingOwnedVersionColumns": missing_owned_version_columns,
+            "passed": not any(missing_shared_columns.values()) and not any(missing_owned_version_columns.values()),
+        }
+
     def _insert(self, conn: sqlite3.Connection, table: str, common: dict[str, str | None], suffix: str, payload: Any) -> None:
+        attribution = _attribution_metadata(common, payload)
         payload_json = json.dumps(sanitize_persistence_payload(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         record_id = _record_id(table, common["decision_id"] or "", suffix, payload_json)
         conn.execute(
@@ -203,9 +247,9 @@ class RegimeSqliteRepository:
             INSERT OR REPLACE INTO {table} (
                 record_id, algorithm_id, algorithm_version, settings_version, strategy_version,
                 profile_version, model_version, timestamp, symbol, data_timestamp,
-                decision_id, order_id, payload_json
+                decision_id, order_id, order_intent_id, position_id, trade_id, payload_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record_id,
@@ -220,6 +264,9 @@ class RegimeSqliteRepository:
                 common["data_timestamp"],
                 common["decision_id"],
                 common["order_id"],
+                attribution["order_intent_id"],
+                attribution["position_id"],
+                attribution["trade_id"],
                 payload_json,
             ),
         )
@@ -244,6 +291,14 @@ def _common_metadata(snapshot: dict[str, Any], regime: dict[str, Any], decision:
     data_timestamp = str(regime.get("dataTimestamp") or decision.get("dataTimestamp") or timestamp)
     symbol = str(regime.get("symbol") or decision.get("symbol") or snapshot.get("symbol") or "UNKNOWN").upper()
     decision_id = str(regime.get("decisionId") or decision.get("decisionId") or f"regime:{symbol}:{data_timestamp}")
+    order_intent_id = _string_or_none(
+        regime.get("orderIntentId")
+        or regime.get("order_intent_id")
+        or decision.get("orderIntentId")
+        or decision.get("order_intent_id")
+        or _record(regime.get("orderIntent")).get("orderIntentId")
+        or _record(regime.get("orderIntent")).get("order_intent_id")
+    )
     return {
         "algorithm_id": REGIME_ALGORITHM_ID,
         "algorithm_version": str(regime.get("algorithmVersion") or decision.get("algorithmVersion") or "regime_algorithm_v2"),
@@ -256,6 +311,9 @@ def _common_metadata(snapshot: dict[str, Any], regime: dict[str, Any], decision:
         "data_timestamp": data_timestamp,
         "decision_id": decision_id,
         "order_id": None if (regime.get("orderId") or decision.get("orderId")) is None else str(regime.get("orderId") or decision.get("orderId")),
+        "order_intent_id": order_intent_id,
+        "position_id": _string_or_none(regime.get("positionId") or regime.get("position_id") or decision.get("positionId") or decision.get("position_id")),
+        "trade_id": _string_or_none(regime.get("tradeId") or regime.get("trade_id") or decision.get("tradeId") or decision.get("trade_id")),
     }
 
 
@@ -287,9 +345,36 @@ def _record_id(table: str, decision_id: str, suffix: str, payload_json: str) -> 
     return f"{table}:{digest}"
 
 
+def _attribution_metadata(common: dict[str, str | None], payload: Any) -> dict[str, str | None]:
+    record = _record(payload)
+    return {
+        "order_intent_id": _string_or_none(
+            record.get("orderIntentId")
+            or record.get("order_intent_id")
+            or record.get("idempotencyKey")
+            or record.get("idempotency_key")
+            or common.get("order_intent_id")
+            or common.get("order_id")
+        ),
+        "position_id": _string_or_none(record.get("positionId") or record.get("position_id") or common.get("position_id")),
+        "trade_id": _string_or_none(record.get("tradeId") or record.get("trade_id") or common.get("trade_id")),
+    }
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
 __all__ = [
     "REGIME_PERSISTENCE_MIGRATION_VERSION",
+    "REGIME_OWNED_TABLES",
     "REGIME_PERSISTENCE_TABLES",
+    "REGIME_SHARED_ATTRIBUTED_TABLES",
+    "REGIME_SHARED_ATTRIBUTION_COLUMNS",
+    "REGIME_VERSION_COLUMNS",
     "RegimeSqliteRepository",
     "migrate_regime_sqlite_database",
     "sanitize_persistence_payload",

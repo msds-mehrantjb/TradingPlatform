@@ -24,7 +24,7 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | Regime execution | `frontend/src/algorithms/regime/execution/*` | Dedicated order intent, order validation, execution pipeline, idempotency, broker attribution, and reconciliation adapter. |
 | Regime ML | `frontend/src/algorithms/regime/ml/*` | Point-in-time feature building, artifact validation/loading, conservative prediction, offline labels, validation, and promotion policy. |
 | Regime backtest | `frontend/src/algorithms/regime/backtest/*` | Dedicated Regime replay engine, execution simulation, metrics, diagnostics, walk-forward summaries, and runner integration. |
-| Backend Regime API | `backend/app/algorithms/regime/*` | Persistence, API routes, and staged paper rollout status. |
+| Backend Regime API | `backend/app/algorithms/regime/*` | Regime-owned persistence, API routes, and staged paper rollout status. |
 | Global risk | `backend/app/risk/*` | Backend-enforced global gates, portfolio/account snapshots, order integrity, reservations, and risk decisions shared across algorithms. |
 
 ## Identity And Contracts
@@ -199,6 +199,30 @@ The Regime algorithm owns immutable order-intent creation and validates the fina
 | `execution/reconciliation-adapter.ts` | Broker reconciliation adapter that preserves Regime ownership. |
 
 The order intent carries algorithm ID `regime`, algorithm version, decision ID, symbol, side, position effect, quantity, entry price, stop, target, requested risk amount, confirmed regime, and confidence. Shared order-side and position-effect types are the only accepted shared execution contracts here.
+
+## Persistence Boundary
+
+The backend Regime repository owns its durable SQLite schema and records under `backend/app/algorithms/regime/persistence.py`. Regime-owned tables are separated from shared account and broker tables in code through `REGIME_OWNED_TABLES` and `REGIME_SHARED_ATTRIBUTED_TABLES`.
+
+Regime-owned tables:
+
+| Table | Ownership rule |
+| --- | --- |
+| `regime_decisions` | Regime decision snapshots. |
+| `regime_classifications` | Raw and confirmed Regime classification records. |
+| `regime_transitions` | Confirmed-regime and transition-state history. |
+| `regime_strategy_outputs` | Directional strategy evaluations and abstentions. |
+| `regime_context_outputs` | Confirmation and context module results. |
+| `regime_safety_results` | Regime safety-gate results. |
+| `regime_family_scores` | Family-level aggregation records. |
+| `regime_effective_profiles` | Effective dynamic profile records. |
+| `regime_order_intents` | Regime order-intent records. |
+| `regime_backtest_runs` | Regime backtest run metadata. |
+| `regime_backtest_trades` | Regime backtest trade records. |
+| `regime_ml_predictions` | Shadow-mode Regime ML prediction records. |
+| `regime_ml_artifacts` | Regime ML artifact metadata. |
+
+Shared account and broker tables may remain portfolio-level infrastructure: `global_gate_evaluations`, `risk_reservations`, `broker_orders`, `fills`, and `positions`. Those tables must preserve Regime attribution with first-class columns for `algorithm_id = "regime"`, `decision_id`, `order_intent_id`, `position_id`, `trade_id`, `settings_version`, and `algorithm_version`. Shared tables may constrain or report Regime activity, but they must not become shared Regime state or rewrite Regime classifications, decisions, settings, strategy outputs, profiles, or artifacts.
 
 ## Authoritative Flow
 

@@ -7,7 +7,14 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
-from backend.app.algorithms.regime.persistence import REGIME_PERSISTENCE_TABLES, RegimeSqliteRepository
+from backend.app.algorithms.regime.persistence import (
+    REGIME_OWNED_TABLES,
+    REGIME_PERSISTENCE_TABLES,
+    REGIME_SHARED_ATTRIBUTED_TABLES,
+    REGIME_SHARED_ATTRIBUTION_COLUMNS,
+    REGIME_VERSION_COLUMNS,
+    RegimeSqliteRepository,
+)
 from backend.app.main import app
 
 
@@ -23,7 +30,34 @@ REQUIRED_COLUMNS = {
     "data_timestamp",
     "decision_id",
     "order_id",
+    "order_intent_id",
+    "position_id",
+    "trade_id",
 }
+
+EXPECTED_REGIME_OWNED_TABLES = (
+    "regime_decisions",
+    "regime_classifications",
+    "regime_transitions",
+    "regime_strategy_outputs",
+    "regime_context_outputs",
+    "regime_safety_results",
+    "regime_family_scores",
+    "regime_effective_profiles",
+    "regime_order_intents",
+    "regime_backtest_runs",
+    "regime_backtest_trades",
+    "regime_ml_predictions",
+    "regime_ml_artifacts",
+)
+
+EXPECTED_SHARED_ATTRIBUTED_TABLES = (
+    "global_gate_evaluations",
+    "risk_reservations",
+    "broker_orders",
+    "fills",
+    "positions",
+)
 
 
 class RegimePhase14PersistenceTest(unittest.TestCase):
@@ -36,7 +70,40 @@ class RegimePhase14PersistenceTest(unittest.TestCase):
 
         with sqlite3.connect(path) as conn:
             versions = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
-        self.assertIn("regime_persistence_phase14_001", versions)
+        self.assertIn("regime_persistence_phase14_002", versions)
+
+    def test_inventory_separates_regime_owned_tables_from_shared_attributed_tables(self) -> None:
+        path = temp_db_path()
+        repository = RegimeSqliteRepository(f"sqlite:///{path}")
+        inventory = repository.persistence_inventory()
+
+        self.assertEqual(REGIME_OWNED_TABLES, EXPECTED_REGIME_OWNED_TABLES)
+        self.assertEqual(REGIME_SHARED_ATTRIBUTED_TABLES, EXPECTED_SHARED_ATTRIBUTED_TABLES)
+        self.assertEqual(REGIME_PERSISTENCE_TABLES, EXPECTED_REGIME_OWNED_TABLES + EXPECTED_SHARED_ATTRIBUTED_TABLES)
+        self.assertEqual(
+            REGIME_SHARED_ATTRIBUTION_COLUMNS,
+            (
+                "algorithm_id",
+                "decision_id",
+                "order_intent_id",
+                "position_id",
+                "trade_id",
+                "settings_version",
+                "algorithm_version",
+            ),
+        )
+        self.assertEqual(REGIME_VERSION_COLUMNS, ("algorithm_version", "settings_version", "strategy_version", "profile_version"))
+        self.assertTrue(inventory["passed"])
+        self.assertEqual(inventory["missingSharedAttributionColumns"], {table: () for table in EXPECTED_SHARED_ATTRIBUTED_TABLES})
+        self.assertEqual(inventory["missingOwnedVersionColumns"], {table: () for table in EXPECTED_REGIME_OWNED_TABLES})
+
+    def test_shared_account_and_broker_tables_preserve_regime_attribution_columns(self) -> None:
+        path = temp_db_path()
+        repository = RegimeSqliteRepository(f"sqlite:///{path}")
+
+        for table in REGIME_SHARED_ATTRIBUTED_TABLES:
+            columns = set(repository.table_columns(table))
+            self.assertTrue(set(REGIME_SHARED_ATTRIBUTION_COLUMNS).issubset(columns), table)
 
     def test_decision_snapshot_fans_out_and_redacts_secrets(self) -> None:
         path = temp_db_path()
@@ -58,8 +125,10 @@ class RegimePhase14PersistenceTest(unittest.TestCase):
 
         with sqlite3.connect(path) as conn:
             payload = conn.execute("SELECT payload_json FROM regime_decisions").fetchone()[0]
+            order_intent_id = conn.execute("SELECT order_intent_id FROM regime_order_intents").fetchone()[0]
         self.assertNotIn("top-secret", payload)
         self.assertIn("[REDACTED]", payload)
+        self.assertEqual(order_intent_id, "regime-intent-1")
 
     def test_backtest_result_persists_run_and_trade_records(self) -> None:
         path = temp_db_path()
@@ -80,6 +149,9 @@ class RegimePhase14PersistenceTest(unittest.TestCase):
         tables = response.json()["tables"]
         self.assertIn("regime_decisions", tables)
         self.assertTrue(REQUIRED_COLUMNS.issubset(set(tables["regime_decisions"])))
+        self.assertEqual(tuple(response.json()["ownedTables"]), EXPECTED_REGIME_OWNED_TABLES)
+        self.assertEqual(tuple(response.json()["sharedAttributedTables"]), EXPECTED_SHARED_ATTRIBUTED_TABLES)
+        self.assertTrue(response.json()["inventoryPassed"])
 
 
 def sample_snapshot() -> dict:
@@ -99,6 +171,9 @@ def sample_snapshot() -> dict:
             "symbol": "SPY",
             "decisionId": "regime:SPY:2026-01-05T15:30:00.000Z",
             "orderId": "regime-order-1",
+            "orderIntentId": "regime-intent-1",
+            "positionId": "regime-position-1",
+            "tradeId": "regime-trade-1",
             "rawClassification": {"rawRegime": "strong_uptrend", "axes": {"direction": "strong_up"}, "missingInputs": []},
             "confirmedState": {"confirmedRegime": "strong_uptrend", "candidateCount": 3},
             "selectedStrategies": [{"strategy": "moving_average_trend", "signal": "buy"}],
@@ -108,7 +183,11 @@ def sample_snapshot() -> dict:
             "familyAggregation": [{"family": "trend", "buyScore": 0.2}],
             "effectiveSettings": {"profileId": "strong_uptrend:regime_profile_matrix_v1"},
             "ml": {"prediction": {"probabilityVector": {"strong_uptrend": 0.72}}},
-            "orderIntent": {"decisionId": "regime:SPY:2026-01-05T15:30:00.000Z", "idempotencyKey": "regime-order-1"},
+            "orderIntent": {
+                "decisionId": "regime:SPY:2026-01-05T15:30:00.000Z",
+                "orderIntentId": "regime-intent-1",
+                "idempotencyKey": "regime-order-1",
+            },
         },
     }
 

@@ -67,8 +67,14 @@ def regime_rollout_status_route() -> dict[str, Any]:
 
 @router.get("/persistence/schema", summary="Describe Regime persistence schema")
 def regime_persistence_schema() -> dict[str, Any]:
+    inventory = REGIME_REPOSITORY.persistence_inventory()
     return {
         "algorithmId": "regime",
+        "ownedTables": inventory["ownedTables"],
+        "sharedAttributedTables": inventory["sharedAttributedTables"],
+        "requiredSharedAttributionColumns": inventory["requiredSharedAttributionColumns"],
+        "ownedVersionColumns": inventory["ownedVersionColumns"],
+        "inventoryPassed": inventory["passed"],
         "tables": {
             table: REGIME_REPOSITORY.table_columns(table)
             for table in REGIME_PERSISTENCE_TABLES
