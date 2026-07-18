@@ -90,9 +90,13 @@ export {
 export { resolveRegimeDynamicProfile } from "./dynamic-profile.ts";
 export {
   baseRegimeSettingsFromTradingSettings,
+  boundedRegimeEffectiveSettings,
   buildRegimeProfileModifierBreakdown,
   combineRegimeProfileModifiers,
+  REGIME_PROFILE_MATRIX,
   resolveEffectiveRegimeSettings,
+  validateEffectiveRegimeProfile,
+  validateRegimeProfileModifiers,
 } from "./dynamic-profile.ts";
 export { buildRegimeOrderIntent, buildRegimeTargetOrder, generateRegimeOrderIntentIdempotencyKey, resolveRegimePositionEffect } from "./order-intent.ts";
 export { calculateRegimePositionSize, calculateRegimePositionSizing, signalStrengthMultiplierForWinningStrength } from "./position-sizing.ts";

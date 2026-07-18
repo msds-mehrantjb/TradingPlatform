@@ -19,6 +19,7 @@ import {
   buildOfflineRegimeLabel,
   buildRegimeMlFeatures,
   baseRegimeSettingsFromTradingSettings,
+  boundedRegimeEffectiveSettings,
   calculateRegimePositionSize,
   confirmedRegimeCondition,
   createConfirmedRegimeState,
@@ -37,6 +38,7 @@ import {
   REGIME_IDENTITY_CONTRACT_FILES,
   REGIME_LEGACY_ALIASES,
   REGIME_OPPORTUNITY_TAGS,
+  REGIME_PROFILE_MATRIX,
   REGIME_PROFILE_VERSION,
   REGIME_CONFIRMATION_MODULE_INVENTORY,
   REGIME_CONTEXT_MODULE_INVENTORY,
@@ -60,6 +62,7 @@ import {
   signalStrengthMultiplierForWinningStrength,
   signedRegimeNetScore,
   validateDirectionalStrategyResult,
+  validateEffectiveRegimeProfile,
   validateRegimeMlArtifact,
   validateRegimeHysteresisSettings,
   validateRegimeIdentityContracts,
@@ -1560,6 +1563,52 @@ test("Regime decision snapshots include Phase 14 recorder fields", () => {
   assert.equal(snapshot.mlMode, output.result.ml?.mode);
   assert.equal(snapshot.globalGateOutcome, null);
   assert.equal(snapshot.brokerReconciliationResult, null);
+});
+
+test("Regime owns dedicated dynamic trading profile inventory", () => {
+  assert.deepEqual(directoryFiles("profile"), [
+    "baseline-settings.ts",
+    "dynamic-profile.ts",
+    "profile-bounds.ts",
+    "profile-validation.ts",
+    "profile-versioning.ts",
+    "regime-profile-matrix.ts",
+  ]);
+  assert.equal(REGIME_PROFILE_VERSION, "regime_profile_matrix_v1");
+  assert.equal(REGIME_PROFILE_MATRIX.extreme_volatility_no_trade.newEntriesAllowed, false);
+  assert.equal(REGIME_PROFILE_MATRIX.extreme_volatility_no_trade.maximumTradesOverride, 0);
+
+  const base = baseRegimeSettingsFromTradingSettings(regimeTradingSettingsFixture());
+  const bounded = boundedRegimeEffectiveSettings(base, {
+    baseSettingsVersion: "settings",
+    profileVersion: REGIME_PROFILE_VERSION,
+    profileId: "strong_uptrend:test",
+    confirmedRegime: "strong_uptrend",
+    generatedAt: "2026-01-05T15:30:00.000Z",
+    effectiveRiskPercent: base.baseRiskPercent * 3,
+    effectiveOrderAllocationPercent: base.orderAllocationPercent * 3,
+    effectiveMaxPositionPercent: base.maxPositionPercent * 3,
+    effectiveAtrStopMultiplier: base.atrStopMultiplier,
+    effectiveTakeProfitR: base.takeProfitR,
+    effectiveMaximumParticipationPercent: base.maximumVolumeParticipationPercent * 3,
+    effectiveMinimumWinningScore: 0,
+    effectiveMinimumDirectionalEdge: 0,
+    effectiveMinimumRegimeConfidence: 0,
+    effectiveMaximumTrades: base.maxTradesPerDay + 10,
+    newEntriesAllowed: true,
+    pyramidingAllowed: base.pyramidingEnabled,
+    reasons: [],
+  });
+
+  assert.equal(bounded.effectiveRiskPercent, base.baseRiskPercent);
+  assert.equal(bounded.effectiveOrderAllocationPercent, base.orderAllocationPercent);
+  assert.equal(bounded.effectiveMaxPositionPercent, base.maxPositionPercent);
+  assert.equal(bounded.effectiveMaximumParticipationPercent, base.maximumVolumeParticipationPercent);
+  assert.equal(bounded.effectiveMinimumWinningScore, base.minimumWinningScore);
+  assert.equal(bounded.effectiveMinimumDirectionalEdge, base.minimumDirectionalEdge);
+  assert.equal(bounded.effectiveMinimumRegimeConfidence, base.minimumRegimeConfidence);
+  assert.equal(bounded.effectiveMaximumTrades, base.maxTradesPerDay);
+  assert.deepEqual(validateEffectiveRegimeProfile(base, bounded), []);
 });
 
 test("Regime dynamic profiles derive effective settings without mutating base settings", () => {

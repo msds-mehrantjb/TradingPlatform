@@ -18,6 +18,7 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | Regime strategies | `frontend/src/algorithms/regime/strategies/*` | Dedicated strategy inventory for directional strategies, confirmation modules, context modules, safety gates, and aliases. |
 | Regime routing | `frontend/src/algorithms/regime/routing/*` | Dedicated compatibility matrix, strategy eligibility, family mapping, conflict resolution, and alias deduplication. |
 | Regime decision | `frontend/src/algorithms/regime/decision/*` | Dedicated family aggregation, contribution caps, decision gates, abstention policy, evidence, and decision orchestration. |
+| Regime profile | `frontend/src/algorithms/regime/profile/*` | Dedicated baseline settings, regime profile matrix, bounded effective settings, validation, and versioning. |
 | Regime ML | `frontend/src/algorithms/regime/ml/*` | Point-in-time feature building, artifact validation/loading, conservative prediction, offline labels, validation, and promotion policy. |
 | Regime backtest | `frontend/src/algorithms/regime/backtest/*` | Dedicated Regime replay engine, execution simulation, metrics, diagnostics, walk-forward summaries, and runner integration. |
 | Backend Regime API | `backend/app/algorithms/regime/*` | Persistence, API routes, and staged paper rollout status. |
@@ -134,6 +135,30 @@ Immutable market snapshot
 ```
 
 The decision path preserves valid Sell decisions and contains no WCA sizing or WCA order adapters.
+
+## Dynamic Profile
+
+The Regime algorithm privately derives effective trading settings from the user baseline and the confirmed market regime. Root `dynamic-profile.ts` is a compatibility facade over the dedicated profile package.
+
+| Component | Dedicated responsibility |
+| --- | --- |
+| `profile/baseline-settings.ts` | Immutable baseline settings derived from user trading settings. |
+| `profile/regime-profile-matrix.ts` | Regime-specific bounded adjustment matrix. |
+| `profile/dynamic-profile.ts` | Effective profile resolution workflow. |
+| `profile/profile-bounds.ts` | Defensive caps that prevent dynamic settings from exceeding baseline limits. |
+| `profile/profile-validation.ts` | Profile modifier and effective profile validation. |
+| `profile/profile-versioning.ts` | Regime profile version export. |
+
+The profile flow is:
+
+```text
+Regime baseline settings
+  -> confirmed market regime
+  -> Regime-specific bounded adjustments
+  -> effective Regime trading profile
+```
+
+The effective profile controls entry-score threshold, minimum edge, minimum confidence, active strategy requirements, independent-family requirements, maximum abstention, risk percentage, position-allocation cap, daily allocation cap, stop distance, profit target, maximum hold time, trade count, spread and volume limits, participation rate, long/short permission, pyramiding permission, session restrictions, regime-specific size reduction, drawdown reduction, and extreme-volatility behavior. Dynamic profile adjustments preserve immutable defaults and are capped so risk, allocation, position exposure, participation, and trade count cannot exceed the baseline settings.
 
 ## Authoritative Flow
 
