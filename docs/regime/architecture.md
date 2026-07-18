@@ -67,12 +67,12 @@ The Regime catalog contains 28 definitions split into four roles:
 
 | Role | Count | Dedicated files | Rule |
 | --- | ---: | --- | --- |
-| Directional strategies | 14 | `strategies/directional-strategies.ts` | May emit Buy, Sell, or Hold. |
-| Confirmation modules | 2 | `strategies/confirmation-modules.ts` | Modify eligibility, confidence, quality, or weight without emitting Buy/Sell votes. |
-| Regime-context modules | 2 | `strategies/context-modules.ts` | Describe the environment for routing or weighting without acting as primary voters. |
-| Safety gates | 10 | `strategies/safety-gates.ts` | Execute before order creation and may reject, reduce, or delay entries only. |
+| Directional strategies | 14 | `strategies/directional/*` | May emit Buy, Sell, or Hold. |
+| Confirmation modules | 2 | `strategies/confirmation/*` | Modify eligibility, confidence, quality, or weight without emitting Buy/Sell votes. |
+| Regime-context modules | 2 | `strategies/context/*` | Describe the environment for routing or weighting without acting as primary voters. |
+| Safety gates | 10 | `strategies/safety/*` | Execute before order creation and may reject, reduce, or delay entries only. |
 
-Aliases in `strategies/aliases.ts` map to canonical strategies and must never receive separate votes.
+Aliases in `strategies/alias-map.ts` map to canonical strategies and must never receive separate votes.
 
 ## Authoritative Flow
 

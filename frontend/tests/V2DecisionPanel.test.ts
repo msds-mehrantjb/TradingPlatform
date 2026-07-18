@@ -596,16 +596,49 @@ test("Regime owns the dedicated strategy role inventory", () => {
   const root = fileURLToPath(new URL("../src/algorithms/regime/strategies", import.meta.url));
   const strategyInventoryFiles = new Set(readdirSync(root));
   for (const file of [
-    "index.ts",
-    "inventory.ts",
-    "directional-strategies.ts",
-    "confirmation-modules.ts",
-    "context-modules.ts",
-    "safety-gates.ts",
-    "aliases.ts",
+    "base.ts",
+    "registry.ts",
+    "evaluator.ts",
+    "alias-map.ts",
   ]) {
     assert.equal(strategyInventoryFiles.has(file), true, `${file} should exist in the Regime strategy inventory`);
   }
+  assert.deepEqual(directoryFiles("strategies/directional"), [
+    "bollinger-band-mean-reversion.ts",
+    "failed-breakout-reversal.ts",
+    "gap-continuation-fade.ts",
+    "intraday-breakout.ts",
+    "liquidity-sweep-reversal.ts",
+    "macd-momentum.ts",
+    "market-structure.ts",
+    "moving-average-trend.ts",
+    "opening-range-breakout.ts",
+    "rsi-mean-reversion.ts",
+    "trend-pullback.ts",
+    "volatility-breakout.ts",
+    "vwap-mean-reversion.ts",
+    "vwap-trend-continuation.ts",
+  ]);
+  assert.deepEqual(directoryFiles("strategies/confirmation"), [
+    "adx-trend-strength.ts",
+    "volume-confirmation.ts",
+  ]);
+  assert.deepEqual(directoryFiles("strategies/context"), [
+    "atr-volatility-regime.ts",
+    "vwap-position.ts",
+  ]);
+  assert.deepEqual(directoryFiles("strategies/safety"), [
+    "cash-avoid-filter.ts",
+    "circuit-breaker.ts",
+    "event-blackout.ts",
+    "excessive-spread.ts",
+    "extreme-volatility.ts",
+    "halt-luld.ts",
+    "insufficient-liquidity.ts",
+    "missing-critical-data.ts",
+    "stale-data.ts",
+    "unsupported-session.ts",
+  ]);
 
   assert.equal(REGIME_TOTAL_STRATEGY_DEFINITION_COUNT, 28);
   assert.equal(regimeSelectionStrategies.length, 28);
@@ -2252,6 +2285,13 @@ function catalogInventory(role: RegimeStrategyDefinition["role"]) {
   return regimeSelectionStrategies
     .filter((strategy) => strategy.role === role)
     .map((strategy) => ({ key: strategy.key ?? null, id: strategy.id, name: strategy.name }));
+}
+
+function directoryFiles(relativePath: string): string[] {
+  const root = fileURLToPath(new URL(`../src/algorithms/regime/${relativePath}`, import.meta.url));
+  return readdirSync(root)
+    .filter((entry) => entry.endsWith(".ts"))
+    .sort((left, right) => left.localeCompare(right));
 }
 
 function readyState(): V2DecisionPanelState {

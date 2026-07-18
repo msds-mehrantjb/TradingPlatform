@@ -71,10 +71,10 @@ export {
   REGIME_CONTEXT_MODULE_INVENTORY,
   REGIME_DIRECTIONAL_STRATEGY_INVENTORY,
   REGIME_SAFETY_GATE_INVENTORY,
-  REGIME_STRATEGY_ALIAS_INVENTORY,
   REGIME_STRATEGY_ROLE_INVENTORY,
   REGIME_TOTAL_STRATEGY_DEFINITION_COUNT,
-} from "./strategies/index.ts";
+} from "./strategies/registry.ts";
+export { REGIME_STRATEGY_ALIAS_INVENTORY, REGIME_STRATEGY_ALIAS_MAP } from "./strategies/alias-map.ts";
 export { regimeBacktestCacheKey, runRegimeBacktest } from "./backtest/engine.ts";
 export { runNodeRegimeBacktest } from "./backtest/runner.ts";
 export { runRegimeWalkForward } from "./backtest/walk-forward.ts";
