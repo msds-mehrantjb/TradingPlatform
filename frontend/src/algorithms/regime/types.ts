@@ -97,6 +97,18 @@ export type RegimeHysteresisSettings = {
   maximumUnknownBars: number;
 };
 
+export type RegimeTransitionHistoryEntry = {
+  rawRegime: MarketRegimeId;
+  confirmedRegime: MarketRegimeId;
+  previousRegime: MarketRegimeId | null;
+  candidateRegime: MarketRegimeId | null;
+  candidateCount: number;
+  dwellBars: number;
+  transitionConfidence: number;
+  transitionReason: string;
+  timestamp: string;
+};
+
 export type ConfirmedRegimeState = {
   rawRegime: MarketRegimeId;
   confirmedRegime: MarketRegimeId;
@@ -108,6 +120,13 @@ export type ConfirmedRegimeState = {
   heldPreviousRegime: boolean;
   transitionReason: string;
   timestamp: string;
+  previousRegime?: MarketRegimeId | null;
+  regimeStartTime?: string;
+  minimumDwellSatisfied?: boolean;
+  unknownRegimeCount?: number;
+  transitionConfidence?: number;
+  transitionEvidence?: Record<string, number | string | boolean | null>;
+  transitionHistory?: RegimeTransitionHistoryEntry[];
 };
 
 export type RegimeFeatureStatus = "ok" | "warn" | "block" | "na";
@@ -391,6 +410,13 @@ export type RegimeConditionSnapshot = {
   heldPreviousRegime?: boolean;
   transitionReason?: string;
   timestamp?: string;
+  previousRegime?: MarketRegimeId | null;
+  regimeStartTime?: string;
+  minimumDwellSatisfied?: boolean;
+  unknownRegimeCount?: number;
+  transitionConfidence?: number;
+  transitionEvidence?: Record<string, number | string | boolean | null>;
+  transitionHistory?: RegimeTransitionHistoryEntry[];
 };
 
 export type RegimeHysteresisSnapshot = RegimeConditionSnapshot | null;

@@ -13,6 +13,7 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | Shared contracts | `frontend/src/trading/shared/*` | Market data, account, order-intent, and gate-result types shared without algorithm state. |
 | Regime core | `frontend/src/algorithms/regime/*` | Pure TypeScript Regime decision logic, strategy routing, aggregation, dynamic profiles, sizing, intent building, diagnostics, and persistence helpers. |
 | Regime classification | `frontend/src/algorithms/regime/classification/*` | Isolated classifier inventory for axes, composite regimes, evidence, hysteresis, transition policy, and no-trade classification. |
+| Regime state | `frontend/src/algorithms/regime/state/*` | Dedicated confirmed-regime state, dwell policy, hysteresis, recovery, and transition history. |
 | Regime market boundary | `frontend/src/algorithms/regime/market/*` | Immutable Regime market snapshots, read-only feature snapshots, context-feed adapters, quote freshness, indicators, and session context. |
 | Regime strategies | `frontend/src/algorithms/regime/strategies/*` | Dedicated strategy inventory for directional strategies, confirmation modules, context modules, safety gates, and aliases. |
 | Regime routing | `frontend/src/algorithms/regime/routing/*` | Dedicated compatibility matrix, strategy eligibility, family mapping, conflict resolution, and alias deduplication. |
@@ -62,6 +63,20 @@ The classifier is isolated from strategy voting and execution. It classifies ind
 | `classification/no-trade-classifier.ts` | No-trade reason classification. |
 
 `MarketRegimeId` is reserved for canonical composite market states. Older labels such as `low_volatility`, `trend_continuation`, `bullish_breakout`, and `mean_reversion` are legacy aliases or opportunity tags, not authoritative market-regime identifiers.
+
+## Hysteresis And State
+
+The Regime algorithm privately owns confirmed-regime and transition state. Root `hysteresis.ts` is a compatibility facade over the dedicated state package.
+
+| Component | Dedicated responsibility |
+| --- | --- |
+| `state/confirmed-regime-state.ts` | Confirmed-regime state contract construction. |
+| `state/transition-history.ts` | Bounded transition-history records. |
+| `state/hysteresis.ts` | Confirmed-regime hysteresis workflow. |
+| `state/dwell-policy.ts` | Minimum dwell state and dwell-bar policy. |
+| `state/state-recovery.ts` | Recovery of previous in-memory or persisted hysteresis snapshots. |
+
+Regime state records current confirmed regime, previous regime, candidate regime, candidate confirmation count, regime start time, minimum dwell state, unknown-regime count, transition confidence, transition evidence, and transition history. Defaults include configurable confirmation bars, immediate-transition confidence, dwell requirements, confidence-gap requirements, and maximum unknown bars.
 
 ## Strategy Inventory
 

@@ -21,9 +21,11 @@ import {
   baseRegimeSettingsFromTradingSettings,
   calculateRegimePositionSize,
   confirmedRegimeCondition,
+  createConfirmedRegimeState,
   compositeRegimeIdFromAxes,
   contextMultiplierForSignal,
   evaluateRegimeMlPromotionPolicy,
+  evaluateRegimeDwellPolicy,
   evaluateRegimeStrategyDefinition,
   generateRegimeOrderIntentIdempotencyKey,
   loadRegimeMlArtifact,
@@ -54,6 +56,7 @@ import {
   resolveEffectiveRegimeSettings,
   routeRegimeStrategies,
   resolveRegimeHysteresisSettings,
+  recoverRegimeHysteresisState,
   signalStrengthMultiplierForWinningStrength,
   signedRegimeNetScore,
   validateDirectionalStrategyResult,
@@ -470,6 +473,60 @@ test("Regime MarketRegimeId excludes legacy opportunity aliases", () => {
   assert.doesNotMatch(marketRegimeBlock, /"mean_reversion"/);
   assert.doesNotMatch(marketRegimeBlock, /"trend_continuation"/);
   assert.doesNotMatch(marketRegimeBlock, /"no_trade"/);
+});
+
+test("Regime owns dedicated hysteresis and transition state inventory", () => {
+  assert.deepEqual(directoryFiles("state"), [
+    "confirmed-regime-state.ts",
+    "dwell-policy.ts",
+    "hysteresis.ts",
+    "state-recovery.ts",
+    "transition-history.ts",
+  ]);
+  const dwell = evaluateRegimeDwellPolicy(2, {
+    confirmationBars: 3,
+    immediateConfidenceThreshold: 0.8,
+    minimumDwellBars: 3,
+    transitionConfidenceGap: 0.1,
+    maximumUnknownBars: 4,
+  });
+  assert.deepEqual(dwell, { dwellBars: 3, minimumDwellSatisfied: true });
+  const state = createConfirmedRegimeState({
+    rawRegime: "weak_downtrend",
+    confirmedRegime: "strong_uptrend",
+    rawConfidence: 0.82,
+    confirmedConfidence: 0.71,
+    candidateRegime: "weak_downtrend",
+    candidateCount: 2,
+    dwellBars: 4,
+    heldPreviousRegime: true,
+    transitionReason: "candidate waiting",
+    timestamp: "2026-01-05T15:35:00.000Z",
+    previousRegime: "strong_uptrend",
+    regimeStartTime: "2026-01-05T15:30:00.000Z",
+    minimumDwellSatisfied: true,
+    unknownRegimeCount: 1,
+    transitionConfidence: 0.82,
+    transitionEvidence: { transitionState: "held" },
+  });
+  assert.equal(state.previousRegime, "strong_uptrend");
+  assert.equal(state.regimeStartTime, "2026-01-05T15:30:00.000Z");
+  assert.equal(state.minimumDwellSatisfied, true);
+  assert.equal(state.unknownRegimeCount, 1);
+  assert.equal(state.transitionConfidence, 0.82);
+  assert.deepEqual(state.transitionEvidence, { transitionState: "held" });
+  const recovered = recoverRegimeHysteresisState({
+    primaryTrend: "Strong uptrend",
+    volatility: "Normal volatility",
+    opportunity: "Trend continuation",
+    confidence: 0.71,
+    key: "strong_uptrend",
+    contextKey: "SPY:2026-01-05",
+    ...state,
+  }, "SPY:2026-01-05");
+  assert.equal(recovered.previousRegime, "strong_uptrend");
+  assert.equal(recovered.previousConfidence, 0.71);
+  assert.equal(recovered.previousDwellBars, 4);
 });
 
 test("Regime isolation keeps settings trade history and archives separate from other algorithms", () => {

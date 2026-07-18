@@ -26,7 +26,15 @@ export {
   validateRegimeIdentityContracts,
   validateRegimeTradingSettings,
 } from "./validation.ts";
-export { confirmedRegimeCondition } from "./hysteresis.ts";
+export {
+  appendRegimeTransitionHistory,
+  confirmedRegimeCondition,
+  createConfirmedRegimeState,
+  emptyRegimeHysteresisForMarket,
+  evaluateRegimeDwellPolicy,
+  recentRegimeConditionKeys,
+  recoverRegimeHysteresisState,
+} from "./hysteresis.ts";
 export { buildRegimeFeatureSnapshot, buildRegimeFeatureSnapshotFromContext } from "./market/feature-snapshot.ts";
 export {
   emptyRegimeContextFeeds,
