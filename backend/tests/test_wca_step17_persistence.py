@@ -8,6 +8,9 @@ from unittest.mock import patch
 
 from backend.app.algorithms.wca.contracts import WcaBacktestSideMode, WcaSide
 from backend.app.algorithms.wca.repository import (
+    WCA_PERSISTENCE_RECORD_IDS,
+    WCA_PERSISTENCE_RECORD_INVENTORY,
+    WCA_PERSISTENCE_TABLES,
     WCA_PERSISTENCE_MIGRATION_VERSION,
     WcaSqliteRepository,
     apply_wca_persistence_migrations,
@@ -24,18 +27,25 @@ WCA_TABLES = (
     "wca_confidence_calibrations",
     "wca_market_status_snapshots",
     "wca_effective_setting_snapshots",
+    "wca_strategy_evaluations",
     "wca_decisions",
     "wca_local_gate_evaluations",
     "global_gate_evaluations",
+    "wca_order_intents",
+    "wca_attributed_orders",
     "wca_proposed_orders",
     "wca_execution_results",
+    "wca_attributed_fills",
+    "wca_positions",
     "wca_trade_ledger",
     "wca_broker_reconciliations",
     "wca_shadow_comparison_evidence",
     "wca_paper_stability_validations",
     "wca_backtest_runs",
+    "wca_backtest_results",
     "wca_backtest_trades",
     "wca_strategy_performance",
+    "wca_rollout_status",
 )
 
 REQUIRED_COLUMNS = {
@@ -50,6 +60,32 @@ REQUIRED_COLUMNS = {
 
 
 class WcaStep17PersistenceTests(unittest.TestCase):
+    def test_persistence_record_inventory_is_exactly_wca_owned_state(self) -> None:
+        expected = (
+            "configuration_versions",
+            "weight_snapshots",
+            "market_status_history",
+            "dynamic_profile_history",
+            "strategy_evaluations",
+            "decisions",
+            "order_intents",
+            "wca_attributed_orders",
+            "wca_attributed_fills",
+            "wca_positions",
+            "wca_trades",
+            "backtest_runs",
+            "backtest_results",
+            "shadow_comparison_records",
+            "paper_stability_evidence",
+            "rollout_status",
+        )
+
+        self.assertEqual(tuple(row.record_id for row in WCA_PERSISTENCE_RECORD_INVENTORY), expected)
+        self.assertEqual(WCA_PERSISTENCE_RECORD_IDS, set(expected))
+        self.assertEqual(WCA_PERSISTENCE_TABLES, tuple(row.table_name for row in WCA_PERSISTENCE_RECORD_INVENTORY))
+        self.assertTrue(all(row.table_name.startswith("wca_") for row in WCA_PERSISTENCE_RECORD_INVENTORY))
+        self.assertTrue(all(row.responsibility.startswith(("Versioned WCA", "WCA")) for row in WCA_PERSISTENCE_RECORD_INVENTORY))
+
     def test_migration_creates_all_authoritative_wca_tables_idempotently(self) -> None:
         with sqlite3.connect(":memory:") as conn:
             apply_wca_persistence_migrations(conn)
@@ -85,15 +121,31 @@ class WcaStep17PersistenceTests(unittest.TestCase):
         self.assertGreater(counts["wca_configuration_versions"], 0)
         self.assertGreater(counts["wca_strategy_versions"], 0)
         self.assertGreater(counts["wca_weight_snapshots"], 0)
+        self.assertGreater(counts["wca_rollout_status"], 0)
         self.assertEqual(counts["wca_backtest_runs"], 1)
+        self.assertEqual(counts["wca_backtest_results"], 1)
         self.assertEqual(counts["wca_backtest_trades"], len(result.trades))
+        self.assertEqual(counts["wca_attributed_fills"], len(result.trades))
+        self.assertEqual(counts["wca_positions"], len(result.trades))
         self.assertEqual(counts["wca_trade_ledger"], len(result.trades))
         self.assertEqual(counts["wca_decisions"], len(result.decisions))
+        self.assertGreater(counts["wca_strategy_evaluations"], 0)
         self.assertGreater(counts["wca_local_gate_evaluations"], 0)
         self.assertGreater(counts["global_gate_evaluations"], 0)
         self.assertGreater(counts["wca_proposed_orders"], 0)
+        self.assertGreater(counts["wca_order_intents"], 0)
+        self.assertGreater(counts["wca_attributed_orders"], 0)
         self.assertGreater(counts["wca_execution_results"], 0)
         self.assertGreater(counts["wca_strategy_performance"], 0)
+
+        with sqlite3.connect(db_path) as conn:
+            for table, count in counts.items():
+                if count <= 0:
+                    continue
+                columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if "algorithm_id" in columns:
+                    owners = {row[0] for row in conn.execute(f"SELECT DISTINCT algorithm_id FROM {table}").fetchall()}
+                    self.assertEqual(owners, {"wca"}, table)
 
     def test_backend_restart_preserves_run_history_through_service_lookup(self) -> None:
         db_path = temp_db_path()

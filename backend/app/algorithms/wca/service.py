@@ -6,7 +6,7 @@ from datetime import timezone
 from typing import Any
 
 from backend.app.algorithms.wca import WCA_PACKAGE_VERSION
-from backend.app.algorithms.wca.configuration import default_baseline_settings
+from backend.app.algorithms.wca.configuration import WCA_CONFIGURATION_VERSION, default_baseline_settings
 from backend.app.algorithms.wca.backtest.engine import run_wca_backtest, run_wca_backtest_modes
 from backend.app.algorithms.wca.contracts import (
     WCA_ALGORITHM_ID,
@@ -28,7 +28,7 @@ from backend.app.algorithms.wca.contracts import (
     WcaShadowComparisonEvidence,
     WcaTradingSettings,
 )
-from backend.app.algorithms.wca.engine import WCA_CONFIGURATION_VERSION, WCA_ENGINE_VERSION, base_weight_map, evaluate_wca_legacy
+from backend.app.algorithms.wca.engine import WCA_ENGINE_VERSION, base_weight_map, evaluate_wca_legacy
 from backend.app.algorithms.wca.execution_pipeline import WCA_EXECUTION_PIPELINE_VERSION, WcaExecutionPipelineInput, run_wca_execution_pipeline
 from backend.app.algorithms.wca.exits import WcaBacktestOpenPosition
 from backend.app.algorithms.wca.final_acceptance import build_wca_final_acceptance_report

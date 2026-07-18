@@ -31,6 +31,32 @@ class WcaDynamicProfileConfig:
 
 
 @dataclass(frozen=True)
+class WcaDynamicProfileValue:
+    value_id: str
+    effective_field: str
+    responsibility: str
+
+
+WCA_DYNAMIC_PROFILE_VALUE_INVENTORY: tuple[WcaDynamicProfileValue, ...] = (
+    WcaDynamicProfileValue("entry_score_threshold", "final_minimum_score", "Tighten the WCA entry-score threshold for defensive conditions."),
+    WcaDynamicProfileValue("minimum_confidence", "final_minimum_confidence", "Tighten minimum calibrated confidence for defensive conditions."),
+    WcaDynamicProfileValue("minimum_agreement", "final_minimum_agreement", "Tighten minimum directional agreement for defensive conditions."),
+    WcaDynamicProfileValue("risk_percentage", "final_risk_percent", "Reduce WCA risk percentage without increasing the user baseline."),
+    WcaDynamicProfileValue("maximum_wca_position_allocation", "final_max_position_percent", "Reduce maximum WCA position allocation without increasing the user baseline."),
+    WcaDynamicProfileValue("stop_distance_multiplier", "final_atr_stop_multiplier", "Cap ATR stop-distance expansion in defensive conditions."),
+    WcaDynamicProfileValue("reward_risk_requirement", "final_take_profit_r", "Carry the WCA reward/risk requirement into effective settings."),
+    WcaDynamicProfileValue("maximum_trade_count", "final_max_daily_trades", "Reduce the WCA maximum trade count for defensive conditions."),
+    WcaDynamicProfileValue("session_restrictions", "final_entry_cutoff_minutes", "Carry WCA session entry restrictions into effective settings."),
+    WcaDynamicProfileValue("spread_limits", "final_max_spread_percent", "Tighten WCA spread limits for liquidity or volatility stress."),
+    WcaDynamicProfileValue("liquidity_limits", "final_max_participation_percent", "Reduce WCA liquidity participation limits for defensive conditions."),
+    WcaDynamicProfileValue("volatility_reductions", "risk_multiplier", "Apply WCA volatility-driven risk, size, and entry reductions."),
+    WcaDynamicProfileValue("drawdown_reductions", "quantity_multiplier", "Apply WCA drawdown-driven risk, size, trade-count, and entry reductions."),
+)
+
+WCA_DYNAMIC_PROFILE_VALUE_IDS = frozenset(value.value_id for value in WCA_DYNAMIC_PROFILE_VALUE_INVENTORY)
+
+
+@dataclass(frozen=True)
 class _Overlay:
     name: str
     risk_multiplier: float = 1.0
@@ -129,6 +155,8 @@ def _baseline_effective_settings(
         final_assumed_slippage_per_share=baseline.assumed_slippage_per_share,
         final_cooldown_seconds=baseline.cooldown_seconds,
         final_entry_cutoff_minutes=baseline.entry_cutoff_minutes,
+        final_max_spread_percent=baseline.max_spread_percent,
+        final_max_participation_percent=baseline.max_participation_percent,
         final_pyramiding_enabled=baseline.pyramiding_enabled,
         entries_blocked=False,
         reason_codes=("wca.dynamic_profile.baseline",),
@@ -184,6 +212,8 @@ def _effective_from_overlays(
         final_assumed_slippage_per_share=baseline.assumed_slippage_per_share * slippage_multiplier,
         final_cooldown_seconds=cooldown_seconds,
         final_entry_cutoff_minutes=baseline.entry_cutoff_minutes,
+        final_max_spread_percent=_spread_limit(baseline.max_spread_percent, slippage_multiplier, entries_blocked),
+        final_max_participation_percent=_participation_limit(baseline.max_participation_percent, quantity_multiplier, entries_blocked),
         final_pyramiding_enabled=baseline.pyramiding_enabled and False,
         entries_blocked=entries_blocked,
         reason_codes=("wca.dynamic_profile.effective",),
@@ -274,14 +304,29 @@ def _scaled_share_cap(max_allowed_shares: int, hard_cap: int, multiplier: float)
     return int(cap * multiplier) if cap > 0 else 0
 
 
+def _spread_limit(baseline_spread_percent: float, slippage_multiplier: float, entries_blocked: bool) -> float:
+    if entries_blocked:
+        return 0
+    return round(baseline_spread_percent / max(1.0, slippage_multiplier), 10)
+
+
+def _participation_limit(baseline_participation_percent: float, quantity_multiplier: float, entries_blocked: bool) -> float:
+    if entries_blocked:
+        return 0
+    return round(baseline_participation_percent * min(1.0, quantity_multiplier), 10)
+
+
 def _min_nonzero_cap(left: int, right: int) -> int:
     caps = tuple(value for value in (left, right) if value > 0)
     return min(caps) if caps else 0
 
 
 __all__ = (
+    "WCA_DYNAMIC_PROFILE_VALUE_IDS",
+    "WCA_DYNAMIC_PROFILE_VALUE_INVENTORY",
     "WcaDynamicProfile",
     "WcaDynamicProfileConfig",
+    "WcaDynamicProfileValue",
     "WcaEffectiveSettings",
     "protective_stop_distance_for_existing_position",
     "resolve_dynamic_profile",

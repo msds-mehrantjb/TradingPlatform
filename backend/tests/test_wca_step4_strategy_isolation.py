@@ -15,6 +15,24 @@ ROOT = Path(__file__).parents[2]
 STRATEGY_PATH = ROOT / "backend" / "app" / "algorithms" / "wca" / "strategies"
 STRATEGY_PACKAGE = "backend.app.algorithms.wca.strategies"
 
+EXPECTED_STRATEGY_FILES = {
+    "__init__.py",
+    "base.py",
+    "indicators.py",
+    "primary_voters.py",
+    "moving_average_trend.py",
+    "trend_pullback.py",
+    "vwap_trend_continuation.py",
+    "vwap_mean_reversion.py",
+    "rsi_mean_reversion.py",
+    "bollinger_atr_reversion.py",
+    "opening_range_breakout.py",
+    "intraday_volatility_breakout.py",
+    "failed_breakout_reversal.py",
+    "liquidity_sweep_reversal.py",
+    "gap_continuation_fade.py",
+}
+
 ISOLATED_STRATEGY_MODULES = (
     ("moving_average_trend", "MovingAverageTrendStrategy"),
     ("trend_pullback", "TrendPullbackStrategy"),
@@ -31,6 +49,11 @@ ISOLATED_STRATEGY_MODULES = (
 
 
 class WcaStep4StrategyIsolationTest(unittest.TestCase):
+    def test_strategy_package_contains_only_dedicated_strategy_files(self) -> None:
+        actual = {path.name for path in STRATEGY_PATH.glob("*.py")}
+
+        self.assertEqual(actual, EXPECTED_STRATEGY_FILES)
+
     def test_each_primary_strategy_imports_and_evaluates_independently(self) -> None:
         for module_name, class_name in ISOLATED_STRATEGY_MODULES:
             with self.subTest(strategy=module_name):
@@ -84,6 +107,16 @@ class WcaStep4StrategyIsolationTest(unittest.TestCase):
                     violations.append(f"{path.name}:{node.lineno}")
 
         self.assertEqual(violations, [])
+
+    def test_primary_voters_contains_registry_only_not_duplicate_strategy_logic(self) -> None:
+        path = STRATEGY_PATH / "primary_voters.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        functions = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
+        classes = [node.name for node in tree.body if isinstance(node, ast.ClassDef)]
+
+        self.assertEqual(functions, ["evaluate_all_primary_voters"])
+        self.assertEqual(classes, [])
+        self.assertNotIn("def moving_average_trend", path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import math
 from datetime import datetime, timezone
 
 from backend.app.algorithms.wca import WCA_PACKAGE_VERSION
+from backend.app.algorithms.wca.configuration import WCA_CONFIGURATION_VERSION
 from backend.app.algorithms.wca.contracts import (
     ProposedOrder,
     WcaAggregationResult,
@@ -34,7 +35,6 @@ from backend.app.algorithms.wca.strategy_registry import WCA_STRATEGY_REGISTRY
 
 
 WCA_ENGINE_VERSION = "wca_legacy_compatible_v1"
-WCA_CONFIGURATION_VERSION = "wca_legacy_configuration_v1"
 
 
 class WcaEngineInputError(ValueError):

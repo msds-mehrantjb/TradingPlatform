@@ -8,8 +8,15 @@ from backend.app.algorithms.wca.contracts import WcaBaselineSettings, WcaEffecti
 from backend.app.algorithms.wca.dynamic_profile import WcaDynamicProfileConfig, resolve_dynamic_profile
 
 
+WCA_CONFIGURATION_VERSION = "wca_legacy_configuration_v1"
+
+
+def validate_baseline_settings(settings: WcaBaselineSettings | dict[str, object]) -> WcaBaselineSettings:
+    return WcaBaselineSettings.model_validate(settings)
+
+
 def default_baseline_settings() -> WcaBaselineSettings:
-    return WcaBaselineSettings()
+    return validate_baseline_settings({})
 
 
 def default_effective_settings() -> WcaEffectiveSettings:

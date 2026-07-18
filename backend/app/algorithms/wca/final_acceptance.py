@@ -110,7 +110,7 @@ WCA_FINAL_ACCEPTANCE_ITEMS: tuple[WcaAcceptanceItem, ...] = (
         "Strategies",
         "Context indicators are modifiers.",
         WcaAcceptanceStatus.PASS,
-        ("backend/app/algorithms/wca/modifiers", "backend/tests/test_wca_step3_strategy_catalog.py"),
+        ("backend/app/algorithms/wca/modifiers", "backend/tests/test_wca_modifier_inventory.py"),
     ),
     WcaAcceptanceItem(
         "Strategies",

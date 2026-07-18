@@ -21,7 +21,7 @@ from backend.app.algorithms.wca.contracts import (
     WcaStrategyEvaluation,
     WcaWeightSnapshot,
 )
-from backend.app.algorithms.wca.execution_pipeline import WcaExecutionPipelineResult
+from backend.app.algorithms.wca.execution_pipeline import WCA_EXECUTION_PIPELINE_MODULES, WcaExecutionPipelineResult
 from backend.app.algorithms.wca.order_validation import WCA_ORDER_VALIDATION_PASSED, WcaOrderValidationContext, apply_wca_final_order_validation
 from backend.app.algorithms.wca.repository import WcaOrderIntentReservation, WcaPersistenceSummary
 from backend.app.algorithms.wca.service import WcaService
@@ -39,17 +39,7 @@ def test_manual_and_automatic_paper_actions_use_shared_execution_pipeline() -> N
     automatic = service.execute_automatic_paper(request)
 
     for result in (manual, automatic):
-        assert "strategy_registry" in result.called_production_modules
-        assert "confidence_calibration" in result.called_production_modules
-        assert "weight_engine" in result.called_production_modules
-        assert "market_status" in result.called_production_modules
-        assert "dynamic_profile" in result.called_production_modules
-        assert "aggregation" in result.called_production_modules
-        assert "local_gates" in result.called_production_modules
-        assert "sizing" in result.called_production_modules
-        assert "order_proposal" in result.called_production_modules
-        assert "order_validation" in result.called_production_modules
-        assert "exits" in result.called_production_modules
+        assert result.called_production_modules == WCA_EXECUTION_PIPELINE_MODULES
         assert result.decision.effective_settings is not None
         assert result.decision.effective_settings.profile_version == "wca_dynamic_profile_v1"
         assert "wca.paper.uses_execution_pipeline" in result.reason_codes
@@ -58,6 +48,22 @@ def test_manual_and_automatic_paper_actions_use_shared_execution_pipeline() -> N
     assert automatic.mode == "automatic"
     assert repository.decisions[manual.decision.decision_id].effective_settings == manual.decision.effective_settings
     assert repository.decisions[automatic.decision.decision_id].effective_settings == automatic.decision.effective_settings
+
+
+def test_wca_execution_pipeline_sequence_is_exact() -> None:
+    assert WCA_EXECUTION_PIPELINE_MODULES == (
+        "strategy_registry",
+        "confidence_calibration",
+        "weight_engine",
+        "market_status",
+        "dynamic_profile",
+        "aggregation",
+        "local_gates",
+        "sizing",
+        "order_proposal",
+        "order_validation",
+        "exits",
+    )
 
 
 def test_paper_execution_api_routes_to_pipeline() -> None:

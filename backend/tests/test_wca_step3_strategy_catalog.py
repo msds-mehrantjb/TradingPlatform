@@ -11,6 +11,7 @@ from backend.app.algorithms.wca.strategy_registry import (
     WCA_MODIFIER_REGISTRY,
     WCA_MODIFIER_SLUGS,
     WCA_PRIMARY_VOTER_SLUGS,
+    WCA_STRATEGY_IDS,
     WCA_STRATEGY_REGISTRY,
     WcaCatalogRole,
 )
@@ -21,21 +22,26 @@ UTC = timezone.utc
 
 class WcaStep3StrategyCatalogTest(unittest.TestCase):
     def test_catalog_registers_exactly_11_primary_voters(self) -> None:
-        expected = {
-            "moving_average_trend",
-            "trend_pullback",
-            "vwap_trend_continuation",
-            "vwap_mean_reversion",
-            "rsi_mean_reversion",
-            "bollinger_atr_reversion",
-            "opening_range_breakout",
-            "intraday_volatility_breakout",
-            "failed_breakout_reversal",
-            "liquidity_sweep_reversal",
-            "gap_continuation_fade",
-        }
+        expected_inventory = (
+            ("C1", "moving_average_trend", "Moving Average Trend", "trend", 0.10),
+            ("C2", "trend_pullback", "Trend Pullback", "trend", 0.09),
+            ("C3", "vwap_trend_continuation", "VWAP Trend Continuation", "trend", 0.09),
+            ("C4", "vwap_mean_reversion", "VWAP Mean Reversion", "mean_reversion", 0.08),
+            ("C5", "rsi_mean_reversion", "RSI Mean Reversion", "mean_reversion", 0.08),
+            ("C6", "bollinger_atr_reversion", "Bollinger/ATR Reversion", "mean_reversion", 0.08),
+            ("C7", "opening_range_breakout", "Opening Range Breakout", "breakout", 0.10),
+            ("C8", "intraday_volatility_breakout", "Intraday/Volatility Breakout", "breakout", 0.10),
+            ("C9", "failed_breakout_reversal", "Failed Breakout Reversal", "reversal", 0.09),
+            ("C10", "liquidity_sweep_reversal", "Liquidity Sweep Reversal", "reversal", 0.09),
+            ("C11", "gap_continuation_fade", "Gap Continuation/Fade", "event", 0.10),
+        )
         self.assertEqual(len(WCA_STRATEGY_REGISTRY), 11)
-        self.assertEqual(WCA_PRIMARY_VOTER_SLUGS, expected)
+        self.assertEqual(
+            tuple((row.strategy_id, row.slug, row.name, row.family, row.base_weight) for row in WCA_STRATEGY_REGISTRY),
+            expected_inventory,
+        )
+        self.assertEqual(WCA_STRATEGY_IDS, {f"C{index}" for index in range(1, 12)})
+        self.assertEqual(WCA_PRIMARY_VOTER_SLUGS, {row[1] for row in expected_inventory})
         self.assertEqual({row.role for row in WCA_STRATEGY_REGISTRY}, {WcaCatalogRole.PRIMARY_VOTER})
         self.assertTrue(all(row.family for row in WCA_STRATEGY_REGISTRY))
         self.assertAlmostEqual(sum(row.base_weight for row in WCA_STRATEGY_REGISTRY), 1.0, places=6)
@@ -63,8 +69,18 @@ class WcaStep3StrategyCatalogTest(unittest.TestCase):
             "extreme_volatility",
             "session_entry_block",
         }
+        expected_filter_inventory = (
+            ("cash_avoid_trading", "Cash/Avoid Trading"),
+            ("economic_event_risk", "Economic Event Risk"),
+            ("invalid_or_stale_data", "Invalid or Stale Data"),
+            ("unsafe_spread", "Unsafe Spread"),
+            ("unsafe_liquidity", "Unsafe Liquidity"),
+            ("extreme_volatility", "Extreme Volatility"),
+            ("session_entry_block", "Session Entry Block"),
+        )
         self.assertEqual(WCA_MODIFIER_SLUGS, required_modifiers)
         self.assertEqual(WCA_HARD_FILTER_SLUGS, required_filters)
+        self.assertEqual(tuple((row.slug, row.name) for row in WCA_HARD_FILTER_REGISTRY), expected_filter_inventory)
         self.assertFalse(WCA_PRIMARY_VOTER_SLUGS & WCA_MODIFIER_SLUGS)
         self.assertFalse(WCA_PRIMARY_VOTER_SLUGS & WCA_HARD_FILTER_SLUGS)
         self.assertEqual({row.role for row in WCA_MODIFIER_REGISTRY}, {WcaCatalogRole.MODIFIER})

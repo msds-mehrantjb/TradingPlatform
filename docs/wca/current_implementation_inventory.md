@@ -29,21 +29,21 @@ Scope: Step 0 baseline only. This document inventories the current Weighted Conf
 | Forecast safety | `forecastBuySafetyBlockers`, `forecastBuySafetyGates`, `forecastStopOverrideKeepReason`, `forecastStopCloseReason`, `openingGraceKeepReason` include `confidence` mode | `frontend/src/main.ts` |
 | Shared entry/exit checks | late-session buy guard, target-order consistency, automatic order rejection, open-order lot exits | `frontend/src/main.ts` |
 
-## Strategy List And Base Weights
+## Backend Primary Voter List And Base Weights
 
-| Key | Slug | Name | Base weight |
-| --- | --- | --- | --- |
-| C1 | `moving_average_trend` | Moving Average Trend | 0.11 |
-| C2 | `vwap_position` | VWAP Position Strategy | 0.11 |
-| C3 | `trend_pullback` | Trend Pullback Strategy | 0.10 |
-| C4 | `rsi_mean_reversion` | RSI Mean Reversion | 0.07 |
-| C5 | `bollinger_band_mean_reversion` | Bollinger Band Mean Reversion | 0.07 |
-| C6 | `opening_range_breakout` | Opening Range Breakout | 0.10 |
-| C7 | `intraday_breakout` | Intraday Breakout Strategy | 0.10 |
-| C8 | `macd_momentum` | MACD Momentum | 0.08 |
-| C9 | `market_structure` | Market Structure Strategy | 0.12 |
-| C10 | `gap_continuation_fade` | Gap Continuation / Gap Fade | 0.06 |
-| C11 | `volume_confirmation` | Volume Confirmation | 0.08 |
+| Key | Slug | Name | Family | Base weight |
+| --- | --- | --- | --- | --- |
+| C1 | `moving_average_trend` | Moving Average Trend | Trend | 0.10 |
+| C2 | `trend_pullback` | Trend Pullback | Trend | 0.09 |
+| C3 | `vwap_trend_continuation` | VWAP Trend Continuation | Trend | 0.09 |
+| C4 | `vwap_mean_reversion` | VWAP Mean Reversion | Mean reversion | 0.08 |
+| C5 | `rsi_mean_reversion` | RSI Mean Reversion | Mean reversion | 0.08 |
+| C6 | `bollinger_atr_reversion` | Bollinger/ATR Reversion | Mean reversion | 0.08 |
+| C7 | `opening_range_breakout` | Opening Range Breakout | Breakout | 0.10 |
+| C8 | `intraday_volatility_breakout` | Intraday/Volatility Breakout | Breakout | 0.10 |
+| C9 | `failed_breakout_reversal` | Failed Breakout Reversal | Reversal | 0.09 |
+| C10 | `liquidity_sweep_reversal` | Liquidity Sweep Reversal | Reversal | 0.09 |
+| C11 | `gap_continuation_fade` | Gap Continuation/Fade | Event | 0.10 |
 
 Total base weight: 1.00.
 

@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from backend.app.algorithms.wca.configuration import default_baseline_settings
 from backend.app.algorithms.wca.contracts import (
+    WCA_SHADOW_COMPARISON_EVIDENCE_SCHEMA_VERSION,
     WcaBaselineSettings,
     WcaCandle,
     WcaEvaluateRequest,
@@ -27,7 +28,7 @@ from backend.app.algorithms.wca.execution_pipeline import WcaExecutionPipelineIn
 from backend.app.algorithms.wca.rollout import WCA_SHADOW_COMPARISON_FIELDS
 
 
-WCA_SHADOW_COMPARISON_EVIDENCE_VERSION = "wca_shadow_comparison_evidence_v1"
+WCA_SHADOW_COMPARISON_EVIDENCE_VERSION = WCA_SHADOW_COMPARISON_EVIDENCE_SCHEMA_VERSION
 
 
 class WcaShadowEvidenceRepository(Protocol):

@@ -1,17 +1,48 @@
 from __future__ import annotations
 
+import ast
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from backend.app.algorithms.wca.contracts import WcaStrategyPerformanceRecord
 from backend.app.algorithms.wca.strategy_registry import WCA_STRATEGY_REGISTRY
-from backend.app.algorithms.wca.weights import WcaWeightEngineConfig, baseline_weight_snapshot, performance_weight_snapshot
+from backend.app.algorithms.wca.weights import (
+    WCA_WEIGHT_SYSTEM_COMPONENT_IDS,
+    WCA_WEIGHT_SYSTEM_INVENTORY,
+    WcaWeightEngineConfig,
+    baseline_weight_snapshot,
+    performance_weight_snapshot,
+)
 
 
 UTC = timezone.utc
+ROOT = Path(__file__).parents[2]
+APP_PATH = ROOT / "backend" / "app"
+WCA_PATH = APP_PATH / "algorithms" / "wca"
 
 
 class WcaStep6PerformanceWeightsTest(unittest.TestCase):
+    def test_weight_system_inventory_is_dedicated_to_wca_responsibilities(self) -> None:
+        expected = (
+            "baseline_weights",
+            "performance_derived_weights",
+            "sample_size_reliability",
+            "shrinkage_toward_baseline",
+            "time_decay",
+            "strategy_health",
+            "regime_adjustment",
+            "correlation_penalties",
+            "maximum_strategy_weight",
+            "maximum_family_concentration",
+            "versioned_weight_snapshots",
+        )
+
+        self.assertEqual(tuple(component.component_id for component in WCA_WEIGHT_SYSTEM_INVENTORY), expected)
+        self.assertEqual(WCA_WEIGHT_SYSTEM_COMPONENT_IDS, set(expected))
+        allowed_prefixes = ("Use WCA", "Derive WCA", "Scale", "Shrink", "Give", "Reduce WCA", "Adjust WCA", "Penalize", "Cap", "Emit")
+        self.assertTrue(all(component.responsibility.startswith(allowed_prefixes) for component in WCA_WEIGHT_SYSTEM_INVENTORY))
+
     def test_replaying_same_cutoff_generates_same_weights(self) -> None:
         cutoff = datetime(2026, 1, 30, 21, 0, tzinfo=UTC)
         records = sample_records(cutoff)
@@ -76,6 +107,42 @@ class WcaStep6PerformanceWeightsTest(unittest.TestCase):
         self.assertEqual(snapshot.metrics_cutoff_timestamp, cutoff)
         self.assertIn("wca.weights.static_baseline", snapshot.reason_codes)
 
+    def test_non_wca_algorithm_modules_cannot_modify_wca_weights(self) -> None:
+        violations: list[str] = []
+        forbidden_imports = {
+            "backend.app.algorithms.wca.weights",
+        }
+        forbidden_names = {
+            "WcaWeightSnapshot",
+            "baseline_weight_snapshot",
+            "equal_weight_snapshot",
+            "performance_weight_snapshot",
+            "save_weight_snapshot",
+        }
+
+        for path in sorted((APP_PATH / "algorithms").rglob("*.py")):
+            if WCA_PATH in path.parents:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    imported_names = {alias.name for alias in node.names}
+                    if node.module in forbidden_imports or imported_names & forbidden_names:
+                        violations.append(f"{path.relative_to(APP_PATH)} imports WCA weight ownership API")
+                elif isinstance(node, ast.Import):
+                    if any(alias.name in forbidden_imports for alias in node.names):
+                        violations.append(f"{path.relative_to(APP_PATH)} imports WCA weight module")
+                elif isinstance(node, ast.Call):
+                    call_name = _call_name(node.func)
+                    if call_name in {"save_weight_snapshot", "performance_weight_snapshot", "baseline_weight_snapshot", "equal_weight_snapshot"}:
+                        violations.append(f"{path.relative_to(APP_PATH)} calls {call_name}")
+
+            source = path.read_text(encoding="utf-8").lower()
+            if "wca_weight_snapshots" in source:
+                violations.append(f"{path.relative_to(APP_PATH)} references WCA weight snapshot storage")
+
+        self.assertEqual(violations, [])
+
 
 def sample_records(cutoff: datetime, *, trend_edge: float = 1.0) -> tuple[WcaStrategyPerformanceRecord, ...]:
     family_by_strategy = {definition.strategy_id: definition.family for definition in WCA_STRATEGY_REGISTRY}
@@ -106,6 +173,14 @@ def performance_record(strategy_id: str, family: str, r_multiple: float, availab
         success=r_multiple > 0,
         regime="default",
     )
+
+
+def _call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
 
 
 if __name__ == "__main__":

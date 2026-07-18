@@ -93,7 +93,9 @@ class WcaStep13MlForecastDecouplingTests(unittest.TestCase):
         payload = snapshot.model_dump(mode="json")
 
         self.assertEqual(snapshot.algorithm_id, "wca")
+        self.assertEqual(snapshot.schema_version, "wca_read_only_feature_snapshot_v1")
         self.assertEqual(snapshot.final_wca_decision, result.decision.aggregation.post_local_gate_decision)
+        self.assertNotIn("ml", snapshot.reason_codes)
         self.assertIn("strategy_signals", payload)
         self.assertIn("strategy_calibrated_confidences", payload)
         self.assertIn("effective_weights", payload)

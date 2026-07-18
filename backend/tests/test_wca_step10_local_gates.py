@@ -7,7 +7,7 @@ from pathlib import Path
 
 from backend.app.algorithms.wca.aggregation import WcaAggregationConfig, aggregate_wca
 from backend.app.algorithms.wca.contracts import WcaBaselineSettings, WcaEffectiveSettings, WcaGateStatus, WcaSide, WcaStrategyEvaluation
-from backend.app.algorithms.wca.local_gates import WcaLocalGateContext, apply_local_gates_to_decision, evaluate_wca_local_gates
+from backend.app.algorithms.wca.local_gates import WCA_LOCAL_GATE_IDS, WCA_LOCAL_GATE_INVENTORY, WcaLocalGateContext, apply_local_gates_to_decision, evaluate_wca_local_gates
 
 
 UTC = timezone.utc
@@ -16,6 +16,29 @@ LOCAL_GATES_PATH = ROOT / "backend" / "app" / "algorithms" / "wca" / "local_gate
 
 
 class WcaStep10LocalGatesTest(unittest.TestCase):
+    def test_local_gate_inventory_is_exactly_wca_owned_controls(self) -> None:
+        expected = (
+            "minimum_active_strategies",
+            "minimum_directional_agreement",
+            "minimum_average_calibrated_confidence",
+            "minimum_aggregate_score",
+            "minimum_winner_edge",
+            "minimum_expectancy_after_costs",
+            "maximum_strategy_family_concentration",
+            "strategy_health_eligibility",
+            "wca_trade_count_limit",
+            "wca_cooldown",
+            "wca_pyramiding_restrictions",
+            "wca_daily_loss_allocation",
+            "wca_allocated_risk_budget",
+            "session_entry_restrictions",
+            "dynamic_profile_restrictions",
+        )
+
+        self.assertEqual(tuple(gate.gate_id for gate in WCA_LOCAL_GATE_INVENTORY), expected)
+        self.assertEqual(WCA_LOCAL_GATE_IDS, set(expected))
+        self.assertTrue(all(gate.name and gate.responsibility for gate in WCA_LOCAL_GATE_INVENTORY))
+
     def test_local_gate_results_are_structured_and_cover_wca_checks(self) -> None:
         aggregation = directional_aggregation()
         settings = effective_settings()
@@ -32,25 +55,7 @@ class WcaStep10LocalGatesTest(unittest.TestCase):
         )
 
         gate_ids = {gate.gate_id for gate in gates}
-        self.assertTrue(
-            {
-                "minimum_active_strategies",
-                "minimum_agreement",
-                "minimum_average_confidence",
-                "minimum_score",
-                "minimum_signal_edge",
-                "minimum_expected_value_after_costs",
-                "strategy_family_concentration",
-                "strategy_health",
-                "wca_maximum_trades",
-                "wca_cooldown",
-                "wca_pyramiding",
-                "wca_daily_loss_budget",
-                "wca_allocated_risk_budget",
-                "wca_session_eligibility",
-                "wca_dynamic_profile_restrictions",
-            }.issubset(gate_ids)
-        )
+        self.assertEqual(gate_ids, WCA_LOCAL_GATE_IDS)
         for gate in gates:
             self.assertTrue(gate.reason_code)
             self.assertTrue(gate.detail)
@@ -72,7 +77,7 @@ class WcaStep10LocalGatesTest(unittest.TestCase):
             ),
         )
 
-        self.assertTrue(any(gate.gate_id == "wca_maximum_trades" and gate.status == WcaGateStatus.FAIL.value for gate in gates))
+        self.assertTrue(any(gate.gate_id == "wca_trade_count_limit" and gate.status == WcaGateStatus.FAIL.value for gate in gates))
         self.assertEqual(apply_local_gates_to_decision(WcaSide.BUY, gates), WcaSide.HOLD)
 
     def test_local_gates_do_not_modify_strategy_signals(self) -> None:
@@ -114,7 +119,7 @@ class WcaStep10LocalGatesTest(unittest.TestCase):
             context=WcaLocalGateContext(evaluation_timestamp=timestamp()),
         )
 
-        gate = next(row for row in gates if row.gate_id == "wca_dynamic_profile_restrictions")
+        gate = next(row for row in gates if row.gate_id == "dynamic_profile_restrictions")
         self.assertEqual(gate.status, WcaGateStatus.FAIL.value)
         self.assertTrue(gate.blocks_entry)
 
@@ -130,6 +135,7 @@ class WcaStep10LocalGatesTest(unittest.TestCase):
         forbidden = ("backend.app.ml", "meta_strategy", "weighted_voting", "regime", "forecast")
         self.assertFalse(any(any(term in module.lower() for term in forbidden) for module in imports))
         self.assertFalse(any(module.startswith("backend.app.algorithms.") and not module.startswith("backend.app.algorithms.wca") for module in imports))
+        self.assertFalse(any("global_gate" in module.lower() or module.startswith("backend.app.risk") for module in imports))
 
 
 def directional_aggregation():

@@ -28,6 +28,29 @@ class WcaWeightEngineConfig:
     weight_version: str = "wca_statistical_weights_v1"
 
 
+@dataclass(frozen=True)
+class WcaWeightSystemComponent:
+    component_id: str
+    responsibility: str
+
+
+WCA_WEIGHT_SYSTEM_INVENTORY: tuple[WcaWeightSystemComponent, ...] = (
+    WcaWeightSystemComponent("baseline_weights", "Use WCA baseline strategy weights from the WCA strategy registry."),
+    WcaWeightSystemComponent("performance_derived_weights", "Derive WCA weights from completed strategy performance records."),
+    WcaWeightSystemComponent("sample_size_reliability", "Scale influence by available WCA sample count."),
+    WcaWeightSystemComponent("shrinkage_toward_baseline", "Shrink low-sample WCA performance weights toward baseline weights."),
+    WcaWeightSystemComponent("time_decay", "Give recent completed WCA outcomes more influence without using future outcomes."),
+    WcaWeightSystemComponent("strategy_health", "Reduce WCA weight for drawdown, downside deviation, instability, and losing streaks."),
+    WcaWeightSystemComponent("regime_adjustment", "Adjust WCA weights for sufficiently sampled market regimes."),
+    WcaWeightSystemComponent("correlation_penalties", "Penalize highly correlated WCA strategy outcome streams."),
+    WcaWeightSystemComponent("maximum_strategy_weight", "Cap any single WCA strategy weight."),
+    WcaWeightSystemComponent("maximum_family_concentration", "Cap total WCA strategy-family concentration."),
+    WcaWeightSystemComponent("versioned_weight_snapshots", "Emit reproducible WCA weight snapshots with cutoff timestamps and versions."),
+)
+
+WCA_WEIGHT_SYSTEM_COMPONENT_IDS = frozenset(component.component_id for component in WCA_WEIGHT_SYSTEM_INVENTORY)
+
+
 def equal_weight_snapshot() -> WcaWeightSnapshot:
     weight = 1.0 / len(WCA_STRATEGY_REGISTRY)
     return WcaWeightSnapshot(weights={definition.strategy_id: weight for definition in WCA_STRATEGY_REGISTRY})
@@ -305,3 +328,14 @@ def _reason_codes(trade_count: int, reliability: float, correlation_factor: floa
     if correlation_factor < 1:
         reasons.append("wca.weights.correlation_penalty")
     return tuple(reasons)
+
+
+__all__ = (
+    "WCA_WEIGHT_SYSTEM_COMPONENT_IDS",
+    "WCA_WEIGHT_SYSTEM_INVENTORY",
+    "WcaWeightEngineConfig",
+    "WcaWeightSystemComponent",
+    "baseline_weight_snapshot",
+    "equal_weight_snapshot",
+    "performance_weight_snapshot",
+)

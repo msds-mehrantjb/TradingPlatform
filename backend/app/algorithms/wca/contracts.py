@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, Optional
@@ -13,6 +14,79 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 WCA_ALGORITHM_ID = "wca"
 WCA_CONTRACT_VERSION = "wca_contracts_v1"
+WCA_FEATURE_SNAPSHOT_SCHEMA_VERSION = "wca_read_only_feature_snapshot_v1"
+WCA_BROKER_RECONCILIATION_SCHEMA_VERSION = "wca_broker_reconciliation_v1"
+WCA_SHADOW_COMPARISON_EVIDENCE_SCHEMA_VERSION = "wca_shadow_comparison_evidence_v1"
+WCA_PAPER_STABILITY_VALIDATION_SCHEMA_VERSION = "wca_paper_stability_validation_v1"
+
+
+@dataclass(frozen=True)
+class WcaSharedPlatformComponent:
+    component_id: str
+    shared_component: str
+    sharing_rule: str
+
+
+@dataclass(frozen=True)
+class WcaDedicatedComponent:
+    component_id: str
+    dedicated_component: str
+    owner_module: str
+
+
+WCA_SHARED_PLATFORM_COMPONENT_INVENTORY: tuple[WcaSharedPlatformComponent, ...] = (
+    WcaSharedPlatformComponent("raw_and_normalized_market_data_services", "Raw and normalized market-data services", "Read-only input."),
+    WcaSharedPlatformComponent("clock_and_market_calendar_service", "Clock and market-calendar service", "Read-only input."),
+    WcaSharedPlatformComponent("account_equity_and_buying_power_snapshot", "Account-equity and buying-power snapshot", "Read-only input."),
+    WcaSharedPlatformComponent("broker_api_client", "Broker API client", "Executes approved proposals only."),
+    WcaSharedPlatformComponent("global_account_risk_engine", "Global account-risk engine", "May reduce or reject WCA risk."),
+    WcaSharedPlatformComponent("global_portfolio_risk_ledger", "Global portfolio-risk ledger", "Must preserve algorithm attribution."),
+    WcaSharedPlatformComponent("global_emergency_controls", "Global emergency controls", "May block new entries."),
+    WcaSharedPlatformComponent("idempotency_service", "Idempotency service", "Must include WCA algorithm and intent identifiers."),
+    WcaSharedPlatformComponent("broker_reconciliation_infrastructure", "Broker reconciliation infrastructure", "Must preserve WCA ownership."),
+    WcaSharedPlatformComponent("database_connection_path_utilities", "Database connection/path utilities", "Infrastructure only."),
+    WcaSharedPlatformComponent("logging_metrics_and_tracing", "Logging, metrics, and tracing", "Must tag records with algorithm_id=wca."),
+    WcaSharedPlatformComponent("api_framework_and_authentication", "API framework and authentication", "Transport only."),
+)
+
+WCA_SHARED_PLATFORM_COMPONENT_IDS = frozenset(component.component_id for component in WCA_SHARED_PLATFORM_COMPONENT_INVENTORY)
+WCA_GLOBAL_RISK_FORBIDDEN_REWRITE_TARGETS = frozenset(
+    {
+        "wca_signals",
+        "strategy_confidence",
+        "strategy_weights",
+        "wca_thresholds",
+        "wca_dynamic_profiles",
+        "wca_stop_logic",
+        "wca_backtest_results",
+    }
+)
+WCA_GLOBAL_RISK_ALLOWED_CONSTRAINTS = frozenset({"reduce_wca_risk", "reject_wca_entry", "block_new_entries"})
+
+WCA_DEDICATED_COMPONENT_INVENTORY: tuple[WcaDedicatedComponent, ...] = (
+    WcaDedicatedComponent("wca_strategies", "WCA strategies", "backend.app.algorithms.wca.strategies"),
+    WcaDedicatedComponent("wca_modifier_implementations", "WCA modifier implementations", "backend.app.algorithms.wca.modifiers"),
+    WcaDedicatedComponent("wca_indicator_interpretation", "WCA indicator interpretation", "backend.app.algorithms.wca.strategies.indicators"),
+    WcaDedicatedComponent("wca_confidence_calibration", "WCA confidence calibration", "backend.app.algorithms.wca.confidence"),
+    WcaDedicatedComponent("wca_performance_statistics", "WCA performance statistics", "backend.app.algorithms.wca.weights"),
+    WcaDedicatedComponent("wca_weight_snapshots", "WCA weight snapshots", "backend.app.algorithms.wca.weights"),
+    WcaDedicatedComponent("wca_family_correlation_state", "WCA family-correlation state", "backend.app.algorithms.wca.weights"),
+    WcaDedicatedComponent("wca_aggregation_logic", "WCA aggregation logic", "backend.app.algorithms.wca.aggregation"),
+    WcaDedicatedComponent("wca_local_gates", "WCA local gates", "backend.app.algorithms.wca.local_gates"),
+    WcaDedicatedComponent("wca_baseline_settings", "WCA baseline settings", "backend.app.algorithms.wca.configuration"),
+    WcaDedicatedComponent("wca_dynamic_profiles", "WCA dynamic profiles", "backend.app.algorithms.wca.dynamic_profile"),
+    WcaDedicatedComponent("wca_sizing_policy", "WCA sizing policy", "backend.app.algorithms.wca.sizing"),
+    WcaDedicatedComponent("wca_exit_policy", "WCA exit policy", "backend.app.algorithms.wca.exits"),
+    WcaDedicatedComponent("wca_decisions", "WCA decisions", "backend.app.algorithms.wca.contracts"),
+    WcaDedicatedComponent("wca_order_intents", "WCA order intents", "backend.app.algorithms.wca.repository"),
+    WcaDedicatedComponent("wca_positions_and_trades", "WCA positions and trades", "backend.app.algorithms.wca.repository"),
+    WcaDedicatedComponent("wca_backtesting", "WCA backtesting", "backend.app.algorithms.wca.backtest"),
+    WcaDedicatedComponent("wca_diagnostics", "WCA diagnostics", "backend.app.algorithms.wca.backtest.metrics"),
+    WcaDedicatedComponent("wca_rollout_state", "WCA rollout state", "backend.app.algorithms.wca.rollout"),
+)
+
+WCA_DEDICATED_COMPONENT_IDS = frozenset(component.component_id for component in WCA_DEDICATED_COMPONENT_INVENTORY)
+WCA_DEDICATED_COMPONENT_OWNER_MODULES = frozenset(component.owner_module for component in WCA_DEDICATED_COMPONENT_INVENTORY)
 
 
 class WcaContractModel(BaseModel):
@@ -352,6 +426,8 @@ class WcaEffectiveSettings(WcaContractModel):
     final_assumed_slippage_per_share: float = Field(default=0.02, ge=0)
     final_cooldown_seconds: int = Field(default=0, ge=0)
     final_entry_cutoff_minutes: int = Field(default=15 * 60 + 30, ge=0)
+    final_max_spread_percent: float = Field(default=0.10, ge=0)
+    final_max_participation_percent: float = Field(default=1.0, ge=0)
     final_pyramiding_enabled: bool = False
     entries_blocked: bool = False
     reason_codes: tuple[str, ...] = ()
@@ -567,7 +643,7 @@ class WcaDecision(WcaContractModel):
 
 class WcaReadOnlyFeatureSnapshot(WcaContractModel):
     algorithm_id: str = WCA_ALGORITHM_ID
-    schema_version: str = "wca_read_only_feature_snapshot_v1"
+    schema_version: str = WCA_FEATURE_SNAPSHOT_SCHEMA_VERSION
     snapshot_id: str = Field(min_length=1)
     decision_id: str = Field(min_length=1)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -690,6 +766,22 @@ class WcaPaperExecutionResult(WcaContractModel):
     explanation: str = ""
 
 
+@dataclass(frozen=True)
+class WcaOrderValidationContext:
+    evaluation_timestamp: datetime
+    paper_only_mode: bool = True
+    current_position_quantity: int = 0
+    current_position_side: WcaSide | str | None = None
+    allow_position_increase: bool = False
+    position_owned_by_wca: bool = True
+
+
+@dataclass(frozen=True)
+class WcaOrderValidationResult:
+    valid: bool
+    reason_codes: tuple[str, ...]
+
+
 class WcaBrokerReconciliationDiscrepancy(WcaContractModel):
     discrepancy_type: Literal[
         "missing_broker_order",
@@ -721,7 +813,7 @@ class WcaBrokerReconciliationDiscrepancy(WcaContractModel):
 
 class WcaBrokerReconciliationResult(WcaContractModel):
     reconciliation_id: str = Field(min_length=1)
-    reconciliation_version: str = "wca_broker_reconciliation_v1"
+    reconciliation_version: str = WCA_BROKER_RECONCILIATION_SCHEMA_VERSION
     account_id: str = Field(min_length=1)
     evaluated_at: datetime
     intents_checked: int = Field(ge=0)
@@ -744,7 +836,7 @@ class WcaShadowFieldComparison(WcaContractModel):
 
 class WcaShadowComparisonEvidence(WcaContractModel):
     evidence_id: str = Field(min_length=1)
-    evidence_version: str = "wca_shadow_comparison_evidence_v1"
+    evidence_version: str = WCA_SHADOW_COMPARISON_EVIDENCE_SCHEMA_VERSION
     snapshot_id: str = Field(min_length=1)
     symbol: str = Field(min_length=1)
     evaluated_at: datetime
@@ -832,7 +924,7 @@ class WcaPaperStabilityValidationRequest(WcaContractModel):
 
 class WcaPaperStabilityValidationResult(WcaContractModel):
     validation_id: str = Field(min_length=1)
-    validation_version: str = "wca_paper_stability_validation_v1"
+    validation_version: str = WCA_PAPER_STABILITY_VALIDATION_SCHEMA_VERSION
     account_id: str = Field(min_length=1)
     started_at: datetime
     ended_at: datetime

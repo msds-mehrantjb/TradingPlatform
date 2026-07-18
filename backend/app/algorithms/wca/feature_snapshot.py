@@ -1,10 +1,10 @@
-"""Read-only WCA feature snapshots for external comparison layers."""
+"""Read-only WCA feature snapshots for external analytics and ML consumers."""
 
 from __future__ import annotations
 
-from backend.app.algorithms.wca.contracts import WcaDecision, WcaDynamicProfile, WcaReadOnlyFeatureSnapshot, WcaSide
+from backend.app.algorithms.wca.contracts import WCA_FEATURE_SNAPSHOT_SCHEMA_VERSION, WcaDecision, WcaDynamicProfile, WcaReadOnlyFeatureSnapshot, WcaSide
 
-WCA_FEATURE_SNAPSHOT_VERSION = "wca_read_only_feature_snapshot_v1"
+WCA_FEATURE_SNAPSHOT_VERSION = WCA_FEATURE_SNAPSHOT_SCHEMA_VERSION
 
 
 def build_wca_feature_snapshot(

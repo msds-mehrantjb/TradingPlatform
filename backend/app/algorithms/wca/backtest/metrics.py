@@ -78,7 +78,7 @@ def _aggregate_metrics(result: BacktestResult, trades: tuple[BacktestTrade, ...]
         "capitalUtilization": round((turnover / max(result.run_configuration.starting_equity, 1.0)), 10),
         "averageHoldingTimeMinutes": round(mean(holding_minutes), 10) if holding_minutes else 0.0,
         "maximumConsecutiveLosses": losses_in_a_row,
-        "dailyLossGateActivations": sum(1 for decision in result.decisions for gate in decision.local_gates if gate.gate_id == "wca_daily_loss_budget" and gate.status == "FAIL"),
+        "dailyLossGateActivations": sum(1 for decision in result.decisions for gate in decision.local_gates if gate.gate_id == "wca_daily_loss_allocation" and gate.status == "FAIL"),
         "globalGateRejections": sum(1 for decision in result.decisions if decision.global_gate_result is not None and decision.global_gate_result.status == "FAIL"),
         "executedTrades": len(trades),
         "decisionCount": len(result.decisions),

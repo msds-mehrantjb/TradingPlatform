@@ -181,6 +181,7 @@ def run_wca_execution_pipeline(
             available_buying_power=max(0.0, pipeline_input.available_buying_power),
             average_one_minute_volume=max(1.0, _average_volume(snapshot.candles)),
             confidence_size_multiplier=max(abs(aggregation.normalized_net_score), 0.01),
+            edge_size_multiplier=max(aggregation.winner_edge, 0.01),
             global_gate_quantity_cap=pipeline_input.global_gate_quantity_cap,
             approved_risk_budget=pipeline_input.approved_risk_budget
             if pipeline_input.approved_risk_budget is not None

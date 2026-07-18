@@ -25,6 +25,7 @@ class WcaSizingContext:
     available_buying_power: float
     average_one_minute_volume: float
     confidence_size_multiplier: float = 1.0
+    edge_size_multiplier: float = 1.0
     dynamic_profile_multiplier: float | None = None
     global_gate_quantity_cap: int | None = None
     approved_risk_budget: float | None = None
@@ -35,6 +36,29 @@ class WcaSizingContext:
     minimum_spread_multiple: float = 2.0
     minimum_reward_risk: float | None = None
     estimated_cost_per_share: float | None = None
+
+
+@dataclass(frozen=True)
+class WcaSizingInputDefinition:
+    input_id: str
+    source: str
+    responsibility: str
+
+
+WCA_SIZING_INPUT_INVENTORY: tuple[WcaSizingInputDefinition, ...] = (
+    WcaSizingInputDefinition("wca_signal_strength", "aggregation.normalized_net_score", "Scale WCA quantity by the final WCA signal strength."),
+    WcaSizingInputDefinition("wca_confidence_and_edge", "context.confidence_size_multiplier and context.edge_size_multiplier", "Represent WCA conviction before position sizing."),
+    WcaSizingInputDefinition("wca_risk_allocation", "effective_settings.final_risk_percent", "Limit risk to the WCA effective risk allocation."),
+    WcaSizingInputDefinition("stop_distance", "ATR, minimum stop distance, spread, and fallback", "Calculate per-share WCA stop risk."),
+    WcaSizingInputDefinition("available_buying_power", "pipeline_input.available_buying_power", "Cap proposal size by available buying power."),
+    WcaSizingInputDefinition("position_cap_limit", "effective_settings.final_max_position_percent", "Cap WCA position value."),
+    WcaSizingInputDefinition("liquidity_participation", "effective_settings.final_max_participation_percent", "Cap quantity by WCA liquidity participation."),
+    WcaSizingInputDefinition("maximum_shares", "effective_settings.final_max_allowed_shares", "Apply the WCA maximum-share limit."),
+    WcaSizingInputDefinition("remaining_wca_risk_budget", "context.approved_risk_budget", "Cap stop risk by remaining approved WCA risk budget."),
+    WcaSizingInputDefinition("global_gate_quantity_cap", "context.global_gate_quantity_cap", "Respect the shared global-gate quantity cap without submitting orders."),
+)
+
+WCA_SIZING_INPUT_IDS = frozenset(row.input_id for row in WCA_SIZING_INPUT_INVENTORY)
 
 
 @dataclass(frozen=True)
@@ -167,6 +191,8 @@ def _invalid_input_reason(context: WcaSizingContext, spread: float) -> str:
         return "invalid_spread"
     if context.confidence_size_multiplier < 0:
         return "invalid_confidence_multiplier"
+    if context.edge_size_multiplier < 0:
+        return "invalid_edge_multiplier"
     if context.dynamic_profile_multiplier is not None and context.dynamic_profile_multiplier < 0:
         return "invalid_dynamic_multiplier"
     return ""
@@ -189,7 +215,7 @@ def _quantity_caps(
         "order_allocation": (context.account_equity * (effective_settings.final_order_allocation_percent / 100.0)) / entry_price,
         "maximum_position": remaining_position_value / entry_price,
         "buying_power": context.available_buying_power / entry_price,
-        "liquidity_participation": context.average_one_minute_volume * (effective_settings.baseline.max_participation_percent / 100.0),
+        "liquidity_participation": context.average_one_minute_volume * (effective_settings.final_max_participation_percent / 100.0),
         "maximum_shares": float(maximum_share_cap),
         "global_gate": float(max(0, global_cap)),
     }
@@ -200,7 +226,7 @@ def _risk_dollars(context: WcaSizingContext, effective_settings: WcaEffectiveSet
     raw_risk = (
         context.account_equity
         * (effective_settings.baseline.base_risk_percent / 100.0)
-        * context.confidence_size_multiplier
+        * min(context.confidence_size_multiplier, context.edge_size_multiplier)
         * dynamic_multiplier
     )
     effective_limit = context.account_equity * (effective_settings.final_risk_percent / 100.0)
@@ -391,8 +417,11 @@ def _positive_number(value: float) -> bool:
 
 
 __all__ = [
+    "WCA_SIZING_INPUT_IDS",
+    "WCA_SIZING_INPUT_INVENTORY",
     "WCA_SIZING_VERSION",
     "WcaManualSizingOverride",
+    "WcaSizingInputDefinition",
     "WcaSizedOrder",
     "WcaSizingContext",
     "WcaSizingResult",

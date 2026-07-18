@@ -2,33 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
 from math import isfinite
 
-from backend.app.algorithms.wca.contracts import WCA_ALGORITHM_ID, ProposedOrder, WcaDecision, WcaOrderStatus, WcaSide
+from backend.app.algorithms.wca.contracts import WCA_ALGORITHM_ID, ProposedOrder, WcaDecision, WcaOrderStatus, WcaOrderValidationContext, WcaOrderValidationResult, WcaSide
 from backend.app.algorithms.wca.strategies.indicators import eastern_minutes
 
 
 WCA_ORDER_VALIDATION_VERSION = "wca_order_validation_v1"
 WCA_ORDER_VALIDATION_PASSED = "wca.order_validation.passed"
 WCA_ORDER_VALIDATION_FAILED = "wca.order_validation.failed"
-
-
-@dataclass(frozen=True)
-class WcaOrderValidationContext:
-    evaluation_timestamp: datetime
-    paper_only_mode: bool = True
-    current_position_quantity: int = 0
-    current_position_side: WcaSide | str | None = None
-    allow_position_increase: bool = False
-    position_owned_by_wca: bool = True
-
-
-@dataclass(frozen=True)
-class WcaOrderValidationResult:
-    valid: bool
-    reason_codes: tuple[str, ...]
 
 
 def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationContext) -> WcaOrderValidationResult:

@@ -16,6 +16,8 @@ from backend.app.algorithms.wca.contracts import (
     WcaVolatilityStatus,
 )
 from backend.app.algorithms.wca.dynamic_profile import (
+    WCA_DYNAMIC_PROFILE_VALUE_IDS,
+    WCA_DYNAMIC_PROFILE_VALUE_INVENTORY,
     WcaDynamicProfileConfig,
     protective_stop_distance_for_existing_position,
     resolve_dynamic_profile,
@@ -26,6 +28,27 @@ UTC = timezone.utc
 
 
 class WcaStep8DynamicProfileTest(unittest.TestCase):
+    def test_dynamic_profile_value_inventory_is_wca_owned(self) -> None:
+        expected = (
+            "entry_score_threshold",
+            "minimum_confidence",
+            "minimum_agreement",
+            "risk_percentage",
+            "maximum_wca_position_allocation",
+            "stop_distance_multiplier",
+            "reward_risk_requirement",
+            "maximum_trade_count",
+            "session_restrictions",
+            "spread_limits",
+            "liquidity_limits",
+            "volatility_reductions",
+            "drawdown_reductions",
+        )
+
+        self.assertEqual(tuple(value.value_id for value in WCA_DYNAMIC_PROFILE_VALUE_INVENTORY), expected)
+        self.assertEqual(WCA_DYNAMIC_PROFILE_VALUE_IDS, set(expected))
+        self.assertTrue(all(value.effective_field and value.responsibility for value in WCA_DYNAMIC_PROFILE_VALUE_INVENTORY))
+
     def test_baseline_remains_unchanged_after_profile_calculation(self) -> None:
         baseline = baseline_settings()
         before = baseline.deterministic_json()
@@ -66,6 +89,8 @@ class WcaStep8DynamicProfileTest(unittest.TestCase):
         self.assertEqual(effective.final_minimum_agreement, baseline.minimum_directional_agreement)
         self.assertEqual(effective.final_minimum_confidence, baseline.minimum_average_confidence)
         self.assertEqual(effective.final_entry_cutoff_minutes, baseline.entry_cutoff_minutes)
+        self.assertEqual(effective.final_max_spread_percent, baseline.max_spread_percent)
+        self.assertEqual(effective.final_max_participation_percent, baseline.max_participation_percent)
         self.assertEqual(effective.final_pyramiding_enabled, baseline.pyramiding_enabled)
         self.assertFalse(effective.entries_blocked)
 
@@ -92,6 +117,8 @@ class WcaStep8DynamicProfileTest(unittest.TestCase):
         self.assertLessEqual(effective.final_max_allowed_shares, baseline.max_allowed_shares)
         self.assertLessEqual(effective.final_max_daily_loss_percent, baseline.max_daily_loss_percent)
         self.assertLessEqual(effective.final_max_daily_trades, baseline.max_daily_trades)
+        self.assertLessEqual(effective.final_max_spread_percent, baseline.max_spread_percent)
+        self.assertLessEqual(effective.final_max_participation_percent, baseline.max_participation_percent)
         self.assertGreaterEqual(effective.final_minimum_score, baseline.minimum_score)
         self.assertGreaterEqual(effective.final_minimum_agreement, baseline.minimum_directional_agreement)
         self.assertGreaterEqual(effective.final_minimum_confidence, baseline.minimum_average_confidence)
@@ -123,6 +150,8 @@ class WcaStep8DynamicProfileTest(unittest.TestCase):
         self.assertEqual(effective.final_max_position_percent, 0)
         self.assertEqual(effective.final_max_daily_trades, 0)
         self.assertEqual(effective.final_max_allowed_shares, 0)
+        self.assertEqual(effective.final_max_spread_percent, 0)
+        self.assertEqual(effective.final_max_participation_percent, 0)
 
     def test_profile_switching_does_not_oscillate_on_every_candle(self) -> None:
         baseline = baseline_settings()

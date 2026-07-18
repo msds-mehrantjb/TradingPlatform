@@ -6,6 +6,13 @@ from datetime import datetime, timezone
 
 from pydantic import ValidationError
 
+from backend.app.algorithms.wca.contracts import (
+    WCA_ALGORITHM_ID,
+    WCA_GLOBAL_RISK_ALLOWED_CONSTRAINTS,
+    WCA_GLOBAL_RISK_FORBIDDEN_REWRITE_TARGETS,
+    WCA_SHARED_PLATFORM_COMPONENT_IDS,
+    WCA_SHARED_PLATFORM_COMPONENT_INVENTORY,
+)
 from backend.app.risk import (
     GLOBAL_GATE_ENGINE_VERSION,
     GlobalGateAccountState,
@@ -25,6 +32,75 @@ from backend.app.risk import (
 
 
 class WcaStep12GlobalGateEngineTests(unittest.TestCase):
+    def test_wca_shared_platform_component_inventory_is_explicit(self) -> None:
+        self.assertEqual(
+            WCA_SHARED_PLATFORM_COMPONENT_IDS,
+            {
+                "raw_and_normalized_market_data_services",
+                "clock_and_market_calendar_service",
+                "account_equity_and_buying_power_snapshot",
+                "broker_api_client",
+                "global_account_risk_engine",
+                "global_portfolio_risk_ledger",
+                "global_emergency_controls",
+                "idempotency_service",
+                "broker_reconciliation_infrastructure",
+                "database_connection_path_utilities",
+                "logging_metrics_and_tracing",
+                "api_framework_and_authentication",
+            },
+        )
+        rules = {component.shared_component: component.sharing_rule for component in WCA_SHARED_PLATFORM_COMPONENT_INVENTORY}
+        self.assertEqual(rules["Raw and normalized market-data services"], "Read-only input.")
+        self.assertEqual(rules["Broker API client"], "Executes approved proposals only.")
+        self.assertEqual(rules["Global account-risk engine"], "May reduce or reject WCA risk.")
+        self.assertEqual(rules["Idempotency service"], "Must include WCA algorithm and intent identifiers.")
+        self.assertEqual(rules["Logging, metrics, and tracing"], "Must tag records with algorithm_id=wca.")
+        self.assertEqual(rules["API framework and authentication"], "Transport only.")
+
+    def test_shared_global_risk_constraints_are_one_way_and_cannot_rewrite_wca_state(self) -> None:
+        self.assertEqual(
+            WCA_GLOBAL_RISK_FORBIDDEN_REWRITE_TARGETS,
+            {
+                "wca_signals",
+                "strategy_confidence",
+                "strategy_weights",
+                "wca_thresholds",
+                "wca_dynamic_profiles",
+                "wca_stop_logic",
+                "wca_backtest_results",
+            },
+        )
+        self.assertEqual(WCA_GLOBAL_RISK_ALLOWED_CONSTRAINTS, {"reduce_wca_risk", "reject_wca_entry", "block_new_entries"})
+
+        order = proposal(quantity=100)
+        result = GlobalGateEngine().evaluate(global_gate_input(proposed_order=order, account_state=account(available_buying_power=5_000)))
+
+        self.assertEqual(result.algorithm_id, WCA_ALGORITHM_ID)
+        self.assertEqual(result.requested_quantity, 100)
+        self.assertEqual(result.approved_quantity, 50)
+        self.assertEqual(order.quantity, 100)
+        self.assertEqual(order.stop_price, 98)
+        for forbidden in WCA_GLOBAL_RISK_FORBIDDEN_REWRITE_TARGETS:
+            self.assertFalse(hasattr(result, forbidden), forbidden)
+        with self.assertRaises(ValidationError):
+            GlobalGateResult(
+                decision=GlobalGateDecision.ALLOW,
+                algorithm_id=WCA_ALGORITHM_ID,
+                proposed_quantity=10,
+                allowed_quantity=10,
+                requested_quantity=10,
+                approved_quantity=10,
+                strategy_weights={"C1": 1.0},
+            )
+
+    def test_global_gate_idempotency_key_changes_by_algorithm_and_intent(self) -> None:
+        order = proposal()
+        base_key = build_global_gate_idempotency_key(order)
+
+        self.assertNotEqual(base_key, build_global_gate_idempotency_key(order.model_copy(update={"algorithm_id": "other_algorithm"})))
+        self.assertNotEqual(base_key, build_global_gate_idempotency_key(order.model_copy(update={"order_intent_id": "intent-2"})))
+
     def test_two_algorithms_cannot_exceed_shared_spy_exposure_limit(self) -> None:
         gate_input = global_gate_input(
             proposed_order=proposal(quantity=200, limit_price=100),

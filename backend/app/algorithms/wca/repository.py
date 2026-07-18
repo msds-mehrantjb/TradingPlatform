@@ -44,6 +44,36 @@ WCA_IGNORED_LOCAL_STORAGE_KEYS = frozenset(
 WCA_ALLOWED_LOCAL_STORAGE_PREFIXES = ("ui-", "display-", "chart-", "panel-", "tab-")
 
 
+@dataclass(frozen=True)
+class WcaPersistenceRecordDefinition:
+    record_id: str
+    table_name: str
+    responsibility: str
+
+
+WCA_PERSISTENCE_RECORD_INVENTORY: tuple[WcaPersistenceRecordDefinition, ...] = (
+    WcaPersistenceRecordDefinition("configuration_versions", "wca_configuration_versions", "Versioned WCA configuration records."),
+    WcaPersistenceRecordDefinition("weight_snapshots", "wca_weight_snapshots", "Versioned WCA strategy-weight snapshots."),
+    WcaPersistenceRecordDefinition("market_status_history", "wca_market_status_snapshots", "WCA market-status history."),
+    WcaPersistenceRecordDefinition("dynamic_profile_history", "wca_effective_setting_snapshots", "WCA dynamic-profile and effective-settings history."),
+    WcaPersistenceRecordDefinition("strategy_evaluations", "wca_strategy_evaluations", "WCA strategy evaluation records."),
+    WcaPersistenceRecordDefinition("decisions", "wca_decisions", "WCA decision snapshots."),
+    WcaPersistenceRecordDefinition("order_intents", "wca_order_intents", "WCA order-intent reservations."),
+    WcaPersistenceRecordDefinition("wca_attributed_orders", "wca_attributed_orders", "WCA-attributed order records."),
+    WcaPersistenceRecordDefinition("wca_attributed_fills", "wca_attributed_fills", "WCA-attributed fill records."),
+    WcaPersistenceRecordDefinition("wca_positions", "wca_positions", "WCA-attributed position records."),
+    WcaPersistenceRecordDefinition("wca_trades", "wca_trade_ledger", "WCA trade ledger records."),
+    WcaPersistenceRecordDefinition("backtest_runs", "wca_backtest_runs", "WCA backtest run records."),
+    WcaPersistenceRecordDefinition("backtest_results", "wca_backtest_results", "WCA backtest result payloads."),
+    WcaPersistenceRecordDefinition("shadow_comparison_records", "wca_shadow_comparison_evidence", "WCA shadow-comparison evidence records."),
+    WcaPersistenceRecordDefinition("paper_stability_evidence", "wca_paper_stability_validations", "WCA paper-stability validation evidence."),
+    WcaPersistenceRecordDefinition("rollout_status", "wca_rollout_status", "WCA rollout status records."),
+)
+
+WCA_PERSISTENCE_RECORD_IDS = frozenset(record.record_id for record in WCA_PERSISTENCE_RECORD_INVENTORY)
+WCA_PERSISTENCE_TABLES = tuple(record.table_name for record in WCA_PERSISTENCE_RECORD_INVENTORY)
+
+
 class WcaRepository(Protocol):
     def initialize_defaults(self, *, symbol: str, configuration: dict[str, Any], weight_snapshot: WcaWeightSnapshot, engine_version: str) -> None:
         ...
@@ -243,6 +273,23 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS wca_strategy_evaluations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            algorithm_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            configuration_version TEXT NOT NULL,
+            engine_version TEXT NOT NULL,
+            market_snapshot_id TEXT NOT NULL,
+            decision_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            strategy_id TEXT NOT NULL,
+            family TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (decision_id, strategy_id)
+        );
+
         CREATE TABLE IF NOT EXISTS wca_local_gate_evaluations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             algorithm_id TEXT NOT NULL,
@@ -294,6 +341,43 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS wca_order_intents (
+            order_intent_id TEXT PRIMARY KEY,
+            idempotency_key TEXT,
+            account_id TEXT NOT NULL DEFAULT 'paper',
+            algorithm_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            configuration_version TEXT NOT NULL,
+            engine_version TEXT NOT NULL,
+            market_snapshot_id TEXT NOT NULL,
+            decision_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_attributed_orders (
+            order_intent_id TEXT PRIMARY KEY,
+            idempotency_key TEXT,
+            account_id TEXT NOT NULL DEFAULT 'paper',
+            algorithm_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            configuration_version TEXT NOT NULL,
+            engine_version TEXT NOT NULL,
+            market_snapshot_id TEXT NOT NULL,
+            decision_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS wca_execution_results (
             execution_id TEXT PRIMARY KEY,
             algorithm_id TEXT NOT NULL,
@@ -305,6 +389,38 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
             decision_id TEXT NOT NULL,
             run_id TEXT NOT NULL,
             status TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_attributed_fills (
+            fill_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            configuration_version TEXT NOT NULL,
+            engine_version TEXT NOT NULL,
+            market_snapshot_id TEXT NOT NULL,
+            decision_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_positions (
+            position_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            configuration_version TEXT NOT NULL,
+            engine_version TEXT NOT NULL,
+            market_snapshot_id TEXT NOT NULL,
+            decision_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -410,6 +526,19 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS wca_backtest_results (
+            run_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            configuration_version TEXT NOT NULL,
+            engine_version TEXT NOT NULL,
+            market_snapshot_id TEXT NOT NULL,
+            decision_id TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS wca_strategy_performance (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             algorithm_id TEXT NOT NULL,
@@ -425,6 +554,21 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE (run_id, strategy_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_rollout_status (
+            status_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            configuration_version TEXT NOT NULL,
+            engine_version TEXT NOT NULL,
+            market_snapshot_id TEXT NOT NULL,
+            decision_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            rollout_version TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_wca_decisions_symbol_time
@@ -475,9 +619,10 @@ class WcaSqliteRepository:
 
     def save_configuration(self, payload: dict[str, Any], *, symbol: str, timestamp: str | None = None, engine_version: str) -> None:
         configuration_version = str(payload.get("configurationVersion") or payload.get("configuration_version") or "wca_configuration_unversioned")
+        saved_at = timestamp or _utc_now()
         row = _common_row(
             symbol=symbol,
-            timestamp=timestamp or _utc_now(),
+            timestamp=saved_at,
             configuration_version=configuration_version,
             engine_version=engine_version,
             market_snapshot_id=f"wca-config-{configuration_version}",
@@ -495,6 +640,8 @@ class WcaSqliteRepository:
                 """,
                 (configuration_version, row["algorithm_id"], symbol, row["timestamp"], engine_version, row["market_snapshot_id"], row["decision_id"], row["run_id"], _json(payload)),
             )
+            if isinstance(payload.get("rollout"), dict):
+                self._insert_rollout_status(conn, payload["rollout"], row)
 
     def save_strategy_versions(self, *, symbol: str, timestamp: str, configuration_version: str, engine_version: str) -> None:
         row = _common_row(
@@ -608,32 +755,7 @@ class WcaSqliteRepository:
         proposed = decision.proposed_order.model_copy(update={"idempotency_key": idempotency_key, "account_id": account_id})
         common = _decision_common(decision.model_copy(update={"proposed_order": proposed}), run_id)
         with self.connect() as conn:
-            cursor = conn.execute(
-                """
-                INSERT OR IGNORE INTO wca_proposed_orders (
-                    order_intent_id, idempotency_key, account_id, algorithm_id, symbol,
-                    timestamp, configuration_version, engine_version, market_snapshot_id,
-                    decision_id, run_id, side, quantity, payload_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    proposed.order_intent_id,
-                    idempotency_key,
-                    account_id,
-                    common["algorithm_id"],
-                    common["symbol"],
-                    common["timestamp"],
-                    common["configuration_version"],
-                    common["engine_version"],
-                    common["market_snapshot_id"],
-                    decision.decision_id,
-                    run_id,
-                    _value(proposed.side),
-                    proposed.quantity,
-                    proposed.model_dump_json(),
-                ),
-            )
+            cursor = self._insert_order_records(conn, proposed, common, ignore_duplicates=True)
             row = conn.execute(
                 "SELECT payload_json FROM wca_proposed_orders WHERE idempotency_key = ?",
                 (idempotency_key,),
@@ -665,8 +787,9 @@ class WcaSqliteRepository:
                 SELECT
                     (SELECT COUNT(*) FROM wca_execution_results WHERE payload_json LIKE ?)
                     + (SELECT COUNT(*) FROM wca_trade_ledger WHERE payload_json LIKE ?)
+                    + (SELECT COUNT(*) FROM wca_attributed_fills WHERE payload_json LIKE ?)
                 """,
-                (pattern, pattern),
+                (pattern, pattern, pattern),
             ).fetchone()[0]
         return int(count) > 0
 
@@ -809,6 +932,16 @@ class WcaSqliteRepository:
                 """,
                 (config.run_id, common["algorithm_id"], config.symbol, timestamp, config.configuration_version, common["engine_version"], market_snapshot_id, decision_id, result.total_pnl, result.model_dump_json()),
             )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO wca_backtest_results (
+                    run_id, algorithm_id, symbol, timestamp, configuration_version,
+                    engine_version, market_snapshot_id, decision_id, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (config.run_id, common["algorithm_id"], config.symbol, timestamp, config.configuration_version, common["engine_version"], market_snapshot_id, decision_id, result.model_dump_json()),
+            )
             for decision in result.decisions:
                 self._insert_decision(conn, decision, _decision_common(decision, config.run_id, engine_version=common["engine_version"]))
             for trade in result.trades:
@@ -844,24 +977,16 @@ class WcaSqliteRepository:
 
     def table_counts(self) -> WcaPersistenceSummary:
         tables = (
-            "wca_configuration_versions",
+            *WCA_PERSISTENCE_TABLES,
             "wca_strategy_versions",
-            "wca_weight_snapshots",
             "wca_confidence_calibrations",
-            "wca_market_status_snapshots",
-            "wca_effective_setting_snapshots",
-            "wca_decisions",
-            "wca_local_gate_evaluations",
             "global_gate_evaluations",
             "wca_proposed_orders",
             "wca_execution_results",
-            "wca_trade_ledger",
             "wca_broker_reconciliations",
-            "wca_shadow_comparison_evidence",
-            "wca_paper_stability_validations",
-            "wca_backtest_runs",
             "wca_backtest_trades",
             "wca_strategy_performance",
+            "wca_local_gate_evaluations",
         )
         with self.connect() as conn:
             counts = {table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables}
@@ -905,32 +1030,8 @@ class WcaSqliteRepository:
                 (common["algorithm_id"], common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], decision.decision_id, common["run_id"], _value(decision.global_gate_result.status), decision.global_gate_result.model_dump_json()),
             )
         if decision.proposed_order is not None:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO wca_proposed_orders (
-                    order_intent_id, idempotency_key, account_id, algorithm_id, symbol,
-                    timestamp, configuration_version, engine_version, market_snapshot_id,
-                    decision_id, run_id, side, quantity, payload_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    decision.proposed_order.order_intent_id,
-                    decision.proposed_order.idempotency_key,
-                    decision.proposed_order.account_id,
-                    common["algorithm_id"],
-                    common["symbol"],
-                    common["timestamp"],
-                    common["configuration_version"],
-                    common["engine_version"],
-                    common["market_snapshot_id"],
-                    decision.decision_id,
-                    common["run_id"],
-                    _value(decision.proposed_order.side),
-                    decision.proposed_order.quantity,
-                    decision.proposed_order.model_dump_json(),
-                ),
-            )
+            self._insert_order_records(conn, decision.proposed_order, common)
+        self._insert_strategy_evaluations(conn, decision, common)
 
     def _insert_trade(self, conn: sqlite3.Connection, trade, result: BacktestResult, common: dict[str, str]) -> None:
         config = result.run_configuration
@@ -972,6 +1073,54 @@ class WcaSqliteRepository:
             """,
             values,
         )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO wca_attributed_fills (
+                fill_id, algorithm_id, symbol, timestamp, configuration_version,
+                engine_version, market_snapshot_id, decision_id, run_id, side,
+                quantity, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"{trade.trade_id}-fill",
+                common["algorithm_id"],
+                trade.symbol,
+                _dt(trade.entry_at),
+                config.configuration_version,
+                common["engine_version"],
+                f"{trade.decision_id}-market",
+                trade.decision_id,
+                config.run_id,
+                _value(trade.side),
+                trade.quantity,
+                payload,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO wca_positions (
+                position_id, algorithm_id, symbol, timestamp, configuration_version,
+                engine_version, market_snapshot_id, decision_id, run_id, side,
+                quantity, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"{trade.trade_id}-position",
+                common["algorithm_id"],
+                trade.symbol,
+                _dt(trade.exit_at or trade.entry_at),
+                config.configuration_version,
+                common["engine_version"],
+                f"{trade.decision_id}-market",
+                trade.decision_id,
+                config.run_id,
+                _value(trade.side),
+                0 if trade.exit_at is not None else trade.quantity,
+                payload,
+            ),
+        )
 
     def _insert_strategy_performance(self, conn: sqlite3.Connection, result: BacktestResult, common: dict[str, str]) -> None:
         by_strategy = result.metrics.get("diagnostics", {}).get("breakdowns", {}).get("byStrategy", {})
@@ -986,6 +1135,117 @@ class WcaSqliteRepository:
                 """,
                 (common["algorithm_id"], common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], strategy_id, str(payload.get("family", "unknown")), _json(payload)),
             )
+
+    def _insert_strategy_evaluations(self, conn: sqlite3.Connection, decision: WcaDecision, common: dict[str, str]) -> None:
+        for evaluation in decision.aggregation.strategy_evaluations:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO wca_strategy_evaluations (
+                    algorithm_id, symbol, timestamp, configuration_version, engine_version,
+                    market_snapshot_id, decision_id, run_id, strategy_id, family, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    common["algorithm_id"],
+                    common["symbol"],
+                    common["timestamp"],
+                    common["configuration_version"],
+                    common["engine_version"],
+                    common["market_snapshot_id"],
+                    decision.decision_id,
+                    common["run_id"],
+                    evaluation.strategy_id,
+                    next((row.family for row in decision.aggregation.strategy_contributions if row.strategy_id == evaluation.strategy_id), "unknown"),
+                    evaluation.model_dump_json(),
+                ),
+            )
+
+    def _insert_order_records(
+        self,
+        conn: sqlite3.Connection,
+        proposed: ProposedOrder,
+        common: dict[str, str],
+        *,
+        ignore_duplicates: bool = False,
+    ) -> sqlite3.Cursor:
+        verb = "INSERT OR IGNORE" if ignore_duplicates else "INSERT OR REPLACE"
+        values = (
+            proposed.order_intent_id,
+            proposed.idempotency_key,
+            proposed.account_id,
+            common["algorithm_id"],
+            common["symbol"],
+            common["timestamp"],
+            common["configuration_version"],
+            common["engine_version"],
+            common["market_snapshot_id"],
+            common["decision_id"],
+            common["run_id"],
+            _value(proposed.side),
+            proposed.quantity,
+            proposed.model_dump_json(),
+        )
+        cursor = conn.execute(
+            f"""
+            {verb} INTO wca_proposed_orders (
+                order_intent_id, idempotency_key, account_id, algorithm_id, symbol,
+                timestamp, configuration_version, engine_version, market_snapshot_id,
+                decision_id, run_id, side, quantity, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        conn.execute(
+            f"""
+            {verb} INTO wca_order_intents (
+                order_intent_id, idempotency_key, account_id, algorithm_id, symbol,
+                timestamp, configuration_version, engine_version, market_snapshot_id,
+                decision_id, run_id, side, quantity, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        conn.execute(
+            f"""
+            {verb} INTO wca_attributed_orders (
+                order_intent_id, idempotency_key, account_id, algorithm_id, symbol,
+                timestamp, configuration_version, engine_version, market_snapshot_id,
+                decision_id, run_id, side, quantity, status, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (*values[:-1], _value(proposed.status), values[-1]),
+        )
+        return cursor
+
+    def _insert_rollout_status(self, conn: sqlite3.Connection, payload: dict[str, Any], common: dict[str, str]) -> None:
+        rollout_version = str(payload.get("rollout_version") or payload.get("rolloutVersion") or "wca_rollout_unversioned")
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO wca_rollout_status (
+                status_id, algorithm_id, symbol, timestamp, configuration_version,
+                engine_version, market_snapshot_id, decision_id, run_id, rollout_version,
+                payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"{common['run_id']}-rollout",
+                common["algorithm_id"],
+                common["symbol"],
+                common["timestamp"],
+                common["configuration_version"],
+                common["engine_version"],
+                common["market_snapshot_id"],
+                common["decision_id"],
+                common["run_id"],
+                rollout_version,
+                _json(payload),
+            ),
+        )
 
     def _insert_market_status(self, conn: sqlite3.Connection, status: WcaMarketStatus, common: dict[str, str]) -> None:  # type: ignore[no-redef]
         conn.execute(
@@ -1076,7 +1336,11 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
 __all__ = [
     "WCA_IGNORED_LOCAL_STORAGE_KEYS",
     "WCA_PERSISTENCE_MIGRATION_VERSION",
+    "WCA_PERSISTENCE_RECORD_IDS",
+    "WCA_PERSISTENCE_RECORD_INVENTORY",
+    "WCA_PERSISTENCE_TABLES",
     "WcaOrderIntentReservation",
+    "WcaPersistenceRecordDefinition",
     "WcaPersistenceSummary",
     "WcaRepository",
     "WcaSqliteRepository",

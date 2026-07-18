@@ -101,5 +101,6 @@ WCA_HARD_FILTER_REGISTRY: tuple[WcaHardFilterDefinition, ...] = (
 )
 
 WCA_PRIMARY_VOTER_SLUGS = frozenset(strategy.slug for strategy in WCA_STRATEGY_REGISTRY)
+WCA_STRATEGY_IDS = frozenset(strategy.strategy_id for strategy in WCA_STRATEGY_REGISTRY)
 WCA_MODIFIER_SLUGS = frozenset(modifier.slug for modifier in WCA_MODIFIER_REGISTRY)
 WCA_HARD_FILTER_SLUGS = frozenset(hard_filter.slug for hard_filter in WCA_HARD_FILTER_REGISTRY)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 
 from backend.app.algorithms.wca.rollout import (
     GLOBAL_GATE_ENGINE_ENABLED,
@@ -28,13 +29,76 @@ from backend.app.algorithms.wca.rollout import (
     wca_rollout_status,
 )
 from backend.app.algorithms.wca.service import WcaService
+from backend.app.algorithms.wca.test_coverage import (
+    WCA_TEST_SUITE_COVERAGE_AREA_IDS,
+    WCA_TEST_SUITE_COVERAGE_INVENTORY,
+    WCA_TEST_SUITE_PASS_REQUIRES_EXECUTION,
+    WCA_VALIDATION_ROLLOUT_FILE_INVENTORY,
+    WCA_VALIDATION_ROLLOUT_FILE_NAMES,
+    wca_validation_rollout_inventory_report,
+)
 from backend.app.config import ApplicationConfig
 
 
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class WcaStep20RolloutTest(unittest.TestCase):
+    def test_validation_and_rollout_file_inventory_is_dedicated(self) -> None:
+        self.assertEqual(
+            WCA_VALIDATION_ROLLOUT_FILE_NAMES,
+            {
+                "shadow_comparison.py",
+                "paper_stability.py",
+                "rollout.py",
+                "final_acceptance.py",
+                "test_coverage.py",
+            },
+        )
+        self.assertEqual(
+            {row.file_name: row.responsibility for row in WCA_VALIDATION_ROLLOUT_FILE_INVENTORY},
+            {
+                "shadow_comparison.py": "Legacy-versus-new WCA comparison.",
+                "paper_stability.py": "Paper-run stability validation.",
+                "rollout.py": "Controlled WCA rollout and rollback.",
+                "final_acceptance.py": "WCA completion ledger.",
+                "test_coverage.py": "WCA test coverage reporting.",
+            },
+        )
+        for file_name in WCA_VALIDATION_ROLLOUT_FILE_NAMES:
+            self.assertTrue((ROOT / "backend" / "app" / "algorithms" / "wca" / file_name).is_file(), file_name)
+
+    def test_dedicated_wca_test_suite_inventory_covers_requested_areas_without_claiming_passage(self) -> None:
+        self.assertEqual(
+            WCA_TEST_SUITE_COVERAGE_AREA_IDS,
+            {
+                "structure",
+                "strategy_isolation",
+                "confidence",
+                "weights",
+                "market_status",
+                "dynamic_settings",
+                "aggregation",
+                "gates",
+                "sizing",
+                "backtesting",
+                "persistence",
+                "rollout",
+                "paper_execution",
+                "reconciliation",
+                "stability",
+                "final_acceptance",
+            },
+        )
+        self.assertTrue(WCA_TEST_SUITE_PASS_REQUIRES_EXECUTION)
+        for area in WCA_TEST_SUITE_COVERAGE_INVENTORY:
+            self.assertTrue((ROOT / "backend" / "tests" / area.test_file).is_file(), area.area_id)
+
+        report = wca_validation_rollout_inventory_report()
+        self.assertFalse(report["testPresenceProvesPassing"])
+        self.assertTrue(report["passingRequiresPytestExecution"])
+
     def test_feature_flags_default_to_active_v2_with_paper_execution_disabled(self) -> None:
         flags = wca_rollout_feature_flags({})
 

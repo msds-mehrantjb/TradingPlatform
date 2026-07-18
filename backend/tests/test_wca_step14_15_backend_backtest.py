@@ -7,6 +7,11 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from backend.app.algorithms.wca.backtest import (
+    WCA_BACKTEST_FILE_INVENTORY,
+    WCA_BACKTEST_INVENTORY,
+    WCA_BACKTEST_RESPONSIBILITY_IDS,
+)
 from backend.app.algorithms.wca.backtest.engine import run_wca_backtest, run_wca_backtest_modes
 from backend.app.algorithms.wca.contracts import (
     BacktestRunConfiguration,
@@ -19,6 +24,63 @@ from backend.app.algorithms.wca.contracts import (
     WcaStrategyEvaluation,
 )
 from backend.app.main import app
+
+
+class WcaBacktestInventoryTests(unittest.TestCase):
+    def test_backtest_package_contains_only_the_dedicated_inventory_files(self) -> None:
+        backtest_path = Path(__file__).resolve().parents[2] / "backend" / "app" / "algorithms" / "wca" / "backtest"
+        files = tuple(sorted(path.name for path in backtest_path.glob("*.py")))
+
+        self.assertEqual(files, tuple(sorted(WCA_BACKTEST_FILE_INVENTORY)))
+        self.assertEqual(
+            WCA_BACKTEST_FILE_INVENTORY,
+            (
+                "__init__.py",
+                "engine.py",
+                "execution.py",
+                "ledger.py",
+                "metrics.py",
+                "reports.py",
+                "walk_forward.py",
+            ),
+        )
+
+    def test_backtest_inventory_records_every_backend_authoritative_responsibility(self) -> None:
+        self.assertEqual(
+            WCA_BACKTEST_RESPONSIBILITY_IDS,
+            {
+                "wca_replay_orchestration",
+                "point_in_time_snapshots",
+                "signal_generation",
+                "next_bar_execution",
+                "fill_simulation",
+                "slippage_and_trading_costs",
+                "partial_fill_simulation",
+                "wca_position_ledger",
+                "wca_trade_ledger",
+                "wca_metrics",
+                "rolling_diagnostics",
+                "walk_forward_testing",
+                "untouched_holdout_testing",
+                "wca_reports",
+                "baseline_comparison",
+            },
+        )
+        self.assertEqual(len(WCA_BACKTEST_INVENTORY), 15)
+        self.assertTrue(all(row.owner_file in WCA_BACKTEST_FILE_INVENTORY for row in WCA_BACKTEST_INVENTORY))
+
+    def test_backtest_result_evidence_matches_inventory_contract(self) -> None:
+        result = run_wca_backtest(backtest_request(candles=sample_candles(35)))
+        suite = run_wca_backtest_modes(backtest_request(candles=multi_session_candles(28)))
+
+        self.assertEqual(result.metrics["engineVersion"], "wca_backend_backtest_v1")
+        self.assertEqual(result.metrics["fillRule"], "signal on bar t fills no earlier than bar t+1 open")
+        self.assertIn("fill_no_earlier_than_bar_t_plus_1_open", result.metrics["eventOrder"])
+        self.assertTrue(result.metrics["openPositionDrawdownIncluded"])
+        self.assertIn("diagnostics", result.metrics)
+        self.assertEqual(suite.walk_forward.label, "Walk-forward evaluation")
+        self.assertEqual(suite.holdout.label, "Untouched holdout")
+        self.assertTrue(all(comparison.metrics["identicalDataset"] for comparison in suite.comparisons))
 
 
 class WcaStep14BackendBacktestTests(unittest.TestCase):

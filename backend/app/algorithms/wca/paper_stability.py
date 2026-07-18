@@ -5,12 +5,13 @@ from __future__ import annotations
 from typing import Protocol
 
 from backend.app.algorithms.wca.contracts import (
+    WCA_PAPER_STABILITY_VALIDATION_SCHEMA_VERSION,
     WcaPaperStabilityValidationRequest,
     WcaPaperStabilityValidationResult,
 )
 
 
-WCA_PAPER_STABILITY_VALIDATION_VERSION = "wca_paper_stability_validation_v1"
+WCA_PAPER_STABILITY_VALIDATION_VERSION = WCA_PAPER_STABILITY_VALIDATION_SCHEMA_VERSION
 
 
 class WcaPaperStabilityRepository(Protocol):

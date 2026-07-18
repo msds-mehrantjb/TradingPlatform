@@ -4,10 +4,35 @@ import unittest
 from dataclasses import replace
 
 from backend.app.algorithms.wca.contracts import WcaBaselineSettings, WcaEffectiveSettings, WcaSide
-from backend.app.algorithms.wca.sizing import WcaManualSizingOverride, WcaSizingContext, size_wca_order, tighten_protective_stop
+from backend.app.algorithms.wca.sizing import (
+    WCA_SIZING_INPUT_IDS,
+    WCA_SIZING_INPUT_INVENTORY,
+    WcaManualSizingOverride,
+    WcaSizingContext,
+    size_wca_order,
+    tighten_protective_stop,
+)
 
 
 class WcaStep11SizingTests(unittest.TestCase):
+    def test_wca_sizing_input_inventory_is_exact(self) -> None:
+        expected = (
+            "wca_signal_strength",
+            "wca_confidence_and_edge",
+            "wca_risk_allocation",
+            "stop_distance",
+            "available_buying_power",
+            "position_cap_limit",
+            "liquidity_participation",
+            "maximum_shares",
+            "remaining_wca_risk_budget",
+            "global_gate_quantity_cap",
+        )
+
+        self.assertEqual(tuple(row.input_id for row in WCA_SIZING_INPUT_INVENTORY), expected)
+        self.assertEqual(WCA_SIZING_INPUT_IDS, set(expected))
+        self.assertTrue(all(row.source and row.responsibility for row in WCA_SIZING_INPUT_INVENTORY))
+
     def test_sizing_reports_each_limiting_cap(self) -> None:
         cases = (
             ("risk_based", replace(_context(), approved_risk_budget=6.0), _settings()),
@@ -60,6 +85,13 @@ class WcaStep11SizingTests(unittest.TestCase):
         self.assertLessEqual(result.sizing.stop_risk_dollars, 50)
         self.assertEqual(result.sizing.limiting_factor, "risk_based")
 
+    def test_confidence_and_edge_reduce_wca_risk_scalar(self) -> None:
+        strong = size_wca_order(replace(_context(), confidence_size_multiplier=0.80, edge_size_multiplier=0.80), _settings()).sizing
+        weak_edge = size_wca_order(replace(_context(), confidence_size_multiplier=0.80, edge_size_multiplier=0.20), _settings()).sizing
+
+        self.assertLess(weak_edge.risk_dollars, strong.risk_dollars)
+        self.assertAlmostEqual(weak_edge.risk_dollars, strong.risk_dollars * 0.25, places=6)
+
     def test_quantity_calculation_is_deterministic(self) -> None:
         first = size_wca_order(_context(), _settings()).sizing
         second = size_wca_order(_context(), _settings()).sizing
@@ -79,6 +111,14 @@ class WcaStep11SizingTests(unittest.TestCase):
         self.assertEqual(result.sizing.final_quantity, 0)
         self.assertIsNone(result.proposed_order)
         self.assertEqual(result.sizing.limiting_factor, "position_increase_blocked")
+
+    def test_sizing_only_produces_a_wca_order_proposal(self) -> None:
+        result = size_wca_order(_context(), _settings())
+
+        self.assertIsNotNone(result.proposed_order)
+        self.assertEqual(result.proposed_order.status, "PROPOSED")
+        self.assertEqual(result.proposed_order.quantity, result.sizing.final_quantity)
+        self.assertIn("wca_sizing_v2_step11", result.proposed_order.reason_codes)
 
     def test_protective_stop_can_tighten_but_not_widen(self) -> None:
         self.assertEqual(tighten_protective_stop(current_stop_price=98, proposed_stop_price=99, side=WcaSide.BUY), 99)
@@ -155,6 +195,7 @@ def _settings(
         final_order_allocation_percent=order_allocation_percent,
         final_max_position_percent=max_position_percent,
         final_max_allowed_shares=max_allowed_shares,
+        final_max_participation_percent=max_participation_percent,
         final_atr_stop_multiplier=baseline.atr_stop_multiplier,
         final_minimum_stop_distance_percent=baseline.minimum_stop_distance_percent,
         final_take_profit_r=baseline.take_profit_r,

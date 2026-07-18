@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from backend.app.algorithms.wca.contracts import (
     WCA_ALGORITHM_ID,
+    WCA_BROKER_RECONCILIATION_SCHEMA_VERSION,
     ProposedOrder,
     WcaBrokerReconciliationDiscrepancy,
     WcaBrokerReconciliationResult,
@@ -17,7 +18,7 @@ from backend.app.execution import BrokerFillUpdate
 from backend.app.gates import BrokerAccountSnapshot, BrokerOrderState, BrokerPositionState
 
 
-WCA_BROKER_RECONCILIATION_VERSION = "wca_broker_reconciliation_v1"
+WCA_BROKER_RECONCILIATION_VERSION = WCA_BROKER_RECONCILIATION_SCHEMA_VERSION
 
 
 class WcaPaperBrokerReconciliationClient(Protocol):
