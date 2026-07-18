@@ -15,18 +15,21 @@ class RegimePhase13BacktestApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
         self.assertEqual(payload["algorithmId"], "regime")
-        self.assertEqual(payload["engineVersion"], "regime_backtest_v2")
-        self.assertIn("frontend/src/algorithms/regime/backtest/engine.ts", payload["authoritativeCore"])
+        self.assertEqual(payload["engineVersion"], "regime_backtest_v3_backend")
+        self.assertEqual(payload["status"], "backend_runtime_available")
+        self.assertEqual(payload["authoritativeRuntime"], "backend.app.algorithms.regime.execution_pipeline")
+        self.assertEqual(payload["authoritativeEngine"], "backend.app.algorithms.regime.backtest.engine")
+        self.assertEqual(payload["runtimeLocation"], "backend/app/algorithms/regime")
+        self.assertEqual(payload["frontendRole"], "API client and presentation only")
         self.assertEqual(
             payload["fileInventory"],
             [
-                "engine.ts",
-                "execution-simulator.ts",
-                "metrics.ts",
-                "diagnostics.ts",
-                "walk-forward.ts",
-                "runner.ts",
-                "types.ts",
+                "__init__.py",
+                "engine.py",
+                "execution.py",
+                "ledger.py",
+                "metrics.py",
+                "walk_forward.py",
             ],
         )
         self.assertEqual(
@@ -52,7 +55,8 @@ class RegimePhase13BacktestApiTest(unittest.TestCase):
         )
         self.assertTrue(payload["isolatedFromWca"])
         self.assertNotIn("/api/wca/", str(payload).lower())
-        self.assertNotIn("wca/backtest", payload["authoritativeCore"].lower())
+        self.assertNotIn("frontend/src/algorithms/regime", str(payload).lower())
+        self.assertNotIn("wca/backtest", payload["authoritativeEngine"].lower())
 
     def test_regime_backtest_route_discovery_does_not_expose_wca_routes(self) -> None:
         client = TestClient(app)
@@ -62,6 +66,8 @@ class RegimePhase13BacktestApiTest(unittest.TestCase):
         payload = response.json()
         paths = {route["path"] for route in payload["routes"]}
         self.assertIn("/api/regime/backtests/status", paths)
+        self.assertIn("/api/regime/evaluate", paths)
+        self.assertIn("/api/regime/backtests/run", paths)
         self.assertTrue(all("/api/wca/" not in path for path in paths))
 
 

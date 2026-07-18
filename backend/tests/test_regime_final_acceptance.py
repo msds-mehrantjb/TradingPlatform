@@ -91,14 +91,16 @@ class RegimeFinalAcceptanceTest(unittest.TestCase):
         self.assertIn("\"test\"", package_json)
         self.assertIn("tests/V2DecisionPanel.test.ts", package_json)
 
-    def test_main_ts_imports_regime_core_without_defining_it(self) -> None:
-        main_ts = (ROOT / "frontend" / "src" / "main.ts").read_text(encoding="utf-8")
+    def test_backend_acceptance_evidence_does_not_claim_frontend_regime_authority(self) -> None:
+        backend_text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (ROOT / "backend" / "app" / "algorithms" / "regime").glob("*.py")
+        )
 
-        self.assertIn('from "./algorithms/regime"', main_ts)
-        self.assertIn("calculateRegimeDecision", main_ts)
-        self.assertNotIn("function calculateRegimeDecision", main_ts)
-        self.assertNotIn("function runRegimeBacktest", main_ts)
-        self.assertNotIn("function buildRegimeOrderIntent", main_ts)
+        self.assertNotIn("frontend/src/algorithms/regime", backend_text)
+        self.assertNotIn("client_core_available", backend_text)
+        self.assertNotIn("TypeScript core", backend_text)
+        self.assertIn("backend.app.algorithms.regime.execution_pipeline", backend_text)
 
 
 if __name__ == "__main__":

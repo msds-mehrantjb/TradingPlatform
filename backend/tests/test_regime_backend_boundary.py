@@ -31,6 +31,26 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
         expected = (
             "__init__.py",
             "api.py",
+            "contracts.py",
+            "configuration.py",
+            "market_snapshot.py",
+            "indicators.py",
+            "classification_axes.py",
+            "classifier.py",
+            "hysteresis.py",
+            "transitions.py",
+            "strategy_registry.py",
+            "router.py",
+            "family_aggregation.py",
+            "decision_engine.py",
+            "local_gates.py",
+            "dynamic_profile.py",
+            "sizing.py",
+            "trade_management.py",
+            "exits.py",
+            "order_intent.py",
+            "order_validation.py",
+            "execution_pipeline.py",
             "service.py",
             "repository.py",
             "global_risk_adapter.py",
@@ -42,6 +62,10 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
 
         self.assertEqual(REGIME_BACKEND_FILE_INVENTORY, expected)
         self.assertEqual(inventory["files"], expected)
+        self.assertEqual(inventory["authoritativeRuntime"], "backend.app.algorithms.regime.execution_pipeline")
+        self.assertEqual(inventory["authoritativeBacktestEngine"], "backend.app.algorithms.regime.backtest.engine")
+        self.assertEqual(inventory["frontendRole"], "API client and presentation only")
+        self.assertIn("classifier", inventory["pipeline"])
         self.assertTrue(inventory["apiTransportOnly"])
         for file_name in expected:
             self.assertTrue((ROOT / "backend" / "app" / "algorithms" / "regime" / file_name).exists(), file_name)
@@ -122,6 +146,7 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
         self.assertEqual(body["algorithmId"], "regime")
         self.assertEqual(body["files"], list(REGIME_BACKEND_FILE_INVENTORY))
         self.assertEqual(body["repository"]["implementation"], "backend.app.algorithms.regime.persistence.RegimeSqliteRepository")
+        self.assertEqual(body["authoritativeRuntime"], "backend.app.algorithms.regime.execution_pipeline")
 
     def test_global_risk_adapter_can_only_reduce_or_reject_regime_quantity(self) -> None:
         approval = evaluate_regime_global_risk_request(

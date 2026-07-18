@@ -66,55 +66,55 @@ REGIME_FINAL_ACCEPTANCE_ITEMS: tuple[RegimeAcceptanceItem, ...] = (
     RegimeAcceptanceItem(
         "Regime logic is isolated from main.ts.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/algorithms/regime", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/execution_pipeline.py", "backend/tests/test_regime_backend_boundary.py"),
         category="Isolation",
     ),
     RegimeAcceptanceItem(
         "Allowed Sell decisions remain Sell.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/algorithms/regime/order-intent.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/order_intent.py", "backend/tests/test_regime_backend_boundary.py"),
         category="Direction",
     ),
     RegimeAcceptanceItem(
         "Regime no longer uses WCA sizing or order adapters.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/algorithms/regime/order-intent.ts", "frontend/src/algorithms/regime/position-sizing.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/order_intent.py", "backend/app/algorithms/regime/sizing.py", "backend/tests/test_regime_backend_boundary.py"),
         category="Isolation",
     ),
     RegimeAcceptanceItem(
         "Directional, context, and safety roles are separated.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/algorithms/regime/strategy-catalog.ts", "frontend/src/algorithms/regime/family-aggregation.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/strategy_registry.py", "backend/app/algorithms/regime/family_aggregation.py", "backend/tests/test_regime_backend_boundary.py"),
         category="Strategy roles",
     ),
     RegimeAcceptanceItem(
         "Strategy aliases cannot double vote.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/algorithms/regime/strategy-catalog.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/strategy_registry.py", "backend/tests/test_regime_backend_boundary.py"),
         category="Strategy roles",
     ),
     RegimeAcceptanceItem(
         "Regime classification is deterministic and explainable.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/algorithms/regime/classifier.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/classifier.py", "backend/tests/test_regime_backend_boundary.py"),
         category="Classification",
     ),
     RegimeAcceptanceItem(
         "Hysteresis is configurable and tested.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/algorithms/regime/hysteresis.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/hysteresis.py", "backend/tests/test_regime_backend_boundary.py"),
         category="Classification",
     ),
     RegimeAcceptanceItem(
         "Dynamic settings derive from immutable defaults.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/algorithms/regime/dynamic-profile.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/dynamic_profile.py", "backend/tests/test_regime_backend_boundary.py"),
         category="Settings",
     ),
     RegimeAcceptanceItem(
         "Dynamic risk cannot exceed permitted limits.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/algorithms/regime/dynamic-profile.ts", "frontend/src/algorithms/regime/position-sizing.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/dynamic_profile.py", "backend/app/algorithms/regime/sizing.py", "backend/tests/test_regime_backend_boundary.py"),
         category="Settings",
     ),
     RegimeAcceptanceItem(
@@ -132,13 +132,13 @@ REGIME_FINAL_ACCEPTANCE_ITEMS: tuple[RegimeAcceptanceItem, ...] = (
     RegimeAcceptanceItem(
         "Regime has a dedicated backtest.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/algorithms/regime/backtest/engine.ts", "backend/tests/test_regime_phase13_backtest_api.py", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/backtest/engine.py", "backend/tests/test_regime_phase13_backtest_api.py"),
         category="Backtesting",
     ),
     RegimeAcceptanceItem(
         "Daily backtesting includes Regime independently.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/main.ts", "frontend/src/algorithms/regime/backtest/engine.ts", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/backtest/engine.py", "backend/tests/test_regime_phase13_backtest_api.py"),
         category="Backtesting",
     ),
     RegimeAcceptanceItem(
@@ -156,7 +156,7 @@ REGIME_FINAL_ACCEPTANCE_ITEMS: tuple[RegimeAcceptanceItem, ...] = (
     RegimeAcceptanceItem(
         "ML has no lookahead leakage.",
         RegimeAcceptanceStatus.PASS,
-        ("frontend/src/algorithms/regime/ml", "frontend/tests/V2DecisionPanel.test.ts"),
+        ("backend/app/algorithms/regime/ml", "backend/tests/test_regime_backend_boundary.py"),
         category="ML",
     ),
     RegimeAcceptanceItem(

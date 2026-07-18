@@ -1,10 +1,4 @@
-"""HTTP boundary for Regime backtest metadata.
-
-The authoritative Regime decision and backtest core is TypeScript so the Vite
-frontend, unit tests, and Node runner use one implementation. This backend API
-exposes the independent Regime route/status contract without duplicating that
-decision logic in Python.
-"""
+"""HTTP boundary for the backend-authoritative Regime runtime."""
 
 from __future__ import annotations
 
@@ -12,22 +6,24 @@ from typing import Any
 
 from fastapi import APIRouter, Body
 
+from backend.app.algorithms.regime.backtest.engine import REGIME_BACKTEST_ENGINE_VERSION, run_regime_backtest
+from backend.app.algorithms.regime.execution_pipeline import REGIME_EXECUTION_PIPELINE_MODULES
 from backend.app.algorithms.regime.final_acceptance import build_regime_final_acceptance_report
 from backend.app.algorithms.regime.rollout import regime_rollout_status
 from backend.app.algorithms.regime.service import RegimeApplicationService
 
 REGIME_API_VERSION = "regime_api_v1"
-REGIME_BACKTEST_ENGINE_VERSION = "regime_backtest_v2"
-REGIME_BACKTEST_ARTIFACT_ROOT = "frontend/data/regime-backtests"
-REGIME_BACKTEST_AUTHORITATIVE_CORE = "frontend/src/algorithms/regime/backtest/engine.ts"
+REGIME_RUNTIME_LOCATION = "backend/app/algorithms/regime"
+REGIME_AUTHORITATIVE_RUNTIME = "backend.app.algorithms.regime.execution_pipeline"
+REGIME_BACKTEST_ARTIFACT_ROOT = "backend/data/regime-backtests"
+REGIME_BACKTEST_AUTHORITATIVE_ENGINE = "backend.app.algorithms.regime.backtest.engine"
 REGIME_BACKTEST_FILE_INVENTORY = (
-    "engine.ts",
-    "execution-simulator.ts",
-    "metrics.ts",
-    "diagnostics.ts",
-    "walk-forward.ts",
-    "runner.ts",
-    "types.ts",
+    "__init__.py",
+    "engine.py",
+    "execution.py",
+    "ledger.py",
+    "metrics.py",
+    "walk_forward.py",
 )
 REGIME_BACKTEST_OWNED_CAPABILITIES = (
     "Regime replay",
@@ -59,16 +55,32 @@ def regime_backtest_status() -> dict[str, Any]:
         "algorithmId": "regime",
         "apiVersion": REGIME_API_VERSION,
         "engineVersion": REGIME_BACKTEST_ENGINE_VERSION,
-        "status": "client_core_available",
+        "status": "backend_runtime_available",
         "artifactRoot": REGIME_BACKTEST_ARTIFACT_ROOT,
         "storageKeyPrefix": "regime-backtest:",
         "cacheKeySource": "symbol:first_timestamp:last_timestamp:candle_count",
-        "authoritativeCore": REGIME_BACKTEST_AUTHORITATIVE_CORE,
+        "authoritativeRuntime": REGIME_AUTHORITATIVE_RUNTIME,
+        "authoritativeEngine": REGIME_BACKTEST_AUTHORITATIVE_ENGINE,
+        "runtimeLocation": REGIME_RUNTIME_LOCATION,
+        "frontendRole": "API client and presentation only",
         "fileInventory": REGIME_BACKTEST_FILE_INVENTORY,
         "ownedCapabilities": REGIME_BACKTEST_OWNED_CAPABILITIES,
         "isolatedFromWca": True,
-        "message": "Regime daily backtests run through the isolated TypeScript core and publish independent result metadata.",
+        "pipeline": REGIME_EXECUTION_PIPELINE_MODULES,
+        "message": "Regime decisions and backtests execute through the backend Python runtime.",
     }
+
+
+@router.post("/evaluate", summary="Evaluate a Regime decision through the backend runtime")
+def evaluate_regime(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    return REGIME_SERVICE.evaluate(payload)
+
+
+@router.post("/backtests/run", summary="Run a Regime backtest through the backend runtime")
+def regime_backtest_run(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    result = run_regime_backtest(payload)
+    REGIME_SERVICE.record_backtest_result(result)
+    return result
 
 
 @router.get("/backtests/routes", summary="Describe Regime backtest API routes")
@@ -80,6 +92,16 @@ def regime_backtest_routes() -> dict[str, Any]:
                 "method": "GET",
                 "path": "/api/regime/backtests/status",
                 "purpose": "Regime backtest status and artifact metadata.",
+            },
+            {
+                "method": "POST",
+                "path": "/api/regime/evaluate",
+                "purpose": "Execute the backend Regime decision pipeline.",
+            },
+            {
+                "method": "POST",
+                "path": "/api/regime/backtests/run",
+                "purpose": "Execute the backend Regime backtest engine.",
             },
             {
                 "method": "GET",

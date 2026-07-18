@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from backend.app.algorithms.regime.broker_adapter import regime_broker_adapter_inventory
+from backend.app.algorithms.regime.execution_pipeline import REGIME_EXECUTION_PIPELINE_MODULES, execute_regime_pipeline
 from backend.app.algorithms.regime.global_risk_adapter import regime_global_risk_adapter_inventory
 from backend.app.algorithms.regime.repository import RegimeRepository, regime_repository_inventory
 
@@ -12,6 +13,26 @@ REGIME_SERVICE_VERSION = "regime_service_v1"
 REGIME_BACKEND_FILE_INVENTORY = (
     "__init__.py",
     "api.py",
+    "contracts.py",
+    "configuration.py",
+    "market_snapshot.py",
+    "indicators.py",
+    "classification_axes.py",
+    "classifier.py",
+    "hysteresis.py",
+    "transitions.py",
+    "strategy_registry.py",
+    "router.py",
+    "family_aggregation.py",
+    "decision_engine.py",
+    "local_gates.py",
+    "dynamic_profile.py",
+    "sizing.py",
+    "trade_management.py",
+    "exits.py",
+    "order_intent.py",
+    "order_validation.py",
+    "execution_pipeline.py",
     "service.py",
     "repository.py",
     "global_risk_adapter.py",
@@ -72,6 +93,11 @@ class RegimeApplicationService:
     def record_backtest_result(self, result: dict[str, Any]) -> dict[str, Any]:
         return self.repository.record_backtest_result(result)
 
+    def evaluate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        result = execute_regime_pipeline(payload)
+        self.record_decision_snapshot(result)
+        return result
+
     def persistence_schema(self) -> dict[str, Any]:
         inventory = self.repository.persistence_inventory()
         return {
@@ -93,6 +119,11 @@ def regime_backend_inventory() -> dict[str, Any]:
         "algorithmId": "regime",
         "version": REGIME_SERVICE_VERSION,
         "files": REGIME_BACKEND_FILE_INVENTORY,
+        "authoritativeRuntime": "backend.app.algorithms.regime.execution_pipeline",
+        "authoritativeBacktestEngine": "backend.app.algorithms.regime.backtest.engine",
+        "runtimeLocation": "backend/app/algorithms/regime",
+        "frontendRole": "API client and presentation only",
+        "pipeline": REGIME_EXECUTION_PIPELINE_MODULES,
         "service": "backend.app.algorithms.regime.service.RegimeApplicationService",
         "repository": regime_repository_inventory(),
         "globalRiskAdapter": regime_global_risk_adapter_inventory(),
