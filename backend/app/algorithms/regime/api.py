@@ -83,6 +83,16 @@ def regime_backtest_run(payload: dict[str, Any] = Body(default_factory=dict)) ->
     return result
 
 
+@router.post("/ml/promotion/evaluate", summary="Evaluate Regime ML promotion through backend evidence only")
+def evaluate_regime_ml_promotion(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    return REGIME_SERVICE.evaluate_ml_promotion(payload)
+
+
+@router.post("/ml/promotion/evidence", summary="Record trusted backend Regime ML promotion evidence")
+def record_regime_ml_promotion_evidence(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    return REGIME_SERVICE.record_ml_promotion_evidence(payload)
+
+
 @router.get("/backtests/routes", summary="Describe Regime backtest API routes")
 def regime_backtest_routes() -> dict[str, Any]:
     return {
@@ -102,6 +112,11 @@ def regime_backtest_routes() -> dict[str, Any]:
                 "method": "POST",
                 "path": "/api/regime/backtests/run",
                 "purpose": "Execute the backend Regime backtest engine.",
+            },
+            {
+                "method": "POST",
+                "path": "/api/regime/ml/promotion/evaluate",
+                "purpose": "Evaluate backend-only Regime ML promotion eligibility.",
             },
             {
                 "method": "GET",

@@ -13,6 +13,12 @@ from backend.app.algorithms.regime.global_risk_adapter import (
     evaluate_regime_global_risk_request,
     regime_global_risk_adapter_inventory,
 )
+from backend.app.algorithms.regime.ml import (
+    RegimeMlCandidateArtifact,
+    RegimeMlPromotionDecision,
+    RegimeMlPromotionEvidence,
+    evaluate_regime_ml_promotion_policy,
+)
 from backend.app.algorithms.regime.repository import RegimeRepository, regime_repository_inventory
 from backend.app.algorithms.regime.service import RegimeApplicationService, regime_backend_inventory
 
@@ -21,11 +27,15 @@ __all__ = [
     "RegimeBrokerSubmission",
     "RegimeGlobalRiskApproval",
     "RegimeGlobalRiskRequest",
+    "RegimeMlCandidateArtifact",
+    "RegimeMlPromotionDecision",
+    "RegimeMlPromotionEvidence",
     "RegimeRepository",
     "REGIME_ALGORITHM_ID",
     "REGIME_ALGORITHM_VERSION",
     "build_regime_broker_submission",
     "execute_regime_pipeline",
+    "evaluate_regime_ml_promotion_policy",
     "evaluate_regime_global_risk_request",
     "regime_backend_inventory",
     "regime_broker_adapter_inventory",

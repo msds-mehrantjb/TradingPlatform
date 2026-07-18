@@ -207,6 +207,43 @@ class RegimeSqliteRepository:
                 trade_count += 1
             return {"recorded": True, "runId": run_id, "tradeCount": trade_count}
 
+    def record_regime_ml_promotion_evidence(self, evidence: dict[str, Any]) -> dict[str, Any]:
+        artifact_id = str(evidence.get("artifact_id") or evidence.get("artifactId") or "")
+        if not artifact_id:
+            return {"recorded": False, "reason": "missing_artifact_id"}
+        payload = {**evidence, "trusted_backend_record": True}
+        common = _common_metadata(
+            {},
+            {
+                "symbol": "REGIME_ML",
+                "decisionId": f"regime-ml-promotion:{artifact_id}",
+                "modelVersion": payload.get("model_version") or payload.get("modelVersion"),
+                "timestamp": payload.get("evidence_generated_at") or payload.get("evidenceGeneratedAt") or "",
+                "algorithmVersion": payload.get("deterministic_baseline_version") or payload.get("deterministicBaselineVersion") or "regime_algorithm_v3_backend_authoritative",
+            },
+            {},
+        )
+        with self.connect() as conn:
+            self._insert(conn, "regime_ml_artifacts", common, f"promotion-evidence-{artifact_id}", payload)
+        return {"recorded": True, "artifactId": artifact_id}
+
+    def latest_regime_ml_promotion_evidence(self, artifact_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT payload_json
+                FROM regime_ml_artifacts
+                WHERE algorithm_id = 'regime'
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            if str(payload.get("artifact_id") or payload.get("artifactId") or "") == artifact_id:
+                payload["trusted_backend_record"] = payload.get("trusted_backend_record", True)
+                return payload
+        return None
+
     def table_counts(self) -> dict[str, int]:
         with self.connect() as conn:
             return {table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in REGIME_PERSISTENCE_TABLES}

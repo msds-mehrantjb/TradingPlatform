@@ -7,6 +7,7 @@ from typing import Any
 from backend.app.algorithms.regime.broker_adapter import regime_broker_adapter_inventory
 from backend.app.algorithms.regime.execution_pipeline import REGIME_EXECUTION_PIPELINE_MODULES, execute_regime_pipeline
 from backend.app.algorithms.regime.global_risk_adapter import regime_global_risk_adapter_inventory
+from backend.app.algorithms.regime.ml.promotion_policy import RegimeMlCandidateArtifact, evaluate_regime_ml_promotion_policy
 from backend.app.algorithms.regime.repository import RegimeRepository, regime_repository_inventory
 
 REGIME_SERVICE_VERSION = "regime_service_v1"
@@ -37,6 +38,8 @@ REGIME_BACKEND_FILE_INVENTORY = (
     "repository.py",
     "global_risk_adapter.py",
     "broker_adapter.py",
+    "ml/paper_stability.py",
+    "ml/promotion_policy.py",
     "rollout.py",
     "final_acceptance.py",
 )
@@ -98,6 +101,26 @@ class RegimeApplicationService:
         self.record_decision_snapshot(result)
         return result
 
+    def record_ml_promotion_evidence(self, evidence: dict[str, Any]) -> dict[str, Any]:
+        return self.repository.record_regime_ml_promotion_evidence(evidence)
+
+    def evaluate_ml_promotion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        candidate_payload = payload.get("candidate") if isinstance(payload.get("candidate"), dict) else payload
+        candidate = RegimeMlCandidateArtifact(
+            artifact_id=str(candidate_payload.get("artifact_id") or candidate_payload.get("artifactId") or ""),
+            artifact_hash=str(candidate_payload.get("artifact_hash") or candidate_payload.get("artifactHash") or ""),
+            model_version=str(candidate_payload.get("model_version") or candidate_payload.get("modelVersion") or ""),
+            feature_schema_version=str(candidate_payload.get("feature_schema_version") or candidate_payload.get("featureSchemaVersion") or ""),
+            label_version=str(candidate_payload.get("label_version") or candidate_payload.get("labelVersion") or ""),
+            deterministic_baseline_version=str(candidate_payload.get("deterministic_baseline_version") or candidate_payload.get("deterministicBaselineVersion") or ""),
+        )
+        decision = evaluate_regime_ml_promotion_policy(
+            candidate,
+            self.repository,
+            frontend_supplied_evidence=payload.get("evidence") if isinstance(payload.get("evidence"), dict) else None,
+        )
+        return decision.as_dict()
+
     def persistence_schema(self) -> dict[str, Any]:
         inventory = self.repository.persistence_inventory()
         return {
@@ -124,6 +147,9 @@ def regime_backend_inventory() -> dict[str, Any]:
         "runtimeLocation": "backend/app/algorithms/regime",
         "frontendRole": "API client and presentation only",
         "pipeline": REGIME_EXECUTION_PIPELINE_MODULES,
+        "mlPromotionPolicy": "backend.app.algorithms.regime.ml.promotion_policy",
+        "mlPromotionMaximumAutomaticMode": "confirm_only",
+        "frontendMayPromoteMl": False,
         "service": "backend.app.algorithms.regime.service.RegimeApplicationService",
         "repository": regime_repository_inventory(),
         "globalRiskAdapter": regime_global_risk_adapter_inventory(),

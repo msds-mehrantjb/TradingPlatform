@@ -33,6 +33,7 @@ EXPECTED_REGIME_FINAL_ACCEPTANCE_STATEMENTS = {
     "Regime archives reference Regime results.",
     "ML defaults to shadow mode.",
     "ML has no lookahead leakage.",
+    "Regime ML cannot move beyond shadow until deterministic walk-forward, untouched holdout, and paper-stability requirements pass.",
     "Other algorithms' outputs remain unchanged.",
     "Frontend build passes.",
     "Backend tests pass.",
@@ -47,13 +48,13 @@ class RegimeFinalAcceptanceTest(unittest.TestCase):
 
         self.assertEqual(report["algorithmId"], "regime")
         self.assertEqual(report["version"], REGIME_FINAL_ACCEPTANCE_VERSION)
-        self.assertEqual(len(report["items"]), 21)
-        self.assertEqual(len(REGIME_FINAL_ACCEPTANCE_ITEMS), 21)
+        self.assertEqual(len(report["items"]), 22)
+        self.assertEqual(len(REGIME_FINAL_ACCEPTANCE_ITEMS), 22)
         self.assertEqual(
             {item.statement for item in REGIME_FINAL_ACCEPTANCE_ITEMS},
             EXPECTED_REGIME_FINAL_ACCEPTANCE_STATEMENTS,
         )
-        self.assertEqual(report["counts"], {"pass": 21, "pending": 0, "fail": 0})
+        self.assertEqual(report["counts"], {"pass": 22, "pending": 0, "fail": 0})
         self.assertTrue(report["complete"])
         self.assertEqual(report["blockingStatements"], [])
         self.assertTrue(regime_acceptance_is_complete())
@@ -77,7 +78,7 @@ class RegimeFinalAcceptanceTest(unittest.TestCase):
         self.assertFalse(body["limited_paper_orders_allowed"])
         self.assertFalse(body["live_trading_allowed"])
         self.assertTrue(body["finalAcceptance"]["complete"])
-        self.assertEqual(body["finalAcceptance"]["counts"], {"pass": 21, "pending": 0, "fail": 0})
+        self.assertEqual(body["finalAcceptance"]["counts"], {"pass": 22, "pending": 0, "fail": 0})
 
     def test_quality_gates_include_backend_frontend_and_regime_acceptance_checks(self) -> None:
         ci_source = (ROOT / "scripts" / "ci_quality_gates.py").read_text(encoding="utf-8")

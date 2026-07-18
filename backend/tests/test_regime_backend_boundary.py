@@ -55,6 +55,8 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
             "repository.py",
             "global_risk_adapter.py",
             "broker_adapter.py",
+            "ml/paper_stability.py",
+            "ml/promotion_policy.py",
             "rollout.py",
             "final_acceptance.py",
         )

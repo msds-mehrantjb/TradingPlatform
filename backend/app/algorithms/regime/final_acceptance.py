@@ -160,6 +160,12 @@ REGIME_FINAL_ACCEPTANCE_ITEMS: tuple[RegimeAcceptanceItem, ...] = (
         category="ML",
     ),
     RegimeAcceptanceItem(
+        "Regime ML cannot move beyond shadow until deterministic walk-forward, untouched holdout, and paper-stability requirements pass.",
+        RegimeAcceptanceStatus.PASS,
+        ("backend/app/algorithms/regime/ml/promotion_policy.py", "backend/app/algorithms/regime/ml/paper_stability.py", "backend/tests/test_regime_ml_promotion_policy.py"),
+        category="ML",
+    ),
+    RegimeAcceptanceItem(
         "Other algorithms' outputs remain unchanged.",
         RegimeAcceptanceStatus.PASS,
         ("frontend/tests/V2DecisionPanel.test.ts", "backend/tests/test_v1_ensemble_baseline.py", "backend/tests/test_weighted_voting_algorithm_isolation.py"),

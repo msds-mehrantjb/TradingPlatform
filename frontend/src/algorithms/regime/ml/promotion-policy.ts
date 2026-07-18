@@ -10,19 +10,10 @@ export function evaluateRegimeMlPromotionPolicy(baseline: RegimeSelectionResult 
   const notDependentOnIsolatedPeriod = artifact?.metrics.confirm_only_trading_results.notDependentOnIsolatedPeriod === 1;
   const fallbackAvailable = true;
   const rollbackArtifactRetained = artifact?.metrics.confirm_only_trading_results.rollbackArtifactRetained === 1;
-  const promoted =
-    leakageTestsPassed &&
-    classCoverageSufficient &&
-    walkForwardStable &&
-    calibrationAcceptable &&
-    improvesOrPreservesDrawdownAndExpectancy &&
-    notDependentOnIsolatedPeriod &&
-    fallbackAvailable &&
-    rollbackArtifactRetained;
   return {
-    promoted,
-    targetMode: promoted ? "confirm_only" : "shadow",
-    reasonCodes: promoted ? ["regime.ml.promotion_confirm_only_allowed"] : ["regime.ml.promotion_shadow_only_until_validated"],
+    promoted: false,
+    targetMode: "shadow",
+    reasonCodes: ["regime.ml.promotion_backend_policy_required"],
     leakageTestsPassed,
     classCoverageSufficient,
     walkForwardStable,

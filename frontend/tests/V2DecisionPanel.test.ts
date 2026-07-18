@@ -1841,6 +1841,7 @@ test("Regime ML labels are offline-only and promotion remains conservative", () 
   assert.equal(output.result.decisionSnapshot?.subsequentRealizedRegimeLabel, null);
   assert.equal(promotion.promoted, false);
   assert.equal(promotion.targetMode, "shadow");
+  assert.deepEqual(promotion.reasonCodes, ["regime.ml.promotion_backend_policy_required"]);
 });
 
 test("Regime decision snapshots include Phase 14 recorder fields", () => {
