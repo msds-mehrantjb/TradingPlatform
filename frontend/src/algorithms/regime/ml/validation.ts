@@ -1,4 +1,23 @@
-import type { RegimeMlValidationPlan } from "./types.ts";
+import {
+  REGIME_ML_FILE_INVENTORY,
+  REGIME_ML_INITIAL_MODE,
+  REGIME_ML_SHADOW_FORBIDDEN_ACTIONS,
+  type RegimeMlInventoryStatus,
+  type RegimeMlValidationPlan,
+} from "./types.ts";
+
+export function regimeMlInventoryStatus(): RegimeMlInventoryStatus {
+  return {
+    algorithmId: "regime",
+    optional: true,
+    initialMode: REGIME_ML_INITIAL_MODE,
+    files: REGIME_ML_FILE_INVENTORY,
+    shadowForbiddenActions: REGIME_ML_SHADOW_FORBIDDEN_ACTIONS,
+    maximumAutomaticPromotionMode: "confirm_only",
+    isolatedFromOtherAlgorithms: true,
+    decisionTimeFeaturesOnly: true,
+  };
+}
 
 export function defaultRegimeMlValidationPlan(): RegimeMlValidationPlan {
   return {

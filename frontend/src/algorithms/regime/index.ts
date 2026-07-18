@@ -49,7 +49,8 @@ export { buildRegimeMlFeatures } from "./ml/feature-builder.ts";
 export { buildOfflineRegimeLabel } from "./ml/label-builder.ts";
 export { predictRegimeMl } from "./ml/predictor.ts";
 export { evaluateRegimeMlPromotionPolicy } from "./ml/promotion-policy.ts";
-export { defaultRegimeMlValidationPlan } from "./ml/validation.ts";
+export { REGIME_ML_FILE_INVENTORY, REGIME_ML_INITIAL_MODE, REGIME_ML_SHADOW_FORBIDDEN_ACTIONS } from "./ml/types.ts";
+export { defaultRegimeMlValidationPlan, regimeMlInventoryStatus } from "./ml/validation.ts";
 export {
   REGIME_COMPATIBILITY_MATRIX,
   REGIME_LEGACY_ROUTING_MATRIX,

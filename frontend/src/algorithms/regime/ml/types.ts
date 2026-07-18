@@ -3,6 +3,44 @@ import type { MarketRegimeId, RegimeFamilyScore, RegimeNoTradeTag, RegimeSelecti
 
 export type RegimeMlMode = "off" | "shadow" | "confirm_only" | "active";
 
+export const REGIME_ML_FILE_INVENTORY = [
+  "feature-builder.ts",
+  "label-builder.ts",
+  "predictor.ts",
+  "artifact-loader.ts",
+  "validation.ts",
+  "promotion-policy.ts",
+  "types.ts",
+] as const;
+
+export const REGIME_ML_INITIAL_MODE = "shadow" as const;
+
+export const REGIME_ML_SHADOW_FORBIDDEN_ACTIONS = [
+  "Replace deterministic classification",
+  "Change strategy signals",
+  "Change dynamic settings",
+  "Block trades",
+  "Increase position size",
+  "Change stops or exits",
+  "Write into another algorithm",
+  "Train using future information",
+  "Promote itself automatically",
+] as const;
+
+export type RegimeMlInventoryFile = typeof REGIME_ML_FILE_INVENTORY[number];
+export type RegimeMlShadowForbiddenAction = typeof REGIME_ML_SHADOW_FORBIDDEN_ACTIONS[number];
+
+export type RegimeMlInventoryStatus = {
+  algorithmId: "regime";
+  optional: true;
+  initialMode: typeof REGIME_ML_INITIAL_MODE;
+  files: readonly RegimeMlInventoryFile[];
+  shadowForbiddenActions: readonly RegimeMlShadowForbiddenAction[];
+  maximumAutomaticPromotionMode: "confirm_only";
+  isolatedFromOtherAlgorithms: true;
+  decisionTimeFeaturesOnly: true;
+};
+
 export type RegimeMlModelType =
   | "multinomial_logistic_regression"
   | "regularized_transition_logistic_regression"

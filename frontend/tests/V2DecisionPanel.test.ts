@@ -43,6 +43,9 @@ import {
   REGIME_COMPOSITE_REGIME_IDS,
   REGIME_IDENTITY_CONTRACT_FILES,
   REGIME_LEGACY_ALIASES,
+  REGIME_ML_FILE_INVENTORY,
+  REGIME_ML_INITIAL_MODE,
+  REGIME_ML_SHADOW_FORBIDDEN_ACTIONS,
   REGIME_OPPORTUNITY_TAGS,
   REGIME_PROFILE_MATRIX,
   REGIME_PROFILE_VERSION,
@@ -59,6 +62,7 @@ import {
   permittedDirectionForRegime,
   regimeDecisionGateSettings,
   regimeBacktestInventoryStatus,
+  regimeMlInventoryStatus,
   regimeLiquidityCap,
   regimePositionAndBuyingPowerCaps,
   regimeRiskBudget,
@@ -1457,6 +1461,100 @@ test("Regime ML defaults to shadow for paper and off for live", () => {
   assert.equal(paper.result.decisionSnapshot?.subsequentRealizedRegimeLabel, null);
   assert.equal(live.result.ml?.mode, "off");
   assert.equal(live.result.ml?.features, null);
+});
+
+test("Regime optional ML inventory is shadow-only and cannot control deterministic decisions initially", () => {
+  const inventory = regimeMlInventoryStatus();
+
+  assert.deepEqual(REGIME_ML_FILE_INVENTORY, [
+    "feature-builder.ts",
+    "label-builder.ts",
+    "predictor.ts",
+    "artifact-loader.ts",
+    "validation.ts",
+    "promotion-policy.ts",
+    "types.ts",
+  ]);
+  assert.deepEqual(inventory.files, REGIME_ML_FILE_INVENTORY);
+  assert.equal(REGIME_ML_INITIAL_MODE, "shadow");
+  assert.deepEqual(REGIME_ML_SHADOW_FORBIDDEN_ACTIONS, [
+    "Replace deterministic classification",
+    "Change strategy signals",
+    "Change dynamic settings",
+    "Block trades",
+    "Increase position size",
+    "Change stops or exits",
+    "Write into another algorithm",
+    "Train using future information",
+    "Promote itself automatically",
+  ]);
+  assert.deepEqual(inventory.shadowForbiddenActions, REGIME_ML_SHADOW_FORBIDDEN_ACTIONS);
+  assert.equal(inventory.optional, true);
+  assert.equal(inventory.maximumAutomaticPromotionMode, "confirm_only");
+  assert.equal(inventory.isolatedFromOtherAlgorithms, true);
+  assert.equal(inventory.decisionTimeFeaturesOnly, true);
+
+  const candles = deterministicRegimeCandles();
+  const settings = {
+    ...liquidRegimeSettings(),
+    minimumWinningScore: 0,
+    minimumBuyScore: 0,
+    minimumDirectionalEdge: 0,
+    minimumSignalEdge: 0,
+    minimumRegimeConfidence: 0,
+    minimumActiveStrategies: 1,
+    minimumIndependentFamilies: 1,
+    maximumAbstentionRate: 1,
+  } as never;
+  const deterministic = calculateRegimeDecision({
+    marketData: {
+      symbol: "SPY",
+      primaryCandles: candles,
+      allCandles: candles,
+      oneMinuteCandles: candles,
+    },
+    settings,
+    mlMode: "off",
+  });
+  const shadow = calculateRegimeDecision({
+    marketData: {
+      symbol: "SPY",
+      primaryCandles: candles,
+      allCandles: candles,
+      oneMinuteCandles: candles,
+    },
+    settings,
+    mlMode: "shadow",
+    mlArtifact: validRegimeMlArtifact(),
+  });
+  const market = buildRegimeMarketContext({
+    symbol: "SPY",
+    primaryCandles: candles,
+    allCandles: candles,
+    oneMinuteCandles: candles,
+  }, settings);
+  assert.ok(market);
+  const deterministicOrder = buildRegimeTargetOrder(deterministic.result, market, "SPY", settings, undefined, { currentPosition: 0, ...pricedIntentOptions() });
+  const shadowOrder = buildRegimeTargetOrder(shadow.result, market, "SPY", settings, undefined, { currentPosition: 0, ...pricedIntentOptions() });
+
+  assert.equal(shadow.result.ml?.mode, "shadow");
+  assert.equal(shadow.result.ml?.appliedEffect, "shadow_only");
+  assert.equal(shadow.result.rawClassification?.rawRegime, deterministic.result.rawClassification?.rawRegime);
+  assert.equal(shadow.result.confirmedState?.confirmedRegime, deterministic.result.confirmedState?.confirmedRegime);
+  assert.deepEqual(
+    shadow.result.selectedStrategies.map((strategy) => [strategy.strategy, strategy.signal]),
+    deterministic.result.selectedStrategies.map((strategy) => [strategy.strategy, strategy.signal]),
+  );
+  assert.equal(shadow.result.signal, deterministic.result.signal);
+  assert.equal(shadow.result.tradeAllowed, deterministic.result.tradeAllowed);
+  assert.deepEqual(shadow.result.tradeBlockers, deterministic.result.tradeBlockers);
+  assert.deepEqual(shadow.result.effectiveSettings, deterministic.result.effectiveSettings);
+  assert.equal(shadowOrder.quantity, deterministicOrder.quantity);
+  assert.equal(shadowOrder.positionEffect, deterministicOrder.positionEffect);
+  assert.equal(shadowOrder.triggerPrice, deterministicOrder.triggerPrice);
+  assert.equal(shadowOrder.stopPrice, deterministicOrder.stopPrice);
+  assert.equal(shadowOrder.targetPrice, deterministicOrder.targetPrice);
+  assert.equal(shadowOrder.riskDollars, deterministicOrder.riskDollars);
 });
 
 test("Regime ML artifact loader rejects unsafe or leaking artifacts", () => {

@@ -10,6 +10,22 @@ Regime ML is not an unrestricted Buy/Sell generator. It may estimate:
 
 The deterministic classifier remains the baseline and fallback.
 
+## Dedicated Inventory
+
+The optional Regime ML package is:
+
+| File | Responsibility |
+| --- | --- |
+| `feature-builder.ts` | Build decision-time Regime feature vectors from deterministic outputs. |
+| `label-builder.ts` | Build offline labels from future observation windows outside live decisions. |
+| `predictor.ts` | Produce optional regime probability and transition estimates. |
+| `artifact-loader.ts` | Validate and load trusted Regime-only artifacts. |
+| `validation.ts` | Define time-ordered validation and expose the ML inventory contract. |
+| `promotion-policy.ts` | Evaluate conservative promotion eligibility. |
+| `types.ts` | Regime ML modes, artifacts, predictions, labels, validation, and inventory contracts. |
+
+Initial ML mode is `shadow`. In shadow mode, ML must not replace deterministic classification, change strategy signals, change dynamic settings, block trades, increase position size, change stops or exits, write into another algorithm, train using future information, or promote itself automatically.
+
 ## Modes
 
 | Mode | Behavior |
