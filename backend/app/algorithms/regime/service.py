@@ -19,6 +19,20 @@ REGIME_BACKEND_FILE_INVENTORY = (
     "rollout.py",
     "final_acceptance.py",
 )
+REGIME_ALLOWED_SHARED_COMPONENTS = (
+    {"component": "Raw market-data service", "allowedUse": "Read-only input"},
+    {"component": "Quote and candle cache", "allowedUse": "Read-only input"},
+    {"component": "Market clock and calendar", "allowedUse": "Read-only input"},
+    {"component": "Economic-event feed", "allowedUse": "Read-only input"},
+    {"component": "Account equity and buying power", "allowedUse": "Read-only snapshot"},
+    {"component": "Broker client", "allowedUse": "Submit approved Regime intents"},
+    {"component": "Global account-risk engine", "allowedUse": "Reduce or reject Regime proposals"},
+    {"component": "Global risk reservations", "allowedUse": "Account-wide exposure control"},
+    {"component": "Database connection utilities", "allowedUse": "Infrastructure only"},
+    {"component": "Logging and telemetry", "allowedUse": "Must include algorithm_id=regime"},
+    {"component": "Order-side contract types", "allowedUse": "Type definitions only"},
+    {"component": "Authentication and API framework", "allowedUse": "Transport only"},
+)
 
 
 class RegimeApplicationService:
@@ -56,12 +70,17 @@ def regime_backend_inventory() -> dict[str, Any]:
         "repository": regime_repository_inventory(),
         "globalRiskAdapter": regime_global_risk_adapter_inventory(),
         "brokerAdapter": regime_broker_adapter_inventory(),
+        "allowedSharedComponents": REGIME_ALLOWED_SHARED_COMPONENTS,
+        "globalRiskLayerSharedServerSide": True,
+        "localControlsRemainRegimeOwned": True,
+        "sharedComponentsMayRewriteRegimeState": False,
         "apiTransportOnly": True,
     }
 
 
 __all__ = [
     "REGIME_BACKEND_FILE_INVENTORY",
+    "REGIME_ALLOWED_SHARED_COMPONENTS",
     "REGIME_SERVICE_VERSION",
     "RegimeApplicationService",
     "regime_backend_inventory",

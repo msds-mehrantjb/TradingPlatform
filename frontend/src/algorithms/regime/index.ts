@@ -64,6 +64,7 @@ export {
 export { compareRegimeShadowDecisions } from "./rollout/shadow-comparison.ts";
 export { evaluateRegimePaperStability } from "./rollout/paper-stability.ts";
 export { regimeFrontendRollbackPolicy } from "./rollout/rollback-policy.ts";
+export { REGIME_ALLOWED_SHARED_COMPONENTS, regimeSharedBoundaryStatus } from "./shared-boundaries.ts";
 export {
   REGIME_COMPATIBILITY_MATRIX,
   REGIME_LEGACY_ROUTING_MATRIX,

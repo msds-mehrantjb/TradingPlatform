@@ -13,7 +13,12 @@ from backend.app.algorithms.regime.global_risk_adapter import (
     regime_global_risk_adapter_inventory,
 )
 from backend.app.algorithms.regime.repository import RegimeRepository, regime_repository_inventory
-from backend.app.algorithms.regime.service import REGIME_BACKEND_FILE_INVENTORY, RegimeApplicationService, regime_backend_inventory
+from backend.app.algorithms.regime.service import (
+    REGIME_ALLOWED_SHARED_COMPONENTS,
+    REGIME_BACKEND_FILE_INVENTORY,
+    RegimeApplicationService,
+    regime_backend_inventory,
+)
 from backend.app.main import app
 
 
@@ -39,6 +44,29 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
         self.assertTrue(inventory["apiTransportOnly"])
         for file_name in expected:
             self.assertTrue((ROOT / "backend" / "app" / "algorithms" / "regime" / file_name).exists(), file_name)
+
+    def test_backend_inventory_declares_allowed_shared_components_only(self) -> None:
+        expected = (
+            {"component": "Raw market-data service", "allowedUse": "Read-only input"},
+            {"component": "Quote and candle cache", "allowedUse": "Read-only input"},
+            {"component": "Market clock and calendar", "allowedUse": "Read-only input"},
+            {"component": "Economic-event feed", "allowedUse": "Read-only input"},
+            {"component": "Account equity and buying power", "allowedUse": "Read-only snapshot"},
+            {"component": "Broker client", "allowedUse": "Submit approved Regime intents"},
+            {"component": "Global account-risk engine", "allowedUse": "Reduce or reject Regime proposals"},
+            {"component": "Global risk reservations", "allowedUse": "Account-wide exposure control"},
+            {"component": "Database connection utilities", "allowedUse": "Infrastructure only"},
+            {"component": "Logging and telemetry", "allowedUse": "Must include algorithm_id=regime"},
+            {"component": "Order-side contract types", "allowedUse": "Type definitions only"},
+            {"component": "Authentication and API framework", "allowedUse": "Transport only"},
+        )
+        inventory = regime_backend_inventory()
+
+        self.assertEqual(REGIME_ALLOWED_SHARED_COMPONENTS, expected)
+        self.assertEqual(inventory["allowedSharedComponents"], expected)
+        self.assertTrue(inventory["globalRiskLayerSharedServerSide"])
+        self.assertTrue(inventory["localControlsRemainRegimeOwned"])
+        self.assertFalse(inventory["sharedComponentsMayRewriteRegimeState"])
 
     def test_repository_service_and_api_expose_same_regime_owned_schema(self) -> None:
         path = ROOT / "backend" / "tests" / "tmp" / "regime_backend_boundary" / f"{uuid4().hex}.sqlite"

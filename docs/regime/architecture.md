@@ -287,6 +287,27 @@ Regime may import neutral helper utilities only when they are stateless, determi
 
 The Regime algorithm stops at immutable `RegimeOrderIntent` creation. The global risk layer may approve, resize, or deny the intent, but it must not change the Regime signal, strategy scores, classifier state, profile settings, or learned artifacts.
 
+## Allowed Shared Components
+
+These shared platform components are allowed only at the following boundaries:
+
+| Shared component | Allowed use |
+| --- | --- |
+| Raw market-data service | Read-only input. |
+| Quote and candle cache | Read-only input. |
+| Market clock and calendar | Read-only input. |
+| Economic-event feed | Read-only input. |
+| Account equity and buying power | Read-only snapshot. |
+| Broker client | Submit approved Regime intents. |
+| Global account-risk engine | Reduce or reject Regime proposals. |
+| Global risk reservations | Account-wide exposure control. |
+| Database connection utilities | Infrastructure only. |
+| Logging and telemetry | Must include `algorithm_id=regime`. |
+| Order-side contract types | Type definitions only. |
+| Authentication and API framework | Transport only. |
+
+The global account-risk layer is shared and server-side. Algorithm-specific local controls, including Regime classification, routing, dynamic profile, local gates, sizing policy, exit policy, and diagnostics, remain Regime-owned.
+
 ## Direction Model
 
 Regime separates direction from position effect:
