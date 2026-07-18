@@ -27,7 +27,10 @@ import {
   manageRegimeOpenPosition,
   REGIME_ALGORITHM_ID,
   REGIME_ALGORITHM_VERSION,
+  REGIME_COMPOSITE_REGIME_IDS,
   REGIME_IDENTITY_CONTRACT_FILES,
+  REGIME_LEGACY_ALIASES,
+  REGIME_OPPORTUNITY_TAGS,
   REGIME_PROFILE_VERSION,
   REGIME_SETTINGS_VERSION,
   REGIME_STRATEGY_CATALOG_VERSION,
@@ -384,6 +387,74 @@ test("Regime scheduled-event feeds classify operational event risk", () => {
   assert.equal(condition.axes.eventRisk, "blackout");
   assert.equal(condition.rawRegime, "event_risk");
   assert.equal(condition.noTradeReasons.some((reason) => reason.includes("Scheduled event blackout")), true);
+});
+
+test("Regime owns dedicated classification inventory and canonical regime IDs", () => {
+  const root = fileURLToPath(new URL("../src/algorithms/regime/classification", import.meta.url));
+  const classificationFiles = new Set(readdirSync(root));
+  const expectedFiles = [
+    "classifier.ts",
+    "classification-axes.ts",
+    "composite-regimes.ts",
+    "evidence-builder.ts",
+    "hysteresis.ts",
+    "transition-policy.ts",
+    "no-trade-classifier.ts",
+  ];
+  for (const file of expectedFiles) {
+    assert.equal(classificationFiles.has(file), true, `${file} should exist in the Regime classification boundary`);
+  }
+
+  assert.deepEqual(REGIME_COMPOSITE_REGIME_IDS, [
+    "strong_uptrend",
+    "weak_uptrend",
+    "strong_downtrend",
+    "weak_downtrend",
+    "range_bound",
+    "sideways_range",
+    "choppy_mixed",
+    "opening_breakout",
+    "intraday_expansion",
+    "high_volatility_trend",
+    "low_volatility_quiet",
+    "failed_breakout_reversal",
+    "gap_session",
+    "event_risk",
+    "liquidity_stress",
+    "extreme_volatility_no_trade",
+  ]);
+  assert.deepEqual(REGIME_LEGACY_ALIASES, [
+    "low_volatility",
+    "normal_volatility",
+    "high_volatility",
+    "trend_continuation",
+    "bullish_breakout",
+    "bearish_breakout",
+    "bullish_reversal_risk",
+    "bearish_reversal_risk",
+    "mean_reversion",
+  ]);
+  assert.equal(REGIME_OPPORTUNITY_TAGS.includes("mean_reversion"), true);
+});
+
+test("Regime MarketRegimeId excludes legacy opportunity aliases", () => {
+  const typesText = readFileSync(fileURLToPath(new URL("../src/algorithms/regime/types.ts", import.meta.url)), "utf8");
+  const marketRegimeBlock = typesText.slice(
+    typesText.indexOf("export type MarketRegimeId ="),
+    typesText.indexOf("export type LegacyRegimeAlias ="),
+  );
+  const legacyBlock = typesText.slice(
+    typesText.indexOf("export type LegacyRegimeAlias ="),
+    typesText.indexOf("export type RegimeNoTradeTag ="),
+  );
+
+  for (const legacy of REGIME_LEGACY_ALIASES) {
+    assert.doesNotMatch(marketRegimeBlock, new RegExp(`"${legacy}"`));
+    assert.match(legacyBlock, new RegExp(`"${legacy}"`));
+  }
+  assert.doesNotMatch(marketRegimeBlock, /"mean_reversion"/);
+  assert.doesNotMatch(marketRegimeBlock, /"trend_continuation"/);
+  assert.doesNotMatch(marketRegimeBlock, /"no_trade"/);
 });
 
 test("Regime isolation keeps settings trade history and archives separate from other algorithms", () => {

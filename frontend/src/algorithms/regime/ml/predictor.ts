@@ -90,15 +90,5 @@ function isMarketRegimeId(value: string): value is MarketRegimeId {
     "event_risk",
     "liquidity_stress",
     "extreme_volatility_no_trade",
-    "low_volatility",
-    "normal_volatility",
-    "high_volatility",
-    "trend_continuation",
-    "bullish_breakout",
-    "bearish_breakout",
-    "bullish_reversal_risk",
-    "bearish_reversal_risk",
-    "mean_reversion",
-    "no_trade",
   ].includes(value);
 }

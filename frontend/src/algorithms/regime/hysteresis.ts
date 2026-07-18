@@ -8,6 +8,7 @@ import type {
   RegimeHysteresisSettings,
   RegimeHysteresisSnapshot,
   RegimeMarketContext,
+  RegimeNoTradeTag,
 } from "./types.ts";
 
 type RawCondition = ReturnType<typeof buildRawRegimeCondition>;
@@ -172,7 +173,7 @@ function isRiskOffRawCondition(raw: RawCondition): boolean {
   );
 }
 
-function isRiskOffRegime(regime: MarketRegimeId | undefined): boolean {
+function isRiskOffRegime(regime: MarketRegimeId | RegimeNoTradeTag | undefined): boolean {
   return regime === "extreme_volatility_no_trade" || regime === "liquidity_stress" || regime === "event_risk" || regime === "no_trade";
 }
 

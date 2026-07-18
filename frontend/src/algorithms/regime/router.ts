@@ -2,9 +2,11 @@ import { clampNumber, roundNumber } from "./indicators.ts";
 import { evaluateRegimeStrategyDefinition, regimeSelectionStrategies } from "./strategy-catalog.ts";
 import type {
   ContextResult,
+  LegacyRegimeAlias,
   MarketRegimeId,
   RegimeAggregationFamily,
   RegimeMarketContext,
+  RegimeNoTradeTag,
   RegimeOpportunityState,
   RegimePrimaryTrend,
   RegimeStrategyDefinition,
@@ -14,7 +16,9 @@ import type {
   StrategyRoutingResult,
 } from "./types.ts";
 
-const noDirectionalRegimes = new Set<MarketRegimeId>(["extreme_volatility_no_trade", "event_risk", "liquidity_stress", "no_trade"]);
+type RegimeRoutingKey = MarketRegimeId | LegacyRegimeAlias | RegimeNoTradeTag;
+
+const noDirectionalRegimes = new Set<MarketRegimeId>(["extreme_volatility_no_trade", "event_risk", "liquidity_stress"]);
 
 const regimeDirectionalMap: Record<MarketRegimeId, string[]> = {
   strong_uptrend: ["moving_average_trend", "trend_pullback", "macd_momentum", "market_structure", "vwap_trend_continuation"],
@@ -33,6 +37,9 @@ const regimeDirectionalMap: Record<MarketRegimeId, string[]> = {
   event_risk: [],
   liquidity_stress: [],
   extreme_volatility_no_trade: [],
+};
+
+const legacyAliasDirectionalMap: Record<LegacyRegimeAlias | RegimeNoTradeTag, string[]> = {
   low_volatility: ["rsi_mean_reversion", "bollinger_band_mean_reversion", "vwap_mean_reversion"],
   normal_volatility: ["moving_average_trend", "trend_pullback", "market_structure", "vwap_mean_reversion"],
   high_volatility: ["market_structure", "volatility_breakout", "failed_breakout_reversal", "liquidity_sweep_reversal"],
@@ -135,7 +142,7 @@ export function regimeSelectedStrategySlugs(
   volatility: RegimeVolatilityState,
   opportunity: RegimeOpportunityState,
 ): string[] {
-  return regimeDirectionalMap[legacyRegimeId(primaryTrend, volatility, opportunity)] ?? [];
+  return strategyIdsForRegimeRoutingKey(legacyRegimeId(primaryTrend, volatility, opportunity));
 }
 
 function contextResultFromStrategy(strategy: RegimeStrategyDefinition, market: RegimeMarketContext): ContextResult {
@@ -185,7 +192,7 @@ function contextBaseMultiplier(signal: "Buy" | "Sell" | "Hold", confidence: numb
   return 1;
 }
 
-function legacyRegimeId(primaryTrend: RegimePrimaryTrend, volatility: RegimeVolatilityState, opportunity: RegimeOpportunityState): MarketRegimeId {
+function legacyRegimeId(primaryTrend: RegimePrimaryTrend, volatility: RegimeVolatilityState, opportunity: RegimeOpportunityState): RegimeRoutingKey {
   if (opportunity === "No-trade") return "no_trade";
   if (opportunity === "Bullish breakout") return "bullish_breakout";
   if (opportunity === "Bearish breakout") return "bearish_breakout";
@@ -199,4 +206,8 @@ function legacyRegimeId(primaryTrend: RegimePrimaryTrend, volatility: RegimeVola
   if (primaryTrend === "Strong downtrend") return "strong_downtrend";
   if (primaryTrend === "Weak downtrend") return "weak_downtrend";
   return "sideways_range";
+}
+
+function strategyIdsForRegimeRoutingKey(key: RegimeRoutingKey): string[] {
+  return regimeDirectionalMap[key as MarketRegimeId] ?? legacyAliasDirectionalMap[key as LegacyRegimeAlias | RegimeNoTradeTag] ?? [];
 }

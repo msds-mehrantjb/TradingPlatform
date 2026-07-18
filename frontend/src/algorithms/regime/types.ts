@@ -32,7 +32,8 @@ export type MarketRegimeId =
   | "gap_session"
   | "event_risk"
   | "liquidity_stress"
-  | "extreme_volatility_no_trade"
+  | "extreme_volatility_no_trade";
+export type LegacyRegimeAlias =
   | "low_volatility"
   | "normal_volatility"
   | "high_volatility"
@@ -41,10 +42,18 @@ export type MarketRegimeId =
   | "bearish_breakout"
   | "bullish_reversal_risk"
   | "bearish_reversal_risk"
-  | "mean_reversion"
-  | "no_trade";
+  | "mean_reversion";
+export type RegimeNoTradeTag = "no_trade";
 export type RegimePrimaryTrend = "Strong uptrend" | "Weak uptrend" | "Strong downtrend" | "Weak downtrend" | "Sideways / range-bound";
 export type RegimeVolatilityState = "Low volatility" | "Normal volatility" | "High volatility";
+export type RegimeOpportunityTag =
+  | "trend_continuation"
+  | "bullish_breakout"
+  | "bearish_breakout"
+  | "bullish_reversal_risk"
+  | "bearish_reversal_risk"
+  | "mean_reversion"
+  | "no_trade";
 export type RegimeOpportunityState =
   | "Trend continuation"
   | "Bullish breakout"
@@ -55,13 +64,20 @@ export type RegimeOpportunityState =
   | "No-trade";
 export type RegimeDecisionSignal = RegimeAlgoSignal | "No-trade";
 
+export type RegimeDirectionAxis = "strong_up" | "weak_up" | "neutral" | "weak_down" | "strong_down";
+export type RegimeVolatilityAxis = "compressed" | "normal" | "expanded" | "extreme";
+export type RegimeStructureAxis = "trend" | "range" | "breakout" | "failed_breakout" | "reversal" | "mixed";
+export type RegimeLiquidityAxis = "good" | "acceptable" | "poor" | "unknown";
+export type RegimeSessionAxis = "opening" | "midday" | "afternoon" | "closing" | "outside_regular";
+export type RegimeEventRiskAxis = "none" | "elevated" | "blackout";
+
 export type RegimeAxes = {
-  direction: "strong_up" | "weak_up" | "neutral" | "weak_down" | "strong_down";
-  volatility: "compressed" | "normal" | "expanded" | "extreme";
-  structure: "trend" | "range" | "breakout" | "failed_breakout" | "reversal" | "mixed";
-  liquidity: "good" | "acceptable" | "poor" | "unknown";
-  session: "opening" | "midday" | "afternoon" | "closing" | "outside_regular";
-  eventRisk: "none" | "elevated" | "blackout";
+  direction: RegimeDirectionAxis;
+  volatility: RegimeVolatilityAxis;
+  structure: RegimeStructureAxis;
+  liquidity: RegimeLiquidityAxis;
+  session: RegimeSessionAxis;
+  eventRisk: RegimeEventRiskAxis;
 };
 
 export type RawRegimeClassification = {
@@ -552,7 +568,7 @@ export type EffectiveRegimeSettings = {
   baseSettingsVersion: string;
   profileVersion: string;
   profileId: string;
-  confirmedRegime: MarketRegimeId;
+  confirmedRegime: MarketRegimeId | RegimeNoTradeTag;
   generatedAt: string;
   effectiveRiskPercent: number;
   effectiveOrderAllocationPercent: number;

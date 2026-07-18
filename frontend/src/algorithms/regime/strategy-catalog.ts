@@ -56,15 +56,6 @@ const allRegimes: MarketRegimeId[] = [
   "event_risk",
   "liquidity_stress",
   "extreme_volatility_no_trade",
-  "low_volatility",
-  "normal_volatility",
-  "high_volatility",
-  "trend_continuation",
-  "bullish_breakout",
-  "bearish_breakout",
-  "bullish_reversal_risk",
-  "bearish_reversal_risk",
-  "mean_reversion",
 ];
 
 function defineStrategy(input: StrategyDefinitionInput): RegimeStrategyDefinition {
@@ -73,7 +64,7 @@ function defineStrategy(input: StrategyDefinitionInput): RegimeStrategyDefinitio
     requiredInputs: input.requiredInputs ?? ["candles", "latest"],
     minimumBars: input.minimumBars ?? 5,
     supportedRegimes: input.supportedRegimes ?? allRegimes,
-    incompatibleRegimes: input.incompatibleRegimes ?? ["no_trade"],
+    incompatibleRegimes: input.incompatibleRegimes ?? [],
     enabledByDefault: input.enabledByDefault ?? true,
     baseWeight: input.baseWeight ?? 0,
     version: input.version ?? "1.0.0",

@@ -4,6 +4,14 @@ export {
   classifyRegimeAxes,
   compositeRegimeIdFromAxes,
 } from "./classifier.ts";
+export {
+  isCanonicalMarketRegimeId,
+  isLegacyRegimeAlias,
+  REGIME_COMPOSITE_REGIME_IDS,
+  REGIME_LEGACY_ALIASES,
+  REGIME_OPPORTUNITY_TAGS,
+} from "./classification/composite-regimes.ts";
+export { isRegimeRiskOffTransition, REGIME_RISK_OFF_REGIME_IDS } from "./classification/transition-policy.ts";
 export { DEFAULT_REGIME_HYSTERESIS_SETTINGS, resolveRegimeHysteresisSettings } from "./config.ts";
 export {
   REGIME_ALGORITHM_ID,
@@ -69,6 +77,7 @@ export {
 } from "./strategy-catalog.ts";
 export type { RegimeOrderIntent, RegimeTargetOrder } from "./order-intent.ts";
 export type { RegimePositionSizingResult } from "./position-sizing.ts";
+export type * from "./classification/composite-regimes.ts";
 export type * from "./market/context-feeds.ts";
 export type * from "./market/feature-snapshot.ts";
 export type * from "./market/market-snapshot.ts";

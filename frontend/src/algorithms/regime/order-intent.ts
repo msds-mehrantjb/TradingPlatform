@@ -364,7 +364,7 @@ function signedQuantityForEffect(positionEffect: PositionEffect, requestedQuanti
 }
 
 function confirmedRegimeId(result: RegimeSelectionResult): MarketRegimeId {
-  return result.confirmedState?.confirmedRegime ?? result.rawClassification?.rawRegime ?? "no_trade";
+  return result.confirmedState?.confirmedRegime ?? result.rawClassification?.rawRegime ?? "choppy_mixed";
 }
 
 function familyScoreRecord(result: RegimeSelectionResult): Record<string, number> {

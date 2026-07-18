@@ -3,9 +3,11 @@ import { clampNumber, roundNumber } from "./indicators.ts";
 import { REGIME_PROFILE_VERSION, REGIME_SETTINGS_VERSION } from "./versions.ts";
 import type {
   EffectiveRegimeSettings,
+  LegacyRegimeAlias,
   MarketRegimeId,
   RegimeBaseSettings,
   RegimeMarketContext,
+  RegimeNoTradeTag,
   RegimeProfileModifierBreakdown,
   RegimeProfileModifiers,
   RegimeSelectionResult,
@@ -31,6 +33,8 @@ type DynamicProfileContext = {
   consecutiveLosses?: number;
   accountExposurePercent?: number;
 };
+
+type RegimeProfileKey = MarketRegimeId | LegacyRegimeAlias | RegimeNoTradeTag;
 
 const neutralModifier: RegimeProfileModifiers = {
   riskMultiplier: 1,
@@ -67,6 +71,9 @@ const profileMatrix: Record<MarketRegimeId, RegimeProfileModifiers> = {
   event_risk: noTradeProfile("event_blackout", "Event blackout: no new entries"),
   liquidity_stress: noTradeProfile("liquidity_stress", "Poor liquidity: no new entries"),
   extreme_volatility_no_trade: noTradeProfile("extreme_volatility", "Extreme volatility: no new entries"),
+};
+
+const legacyAliasProfileMatrix: Record<LegacyRegimeAlias | RegimeNoTradeTag, RegimeProfileModifiers> = {
   low_volatility: profile("low_volatility_quiet", 0.4, 0.5, 0.5, 0.85, 0.8, "Low-volatility fallback profile"),
   normal_volatility: profile("normal_volatility", 0.8, 0.85, 0.85, 1, 1, "Normal-volatility fallback profile"),
   high_volatility: profile("high_volatility", 0.5, 0.6, 0.6, 1.35, 1.15, "High-volatility fallback profile"),
@@ -131,7 +138,7 @@ export function resolveRegimeDynamicProfile(
 
 export function resolveEffectiveRegimeSettings(context: DynamicProfileContext): EffectiveRegimeSettings {
   const base = baseRegimeSettingsFromTradingSettings(context.settings);
-  const confirmedRegime = context.result.confirmedState?.confirmedRegime ?? context.result.rawClassification?.rawRegime ?? "no_trade";
+  const confirmedRegime: RegimeProfileKey = context.result.confirmedState?.confirmedRegime ?? context.result.rawClassification?.rawRegime ?? "no_trade";
   const breakdown = buildRegimeProfileModifierBreakdown(context, confirmedRegime);
   const combined = combineRegimeProfileModifiers(Object.values(breakdown));
   const generatedAt = context.result.confirmedState?.timestamp ?? context.result.rawClassification?.timestamp ?? new Date(0).toISOString();
@@ -157,9 +164,9 @@ export function resolveEffectiveRegimeSettings(context: DynamicProfileContext): 
   };
 }
 
-export function buildRegimeProfileModifierBreakdown(context: DynamicProfileContext, confirmedRegime: MarketRegimeId): RegimeProfileModifierBreakdown {
+export function buildRegimeProfileModifierBreakdown(context: DynamicProfileContext, confirmedRegime: RegimeProfileKey): RegimeProfileModifierBreakdown {
   return {
-    profile: profileMatrix[confirmedRegime] ?? profileMatrix.no_trade,
+    profile: profileModifiersForKey(confirmedRegime),
     timeOfDay: timeOfDayModifier(context.market),
     eventProximity: neutral("Event proximity unavailable; no loosening applied"),
     spread: spreadModifier(context.market),
@@ -171,6 +178,10 @@ export function buildRegimeProfileModifierBreakdown(context: DynamicProfileConte
     regimeStability: regimeStabilityModifier(context.result),
     mlDisagreement: mlDisagreementModifier(context.result),
   };
+}
+
+function profileModifiersForKey(key: RegimeProfileKey): RegimeProfileModifiers {
+  return profileMatrix[key as MarketRegimeId] ?? legacyAliasProfileMatrix[key as LegacyRegimeAlias | RegimeNoTradeTag];
 }
 
 export function combineRegimeProfileModifiers(modifiers: RegimeProfileModifiers[]): RegimeProfileModifiers {

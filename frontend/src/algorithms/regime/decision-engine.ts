@@ -513,7 +513,7 @@ export function regimeTradeBlockers(
   if (opportunity === "No-trade") {
     blockers.push("Opportunity state is No-trade");
   }
-  if (confirmedRegime === "extreme_volatility_no_trade" || confirmedRegime === "event_risk" || confirmedRegime === "liquidity_stress" || confirmedRegime === "no_trade") {
+  if (confirmedRegime === "extreme_volatility_no_trade" || confirmedRegime === "event_risk" || confirmedRegime === "liquidity_stress") {
     blockers.push(`Dynamic Regime profile prohibits new entries for ${confirmedRegime}`);
   }
   return blockers;

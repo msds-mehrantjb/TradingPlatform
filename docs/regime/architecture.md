@@ -12,6 +12,7 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | --- | --- | --- |
 | Shared contracts | `frontend/src/trading/shared/*` | Market data, account, order-intent, and gate-result types shared without algorithm state. |
 | Regime core | `frontend/src/algorithms/regime/*` | Pure TypeScript Regime decision logic, strategy routing, aggregation, dynamic profiles, sizing, intent building, diagnostics, and persistence helpers. |
+| Regime classification | `frontend/src/algorithms/regime/classification/*` | Isolated classifier inventory for axes, composite regimes, evidence, hysteresis, transition policy, and no-trade classification. |
 | Regime market boundary | `frontend/src/algorithms/regime/market/*` | Immutable Regime market snapshots, read-only feature snapshots, context-feed adapters, quote freshness, indicators, and session context. |
 | Regime ML | `frontend/src/algorithms/regime/ml/*` | Point-in-time feature building, artifact validation/loading, conservative prediction, offline labels, validation, and promotion policy. |
 | Regime backtest | `frontend/src/algorithms/regime/backtest/*` | Dedicated Regime replay engine, execution simulation, metrics, diagnostics, walk-forward summaries, and runner integration. |
@@ -42,6 +43,22 @@ Regime consumes shared raw market-data services as read-only input, then convert
 | `market/context-feeds.ts` | Adapter for quote freshness, QQQ/IWM relative strength, breadth, VIX, ES futures, scheduled events, halt/LULD, and circuit-breaker state. |
 | `market/freshness.ts` | Quote freshness contract and resolver. |
 | `market/session-context.ts` | Regime session-phase context. |
+
+## Classification Boundary
+
+The classifier is isolated from strategy voting and execution. It classifies independent axes, builds evidence, applies hysteresis, and derives one canonical composite regime before strategy routing begins.
+
+| Component | Dedicated responsibility |
+| --- | --- |
+| `classification/classifier.ts` | Public classification workflow exports. |
+| `classification/classification-axes.ts` | Direction, volatility, structure, liquidity, session, and event-risk axes. |
+| `classification/composite-regimes.ts` | Authoritative composite-regime IDs, legacy aliases, and opportunity tags. |
+| `classification/evidence-builder.ts` | Classification feature and evidence exports. |
+| `classification/hysteresis.ts` | Confirmed-regime hysteresis exports. |
+| `classification/transition-policy.ts` | Risk-off transition policy. |
+| `classification/no-trade-classifier.ts` | No-trade reason classification. |
+
+`MarketRegimeId` is reserved for canonical composite market states. Older labels such as `low_volatility`, `trend_continuation`, `bullish_breakout`, and `mean_reversion` are legacy aliases or opportunity tags, not authoritative market-regime identifiers.
 
 ## Authoritative Flow
 

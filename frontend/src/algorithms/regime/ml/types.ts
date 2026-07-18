@@ -1,5 +1,5 @@
 import type { MarketCandle } from "../../../trading/shared/market-data-types.ts";
-import type { MarketRegimeId, RegimeFamilyScore, RegimeSelectionResult } from "../types.ts";
+import type { MarketRegimeId, RegimeFamilyScore, RegimeNoTradeTag, RegimeSelectionResult } from "../types.ts";
 
 export type RegimeMlMode = "off" | "shadow" | "confirm_only" | "active";
 
@@ -76,8 +76,8 @@ export type RegimeDecisionSnapshot = {
   pointInTimeFeatures: RegimeMlFeatureVector | null;
   axes: Record<string, string>;
   missingInputs: string[];
-  rawRuleRegime: MarketRegimeId;
-  confirmedRuleRegime: MarketRegimeId;
+  rawRuleRegime: MarketRegimeId | RegimeNoTradeTag;
+  confirmedRuleRegime: MarketRegimeId | RegimeNoTradeTag;
   hysteresisState: Record<string, unknown> | null;
   selectedStrategies: RegimeSelectionResult["selectedStrategies"];
   skippedStrategies: RegimeSelectionResult["skippedStrategies"];
