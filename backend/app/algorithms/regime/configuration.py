@@ -59,6 +59,10 @@ def validate_regime_settings(settings: dict[str, Any] | None = None) -> dict[str
     merged["pyramidingEnabled"] = bool(merged["pyramidingEnabled"])
     if merged["mlMode"] not in {"off", "shadow", "confirm_only", "active"}:
         merged["mlMode"] = "shadow"
+    merged["confirmationBars"] = max(1, int(merged["confirmationBars"]))
+    merged["immediateConfidenceThreshold"] = max(0.0, min(1.0, float(merged["immediateConfidenceThreshold"])))
+    merged["minimumDwellBars"] = max(0, int(merged["minimumDwellBars"]))
+    merged["transitionConfidenceGap"] = max(0.0, min(1.0, float(merged["transitionConfidenceGap"])))
+    merged["maximumUnknownBars"] = max(0, int(merged["maximumUnknownBars"]))
     merged["settingsVersion"] = REGIME_SETTINGS_VERSION
     return merged
-

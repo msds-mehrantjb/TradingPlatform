@@ -10,8 +10,11 @@ def calculate_regime_position_size(decision: RegimeDecision, snapshot: RegimeMar
         return RegimeSizingResult(0, 0.0, 0.0, None, None, "blocked", (), tuple(decision.trade_blockers))
     profile = decision.effective_settings
     latest_price = snapshot.latest.close
-    buying_power = float((account or {}).get("availableBuyingPower") or profile["startingCapital"])
-    remaining_risk = float((account or {}).get("remainingAlgorithmRiskDollars") or profile["startingCapital"])
+    account_snapshot = account or {}
+    buying_power_value = account_snapshot.get("availableBuyingPower")
+    remaining_risk_value = account_snapshot.get("remainingAlgorithmRiskDollars")
+    buying_power = float(profile["startingCapital"] if buying_power_value is None else buying_power_value)
+    remaining_risk = float(profile["startingCapital"] if remaining_risk_value is None else remaining_risk_value)
     atr_value = decision.raw_classification.features.get("atr") or max(0.01, latest_price * float(profile["minimumStopDistancePercent"]) / 100)
     stop_distance = max(float(atr_value) * float(profile["atrStopMultiplier"]), latest_price * float(profile["minimumStopDistancePercent"]) / 100)
     risk_dollars = min(
@@ -38,4 +41,3 @@ def calculate_regime_position_size(decision: RegimeDecision, snapshot: RegimeMar
         stop_price = latest_price + stop_distance
         target_price = latest_price - (stop_distance * float(profile["takeProfitR"]))
     return RegimeSizingResult(final, risk_dollars, stop_distance, stop_price, target_price, limiting, tuple(caps), ())
-

@@ -184,6 +184,20 @@ REGIME_FINAL_ACCEPTANCE_ITEMS: tuple[RegimeAcceptanceItem, ...] = (
         category="Verification",
     ),
     RegimeAcceptanceItem(
+        "Every authoritative Regime strategy, classifier state, transition rule, dynamic profile, local gate, sizing rule, trade-management rule, and execution boundary has a focused automated test suite.",
+        RegimeAcceptanceStatus.PENDING,
+        (
+            "backend/tests/regime/coverage_manifest.json",
+            "backend/tests/regime/test_coverage_manifest.py",
+            "scripts/ci_quality_gates.py",
+        ),
+        category="Verification",
+        limitations=(
+            "Pending until the focused Regime suite passes in CI with branch coverage enabled.",
+            "Pending until runtime parity and no-skip manifest checks pass in the quality gate.",
+        ),
+    ),
+    RegimeAcceptanceItem(
         "Frontend tests pass.",
         RegimeAcceptanceStatus.PASS,
         ("frontend/package.json", "frontend/tests/V2DecisionPanel.test.ts", "scripts/ci_quality_gates.py"),

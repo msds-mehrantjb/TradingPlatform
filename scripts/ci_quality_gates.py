@@ -51,6 +51,18 @@ QUALITY_GATES = (
         command=[PYTHON, "-m", "pytest", "backend/tests", "-q"],
     ),
     QualityGate(
+        label="regime-focused-tests",
+        command=[
+            PYTHON,
+            "-m",
+            "pytest",
+            "backend/tests/regime",
+            "-q",
+            "--cov=backend/app/algorithms/regime",
+            "--cov-branch",
+        ],
+    ),
+    QualityGate(
         label="typescript-type-check",
         command=[NPM, "run", "typecheck"],
         cwd=FRONTEND,
@@ -110,6 +122,7 @@ QUALITY_GATES = (
             "backend/tests/test_wca_step21_final_acceptance.py",
             "backend/tests/test_regime_final_acceptance.py",
             "backend/tests/test_regime_phase17_rollout.py",
+            "backend/tests/regime",
             "backend/tests/test_weighted_voting_final_acceptance.py",
             "backend/tests/test_weighted_voting_step32_comprehensive.py",
             "backend/tests/test_event_driven_replay_engine.py",

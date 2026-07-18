@@ -29,6 +29,7 @@ class CIQualityGatesTest(unittest.TestCase):
             "python-format-lint",
             "python-type-check",
             "pytest",
+            "regime-focused-tests",
             "typescript-type-check",
             "frontend-tests",
             "frontend-build",
@@ -56,6 +57,7 @@ class CIQualityGatesTest(unittest.TestCase):
             "test_safe_ml_inference_modes.py",
             "test_regime_final_acceptance.py",
             "test_regime_phase17_rollout.py",
+            "backend/tests/regime",
         ):
             self.assertIn(test_file, source)
 
