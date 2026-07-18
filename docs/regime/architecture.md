@@ -21,6 +21,7 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | Regime profile | `frontend/src/algorithms/regime/profile/*` | Dedicated baseline settings, regime profile matrix, bounded effective settings, validation, and versioning. |
 | Regime risk sizing | `frontend/src/algorithms/regime/risk/*` | Dedicated position sizing, risk budget, stop/target distance, liquidity caps, and exposure caps. |
 | Regime trade management | `frontend/src/algorithms/regime/trade-management/*` | Dedicated entry, exit, stop, profit, time, regime-transition, and reconciliation policies. |
+| Regime execution | `frontend/src/algorithms/regime/execution/*` | Dedicated order intent, order validation, execution pipeline, idempotency, broker attribution, and reconciliation adapter. |
 | Regime ML | `frontend/src/algorithms/regime/ml/*` | Point-in-time feature building, artifact validation/loading, conservative prediction, offline labels, validation, and promotion policy. |
 | Regime backtest | `frontend/src/algorithms/regime/backtest/*` | Dedicated Regime replay engine, execution simulation, metrics, diagnostics, walk-forward summaries, and runner integration. |
 | Backend Regime API | `backend/app/algorithms/regime/*` | Persistence, API routes, and staged paper rollout status. |
@@ -183,6 +184,21 @@ The Regime algorithm owns its sizing and open-position management policy. Root `
 | `trade-management/position-reconciliation.ts` | Trade-history summary and pending-order lifecycle reconciliation. |
 
 Regime sizing uses only Regime decision strength, confirmed-regime confidence through the effective profile, entry and stop distance, Regime-specific risk allocation, available buying power, remaining algorithm risk budget, position cap, liquidity participation limit, and global-risk approval. The path contains no WCA sizing or WCA order adapters.
+
+## Execution Boundary
+
+The Regime algorithm owns immutable order-intent creation and validates the final proposed order after profile, sizing, and global-risk capacity inputs are applied. Root `order-intent.ts` is a compatibility facade over the dedicated execution package.
+
+| Component | Dedicated responsibility |
+| --- | --- |
+| `execution/order-intent.ts` | Regime order-intent and target-order construction. |
+| `execution/order-validation.ts` | Final Regime order and target-order validation. |
+| `execution/execution-pipeline.ts` | Regime execution proposal workflow wrapper. |
+| `execution/idempotency.ts` | Regime decision and order-intent idempotency keys. |
+| `execution/broker-attribution.ts` | Broker-submission attribution fields tagged to Regime. |
+| `execution/reconciliation-adapter.ts` | Broker reconciliation adapter that preserves Regime ownership. |
+
+The order intent carries algorithm ID `regime`, algorithm version, decision ID, symbol, side, position effect, quantity, entry price, stop, target, requested risk amount, confirmed regime, and confidence. Shared order-side and position-effect types are the only accepted shared execution contracts here.
 
 ## Authoritative Flow
 

@@ -6,7 +6,10 @@ import test from "node:test";
 
 import {
   buildRegimeOrderIntent,
+  buildRegimeBrokerAttribution,
+  buildRegimeExecutionPipeline,
   buildRegimeTargetOrder,
+  adaptRegimeBrokerReconciliation,
   buildRegimeMarketContext,
   buildRegimeMarketSnapshot,
   buildRawRegimeCondition,
@@ -44,6 +47,7 @@ import {
   REGIME_CONFIRMATION_MODULE_INVENTORY,
   REGIME_CONTEXT_MODULE_INVENTORY,
   REGIME_DIRECTIONAL_STRATEGY_INVENTORY,
+  REGIME_EXECUTION_PIPELINE,
   REGIME_SAFETY_GATE_INVENTORY,
   REGIME_SETTINGS_VERSION,
   REGIME_STRATEGY_ALIAS_INVENTORY,
@@ -70,6 +74,8 @@ import {
   summarizeRegimeTradeHistory,
   validateDirectionalStrategyResult,
   validateEffectiveRegimeProfile,
+  validateRegimeOrderIntent,
+  validateRegimeTargetOrder,
   validateRegimeMlArtifact,
   validateRegimeHysteresisSettings,
   validateRegimeIdentityContracts,
@@ -253,6 +259,44 @@ test("Regime order intents are immutable and use deterministic idempotency keys"
   assert.equal(Object.isFrozen(first?.reasons), true);
 });
 
+test("Regime owns dedicated order-intent and validation inventory", () => {
+  assert.deepEqual(directoryFiles("execution"), [
+    "broker-attribution.ts",
+    "execution-pipeline.ts",
+    "idempotency.ts",
+    "order-intent.ts",
+    "order-validation.ts",
+    "reconciliation-adapter.ts",
+  ]);
+  assert.deepEqual(REGIME_EXECUTION_PIPELINE, [
+    "decision_result",
+    "dynamic_profile",
+    "position_sizing",
+    "order_intent",
+    "order_validation",
+    "broker_attribution",
+    "reconciliation_adapter",
+  ]);
+  const intent = buildRegimeOrderIntent(regimeResult({ signal: "Buy", tradeAllowed: true }), "SPY", 12, pricedIntentOptions());
+  assert.ok(intent);
+  assert.deepEqual(validateRegimeOrderIntent(intent), []);
+  assert.deepEqual(buildRegimeBrokerAttribution(intent), {
+    algorithmId: "regime",
+    algorithmVersion: REGIME_ALGORITHM_VERSION,
+    decisionId: intent.decisionId,
+    symbol: "SPY",
+    side: "Buy",
+    positionEffect: "enter_long",
+    requestedQuantity: 12,
+  });
+  assert.deepEqual(adaptRegimeBrokerReconciliation(intent, { brokerOrderId: "BRK-1", status: "accepted" }), {
+    attribution: buildRegimeBrokerAttribution(intent),
+    brokerOrderId: "BRK-1",
+    brokerStatus: "accepted",
+    reconciledAt: intent.generatedAt,
+  });
+});
+
 test("Regime target orders are built without WCA confidence adaptation", () => {
   const candles = deterministicRegimeCandles();
   const market = buildRegimeMarketContext({
@@ -270,10 +314,13 @@ test("Regime target orders are built without WCA confidence adaptation", () => {
     },
   }).result;
   const target = buildRegimeTargetOrder(decision, market, "SPY");
+  const pipeline = buildRegimeExecutionPipeline(decision, market, "SPY", regimeTradingSettingsFixture());
 
   assert.equal(target.symbol, "SPY");
   assert.equal(target.signalDirection === "Buy" || target.signalDirection === "Sell" || target.signalDirection === "Hold", true);
   assert.equal(typeof target.sizing.finalQuantity, "number");
+  assert.equal(pipeline.modules, REGIME_EXECUTION_PIPELINE);
+  assert.deepEqual(validateRegimeTargetOrder(target), target.eligible ? [] : target.failedGates);
 });
 
 test("Regime module contains no WCA storage keys or confidence target-order adapter references", () => {

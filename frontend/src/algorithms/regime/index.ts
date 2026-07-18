@@ -98,7 +98,18 @@ export {
   validateEffectiveRegimeProfile,
   validateRegimeProfileModifiers,
 } from "./dynamic-profile.ts";
-export { buildRegimeOrderIntent, buildRegimeTargetOrder, generateRegimeOrderIntentIdempotencyKey, resolveRegimePositionEffect } from "./order-intent.ts";
+export {
+  REGIME_EXECUTION_PIPELINE,
+  adaptRegimeBrokerReconciliation,
+  buildRegimeBrokerAttribution,
+  buildRegimeExecutionPipeline,
+  buildRegimeOrderIntent,
+  buildRegimeTargetOrder,
+  generateRegimeOrderIntentIdempotencyKey,
+  resolveRegimePositionEffect,
+  validateRegimeOrderIntent,
+  validateRegimeTargetOrder,
+} from "./order-intent.ts";
 export {
   calculateRegimePositionSize,
   calculateRegimePositionSizing,
