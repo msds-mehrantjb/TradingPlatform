@@ -82,6 +82,16 @@ class RegimeBackendAuthoritativeRuntimeTest(unittest.TestCase):
         self.assertNotIn("client_core_available", backend_source)
         self.assertNotIn("TypeScript core", backend_source)
 
+    def test_frontend_no_longer_contains_regime_runtime_or_fallback(self) -> None:
+        frontend_regime_path = ROOT / "frontend" / "src" / "algorithms" / "regime"
+        main_source = (ROOT / "frontend" / "src" / "main.ts").read_text(encoding="utf-8")
+
+        self.assertFalse(frontend_regime_path.exists())
+        self.assertIn("evaluateRegimeOnBackend", main_source)
+        self.assertNotIn("calculateRegimeDecision(", main_source)
+        self.assertNotIn("buildRegimeMarketContext(", main_source)
+        self.assertNotIn("buildRegimeTargetOrder(", main_source)
+
 
 if __name__ == "__main__":
     unittest.main()

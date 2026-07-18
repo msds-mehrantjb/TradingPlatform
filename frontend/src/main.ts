@@ -1,18 +1,8 @@
-import "./styles.css";
+﻿import "./styles.css";
 import { API_BASE, BACKTEST_API_CANDIDATES } from "./api/client";
 import { directionalSignal, isEligibleStrategyVote, winningVoteSignal } from "./domain/tradingSignals";
-import {
-  baseRegimeSettingsFromTradingSettings,
-  buildRegimeMarketContext,
-  buildRegimeProfileModifierBreakdown,
-  buildRegimeTargetOrder,
-  calculateRegimeDecision,
-  combineRegimeProfileModifiers,
-  resolveRegimeDecision,
-} from "./algorithms/regime";
-import type { RegimeOrderIntent, RegimePositionSizingResult, RegimeSelectionResult as RegimeCoreSelectionResult, RegimeTargetOrder } from "./algorithms/regime";
-import type { RegimeBacktestResult } from "./algorithms/regime/backtest/types";
-import { runRegimeBacktestOnBackend } from "./features/regime/api";
+import type { RegimeBacktestResult } from "./features/regime/types";
+import { evaluateRegimeOnBackend, runRegimeBacktestOnBackend } from "./features/regime/api";
 import { fetchWcaBaselineSettings, fetchWcaConfiguration, fetchWcaStatus, updateWcaConfiguration } from "./features/wca/api";
 import {
   createInitialWcaState,
@@ -626,6 +616,146 @@ type RegimeSelectedStrategy = ConfidenceStrategyResult & {
   correlationPenalty?: number;
 };
 
+type BackendRegimeOrderIntent = {
+  algorithm_id: "regime";
+  algorithm_version: string;
+  settings_version: string;
+  decision_id: string;
+  order_intent_id: string;
+  symbol: string;
+  side: AlgoSignal;
+  position_effect: PositionEffect | string;
+  quantity: number;
+  entry_price: number;
+  stop_price: number | null;
+  target_price: number | null;
+  risk_dollars: number;
+  regime: string;
+  confidence: number;
+};
+
+type RegimeOrderIntent = BackendRegimeOrderIntent;
+
+type RegimePositionSizingResult = {
+  signalStrength: number;
+  signalStrengthMultiplier: number;
+  sizeMultiplier: number;
+  finalQuantity: number;
+  requestedQuantityBeforeGlobalCapacity: number;
+  riskDollars: number;
+  stopDistance: number;
+  effectiveTargetR: number;
+  targetDistance: number;
+  riskBasedQuantity: number;
+  allocationBasedQuantity: number;
+  positionBasedQuantity: number;
+  buyingPowerQuantity: number;
+  liquidityBasedQuantity: number;
+  shareLimitQuantity: number;
+  globalRiskCapacityQuantity: number | null;
+  sharesByRisk: number;
+  sharesByOrder: number;
+  sharesByCapital: number;
+  sharesByBuyingPower: number;
+  sharesByLiquidity: number;
+  availableBuyingPower: number;
+  accountEquity: number;
+  maxPositionDollars: number;
+  currentPositionValue: number;
+  limitingFactor: string;
+  quantityCaps: Array<{ label: string; quantity: number | null }>;
+  blockedReason: string;
+  blockerCodes: string[];
+};
+
+type BackendRegimeEvaluationResponse = {
+  algorithmId: "regime";
+  runtime: "backend.app.algorithms.regime.execution_pipeline";
+  pipeline: string[];
+  decision: Record<string, unknown>;
+  sizing: Record<string, unknown>;
+  orderIntent: BackendRegimeOrderIntent | null;
+  orderValidation: { valid: boolean; reasonCodes: string[] };
+  globalRiskApproval: Record<string, unknown> | null;
+  brokerSubmission: Record<string, unknown> | null;
+};
+
+type RegimeUiRawClassification = {
+  rawRegime: string;
+  timestamp?: string;
+  axes: {
+    direction: string;
+    volatility: string;
+    structure: string;
+    liquidity: string;
+    session: string;
+    eventRisk: string;
+  };
+  missingInputs: string[];
+};
+
+type RegimeUiConfirmedState = {
+  confirmedRegime: string;
+  previousRegime: unknown;
+  candidateRegime: unknown;
+  candidateCount: number;
+  dwellBars: number;
+  transitionReason: string;
+  timestamp?: string;
+};
+
+type RegimeUiMlState = {
+  mode: string;
+  appliedEffect: string;
+  reasonCodes: string[];
+  prediction?: {
+    enabled?: boolean;
+    predictedRegime?: string;
+    transitionProbability?: number | null;
+    probabilityVector?: Record<string, number>;
+  };
+};
+
+type RegimeUiDecisionSnapshot = {
+  algorithmVersion?: string;
+  settingsVersion?: string;
+  strategyVersion?: string;
+  profileVersion?: string;
+  modelVersion?: string | null;
+  decisionId?: string;
+  runtime?: string;
+};
+
+type RegimeUiEffectiveSettings = {
+  profileId?: string;
+  profileVersion?: string;
+  baseSettingsVersion?: string;
+  effectiveRiskPercent?: number;
+  effectiveOrderAllocationPercent?: number;
+  effectiveMaxPositionPercent?: number;
+  effectiveAtrStopMultiplier?: number;
+  effectiveTakeProfitR?: number;
+  effectiveMaximumParticipationPercent?: number;
+  effectiveMinimumWinningScore?: number;
+  effectiveMinimumDirectionalEdge?: number;
+  effectiveMinimumRegimeConfidence?: number;
+  effectiveMaximumTrades?: number;
+  newEntriesAllowed?: boolean;
+  pyramidingAllowed?: boolean;
+  reasons: string[];
+};
+
+type RegimeFrontendMarketContext = {
+  symbol: string;
+  candles: Candle[];
+  allCandles: Candle[];
+  oneMinuteCandles: Candle[];
+  fiveMinuteCandles: Candle[];
+  latest: Candle;
+  vwap: number | null;
+  openingRange: { high: number; low: number } | null;
+};
+
 type RegimeSelectionScores = {
   buy: number;
   sell: number;
@@ -674,13 +804,16 @@ type RegimeSelectionResult = {
   features: RegimeSelectionFeature[];
   selectedStrategies: RegimeSelectedStrategy[];
   skippedStrategies: Array<{ name: string; reason: string }>;
-  rawClassification?: RegimeCoreSelectionResult["rawClassification"];
-  confirmedState?: RegimeCoreSelectionResult["confirmedState"];
-  routing?: RegimeCoreSelectionResult["routing"];
-  familyScores?: RegimeCoreSelectionResult["familyScores"];
-  effectiveSettings?: RegimeCoreSelectionResult["effectiveSettings"];
-  ml?: RegimeCoreSelectionResult["ml"];
-  decisionSnapshot?: RegimeCoreSelectionResult["decisionSnapshot"];
+  rawClassification?: RegimeUiRawClassification;
+  confirmedState?: RegimeUiConfirmedState;
+  routing?: { skippedStrategies?: Array<{ strategyId: string; reason: string }>; contextResults?: unknown[]; safetyResults?: unknown[] };
+  familyScores?: Array<{ family: string; buyScore: number; sellScore: number }>;
+  effectiveSettings?: RegimeUiEffectiveSettings;
+  ml?: RegimeUiMlState;
+  decisionSnapshot?: RegimeUiDecisionSnapshot;
+  backendResponse?: BackendRegimeEvaluationResponse;
+  backendOrderIntent?: BackendRegimeOrderIntent | null;
+  backendSizing?: RegimePositionSizingResult;
   reasons: string[];
   noTradeReasons: string[];
 };
@@ -2144,7 +2277,7 @@ function buildDecisionRecorderSnapshot(reason: string) {
   const weighted = weightedVotingBackendSummary();
   const confidence = wcaBackendDecisionAsConfidenceResult();
   const regime = calculateRegimeSelection();
-  const regimeTargetOrder = buildRegimeTargetOrderRecommendation(regime);
+  const regimeTargetOrder = buildBackendRegimeOrderRecommendation(regime);
   const meta = calculateMetaStrategy();
   const activeMode = state.tradingWindowMode;
   const candles = latestRegularSessionCandles().length ? latestRegularSessionCandles() : state.candles.slice(-DECISION_SNAPSHOT_MAX_CANDLES);
@@ -2173,8 +2306,8 @@ function buildDecisionRecorderSnapshot(reason: string) {
     strategyVersion: regime.decisionSnapshot?.strategyVersion ?? "regime_strategy_catalog_v2",
     profileVersion: regime.effectiveSettings?.profileVersion ?? regime.decisionSnapshot?.profileVersion ?? "regime_profile_matrix_v1",
     modelVersion: regime.decisionSnapshot?.modelVersion ?? null,
-    decisionId: regimeTargetOrder.orderIntent?.decisionId ?? regime.decisionSnapshot?.decisionId ?? "",
-    orderId: regimeTargetOrder.orderIntent?.decisionId ?? null,
+    decisionId: regimeTargetOrder.orderIntent?.decision_id ?? regime.decisionSnapshot?.decisionId ?? "",
+    orderId: regimeTargetOrder.orderIntent?.decision_id ?? null,
     symbol: state.symbol,
     timestamp: regime.confirmedState?.timestamp ?? regime.rawClassification?.timestamp ?? latest?.timestamp ?? new Date().toISOString(),
     dataTimestamp: regime.confirmedState?.timestamp ?? regime.rawClassification?.timestamp ?? latest?.timestamp ?? "",
@@ -2192,7 +2325,7 @@ function buildDecisionRecorderSnapshot(reason: string) {
     effectiveSettings: regime.effectiveSettings ?? null,
     ml: regime.ml ?? null,
     mlMode: regime.ml?.mode ?? ((state.regimeTradingSettings as typeof state.regimeTradingSettings & { mlMode?: string }).mlMode ?? "shadow"),
-    mlProbabilities: regime.ml?.prediction.probabilityVector ?? null,
+    mlProbabilities: regime.ml?.prediction?.probabilityVector ?? null,
     targetOrder: compactTargetOrder(regimeTargetOrder),
     orderIntent: regimeTargetOrder.orderIntent ?? null,
     globalGateOutcome: null,
@@ -2362,7 +2495,9 @@ let regimeBacktestError = "";
 let wcaPresentationState = createInitialWcaState();
 let wcaPresentationRefreshInFlight = false;
 let latestWcaBackendBacktestResult: WcaBacktestResult | null = null;
-let lastConfirmedRegimeCondition: RegimeConditionSnapshot | null = null;
+let backendRegimeSelectionCache: { key: string; result: RegimeSelectionResult } | null = null;
+let backendRegimeEvaluationInFlightKey: string | null = null;
+let backendRegimeEvaluationError: string | null = null;
 let confidenceBacktestAutoRunKey = "";
 let regimeBacktestAutoRunKey = "";
 let confidenceBacktestDatasetCheckInFlight = false;
@@ -10591,7 +10726,7 @@ function scheduleRegimeSelectionPanelUpdate() {
 
 function updateRegimeSelectionPanel() {
   const result = calculateRegimeSelection();
-  const targetOrder = buildRegimeTargetOrderRecommendation(result);
+  const targetOrder = buildBackendRegimeOrderRecommendation(result);
   state.currentRegimeTargetOrder = targetOrder;
   regimeFinalSignal.textContent = result.signal;
   regimeFinalSignal.className = `algo-final ${regimeSignalClass(result.signal)}`;
@@ -10621,23 +10756,28 @@ function updateRegimeSelectionPanel() {
   maybeAutoSubmitOpenOrderControls();
 }
 
-function currentRegimeMarketContext() {
+function currentRegimeMarketContext(): RegimeFrontendMarketContext | null {
   const oneMinuteCandles = state.weightedMarketData.timeframeCandles["1Min"]?.length ? state.weightedMarketData.timeframeCandles["1Min"]! : state.candles;
   const primaryCandles = latestWeightedCalculationCandles();
   const sessionCandles = primaryCandles.length ? primaryCandles : latestRegularSessionCandles();
+  const candles = sessionCandles.length ? sessionCandles : state.candles;
+  const latest = candles.at(-1);
+  if (!latest) {
+    return null;
+  }
   const fiveMinuteCandles = state.weightedMarketData.timeframeCandles["5Min"]?.length
     ? latestRegularSessionCandlesFrom(state.weightedMarketData.timeframeCandles["5Min"]!)
     : aggregateCandlesToFiveMinute(sessionCandles);
-  return buildRegimeMarketContext(
-    {
-      symbol: state.symbol,
-      primaryCandles: sessionCandles.length ? sessionCandles : state.candles,
-      allCandles: oneMinuteCandles.length ? oneMinuteCandles : state.candles,
-      oneMinuteCandles,
-      fiveMinuteCandles,
-    },
-    state.regimeTradingSettings,
-  );
+  return {
+    symbol: state.symbol,
+    candles,
+    allCandles: oneMinuteCandles.length ? oneMinuteCandles : state.candles,
+    oneMinuteCandles,
+    fiveMinuteCandles,
+    latest,
+    vwap: candles.length ? sessionVwapValue(candles) : null,
+    openingRange: candles.length ? openingRangeValues(candles, Math.min(15, candles.length)) : null,
+  };
 }
 
 function calculateRegimeSelection(): RegimeSelectionResult {
@@ -10645,21 +10785,344 @@ function calculateRegimeSelection(): RegimeSelectionResult {
   if (!market) {
     return emptyRegimeSelectionResult("Waiting for regular-session candles");
   }
-  const output = calculateRegimeDecision({
+  const payload = backendRegimeEvaluationPayload(market);
+  const key = backendRegimeEvaluationKey(payload);
+  if (backendRegimeSelectionCache?.key === key) {
+    return backendRegimeSelectionCache.result;
+  }
+  void requestBackendRegimeSelection(key, payload);
+  return emptyRegimeSelectionResult(backendRegimeEvaluationError ?? "Waiting for backend Regime runtime");
+}
+
+function backendRegimeEvaluationPayload(market: RegimeFrontendMarketContext) {
+  const settings = state.regimeTradingSettings as typeof state.regimeTradingSettings & {
+    mlMode?: "off" | "shadow" | "confirm_only" | "active";
+    shortEntriesEnabled?: boolean;
+  };
+  return {
     marketData: {
       symbol: state.symbol,
       primaryCandles: market.candles,
-      allCandles: market.allCandles,
+      candles: market.candles,
       oneMinuteCandles: market.oneMinuteCandles,
       fiveMinuteCandles: market.fiveMinuteCandles,
     },
-    settings: state.regimeTradingSettings,
-    sizingDefaults: regimeDefaultSizingSettings(),
-    currentPosition: regimeCurrentPositionSnapshot(market.latest.close),
-    hysteresis: lastConfirmedRegimeCondition,
+    settings: {
+      ...settings,
+      minimumWinningScore: settings.minimumBuyScore,
+      minimumRegimeConfidence: 0,
+      shortEntriesEnabled: false,
+      mlMode: settings.mlMode ?? "shadow",
+    },
+    account: {
+      availableBuyingPower: targetBuyingPowerAvailable(settings) ? settings.startingCapital : 0,
+      remainingAlgorithmRiskDollars: settings.startingCapital,
+      globalRiskCapacityQuantity: 1000000,
+    },
+  };
+}
+
+function backendRegimeEvaluationKey(payload: ReturnType<typeof backendRegimeEvaluationPayload>) {
+  const marketData = payload.marketData;
+  const candles = marketData.primaryCandles;
+  const latest = candles.at(-1);
+  return JSON.stringify({
+    symbol: marketData.symbol,
+    candleCount: candles.length,
+    latestTimestamp: latest?.timestamp ?? "none",
+    latestClose: latest?.close ?? null,
+    settings: payload.settings,
+    account: payload.account,
   });
-  lastConfirmedRegimeCondition = output.hysteresis;
-  return output.result;
+}
+
+async function requestBackendRegimeSelection(key: string, payload: ReturnType<typeof backendRegimeEvaluationPayload>) {
+  if (backendRegimeEvaluationInFlightKey === key) {
+    return;
+  }
+  backendRegimeEvaluationInFlightKey = key;
+  try {
+    const response = await evaluateRegimeOnBackend<BackendRegimeEvaluationResponse>(payload);
+    backendRegimeSelectionCache = { key, result: regimeBackendEvaluationAsSelectionResult(response) };
+    backendRegimeEvaluationError = null;
+  } catch (error) {
+    backendRegimeEvaluationError = error instanceof Error ? error.message : "Backend Regime evaluation failed";
+  } finally {
+    if (backendRegimeEvaluationInFlightKey === key) {
+      backendRegimeEvaluationInFlightKey = null;
+    }
+    scheduleRegimeSelectionPanelUpdate();
+  }
+}
+
+function regimeBackendEvaluationAsSelectionResult(response: BackendRegimeEvaluationResponse): RegimeSelectionResult {
+  const decision = response.decision;
+  const rawClassification = childRecord(decision, "raw_classification") ?? {};
+  const confirmedState = childRecord(decision, "confirmed_state") ?? {};
+  const axes = childRecord(rawClassification, "axes") ?? {};
+  const features = childRecord(rawClassification, "features") ?? {};
+  const evidence = childRecord(rawClassification, "evidence") ?? {};
+  const familyScoreRecord = childRecord(decision, "family_scores") ?? {};
+  const strategyOutputs = arrayFromUnknown(decision.strategy_outputs).filter(isRecord);
+  const signal = regimeDecisionSignalFromBackend(decision.signal);
+  const aggregateSignal = confidenceContractSignal(signal === "No-trade" ? "Hold" : signal);
+  const familyScores = Object.entries(familyScoreRecord).map(([family, value]) => ({
+    family,
+    buyScore: Math.max(0, numberFromUnknown(value, 0)),
+    sellScore: Math.min(0, numberFromUnknown(value, 0)),
+  }));
+  const selectedStrategies = strategyOutputs.map(regimeBackendStrategyAsUiStrategy);
+  const skippedStrategies = selectedStrategies
+    .filter((strategy) => !strategy.eligible)
+    .map((strategy) => ({ name: strategy.name, reason: strategy.reason }));
+  const buyScore = signal === "Buy" ? numberFromUnknown(decision.score, 0) : 0;
+  const sellScore = signal === "Sell" ? numberFromUnknown(decision.score, 0) : 0;
+  const holdScore = signal === "Hold" || signal === "No-trade" ? Math.max(0, 1 - Math.max(buyScore, sellScore)) : 0;
+  const scores = { buy: buyScore, sell: sellScore, hold: holdScore };
+  const sortedScores = Object.values(scores).sort((left, right) => right - left);
+  const blockers = arrayFromUnknown(decision.trade_blockers).map((item) => String(item));
+  const noTradeReasons = arrayFromUnknown(rawClassification.no_trade_reasons).map((item) => String(item));
+  const rawRegime = stringFromUnknown(rawClassification.raw_regime, "unknown");
+  const confirmedRegime = stringFromUnknown(confirmedState.confirmed_regime, rawRegime);
+  const confidence = numberFromUnknown(decision.confidence ?? rawClassification.confidence, 0);
+  const activeStrategyCount = selectedStrategies.filter((strategy) => strategy.eligible && strategy.role === "directional").length;
+  return {
+    signal,
+    aggregateSignal,
+    scores,
+    rawCondition: rawRegime,
+    confirmedCondition: confirmedRegime,
+    confirmationCount: Math.floor(numberFromUnknown(confirmedState.candidate_confirmation_count, 0)),
+    conditionHeld: stringFromUnknown(confirmedState.transition_reason, "").includes("waiting"),
+    primaryTrend: regimePrimaryTrendFromAxis(stringFromUnknown(axes.direction, "neutral")),
+    volatility: regimeVolatilityFromAxis(stringFromUnknown(axes.volatility, "normal")),
+    opportunity: regimeOpportunityFromRegime(rawRegime),
+    confidence,
+    buyScore,
+    sellScore,
+    holdScore,
+    winningScore: numberFromUnknown(decision.score, Math.max(buyScore, sellScore, holdScore)),
+    winningDirectionScore: Math.max(buyScore, sellScore),
+    signedNetScore: buyScore - sellScore,
+    secondBestScore: sortedScores[1] ?? 0,
+    scoreEdge: Math.max(0, (sortedScores[0] ?? 0) - (sortedScores[1] ?? 0)),
+    winningDirectionEdge: Math.abs(buyScore - sellScore),
+    winningDirection: aggregateSignal,
+    directionalEdge: Math.abs(buyScore - sellScore),
+    activeFamilyCount: Object.keys(familyScoreRecord).length,
+    abstentionRate: selectedStrategies.length ? selectedStrategies.filter((strategy) => strategy.signal === "hold").length / selectedStrategies.length : 1,
+    normalizedNetScore: buyScore - sellScore,
+    tradeAllowed: Boolean(decision.trade_allowed),
+    tradeBlockers: blockers,
+    activeStrategyCount,
+    selectedStrategyCount: selectedStrategies.filter((strategy) => strategy.eligible).length,
+    features: regimeBackendFeaturesForUi(features, evidence),
+    selectedStrategies: selectedStrategies.filter((strategy) => strategy.eligible),
+    skippedStrategies,
+    rawClassification: {
+      rawRegime,
+      axes: {
+        direction: stringFromUnknown(axes.direction, "unknown"),
+        volatility: stringFromUnknown(axes.volatility, "unknown"),
+        structure: stringFromUnknown(axes.structure, "unknown"),
+        liquidity: stringFromUnknown(axes.liquidity, "unknown"),
+        session: stringFromUnknown(axes.session, "unknown"),
+        eventRisk: stringFromUnknown(axes.event_risk, "unknown"),
+      },
+      missingInputs: arrayFromUnknown(rawClassification.missing_inputs).map((item) => String(item)),
+    },
+    confirmedState: {
+      confirmedRegime,
+      previousRegime: confirmedState.previous_regime ?? null,
+      candidateRegime: confirmedState.candidate_regime ?? null,
+      candidateCount: numberFromUnknown(confirmedState.candidate_confirmation_count, 0),
+      dwellBars: 0,
+      transitionReason: stringFromUnknown(confirmedState.transition_reason, "backend_confirmed"),
+    },
+    routing: { skippedStrategies: skippedStrategies.map((strategy) => ({ strategyId: strategy.name, reason: strategy.reason })) },
+    familyScores,
+    effectiveSettings: regimeEffectiveSettingsForUi(childRecord(decision, "effective_settings") ?? {}),
+    ml: {
+      mode: "shadow",
+      appliedEffect: "shadow_only",
+      reasonCodes: ["regime.ml.shadow_backend_only"],
+    },
+    decisionSnapshot: {
+      modelVersion: null,
+      runtime: response.runtime,
+    },
+    backendResponse: response,
+    backendOrderIntent: response.orderIntent,
+    backendSizing: regimeBackendSizingForUi(response.sizing, response.globalRiskApproval, signal),
+    reasons: blockers.length ? blockers : ["Backend Regime runtime evaluated this decision"],
+    noTradeReasons,
+  };
+}
+
+function regimeBackendStrategyAsUiStrategy(row: Record<string, unknown>): RegimeSelectedStrategy {
+  const signal = confidenceContractSignal(algoSignalFromUnknown(row.signal));
+  const confidence = numberFromUnknown(row.confidence, 0);
+  const weight = numberFromUnknown(row.weight, 0);
+  const family = regimeUiFamilyFromBackend(stringFromUnknown(row.family, "regime_context"), stringFromUnknown(row.role, "regime_context"));
+  return {
+    strategy: stringFromUnknown(row.strategy_id, "regime_strategy"),
+    signal,
+    confidence,
+    base_weight: weight,
+    effective_weight: weight,
+    direction: confidenceSignalDirection(signal),
+    reason: stringFromUnknown(row.reason, "Backend Regime strategy output"),
+    key: stringFromUnknown(row.strategy_id, "regime_strategy") as ConfidenceStrategyKey,
+    name: stringFromUnknown(row.name ?? row.strategy_id, "Regime strategy"),
+    contribution: weight * confidence,
+    quality: confidence,
+    effectiveWeight: weight,
+    role: stringFromUnknown(row.role, "regime_context") as RegimeStrategyRole,
+    family,
+    eligible: Boolean(row.eligible),
+    timestamp: new Date().toISOString(),
+    evidence: (childRecord(row, "evidence") as Record<string, number | string | boolean | null> | null) ?? {},
+    signedContribution: signal === "buy" ? weight * confidence : signal === "sell" ? -weight * confidence : 0,
+    selected: Boolean(row.eligible),
+    selectorReason: stringFromUnknown(row.reason, "Backend-selected Regime strategy"),
+    rawConfidence: confidence,
+    effectiveConfidence: confidence,
+    compatibilityMultiplier: 1,
+    contextMultiplier: 1,
+    reliabilityMultiplier: 1,
+    correlationPenalty: 1,
+  };
+}
+
+function regimeBackendFeaturesForUi(features: Record<string, unknown>, evidence: Record<string, unknown>): RegimeSelectionFeature[] {
+  const rows: Array<[string, unknown]> = [
+    ["Close", evidence.close],
+    ["VWAP", features.vwap],
+    ["EMA 20", features.ema20],
+    ["EMA 50", features.ema50],
+    ["ATR", features.atr],
+    ["ATR %", features.atrPercent],
+    ["RSI", features.rsi],
+    ["MACD histogram", features.macdHistogram],
+    ["Relative volume", features.relativeVolume],
+    ["Quote freshness", evidence.quoteFreshness],
+    ["QQQ relative strength", evidence.qqqRelativeStrength],
+    ["IWM relative strength", evidence.iwmRelativeStrength],
+    ["Market breadth", evidence.marketBreadth],
+    ["VIX", evidence.vixState],
+    ["ES futures", evidence.esFuturesState],
+    ["Scheduled event", evidence.scheduledEventState],
+  ];
+  return rows.map(([name, value]) => ({
+    name,
+    value: typeof value === "number" ? roundNumber(value, 4).toString() : String(value ?? "unknown"),
+    status: value === null || value === undefined || value === "unknown" ? "na" : "ok",
+  }));
+}
+
+function regimeBackendSizingForUi(sizing: Record<string, unknown> | null, approval: Record<string, unknown> | null, signal: RegimeDecisionSignal): RegimePositionSizingResult {
+  const finalQuantity = Math.max(0, Math.floor(numberFromUnknown(sizing?.quantity, 0)));
+  const approvedQuantity = approval ? Math.max(0, Math.floor(numberFromUnknown(approval.approved_quantity, finalQuantity))) : null;
+  const stopDistance = numberFromUnknown(sizing?.stop_distance, 0);
+  const riskDollars = numberFromUnknown(sizing?.risk_dollars, 0);
+  const caps = arrayFromUnknown(sizing?.quantity_caps).filter(isRecord).map((cap) => ({
+    label: stringFromUnknown(cap.label, "cap"),
+    quantity: cap.quantity === null || cap.quantity === undefined ? null : Math.floor(numberFromUnknown(cap.quantity, 0)),
+  }));
+  return {
+    signalStrength: signal === "No-trade" || signal === "Hold" ? 0 : 1,
+    signalStrengthMultiplier: signal === "No-trade" || signal === "Hold" ? 0 : 1,
+    sizeMultiplier: finalQuantity > 0 ? 1 : 0,
+    finalQuantity,
+    requestedQuantityBeforeGlobalCapacity: finalQuantity,
+    riskDollars,
+    stopDistance,
+    effectiveTargetR: state.regimeTradingSettings.takeProfitR,
+    targetDistance: Math.abs(numberFromUnknown(sizing?.target_price, 0) - numberFromUnknown(sizing?.stop_price, 0)),
+    riskBasedQuantity: regimeQuantityCap(caps, "risk"),
+    allocationBasedQuantity: regimeQuantityCap(caps, "allocation"),
+    positionBasedQuantity: finalQuantity,
+    buyingPowerQuantity: regimeQuantityCap(caps, "allocation"),
+    liquidityBasedQuantity: regimeQuantityCap(caps, "liquidity"),
+    shareLimitQuantity: regimeQuantityCap(caps, "share_limit"),
+    globalRiskCapacityQuantity: approvedQuantity,
+    sharesByRisk: regimeQuantityCap(caps, "risk"),
+    sharesByOrder: regimeQuantityCap(caps, "allocation"),
+    sharesByCapital: regimeQuantityCap(caps, "allocation"),
+    sharesByBuyingPower: regimeQuantityCap(caps, "allocation"),
+    sharesByLiquidity: regimeQuantityCap(caps, "liquidity"),
+    availableBuyingPower: state.regimeTradingSettings.startingCapital,
+    accountEquity: state.regimeTradingSettings.startingCapital,
+    maxPositionDollars: state.regimeTradingSettings.startingCapital * state.regimeTradingSettings.maxPositionPercent / 100,
+    currentPositionValue: 0,
+    limitingFactor: stringFromUnknown(sizing?.limiting_factor, "backend"),
+    quantityCaps: caps,
+    blockedReason: arrayFromUnknown(sizing?.blockers).map((item) => String(item)).join("; "),
+    blockerCodes: arrayFromUnknown(sizing?.blockers).map((item) => String(item)),
+  };
+}
+
+function regimeQuantityCap(caps: Array<{ label: string; quantity: number | null }>, label: string) {
+  return caps.find((cap) => cap.label === label)?.quantity ?? 0;
+}
+
+function regimeEffectiveSettingsForUi(settings: Record<string, unknown>): RegimeUiEffectiveSettings {
+  return {
+    profileId: stringFromUnknown(settings.profileId, "backend_profile"),
+    baseSettingsVersion: stringFromUnknown(settings.settingsVersion, "regime_base_settings_v2"),
+    profileVersion: "regime_profile_matrix_v2_backend",
+    effectiveRiskPercent: numberFromUnknown(settings.baseRiskPercent, 0),
+    effectiveOrderAllocationPercent: numberFromUnknown(settings.maxPositionPercent, 0),
+    effectiveMaxPositionPercent: numberFromUnknown(settings.maxPositionPercent, 0),
+    effectiveAtrStopMultiplier: numberFromUnknown(settings.atrStopMultiplier, 0),
+    effectiveTakeProfitR: numberFromUnknown(settings.takeProfitR, 0),
+    effectiveMaximumParticipationPercent: numberFromUnknown(settings.maxParticipationPercent, 0) * 100,
+    effectiveMinimumWinningScore: numberFromUnknown(settings.minimumWinningScore, 0),
+    effectiveMinimumDirectionalEdge: numberFromUnknown(settings.minimumSignalEdge, 0),
+    effectiveMinimumRegimeConfidence: numberFromUnknown(settings.minimumRegimeConfidence, 0),
+    effectiveMaximumTrades: numberFromUnknown(settings.maxTradesPerDay, state.regimeTradingSettings.maxTradesPerDay),
+    newEntriesAllowed: numberFromUnknown(settings.baseRiskPercent, 0) > 0,
+    pyramidingAllowed: Boolean(settings.pyramidingEnabled),
+    reasons: arrayFromUnknown(settings.profileReasons).map((item) => String(item)),
+  };
+}
+
+function regimeDecisionSignalFromBackend(value: unknown): RegimeDecisionSignal {
+  const signal = algoSignalFromUnknown(value);
+  return signal === "Hold" ? "Hold" : signal;
+}
+
+function regimePrimaryTrendFromAxis(axis: string): RegimePrimaryTrend {
+  if (axis === "strong_up") return "Strong uptrend";
+  if (axis === "weak_up") return "Weak uptrend";
+  if (axis === "strong_down") return "Strong downtrend";
+  if (axis === "weak_down") return "Weak downtrend";
+  return "Sideways / range-bound";
+}
+
+function regimeVolatilityFromAxis(axis: string): RegimeVolatilityState {
+  if (axis === "expanded" || axis === "extreme") return "High volatility";
+  if (axis === "compressed") return "Low volatility";
+  return "Normal volatility";
+}
+
+function regimeOpportunityFromRegime(regime: string): RegimeOpportunityState {
+  if (regime.includes("breakout") || regime.includes("expansion")) return "Bullish breakout";
+  if (regime.includes("reversal")) return "Bullish reversal risk";
+  if (regime.includes("range") || regime.includes("quiet")) return "Mean reversion";
+  if (regime.includes("event") || regime.includes("liquidity") || regime.includes("no_trade")) return "No-trade";
+  return "Trend continuation";
+}
+
+function regimeUiFamilyFromBackend(family: string, role: string): RegimeStrategyFamily {
+  if (role === "confirmation") return "confirmation";
+  if (role === "regime_context") return "regime_context";
+  if (role === "safety_gate") return "safety";
+  if (family === "trend" || family === "momentum" || family === "structure") return "trend_momentum";
+  if (family === "event") return "gap_session_event";
+  if (family === "vwap") return "regime_context";
+  if (family === "breakout" || family === "mean_reversion" || family === "reversal") return family;
+  return "regime_context";
 }
 
 function regimeCurrentPositionSnapshot(latestPrice: number) {
@@ -10708,588 +11171,6 @@ function emptyRegimeSelectionResult(reason: string): RegimeSelectionResult {
     reasons: [reason],
     noTradeReasons: [reason],
   };
-}
-
-function regimeSelectionFeatures(market: ConfidenceMarket) {
-  const ema20Series = exponentialMovingAverageSeries(market.closes, 20);
-  const ema20 = lastDefined(ema20Series);
-  const ema50 = lastDefined(exponentialMovingAverageSeries(market.closes, 50));
-  const structure = marketStructureContext(market.candles, market.vwap);
-  const priorDay = priorDayRangeForRegimeSelection(market.latest.timestamp);
-  const vwapDistance = (market.latest.close - market.vwap) / Math.max(market.vwap, 0.01);
-  const recentRange = recentRangeForRegimeSelection(market.candles);
-  const openingBreakUp = market.latest.close > market.openingRange.high;
-  const openingBreakDown = market.latest.close < market.openingRange.low;
-  const priorDayBreakUp = priorDay ? market.latest.close > priorDay.high : false;
-  const priorDayBreakDown = priorDay ? market.latest.close < priorDay.low : false;
-  const ema20Slope = emaSlopeFromSeries(ema20Series, market.latest.close);
-  const higherHighAndHigherLow = Boolean(structure?.higherHigh && structure.higherLow);
-  const lowerHighAndLowerLow = Boolean(structure?.lowerHigh && structure.lowerLow);
-  const macdHistogram = market.macd?.histogram ?? null;
-  const atrPercent = market.atr.atr1m !== null ? market.atr.atr1m / Math.max(market.latest.close, 0.01) : market.atr.atrPercent;
-  const atrHistory = oneMinuteAtrPercentHistoryForRegimeSelection(market);
-  const atrPercentile = atrHistory.length && atrPercent ? percentileRank(atrHistory, atrPercent) : null;
-  const atrExpanding = atrHistory.length >= 6 && atrPercent > meanNumber(atrHistory.slice(-6));
-  const bearishRejectionCandle = isBearishRejectionCandle(market.latest);
-  const bullishRejectionCandle = isBullishRejectionCandle(market.latest);
-  const recentVwapCrosses = recentLevelCrosses(market.candles.map((candle) => candle.close), market.vwap, 14);
-  const priceChoppingAroundVwap = recentVwapCrosses >= 4 && Math.abs(vwapDistance) < 0.0015;
-  const bullScore =
-    (market.latest.close > market.vwap ? 1 : 0) +
-    (ema20 !== null && market.latest.close > ema20 ? 1 : 0) +
-    (ema20 !== null && ema50 !== null && ema20 > ema50 ? 1 : 0) +
-    (ema20Slope > 0 ? 1 : 0) +
-    (higherHighAndHigherLow ? 1 : 0) +
-    (macdHistogram !== null && macdHistogram > 0 ? 1 : 0);
-  const bearScore =
-    (market.latest.close < market.vwap ? 1 : 0) +
-    (ema20 !== null && market.latest.close < ema20 ? 1 : 0) +
-    (ema20 !== null && ema50 !== null && ema20 < ema50 ? 1 : 0) +
-    (ema20Slope < 0 ? 1 : 0) +
-    (lowerHighAndLowerLow ? 1 : 0) +
-    (macdHistogram !== null && macdHistogram < 0 ? 1 : 0);
-  return {
-    ema20,
-    ema50,
-    ema20Slope,
-    vwap: market.vwap,
-    adx: market.adx?.adx ?? null,
-    atr: market.atr.atr1m,
-    atrPercent,
-    atrPercentile,
-    atrExpanding,
-    rsi: market.rsi,
-    macdHistogram,
-    bullScore,
-    bearScore,
-    volumeRatio: market.volume.relativeVolume,
-    structure,
-    higherHigh: Boolean(structure?.higherHigh),
-    higherLow: Boolean(structure?.higherLow),
-    lowerHigh: Boolean(structure?.lowerHigh),
-    lowerLow: Boolean(structure?.lowerLow),
-    higherHighAndHigherLow,
-    lowerHighAndLowerLow,
-    openingRangeHigh: market.openingRange.high,
-    openingRangeLow: market.openingRange.low,
-    recentRangeHigh: recentRange.high,
-    recentRangeLow: recentRange.low,
-    priorDayHigh: priorDay?.high ?? null,
-    priorDayLow: priorDay?.low ?? null,
-    distanceFromVwap: vwapDistance,
-    openingBreakUp,
-    openingBreakDown,
-    priorDayBreakUp,
-    priorDayBreakDown,
-    bearishRejectionCandle,
-    bullishRejectionCandle,
-    priceChoppingAroundVwap,
-    spreadTooWide: market.spreadLiquidity.spreadTooWide,
-    volumeTooLow: market.spreadLiquidity.volumeTooLow || market.volume.relativeVolume < 0.55,
-    display: [
-      regimeFeature("Bull / Bear score", `${bullScore} / ${bearScore}`, Math.abs(bullScore - bearScore) <= 1 ? "warn" : "ok"),
-      regimeFeature("EMA 20", ema20 === null ? "NA" : price(ema20), ema20 === null ? "na" : "ok"),
-      regimeFeature("EMA 50", ema50 === null ? "NA" : price(ema50), ema50 === null ? "na" : "ok"),
-      regimeFeature("EMA20 slope", formatProbability(ema20Slope), ema20Slope === 0 ? "warn" : "ok"),
-      regimeFeature("VWAP", price(market.vwap), "ok"),
-      regimeFeature("ADX 14", market.adx === null ? "NA" : market.adx.adx.toFixed(1), market.adx === null ? "na" : market.adx.adx >= 20 ? "ok" : "warn"),
-      regimeFeature("ATR %ile", atrPercentile === null ? "NA" : formatProbability(atrPercentile), atrPercentile === null ? "na" : atrPercentile > 0.7 || atrPercentile < 0.3 ? "warn" : "ok"),
-      regimeFeature("ATR expanding", atrExpanding ? "Yes" : "No", atrExpanding ? "ok" : "warn"),
-      regimeFeature("RSI 14", market.rsi === null ? "NA" : market.rsi.toFixed(1), market.rsi === null ? "na" : market.rsi <= 30 || market.rsi >= 70 ? "warn" : "ok"),
-      regimeFeature("MACD histogram", macdHistogram === null ? "NA" : macdHistogram.toFixed(3), macdHistogram === null ? "na" : macdHistogram === 0 ? "warn" : "ok"),
-      regimeFeature("Volume ratio", `${market.volume.relativeVolume.toFixed(2)}x`, market.volume.relativeVolume < 0.75 ? "warn" : "ok"),
-      regimeFeature("HH+HL / LH+LL", `${higherHighAndHigherLow ? "HH+HL" : "--"} / ${lowerHighAndLowerLow ? "LH+LL" : "--"}`, structure ? "ok" : "na"),
-      regimeFeature("Recent range", `${price(recentRange.low)} - ${price(recentRange.high)}`, "ok"),
-      regimeFeature("Prior day H/L", priorDay ? `${price(priorDay.low)} - ${price(priorDay.high)}` : "NA", priorDay ? "ok" : "na"),
-      regimeFeature("Distance from VWAP", formatProbability(vwapDistance), Math.abs(vwapDistance) >= 0.004 ? "warn" : "ok"),
-    ],
-  };
-}
-
-function regimeFeature(name: string, value: string, status: RegimeSelectionFeature["status"]): RegimeSelectionFeature {
-  return { name, value, status };
-}
-
-function rawRegimeConditionFromMarket(market: ConfidenceMarket) {
-  const features = regimeSelectionFeatures(market);
-  const noTradeReasons = regimeNoTradeReasons(market, features);
-  const primaryTrend = classifyRegimePrimaryTrend(market, features);
-  const volatility = classifyRegimeVolatility(features);
-  const opportunity = classifyRegimeOpportunity(market, features, primaryTrend, noTradeReasons);
-  const confidence = regimeMarketConditionConfidence(features, primaryTrend, volatility, opportunity, noTradeReasons);
-  return {
-    features,
-    noTradeReasons,
-    primaryTrend,
-    volatility,
-    opportunity,
-    confidence,
-    key: regimeConditionKey(primaryTrend, volatility, opportunity),
-    contextKey: regimeConditionContextKey(market),
-  };
-}
-
-function confirmedRegimeCondition(market: ConfidenceMarket, raw: ReturnType<typeof rawRegimeConditionFromMarket>) {
-  if (lastConfirmedRegimeCondition?.contextKey !== raw.contextKey) {
-    lastConfirmedRegimeCondition = null;
-  }
-
-  const confirmationCount = recentRegimeConditionKeys(market).filter((key) => key === raw.key).length;
-  const previous = lastConfirmedRegimeCondition;
-  const isSwitch = Boolean(previous && previous.key !== raw.key);
-  const switchConfirmed = !previous || !isSwitch || confirmationCount >= 2 || raw.confidence >= 0.65;
-
-  if (switchConfirmed) {
-    lastConfirmedRegimeCondition = {
-      primaryTrend: raw.primaryTrend,
-      volatility: raw.volatility,
-      opportunity: raw.opportunity,
-      confidence: raw.confidence,
-      key: raw.key,
-      contextKey: raw.contextKey,
-    };
-    return { condition: lastConfirmedRegimeCondition, confirmationCount, held: false };
-  }
-
-  return { condition: previous!, confirmationCount, held: true };
-}
-
-function recentRegimeConditionKeys(market: ConfidenceMarket) {
-  const keys: string[] = [];
-  const start = Math.max(0, market.candles.length - 3);
-  for (let index = start; index < market.candles.length; index += 1) {
-    const prefix = market.candles.slice(0, index + 1);
-    const snapshot = confidenceMarketSnapshotFromCandles(prefix, state.candles);
-    if (!snapshot) {
-      continue;
-    }
-    const condition = rawRegimeConditionFromMarket(snapshot);
-    keys.push(condition.key);
-  }
-  return keys;
-}
-
-function regimeConditionKey(primaryTrend: RegimePrimaryTrend, volatility: RegimeVolatilityState, opportunity: RegimeOpportunityState) {
-  return `${primaryTrend} + ${volatility} + ${opportunity}`;
-}
-
-function regimeConditionContextKey(market: ConfidenceMarket) {
-  return `${market.latest.symbol}|${easternDateString(market.latest.timestamp)}`;
-}
-
-function aggregateRegimeStrategyScores(strategyOutputs: RegimeSelectedStrategy[]) {
-  const scores: RegimeSelectionScores = { buy: 0, sell: 0, hold: 0 };
-  strategyOutputs.forEach((output) => {
-    const signal = output.signal;
-    const confidence = clampNumber(output.confidence, 0, 1);
-    const weight = Number.isFinite(output.effective_weight) && output.effective_weight > 0 ? output.effective_weight : 1;
-    scores[signal] += confidence * weight;
-  });
-
-  const total = scores.buy + scores.sell + scores.hold;
-  if (total > 0) {
-    scores.buy = roundNumber(scores.buy / total, 4);
-    scores.sell = roundNumber(scores.sell / total, 4);
-    scores.hold = roundNumber(scores.hold / total, 4);
-  }
-
-  const finalSignal = (Object.entries(scores).sort((left, right) => right[1] - left[1])[0]?.[0] ?? "hold") as ConfidenceStrategySignal;
-  return { finalSignal, scores };
-}
-
-function regimeMarketConditionConfidence(
-  features: ReturnType<typeof regimeSelectionFeatures>,
-  primaryTrend: RegimePrimaryTrend,
-  volatility: RegimeVolatilityState,
-  opportunity: RegimeOpportunityState,
-  noTradeReasons: string[],
-) {
-  if (opportunity === "No-trade") {
-    return roundNumber(clampNumber(0.35 - noTradeReasons.length * 0.08, 0, 0.6), 4);
-  }
-  const trendScore = Math.max(features.bullScore, features.bearScore) / 6;
-  const trendClarity = Math.abs(features.bullScore - features.bearScore) / 6;
-  const adxConfidence = clampNumber((features.adx ?? 0) / 30, 0, 1);
-  const volatilityConfidence =
-    features.atrPercentile === null
-      ? 0.5
-      : volatility === "Normal volatility"
-        ? 0.65
-        : Math.max(features.atrPercentile, 1 - features.atrPercentile);
-  const opportunityBoost =
-    opportunity === "Bullish breakout" || opportunity === "Bearish breakout"
-      ? features.atrExpanding && features.volumeRatio > 1.2
-        ? 0.15
-        : 0
-      : opportunity === "Bullish reversal risk" || opportunity === "Bearish reversal risk"
-        ? 0.1
-        : 0.05;
-  const trendPenalty = primaryTrend === "Sideways / range-bound" && opportunity === "Trend continuation" ? -0.15 : 0;
-  return roundNumber(clampNumber(0.2 + trendScore * 0.25 + trendClarity * 0.25 + adxConfidence * 0.15 + volatilityConfidence * 0.15 + opportunityBoost + trendPenalty, 0, 1), 4);
-}
-
-function regimeTradeBlockers(
-  finalSignal: ConfidenceStrategySignal,
-  scores: RegimeSelectionScores,
-  scoreEdge: number,
-  conditionConfidence: number,
-  opportunity: RegimeOpportunityState,
-  conditionHeld: boolean,
-) {
-  const blockers: string[] = [];
-  if (conditionHeld) {
-    blockers.push("Market condition switch is not confirmed yet");
-  }
-  if (finalSignal !== "buy" && finalSignal !== "sell") {
-    blockers.push("Final aggregate signal is not Buy or Sell");
-  }
-  const winningScore = finalSignal === "buy" ? scores.buy : finalSignal === "sell" ? scores.sell : 0;
-  if (winningScore < 0.6) {
-    blockers.push(`Winning direction score ${formatProbability(winningScore)} is below 60%`);
-  }
-  if (scoreEdge < 0.2) {
-    blockers.push(`Winning direction edge ${formatProbability(scoreEdge)} is below 20%`);
-  }
-  if (conditionConfidence < 0.65) {
-    blockers.push(`Market condition confidence ${formatProbability(conditionConfidence)} is below 65%`);
-  }
-  if (opportunity === "No-trade") {
-    blockers.push("Opportunity state is No-trade");
-  }
-  return blockers;
-}
-
-function classifyRegimePrimaryTrend(market: ConfidenceMarket, features: ReturnType<typeof regimeSelectionFeatures>): RegimePrimaryTrend {
-  const adx = features.adx ?? 0;
-  if (features.bullScore >= 5 && adx >= 20) {
-    return "Strong uptrend";
-  }
-  if (features.bullScore >= 3) {
-    return "Weak uptrend";
-  }
-  if (features.bearScore >= 5 && adx >= 20) {
-    return "Strong downtrend";
-  }
-  if (features.bearScore >= 3) {
-    return "Weak downtrend";
-  }
-  return "Sideways / range-bound";
-}
-
-function classifyRegimeVolatility(features: ReturnType<typeof regimeSelectionFeatures>): RegimeVolatilityState {
-  if (features.atrPercentile !== null && features.atrPercentile > 0.7) {
-    return "High volatility";
-  }
-  if (features.atrPercentile !== null && features.atrPercentile < 0.3) {
-    return "Low volatility";
-  }
-  return "Normal volatility";
-}
-
-function classifyRegimeOpportunity(
-  market: ConfidenceMarket,
-  features: ReturnType<typeof regimeSelectionFeatures>,
-  primaryTrend: RegimePrimaryTrend,
-  noTradeReasons: string[],
-): RegimeOpportunityState {
-  if (noTradeReasons.length > 0) {
-    return "No-trade";
-  }
-  const volumeConfirms = features.volumeRatio > 1.2;
-  if (market.latest.close > features.recentRangeHigh && volumeConfirms && features.atrExpanding) {
-    return "Bullish breakout";
-  }
-  if (market.latest.close < features.recentRangeLow && volumeConfirms && features.atrExpanding) {
-    return "Bearish breakout";
-  }
-  if (
-    features.rsi !== null &&
-    features.rsi > 70 &&
-    features.distanceFromVwap > 0.004 &&
-    features.bearishRejectionCandle
-  ) {
-    return "Bearish reversal risk";
-  }
-  if (
-    features.rsi !== null &&
-    features.rsi < 30 &&
-    features.distanceFromVwap < -0.004 &&
-    features.bullishRejectionCandle
-  ) {
-    return "Bullish reversal risk";
-  }
-  if (primaryTrend === "Sideways / range-bound") {
-    return "Mean reversion";
-  }
-  return "Trend continuation";
-}
-
-function regimeNoTradeReasons(market: ConfidenceMarket, features: ReturnType<typeof regimeSelectionFeatures>) {
-  const reasons: string[] = [];
-  if (market.candles.length < 50) {
-    reasons.push("Need at least 50 regular-session candles for EMA 50 and regime quality");
-  }
-  if (features.spreadTooWide) {
-    reasons.push("Spread is too wide");
-  }
-  if (features.volumeTooLow) {
-    reasons.push("Volume is too light versus the recent average");
-  }
-  if (Math.abs(features.bullScore - features.bearScore) <= 1 && Math.max(features.bullScore, features.bearScore) >= 2) {
-    reasons.push(`Bull and bear scores are close (${features.bullScore}/${features.bearScore})`);
-  }
-  if (features.priceChoppingAroundVwap) {
-    reasons.push("Price is chopping around VWAP");
-  }
-  if (market.timeOfDay.minutes >= 15 * 60 + 45) {
-    reasons.push("New entries are late in the session");
-  }
-  return reasons;
-}
-
-function regimeSelectedStrategySlugs(
-  primaryTrend: RegimePrimaryTrend,
-  volatility: RegimeVolatilityState,
-  opportunity: RegimeOpportunityState,
-) {
-  const slugs = new Set<string>();
-  if (opportunity === "No-trade") {
-    return ["cash_avoid_filter"];
-  }
-
-  const activate = (...names: string[]) => names.forEach((slug) => slugs.add(slug));
-  const avoid = (...names: string[]) => names.forEach((slug) => slugs.delete(slug));
-
-  switch (primaryTrend) {
-    case "Strong uptrend":
-      activate(
-        "moving_average_trend",
-        "trend_pullback",
-        "opening_range_breakout",
-        "intraday_breakout",
-        "vwap_trend_continuation",
-        "macd_momentum",
-        "adx_trend_strength",
-        "market_structure",
-        "volume_confirmation",
-      );
-      avoid("vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal");
-      break;
-    case "Weak uptrend":
-      activate("trend_pullback", "vwap_mean_reversion", "rsi_mean_reversion", "vwap_position", "market_structure", "volume_confirmation");
-      avoid("volatility_breakout", "intraday_breakout");
-      break;
-    case "Strong downtrend":
-      activate(
-        "moving_average_trend",
-        "vwap_position",
-        "vwap_trend_continuation",
-        "macd_momentum",
-        "adx_trend_strength",
-        "market_structure",
-        "volatility_breakout",
-        "atr_volatility_regime",
-        "volume_confirmation",
-      );
-      avoid("rsi_mean_reversion", "bollinger_band_mean_reversion");
-      break;
-    case "Weak downtrend":
-      activate("vwap_position", "market_structure", "atr_volatility_regime", "volume_confirmation", "cash_avoid_filter");
-      avoid("opening_range_breakout", "intraday_breakout", "vwap_trend_continuation");
-      break;
-    case "Sideways / range-bound":
-      activate("vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal", "market_structure");
-      avoid("moving_average_trend", "trend_pullback", "vwap_trend_continuation", "macd_momentum", "adx_trend_strength");
-      break;
-  }
-
-  if (opportunity === "Bullish breakout" || opportunity === "Bearish breakout") {
-    activate("opening_range_breakout", "volatility_breakout", "intraday_breakout", "vwap_trend_continuation", "macd_momentum", "volume_confirmation");
-    avoid("vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal");
-  }
-  if (opportunity === "Bullish reversal risk" || opportunity === "Bearish reversal risk") {
-    activate("rsi_mean_reversion", "vwap_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal", "cash_avoid_filter");
-    avoid("moving_average_trend", "trend_pullback", "vwap_trend_continuation", "opening_range_breakout", "intraday_breakout", "volatility_breakout", "macd_momentum");
-  }
-  if (opportunity === "Mean reversion") {
-    activate("vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "market_structure");
-    avoid("moving_average_trend", "vwap_trend_continuation", "macd_momentum");
-  }
-  if (volatility === "Low volatility") {
-    if (opportunity !== "Bullish breakout" && opportunity !== "Bearish breakout") {
-      activate("vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion");
-    }
-    avoid("volatility_breakout", "intraday_breakout");
-  }
-  if (volatility === "High volatility" && opportunity !== "Bullish reversal risk" && opportunity !== "Bearish reversal risk") {
-    activate("volatility_breakout", "atr_volatility_regime");
-  }
-
-  return Array.from(slugs);
-}
-
-function regimeStrategySelectorReason(
-  slug: string,
-  primaryTrend: RegimePrimaryTrend,
-  volatility: RegimeVolatilityState,
-  opportunity: RegimeOpportunityState,
-) {
-  if (slug.includes("breakout") || slug === "opening_range_breakout") {
-    return opportunity === "Bullish breakout" || opportunity === "Bearish breakout"
-      ? `Selected for ${opportunity}`
-      : `Selected as a range-edge check in ${opportunity}`;
-  }
-  if (slug.includes("reversion") || slug.includes("rsi") || slug.includes("bollinger")) {
-    return opportunity === "Bullish reversal risk" || opportunity === "Bearish reversal risk" || opportunity === "Mean reversion"
-      ? `Selected for ${opportunity}`
-      : `Selected as a pullback risk check`;
-  }
-  if (slug.includes("volatility") || slug.includes("atr")) {
-    return `Selected for ${volatility}`;
-  }
-  return `Selected for ${primaryTrend}`;
-}
-
-function regimeStrategyAvoidReason(
-  slug: string,
-  primaryTrend: RegimePrimaryTrend,
-  volatility: RegimeVolatilityState,
-  opportunity: RegimeOpportunityState,
-) {
-  const trendFollowing = ["moving_average_trend", "trend_pullback", "vwap_trend_continuation", "macd_momentum", "adx_trend_strength"].includes(slug);
-  const meanReversion = ["vwap_mean_reversion", "rsi_mean_reversion", "bollinger_band_mean_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal"].includes(slug);
-  const breakout = ["opening_range_breakout", "intraday_breakout", "volatility_breakout"].includes(slug);
-
-  if (opportunity === "No-trade") {
-    return "Avoided because No-trade activates only Cash / Avoid Trading";
-  }
-  if ((opportunity === "Bullish breakout" || opportunity === "Bearish breakout") && meanReversion) {
-    return "Avoided: mean reversion against active breakout";
-  }
-  if ((opportunity === "Bullish reversal risk" || opportunity === "Bearish reversal risk") && (trendFollowing || breakout)) {
-    return "Avoided: reversal/exhaustion risk blocks chasing trend late";
-  }
-  if (primaryTrend === "Strong uptrend" && meanReversion) {
-    return "Avoided: short mean reversion in strong uptrend";
-  }
-  if (primaryTrend === "Strong downtrend" && meanReversion) {
-    return "Avoided: dip-buying behavior in strong downtrend";
-  }
-  if (primaryTrend === "Weak uptrend" && breakout) {
-    return "Avoided: aggressive breakout in weak uptrend";
-  }
-  if (primaryTrend === "Weak downtrend" && breakout) {
-    return "Avoided: strong long breakout in weak downtrend";
-  }
-  if (primaryTrend === "Sideways / range-bound" && trendFollowing) {
-    return "Avoided: trend following in sideways market";
-  }
-  if (volatility === "Low volatility" && breakout) {
-    return "Avoided: wide breakout system in low volatility";
-  }
-  if (volatility === "High volatility" && slug === "cash_avoid_filter") {
-    return "Avoided: high volatility favors ATR/volatility logic before cash filter unless other blockers exist";
-  }
-  return `Avoided: not suitable for ${primaryTrend}, ${volatility}, ${opportunity}`;
-}
-
-function priorDayRangeForRegimeSelection(latestTimestamp: string) {
-  const latestDay = easternDateString(latestTimestamp);
-  const priorCandles = state.candles
-    .filter((candle) => isRegularSession(candle.timestamp) && easternDateString(candle.timestamp) < latestDay)
-    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
-  const priorDay = priorCandles.at(-1) ? easternDateString(priorCandles.at(-1)!.timestamp) : "";
-  const dayCandles = priorCandles.filter((candle) => easternDateString(candle.timestamp) === priorDay);
-  if (!dayCandles.length) {
-    return null;
-  }
-  return {
-    high: Math.max(...dayCandles.map((candle) => candle.high)),
-    low: Math.min(...dayCandles.map((candle) => candle.low)),
-  };
-}
-
-function recentRangeForRegimeSelection(candles: Candle[]) {
-  const sample = candles.slice(-21, -1);
-  const rangeCandles = sample.length ? sample : candles.slice(-20);
-  return {
-    high: Math.max(...rangeCandles.map((candle) => candle.high)),
-    low: Math.min(...rangeCandles.map((candle) => candle.low)),
-  };
-}
-
-function emaSlopeFromSeries(values: Array<number | null>, latestPrice: number) {
-  const defined = values.filter((value): value is number => value !== null);
-  if (defined.length < 6) {
-    return 0;
-  }
-  const current = defined.at(-1)!;
-  const previous = defined.at(-6)!;
-  return (current - previous) / Math.max(latestPrice, 0.01);
-}
-
-function oneMinuteAtrPercentHistoryForRegimeSelection(market: ConfidenceMarket) {
-  const latestTime = new Date(market.latest.timestamp).getTime();
-  const source = (state.weightedMarketData.timeframeCandles["1Min"]?.length ? state.weightedMarketData.timeframeCandles["1Min"]! : state.candles)
-    .filter((candle) => isRegularSession(candle.timestamp) && new Date(candle.timestamp).getTime() <= latestTime)
-    .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
-  const historySource = source.length >= 80 ? source.slice(-1600) : market.candles;
-  const values: number[] = [];
-  for (let end = 15; end <= historySource.length; end += 1) {
-    const sample = historySource.slice(0, end);
-    const atr = averageTrueRange(sample, 14);
-    const close = sample.at(-1)?.close ?? 0;
-    if (atr !== null && close > 0) {
-      values.push(atr / close);
-    }
-  }
-  return values;
-}
-
-function percentileRank(values: number[], current: number) {
-  const finiteValues = values.filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
-  if (!finiteValues.length) {
-    return null;
-  }
-  return finiteValues.filter((value) => value <= current).length / finiteValues.length;
-}
-
-function meanNumber(values: number[]) {
-  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
-}
-
-function recentLevelCrosses(values: number[], level: number, lookback: number) {
-  const sample = values.slice(-lookback);
-  if (sample.length < 2 || !level) {
-    return 0;
-  }
-  const signs = sample.map((value) => value >= level);
-  return signs.slice(1).reduce((count, sign, index) => count + (sign !== signs[index] ? 1 : 0), 0);
-}
-
-function isBearishRejectionCandle(candle: Candle) {
-  const range = Math.max(candle.high - candle.low, 0.01);
-  const body = Math.abs(candle.close - candle.open);
-  const upperWick = candle.high - Math.max(candle.open, candle.close);
-  const closeBelowMidpoint = candle.close < candle.low + range * 0.45;
-  return upperWick >= Math.max(body * 1.2, range * 0.35) && closeBelowMidpoint;
-}
-
-function isBullishRejectionCandle(candle: Candle) {
-  const range = Math.max(candle.high - candle.low, 0.01);
-  const body = Math.abs(candle.close - candle.open);
-  const lowerWick = Math.min(candle.open, candle.close) - candle.low;
-  const closeAboveMidpoint = candle.close > candle.low + range * 0.55;
-  return lowerWick >= Math.max(body * 1.2, range * 0.35) && closeAboveMidpoint;
-}
-
-function lastDefined(values: Array<number | null>) {
-  for (let index = values.length - 1; index >= 0; index -= 1) {
-    if (values[index] !== null) {
-      return values[index]!;
-    }
-  }
-  return null;
 }
 
 function regimeSignalClass(signal: RegimeDecisionSignal) {
@@ -13005,10 +12886,9 @@ function regimeTradingSettingsSummary(result: RegimeSelectionResult, targetOrder
 
 function renderRegimeProfileComparison(result: RegimeSelectionResult) {
   const settings = state.regimeTradingSettings;
-  const base = baseRegimeSettingsFromTradingSettings(settings);
   const effective = result.effectiveSettings;
   const modifierBreakdown = regimeProfileModifierBreakdownForUi(result);
-  const combinedModifiers = modifierBreakdown ? combineRegimeProfileModifiers(Object.values(modifierBreakdown)) : null;
+  const combinedModifiers = null;
   const noTradeReason = effective && !effective.newEntriesAllowed ? effective.reasons.join("; ") || "Effective profile blocks new entries" : "None";
   return `
     <div class="regime-profile-shell">
@@ -13068,7 +12948,7 @@ function renderRegimeProfileComparison(result: RegimeSelectionResult) {
       </div>
       <div class="regime-baseline-note">
         <span>Effective current profile values are read-only. User edits apply only to the Default baseline and permitted profile configuration.</span>
-        <span>Baseline snapshot: risk ${base.baseRiskPercent}% / allocation ${base.orderAllocationPercent}% / max position ${base.maxPositionPercent}%.</span>
+        <span>Baseline snapshot: risk ${settings.baseRiskPercent}% / allocation ${settings.orderAllocationPercent}% / max position ${settings.maxPositionPercent}%.</span>
       </div>
     </div>
   `;
@@ -13079,33 +12959,14 @@ function renderRegimeReadOnlyProfileValue(label: string, value: string | number 
   return `<span><b>${escapeHtml(label)}</b><strong>${escapeHtml(display)}</strong></span>`;
 }
 
-function regimeProfileModifierBreakdownForUi(result: RegimeSelectionResult) {
-  const market = currentRegimeMarketContext();
-  const confirmedRegime = result.confirmedState?.confirmedRegime ?? result.rawClassification?.rawRegime ?? "no_trade";
-  if (!confirmedRegime) {
-    return null;
-  }
-  return buildRegimeProfileModifierBreakdown({ market, result, settings: state.regimeTradingSettings }, confirmedRegime);
+function regimeProfileModifierBreakdownForUi(result: RegimeSelectionResult): Record<string, { reasons: string[] }> | null {
+  void result;
+  return null;
 }
 
-function renderRegimeCombinedModifierSummary(modifier: ReturnType<typeof combineRegimeProfileModifiers> | null) {
-  if (!modifier) {
-    return "";
-  }
-  return `
-    <span><b>Risk multiplier</b> ${formatMultiplier(modifier.riskMultiplier)}</span>
-    <span><b>Allocation multiplier</b> ${formatMultiplier(modifier.allocationMultiplier)}</span>
-    <span><b>Position multiplier</b> ${formatMultiplier(modifier.positionMultiplier)}</span>
-    <span><b>Liquidity participation multiplier</b> ${formatMultiplier(modifier.liquidityParticipationMultiplier)}</span>
-    <span><b>Signal size multiplier</b> ${formatMultiplier(modifier.signalSizeMultiplier)}</span>
-    <span><b>ATR stop adjustment</b> ${roundNumber(modifier.atrStopMultiplierAdjustment, 4)}</span>
-    <span><b>Target R multiplier</b> ${formatMultiplier(modifier.targetRMultiplier)}</span>
-    <span><b>Winning score adjustment</b> ${roundNumber(modifier.winningScoreAdjustment, 4)}</span>
-    <span><b>Directional edge adjustment</b> ${roundNumber(modifier.directionalEdgeAdjustment, 4)}</span>
-    <span><b>Regime confidence adjustment</b> ${roundNumber(modifier.regimeConfidenceAdjustment, 4)}</span>
-    <span><b>Maximum trades override</b> ${modifier.maximumTradesOverride ?? "None"}</span>
-    <span><b>Entry cutoff override</b> ${escapeHtml(modifier.entryCutoffOverride ?? "None")}</span>
-  `;
+function renderRegimeCombinedModifierSummary(modifier: unknown) {
+  void modifier;
+  return "";
 }
 
 function renderRegimeModifierBreakdown(breakdown: NonNullable<ReturnType<typeof regimeProfileModifierBreakdownForUi>>) {
@@ -13161,85 +13022,67 @@ function renderRegimeDefaultSizingSection(settings: TradingSettings, sizing: Reg
   `;
 }
 
-function buildRegimeTargetOrderRecommendation(result: RegimeSelectionResult): ManualOrderRecommendation {
+function buildBackendRegimeOrderRecommendation(result: RegimeSelectionResult): ManualOrderRecommendation {
   const market = currentRegimeMarketContext();
   const latest = market?.latest ?? latestExecutionCandleForMode("regime");
-  const target = buildRegimeTargetOrder(
-    result,
-    market,
-    state.symbol,
-    state.regimeTradingSettings,
-    regimeDefaultSizingSettings(),
-    latest ? regimeCurrentPositionSnapshot(latest.close) : { shares: 0, marketValue: 0 },
-    {
-      shortTradingEnabled: false,
-      accountShortPermission: false,
-      assetShortable: false,
-      borrowAvailable: false,
-      buyingPowerAvailable: targetBuyingPowerAvailable(state.regimeTradingSettings),
-      shortSaleRestrictionActive: false,
-    },
-  );
-  const order = regimeTargetOrderAsManualRecommendation(result, target, market, latest?.timestamp ?? null);
-  return applyConfidenceTargetOrderOverrides(order, "regime");
-}
-
-function regimeTargetOrderAsManualRecommendation(
-  result: RegimeSelectionResult,
-  target: RegimeTargetOrder,
-  market: ReturnType<typeof currentRegimeMarketContext>,
-  lastTime: string | null,
-): ManualOrderRecommendation {
-  const failedGates = regimeTargetOrderFailedGates(result, target);
-  const eligible = target.eligible && failedGates.length === 0;
-  return {
+  const sizing = result.backendSizing ?? emptyRegimeSizingForUi(state.regimeTradingSettings, result.tradeBlockers[0] ?? "Waiting for backend Regime sizing");
+  const intent = result.backendOrderIntent ?? null;
+  const failedGates = regimeTargetOrderFailedGates(result, sizing, intent);
+  const eligible = Boolean(intent && result.tradeAllowed && sizing.finalQuantity > 0 && failedGates.length === 0);
+  const side = eligible ? intent!.side : "Hold";
+  const quantity = eligible ? intent!.quantity : 0;
+  const entryPrice = intent?.entry_price ?? latest?.close ?? null;
+  const order: ManualOrderRecommendation = {
     eligible,
-    side: eligible ? target.side : "Hold",
-    signalDirection: target.signalDirection,
-    positionEffect: target.positionEffect,
-    orderIntent: target.orderIntent,
-    effectiveProfileId: target.profileId,
-    currentPosition: target.currentPosition,
-    requestedResultingPosition: target.requestedResultingPosition,
-    orderType: eligible ? target.orderType : "No order",
-    symbol: target.symbol,
-    quantity: eligible ? target.quantity : 0,
-    triggerPrice: target.triggerPrice,
-    limitPrice: target.limitPrice,
-    stopPrice: target.stopPrice,
-    targetPrice: target.targetPrice,
-    accountBalance: target.accountBalance,
-    orderLimitDollars: target.orderLimitDollars,
-    dailyLimitDollars: target.dailyLimitDollars,
-    riskDollars: target.riskDollars,
-    orderNotional: target.orderNotional,
-    plannedStopRiskDollars: target.plannedStopRiskDollars,
-    estimatedSlippage: target.estimatedSlippage,
-    timeInForce: target.timeInForce,
-    cutoff: target.cutoff,
+    side,
+    signalDirection: intent?.side ?? (result.signal === "No-trade" ? "Hold" : result.signal),
+    positionEffect: regimePositionEffectFromBackend(intent?.position_effect),
+    orderIntent: intent,
+    effectiveProfileId: stringFromUnknown(result.effectiveSettings?.profileId, null as unknown as string) || null,
+    currentPosition: latest ? regimeCurrentPositionSnapshot(latest.close).shares : 0,
+    requestedResultingPosition: intent ? intent.quantity : 0,
+    orderType: eligible ? "Backend proposed order" : "No order",
+    symbol: intent?.symbol ?? state.symbol,
+    quantity,
+    triggerPrice: entryPrice,
+    limitPrice: entryPrice,
+    stopPrice: intent?.stop_price ?? null,
+    targetPrice: intent?.target_price ?? null,
+    accountBalance: state.regimeTradingSettings.startingCapital,
+    orderLimitDollars: state.regimeTradingSettings.startingCapital * state.regimeTradingSettings.orderAllocationPercent / 100,
+    dailyLimitDollars: state.regimeTradingSettings.startingCapital * state.regimeTradingSettings.dailyAllocationPercent / 100,
+    riskDollars: intent?.risk_dollars ?? sizing.riskDollars,
+    orderNotional: quantity * (entryPrice ?? 0),
+    plannedStopRiskDollars: intent?.risk_dollars ?? sizing.riskDollars,
+    estimatedSlippage: quantity * state.regimeTradingSettings.slippagePerShare,
+    timeInForce: "day",
+    cutoff: "backend controlled",
     submitMode: (state.regimeTargetOrderOverrides.submitMode as SubmitOrderMode | undefined) ?? DEFAULT_SUBMIT_MODE,
     failedGates,
-    gates: regimeTargetOrderGates(result, target),
+    gates: regimeTargetOrderGates(result, sizing, intent),
     levels: {
       last: market?.latest.close ?? null,
       vwap: market?.vwap ?? null,
-      openingHigh: market?.openingRange.high ?? null,
-      openingLow: market?.openingRange.low ?? null,
-      lastTime,
+      openingHigh: market?.openingRange?.high ?? null,
+      openingLow: market?.openingRange?.low ?? null,
+      lastTime: latest?.timestamp ?? null,
     },
-    summary: eligible ? target.summary : `No order: ${uniqueStrings(failedGates).join(", ") || "Regime final signal is Hold"}.`,
-    regimeSizing: target.sizing,
+    summary: eligible ? `Backend Regime order intent ${intent!.order_intent_id}` : `No order: ${uniqueStrings(failedGates).join(", ") || "backend Regime did not create an order intent"}.`,
+    regimeSizing: sizing,
   };
+  return applyConfidenceTargetOrderOverrides(order, "regime");
 }
 
-function regimeTargetOrderFailedGates(result: RegimeSelectionResult, target: RegimeTargetOrder) {
-  const failed = target.failedGates.map((gate) => (gate.startsWith("regime.") ? regimeReasonLabel(gate) : gate));
-  if (target.sizing.blockedReason) {
-    failed.push(`Sizing: ${target.sizing.blockedReason}`);
+function regimeTargetOrderFailedGates(result: RegimeSelectionResult, sizing: RegimePositionSizingResult, intent: BackendRegimeOrderIntent | null) {
+  const failed = result.tradeBlockers.map((gate) => (gate.startsWith("regime.") ? regimeReasonLabel(gate) : gate));
+  if (sizing.blockedReason) {
+    failed.push(`Sizing: ${sizing.blockedReason}`);
+  }
+  if (!intent) {
+    failed.push("Backend Regime did not create an order intent");
   }
   const latest = latestExecutionCandleForMode("regime");
-  const resolved = resolveRegimeDecision(result);
-  if (latest && resolved.signal === "Buy") {
+  if (latest && result.signal === "Buy") {
     const lateSessionBlocker = lateSessionAboveAverageBuyBlocker("regime", latest.close, latest.timestamp);
     if (lateSessionBlocker) {
       failed.push(`Regime Late-session Buy Guard: ${lateSessionBlocker}`);
@@ -13251,7 +13094,7 @@ function regimeTargetOrderFailedGates(result: RegimeSelectionResult, target: Reg
   return uniqueStrings(failed.filter(Boolean));
 }
 
-function regimeTargetOrderGates(result: RegimeSelectionResult, target: RegimeTargetOrder): TradeLayerGate[] {
+function regimeTargetOrderGates(result: RegimeSelectionResult, sizing: RegimePositionSizingResult, intent: BackendRegimeOrderIntent | null): TradeLayerGate[] {
   return [
     {
       layer: "Regime Selector",
@@ -13261,17 +13104,23 @@ function regimeTargetOrderGates(result: RegimeSelectionResult, target: RegimeTar
     },
     {
       layer: "Regime Sizing",
-      status: target.sizing.finalQuantity > 0 ? "pass" : "fail",
-      signal: target.signalDirection,
-      detail: `Quantity ${target.sizing.finalQuantity}, limited by ${target.sizing.limitingFactor}`,
+      status: sizing.finalQuantity > 0 ? "pass" : "fail",
+      signal: result.signal,
+      detail: `Quantity ${sizing.finalQuantity}, limited by ${sizing.limitingFactor}`,
     },
     {
-      layer: "Position Effect",
-      status: target.positionEffect === "none" ? "fail" : "pass",
-      signal: target.signalDirection,
-      detail: `${target.positionEffect}; current ${target.currentPosition}, requested ${target.requestedResultingPosition}`,
+      layer: "Backend Order Intent",
+      status: intent ? "pass" : "fail",
+      signal: intent?.side ?? result.signal,
+      detail: intent ? `${intent.position_effect}; quantity ${intent.quantity}; decision ${intent.decision_id}` : "No backend order intent",
     },
   ];
+}
+
+function regimePositionEffectFromBackend(value: unknown): PositionEffect {
+  const text = String(value ?? "none");
+  if (text === "enter_long" || text === "exit_long" || text === "enter_short" || text === "cover_short") return text;
+  return "none";
 }
 
 function targetBuyingPowerAvailable(settings: TradingSettings) {
@@ -21107,4 +20956,5 @@ void loadMarketContext();
 void loadCandles();
 void loadLatestDynamicTradingArtifact();
 void loadAlgoBacktestCandles();
+
 
