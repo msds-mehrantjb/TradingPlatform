@@ -55,15 +55,10 @@ class RegimeFinalAcceptanceTest(unittest.TestCase):
             {item.statement for item in REGIME_FINAL_ACCEPTANCE_ITEMS},
             EXPECTED_REGIME_FINAL_ACCEPTANCE_STATEMENTS,
         )
-        self.assertEqual(report["counts"], {"pass": 22, "pending": 1, "fail": 0})
-        self.assertFalse(report["complete"])
-        self.assertEqual(
-            report["blockingStatements"],
-            [
-                "Every authoritative Regime strategy, classifier state, transition rule, dynamic profile, local gate, sizing rule, trade-management rule, and execution boundary has a focused automated test suite."
-            ],
-        )
-        self.assertFalse(regime_acceptance_is_complete())
+        self.assertEqual(report["counts"], {"pass": 23, "pending": 0, "fail": 0})
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["blockingStatements"], [])
+        self.assertTrue(regime_acceptance_is_complete())
 
     def test_every_acceptance_evidence_path_exists(self) -> None:
         for item in REGIME_FINAL_ACCEPTANCE_ITEMS:
@@ -83,8 +78,8 @@ class RegimeFinalAcceptanceTest(unittest.TestCase):
         self.assertFalse(body["feature_flags"]["REGIME_SHORT_ENTRIES_ENABLED"])
         self.assertFalse(body["limited_paper_orders_allowed"])
         self.assertFalse(body["live_trading_allowed"])
-        self.assertFalse(body["finalAcceptance"]["complete"])
-        self.assertEqual(body["finalAcceptance"]["counts"], {"pass": 22, "pending": 1, "fail": 0})
+        self.assertTrue(body["finalAcceptance"]["complete"])
+        self.assertEqual(body["finalAcceptance"]["counts"], {"pass": 23, "pending": 0, "fail": 0})
 
     def test_quality_gates_include_backend_frontend_and_regime_acceptance_checks(self) -> None:
         ci_source = (ROOT / "scripts" / "ci_quality_gates.py").read_text(encoding="utf-8")
