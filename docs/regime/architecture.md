@@ -308,6 +308,40 @@ These shared platform components are allowed only at the following boundaries:
 
 The global account-risk layer is shared and server-side. Algorithm-specific local controls, including Regime classification, routing, dynamic profile, local gates, sizing policy, exit policy, and diagnostics, remain Regime-owned.
 
+## Never Shared Components
+
+The following inventory must remain private to the Regime algorithm:
+
+| Private Regime component |
+| --- |
+| Regime classification formulas |
+| Regime classification thresholds |
+| Regime axes and composite-state mapping |
+| Regime hysteresis state |
+| Regime transition history |
+| Regime strategy implementations |
+| Regime strategy compatibility matrix |
+| Regime strategy aliases |
+| Regime strategy health |
+| Regime strategy outputs |
+| Regime context outputs |
+| Regime family scores |
+| Regime aggregation |
+| Regime local gates |
+| Regime baseline settings |
+| Regime dynamic profiles |
+| Regime position sizing |
+| Regime entry and exit policy |
+| Regime decisions |
+| Regime order intents |
+| Regime positions and trades |
+| Regime backtest state |
+| Regime backtest results |
+| Regime ML features and artifacts |
+| Regime rollout state |
+
+Another algorithm may independently implement similar concepts, but it must own its own formulas, thresholds, state, strategies, settings, sizing, decisions, results, artifacts, rollout state, and tests. It may not modify or reuse Regime private components as shared algorithm state.
+
 ## Direction Model
 
 Regime separates direction from position effect:

@@ -48,6 +48,7 @@ import {
   REGIME_ML_FILE_INVENTORY,
   REGIME_ML_INITIAL_MODE,
   REGIME_ML_SHADOW_FORBIDDEN_ACTIONS,
+  REGIME_NEVER_SHARED_COMPONENTS,
   REGIME_OPPORTUNITY_TAGS,
   REGIME_FRONTEND_ROLLOUT_PHASES,
   REGIME_PROFILE_MATRIX,
@@ -762,6 +763,45 @@ test("Regime allowed shared components are read-only transport or approval bound
   assert.equal(status.globalRiskLayerSharedServerSide, true);
   assert.equal(status.localControlsRemainRegimeOwned, true);
   assert.equal(status.sharedComponentsMayRewriteRegimeState, false);
+  assert.equal(status.otherAlgorithmsMayModifyPrivateRegimeComponents, false);
+});
+
+test("Regime private components are never shared with other algorithms", () => {
+  const status = regimeSharedBoundaryStatus();
+  const expected = [
+    "Regime classification formulas",
+    "Regime classification thresholds",
+    "Regime axes and composite-state mapping",
+    "Regime hysteresis state",
+    "Regime transition history",
+    "Regime strategy implementations",
+    "Regime strategy compatibility matrix",
+    "Regime strategy aliases",
+    "Regime strategy health",
+    "Regime strategy outputs",
+    "Regime context outputs",
+    "Regime family scores",
+    "Regime aggregation",
+    "Regime local gates",
+    "Regime baseline settings",
+    "Regime dynamic profiles",
+    "Regime position sizing",
+    "Regime entry and exit policy",
+    "Regime decisions",
+    "Regime order intents",
+    "Regime positions and trades",
+    "Regime backtest state",
+    "Regime backtest results",
+    "Regime ML features and artifacts",
+    "Regime rollout state",
+  ];
+
+  assert.deepEqual(REGIME_NEVER_SHARED_COMPONENTS, expected);
+  assert.deepEqual(status.neverSharedComponents, REGIME_NEVER_SHARED_COMPONENTS);
+  assert.equal(new Set(REGIME_NEVER_SHARED_COMPONENTS).size, REGIME_NEVER_SHARED_COMPONENTS.length);
+  for (const privateComponent of REGIME_NEVER_SHARED_COMPONENTS) {
+    assert.match(privateComponent, /^Regime /);
+  }
 });
 
 test("Regime context and safety components cannot modify directional totals", () => {

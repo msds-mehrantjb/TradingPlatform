@@ -16,6 +16,7 @@ from backend.app.algorithms.regime.repository import RegimeRepository, regime_re
 from backend.app.algorithms.regime.service import (
     REGIME_ALLOWED_SHARED_COMPONENTS,
     REGIME_BACKEND_FILE_INVENTORY,
+    REGIME_NEVER_SHARED_COMPONENTS,
     RegimeApplicationService,
     regime_backend_inventory,
 )
@@ -67,6 +68,42 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
         self.assertTrue(inventory["globalRiskLayerSharedServerSide"])
         self.assertTrue(inventory["localControlsRemainRegimeOwned"])
         self.assertFalse(inventory["sharedComponentsMayRewriteRegimeState"])
+        self.assertFalse(inventory["otherAlgorithmsMayModifyPrivateRegimeComponents"])
+
+    def test_backend_inventory_declares_never_shared_regime_private_components(self) -> None:
+        expected = (
+            "Regime classification formulas",
+            "Regime classification thresholds",
+            "Regime axes and composite-state mapping",
+            "Regime hysteresis state",
+            "Regime transition history",
+            "Regime strategy implementations",
+            "Regime strategy compatibility matrix",
+            "Regime strategy aliases",
+            "Regime strategy health",
+            "Regime strategy outputs",
+            "Regime context outputs",
+            "Regime family scores",
+            "Regime aggregation",
+            "Regime local gates",
+            "Regime baseline settings",
+            "Regime dynamic profiles",
+            "Regime position sizing",
+            "Regime entry and exit policy",
+            "Regime decisions",
+            "Regime order intents",
+            "Regime positions and trades",
+            "Regime backtest state",
+            "Regime backtest results",
+            "Regime ML features and artifacts",
+            "Regime rollout state",
+        )
+        inventory = regime_backend_inventory()
+
+        self.assertEqual(REGIME_NEVER_SHARED_COMPONENTS, expected)
+        self.assertEqual(inventory["neverSharedComponents"], expected)
+        self.assertEqual(len(set(REGIME_NEVER_SHARED_COMPONENTS)), len(REGIME_NEVER_SHARED_COMPONENTS))
+        self.assertTrue(all(component.startswith("Regime ") for component in REGIME_NEVER_SHARED_COMPONENTS))
 
     def test_repository_service_and_api_expose_same_regime_owned_schema(self) -> None:
         path = ROOT / "backend" / "tests" / "tmp" / "regime_backend_boundary" / f"{uuid4().hex}.sqlite"

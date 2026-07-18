@@ -33,6 +33,33 @@ REGIME_ALLOWED_SHARED_COMPONENTS = (
     {"component": "Order-side contract types", "allowedUse": "Type definitions only"},
     {"component": "Authentication and API framework", "allowedUse": "Transport only"},
 )
+REGIME_NEVER_SHARED_COMPONENTS = (
+    "Regime classification formulas",
+    "Regime classification thresholds",
+    "Regime axes and composite-state mapping",
+    "Regime hysteresis state",
+    "Regime transition history",
+    "Regime strategy implementations",
+    "Regime strategy compatibility matrix",
+    "Regime strategy aliases",
+    "Regime strategy health",
+    "Regime strategy outputs",
+    "Regime context outputs",
+    "Regime family scores",
+    "Regime aggregation",
+    "Regime local gates",
+    "Regime baseline settings",
+    "Regime dynamic profiles",
+    "Regime position sizing",
+    "Regime entry and exit policy",
+    "Regime decisions",
+    "Regime order intents",
+    "Regime positions and trades",
+    "Regime backtest state",
+    "Regime backtest results",
+    "Regime ML features and artifacts",
+    "Regime rollout state",
+)
 
 
 class RegimeApplicationService:
@@ -71,9 +98,11 @@ def regime_backend_inventory() -> dict[str, Any]:
         "globalRiskAdapter": regime_global_risk_adapter_inventory(),
         "brokerAdapter": regime_broker_adapter_inventory(),
         "allowedSharedComponents": REGIME_ALLOWED_SHARED_COMPONENTS,
+        "neverSharedComponents": REGIME_NEVER_SHARED_COMPONENTS,
         "globalRiskLayerSharedServerSide": True,
         "localControlsRemainRegimeOwned": True,
         "sharedComponentsMayRewriteRegimeState": False,
+        "otherAlgorithmsMayModifyPrivateRegimeComponents": False,
         "apiTransportOnly": True,
     }
 
@@ -81,6 +110,7 @@ def regime_backend_inventory() -> dict[str, Any]:
 __all__ = [
     "REGIME_BACKEND_FILE_INVENTORY",
     "REGIME_ALLOWED_SHARED_COMPONENTS",
+    "REGIME_NEVER_SHARED_COMPONENTS",
     "REGIME_SERVICE_VERSION",
     "RegimeApplicationService",
     "regime_backend_inventory",
