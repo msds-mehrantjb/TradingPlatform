@@ -43,9 +43,20 @@ export { predictRegimeMl } from "./ml/predictor.ts";
 export { evaluateRegimeMlPromotionPolicy } from "./ml/promotion-policy.ts";
 export { defaultRegimeMlValidationPlan } from "./ml/validation.ts";
 export {
+  REGIME_COMPATIBILITY_MATRIX,
+  REGIME_LEGACY_ROUTING_MATRIX,
+  REGIME_NO_DIRECTIONAL_REGIMES,
+  canonicalRegimeRoutingStrategyId,
   contextMultiplierForSignal,
+  dedupeRegimeStrategyIds,
+  evaluateRoutingEligibility,
+  hasMinimumIndependentFamilyParticipation,
+  permittedDirectionForRegime,
+  regimeCompatibilityMultiplier,
   regimeStrategyAggregationFamily,
+  representedRegimeFamilies,
   routeRegimeStrategies,
+  strategyIdsForConfirmedRegime,
 } from "./router.ts";
 export {
   calculateRegimeDecision,

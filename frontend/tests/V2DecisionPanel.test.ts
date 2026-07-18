@@ -27,6 +27,7 @@ import {
   manageRegimeOpenPosition,
   REGIME_ALGORITHM_ID,
   REGIME_ALGORITHM_VERSION,
+  REGIME_COMPATIBILITY_MATRIX,
   REGIME_COMPOSITE_REGIME_IDS,
   REGIME_IDENTITY_CONTRACT_FILES,
   REGIME_LEGACY_ALIASES,
@@ -40,8 +41,11 @@ import {
   REGIME_STRATEGY_ALIAS_INVENTORY,
   REGIME_STRATEGY_CATALOG_VERSION,
   REGIME_TOTAL_STRATEGY_DEFINITION_COUNT,
+  canonicalRegimeRoutingStrategyId,
+  permittedDirectionForRegime,
   runRegimeBacktest,
   regimeSelectionStrategies,
+  representedRegimeFamilies,
   resolveEffectiveRegimeSettings,
   routeRegimeStrategies,
   resolveRegimeHysteresisSettings,
@@ -646,6 +650,54 @@ test("Regime owns the dedicated strategy role inventory", () => {
   assert.deepEqual(catalogInventory("confirmation"), REGIME_CONFIRMATION_MODULE_INVENTORY.map(({ key, id, name }) => ({ key, id, name })));
   assert.deepEqual(catalogInventory("regime_context"), REGIME_CONTEXT_MODULE_INVENTORY.map(({ key, id, name }) => ({ key, id, name })));
   assert.deepEqual(catalogInventory("safety_gate"), REGIME_SAFETY_GATE_INVENTORY.map(({ key, id, name }) => ({ key, id, name })));
+});
+
+test("Regime owns dedicated strategy routing inventory and outputs", () => {
+  assert.deepEqual(directoryFiles("routing"), [
+    "alias-deduplication.ts",
+    "compatibility-matrix.ts",
+    "conflict-resolution.ts",
+    "regime-family-map.ts",
+    "router.ts",
+    "strategy-eligibility.ts",
+  ]);
+  assert.deepEqual(REGIME_COMPATIBILITY_MATRIX.strong_uptrend, [
+    "moving_average_trend",
+    "trend_pullback",
+    "macd_momentum",
+    "market_structure",
+    "vwap_trend_continuation",
+  ]);
+  assert.equal(canonicalRegimeRoutingStrategyId("first_pullback_after_open"), "trend_pullback");
+  assert.equal(permittedDirectionForRegime("strong_uptrend"), "long");
+  assert.equal(permittedDirectionForRegime("strong_downtrend"), "short");
+  assert.equal(permittedDirectionForRegime("extreme_volatility_no_trade"), "none");
+  assert.deepEqual(representedRegimeFamilies(["moving_average_trend", "vwap_trend_continuation", "opening_range_breakout"]), [
+    "trend",
+    "vwap",
+    "breakout",
+  ]);
+
+  const market = buildRegimeMarketContext({
+    symbol: "SPY",
+    primaryCandles: deterministicRegimeCandles(),
+    allCandles: deterministicRegimeCandles(),
+    oneMinuteCandles: deterministicRegimeCandles(),
+  }, liquidRegimeSettings())!;
+  const routing = routeRegimeStrategies("strong_uptrend", market);
+
+  assert.equal(routing.permittedDirection, "long");
+  assert.deepEqual(routing.representedFamilies, ["trend", "vwap"]);
+  assert.equal(routing.minimumIndependentFamilyParticipationMet, true);
+  assert.equal(routing.incompatibleStrategyIds.includes("rsi_mean_reversion"), true);
+  assert.equal(routing.abstainedStrategyIds.includes("rsi_mean_reversion"), true);
+  assert.equal(routing.disabledStrategyIds.length, 0);
+  assert.equal(routing.unhealthyStrategyIds.length, 0);
+  assert.deepEqual(routing.aliasDeduplication, [
+    { alias: "first_pullback_after_open", canonicalStrategyId: "trend_pullback", alreadyVoted: true },
+    { alias: "bollinger_atr_reversion", canonicalStrategyId: "bollinger_band_mean_reversion", alreadyVoted: false },
+    { alias: "failed_breakout_strategy", canonicalStrategyId: "failed_breakout_reversal", alreadyVoted: false },
+  ]);
 });
 
 test("Regime non-directional modules cannot emit Buy or Sell votes", () => {

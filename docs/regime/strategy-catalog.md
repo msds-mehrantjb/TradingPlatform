@@ -95,7 +95,7 @@ Current multiplier rules:
 
 | Component | Rule |
 | --- | --- |
-| Regime compatibility | 1 when the strategy is selected for the confirmed regime; 0 otherwise. |
+| Regime compatibility | 1 when `routing/compatibility-matrix.ts` selects the strategy for the confirmed regime; 0 otherwise. |
 | Context ineligible | Multiplier 0.8. |
 | Context Hold | `max(0.65, 1 - confidence * 0.35)`. |
 | Context agrees with direction | Multiplier 1. |

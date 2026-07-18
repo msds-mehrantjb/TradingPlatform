@@ -261,6 +261,18 @@ export type StrategyRoutingResult = {
   }>;
   contextResults: ContextResult[];
   safetyResults: SafetyGateResult[];
+  incompatibleStrategyIds: string[];
+  permittedDirection: "long" | "short" | "both" | "none";
+  representedFamilies: RegimeAggregationFamily[];
+  aliasDeduplication: Array<{
+    alias: string;
+    canonicalStrategyId: string;
+    alreadyVoted: boolean;
+  }>;
+  minimumIndependentFamilyParticipationMet: boolean;
+  abstainedStrategyIds: string[];
+  disabledStrategyIds: string[];
+  unhealthyStrategyIds: string[];
 };
 
 export type RegimeStrategyDefinition = {

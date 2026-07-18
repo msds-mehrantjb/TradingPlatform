@@ -15,6 +15,7 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | Regime classification | `frontend/src/algorithms/regime/classification/*` | Isolated classifier inventory for axes, composite regimes, evidence, hysteresis, transition policy, and no-trade classification. |
 | Regime market boundary | `frontend/src/algorithms/regime/market/*` | Immutable Regime market snapshots, read-only feature snapshots, context-feed adapters, quote freshness, indicators, and session context. |
 | Regime strategies | `frontend/src/algorithms/regime/strategies/*` | Dedicated strategy inventory for directional strategies, confirmation modules, context modules, safety gates, and aliases. |
+| Regime routing | `frontend/src/algorithms/regime/routing/*` | Dedicated compatibility matrix, strategy eligibility, family mapping, conflict resolution, and alias deduplication. |
 | Regime ML | `frontend/src/algorithms/regime/ml/*` | Point-in-time feature building, artifact validation/loading, conservative prediction, offline labels, validation, and promotion policy. |
 | Regime backtest | `frontend/src/algorithms/regime/backtest/*` | Dedicated Regime replay engine, execution simulation, metrics, diagnostics, walk-forward summaries, and runner integration. |
 | Backend Regime API | `backend/app/algorithms/regime/*` | Persistence, API routes, and staged paper rollout status. |
@@ -73,6 +74,21 @@ The Regime catalog contains 28 definitions split into four roles:
 | Safety gates | 10 | `strategies/safety/*` | Execute before order creation and may reject, reduce, or delay entries only. |
 
 Aliases in `strategies/alias-map.ts` map to canonical strategies and must never receive separate votes.
+
+## Strategy Routing
+
+The Regime algorithm owns the mapping between classified regimes and eligible strategies. The compatibility matrix and routing output are Regime-owned and must not be modified by another algorithm.
+
+| Component | Dedicated responsibility |
+| --- | --- |
+| `routing/router.ts` | Public Regime routing workflow. |
+| `routing/compatibility-matrix.ts` | Authoritative regime-to-strategy compatibility matrix and permitted direction. |
+| `routing/strategy-eligibility.ts` | Strategy eligibility, incompatible, disabled, unhealthy, and abstention decisions. |
+| `routing/regime-family-map.ts` | Strategy-family representation and independent-family participation. |
+| `routing/conflict-resolution.ts` | Context compatibility, reliability, and correlation multipliers. |
+| `routing/alias-deduplication.ts` | Alias canonicalization and duplicate-vote prevention. |
+
+The routing output records selected strategies, incompatible strategies, permitted direction, represented families, alias deduplication status, independent-family participation, abstentions, disabled strategies, unhealthy strategies, context results, and safety results.
 
 ## Authoritative Flow
 
