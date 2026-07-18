@@ -14,6 +14,11 @@ class RuntimeParityTest(unittest.TestCase):
 
         self.assertEqual(live["runtime"], "backend.app.algorithms.regime.execution_pipeline")
         self.assertEqual(paper["runtime"], live["runtime"])
+        self.assertEqual(live["pipeline"], paper["pipeline"])
+        for module in ("classifier", "router", "dynamic_profile", "family_aggregation", "sizing", "trade_management"):
+            self.assertIn(module, live["pipeline"])
+        self.assertIn("tradeManagement", live)
+        self.assertIn("tradeManagement", paper)
         self.assertEqual(backtest["authoritativeEngine"], "backend.app.algorithms.regime.backtest.engine")
         self.assertIn("backend_authoritative_runtime", backtest["diagnostics"])
-
+        self.assertTrue(all("tradeManagement" in decision for decision in backtest["decisions"]))

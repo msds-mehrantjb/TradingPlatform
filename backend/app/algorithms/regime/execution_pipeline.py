@@ -12,6 +12,7 @@ from backend.app.algorithms.regime.market_snapshot import build_regime_market_sn
 from backend.app.algorithms.regime.order_intent import build_regime_order_intent
 from backend.app.algorithms.regime.order_validation import validate_regime_order_intent
 from backend.app.algorithms.regime.sizing import calculate_regime_position_size
+from backend.app.algorithms.regime.trade_management import evaluate_regime_exit
 
 
 REGIME_EXECUTION_PIPELINE_MODULES = (
@@ -24,6 +25,7 @@ REGIME_EXECUTION_PIPELINE_MODULES = (
     "local_gates",
     "dynamic_profile",
     "sizing",
+    "trade_management",
     "order_intent",
     "order_validation",
     "global_risk_adapter",
@@ -37,6 +39,18 @@ def execute_regime_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
     account = payload.get("account") or {}
     decision = calculate_regime_decision(snapshot, settings=settings)
     sizing = calculate_regime_position_size(decision, snapshot, account)
+    trade_management = evaluate_regime_exit(
+        payload.get("position") or account.get("position") or account.get("currentPosition"),
+        {
+            "timestamp": snapshot.latest.timestamp,
+            "open": snapshot.latest.open,
+            "high": snapshot.latest.high,
+            "low": snapshot.latest.low,
+            "close": snapshot.latest.close,
+            "volume": snapshot.latest.volume,
+        },
+        decision.confirmed_state.confirmed_regime,
+    )
     intent = build_regime_order_intent(decision, sizing)
     order_valid, order_reasons = validate_regime_order_intent(intent, decision.effective_settings)
     risk_approval = None
@@ -70,9 +84,9 @@ def execute_regime_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
         "pipeline": REGIME_EXECUTION_PIPELINE_MODULES,
         "decision": to_dict(decision),
         "sizing": to_dict(sizing),
+        "tradeManagement": trade_management,
         "orderIntent": to_dict(intent),
         "orderValidation": {"valid": order_valid, "reasonCodes": order_reasons},
         "globalRiskApproval": to_dict(risk_approval),
         "brokerSubmission": to_dict(broker_submission),
     }
-

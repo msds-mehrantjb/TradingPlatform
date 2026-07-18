@@ -9,6 +9,7 @@ from backend.app.algorithms.regime.backtest.ledger import close_trade
 from backend.app.algorithms.regime.backtest.metrics import calculate_backtest_metrics
 from backend.app.algorithms.regime.backtest.walk_forward import walk_forward_summary
 from backend.app.algorithms.regime.execution_pipeline import execute_regime_pipeline
+from backend.app.algorithms.regime.trade_management import evaluate_regime_exit
 
 
 REGIME_BACKTEST_ENGINE_VERSION = "regime_backtest_v3_backend"
@@ -23,23 +24,21 @@ def run_regime_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     trades: list[dict] = []
     open_trade: dict | None = None
     for index, candle in enumerate(candles):
-        if open_trade is not None:
-            stop = float(open_trade["stopPrice"])
-            target = float(open_trade["targetPrice"])
-            if float(candle.get("low", 0)) <= stop:
-                trades.append(close_trade(open_trade, candle, stop, "stop_hit"))
-                open_trade = None
-            elif float(candle.get("high", 0)) >= target:
-                trades.append(close_trade(open_trade, candle, target, "target_hit"))
-                open_trade = None
         history = candles[: index + 1]
         output = execute_regime_pipeline({"marketData": {"symbol": symbol, "primaryCandles": history}, "settings": settings, "account": payload.get("account") or {}})
+        if open_trade is not None:
+            exit_result = evaluate_regime_exit(open_trade, candle, output["decision"]["confirmed_state"]["confirmed_regime"])
+            if exit_result["action"] != "hold":
+                reason = str((exit_result.get("reasonCodes") or ("regime.exit.policy",))[0])
+                trades.append(close_trade(open_trade, candle, float(exit_result.get("price") or candle.get("close", 0)), reason))
+                open_trade = None
         decision_record = {
             "timestamp": candle.get("timestamp"),
             "signal": output["decision"]["signal"],
             "regime": output["decision"]["confirmed_state"]["confirmed_regime"],
             "strategyIds": [item["strategy_id"] for item in output["decision"]["strategy_outputs"] if item["eligible"]],
             "orderIntent": output["orderIntent"],
+            "tradeManagement": output["tradeManagement"],
             "tradeBlockers": output["decision"]["trade_blockers"],
         }
         decisions.append(decision_record)
