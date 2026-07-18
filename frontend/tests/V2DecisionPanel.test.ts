@@ -170,6 +170,15 @@ test("Regime core runs from supplied candles without DOM access", () => {
   assert.equal(typeof output.result.buyScore, "number");
 });
 
+test("Regime daily backtest production path calls backend runtime only", () => {
+  const mainSource = readFileSync(fileURLToPath(new URL("../src/main.ts", import.meta.url)), "utf-8");
+  const apiSource = readFileSync(fileURLToPath(new URL("../src/features/regime/api.ts", import.meta.url)), "utf-8");
+
+  assert.match(mainSource, /runRegimeBacktestOnBackend/);
+  assert.match(apiSource, /\/api\/regime\/backtests\/run/);
+  assert.doesNotMatch(mainSource, /\brunRegimeBacktest\(/);
+});
+
 test("Regime order intents preserve allowed Buy and allowed Sell directions", () => {
   const buyIntent = buildRegimeOrderIntent(regimeResult({ signal: "Buy", tradeAllowed: true }), "SPY", 12, {
     currentPosition: 0,

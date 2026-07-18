@@ -60,6 +60,8 @@ def run_regime_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     if open_trade and candles:
         trades.append(close_trade(open_trade, candles[-1], float(candles[-1].get("close", 0)), "end_of_backtest"))
     metrics = calculate_backtest_metrics(trades, decisions, starting_capital)
+    first_day = str(candles[0].get("timestamp", "na"))[:10] if candles else "na"
+    last_day = str(candles[-1].get("timestamp", "na"))[:10] if candles else "na"
     return {
         "algorithmId": "regime",
         "engineVersion": REGIME_BACKTEST_ENGINE_VERSION,
@@ -68,8 +70,12 @@ def run_regime_backtest(payload: dict[str, Any]) -> dict[str, Any]:
         "candles": len(candles),
         "decisions": decisions,
         "trades": trades,
+        "totalPnl": metrics["netProfit"],
         "metrics": metrics,
-        "walkForward": walk_forward_summary(candles, trades),
+        "walkForward": [walk_forward_summary(candles, trades)],
         "diagnostics": ("backend_authoritative_runtime", "next_bar_execution"),
+        "artifactPath": f"backend/data/regime-backtests/{symbol}_{first_day}_{last_day}.json",
+        "cacheKey": f"{symbol}:{first_day}:{last_day}:{len(candles)}",
+        "storageKey": f"regime-backtest:{symbol}:{first_day}:{last_day}:{len(candles)}",
+        "failureMessage": None,
     }
-

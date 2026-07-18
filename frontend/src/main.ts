@@ -8,12 +8,11 @@ import {
   buildRegimeTargetOrder,
   calculateRegimeDecision,
   combineRegimeProfileModifiers,
-  regimeBacktestCacheKey,
   resolveRegimeDecision,
-  runRegimeBacktest,
 } from "./algorithms/regime";
 import type { RegimeOrderIntent, RegimePositionSizingResult, RegimeSelectionResult as RegimeCoreSelectionResult, RegimeTargetOrder } from "./algorithms/regime";
 import type { RegimeBacktestResult } from "./algorithms/regime/backtest/types";
+import { runRegimeBacktestOnBackend } from "./features/regime/api";
 import { fetchWcaBaselineSettings, fetchWcaConfiguration, fetchWcaStatus, updateWcaConfiguration } from "./features/wca/api";
 import {
   createInitialWcaState,
@@ -17974,7 +17973,7 @@ async function runRegimeDailyBacktestFromPreparedCandles(preparedOneMinuteCandle
     renderRegimeBacktestState();
     return;
   }
-  const cacheKey = regimeBacktestCacheKey(state.symbol, sorted);
+  const cacheKey = backendRegimeBacktestCacheKey(state.symbol, sorted);
   if (regimeBacktestCache?.key === cacheKey && regimeBacktestResult) {
     regimeBacktestStatus = "ready";
     renderRegimeBacktestState();
@@ -17994,16 +17993,15 @@ async function runRegimeDailyBacktestFromPreparedCandles(preparedOneMinuteCandle
       mlMode?: "off" | "shadow" | "confirm_only" | "active";
       shortEntriesEnabled?: boolean;
     };
-    const result = runRegimeBacktest({
+    const result = await runRegimeBacktestOnBackend<RegimeBacktestResult>({
       symbol: state.symbol,
       candles: sorted,
       settings: regimeSettings,
       startingCapital: regimeSettings.startingCapital,
-      mlMode: regimeSettings.mlMode ?? "shadow",
-      shortEntriesEnabled: regimeSettings.shortEntriesEnabled ?? false,
-      costModel: {
-        slippagePerShare: regimeSettings.slippagePerShare,
-        orderDelayBars: 1,
+      account: {
+        availableBuyingPower: state.regimeTradingSettings.startingCapital,
+        remainingAlgorithmRiskDollars: state.regimeTradingSettings.startingCapital,
+        globalRiskCapacityQuantity: 1000000,
       },
     });
     regimeBacktestResult = result;
@@ -18016,6 +18014,12 @@ async function runRegimeDailyBacktestFromPreparedCandles(preparedOneMinuteCandle
     regimeBacktestError = error instanceof Error ? error.message : "Unable to run Regime backtest";
   }
   renderRegimeBacktestState();
+}
+
+function backendRegimeBacktestCacheKey(symbol: string, candles: Candle[]): string {
+  const first = candles[0]?.timestamp ?? "na";
+  const last = candles[candles.length - 1]?.timestamp ?? "na";
+  return `${symbol.toUpperCase()}:${first}:${last}:${candles.length}`;
 }
 
 async function recordRegimeBacktestResult(result: RegimeBacktestResult) {
