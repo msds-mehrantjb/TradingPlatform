@@ -14,6 +14,7 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | Regime core | `frontend/src/algorithms/regime/*` | Pure TypeScript Regime decision logic, strategy routing, aggregation, dynamic profiles, sizing, intent building, diagnostics, and persistence helpers. |
 | Regime classification | `frontend/src/algorithms/regime/classification/*` | Isolated classifier inventory for axes, composite regimes, evidence, hysteresis, transition policy, and no-trade classification. |
 | Regime market boundary | `frontend/src/algorithms/regime/market/*` | Immutable Regime market snapshots, read-only feature snapshots, context-feed adapters, quote freshness, indicators, and session context. |
+| Regime strategies | `frontend/src/algorithms/regime/strategies/*` | Dedicated strategy inventory for directional strategies, confirmation modules, context modules, safety gates, and aliases. |
 | Regime ML | `frontend/src/algorithms/regime/ml/*` | Point-in-time feature building, artifact validation/loading, conservative prediction, offline labels, validation, and promotion policy. |
 | Regime backtest | `frontend/src/algorithms/regime/backtest/*` | Dedicated Regime replay engine, execution simulation, metrics, diagnostics, walk-forward summaries, and runner integration. |
 | Backend Regime API | `backend/app/algorithms/regime/*` | Persistence, API routes, and staged paper rollout status. |
@@ -59,6 +60,19 @@ The classifier is isolated from strategy voting and execution. It classifies ind
 | `classification/no-trade-classifier.ts` | No-trade reason classification. |
 
 `MarketRegimeId` is reserved for canonical composite market states. Older labels such as `low_volatility`, `trend_continuation`, `bullish_breakout`, and `mean_reversion` are legacy aliases or opportunity tags, not authoritative market-regime identifiers.
+
+## Strategy Inventory
+
+The Regime catalog contains 28 definitions split into four roles:
+
+| Role | Count | Dedicated files | Rule |
+| --- | ---: | --- | --- |
+| Directional strategies | 14 | `strategies/directional-strategies.ts` | May emit Buy, Sell, or Hold. |
+| Confirmation modules | 2 | `strategies/confirmation-modules.ts` | Modify eligibility, confidence, quality, or weight without emitting Buy/Sell votes. |
+| Regime-context modules | 2 | `strategies/context-modules.ts` | Describe the environment for routing or weighting without acting as primary voters. |
+| Safety gates | 10 | `strategies/safety-gates.ts` | Execute before order creation and may reject, reduce, or delay entries only. |
+
+Aliases in `strategies/aliases.ts` map to canonical strategies and must never receive separate votes.
 
 ## Authoritative Flow
 

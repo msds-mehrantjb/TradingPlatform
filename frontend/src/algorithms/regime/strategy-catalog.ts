@@ -80,31 +80,31 @@ function defineStrategy(input: StrategyDefinitionInput): RegimeStrategyDefinitio
 
 export const regimeSelectionStrategies: RegimeStrategyDefinition[] = [
   defineStrategy({ key: "C1", id: "moving_average_trend", name: "Moving Average Trend", role: "directional", family: "trend_momentum", baseWeight: baseWeights.moving_average_trend, requiredInputs: ["candles", "latest", "sma20", "sma50"], minimumBars: 50, signal: movingAverageTrend }),
-  defineStrategy({ key: "C2", id: "vwap_position", name: "VWAP Position Strategy", role: "regime_context", family: "regime_context", requiredInputs: ["candles", "latest", "vwap"], minimumBars: 5, signal: vwapPosition }),
-  defineStrategy({ key: "C3", id: "trend_pullback", name: "Trend Pullback Strategy", role: "directional", family: "trend_momentum", baseWeight: baseWeights.trend_pullback, aliases: ["first_pullback_after_open"], requiredInputs: ["candles", "latest", "sma20", "sma50", "vwap"], minimumBars: 50, signal: trendPullback }),
+  defineStrategy({ key: "C2", id: "vwap_position", name: "VWAP Position", role: "regime_context", family: "regime_context", requiredInputs: ["candles", "latest", "vwap"], minimumBars: 5, signal: vwapPosition }),
+  defineStrategy({ key: "C3", id: "trend_pullback", name: "Trend Pullback", role: "directional", family: "trend_momentum", baseWeight: baseWeights.trend_pullback, aliases: ["first_pullback_after_open"], requiredInputs: ["candles", "latest", "sma20", "sma50", "vwap"], minimumBars: 50, signal: trendPullback }),
   defineStrategy({ key: "C4", id: "rsi_mean_reversion", name: "RSI Mean Reversion", role: "directional", family: "mean_reversion", baseWeight: baseWeights.rsi_mean_reversion, requiredInputs: ["candles", "latest", "rsi"], minimumBars: 15, signal: rsiMeanReversion }),
   defineStrategy({ key: "C5", id: "bollinger_band_mean_reversion", name: "Bollinger Band Mean Reversion", role: "directional", family: "mean_reversion", baseWeight: baseWeights.bollinger_band_mean_reversion, aliases: ["bollinger_atr_reversion"], requiredInputs: ["candles", "latest", "bollinger_bands"], minimumBars: 20, signal: bollingerMeanReversion }),
   defineStrategy({ key: "C6", id: "opening_range_breakout", name: "Opening Range Breakout", role: "directional", family: "breakout", baseWeight: baseWeights.opening_range_breakout, requiredInputs: ["candles", "latest", "opening_range"], minimumBars: 15, signal: openingRangeBreakout }),
-  defineStrategy({ key: "C7", id: "intraday_breakout", name: "Intraday Breakout Strategy", role: "directional", family: "breakout", baseWeight: baseWeights.intraday_breakout, requiredInputs: ["candles", "latest", "recent_range"], minimumBars: 21, signal: intradayBreakout }),
+  defineStrategy({ key: "C7", id: "intraday_breakout", name: "Intraday Breakout", role: "directional", family: "breakout", baseWeight: baseWeights.intraday_breakout, requiredInputs: ["candles", "latest", "recent_range"], minimumBars: 21, signal: intradayBreakout }),
   defineStrategy({ key: "C8", id: "macd_momentum", name: "MACD Momentum", role: "directional", family: "trend_momentum", baseWeight: baseWeights.macd_momentum, requiredInputs: ["candles", "latest", "macd"], minimumBars: 26, signal: macdMomentum }),
-  defineStrategy({ key: "C9", id: "market_structure", name: "Market Structure Strategy", role: "directional", family: "trend_momentum", baseWeight: baseWeights.market_structure, requiredInputs: ["candles", "latest", "market_structure"], minimumBars: 10, signal: marketStructure }),
-  defineStrategy({ key: "C10", id: "gap_continuation_fade", name: "Gap Continuation / Gap Fade", role: "directional", family: "gap_session_event", baseWeight: baseWeights.gap_continuation_fade, requiredInputs: ["candles", "latest", "prior_close", "opening_range"], minimumBars: 15, signal: gapContinuationFade }),
+  defineStrategy({ key: "C9", id: "market_structure", name: "Market Structure", role: "directional", family: "trend_momentum", baseWeight: baseWeights.market_structure, requiredInputs: ["candles", "latest", "market_structure"], minimumBars: 10, signal: marketStructure }),
+  defineStrategy({ key: "C10", id: "gap_continuation_fade", name: "Gap Continuation/Fade", role: "directional", family: "gap_session_event", baseWeight: baseWeights.gap_continuation_fade, requiredInputs: ["candles", "latest", "prior_close", "opening_range"], minimumBars: 15, signal: gapContinuationFade }),
   defineStrategy({ key: "C11", id: "volume_confirmation", name: "Volume Confirmation", role: "confirmation", family: "confirmation", requiredInputs: ["candles", "latest", "volume"], minimumBars: 5, signal: volumeConfirmation }),
   defineStrategy({ key: "R1", id: "vwap_trend_continuation", name: "VWAP Trend Continuation", role: "directional", family: "trend_momentum", baseWeight: 0.1, requiredInputs: ["candles", "latest", "vwap", "sma20", "sma50"], minimumBars: 50, signal: vwapTrendContinuation }),
   defineStrategy({ key: "R2", id: "vwap_mean_reversion", name: "VWAP Mean Reversion", role: "directional", family: "mean_reversion", baseWeight: 0.09, requiredInputs: ["candles", "latest", "vwap", "adx"], minimumBars: 15, signal: vwapMeanReversion }),
   defineStrategy({ key: "R3", id: "failed_breakout_reversal", name: "Failed Breakout Reversal", role: "directional", family: "reversal", baseWeight: 0.08, aliases: ["failed_breakout_strategy"], requiredInputs: ["candles", "latest", "recent_range"], minimumBars: 21, signal: failedBreakoutReversal }),
   defineStrategy({ key: "R4", id: "liquidity_sweep_reversal", name: "Liquidity Sweep Reversal", role: "directional", family: "reversal", baseWeight: 0.08, requiredInputs: ["candles", "latest", "recent_range", "volume"], minimumBars: 21, signal: liquiditySweepReversal }),
-  defineStrategy({ key: "R5", id: "adx_trend_strength", name: "ADX Trend Strength Filter", role: "confirmation", family: "confirmation", requiredInputs: ["candles", "latest", "adx"], minimumBars: 15, signal: adxTrendStrength }),
+  defineStrategy({ key: "R5", id: "adx_trend_strength", name: "ADX Trend Strength", role: "confirmation", family: "confirmation", requiredInputs: ["candles", "latest", "adx"], minimumBars: 15, signal: adxTrendStrength }),
   defineStrategy({ key: "R6", id: "atr_volatility_regime", name: "ATR Volatility Regime", role: "regime_context", family: "regime_context", requiredInputs: ["candles", "latest", "atr"], minimumBars: 15, signal: atrVolatilityRegime }),
   defineStrategy({ key: "R7", id: "volatility_breakout", name: "Volatility Breakout", role: "directional", family: "breakout", baseWeight: 0.08, requiredInputs: ["candles", "latest", "atr", "recent_range", "volume"], minimumBars: 21, signal: volatilityBreakout }),
-  defineStrategy({ key: "R8", id: "cash_avoid_filter", name: "Cash / Avoid Trading Filter", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest", "spread_liquidity", "time_of_day"], minimumBars: 5, signal: cashAvoidFilter }),
+  defineStrategy({ key: "R8", id: "cash_avoid_filter", name: "Cash/Avoid Trading", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest", "spread_liquidity", "time_of_day"], minimumBars: 5, signal: cashAvoidFilter }),
   defineStrategy({ id: "missing_critical_data", name: "Missing Critical Data", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest"], minimumBars: 5, signal: missingCriticalDataGate }),
   defineStrategy({ id: "stale_data", name: "Stale Data", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest"], minimumBars: 5, signal: staleDataGate }),
   defineStrategy({ id: "extreme_volatility", name: "Extreme Volatility", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest", "atr"], minimumBars: 15, signal: extremeVolatilityGate }),
   defineStrategy({ id: "excessive_spread", name: "Excessive Spread", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest", "spread_liquidity"], minimumBars: 5, signal: excessiveSpreadGate }),
   defineStrategy({ id: "insufficient_liquidity", name: "Insufficient Liquidity", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest", "volume"], minimumBars: 5, signal: insufficientLiquidityGate }),
   defineStrategy({ id: "event_blackout", name: "Event Blackout", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest"], minimumBars: 5, signal: eventBlackoutGate }),
-  defineStrategy({ id: "halt_luld", name: "Halt or LULD", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest"], minimumBars: 5, signal: haltLuldGate }),
+  defineStrategy({ id: "halt_luld", name: "Halt/LULD", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest"], minimumBars: 5, signal: haltLuldGate }),
   defineStrategy({ id: "circuit_breaker", name: "Circuit Breaker", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest"], minimumBars: 5, signal: circuitBreakerGate }),
   defineStrategy({ id: "unsupported_session", name: "Unsupported Session", role: "safety_gate", family: "safety", requiredInputs: ["candles", "latest", "time_of_day"], minimumBars: 5, signal: unsupportedSessionGate }),
 ];
@@ -417,10 +417,10 @@ function vwapPosition(market: RegimeMarketContext): RegimeRawStrategySignal {
 
   const distanceText = `distance ${probabilityLabel(Math.abs(distance))}`;
   if (buyConfidence >= 0.45 && buyConfidence > sellConfidence) {
-    return vote("Buy", Math.min(1, buyConfidence), `${buyReasons.join(", ")}; ${distanceText}`);
+    return vote("Hold", Math.min(1, buyConfidence), `VWAP bullish context: ${buyReasons.join(", ")}; ${distanceText}`);
   }
   if (sellConfidence >= 0.45 && sellConfidence > buyConfidence) {
-    return vote("Sell", Math.min(1, sellConfidence), `${sellReasons.join(", ")}; ${distanceText}`);
+    return vote("Hold", Math.min(1, sellConfidence), `VWAP bearish context: ${sellReasons.join(", ")}; ${distanceText}`);
   }
   return vote("Hold", Math.max(0.2, Math.min(0.4, Math.max(buyConfidence, sellConfidence))), `VWAP acceptance is mixed; ${distanceText}`);
 }
@@ -567,10 +567,10 @@ function adxTrendStrength(market: RegimeMarketContext): RegimeRawStrategySignal 
   }
   const confidence = Math.min(0.9, 0.45 + (market.adx.adx - 20) / 45);
   if (market.sma20 > market.sma50 && market.latest.close > market.vwap) {
-    return vote("Buy", confidence, `ADX ${market.adx.adx.toFixed(1)} allows bullish trend`);
+    return vote("Hold", confidence, `ADX ${market.adx.adx.toFixed(1)} confirms bullish trend strength`);
   }
   if (market.sma20 < market.sma50 && market.latest.close < market.vwap) {
-    return vote("Sell", confidence, `ADX ${market.adx.adx.toFixed(1)} allows bearish trend`);
+    return vote("Hold", confidence, `ADX ${market.adx.adx.toFixed(1)} confirms bearish trend strength`);
   }
   return vote("Hold", 0.2, `ADX ${market.adx.adx.toFixed(1)} lacks directional alignment`);
 }
@@ -597,10 +597,10 @@ function volumeConfirmation(market: RegimeMarketContext): RegimeRawStrategySigna
   if (volume.volumeSpike) sellConfidence += 0.1, sellReasons.push("volume spike");
 
   if (buyConfidence >= 0.45 && buyConfidence > sellConfidence) {
-    return vote("Buy", Math.min(1, buyConfidence), buyReasons.join(", "));
+    return vote("Hold", Math.min(1, buyConfidence), `Volume confirms bullish participation: ${buyReasons.join(", ")}`);
   }
   if (sellConfidence >= 0.45 && sellConfidence > buyConfidence) {
-    return vote("Sell", Math.min(1, sellConfidence), sellReasons.join(", "));
+    return vote("Hold", Math.min(1, sellConfidence), `Volume confirms bearish participation: ${sellReasons.join(", ")}`);
   }
   return vote("Hold", Math.max(0.2, Math.min(0.4, Math.max(buyConfidence, sellConfidence))), `Volume participation is mixed at ${volume.relativeVolume.toFixed(2)}x`);
 }
@@ -615,10 +615,10 @@ function atrVolatilityRegime(market: RegimeMarketContext): RegimeRawStrategySign
   }
   const confidence = Math.min(0.78, 0.45 + atrPercent * 35);
   if (market.sma20 > market.sma50 && market.latest.close > market.vwap) {
-    return vote("Buy", confidence, `ATR regime ${probabilityLabel(atrPercent)} supports trend sizing`);
+    return vote("Hold", confidence, `ATR regime ${probabilityLabel(atrPercent)} supports bullish trend sizing`);
   }
   if (market.sma20 < market.sma50 && market.latest.close < market.vwap) {
-    return vote("Sell", confidence, `ATR regime ${probabilityLabel(atrPercent)} supports trend sizing`);
+    return vote("Hold", confidence, `ATR regime ${probabilityLabel(atrPercent)} supports bearish trend sizing`);
   }
   return vote("Hold", 0.18, `ATR regime ${probabilityLabel(atrPercent)} has no directional edge`);
 }

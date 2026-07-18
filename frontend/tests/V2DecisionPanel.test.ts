@@ -32,8 +32,14 @@ import {
   REGIME_LEGACY_ALIASES,
   REGIME_OPPORTUNITY_TAGS,
   REGIME_PROFILE_VERSION,
+  REGIME_CONFIRMATION_MODULE_INVENTORY,
+  REGIME_CONTEXT_MODULE_INVENTORY,
+  REGIME_DIRECTIONAL_STRATEGY_INVENTORY,
+  REGIME_SAFETY_GATE_INVENTORY,
   REGIME_SETTINGS_VERSION,
+  REGIME_STRATEGY_ALIAS_INVENTORY,
   REGIME_STRATEGY_CATALOG_VERSION,
+  REGIME_TOTAL_STRATEGY_DEFINITION_COUNT,
   runRegimeBacktest,
   regimeSelectionStrategies,
   resolveEffectiveRegimeSettings,
@@ -572,8 +578,55 @@ test("Regime aliases cannot vote as separate strategies", () => {
   const aliases = regimeSelectionStrategies.flatMap((strategy) => strategy.aliases ?? []);
 
   assert.equal(ids.size, regimeSelectionStrategies.length);
+  assert.deepEqual(REGIME_STRATEGY_ALIAS_INVENTORY.map((entry) => entry.alias), [
+    "first_pullback_after_open",
+    "bollinger_atr_reversion",
+    "failed_breakout_strategy",
+  ]);
   for (const alias of aliases) {
     assert.equal(ids.has(alias), false);
+  }
+  for (const entry of REGIME_STRATEGY_ALIAS_INVENTORY) {
+    assert.equal(ids.has(entry.canonicalStrategyId), true);
+    assert.equal(ids.has(entry.alias), false);
+  }
+});
+
+test("Regime owns the dedicated strategy role inventory", () => {
+  const root = fileURLToPath(new URL("../src/algorithms/regime/strategies", import.meta.url));
+  const strategyInventoryFiles = new Set(readdirSync(root));
+  for (const file of [
+    "index.ts",
+    "inventory.ts",
+    "directional-strategies.ts",
+    "confirmation-modules.ts",
+    "context-modules.ts",
+    "safety-gates.ts",
+    "aliases.ts",
+  ]) {
+    assert.equal(strategyInventoryFiles.has(file), true, `${file} should exist in the Regime strategy inventory`);
+  }
+
+  assert.equal(REGIME_TOTAL_STRATEGY_DEFINITION_COUNT, 28);
+  assert.equal(regimeSelectionStrategies.length, 28);
+  assert.deepEqual(catalogInventory("directional"), REGIME_DIRECTIONAL_STRATEGY_INVENTORY.map(({ key, id, name }) => ({ key, id, name })));
+  assert.deepEqual(catalogInventory("confirmation"), REGIME_CONFIRMATION_MODULE_INVENTORY.map(({ key, id, name }) => ({ key, id, name })));
+  assert.deepEqual(catalogInventory("regime_context"), REGIME_CONTEXT_MODULE_INVENTORY.map(({ key, id, name }) => ({ key, id, name })));
+  assert.deepEqual(catalogInventory("safety_gate"), REGIME_SAFETY_GATE_INVENTORY.map(({ key, id, name }) => ({ key, id, name })));
+});
+
+test("Regime non-directional modules cannot emit Buy or Sell votes", () => {
+  const candles = deterministicRegimeCandles();
+  const market = buildRegimeMarketContext({
+    symbol: "SPY",
+    primaryCandles: candles,
+    allCandles: candles,
+    oneMinuteCandles: candles,
+  }, liquidRegimeSettings())!;
+
+  for (const strategy of regimeSelectionStrategies.filter((candidate) => candidate.role !== "directional")) {
+    const raw = evaluateRegimeStrategyDefinition(strategy, market);
+    assert.equal(raw.signal, "Hold", `${strategy.id} must not emit an independent ${raw.signal} vote`);
   }
 });
 
@@ -2193,6 +2246,12 @@ function readRegimeModuleText(): string {
 
 function readFrontendMainText(): string {
   return readFileSync(fileURLToPath(new URL("../src/main.ts", import.meta.url)), "utf8");
+}
+
+function catalogInventory(role: RegimeStrategyDefinition["role"]) {
+  return regimeSelectionStrategies
+    .filter((strategy) => strategy.role === role)
+    .map((strategy) => ({ key: strategy.key ?? null, id: strategy.id, name: strategy.name }));
 }
 
 function readyState(): V2DecisionPanelState {
