@@ -5,6 +5,19 @@ export {
   compositeRegimeIdFromAxes,
 } from "./classifier.ts";
 export { DEFAULT_REGIME_HYSTERESIS_SETTINGS, resolveRegimeHysteresisSettings } from "./config.ts";
+export {
+  REGIME_ALGORITHM_ID,
+  REGIME_ALGORITHM_VERSION,
+  REGIME_IDENTITY_CONTRACT_FILES,
+  REGIME_PROFILE_VERSION,
+  REGIME_SETTINGS_VERSION,
+  REGIME_STRATEGY_CATALOG_VERSION,
+} from "./versions.ts";
+export {
+  validateRegimeHysteresisSettings,
+  validateRegimeIdentityContracts,
+  validateRegimeTradingSettings,
+} from "./validation.ts";
 export { confirmedRegimeCondition } from "./hysteresis.ts";
 export { loadRegimeMlArtifact, validateRegimeMlArtifact } from "./ml/artifact-loader.ts";
 export { buildRegimeMlFeatures } from "./ml/feature-builder.ts";
@@ -32,7 +45,6 @@ export {
   buildRegimeProfileModifierBreakdown,
   combineRegimeProfileModifiers,
   resolveEffectiveRegimeSettings,
-  REGIME_PROFILE_VERSION,
 } from "./dynamic-profile.ts";
 export { buildRegimeOrderIntent, buildRegimeTargetOrder, generateRegimeOrderIntentIdempotencyKey, resolveRegimePositionEffect } from "./order-intent.ts";
 export { calculateRegimePositionSize, calculateRegimePositionSizing, signalStrengthMultiplierForWinningStrength } from "./position-sizing.ts";

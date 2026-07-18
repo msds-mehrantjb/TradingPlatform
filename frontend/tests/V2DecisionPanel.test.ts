@@ -23,6 +23,12 @@ import {
   generateRegimeOrderIntentIdempotencyKey,
   loadRegimeMlArtifact,
   manageRegimeOpenPosition,
+  REGIME_ALGORITHM_ID,
+  REGIME_ALGORITHM_VERSION,
+  REGIME_IDENTITY_CONTRACT_FILES,
+  REGIME_PROFILE_VERSION,
+  REGIME_SETTINGS_VERSION,
+  REGIME_STRATEGY_CATALOG_VERSION,
   runRegimeBacktest,
   regimeSelectionStrategies,
   resolveEffectiveRegimeSettings,
@@ -32,6 +38,9 @@ import {
   signedRegimeNetScore,
   validateDirectionalStrategyResult,
   validateRegimeMlArtifact,
+  validateRegimeHysteresisSettings,
+  validateRegimeIdentityContracts,
+  validateRegimeTradingSettings,
   winningDirectionScore,
 } from "../src/algorithms/regime/index.ts";
 import { aggregateRegimeStrategyScores } from "../src/algorithms/regime/family-aggregation.ts";
@@ -240,6 +249,51 @@ test("Regime module contains no WCA storage keys or confidence target-order adap
   assert.doesNotMatch(text, /confidenceTargetOrderRecommendation/);
   assert.doesNotMatch(text, /weighted-confidence/);
   assert.doesNotMatch(text, /confidenceBacktestResult/);
+});
+
+test("Regime owns the dedicated algorithm identity and contract inventory", () => {
+  const root = fileURLToPath(new URL("../src/algorithms/regime", import.meta.url));
+  const topLevelFiles = new Set(readdirSync(root));
+  const expectedFiles = ["index.ts", "types.ts", "versions.ts", "config.ts", "validation.ts"];
+
+  assert.deepEqual(REGIME_IDENTITY_CONTRACT_FILES.map((entry) => entry.file), expectedFiles);
+  for (const file of expectedFiles) {
+    assert.equal(topLevelFiles.has(file), true, `${file} should exist in the Regime package root`);
+  }
+
+  assert.equal(REGIME_ALGORITHM_ID, "regime");
+  assert.equal(REGIME_ALGORITHM_VERSION, "regime_algorithm_v2");
+  assert.equal(REGIME_SETTINGS_VERSION, "regime_base_settings_v1");
+  assert.equal(REGIME_STRATEGY_CATALOG_VERSION, "regime_strategy_catalog_v2");
+  assert.equal(REGIME_PROFILE_VERSION, "regime_profile_matrix_v1");
+
+  const contracts = validateRegimeIdentityContracts();
+  assert.equal(contracts.valid, true);
+  assert.equal(contracts.algorithmId, "regime");
+});
+
+test("Regime validation clamps configuration contracts at the package boundary", () => {
+  const tradingSettings = validateRegimeTradingSettings({
+    startingCapital: -1,
+    minimumWinningScore: 2,
+    minimumDirectionalEdge: -0.4,
+    minimumActiveStrategies: 0,
+    mlMode: "unsafe" as never,
+  });
+  const hysteresisSettings = validateRegimeHysteresisSettings({
+    confirmationBars: 0,
+    immediateConfidenceThreshold: 2,
+    minimumDwellBars: -5,
+  });
+
+  assert.equal(tradingSettings.startingCapital, 0);
+  assert.equal(tradingSettings.minimumWinningScore, 1);
+  assert.equal(tradingSettings.minimumDirectionalEdge, 0);
+  assert.equal(tradingSettings.minimumActiveStrategies, 1);
+  assert.equal(tradingSettings.mlMode, "shadow");
+  assert.equal(hysteresisSettings.confirmationBars, 1);
+  assert.equal(hysteresisSettings.immediateConfidenceThreshold, 1);
+  assert.equal(hysteresisSettings.minimumDwellBars, 0);
 });
 
 test("Regime isolation keeps settings trade history and archives separate from other algorithms", () => {

@@ -1,5 +1,6 @@
 import { defaultRegimeTradingSettings } from "./config.ts";
 import { clampNumber, roundNumber } from "./indicators.ts";
+import { REGIME_PROFILE_VERSION, REGIME_SETTINGS_VERSION } from "./versions.ts";
 import type {
   EffectiveRegimeSettings,
   MarketRegimeId,
@@ -11,7 +12,7 @@ import type {
   RegimeTradingSettings,
 } from "./types.ts";
 
-export const REGIME_PROFILE_VERSION = "regime_profile_matrix_v1";
+export { REGIME_PROFILE_VERSION };
 
 export type RegimeDynamicProfile = {
   riskMultiplier: number;
@@ -110,7 +111,7 @@ export function resolveRegimeDynamicProfile(
   result: RegimeSelectionResult,
   marketOrSettings?: RegimeMarketContext | RegimeTradingSettings | null,
   maybeSettings?: RegimeTradingSettings,
-  baseSettingsVersion = "regime_base_settings_v1",
+  baseSettingsVersion = REGIME_SETTINGS_VERSION,
 ): RegimeDynamicProfile {
   const market = isMarketContext(marketOrSettings) ? marketOrSettings : null;
   const settings = maybeSettings ?? (isTradingSettings(marketOrSettings) ? marketOrSettings : undefined);
@@ -135,7 +136,7 @@ export function resolveEffectiveRegimeSettings(context: DynamicProfileContext): 
   const combined = combineRegimeProfileModifiers(Object.values(breakdown));
   const generatedAt = context.result.confirmedState?.timestamp ?? context.result.rawClassification?.timestamp ?? new Date(0).toISOString();
   return {
-    baseSettingsVersion: context.baseSettingsVersion ?? "regime_base_settings_v1",
+    baseSettingsVersion: context.baseSettingsVersion ?? REGIME_SETTINGS_VERSION,
     profileVersion: REGIME_PROFILE_VERSION,
     profileId: `${confirmedRegime}:${REGIME_PROFILE_VERSION}`,
     confirmedRegime,

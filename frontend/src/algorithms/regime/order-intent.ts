@@ -4,10 +4,12 @@ import { resolveRegimeDecision } from "./decision-engine.ts";
 import { resolveRegimeDynamicProfile } from "./dynamic-profile.ts";
 import { calculateRegimePositionSize, type RegimePositionSizingResult } from "./position-sizing.ts";
 import type { MarketRegimeId, RegimeMarketContext, RegimePositionSnapshot, RegimeSelectionResult, RegimeSizingDefaults, RegimeTradingSettings } from "./types.ts";
+import { REGIME_ALGORITHM_ID, REGIME_ALGORITHM_VERSION, REGIME_PROFILE_VERSION, REGIME_SETTINGS_VERSION } from "./versions.ts";
 
-export const REGIME_ALGORITHM_VERSION = "regime_v2_order_intent_v1";
-const DEFAULT_REGIME_BASE_SETTINGS_VERSION = "regime_base_settings_v1";
-const DEFAULT_REGIME_PROFILE_VERSION = "regime_profile_matrix_v1";
+export { REGIME_ALGORITHM_VERSION };
+export const REGIME_ORDER_INTENT_VERSION = "regime_v2_order_intent_v1";
+const DEFAULT_REGIME_BASE_SETTINGS_VERSION = REGIME_SETTINGS_VERSION;
+const DEFAULT_REGIME_PROFILE_VERSION = REGIME_PROFILE_VERSION;
 
 export type RegimeOrderIntentOptions = {
   currentPosition?: number;
@@ -126,7 +128,7 @@ export function buildRegimeOrderIntent(
   const profileVersion = options.profileVersion ?? result.effectiveSettings?.profileVersion ?? DEFAULT_REGIME_PROFILE_VERSION;
   const effectiveProfileId = options.effectiveProfileId ?? result.effectiveSettings?.profileId ?? `${confirmedRegimeId(result)}:${profileVersion}`;
   const decisionId = generateRegimeOrderIntentIdempotencyKey({
-    algorithmId: "regime",
+    algorithmId: REGIME_ALGORITHM_ID,
     symbol,
     decisionCandle: marketDataTimestamp,
     positionEffect,
@@ -137,7 +139,7 @@ export function buildRegimeOrderIntent(
   const familyScores = options.familyScores ?? familyScoreRecord(result);
   const intent: RegimeOrderIntent = {
     decisionId,
-    algorithmId: "regime",
+    algorithmId: REGIME_ALGORITHM_ID,
     algorithmVersion: options.algorithmVersion ?? REGIME_ALGORITHM_VERSION,
     symbol,
     signal: signalDirection,

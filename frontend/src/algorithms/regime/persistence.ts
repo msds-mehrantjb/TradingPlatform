@@ -1,10 +1,16 @@
 import type { RegimeDecisionSnapshot, RegimeMlFeatureVector, RegimeMlPrediction } from "./ml/types.ts";
 import type { RegimeSelectionResult } from "./types.ts";
+import {
+  REGIME_ALGORITHM_ID,
+  REGIME_ALGORITHM_VERSION,
+  REGIME_PROFILE_VERSION,
+  REGIME_SETTINGS_VERSION,
+  REGIME_STRATEGY_CATALOG_VERSION,
+} from "./versions.ts";
 
-export const REGIME_ALGORITHM_VERSION = "regime_algorithm_v2";
-export const REGIME_SETTINGS_VERSION = "regime_base_settings_v1";
-export const REGIME_STRATEGY_VERSION = "regime_strategy_catalog_v2";
-export const REGIME_PROFILE_VERSION_FOR_PERSISTENCE = "regime_profile_matrix_v1";
+export { REGIME_ALGORITHM_ID, REGIME_ALGORITHM_VERSION, REGIME_SETTINGS_VERSION, REGIME_STRATEGY_CATALOG_VERSION };
+export const REGIME_STRATEGY_VERSION = REGIME_STRATEGY_CATALOG_VERSION;
+export const REGIME_PROFILE_VERSION_FOR_PERSISTENCE = REGIME_PROFILE_VERSION;
 
 export const REGIME_STORAGE_KEYS = {
   tradingSettings: "regime-selection-trading-settings-v1",
@@ -33,14 +39,14 @@ export function buildRegimeDecisionSnapshot(
   const decisionTimestamp = result.confirmedState?.timestamp ?? result.rawClassification?.timestamp ?? "";
   const symbol = metadata.symbol ?? "UNKNOWN";
   const decisionId = [
-    "regime",
+    REGIME_ALGORITHM_ID,
     symbol,
     decisionTimestamp,
     result.confirmedState?.confirmedRegime ?? result.rawClassification?.rawRegime ?? "no_trade",
     result.signal,
   ].join(":");
   return {
-    algorithm_id: "regime",
+    algorithm_id: REGIME_ALGORITHM_ID,
     algorithmVersion: REGIME_ALGORITHM_VERSION,
     settingsVersion: metadata.settingsVersion ?? REGIME_SETTINGS_VERSION,
     strategyVersion: metadata.strategyVersion ?? REGIME_STRATEGY_VERSION,

@@ -17,6 +17,18 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | Backend Regime API | `backend/app/algorithms/regime/*` | Persistence, API routes, and staged paper rollout status. |
 | Global risk | `backend/app/risk/*` | Backend-enforced global gates, portfolio/account snapshots, order integrity, reservations, and risk decisions shared across algorithms. |
 
+## Identity And Contracts
+
+These package-root files are owned exclusively by the Regime algorithm:
+
+| Component | Dedicated responsibility |
+| --- | --- |
+| `index.ts` | Public Regime exports. |
+| `types.ts` | Regime decisions, classifications, strategy outputs, profiles, orders, and positions. |
+| `versions.ts` | Algorithm, settings, strategy-catalog, and profile versions. |
+| `config.ts` | Regime defaults and thresholds. |
+| `validation.ts` | Regime configuration and contract validation. |
+
 ## Authoritative Flow
 
 ```text
