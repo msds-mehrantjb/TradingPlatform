@@ -19,6 +19,15 @@ export {
   validateRegimeTradingSettings,
 } from "./validation.ts";
 export { confirmedRegimeCondition } from "./hysteresis.ts";
+export { buildRegimeFeatureSnapshot, buildRegimeFeatureSnapshotFromContext } from "./market/feature-snapshot.ts";
+export {
+  emptyRegimeContextFeeds,
+  normalizeRegimeContextFeeds,
+  regimeContextFeedsFromSharedSnapshot,
+  resolveRegimeQuoteFreshness,
+} from "./market/context-feeds.ts";
+export { buildRegimeMarketSnapshot } from "./market/market-snapshot.ts";
+export { resolveRegimeSessionContext } from "./market/session-context.ts";
 export { loadRegimeMlArtifact, validateRegimeMlArtifact } from "./ml/artifact-loader.ts";
 export { buildRegimeMlFeatures } from "./ml/feature-builder.ts";
 export { buildOfflineRegimeLabel } from "./ml/label-builder.ts";
@@ -60,5 +69,8 @@ export {
 } from "./strategy-catalog.ts";
 export type { RegimeOrderIntent, RegimeTargetOrder } from "./order-intent.ts";
 export type { RegimePositionSizingResult } from "./position-sizing.ts";
+export type * from "./market/context-feeds.ts";
+export type * from "./market/feature-snapshot.ts";
+export type * from "./market/market-snapshot.ts";
 export type * from "./backtest/types.ts";
 export type * from "./types.ts";

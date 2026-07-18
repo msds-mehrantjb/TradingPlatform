@@ -1,4 +1,5 @@
 import type { MarketCandle, MarketDataSnapshot } from "../../trading/shared/market-data-types.ts";
+import type { RegimeContextFeedsSnapshot } from "./market/context-feeds.ts";
 import type { RegimeDecisionSnapshot, RegimeMlArtifact, RegimeMlMode, RegimeMlSnapshot } from "./ml/types.ts";
 
 export type RegimeAlgoSignal = "Buy" | "Sell" | "Hold";
@@ -202,6 +203,7 @@ export type RegimeMarketContext = {
   spreadLiquidity: RegimeSpreadLiquidityContext;
   timeOfDay: RegimeTimeOfDayContext;
   structure: RegimeMarketStructure | null;
+  contextFeeds: RegimeContextFeedsSnapshot;
 };
 
 export type RegimeRawStrategySignal = {

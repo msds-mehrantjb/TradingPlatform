@@ -8,9 +8,11 @@ import {
   buildRegimeOrderIntent,
   buildRegimeTargetOrder,
   buildRegimeMarketContext,
+  buildRegimeMarketSnapshot,
   buildRawRegimeCondition,
   calculateRegimeDecision,
   buildDirectionalStrategyResult,
+  buildRegimeFeatureSnapshot,
   buildOfflineRegimeLabel,
   buildRegimeMlFeatures,
   baseRegimeSettingsFromTradingSettings,
@@ -294,6 +296,94 @@ test("Regime validation clamps configuration contracts at the package boundary",
   assert.equal(hysteresisSettings.confirmationBars, 1);
   assert.equal(hysteresisSettings.immediateConfidenceThreshold, 1);
   assert.equal(hysteresisSettings.minimumDwellBars, 0);
+});
+
+test("Regime owns immutable market and feature snapshot inventory", () => {
+  const root = fileURLToPath(new URL("../src/algorithms/regime/market", import.meta.url));
+  const marketFiles = new Set(readdirSync(root));
+  const expectedFiles = [
+    "market-snapshot.ts",
+    "feature-snapshot.ts",
+    "indicators.ts",
+    "context-feeds.ts",
+    "freshness.ts",
+    "session-context.ts",
+  ];
+  for (const file of expectedFiles) {
+    assert.equal(marketFiles.has(file), true, `${file} should exist in the Regime market boundary`);
+  }
+
+  const candles = deterministicRegimeCandles();
+  const snapshot = buildRegimeMarketSnapshot({
+    symbol: "SPY",
+    primaryCandles: candles,
+    oneMinuteCandles: candles,
+    allCandles: candles,
+    regimeContextFeeds: regimeContextFeedsFixture(candles.at(-1)!.timestamp),
+  });
+  const featureSnapshot = buildRegimeFeatureSnapshot(snapshot);
+
+  assert.equal(snapshot.algorithmId, "regime");
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.primarySymbolCandles), true);
+  assert.equal(snapshot.contextFeeds.quoteFreshness.status, "fresh");
+  assert.equal(snapshot.contextFeeds.qqqRelativeStrength.availability, "available");
+  assert.equal(featureSnapshot?.algorithmId, "regime");
+  assert.equal(featureSnapshot?.contextFeedEvidence.quoteFreshness, "fresh");
+});
+
+test("Regime context feeds make external classifier evidence operational", () => {
+  const candles = deterministicRegimeCandles();
+  const market = buildRegimeMarketContext({
+    symbol: "SPY",
+    primaryCandles: candles,
+    oneMinuteCandles: candles,
+    allCandles: candles,
+    regimeContextFeeds: regimeContextFeedsFixture(candles.at(-1)!.timestamp),
+  }, liquidRegimeSettings())!;
+  const condition = buildRawRegimeCondition(market);
+
+  for (const missing of [
+    "spread quote freshness",
+    "QQQ/IWM relative strength",
+    "market breadth",
+    "VIX state",
+    "ES futures state",
+    "scheduled event state",
+  ]) {
+    assert.equal(condition.missingInputs.includes(missing), false, `${missing} should be supplied by Regime context feeds`);
+  }
+  assert.equal(condition.evidence.quoteFreshness, "fresh");
+  assert.equal(condition.evidence.qqqRelativeStrength, 0.2);
+  assert.equal(condition.evidence.iwmRelativeStrength, -0.1);
+  assert.equal(condition.evidence.marketBreadth, 1.4);
+  assert.equal(condition.evidence.vixState, 14.8);
+  assert.equal(condition.evidence.esFuturesState, 0.15);
+  assert.equal(condition.evidence.scheduledEventState, "none");
+});
+
+test("Regime scheduled-event feeds classify operational event risk", () => {
+  const candles = deterministicRegimeCandles();
+  const market = buildRegimeMarketContext({
+    symbol: "SPY",
+    primaryCandles: candles,
+    oneMinuteCandles: candles,
+    allCandles: candles,
+    regimeContextFeeds: {
+      ...regimeContextFeedsFixture(candles.at(-1)!.timestamp),
+      scheduledEconomicEvent: {
+        state: "blackout",
+        eventName: "FOMC",
+        minutesUntil: 5,
+        source: "fixture",
+      },
+    },
+  }, liquidRegimeSettings())!;
+  const condition = buildRawRegimeCondition(market);
+
+  assert.equal(condition.axes.eventRisk, "blackout");
+  assert.equal(condition.rawRegime, "event_risk");
+  assert.equal(condition.noTradeReasons.some((reason) => reason.includes("Scheduled event blackout")), true);
 });
 
 test("Regime isolation keeps settings trade history and archives separate from other algorithms", () => {
@@ -1731,6 +1821,57 @@ function deterministicBearishRegimeCandles(): MarketCandle[] {
       vwap: null,
     };
   });
+}
+
+function regimeContextFeedsFixture(timestamp: string) {
+  return {
+    quote: {
+      bid: 105.58,
+      ask: 105.6,
+      timestamp,
+      maxAgeMs: 60_000,
+      source: "fixture",
+    },
+    qqqRelativeStrength: {
+      relativeToPrimaryPercent: 0.2,
+      state: "risk_on" as const,
+      source: "fixture",
+    },
+    iwmRelativeStrength: {
+      relativeToPrimaryPercent: -0.1,
+      state: "neutral" as const,
+      source: "fixture",
+    },
+    marketBreadth: {
+      advanceDeclineRatio: 1.4,
+      percentAboveVwap: 58,
+      state: "risk_on" as const,
+      source: "fixture",
+    },
+    vix: {
+      value: 14.8,
+      changePercent: -1.2,
+      state: "risk_on" as const,
+      source: "fixture",
+    },
+    esFutures: {
+      changePercent: 0.15,
+      trend: "risk_on" as const,
+      source: "fixture",
+    },
+    scheduledEconomicEvent: {
+      state: "none" as const,
+      eventName: null,
+      minutesUntil: null,
+      source: "fixture",
+    },
+    haltLuldCircuitBreaker: {
+      haltState: "none" as const,
+      circuitBreakerState: "none" as const,
+      reason: null,
+      source: "fixture",
+    },
+  };
 }
 
 function relaxedRegimeBacktestSettings() {

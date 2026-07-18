@@ -748,8 +748,14 @@ function missingCriticalDataGate(market: RegimeMarketContext): RegimeRawStrategy
   return missing.length ? safetyGate(false, `Missing critical data: ${missing.join(", ")}`) : safetyGate(true, "Critical Regime inputs are present");
 }
 
-function staleDataGate(_market: RegimeMarketContext): RegimeRawStrategySignal {
-  return safetyGate(true, "Stale-data check requires live clock service; no stale condition detected in supplied snapshot");
+function staleDataGate(market: RegimeMarketContext): RegimeRawStrategySignal {
+  if (market.contextFeeds.quoteFreshness.status === "stale") {
+    return safetyGate(false, "Stale quote freshness blocks new Regime entries");
+  }
+  if (market.contextFeeds.quoteFreshness.status === "fresh") {
+    return safetyGate(true, "Quote freshness is within Regime limits");
+  }
+  return safetyGate(true, "Stale-data check has no quote freshness feed; no stale condition detected in supplied snapshot");
 }
 
 function extremeVolatilityGate(market: RegimeMarketContext): RegimeRawStrategySignal {
@@ -770,17 +776,38 @@ function insufficientLiquidityGate(market: RegimeMarketContext): RegimeRawStrate
     : safetyGate(true, "Liquidity is within Regime limits");
 }
 
-function eventBlackoutGate(_market: RegimeMarketContext): RegimeRawStrategySignal {
+function eventBlackoutGate(market: RegimeMarketContext): RegimeRawStrategySignal {
+  if (market.contextFeeds.scheduledEconomicEvent.state === "blackout") {
+    return safetyGate(false, "Scheduled event blackout blocks new Regime entries");
+  }
+  if (market.contextFeeds.scheduledEconomicEvent.state === "elevated") {
+    return safetyGate(false, "Elevated scheduled event risk blocks new Regime entries");
+  }
+  if (market.contextFeeds.scheduledEconomicEvent.state === "none") {
+    return safetyGate(true, "No scheduled economic event risk in supplied Regime feed");
+  }
   return safetyGate(true, "No Regime event-blackout feed is attached; gate passes until an event blackout is supplied");
 }
 
 function haltLuldGate(market: RegimeMarketContext): RegimeRawStrategySignal {
+  if (market.contextFeeds.haltLuldCircuitBreaker.haltState === "halted" || market.contextFeeds.haltLuldCircuitBreaker.haltState === "luld_pause") {
+    return safetyGate(false, market.contextFeeds.haltLuldCircuitBreaker.reason ?? "Halt/LULD state blocks new Regime entries");
+  }
   return market.latest.volume <= 0
     ? safetyGate(false, "Zero-volume latest candle may indicate halt/LULD; new Regime entries blocked")
     : safetyGate(true, "No halt/LULD condition detected in supplied snapshot");
 }
 
-function circuitBreakerGate(_market: RegimeMarketContext): RegimeRawStrategySignal {
+function circuitBreakerGate(market: RegimeMarketContext): RegimeRawStrategySignal {
+  if (market.contextFeeds.haltLuldCircuitBreaker.circuitBreakerState === "active") {
+    return safetyGate(false, market.contextFeeds.haltLuldCircuitBreaker.reason ?? "Circuit-breaker state blocks new Regime entries");
+  }
+  if (market.contextFeeds.haltLuldCircuitBreaker.circuitBreakerState === "watch") {
+    return safetyGate(false, "Circuit-breaker watch blocks new Regime entries");
+  }
+  if (market.contextFeeds.haltLuldCircuitBreaker.circuitBreakerState === "none") {
+    return safetyGate(true, "No circuit-breaker state in supplied Regime feed");
+  }
   return safetyGate(true, "No circuit-breaker state is attached; gate passes until circuit-breaker data is supplied");
 }
 

@@ -32,6 +32,7 @@ import {
 import { loadRegimeMlArtifact } from "./ml/artifact-loader.ts";
 import { buildRegimeMlFeatures } from "./ml/feature-builder.ts";
 import { predictRegimeMl } from "./ml/predictor.ts";
+import { normalizeRegimeContextFeeds, type RegimeContextFeedInput } from "./market/context-feeds.ts";
 import { buildRegimeDecisionSnapshot } from "./persistence.ts";
 import { resolveEffectiveRegimeSettings } from "./dynamic-profile.ts";
 import {
@@ -341,7 +342,10 @@ function conservativeMlEffect(result: RegimeSelectionResult, prediction: RegimeM
   return null;
 }
 
-export function buildRegimeMarketContext(marketData: MarketDataSnapshot, settings?: { slippagePerShare?: number; minimumOneMinuteVolume?: number; maxSpreadPercent?: number }): RegimeMarketContext | null {
+export function buildRegimeMarketContext(
+  marketData: MarketDataSnapshot & { regimeContextFeeds?: RegimeContextFeedInput },
+  settings?: { slippagePerShare?: number; minimumOneMinuteVolume?: number; maxSpreadPercent?: number },
+): RegimeMarketContext | null {
   const sorted = marketData.primaryCandles.slice().sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
   const regularCandles = sorted.filter((candle) => isRegularSession(candle.timestamp));
   const latest = regularCandles.at(-1);
@@ -371,6 +375,8 @@ export function buildRegimeMarketContext(marketData: MarketDataSnapshot, setting
   const volume = volumeContext(latest, averageVolume, vwap, openingRange, priorHigh, priorLow);
   const structure = marketStructureContext(sessionCandles, vwap);
   const atr = atrContext(sessionCandles, fiveMinuteCandles, latest.close);
+  const contextFeeds = normalizeRegimeContextFeeds(marketData.regimeContextFeeds, latest.timestamp);
+  const spreadLiquidity = spreadLiquidityWithQuoteFeed(spreadLiquidityContext(latest, volume, settings), contextFeeds.quoteFreshness.spreadPercent);
 
   return {
     candles: sessionCandles,
@@ -397,9 +403,10 @@ export function buildRegimeMarketContext(marketData: MarketDataSnapshot, setting
     bands: bollingerBands(closes, 20, 2),
     adx: averageDirectionalIndex(sessionCandles, Math.min(14, sessionCandles.length - 1)),
     volume,
-    spreadLiquidity: spreadLiquidityContext(latest, volume, settings),
+    spreadLiquidity,
     timeOfDay: timeOfDayContext(latest.timestamp),
     structure,
+    contextFeeds,
   };
 }
 
@@ -602,6 +609,17 @@ function spreadLiquidityContext(latest: MarketCandle, volume: ReturnType<typeof 
     volumeTooLow,
     minimumOneMinuteVolume,
     relativeVolume: volume.relativeVolume,
+  };
+}
+
+function spreadLiquidityWithQuoteFeed(base: ReturnType<typeof spreadLiquidityContext>, quoteSpreadPercent: number | null) {
+  if (quoteSpreadPercent === null || !Number.isFinite(quoteSpreadPercent)) {
+    return base;
+  }
+  return {
+    ...base,
+    spreadPercent: quoteSpreadPercent,
+    spreadTooWide: base.maxSpreadPercent > 0 && quoteSpreadPercent > base.maxSpreadPercent,
   };
 }
 

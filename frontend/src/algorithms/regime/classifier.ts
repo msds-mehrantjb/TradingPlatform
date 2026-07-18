@@ -184,19 +184,26 @@ export function classifyRawRegime(
       volumeTrend: volumeTrendLabel(market),
       spreadPercent: market.spreadLiquidity.spreadPercent,
       spreadTooWide: features.spreadTooWide,
-      quoteFreshness: "unknown",
-      qqqRelativeStrength: "unknown",
-      iwmRelativeStrength: "unknown",
-      marketBreadth: "unknown",
-      vixState: "unknown",
-      esFuturesState: "unknown",
-      scheduledEventState: axes.eventRisk,
+      quoteFreshness: market.contextFeeds.quoteFreshness.status,
+      quoteAgeMs: market.contextFeeds.quoteFreshness.ageMs,
+      qqqRelativeStrength: relativeStrengthEvidence(market.contextFeeds.qqqRelativeStrength.relativeToPrimaryPercent, market.contextFeeds.qqqRelativeStrength.state),
+      iwmRelativeStrength: relativeStrengthEvidence(market.contextFeeds.iwmRelativeStrength.relativeToPrimaryPercent, market.contextFeeds.iwmRelativeStrength.state),
+      marketBreadth: market.contextFeeds.marketBreadth.advanceDeclineRatio ?? market.contextFeeds.marketBreadth.state,
+      vixState: market.contextFeeds.vix.value ?? market.contextFeeds.vix.state,
+      esFuturesState: market.contextFeeds.esFutures.changePercent ?? market.contextFeeds.esFutures.trend,
+      scheduledEventState: market.contextFeeds.scheduledEconomicEvent.state === "unknown" ? axes.eventRisk : market.contextFeeds.scheduledEconomicEvent.state,
+      haltLuldState: market.contextFeeds.haltLuldCircuitBreaker.haltState,
+      circuitBreakerState: market.contextFeeds.haltLuldCircuitBreaker.circuitBreakerState,
       timeOfDay: market.timeOfDay.label,
       noTradeReasons,
     },
     missingInputs,
     timestamp: market.latest.timestamp,
   };
+}
+
+function relativeStrengthEvidence(value: number | null, state: string): number | string {
+  return value ?? state;
 }
 
 export function classifyRegimeAxes(
@@ -210,7 +217,7 @@ export function classifyRegimeAxes(
     structure: classifyStructureAxis(market, features, noTradeReasons),
     liquidity: classifyLiquidityAxis(market, features),
     session: classifySessionAxis(market),
-    eventRisk: classifyEventRiskAxis(noTradeReasons),
+    eventRisk: classifyEventRiskAxis(market, noTradeReasons),
   };
 }
 
@@ -460,8 +467,18 @@ function classifySessionAxis(market: RegimeMarketContext): RegimeAxes["session"]
   return "closing";
 }
 
-function classifyEventRiskAxis(noTradeReasons: string[]): RegimeAxes["eventRisk"] {
-  return noTradeReasons.some((reason) => reason.toLowerCase().includes("event blackout")) ? "blackout" : "none";
+function classifyEventRiskAxis(market: RegimeMarketContext, noTradeReasons: string[]): RegimeAxes["eventRisk"] {
+  const scheduledState = market.contextFeeds.scheduledEconomicEvent.state;
+  if (scheduledState === "blackout") {
+    return "blackout";
+  }
+  if (scheduledState === "elevated") {
+    return "elevated";
+  }
+  if (noTradeReasons.some((reason) => reason.toLowerCase().includes("event blackout"))) {
+    return "blackout";
+  }
+  return "none";
 }
 
 function missingClassifierInputs(market: RegimeMarketContext, features: RegimeClassifierFeatures): string[] {
@@ -472,12 +489,12 @@ function missingClassifierInputs(market: RegimeMarketContext, features: RegimeCl
   if (!market.structure) missing.push("higher-high/higher-low structure");
   if (features.adx === null) missing.push("ADX");
   if (features.atr === null || features.atrPercentile === null) missing.push("ATR percentile");
-  missing.push("spread quote freshness");
-  missing.push("QQQ/IWM relative strength");
-  missing.push("market breadth");
-  missing.push("VIX state");
-  missing.push("ES futures state");
-  missing.push("scheduled event state");
+  if (market.contextFeeds.quoteFreshness.status === "unknown") missing.push("spread quote freshness");
+  if (market.contextFeeds.qqqRelativeStrength.availability === "unknown" || market.contextFeeds.iwmRelativeStrength.availability === "unknown") missing.push("QQQ/IWM relative strength");
+  if (market.contextFeeds.marketBreadth.availability === "unknown") missing.push("market breadth");
+  if (market.contextFeeds.vix.availability === "unknown") missing.push("VIX state");
+  if (market.contextFeeds.esFutures.availability === "unknown") missing.push("ES futures state");
+  if (market.contextFeeds.scheduledEconomicEvent.availability === "unknown") missing.push("scheduled event state");
   return missing;
 }
 

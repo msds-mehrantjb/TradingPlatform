@@ -12,6 +12,7 @@ It may use shared read-only market/account data, logging, persistence, a common 
 | --- | --- | --- |
 | Shared contracts | `frontend/src/trading/shared/*` | Market data, account, order-intent, and gate-result types shared without algorithm state. |
 | Regime core | `frontend/src/algorithms/regime/*` | Pure TypeScript Regime decision logic, strategy routing, aggregation, dynamic profiles, sizing, intent building, diagnostics, and persistence helpers. |
+| Regime market boundary | `frontend/src/algorithms/regime/market/*` | Immutable Regime market snapshots, read-only feature snapshots, context-feed adapters, quote freshness, indicators, and session context. |
 | Regime ML | `frontend/src/algorithms/regime/ml/*` | Point-in-time feature building, artifact validation/loading, conservative prediction, offline labels, validation, and promotion policy. |
 | Regime backtest | `frontend/src/algorithms/regime/backtest/*` | Dedicated Regime replay engine, execution simulation, metrics, diagnostics, walk-forward summaries, and runner integration. |
 | Backend Regime API | `backend/app/algorithms/regime/*` | Persistence, API routes, and staged paper rollout status. |
@@ -28,6 +29,19 @@ These package-root files are owned exclusively by the Regime algorithm:
 | `versions.ts` | Algorithm, settings, strategy-catalog, and profile versions. |
 | `config.ts` | Regime defaults and thresholds. |
 | `validation.ts` | Regime configuration and contract validation. |
+
+## Market Snapshot Boundary
+
+Regime consumes shared raw market-data services as read-only input, then converts supplied candles and optional context feeds into its own immutable snapshot boundary:
+
+| Component | Dedicated responsibility |
+| --- | --- |
+| `market/market-snapshot.ts` | Immutable Regime input snapshot for candles and context feeds. |
+| `market/feature-snapshot.ts` | Read-only outbound Regime feature export for analytics and ML consumers. |
+| `market/indicators.ts` | Regime-owned indicator export surface. |
+| `market/context-feeds.ts` | Adapter for quote freshness, QQQ/IWM relative strength, breadth, VIX, ES futures, scheduled events, halt/LULD, and circuit-breaker state. |
+| `market/freshness.ts` | Quote freshness contract and resolver. |
+| `market/session-context.ts` | Regime session-phase context. |
 
 ## Authoritative Flow
 
