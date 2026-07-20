@@ -3,8 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import UTC, datetime, timedelta
 
-from backend.app.ml.features import ForbiddenMLFeatureFieldError, build_candidate_meta_features
-from backend.app.ml.forecast_oos import (
+from backend.app.algorithms.meta_strategy.forecast.oos_features import (
     ForecastFallbackFeature,
     ForecastFeatureLeakageError,
     OutOfSampleForecastFeature,
@@ -13,6 +12,7 @@ from backend.app.ml.forecast_oos import (
     select_live_forecast_feature,
     validate_oos_fold,
 )
+from backend.app.algorithms.meta_strategy.ml_features import ForbiddenMLFeatureFieldError, build_candidate_meta_features
 from backend.tests.test_decision_snapshot_v2_archive import CONFIG_HASH, NOW, snapshot
 
 
@@ -172,4 +172,3 @@ class OutOfSampleForecastFeatureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

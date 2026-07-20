@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from backend.app.domain.models import ContextSignal, Direction, FamilyScore, MetaModelPrediction, OrderPlan, RegimeState, Signal, StrategyFamily
-from backend.app.ml.features import ForbiddenMLFeatureFieldError, build_candidate_meta_features, candidate_meta_feature_schema_hash
+from backend.app.algorithms.meta_strategy.ml_features import ForbiddenMLFeatureFieldError, build_candidate_meta_features, candidate_meta_feature_schema_hash
 from backend.app.strategies.registry import directional_strategy_input_ids
 from backend.tests.test_decision_snapshot_v2_archive import CONFIG_HASH, NOW, SESSION_DATE, ensemble, snapshot
 from backend.tests.test_family_aware_ensemble import strategy_signal
@@ -163,4 +163,3 @@ class CandidateMetaFeatureBuilderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -1,0 +1,285 @@
+{
+  "manifest_version": "meta_strategy_coverage_manifest_v1",
+  "algorithm_id": "meta_strategy",
+  "required_fields": [
+    "component_id",
+    "component_type",
+    "implementation_path",
+    "test_path",
+    "positive_case",
+    "negative_case",
+    "boundary_case",
+    "missing_input_case",
+    "determinism_case",
+    "isolation_case"
+  ],
+  "coverage_groups": [
+    {
+      "component_type": "strategy.directional",
+      "test_path": "backend/tests/meta_strategy/test_every_strategy.py",
+      "positive_case": "MetaStrategyStep9DirectionalStrategiesTest::test_every_directional_strategy_has_focused_behavior_coverage[buy-or-sell]",
+      "negative_case": "MetaStrategyStep9DirectionalStrategiesTest::test_every_directional_strategy_has_focused_behavior_coverage[hold]",
+      "boundary_case": "MetaStrategyStep9DirectionalStrategiesTest::test_every_directional_strategy_has_focused_behavior_coverage[exact-thresholds]",
+      "missing_input_case": "MetaStrategyStep9DirectionalStrategiesTest::test_every_directional_strategy_has_focused_behavior_coverage[missing-inputs]",
+      "determinism_case": "MetaStrategyStep9DirectionalStrategiesTest::test_every_directional_strategy_has_focused_behavior_coverage[determinism]",
+      "isolation_case": "MetaStrategyStep8StrategyRegistryTest::test_strategy_modules_do_not_import_databases_brokers_apis_or_legacy_strategies",
+      "components": [
+        {
+          "component_id": "multi_timeframe_trend_alignment",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/multi_timeframe_trend_alignment.py"
+        },
+        {
+          "component_id": "first_pullback_after_open",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/first_pullback_after_open.py"
+        },
+        {
+          "component_id": "vwap_trend_continuation",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/vwap_trend_continuation.py"
+        },
+        {
+          "component_id": "opening_range_breakout",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/opening_range_breakout.py"
+        },
+        {
+          "component_id": "volatility_breakout",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/volatility_breakout.py"
+        },
+        {
+          "component_id": "failed_breakout_reversal",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/failed_breakout_reversal.py"
+        },
+        {
+          "component_id": "liquidity_sweep_reversal",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/liquidity_sweep_reversal.py"
+        },
+        {
+          "component_id": "vwap_mean_reversion",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/vwap_mean_reversion.py"
+        },
+        {
+          "component_id": "bollinger_atr_reversion",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/bollinger_atr_reversion.py"
+        },
+        {
+          "component_id": "gap_continuation_gap_fade",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/gap_continuation_gap_fade.py"
+        }
+      ]
+    },
+    {
+      "component_type": "strategy.context",
+      "test_path": "backend/tests/meta_strategy/test_context.py",
+      "positive_case": "MetaStrategyStep10ContextModulesTest::test_context_modules_adjust_only_and_never_generate_trades",
+      "negative_case": "MetaStrategyStep10ContextModulesTest::test_context_modules_adjust_only_and_never_generate_trades",
+      "boundary_case": "MetaStrategyStep10ContextModulesTest::test_context_adjustment_limits_are_enforced",
+      "missing_input_case": "MetaStrategyStep10ContextModulesTest::test_missing_context_fails_safely",
+      "determinism_case": "MetaStrategyStep10ContextModulesTest::test_context_modules_adjust_only_and_never_generate_trades",
+      "isolation_case": "MetaStrategyStep10ContextModulesTest::test_context_sources_do_not_encode_directional_signals",
+      "components": [
+        {
+          "component_id": "relative_strength_qqq_iwm",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/context/relative_strength_qqq_iwm.py"
+        },
+        {
+          "component_id": "market_breadth_momentum",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/context/market_breadth_momentum.py"
+        },
+        {
+          "component_id": "economic_event_context",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/context/economic_event_context.py"
+        },
+        {
+          "component_id": "market_structure_context",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/context/market_structure_context.py"
+        },
+        {
+          "component_id": "volume_confirmation",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/context/volume_confirmation.py"
+        },
+        {
+          "component_id": "vwap_position_context",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/context/vwap_position_context.py"
+        }
+      ]
+    },
+    {
+      "component_type": "strategy.regime",
+      "test_path": "backend/tests/meta_strategy/test_regime.py",
+      "positive_case": "MetaStrategyStep11RegimeModulesTest::test_regime_modules_describe_environment_without_casting_votes",
+      "negative_case": "MetaStrategyStep11RegimeModulesTest::test_regime_modules_describe_environment_without_casting_votes",
+      "boundary_case": "MetaStrategyStep11RegimeModulesTest::test_regime_outputs_have_expected_environment_labels",
+      "missing_input_case": "MetaStrategyStep11RegimeModulesTest::test_regime_missing_data_fails_safely",
+      "determinism_case": "MetaStrategyStep11RegimeModulesTest::test_regime_results_are_persisted_with_evidence",
+      "isolation_case": "MetaStrategyStep11RegimeModulesTest::test_regime_sources_do_not_encode_directional_votes",
+      "components": [
+        {
+          "component_id": "adx_trend_strength_regime",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/regime/adx_trend_strength.py"
+        },
+        {
+          "component_id": "atr_volatility_regime",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/regime/atr_volatility_regime.py"
+        }
+      ]
+    },
+    {
+      "component_type": "strategy.safety",
+      "test_path": "backend/tests/meta_strategy/test_safety.py",
+      "positive_case": "MetaStrategyStep12SafetyInventoryTest::test_each_safety_module_has_required_behavior_coverage[trigger]",
+      "negative_case": "MetaStrategyStep12SafetyInventoryTest::test_each_safety_module_has_required_behavior_coverage[non-trigger]",
+      "boundary_case": "MetaStrategyStep12SafetyInventoryTest::test_each_safety_module_has_required_behavior_coverage[threshold-boundary]",
+      "missing_input_case": "MetaStrategyStep12SafetyInventoryTest::test_each_safety_module_has_required_behavior_coverage[missing-data]",
+      "determinism_case": "MetaStrategyStep12SafetyInventoryTest::test_each_safety_module_has_required_behavior_coverage[reason-code]",
+      "isolation_case": "MetaStrategyStep12SafetyInventoryTest::test_safety_sources_do_not_encode_directional_signals",
+      "components": [
+        {
+          "component_id": "cash_avoid_trading_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/cash_avoid_trading.py"
+        },
+        {
+          "component_id": "missing_critical_data_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/missing_critical_data.py"
+        },
+        {
+          "component_id": "stale_market_data_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/stale_market_data.py"
+        },
+        {
+          "component_id": "excessive_spread_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/excessive_spread.py"
+        },
+        {
+          "component_id": "insufficient_liquidity_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/insufficient_liquidity.py"
+        },
+        {
+          "component_id": "extreme_volatility_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/extreme_volatility.py"
+        },
+        {
+          "component_id": "economic_event_blackout_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/economic_event_blackout.py"
+        },
+        {
+          "component_id": "unsupported_session_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/unsupported_session.py"
+        },
+        {
+          "component_id": "halt_luld_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/halt_luld.py"
+        },
+        {
+          "component_id": "operational_health_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/operational_health.py"
+        }
+      ]
+    },
+    {
+      "component_type": "local_gate",
+      "implementation_path": "backend/app/algorithms/meta_strategy/local_gates.py",
+      "test_path": "backend/tests/meta_strategy/test_local_gates.py",
+      "positive_case": "MetaStrategyStep27LocalGatesTest::test_all_local_gates_have_non_triggering_pass_case",
+      "negative_case": "MetaStrategyStep27LocalGatesTest::test_each_local_gate_trigger_forces_quantity_to_zero",
+      "boundary_case": "MetaStrategyStep27LocalGatesTest::test_threshold_boundaries_pass_and_live_permission_is_explicit",
+      "missing_input_case": "MetaStrategyStep27LocalGatesTest::test_each_local_gate_trigger_forces_quantity_to_zero",
+      "determinism_case": "MetaStrategyStep27LocalGatesTest::test_each_local_gate_trigger_forces_quantity_to_zero",
+      "isolation_case": "MetaStrategyStep27LocalGatesTest::test_local_gates_do_not_import_or_apply_global_gates",
+      "components": [
+        {"component_id": "minimum_active_strategies"},
+        {"component_id": "minimum_independent_families"},
+        {"component_id": "minimum_deterministic_score"},
+        {"component_id": "minimum_deterministic_edge"},
+        {"component_id": "minimum_calibrated_success_probability"},
+        {"component_id": "maximum_uncertainty"},
+        {"component_id": "maximum_missingness"},
+        {"component_id": "maximum_ood_score"},
+        {"component_id": "minimum_model_health"},
+        {"component_id": "minimum_reward_risk_after_costs"},
+        {"component_id": "maximum_spread"},
+        {"component_id": "minimum_liquidity"},
+        {"component_id": "daily_loss_limit"},
+        {"component_id": "trade_count_limit"},
+        {"component_id": "cooldown"},
+        {"component_id": "event_blackout"},
+        {"component_id": "session_restriction"},
+        {"component_id": "paper_live_permission"}
+      ]
+    },
+    {
+      "component_type": "sizing_cap",
+      "implementation_path": "backend/app/algorithms/meta_strategy/sizing.py",
+      "test_path": "backend/tests/meta_strategy/test_sizing.py",
+      "positive_case": "MetaStrategyStep29PositionSizingTest::test_every_sizing_cap_is_visible_and_final_quantity_is_minimum_valid_cap",
+      "negative_case": "MetaStrategyStep29PositionSizingTest::test_hold_rejected_candidates_and_failed_local_gates_receive_zero_quantity",
+      "boundary_case": "MetaStrategyStep29PositionSizingTest::test_each_cap_has_focused_boundary_case",
+      "missing_input_case": "MetaStrategyStep29PositionSizingTest::test_invalid_prices_and_stop_distances_fail_safely",
+      "determinism_case": "MetaStrategyStep29PositionSizingTest::test_every_sizing_cap_is_visible_and_final_quantity_is_minimum_valid_cap",
+      "isolation_case": "MetaStrategyStep29PositionSizingTest::test_ml_risk_multiplier_cannot_increase_quantity",
+      "components": [
+        {"component_id": "risk_based_quantity"},
+        {"component_id": "position_cap_quantity"},
+        {"component_id": "buying_power_quantity"},
+        {"component_id": "liquidity_quantity"},
+        {"component_id": "maximum_share_quantity"},
+        {"component_id": "remaining_algorithm_risk_quantity"},
+        {"component_id": "global_risk_quantity_cap"}
+      ]
+    },
+    {
+      "component_type": "artifact_rule",
+      "implementation_path": "backend/app/algorithms/meta_strategy/models/artifact_loader.py",
+      "test_path": "backend/tests/meta_strategy/test_artifacts.py",
+      "positive_case": "MetaStrategyStep21ArtifactManagementTest::test_runtime_artifact_contains_required_management_metadata_and_loads_immutable",
+      "boundary_case": "MetaStrategyStep21ArtifactManagementTest::test_invalid_top_level_artifact_hash_is_rejected",
+      "missing_input_case": "MetaStrategyStep21ArtifactManagementTest::test_missing_required_runtime_metadata_is_rejected",
+      "determinism_case": "MetaStrategyStep21ArtifactManagementTest::test_invalid_top_level_artifact_hash_is_rejected",
+      "isolation_case": "MetaStrategyStep21ArtifactManagementTest::test_runtime_artifact_contains_required_management_metadata_and_loads_immutable",
+      "components": [
+        {
+          "component_id": "required_runtime_artifact_fields",
+          "negative_case": "MetaStrategyStep21ArtifactManagementTest::test_missing_required_runtime_metadata_is_rejected"
+        },
+        {
+          "component_id": "feature_schema_hash_compatibility",
+          "negative_case": "MetaStrategyStep21ArtifactManagementTest::test_incompatible_feature_schema_is_rejected"
+        },
+        {
+          "component_id": "approved_promotion_status",
+          "negative_case": "MetaStrategyStep21ArtifactManagementTest::test_unapproved_or_retired_artifacts_cannot_load"
+        },
+        {
+          "component_id": "retired_artifact_rejection",
+          "negative_case": "MetaStrategyStep21ArtifactManagementTest::test_unapproved_or_retired_artifacts_cannot_load"
+        },
+        {
+          "component_id": "rollback_artifact_required",
+          "negative_case": "MetaStrategyStep21ArtifactManagementTest::test_missing_required_runtime_metadata_is_rejected"
+        },
+        {
+          "component_id": "validation_windows_required",
+          "negative_case": "MetaStrategyStep21ArtifactManagementTest::test_runtime_artifact_contains_required_management_metadata_and_loads_immutable"
+        },
+        {
+          "component_id": "non_empty_training_holdout_metrics_and_library_metadata",
+          "negative_case": "MetaStrategyStep21ArtifactManagementTest::test_runtime_artifact_contains_required_management_metadata_and_loads_immutable"
+        },
+        {
+          "component_id": "runtime_artifact_hash_integrity",
+          "negative_case": "MetaStrategyStep21ArtifactManagementTest::test_invalid_top_level_artifact_hash_is_rejected"
+        },
+        {
+          "component_id": "nested_model_feature_schema_compatibility",
+          "negative_case": "MetaStrategyStep21ArtifactManagementTest::test_incompatible_feature_schema_is_rejected"
+        },
+        {
+          "component_id": "nested_model_hash_integrity",
+          "negative_case": "MetaStrategyStep21ArtifactManagementTest::test_invalid_nested_model_hash_is_rejected"
+        },
+        {
+          "component_id": "runtime_artifact_immutability",
+          "negative_case": "MetaStrategyStep21ArtifactManagementTest::test_runtime_artifact_contains_required_management_metadata_and_loads_immutable"
+        }
+      ]
+    }
+  ]
+}

@@ -16,7 +16,7 @@ from backend.app.domain.models import (
     TradeCandidate,
 )
 from backend.app.domain.trading_settings import trading_settings_configuration_hash
-from backend.app.ml.inference import SafeMLInferenceResult
+from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceResult
 from backend.app.algorithms.voting_ensemble.exit_policy import VOTING_ENSEMBLE_EXIT_POLICY_VERSION
 from backend.app.algorithms.voting_ensemble.order_planner import (
     VOTING_ENSEMBLE_ORDER_PLANNER_VERSION,

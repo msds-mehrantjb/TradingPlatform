@@ -12,8 +12,8 @@ from backend.app.backtesting import (
     build_ml_filter_shadow_comparison_report,
 )
 from backend.app.domain.models import Signal
-from backend.app.ml.features import MLFeatureSet
-from backend.app.ml.inference import SafeMLInferenceConfig, apply_safe_ml_inference
+from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceConfig, apply_safe_ml_inference
+from backend.app.algorithms.meta_strategy.ml_features import MLFeatureSet
 
 
 NOW = datetime(2026, 1, 5, 15, 45, tzinfo=UTC)

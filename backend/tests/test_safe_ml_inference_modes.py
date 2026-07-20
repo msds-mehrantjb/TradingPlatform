@@ -4,8 +4,8 @@ import unittest
 from datetime import UTC, date, datetime
 
 from backend.app.domain.models import OperatingMode, Signal
-from backend.app.ml.features import MLFeatureSet
-from backend.app.ml.inference import SafeMLInferenceConfig, apply_safe_ml_inference
+from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceConfig, apply_safe_ml_inference
+from backend.app.algorithms.meta_strategy.ml_features import MLFeatureSet
 
 
 SCHEMA_HASH = "candidate-meta-schema-test"

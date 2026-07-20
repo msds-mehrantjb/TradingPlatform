@@ -4,7 +4,6 @@ import asyncio
 import csv
 import ctypes
 import hashlib
-import importlib
 import json
 import os
 import re
@@ -28,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .alpaca import AlpacaClient, demo_bars, local_market_status
 from .algorithms.regime.api import router as regime_router
 from .algorithms.regime.api import REGIME_REPOSITORY
+from .algorithms.meta_strategy.api import router as meta_strategy_router
 from .algorithms.voting_ensemble.api import router as voting_ensemble_router
 from .algorithms.wca.api import router as wca_router
 from .algorithms.weighted_voting.api import router as weighted_voting_router
@@ -67,6 +67,7 @@ app.include_router(voting_ensemble_router)
 app.include_router(weighted_voting_router)
 app.include_router(wca_router)
 app.include_router(regime_router)
+app.include_router(meta_strategy_router)
 app.include_router(risk_router)
 
 DAILY_BACKTEST_REFRESH_STATUS: dict = {
@@ -755,11 +756,10 @@ def compact_meta_strategy_training_status(result: dict) -> dict:
 
 
 def run_meta_strategy_training(*, symbol: str, session_date: str | None, min_rows: int, v2: bool = False) -> dict:
-    from . import meta_strategy_training
+    from backend.app.algorithms.meta_strategy.training import trainer as meta_strategy_trainer
 
-    reloaded = importlib.reload(meta_strategy_training)
-    trainer = reloaded.train_and_validate_meta_model_v2 if v2 else reloaded.train_meta_strategy_baselines
-    result = trainer(
+    trainer_fn = meta_strategy_trainer.train_and_validate_meta_model_v2 if v2 else meta_strategy_trainer.train_meta_strategy_baselines
+    result = trainer_fn(
         decision_snapshot_dir=DECISION_SNAPSHOT_DIR,
         symbol=symbol,
         session_date=session_date,
@@ -767,7 +767,7 @@ def run_meta_strategy_training(*, symbol: str, session_date: str | None, min_row
     )
     return {
         **result,
-        "trainerSourcePath": str(Path(reloaded.__file__).resolve()),
+        "trainerSourcePath": str(Path(meta_strategy_trainer.__file__).resolve()),
         "trainerVersion": "meta_model_v2" if v2 else "directional_trust_v2",
     }
 
@@ -4592,7 +4592,7 @@ def cached_voting_ensemble_purged_walk_forward_ml_comparison(
         return json.loads(cache_path.read_text(encoding="utf-8"))
 
     from backend.app.algorithms.voting_ensemble import merge_voting_ensemble_replay_snapshot_labels
-    from backend.app.meta_strategy_training import train_and_validate_meta_model_v2
+    from backend.app.algorithms.meta_strategy.training import train_and_validate_meta_model_v2
 
     source_roots = []
     source_summaries = []
@@ -6254,10 +6254,16 @@ async def news_summary(
         selected_model, summary = await ask_ollama_for_trade_summary(snapshot)
         source = f"Ollama {selected_model}"
         warning = ""
+        ollama_health = {
+            "status": "ready",
+            "baseUrl": settings.ollama_base_url,
+            "model": selected_model,
+            "action": "",
+        }
     except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
         summary = fallback_trade_summary(snapshot)
         source = "Rule fallback"
-        warning = f"Ollama summary unavailable: {exc}"
+        warning, ollama_health = ollama_failure_context(exc)
 
     return {
         "source": source,
@@ -6266,6 +6272,47 @@ async def news_summary(
         "summary": summary,
         "snapshot": snapshot,
         "warning": warning,
+        "ollamaHealth": ollama_health,
+    }
+
+
+def ollama_failure_context(exc: Exception) -> tuple[str, dict]:
+    base_url = settings.ollama_base_url
+    model = settings.ollama_model
+    detail = str(exc) or exc.__class__.__name__
+    status = "unavailable"
+    action = f"Start Ollama with `ollama serve`, or set OLLAMA_BASE_URL to the running Ollama host. Current URL: {base_url}."
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        detail = f"HTTP {status_code}: {exc.response.text[:240]}"
+        if status_code in {400, 404}:
+            status = "model_not_available"
+            action = f"Install or select the configured model with `ollama pull {model}`, or set OLLAMA_MODEL to an installed local model."
+        else:
+            status = "http_error"
+            action = f"Check the Ollama server at {base_url}; it returned HTTP {status_code}."
+    elif isinstance(exc, httpx.ConnectError):
+        status = "connection_failed"
+        detail = f"Could not connect to {base_url}."
+    elif isinstance(exc, httpx.TimeoutException):
+        status = "timeout"
+        action = f"Ollama at {base_url} did not respond before the timeout; try a smaller model or restart Ollama."
+    elif isinstance(exc, json.JSONDecodeError):
+        status = "invalid_json"
+        detail = "Ollama returned non-JSON content for a JSON-only summary prompt."
+        action = f"Retry the summary or use a more instruction-following model than {model}."
+    elif isinstance(exc, ValueError) and "No Ollama model available" in detail:
+        status = "model_not_available"
+        action = f"No local Ollama model matched the dashboard preference. Run `ollama pull {model}` or set OLLAMA_MODEL."
+
+    warning = f"Ollama summary unavailable ({status}): {action}"
+    return warning, {
+        "status": status,
+        "baseUrl": base_url,
+        "model": model,
+        "detail": detail,
+        "action": action,
     }
 
 

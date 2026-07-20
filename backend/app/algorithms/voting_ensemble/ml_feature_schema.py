@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from backend.app.ml.features import MLFeatureSpec
+from backend.app.algorithms.meta_strategy.ml_features import MLFeatureSpec
 
 
 VOTING_ENSEMBLE_ML_FEATURE_SCHEMA_VERSION = "voting_ensemble_ml_feature_schema_v1"
@@ -43,4 +43,3 @@ def voting_ensemble_ml_feature_schema() -> tuple[MLFeatureSpec, ...]:
 
 def voting_ensemble_ml_feature_names() -> tuple[str, ...]:
     return tuple(spec.name for spec in voting_ensemble_ml_feature_schema())
-

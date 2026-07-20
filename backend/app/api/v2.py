@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, date, datetime
-from typing import Any, Literal
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
@@ -16,12 +16,7 @@ from backend.app.backtesting import (
     ReplayEngineConfig,
     ReplayResult,
     V1ShadowDecision,
-    build_deterministic_v2_activation_report,
-    build_dynamic_policy_activation_report,
-    build_dynamic_policy_shadow_report,
     build_historical_shadow_comparison,
-    build_ml_filter_rollout_report,
-    build_ml_risk_modifier_experiment_report,
     build_paper_shadow_report,
 )
 from backend.app.backtesting.event_replay import ReplayDecisionSnapshot
@@ -42,7 +37,6 @@ from backend.app.domain.models import (
     GateResult,
     GateStatus,
     GlobalGateDecision,
-    OperatingMode,
     OrderPlan,
     RegimeState,
     Signal,
@@ -50,8 +44,7 @@ from backend.app.domain.models import (
 )
 from backend.app.ensemble import FamilyAwareDeterministicEnsemble
 from backend.app.gates import GLOBAL_GATE_ENGINE_VERSION, GlobalGateEngine, GlobalGateInput
-from backend.app.ml.features import MLFeatureSet
-from backend.app.ml.inference import SafeMLInferenceConfig, apply_safe_ml_inference
+from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceConfig
 from backend.app.strategies import StrategyEvaluationContext, resolve_strategy
 from backend.app.strategies.context import (
     MarketBreadthMomentumContext,
@@ -111,17 +104,6 @@ class EnsembleEvaluationRequest(DomainModel):
     sessionDate: date | None = None
 
 
-class MetaModelPredictionRequest(DomainModel):
-    deterministicSignal: Signal
-    featureSet: MLFeatureSet
-    modelArtifact: dict[str, Any] | None = None
-    config: SafeMLInferenceConfig = Field(default_factory=SafeMLInferenceConfig)
-    hardGatesPassed: bool = True
-    candidateEligible: bool = True
-    sessionDate: date | None = None
-    predictedAt: datetime | None = None
-
-
 class OrderValidationRequest(DomainModel):
     orderPlan: OrderPlan
     gateDecision: GlobalGateDecision | None = None
@@ -165,39 +147,6 @@ class HistoricalShadowComparisonRequest(BacktestRunRequest):
 
 class PaperShadowEvaluateRequest(ReplayDecisionEvaluateRequest):
     baselineDecision: CurrentBaselineDecision | None = None
-
-
-class DeterministicV2ActivationEvaluateRequest(ReplayDecisionEvaluateRequest):
-    rollbackMode: Literal["NONE", "V1", "DISABLE_AUTOMATIC_ENTRIES"] = "NONE"
-
-
-class MLFilterRolloutEvaluateRequest(ReplayDecisionEvaluateRequest):
-    stage: Literal["SHADOW", "FILTER_ACTIVE"] = "SHADOW"
-    shadowComparisonPassed: bool = False
-    modelArtifact: dict[str, Any] | None = None
-    fallbackBehavior: Literal["DETERMINISTIC_BASELINE", "NO_TRADE"] = "DETERMINISTIC_BASELINE"
-
-
-class DynamicPolicyShadowEvaluateRequest(ReplayDecisionEvaluateRequest):
-    dynamicPolicyShadowEnabled: bool = True
-
-
-class DynamicPolicyActivationEvaluateRequest(ReplayDecisionEvaluateRequest):
-    requestedStages: list[
-        Literal[
-            "RISK_REDUCTION",
-            "STOP_AND_QUANTITY",
-            "STRATEGY_FAMILY_ENTRY",
-            "TARGET_AND_TIME_STOP",
-            "TRAILING_BEHAVIOR",
-        ]
-    ] = Field(default_factory=lambda: ["RISK_REDUCTION"])
-    stageComparisons: list[dict[str, Any]]
-    rollback: dict[str, Any] = Field(default_factory=dict)
-
-
-class MLRiskModifierExperimentEvaluateRequest(DynamicPolicyActivationEvaluateRequest):
-    mlRiskModifierConfig: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.post("/features/evaluate")
@@ -249,26 +198,6 @@ def evaluate_ensemble(request: EnsembleEvaluationRequest) -> ApiV2Envelope:
         payload={"ensembleDecision": decision.model_dump(mode="json")},
         configuration_hash=decision.configurationHash,
         explanation="Family-aware deterministic ensemble was evaluated by the backend.",
-    )
-
-
-@router.post("/meta-model/predict")
-def predict_meta_model(request: MetaModelPredictionRequest) -> ApiV2Envelope:
-    result = apply_safe_ml_inference(
-        deterministic_signal=request.deterministicSignal,
-        feature_set=request.featureSet,
-        model_artifact=request.modelArtifact,
-        config=request.config,
-        hard_gates_passed=request.hardGatesPassed,
-        candidate_eligible=request.candidateEligible,
-        session_date=request.sessionDate,
-        predicted_at=request.predictedAt,
-    )
-    return envelope(
-        endpoint_version="meta_model_predict_v1",
-        payload={"mlResult": result.model_dump(mode="json")},
-        configuration_hash=result.configurationHash,
-        explanation="Safe V2 ML inference was evaluated as a candidate filter; it did not submit orders.",
     )
 
 
@@ -373,204 +302,6 @@ def evaluate_paper_shadow(request: PaperShadowEvaluateRequest) -> ApiV2Envelope:
     )
 
 
-@router.post("/activation/deterministic/evaluate")
-def evaluate_deterministic_v2_activation(request: DeterministicV2ActivationEvaluateRequest) -> ApiV2Envelope:
-    snapshot = build_replay_engine(
-        ml_config=SafeMLInferenceConfig(mode=OperatingMode.SHADOW, fallbackBehavior="DETERMINISTIC_BASELINE")
-    ).decide_at(
-        symbol=request.symbol,
-        sessionDate=request.sessionDate,
-        evaluationTimestamp=request.evaluationTimestamp,
-        spy1mCandles=request.spy1mCandles,
-        spy5mCandles=request.spy5mCandles,
-        spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles,
-        iwmCandles=request.iwmCandles,
-        priorDayOHLC=request.priorDayOHLC,
-        premarket=request.premarket,
-        openingRange=request.openingRange,
-        breadthComponents=request.breadthComponents,
-        economicEventState=request.economicEventState,
-    )
-    report = build_deterministic_v2_activation_report(snapshot=snapshot, rollbackMode=request.rollbackMode)
-    DECISION_SNAPSHOTS[f"deterministic_v2_active:{snapshot.snapshotId}"] = report.deterministicDecisionSnapshot
-    return envelope(
-        endpoint_version="deterministic_v2_activation_evaluate_v1",
-        payload={"report": report.model_dump(mode="json")},
-        configuration_hash=report.activationConfig.configurationHash,
-        explanation=(
-            "Deterministic V2 static baseline was evaluated for paper-entry eligibility. "
-            "ML and dynamic policy were recorded as shadow-only and rollback mode was applied before submission."
-        ),
-    )
-
-
-@router.post("/ml-filter/rollout/evaluate")
-def evaluate_ml_filter_rollout(request: MLFilterRolloutEvaluateRequest) -> ApiV2Envelope:
-    deterministic_snapshot = build_replay_engine(
-        ml_config=SafeMLInferenceConfig(mode=OperatingMode.SHADOW, fallbackBehavior="DETERMINISTIC_BASELINE"),
-        ml_model_artifact=request.modelArtifact,
-    ).decide_at(
-        symbol=request.symbol,
-        sessionDate=request.sessionDate,
-        evaluationTimestamp=request.evaluationTimestamp,
-        spy1mCandles=request.spy1mCandles,
-        spy5mCandles=request.spy5mCandles,
-        spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles,
-        iwmCandles=request.iwmCandles,
-        priorDayOHLC=request.priorDayOHLC,
-        premarket=request.premarket,
-        openingRange=request.openingRange,
-        breadthComponents=request.breadthComponents,
-        economicEventState=request.economicEventState,
-    )
-    filter_mode = OperatingMode.SHADOW if request.stage == "SHADOW" else OperatingMode.FILTER
-    filtered_snapshot = build_replay_engine(
-        ml_config=SafeMLInferenceConfig(mode=filter_mode, fallbackBehavior=request.fallbackBehavior),
-        ml_model_artifact=request.modelArtifact,
-    ).decide_at(
-        symbol=request.symbol,
-        sessionDate=request.sessionDate,
-        evaluationTimestamp=request.evaluationTimestamp,
-        spy1mCandles=request.spy1mCandles,
-        spy5mCandles=request.spy5mCandles,
-        spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles,
-        iwmCandles=request.iwmCandles,
-        priorDayOHLC=request.priorDayOHLC,
-        premarket=request.premarket,
-        openingRange=request.openingRange,
-        breadthComponents=request.breadthComponents,
-        economicEventState=request.economicEventState,
-    )
-    report = build_ml_filter_rollout_report(
-        snapshot=filtered_snapshot,
-        deterministicBaselineSnapshot=deterministic_snapshot,
-        stage=request.stage,
-        shadowComparisonPassed=request.shadowComparisonPassed,
-        fallbackBehavior=request.fallbackBehavior,
-    )
-    DECISION_SNAPSHOTS[f"ml_filter:{request.stage.lower()}:{filtered_snapshot.snapshotId}"] = report.mlFilteredDecisionSnapshot
-    return envelope(
-        endpoint_version="ml_filter_rollout_evaluate_v1",
-        payload={"report": report.model_dump(mode="json")},
-        configuration_hash=report.rolloutConfig.configurationHash,
-        explanation=(
-            "Meta-Model V2 filter rollout was evaluated for paper trading. "
-            "Shadow mode records only; filter-active mode can only accept or reject deterministic candidates and keeps static sizing."
-        ),
-    )
-
-
-@router.post("/dynamic-policy/shadow/evaluate")
-def evaluate_dynamic_policy_shadow(request: DynamicPolicyShadowEvaluateRequest) -> ApiV2Envelope:
-    if not request.dynamicPolicyShadowEnabled:
-        raise HTTPException(status_code=400, detail="dynamic policy shadow must be enabled for this endpoint")
-    snapshot = build_replay_engine(
-        ml_config=SafeMLInferenceConfig(mode=OperatingMode.SHADOW, fallbackBehavior="DETERMINISTIC_BASELINE")
-    ).decide_at(
-        symbol=request.symbol,
-        sessionDate=request.sessionDate,
-        evaluationTimestamp=request.evaluationTimestamp,
-        spy1mCandles=request.spy1mCandles,
-        spy5mCandles=request.spy5mCandles,
-        spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles,
-        iwmCandles=request.iwmCandles,
-        priorDayOHLC=request.priorDayOHLC,
-        premarket=request.premarket,
-        openingRange=request.openingRange,
-        breadthComponents=request.breadthComponents,
-        economicEventState=request.economicEventState,
-    )
-    report = build_dynamic_policy_shadow_report(snapshot=snapshot)
-    DECISION_SNAPSHOTS[f"dynamic_policy_shadow:{snapshot.snapshotId}"] = report.deterministicDecisionSnapshot
-    return envelope(
-        endpoint_version="dynamic_policy_shadow_evaluate_v1",
-        payload={"report": report.model_dump(mode="json")},
-        configuration_hash=report.shadowConfig.configurationHash,
-        explanation=(
-            "Deterministic dynamic policy was calculated in shadow mode beside the static paper path. "
-            "Static settings remain the execution source; the dynamic policy did not submit orders."
-        ),
-    )
-
-
-@router.post("/dynamic-policy/activation/evaluate")
-def evaluate_dynamic_policy_activation(request: DynamicPolicyActivationEvaluateRequest) -> ApiV2Envelope:
-    snapshot = build_replay_engine(
-        ml_config=SafeMLInferenceConfig(mode=OperatingMode.FILTER, fallbackBehavior="DETERMINISTIC_BASELINE")
-    ).decide_at(
-        symbol=request.symbol,
-        sessionDate=request.sessionDate,
-        evaluationTimestamp=request.evaluationTimestamp,
-        spy1mCandles=request.spy1mCandles,
-        spy5mCandles=request.spy5mCandles,
-        spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles,
-        iwmCandles=request.iwmCandles,
-        priorDayOHLC=request.priorDayOHLC,
-        premarket=request.premarket,
-        openingRange=request.openingRange,
-        breadthComponents=request.breadthComponents,
-        economicEventState=request.economicEventState,
-    )
-    report = build_dynamic_policy_activation_report(
-        snapshot=snapshot,
-        stageComparisons=request.stageComparisons,
-        requestedStages=request.requestedStages,
-        rollback=request.rollback,
-    )
-    DECISION_SNAPSHOTS[f"dynamic_policy_active:{snapshot.snapshotId}"] = report.deterministicDecisionSnapshot
-    return envelope(
-        endpoint_version="dynamic_policy_activation_evaluate_v1",
-        payload={"report": report.model_dump(mode="json")},
-        configuration_hash=report.activationConfig.configurationHash,
-        explanation=(
-            "Deterministic dynamic policy activation was evaluated with staged capability gates, rollback controls, "
-            "authoritative global risk/broker reconciliation, and ML limited to trade filtering."
-        ),
-    )
-
-
-@router.post("/ml-risk-modifier/experiment/evaluate")
-def evaluate_ml_risk_modifier_experiment(request: MLRiskModifierExperimentEvaluateRequest) -> ApiV2Envelope:
-    snapshot = build_replay_engine(
-        ml_config=SafeMLInferenceConfig(mode=OperatingMode.FILTER, fallbackBehavior="DETERMINISTIC_BASELINE")
-    ).decide_at(
-        symbol=request.symbol,
-        sessionDate=request.sessionDate,
-        evaluationTimestamp=request.evaluationTimestamp,
-        spy1mCandles=request.spy1mCandles,
-        spy5mCandles=request.spy5mCandles,
-        spy15mCandles=request.spy15mCandles,
-        qqqCandles=request.qqqCandles,
-        iwmCandles=request.iwmCandles,
-        priorDayOHLC=request.priorDayOHLC,
-        premarket=request.premarket,
-        openingRange=request.openingRange,
-        breadthComponents=request.breadthComponents,
-        economicEventState=request.economicEventState,
-    )
-    report = build_ml_risk_modifier_experiment_report(
-        snapshot=snapshot,
-        stageComparisons=request.stageComparisons,
-        requestedStages=request.requestedStages,
-        dynamicPolicyRollback=request.rollback,
-        config=request.mlRiskModifierConfig,
-    )
-    return envelope(
-        endpoint_version="ml_risk_modifier_experiment_evaluate_v1",
-        payload={"report": report.model_dump(mode="json")},
-        configuration_hash=report.config.configurationHash,
-        explanation=(
-            "Bounded ML risk modification was evaluated as a separate experiment. "
-            "The deterministic dynamic policy remains fallback and the feature is disabled by default until validated."
-        ),
-    )
-
-
 @router.post("/backtests/shadow-comparison")
 def run_historical_shadow_comparison(request: HistoricalShadowComparisonRequest) -> ApiV2Envelope:
     replay = build_replay_engine().replay_session(
@@ -615,29 +346,6 @@ def get_backtest(backtest_id: str) -> ApiV2Envelope:
         payload=payload,
         configuration_hash=hash_payload(payload),
         explanation="Stored V2 backtest result retrieved by id.",
-    )
-
-
-@router.get("/models/status")
-def get_models_status() -> ApiV2Envelope:
-    payload = {
-        "metaModel": {
-            "mode": "OFF",
-            "status": "not_loaded",
-            "modelVersion": "none",
-            "configurationHash": "safe_ml_inference_config_v1",
-            "reasonCodes": ["ml.model_unavailable", "ml.off_by_default"],
-        },
-        "familyWeighting": {
-            "enabled": False,
-            "configurationHash": "ml_family_weighting_disabled",
-        },
-    }
-    return envelope(
-        endpoint_version="models_status_v1",
-        payload=payload,
-        configuration_hash=hash_payload(payload),
-        explanation="Current V2 model status returned without applying ML to orders.",
     )
 
 

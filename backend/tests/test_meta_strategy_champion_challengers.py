@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from backend.app.meta_strategy_training import (
+from backend.app.algorithms.meta_strategy.training.training_core import (
     load_meta_strategy_model_artifact_data,
     train_meta_strategy_baselines,
 )
@@ -139,11 +139,11 @@ class patched_optional_boosters_unavailable:
     def __init__(self) -> None:
         self.patches = [
             patch(
-                "backend.app.meta_strategy_training.train_xgboost_booster",
+                "backend.app.algorithms.meta_strategy.training.training_core.train_xgboost_booster",
                 return_value={"available": False, "reason": "xgboost import failed: not installed"},
             ),
             patch(
-                "backend.app.meta_strategy_training.train_lightgbm_booster",
+                "backend.app.algorithms.meta_strategy.training.training_core.train_lightgbm_booster",
                 return_value={"available": False, "reason": "lightgbm import failed: not installed"},
             ),
         ]

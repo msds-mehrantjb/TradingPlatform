@@ -4,7 +4,7 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
-from backend.app.meta_strategy_training import (
+from backend.app.algorithms.meta_strategy.training.training_core import (
     DEFAULT_META_LABEL_VERSION,
     build_meta_model_v2_validation_package,
     train_and_validate_meta_model_v2,

@@ -1,0 +1,4642 @@
+{
+  "algorithmId": "meta_strategy",
+  "capturedAtUtc": "2026-01-05T15:45:00Z",
+  "dataPolicy": {
+    "containsCredentials": false,
+    "containsPrivateAccountInformation": false,
+    "marketDataFeed": "deterministic_synthetic",
+    "requiresLiveFeed": false
+  },
+  "featureSchemaHash": "988c0cfe6ab86361",
+  "fixtures": [
+    {
+      "candidateGeometry": {
+        "candidateId": "trending_market-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 100.02,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 99.0,
+        "targetPrice": 102.0
+      },
+      "category": "market_regime",
+      "contextOutputs": [
+        {
+          "confidence": 0.8,
+          "contextId": "relative_strength_qqq_iwm",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "confirm_long",
+            "distanceFromVwapAtr": 0.0,
+            "eventImportance": "low",
+            "eventState": "none",
+            "reclaimRejectionState": "near_vwap",
+            "volumeTrend": "normal"
+          }
+        },
+        {
+          "confidence": 0.7,
+          "contextId": "market_breadth_momentum",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "confirm_long",
+            "distanceFromVwapAtr": 0.0,
+            "eventImportance": "low",
+            "eventState": "none",
+            "reclaimRejectionState": "near_vwap",
+            "volumeTrend": "normal"
+          }
+        }
+      ],
+      "description": "Strong trend context where trend and breakout families support a long candidate.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.782,
+        "confidence": 0.782,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-34862f01a95689d8",
+        "direction": 1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.782,
+        "holdConfidence": 0.218,
+        "opposingFamilies": [],
+        "rawScore": 0.662,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "BUY",
+        "supportingFamilies": [
+          "TREND",
+          "BREAKOUT"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.86,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.74,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.7912,
+          "confidence": 0.7912,
+          "family": "TREND",
+          "holdScore": 0.2088,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.5328,
+          "confidence": 0.5328,
+          "family": "BREAKOUT",
+          "holdScore": 0.4672,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "798a2803bb64234d",
+        "featureCount": 266,
+        "missingFeatureCount": 16,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "BUY",
+          "deterministic_score": 0.782,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.5328,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.7912,
+          "regime_category": "strong_trend",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.782,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "TREND",
+          "strongest_family_score": 0.7912,
+          "target_distance": 2.0,
+          "weakest_family": "BREAKOUT",
+          "weakest_family_score": 0.5328
+        }
+      },
+      "finalCandidateStatus": "ACCEPTED",
+      "id": "trending_market",
+      "label": {
+        "candidateSide": "BUY",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 100.02,
+        "firstBarrierHit": "TARGET",
+        "labelId": "35cd1726640b3031",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 102.0,
+        "protectiveStopPrice": 99.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.68,
+        "candidateAccepted": true,
+        "deterministicSignal": "BUY",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": 0.98,
+        "featureMissingness": 0.12030075187969924,
+        "finalSignal": "BUY",
+        "mlWouldAcceptCandidate": true,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 0.76,
+        "successProbability": 0.68
+      },
+      "modelProbabilities": {
+        "BUY": 0.68,
+        "HOLD": 0.24,
+        "SELL": 0.08
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 1,
+        "features": {
+          "atrPercentile": 0.58,
+          "breakoutFit": 0.72,
+          "gapSessionFit": 0.3,
+          "meanReversionFit": 0.22,
+          "realizedVolatilityPercentile": 0.55,
+          "reversalFit": 0.2,
+          "trendFit": 0.92,
+          "trendStrengthAdx": 34.0
+        },
+        "label": "strong_trend",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "NORMAL"
+      },
+      "riskMultiplier": 0.76
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": "range_bound_market-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 99.98,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 101.0,
+        "targetPrice": 98.0
+      },
+      "category": "market_regime",
+      "contextOutputs": [
+        {
+          "confidence": 0.6,
+          "contextId": "market_structure_context",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "confirm_short",
+            "distanceFromVwapAtr": 0.0,
+            "eventImportance": "low",
+            "eventState": "none",
+            "reclaimRejectionState": "near_vwap",
+            "volumeTrend": "normal"
+          }
+        }
+      ],
+      "description": "Range context where reversal and mean-reversion evidence produce a short candidate.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.0,
+        "confidence": 0.5896,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-519e2828ce78d013",
+        "direction": -1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": -0.5896,
+        "holdConfidence": 0.4104,
+        "opposingFamilies": [],
+        "rawScore": -0.6376,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.5896,
+        "signal": "SELL",
+        "supportingFamilies": [
+          "REVERSAL",
+          "MEAN_REVERSION"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.8,
+          "dataReady": true,
+          "direction": -1,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "SELL"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.72,
+          "dataReady": true,
+          "direction": -1,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "SELL"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.0,
+          "confidence": 0.656,
+          "family": "REVERSAL",
+          "holdScore": 0.344,
+          "reliability": 1.0,
+          "sellScore": 0.656
+        },
+        {
+          "buyScore": 0.0,
+          "confidence": 0.6192,
+          "family": "MEAN_REVERSION",
+          "holdScore": 0.3808,
+          "reliability": 1.0,
+          "sellScore": 0.6192
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "2466c1efde96ef64",
+        "featureCount": 266,
+        "missingFeatureCount": 18,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "SELL",
+          "deterministic_score": -0.5896,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.0,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": -0.6192,
+          "family_reversal_score": -0.656,
+          "family_trend_score": 0.0,
+          "regime_category": "range",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.5896,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "REVERSAL",
+          "strongest_family_score": -0.656,
+          "target_distance": 2.0,
+          "weakest_family": "MEAN_REVERSION",
+          "weakest_family_score": -0.6192
+        }
+      },
+      "finalCandidateStatus": "ACCEPTED",
+      "id": "range_bound_market",
+      "label": {
+        "candidateSide": "SELL",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 99.98,
+        "firstBarrierHit": "TARGET",
+        "labelId": "6551582f8401d8e1",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 98.0,
+        "protectiveStopPrice": 101.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.67,
+        "candidateAccepted": true,
+        "deterministicSignal": "SELL",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": 0.95,
+        "featureMissingness": 0.13533834586466165,
+        "finalSignal": "SELL",
+        "mlWouldAcceptCandidate": true,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 0.7525000000000001,
+        "successProbability": 0.67
+      },
+      "modelProbabilities": {
+        "BUY": 0.12,
+        "HOLD": 0.21,
+        "SELL": 0.67
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 0,
+        "features": {
+          "atrPercentile": 0.42,
+          "breakoutFit": 0.28,
+          "gapSessionFit": 0.25,
+          "meanReversionFit": 0.86,
+          "realizedVolatilityPercentile": 0.38,
+          "reversalFit": 0.82,
+          "trendFit": 0.24,
+          "trendStrengthAdx": 15.0
+        },
+        "label": "range",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "NORMAL"
+      },
+      "riskMultiplier": 0.7525000000000001
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": null,
+        "eligible": false,
+        "entryPrice": null,
+        "orderType": "NO_ORDER",
+        "quantity": 0,
+        "stopPrice": null,
+        "targetPrice": null
+      },
+      "category": "market_regime",
+      "contextOutputs": [
+        {
+          "confidence": 0.7,
+          "contextId": "economic_event_context",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "reduce_long",
+            "distanceFromVwapAtr": 0.0,
+            "eventImportance": "medium",
+            "eventState": "watch",
+            "reclaimRejectionState": "near_vwap",
+            "volumeTrend": "normal"
+          }
+        }
+      ],
+      "description": "Volatility expansion with a global gate block despite deterministic long evidence.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.0,
+        "confidence": 0.4868,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-8d2e71fbef087422",
+        "direction": 0,
+        "eligible": false,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.5132,
+        "holdConfidence": 0.4868,
+        "opposingFamilies": [],
+        "rawScore": 0.5692,
+        "reasonCodes": [
+          "ensemble.safety_blocked_new_entry"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "HOLD",
+        "supportingFamilies": [
+          "TREND",
+          "BREAKOUT"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.68,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.83,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.408,
+          "confidence": 0.408,
+          "family": "TREND",
+          "holdScore": 0.592,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.7304,
+          "confidence": 0.7304,
+          "family": "BREAKOUT",
+          "holdScore": 0.2696,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "ca610c534fc239b2",
+        "featureCount": 266,
+        "missingFeatureCount": 22,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "HOLD",
+          "deterministic_score": 0.5132,
+          "entry_distance": 0.0,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.7304,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.408,
+          "regime_category": "event_shock",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 0.0,
+          "signal_margin": 0.0,
+          "spread_dollars": 0.02,
+          "stop_distance": 0.0,
+          "strongest_family": "BREAKOUT",
+          "strongest_family_score": 0.7304,
+          "target_distance": 0.0,
+          "weakest_family": "TREND",
+          "weakest_family_score": 0.408
+        }
+      },
+      "finalCandidateStatus": "HOLD_DIAGNOSTIC",
+      "id": "high_volatility_market",
+      "label": {
+        "candidateSide": "HOLD",
+        "costAdjustedTrainingLabel": null,
+        "eligibleForTraining": false,
+        "entryPrice": null,
+        "firstBarrierHit": "NO_CANDIDATE",
+        "labelId": "c74d886c24aaf0b6",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": null,
+        "protectiveStopPrice": null,
+        "reasonCodes": [
+          "hold_snapshot_diagnostic_only"
+        ],
+        "strictOutcomeLabel": null
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.0,
+        "candidateAccepted": false,
+        "deterministicSignal": "HOLD",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": -1.06,
+        "featureMissingness": 0.16541353383458646,
+        "finalSignal": "HOLD",
+        "mlWouldAcceptCandidate": false,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.candidate_ineligible",
+          "ml.cannot_create_trade_from_hold",
+          "ml.current_candidate_probability_below_threshold",
+          "ml.hard_gate_failed_no_bypass",
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 1.0,
+        "successProbability": 0.0
+      },
+      "modelProbabilities": {
+        "BUY": 0.76,
+        "HOLD": 0.18,
+        "SELL": 0.06
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 1,
+        "features": {
+          "atrPercentile": 0.95,
+          "breakoutFit": 0.88,
+          "gapSessionFit": 0.45,
+          "meanReversionFit": 0.2,
+          "realizedVolatilityPercentile": 0.97,
+          "reversalFit": 0.35,
+          "trendFit": 0.6,
+          "trendStrengthAdx": 26.0
+        },
+        "label": "event_shock",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "EXTREME"
+      },
+      "riskMultiplier": 1.0
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": null,
+        "eligible": false,
+        "entryPrice": null,
+        "orderType": "NO_ORDER",
+        "quantity": 0,
+        "stopPrice": null,
+        "targetPrice": null
+      },
+      "category": "market_regime",
+      "contextOutputs": [
+        {
+          "confidence": 0.4,
+          "contextId": "volume_confirmation",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "neutral",
+            "distanceFromVwapAtr": 0.0,
+            "eventImportance": "low",
+            "eventState": "none",
+            "reclaimRejectionState": "near_vwap",
+            "volumeTrend": "flat"
+          }
+        }
+      ],
+      "description": "Low-volatility compression where deterministic score is too weak to create a trade.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.0,
+        "confidence": 0.9604,
+        "dataReady": false,
+        "decisionId": "ensemble-v2-ceec26349707ba32",
+        "direction": 0,
+        "eligible": false,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.0396,
+        "holdConfidence": 0.9604,
+        "opposingFamilies": [],
+        "rawScore": 0.0396,
+        "reasonCodes": [
+          "ensemble.insufficient_eligible_directional_strategies",
+          "ensemble.weak_raw_score",
+          "ensemble.weak_final_score",
+          "ensemble.insufficient_independent_family_support"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "HOLD",
+        "supportingFamilies": []
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.55,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.22,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.0396,
+          "confidence": 0.0396,
+          "family": "BREAKOUT",
+          "holdScore": 0.9604,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "5266e9f49f3b1c1e",
+        "featureCount": 266,
+        "missingFeatureCount": 23,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "HOLD",
+          "deterministic_score": 0.0396,
+          "entry_distance": 0.0,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.0396,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.0,
+          "regime_category": "low_volatility",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 0.0,
+          "signal_margin": 0.0,
+          "spread_dollars": 0.02,
+          "stop_distance": 0.0,
+          "strongest_family": "BREAKOUT",
+          "strongest_family_score": 0.0396,
+          "target_distance": 0.0,
+          "weakest_family": "BREAKOUT",
+          "weakest_family_score": 0.0396
+        }
+      },
+      "finalCandidateStatus": "HOLD_DIAGNOSTIC",
+      "id": "low_volatility_market",
+      "label": {
+        "candidateSide": "HOLD",
+        "costAdjustedTrainingLabel": null,
+        "eligibleForTraining": false,
+        "entryPrice": null,
+        "firstBarrierHit": "NO_CANDIDATE",
+        "labelId": "4d6ba6a1b3b147a2",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": null,
+        "protectiveStopPrice": null,
+        "reasonCodes": [
+          "hold_snapshot_diagnostic_only"
+        ],
+        "strictOutcomeLabel": null
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.0,
+        "candidateAccepted": false,
+        "deterministicSignal": "HOLD",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": -1.06,
+        "featureMissingness": 0.17293233082706766,
+        "finalSignal": "HOLD",
+        "mlWouldAcceptCandidate": false,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.candidate_ineligible",
+          "ml.cannot_create_trade_from_hold",
+          "ml.current_candidate_probability_below_threshold",
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 1.0,
+        "successProbability": 0.0
+      },
+      "modelProbabilities": {
+        "BUY": 0.41,
+        "HOLD": 0.44,
+        "SELL": 0.15
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 0,
+        "features": {
+          "atrPercentile": 0.12,
+          "breakoutFit": 0.18,
+          "gapSessionFit": 0.18,
+          "meanReversionFit": 0.42,
+          "realizedVolatilityPercentile": 0.1,
+          "reversalFit": 0.38,
+          "trendFit": 0.3,
+          "trendStrengthAdx": 12.0
+        },
+        "label": "low_volatility",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "LOW"
+      },
+      "riskMultiplier": 1.0
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": "breakout-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 100.02,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 99.0,
+        "targetPrice": 102.0
+      },
+      "category": "market_setup",
+      "contextOutputs": [
+        {
+          "confidence": 0.8,
+          "contextId": "volume_confirmation",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "confirm_long",
+            "distanceFromVwapAtr": 0.0,
+            "eventImportance": "low",
+            "eventState": "none",
+            "reclaimRejectionState": "near_vwap",
+            "volumeTrend": "rising"
+          }
+        }
+      ],
+      "description": "Breakout case with breakout and trend families independently aligned long.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.6791,
+        "confidence": 0.6791,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-ceec26349707ba32",
+        "direction": 1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.6791,
+        "holdConfidence": 0.3209,
+        "opposingFamilies": [],
+        "rawScore": 0.6151,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "BUY",
+        "supportingFamilies": [
+          "TREND",
+          "BREAKOUT"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.66,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.88,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.79,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.462,
+          "confidence": 0.462,
+          "family": "TREND",
+          "holdScore": 0.538,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.7682,
+          "confidence": 0.7682,
+          "family": "BREAKOUT",
+          "holdScore": 0.2318,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "376881f996d2d4ae",
+        "featureCount": 266,
+        "missingFeatureCount": 18,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "BUY",
+          "deterministic_score": 0.6791,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.7682,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.462,
+          "regime_category": "breakout_expansion",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.6791,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "BREAKOUT",
+          "strongest_family_score": 0.7682,
+          "target_distance": 2.0,
+          "weakest_family": "TREND",
+          "weakest_family_score": 0.462
+        }
+      },
+      "finalCandidateStatus": "ACCEPTED",
+      "id": "breakout",
+      "label": {
+        "candidateSide": "BUY",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 100.02,
+        "firstBarrierHit": "TARGET",
+        "labelId": "38d91de762e45cd4",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 102.0,
+        "protectiveStopPrice": 99.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.7,
+        "candidateAccepted": true,
+        "deterministicSignal": "BUY",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": 1.04,
+        "featureMissingness": 0.13533834586466165,
+        "finalSignal": "BUY",
+        "mlWouldAcceptCandidate": true,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 0.7749999999999999,
+        "successProbability": 0.7
+      },
+      "modelProbabilities": {
+        "BUY": 0.7,
+        "HOLD": 0.22,
+        "SELL": 0.08
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 1,
+        "features": {
+          "atrPercentile": 0.74,
+          "breakoutFit": 0.92,
+          "gapSessionFit": 0.3,
+          "meanReversionFit": 0.2,
+          "realizedVolatilityPercentile": 0.78,
+          "reversalFit": 0.18,
+          "trendFit": 0.7,
+          "trendStrengthAdx": 24.0
+        },
+        "label": "breakout_expansion",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "HIGH"
+      },
+      "riskMultiplier": 0.7749999999999999
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": "failed_breakout-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 99.98,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 101.0,
+        "targetPrice": 98.0
+      },
+      "category": "market_setup",
+      "contextOutputs": [
+        {
+          "confidence": 0.9,
+          "contextId": "market_structure_context",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "confirm_short",
+            "distanceFromVwapAtr": 0.0,
+            "eventImportance": "low",
+            "eventState": "none",
+            "reclaimRejectionState": "near_vwap",
+            "volumeTrend": "normal"
+          }
+        }
+      ],
+      "description": "Failed upside breakout with reversal and mean-reversion families aligned short.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.0,
+        "confidence": 0.56,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-519e2828ce78d013",
+        "direction": -1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": -0.56,
+        "holdConfidence": 0.44,
+        "opposingFamilies": [],
+        "rawScore": -0.632,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.56,
+        "signal": "SELL",
+        "supportingFamilies": [
+          "REVERSAL",
+          "MEAN_REVERSION"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.7,
+          "dataReady": true,
+          "direction": -1,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "SELL"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.86,
+          "dataReady": true,
+          "direction": -1,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "SELL"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.0,
+          "confidence": 0.774,
+          "family": "REVERSAL",
+          "holdScore": 0.226,
+          "reliability": 1.0,
+          "sellScore": 0.774
+        },
+        {
+          "buyScore": 0.0,
+          "confidence": 0.49,
+          "family": "MEAN_REVERSION",
+          "holdScore": 0.51,
+          "reliability": 1.0,
+          "sellScore": 0.49
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "c464690b8f413c1d",
+        "featureCount": 266,
+        "missingFeatureCount": 18,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "SELL",
+          "deterministic_score": -0.56,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.0,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": -0.49,
+          "family_reversal_score": -0.774,
+          "family_trend_score": 0.0,
+          "regime_category": "failed_breakout_reversal",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.56,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "REVERSAL",
+          "strongest_family_score": -0.774,
+          "target_distance": 2.0,
+          "weakest_family": "MEAN_REVERSION",
+          "weakest_family_score": -0.49
+        }
+      },
+      "finalCandidateStatus": "ACCEPTED",
+      "id": "failed_breakout",
+      "label": {
+        "candidateSide": "SELL",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 99.98,
+        "firstBarrierHit": "TARGET",
+        "labelId": "4f79f726fdba9bac",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 98.0,
+        "protectiveStopPrice": 101.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.72,
+        "candidateAccepted": true,
+        "deterministicSignal": "SELL",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": 1.1,
+        "featureMissingness": 0.13533834586466165,
+        "finalSignal": "SELL",
+        "mlWouldAcceptCandidate": true,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 0.79,
+        "successProbability": 0.72
+      },
+      "modelProbabilities": {
+        "BUY": 0.1,
+        "HOLD": 0.18,
+        "SELL": 0.72
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": -1,
+        "features": {
+          "atrPercentile": 0.55,
+          "breakoutFit": 0.34,
+          "gapSessionFit": 0.2,
+          "meanReversionFit": 0.7,
+          "realizedVolatilityPercentile": 0.51,
+          "reversalFit": 0.9,
+          "trendFit": 0.26,
+          "trendStrengthAdx": 18.0
+        },
+        "label": "failed_breakout_reversal",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "NORMAL"
+      },
+      "riskMultiplier": 0.79
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": "gap_up_session-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 100.02,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 99.0,
+        "targetPrice": 102.0
+      },
+      "category": "market_setup",
+      "contextOutputs": [
+        {
+          "confidence": 0.7,
+          "contextId": "relative_strength_qqq_iwm",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "confirm_long",
+            "distanceFromVwapAtr": 0.0,
+            "eventImportance": "low",
+            "eventState": "none",
+            "reclaimRejectionState": "near_vwap",
+            "volumeTrend": "normal"
+          }
+        }
+      ],
+      "description": "Gap-up continuation candidate with trend confirmation.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.6596,
+        "confidence": 0.6596,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-3a06bd1c26ace674",
+        "direction": 1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.6596,
+        "holdConfidence": 0.3404,
+        "opposingFamilies": [],
+        "rawScore": 0.6036,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "BUY",
+        "supportingFamilies": [
+          "TREND",
+          "GAP_SESSION"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.82,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.69,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.4692,
+          "confidence": 0.4692,
+          "family": "TREND",
+          "holdScore": 0.5308,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.738,
+          "confidence": 0.738,
+          "family": "GAP_SESSION",
+          "holdScore": 0.262,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "4c8756649f9debbd",
+        "featureCount": 266,
+        "missingFeatureCount": 18,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "BUY",
+          "deterministic_score": 0.6596,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.0,
+          "family_gap_session_score": 0.738,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.4692,
+          "regime_category": "gap_up_continuation",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.6596,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "GAP_SESSION",
+          "strongest_family_score": 0.738,
+          "target_distance": 2.0,
+          "weakest_family": "TREND",
+          "weakest_family_score": 0.4692
+        }
+      },
+      "finalCandidateStatus": "ACCEPTED",
+      "id": "gap_up_session",
+      "label": {
+        "candidateSide": "BUY",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 100.02,
+        "firstBarrierHit": "TARGET",
+        "labelId": "c33773605b6debda",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 102.0,
+        "protectiveStopPrice": 99.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.66,
+        "candidateAccepted": true,
+        "deterministicSignal": "BUY",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": 0.92,
+        "featureMissingness": 0.13533834586466165,
+        "finalSignal": "BUY",
+        "mlWouldAcceptCandidate": true,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 0.745,
+        "successProbability": 0.66
+      },
+      "modelProbabilities": {
+        "BUY": 0.66,
+        "HOLD": 0.24,
+        "SELL": 0.1
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 1,
+        "features": {
+          "atrPercentile": 0.68,
+          "breakoutFit": 0.64,
+          "gapSessionFit": 0.9,
+          "meanReversionFit": 0.25,
+          "realizedVolatilityPercentile": 0.66,
+          "reversalFit": 0.22,
+          "trendFit": 0.68,
+          "trendStrengthAdx": 29.0
+        },
+        "label": "gap_up_continuation",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "HIGH"
+      },
+      "riskMultiplier": 0.745
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": "gap_down_session-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 99.98,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 101.0,
+        "targetPrice": 98.0
+      },
+      "category": "market_setup",
+      "contextOutputs": [
+        {
+          "confidence": 0.7,
+          "contextId": "relative_strength_qqq_iwm",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "confirm_short",
+            "distanceFromVwapAtr": 0.0,
+            "eventImportance": "low",
+            "eventState": "none",
+            "reclaimRejectionState": "near_vwap",
+            "volumeTrend": "normal"
+          }
+        }
+      ],
+      "description": "Gap-down continuation candidate with trend confirmation.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.0,
+        "confidence": 0.5204,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-3a06bd1c26ace674",
+        "direction": -1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": -0.5204,
+        "holdConfidence": 0.4796,
+        "opposingFamilies": [],
+        "rawScore": -0.5764,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.5204,
+        "signal": "SELL",
+        "supportingFamilies": [
+          "TREND",
+          "GAP_SESSION"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.8,
+          "dataReady": true,
+          "direction": -1,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "SELL"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.68,
+          "dataReady": true,
+          "direction": -1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "SELL"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.0,
+          "confidence": 0.4488,
+          "family": "TREND",
+          "holdScore": 0.5512,
+          "reliability": 1.0,
+          "sellScore": 0.4488
+        },
+        {
+          "buyScore": 0.0,
+          "confidence": 0.704,
+          "family": "GAP_SESSION",
+          "holdScore": 0.296,
+          "reliability": 1.0,
+          "sellScore": 0.704
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "603722d7e1197594",
+        "featureCount": 266,
+        "missingFeatureCount": 18,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "SELL",
+          "deterministic_score": -0.5204,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.0,
+          "family_gap_session_score": -0.704,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": -0.4488,
+          "regime_category": "gap_down_continuation",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.5204,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "GAP_SESSION",
+          "strongest_family_score": -0.704,
+          "target_distance": 2.0,
+          "weakest_family": "TREND",
+          "weakest_family_score": -0.4488
+        }
+      },
+      "finalCandidateStatus": "ACCEPTED",
+      "id": "gap_down_session",
+      "label": {
+        "candidateSide": "SELL",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 99.98,
+        "firstBarrierHit": "TARGET",
+        "labelId": "9d87494d576037d4",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 98.0,
+        "protectiveStopPrice": 101.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.64,
+        "candidateAccepted": true,
+        "deterministicSignal": "SELL",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": 0.86,
+        "featureMissingness": 0.13533834586466165,
+        "finalSignal": "SELL",
+        "mlWouldAcceptCandidate": true,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 0.73,
+        "successProbability": 0.64
+      },
+      "modelProbabilities": {
+        "BUY": 0.08,
+        "HOLD": 0.28,
+        "SELL": 0.64
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": -1,
+        "features": {
+          "atrPercentile": 0.7,
+          "breakoutFit": 0.62,
+          "gapSessionFit": 0.88,
+          "meanReversionFit": 0.24,
+          "realizedVolatilityPercentile": 0.68,
+          "reversalFit": 0.24,
+          "trendFit": 0.66,
+          "trendStrengthAdx": 30.0
+        },
+        "label": "gap_down_continuation",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "HIGH"
+      },
+      "riskMultiplier": 0.73
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": null,
+        "eligible": false,
+        "entryPrice": null,
+        "orderType": "NO_ORDER",
+        "quantity": 0,
+        "stopPrice": null,
+        "targetPrice": null
+      },
+      "category": "market_safety",
+      "contextOutputs": [
+        {
+          "confidence": 1.0,
+          "contextId": "economic_event_context",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "veto_long",
+            "distanceFromVwapAtr": 0.0,
+            "eventImportance": "high",
+            "eventState": "blackout",
+            "reclaimRejectionState": "near_vwap",
+            "volumeTrend": "normal"
+          }
+        }
+      ],
+      "description": "Event-risk session where local/global safety blocks the otherwise valid deterministic setup.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.0,
+        "confidence": 0.7576,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-8d2e71fbef087422",
+        "direction": 0,
+        "eligible": false,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.2424,
+        "holdConfidence": 0.7576,
+        "opposingFamilies": [],
+        "rawScore": 0.3224,
+        "reasonCodes": [
+          "ensemble.safety_blocked_new_entry"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "HOLD",
+        "supportingFamilies": [
+          "TREND",
+          "BREAKOUT"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.74,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.76,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.3256,
+          "confidence": 0.3256,
+          "family": "TREND",
+          "holdScore": 0.6744,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.3192,
+          "confidence": 0.3192,
+          "family": "BREAKOUT",
+          "holdScore": 0.6808,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "28ed58c940a66ac8",
+        "featureCount": 266,
+        "missingFeatureCount": 22,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "HOLD",
+          "deterministic_score": 0.2424,
+          "entry_distance": 0.0,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.3192,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.3256,
+          "regime_category": "event_blackout",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 0.0,
+          "signal_margin": 0.0,
+          "spread_dollars": 0.02,
+          "stop_distance": 0.0,
+          "strongest_family": "TREND",
+          "strongest_family_score": 0.3256,
+          "target_distance": 0.0,
+          "weakest_family": "BREAKOUT",
+          "weakest_family_score": 0.3192
+        }
+      },
+      "finalCandidateStatus": "HOLD_DIAGNOSTIC",
+      "id": "event_risk_session",
+      "label": {
+        "candidateSide": "HOLD",
+        "costAdjustedTrainingLabel": null,
+        "eligibleForTraining": false,
+        "entryPrice": null,
+        "firstBarrierHit": "NO_CANDIDATE",
+        "labelId": "abe02759831815c5",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": null,
+        "protectiveStopPrice": null,
+        "reasonCodes": [
+          "hold_snapshot_diagnostic_only"
+        ],
+        "strictOutcomeLabel": null
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.0,
+        "candidateAccepted": false,
+        "deterministicSignal": "HOLD",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": -1.06,
+        "featureMissingness": 0.16541353383458646,
+        "finalSignal": "HOLD",
+        "mlWouldAcceptCandidate": false,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.candidate_ineligible",
+          "ml.cannot_create_trade_from_hold",
+          "ml.current_candidate_probability_below_threshold",
+          "ml.hard_gate_failed_no_bypass",
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 1.0,
+        "successProbability": 0.0
+      },
+      "modelProbabilities": {
+        "BUY": 0.71,
+        "HOLD": 0.22,
+        "SELL": 0.07
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 0,
+        "features": {
+          "atrPercentile": 0.93,
+          "breakoutFit": 0.42,
+          "gapSessionFit": 0.4,
+          "meanReversionFit": 0.2,
+          "realizedVolatilityPercentile": 0.96,
+          "reversalFit": 0.32,
+          "trendFit": 0.44,
+          "trendStrengthAdx": 22.0
+        },
+        "label": "event_blackout",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "EXTREME"
+      },
+      "riskMultiplier": 1.0
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": null,
+        "eligible": false,
+        "entryPrice": null,
+        "orderType": "NO_ORDER",
+        "quantity": 0,
+        "stopPrice": null,
+        "targetPrice": null
+      },
+      "category": "market_safety",
+      "contextOutputs": [
+        {
+          "confidence": 0.8,
+          "contextId": "volume_confirmation",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "reduce_long",
+            "distanceFromVwapAtr": 0.0,
+            "eventImportance": "low",
+            "eventState": "none",
+            "reclaimRejectionState": "near_vwap",
+            "volumeTrend": "thin"
+          }
+        }
+      ],
+      "description": "Poor-liquidity session where spread and volume inputs reject candidate application.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.0,
+        "confidence": 0.702,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-ceec26349707ba32",
+        "direction": 0,
+        "eligible": false,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.298,
+        "holdConfidence": 0.702,
+        "opposingFamilies": [],
+        "rawScore": 0.362,
+        "reasonCodes": [
+          "ensemble.safety_blocked_new_entry"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "HOLD",
+        "supportingFamilies": [
+          "TREND",
+          "BREAKOUT"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.7,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.72,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.364,
+          "confidence": 0.364,
+          "family": "TREND",
+          "holdScore": 0.636,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.36,
+          "confidence": 0.36,
+          "family": "BREAKOUT",
+          "holdScore": 0.64,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "920456b72d5061c4",
+        "featureCount": 266,
+        "missingFeatureCount": 22,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "HOLD",
+          "deterministic_score": 0.298,
+          "entry_distance": 0.0,
+          "expected_transaction_cost": 0.22,
+          "family_breakout_score": 0.36,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.364,
+          "regime_category": "poor_liquidity",
+          "relative_volume": 0.35,
+          "reward_risk_ratio": 0.0,
+          "signal_margin": 0.0,
+          "spread_dollars": 0.18,
+          "stop_distance": 0.0,
+          "strongest_family": "TREND",
+          "strongest_family_score": 0.364,
+          "target_distance": 0.0,
+          "weakest_family": "BREAKOUT",
+          "weakest_family_score": 0.36
+        }
+      },
+      "finalCandidateStatus": "HOLD_DIAGNOSTIC",
+      "id": "poor_liquidity_session",
+      "label": {
+        "candidateSide": "HOLD",
+        "costAdjustedTrainingLabel": null,
+        "eligibleForTraining": false,
+        "entryPrice": null,
+        "firstBarrierHit": "NO_CANDIDATE",
+        "labelId": "3071524d51cf9427",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": null,
+        "protectiveStopPrice": null,
+        "reasonCodes": [
+          "hold_snapshot_diagnostic_only"
+        ],
+        "strictOutcomeLabel": null
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.0,
+        "candidateAccepted": false,
+        "deterministicSignal": "HOLD",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": -1.22,
+        "featureMissingness": 0.16541353383458646,
+        "finalSignal": "HOLD",
+        "mlWouldAcceptCandidate": false,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.candidate_ineligible",
+          "ml.cannot_create_trade_from_hold",
+          "ml.current_candidate_probability_below_threshold",
+          "ml.hard_gate_failed_no_bypass",
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 1.0,
+        "successProbability": 0.0
+      },
+      "modelProbabilities": {
+        "BUY": 0.69,
+        "HOLD": 0.22,
+        "SELL": 0.09
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 0,
+        "features": {
+          "atrPercentile": 0.45,
+          "breakoutFit": 0.5,
+          "gapSessionFit": 0.18,
+          "meanReversionFit": 0.25,
+          "realizedVolatilityPercentile": 0.42,
+          "reversalFit": 0.28,
+          "trendFit": 0.52,
+          "trendStrengthAdx": 20.0
+        },
+        "label": "poor_liquidity",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "NORMAL"
+      },
+      "riskMultiplier": 1.0
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": "buy_candidate-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 100.02,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 99.0,
+        "targetPrice": 102.0
+      },
+      "category": "candidate",
+      "contextOutputs": [
+        {
+          "confidence": 0.6,
+          "contextId": "vwap_position_context",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "confirm_long",
+            "distanceFromVwapAtr": 0.42,
+            "eventImportance": "low",
+            "eventState": "none",
+            "reclaimRejectionState": "above_rising_vwap",
+            "volumeTrend": "normal"
+          }
+        }
+      ],
+      "description": "Canonical deterministic buy candidate with complete order geometry.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.6156,
+        "confidence": 0.6156,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-e80e613b182aa022",
+        "direction": 1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.6156,
+        "holdConfidence": 0.3844,
+        "opposingFamilies": [],
+        "rawScore": 0.5676,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "BUY",
+        "supportingFamilies": [
+          "TREND",
+          "BREAKOUT"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.84,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.78,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.6048,
+          "confidence": 0.6048,
+          "family": "TREND",
+          "holdScore": 0.3952,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.5304,
+          "confidence": 0.5304,
+          "family": "BREAKOUT",
+          "holdScore": 0.4696,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "05b89e03cddfee8c",
+        "featureCount": 266,
+        "missingFeatureCount": 18,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "BUY",
+          "deterministic_score": 0.6156,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.5304,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.6048,
+          "regime_category": "weak_trend",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.6156,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "TREND",
+          "strongest_family_score": 0.6048,
+          "target_distance": 2.0,
+          "weakest_family": "BREAKOUT",
+          "weakest_family_score": 0.5304
+        }
+      },
+      "finalCandidateStatus": "ACCEPTED",
+      "id": "buy_candidate",
+      "label": {
+        "candidateSide": "BUY",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 100.02,
+        "firstBarrierHit": "TARGET",
+        "labelId": "59d1715b25d1e15c",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 102.0,
+        "protectiveStopPrice": 99.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.63,
+        "candidateAccepted": true,
+        "deterministicSignal": "BUY",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": 0.83,
+        "featureMissingness": 0.13533834586466165,
+        "finalSignal": "BUY",
+        "mlWouldAcceptCandidate": true,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 0.7225,
+        "successProbability": 0.63
+      },
+      "modelProbabilities": {
+        "BUY": 0.63,
+        "HOLD": 0.25,
+        "SELL": 0.12
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 1,
+        "features": {
+          "atrPercentile": 0.57,
+          "breakoutFit": 0.68,
+          "gapSessionFit": 0.25,
+          "meanReversionFit": 0.34,
+          "realizedVolatilityPercentile": 0.52,
+          "reversalFit": 0.3,
+          "trendFit": 0.72,
+          "trendStrengthAdx": 23.0
+        },
+        "label": "weak_trend",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "NORMAL"
+      },
+      "riskMultiplier": 0.7225
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": "sell_candidate-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 99.98,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 101.0,
+        "targetPrice": 98.0
+      },
+      "category": "candidate",
+      "contextOutputs": [
+        {
+          "confidence": 0.6,
+          "contextId": "vwap_position_context",
+          "dataReady": true,
+          "features": {
+            "contextEffect": "confirm_short",
+            "distanceFromVwapAtr": -0.39,
+            "eventImportance": "low",
+            "eventState": "none",
+            "reclaimRejectionState": "below_falling_vwap",
+            "volumeTrend": "normal"
+          }
+        }
+      ],
+      "description": "Canonical deterministic sell candidate with complete order geometry.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.0,
+        "confidence": 0.5834,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-e80e613b182aa022",
+        "direction": -1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": -0.5834,
+        "holdConfidence": 0.4166,
+        "opposingFamilies": [],
+        "rawScore": -0.6314,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.5834,
+        "signal": "SELL",
+        "supportingFamilies": [
+          "REVERSAL",
+          "MEAN_REVERSION"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.82,
+          "dataReady": true,
+          "direction": -1,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "SELL"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.76,
+          "dataReady": true,
+          "direction": -1,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "SELL"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.0,
+          "confidence": 0.6396,
+          "family": "REVERSAL",
+          "holdScore": 0.3604,
+          "reliability": 1.0,
+          "sellScore": 0.6396
+        },
+        {
+          "buyScore": 0.0,
+          "confidence": 0.6232,
+          "family": "MEAN_REVERSION",
+          "holdScore": 0.3768,
+          "reliability": 1.0,
+          "sellScore": 0.6232
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "6dd96ca3dd1b6ce9",
+        "featureCount": 266,
+        "missingFeatureCount": 18,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "SELL",
+          "deterministic_score": -0.5834,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.0,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": -0.6232,
+          "family_reversal_score": -0.6396,
+          "family_trend_score": 0.0,
+          "regime_category": "range",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.5834,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "REVERSAL",
+          "strongest_family_score": -0.6396,
+          "target_distance": 2.0,
+          "weakest_family": "MEAN_REVERSION",
+          "weakest_family_score": -0.6232
+        }
+      },
+      "finalCandidateStatus": "ACCEPTED",
+      "id": "sell_candidate",
+      "label": {
+        "candidateSide": "SELL",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 99.98,
+        "firstBarrierHit": "TARGET",
+        "labelId": "6f63273a3c10d1a1",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 98.0,
+        "protectiveStopPrice": 101.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.65,
+        "candidateAccepted": true,
+        "deterministicSignal": "SELL",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": 0.89,
+        "featureMissingness": 0.13533834586466165,
+        "finalSignal": "SELL",
+        "mlWouldAcceptCandidate": true,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 0.7375,
+        "successProbability": 0.65
+      },
+      "modelProbabilities": {
+        "BUY": 0.1,
+        "HOLD": 0.25,
+        "SELL": 0.65
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": -1,
+        "features": {
+          "atrPercentile": 0.46,
+          "breakoutFit": 0.26,
+          "gapSessionFit": 0.2,
+          "meanReversionFit": 0.82,
+          "realizedVolatilityPercentile": 0.43,
+          "reversalFit": 0.78,
+          "trendFit": 0.22,
+          "trendStrengthAdx": 16.0
+        },
+        "label": "range",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "NORMAL"
+      },
+      "riskMultiplier": 0.7375
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": null,
+        "eligible": false,
+        "entryPrice": null,
+        "orderType": "NO_ORDER",
+        "quantity": 0,
+        "stopPrice": null,
+        "targetPrice": null
+      },
+      "category": "candidate",
+      "contextOutputs": [],
+      "description": "Diagnostic hold case produced by conflicting directional families.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.0,
+        "confidence": 1.0,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-db6d29ad0a7ccd11",
+        "direction": 0,
+        "eligible": false,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.0,
+        "holdConfidence": 1.0,
+        "opposingFamilies": [],
+        "rawScore": 0.0,
+        "reasonCodes": [
+          "ensemble.weak_raw_score",
+          "ensemble.weak_final_score",
+          "ensemble.insufficient_independent_family_support"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "HOLD",
+        "supportingFamilies": []
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.78,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.78,
+          "dataReady": true,
+          "direction": -1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "SELL"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.39,
+          "confidence": 0.39,
+          "family": "TREND",
+          "holdScore": 0.61,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.0,
+          "confidence": 0.39,
+          "family": "BREAKOUT",
+          "holdScore": 0.61,
+          "reliability": 1.0,
+          "sellScore": 0.39
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "2d850c25ab30fdc9",
+        "featureCount": 266,
+        "missingFeatureCount": 24,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "HOLD",
+          "deterministic_score": 0.0,
+          "entry_distance": 0.0,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": -0.39,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.39,
+          "regime_category": "mixed",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 0.0,
+          "signal_margin": 0.0,
+          "spread_dollars": 0.02,
+          "stop_distance": 0.0,
+          "strongest_family": "TREND",
+          "strongest_family_score": 0.39,
+          "target_distance": 0.0,
+          "weakest_family": "TREND",
+          "weakest_family_score": 0.39
+        }
+      },
+      "finalCandidateStatus": "HOLD_DIAGNOSTIC",
+      "id": "hold_candidate",
+      "label": {
+        "candidateSide": "HOLD",
+        "costAdjustedTrainingLabel": null,
+        "eligibleForTraining": false,
+        "entryPrice": null,
+        "firstBarrierHit": "NO_CANDIDATE",
+        "labelId": "8c6c6467c1008819",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": null,
+        "protectiveStopPrice": null,
+        "reasonCodes": [
+          "hold_snapshot_diagnostic_only"
+        ],
+        "strictOutcomeLabel": null
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.0,
+        "candidateAccepted": false,
+        "deterministicSignal": "HOLD",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": -1.06,
+        "featureMissingness": 0.18045112781954886,
+        "finalSignal": "HOLD",
+        "mlWouldAcceptCandidate": false,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.candidate_ineligible",
+          "ml.cannot_create_trade_from_hold",
+          "ml.current_candidate_probability_below_threshold",
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 1.0,
+        "successProbability": 0.0
+      },
+      "modelProbabilities": {
+        "BUY": 0.42,
+        "HOLD": 0.18,
+        "SELL": 0.4
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 0,
+        "features": {
+          "atrPercentile": 0.5,
+          "breakoutFit": 0.5,
+          "gapSessionFit": 0.2,
+          "meanReversionFit": 0.44,
+          "realizedVolatilityPercentile": 0.49,
+          "reversalFit": 0.45,
+          "trendFit": 0.5,
+          "trendStrengthAdx": 19.0
+        },
+        "label": "mixed",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "NORMAL"
+      },
+      "riskMultiplier": 1.0
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": "accepted_ml_candidate-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 100.02,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 99.0,
+        "targetPrice": 102.0
+      },
+      "category": "ml_policy",
+      "contextOutputs": [],
+      "description": "Active ML accepts the deterministic buy candidate and returns bounded sizing.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.5345,
+        "confidence": 0.5345,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-db6d29ad0a7ccd11",
+        "direction": 1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.5345,
+        "holdConfidence": 0.4655,
+        "opposingFamilies": [],
+        "rawScore": 0.5345,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "BUY",
+        "supportingFamilies": [
+          "TREND",
+          "BREAKOUT"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.82,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.75,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.574,
+          "confidence": 0.574,
+          "family": "TREND",
+          "holdScore": 0.426,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.495,
+          "confidence": 0.495,
+          "family": "BREAKOUT",
+          "holdScore": 0.505,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "6aeaf625a1184446",
+        "featureCount": 266,
+        "missingFeatureCount": 20,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "BUY",
+          "deterministic_score": 0.5345,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.495,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.574,
+          "regime_category": "weak_trend",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.5345,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "TREND",
+          "strongest_family_score": 0.574,
+          "target_distance": 2.0,
+          "weakest_family": "BREAKOUT",
+          "weakest_family_score": 0.495
+        }
+      },
+      "finalCandidateStatus": "ACCEPTED",
+      "id": "accepted_ml_candidate",
+      "label": {
+        "candidateSide": "BUY",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 100.02,
+        "firstBarrierHit": "TARGET",
+        "labelId": "c939aad538460802",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 102.0,
+        "protectiveStopPrice": 99.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.78,
+        "candidateAccepted": true,
+        "deterministicSignal": "BUY",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": 1.28,
+        "featureMissingness": 0.15037593984962405,
+        "finalSignal": "BUY",
+        "mlWouldAcceptCandidate": true,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 0.835,
+        "successProbability": 0.78
+      },
+      "modelProbabilities": {
+        "BUY": 0.78,
+        "HOLD": 0.17,
+        "SELL": 0.05
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 1,
+        "features": {
+          "atrPercentile": 0.54,
+          "breakoutFit": 0.66,
+          "gapSessionFit": 0.2,
+          "meanReversionFit": 0.3,
+          "realizedVolatilityPercentile": 0.51,
+          "reversalFit": 0.3,
+          "trendFit": 0.7,
+          "trendStrengthAdx": 24.0
+        },
+        "label": "weak_trend",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "NORMAL"
+      },
+      "riskMultiplier": 0.835
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": "rejected_ml_candidate-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 100.02,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 99.0,
+        "targetPrice": 102.0
+      },
+      "category": "ml_policy",
+      "contextOutputs": [],
+      "description": "Active ML rejects a deterministic buy candidate whose candidate-side probability is below threshold.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.5345,
+        "confidence": 0.5345,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-db6d29ad0a7ccd11",
+        "direction": 1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.5345,
+        "holdConfidence": 0.4655,
+        "opposingFamilies": [],
+        "rawScore": 0.5345,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "BUY",
+        "supportingFamilies": [
+          "TREND",
+          "BREAKOUT"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.82,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.75,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.574,
+          "confidence": 0.574,
+          "family": "TREND",
+          "holdScore": 0.426,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.495,
+          "confidence": 0.495,
+          "family": "BREAKOUT",
+          "holdScore": 0.505,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "6aeaf625a1184446",
+        "featureCount": 266,
+        "missingFeatureCount": 20,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "BUY",
+          "deterministic_score": 0.5345,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.495,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.574,
+          "regime_category": "weak_trend",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.5345,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "TREND",
+          "strongest_family_score": 0.574,
+          "target_distance": 2.0,
+          "weakest_family": "BREAKOUT",
+          "weakest_family_score": 0.495
+        }
+      },
+      "finalCandidateStatus": "REJECTED",
+      "id": "rejected_ml_candidate",
+      "label": {
+        "candidateSide": "BUY",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 100.02,
+        "firstBarrierHit": "TARGET",
+        "labelId": "fce2e5f67e86b947",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 102.0,
+        "protectiveStopPrice": 99.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": true,
+        "calibratedProbability": 0.31,
+        "candidateAccepted": false,
+        "deterministicSignal": "BUY",
+        "effectiveMode": "ACTIVE",
+        "expectedValueAfterCosts": -0.13,
+        "featureMissingness": 0.15037593984962405,
+        "finalSignal": "HOLD",
+        "mlWouldAcceptCandidate": false,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.current_candidate_probability_below_threshold",
+          "ml.mode_active"
+        ],
+        "recommendedRiskCap": 1.0,
+        "successProbability": 0.31
+      },
+      "modelProbabilities": {
+        "BUY": 0.31,
+        "HOLD": 0.57,
+        "SELL": 0.12
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 1,
+        "features": {
+          "atrPercentile": 0.54,
+          "breakoutFit": 0.66,
+          "gapSessionFit": 0.2,
+          "meanReversionFit": 0.3,
+          "realizedVolatilityPercentile": 0.51,
+          "reversalFit": 0.3,
+          "trendFit": 0.7,
+          "trendStrengthAdx": 24.0
+        },
+        "label": "weak_trend",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "NORMAL"
+      },
+      "riskMultiplier": 1.0
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": "missing_feature_fallback-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 100.02,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 99.0,
+        "targetPrice": 102.0
+      },
+      "category": "ml_fallback",
+      "contextOutputs": [],
+      "description": "Missing decision-time features exceed configured missingness tolerance and fall back to deterministic baseline.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.785,
+        "confidence": 0.785,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-db6d29ad0a7ccd11",
+        "direction": 1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.785,
+        "holdConfidence": 0.215,
+        "opposingFamilies": [],
+        "rawScore": 0.785,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "BUY",
+        "supportingFamilies": [
+          "TREND",
+          "BREAKOUT"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.82,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.75,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.82,
+          "confidence": 0.82,
+          "family": "TREND",
+          "holdScore": 0.18,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.75,
+          "confidence": 0.75,
+          "family": "BREAKOUT",
+          "holdScore": 0.25,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "e260d2862305be90",
+        "featureCount": 266,
+        "missingFeatureCount": 27,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "BUY",
+          "deterministic_score": 0.785,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.75,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.82,
+          "regime_category": "unknown",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.785,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "TREND",
+          "strongest_family_score": 0.82,
+          "target_distance": 2.0,
+          "weakest_family": "BREAKOUT",
+          "weakest_family_score": 0.75
+        }
+      },
+      "finalCandidateStatus": "FALLBACK_ACCEPTED",
+      "id": "missing_feature_fallback",
+      "label": {
+        "candidateSide": "BUY",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 100.02,
+        "firstBarrierHit": "TARGET",
+        "labelId": "86be6cf114aaf8c5",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 102.0,
+        "protectiveStopPrice": 99.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": false,
+        "calibratedProbability": 0.82,
+        "candidateAccepted": true,
+        "deterministicSignal": "BUY",
+        "effectiveMode": "FALLBACK",
+        "expectedValueAfterCosts": 1.4,
+        "featureMissingness": 0.20300751879699247,
+        "finalSignal": "BUY",
+        "mlWouldAcceptCandidate": false,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.0,
+        "reasonCodes": [
+          "ml.fallback_deterministic_baseline",
+          "ml.feature_missingness_too_high",
+          "ml.operational_health_failed"
+        ],
+        "recommendedRiskCap": 1.0,
+        "successProbability": 0.82
+      },
+      "modelProbabilities": {
+        "BUY": 0.82,
+        "HOLD": 0.14,
+        "SELL": 0.04
+      },
+      "regimeOutput": {
+        "confidence": 0.35,
+        "direction": 0,
+        "features": {},
+        "label": "unknown",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "NORMAL"
+      },
+      "riskMultiplier": 1.0
+    },
+    {
+      "candidateGeometry": {
+        "candidateId": "out_of_distribution_fallback-candidate",
+        "eligible": true,
+        "entryPrice": 100.0,
+        "limitPrice": 100.02,
+        "orderType": "STOP_LIMIT",
+        "quantity": 10,
+        "stopPrice": 99.0,
+        "targetPrice": 102.0
+      },
+      "category": "ml_fallback",
+      "contextOutputs": [],
+      "description": "Explicit OOD score exceeds configured tolerance and falls back to deterministic baseline.",
+      "deterministicCandidate": {
+        "buyConfidence": 0.5345,
+        "confidence": 0.5345,
+        "dataReady": true,
+        "decisionId": "ensemble-v2-db6d29ad0a7ccd11",
+        "direction": 1,
+        "eligible": true,
+        "engineVersion": "family_aware_deterministic_ensemble_v1",
+        "finalScore": 0.5345,
+        "holdConfidence": 0.4655,
+        "opposingFamilies": [],
+        "rawScore": 0.5345,
+        "reasonCodes": [
+          "ensemble.family_aware_candidate"
+        ],
+        "sellConfidence": 0.0,
+        "signal": "BUY",
+        "supportingFamilies": [
+          "TREND",
+          "BREAKOUT"
+        ]
+      },
+      "directionalStrategyOutputs": {
+        "bollinger_atr_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "failed_breakout_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "first_pullback_after_open": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "gap_continuation_gap_fade": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "GAP_SESSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "liquidity_sweep_reversal": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "REVERSAL",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "multi_timeframe_trend_alignment": {
+          "active": true,
+          "confidence": 0.82,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "opening_range_breakout": {
+          "active": true,
+          "confidence": 0.75,
+          "dataReady": true,
+          "direction": 1,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "BUY"
+        },
+        "volatility_breakout": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "BREAKOUT",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_mean_reversion": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "MEAN_REVERSION",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        },
+        "vwap_trend_continuation": {
+          "active": true,
+          "confidence": 0.0,
+          "dataReady": true,
+          "direction": 0,
+          "eligible": true,
+          "family": "TREND",
+          "regimeFit": 1.0,
+          "reliability": 1.0,
+          "signal": "HOLD"
+        }
+      },
+      "familyScores": [
+        {
+          "buyScore": 0.574,
+          "confidence": 0.574,
+          "family": "TREND",
+          "holdScore": 0.426,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        },
+        {
+          "buyScore": 0.495,
+          "confidence": 0.495,
+          "family": "BREAKOUT",
+          "holdScore": 0.505,
+          "reliability": 1.0,
+          "sellScore": 0.0
+        }
+      ],
+      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureVector": {
+        "completeFeatureVectorHash": "6aeaf625a1184446",
+        "featureCount": 266,
+        "missingFeatureCount": 20,
+        "schemaHash": "988c0cfe6ab86361",
+        "schemaVersion": "candidate_meta_feature_schema_v1",
+        "selectedValues": {
+          "candidate_side": "BUY",
+          "deterministic_score": 0.5345,
+          "entry_distance": 0.1,
+          "expected_transaction_cost": 0.06,
+          "family_breakout_score": 0.495,
+          "family_gap_session_score": 0.0,
+          "family_mean_reversion_score": 0.0,
+          "family_reversal_score": 0.0,
+          "family_trend_score": 0.574,
+          "regime_category": "weak_trend",
+          "relative_volume": 1.25,
+          "reward_risk_ratio": 2.0,
+          "signal_margin": 0.5345,
+          "spread_dollars": 0.02,
+          "stop_distance": 1.0,
+          "strongest_family": "TREND",
+          "strongest_family_score": 0.574,
+          "target_distance": 2.0,
+          "weakest_family": "BREAKOUT",
+          "weakest_family_score": 0.495
+        }
+      },
+      "finalCandidateStatus": "FALLBACK_ACCEPTED",
+      "id": "out_of_distribution_fallback",
+      "label": {
+        "candidateSide": "BUY",
+        "costAdjustedTrainingLabel": 1,
+        "eligibleForTraining": true,
+        "entryPrice": 100.02,
+        "firstBarrierHit": "TARGET",
+        "labelId": "b24fb3b4a55a649c",
+        "labelVersion": "candidate_triple_barrier_v1",
+        "profitTargetPrice": 102.0,
+        "protectiveStopPrice": 99.0,
+        "reasonCodes": [
+          "first_barrier_target",
+          "candidate_only_binary_meta_label"
+        ],
+        "strictOutcomeLabel": 1
+      },
+      "mlDecision": {
+        "appliedToOrder": false,
+        "calibratedProbability": 0.82,
+        "candidateAccepted": true,
+        "deterministicSignal": "BUY",
+        "effectiveMode": "FALLBACK",
+        "expectedValueAfterCosts": 1.4,
+        "featureMissingness": 0.15037593984962405,
+        "finalSignal": "BUY",
+        "mlWouldAcceptCandidate": false,
+        "mode": "ACTIVE",
+        "modelHealth": {
+          "reasonCodes": [],
+          "score": 1.0,
+          "status": "OK"
+        },
+        "outOfDistributionScore": 0.95,
+        "reasonCodes": [
+          "ml.fallback_deterministic_baseline",
+          "ml.operational_health_failed",
+          "ml.out_of_distribution"
+        ],
+        "recommendedRiskCap": 1.0,
+        "successProbability": 0.82
+      },
+      "modelProbabilities": {
+        "BUY": 0.82,
+        "HOLD": 0.14,
+        "SELL": 0.04
+      },
+      "regimeOutput": {
+        "confidence": 0.72,
+        "direction": 1,
+        "features": {
+          "atrPercentile": 0.54,
+          "breakoutFit": 0.66,
+          "gapSessionFit": 0.2,
+          "meanReversionFit": 0.3,
+          "realizedVolatilityPercentile": 0.51,
+          "reversalFit": 0.3,
+          "trendFit": 0.7,
+          "trendStrengthAdx": 24.0
+        },
+        "label": "weak_trend",
+        "regimeId": "legacy_characterized_regime",
+        "volatility": "NORMAL"
+      },
+      "riskMultiplier": 1.0
+    }
+  ],
+  "schemaVersion": "meta_strategy_current_behavior_characterization_v1",
+  "sessionDate": "2026-01-05",
+  "sourceBehavior": "legacy_public_v2_components",
+  "versions": {
+    "algorithmVersion": "meta_strategy_algorithm_v1",
+    "backtestEngineVersion": "meta_strategy_backtest_engine_v1",
+    "configurationVersion": "meta_strategy_config_v1",
+    "dynamicProfileVersion": "meta_strategy_dynamic_profile_v1",
+    "exitPolicyVersion": "meta_strategy_exit_policy_v1",
+    "featureSchemaVersion": "meta_strategy_feature_schema_v1",
+    "labelSpecificationVersion": "meta_strategy_label_specification_v1",
+    "modelArtifactVersion": "meta_strategy_model_artifact_v1",
+    "modelVersion": "meta_strategy_model_v1",
+    "positionSizingVersion": "meta_strategy_position_sizing_v1",
+    "strategyCatalogVersion": "meta_strategy_strategy_catalog_v1"
+  }
+}

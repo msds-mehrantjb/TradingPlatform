@@ -63,6 +63,19 @@ QUALITY_GATES = (
         ],
     ),
     QualityGate(
+        label="meta-strategy-dedicated-tests",
+        command=[
+            PYTHON,
+            "-m",
+            "pytest",
+            "backend/tests/meta_strategy",
+            "-q",
+            "--cov=backend/app/algorithms/meta_strategy",
+            "--cov-branch",
+            "--cov-fail-under=85",
+        ],
+    ),
+    QualityGate(
         label="typescript-type-check",
         command=[NPM, "run", "typecheck"],
         cwd=FRONTEND,
@@ -117,6 +130,8 @@ QUALITY_GATES = (
             "backend/tests/test_decision_snapshot_v2_archive.py",
             "backend/tests/test_candidate_meta_features.py",
             "backend/tests/test_safe_ml_inference_modes.py",
+            "backend/tests/test_meta_strategy_step6_architecture_isolation.py",
+            "backend/tests/test_meta_strategy_step42_frontend_boundary.py",
             "backend/tests/test_global_gate_engine.py",
             "backend/tests/test_wca_step19_comprehensive.py",
             "backend/tests/test_wca_step21_final_acceptance.py",

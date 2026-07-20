@@ -13,7 +13,7 @@ from backend.app.algorithms.voting_ensemble.models import VotingCandle, VotingEn
 from backend.app.algorithms.voting_ensemble.service import evaluate_first_pullback_after_open
 from backend.app.algorithms.voting_ensemble.ml_snapshots import stage_result_to_v2_training_row
 from backend.app.api.trading_engine import V2TradingEngine
-from backend.app.meta_strategy_training import DEFAULT_META_LABEL_VERSION, v2_training_compatibility_report
+from backend.app.algorithms.meta_strategy.training.training_core import DEFAULT_META_LABEL_VERSION, v2_training_compatibility_report
 
 
 START = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)

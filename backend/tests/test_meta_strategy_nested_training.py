@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from backend.app.meta_strategy_training import (
+from backend.app.algorithms.meta_strategy.training.training_core import (
     MetaTrainingConfig,
     build_nested_walk_forward_plan,
     train_meta_strategy_baselines,
@@ -177,9 +177,9 @@ class patched_training_io:
         self.rows = rows
         self.artifact_path = FakeArtifactPath()
         self.patches = [
-            patch("backend.app.meta_strategy_training.load_labeled_rows", return_value=rows),
-            patch("backend.app.meta_strategy_training.save_latest_training_status", side_effect=lambda _root, result: result),
-            patch("backend.app.meta_strategy_training.meta_strategy_artifact_path", return_value=self.artifact_path),
+            patch("backend.app.algorithms.meta_strategy.training.training_core.load_labeled_rows", return_value=rows),
+            patch("backend.app.algorithms.meta_strategy.training.training_core.save_latest_training_status", side_effect=lambda _root, result: result),
+            patch("backend.app.algorithms.meta_strategy.training.training_core.meta_strategy_artifact_path", return_value=self.artifact_path),
         ]
 
     def __enter__(self):

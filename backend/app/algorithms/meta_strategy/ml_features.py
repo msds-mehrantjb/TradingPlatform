@@ -9,15 +9,32 @@ from typing import Any, Literal
 from pydantic import Field
 
 from backend.app.domain.models import DecisionSnapshotV2, DomainModel, Signal, StrategyFamily
-from backend.app.ensemble.family_aware import FAMILY_ORDER
-from backend.app.ml.forecast_oos import ForecastFallbackFeature, OutOfSampleForecastFeature
-from backend.app.strategies.registry import directional_strategy_input_ids
+from backend.app.algorithms.meta_strategy.forecast.oos_features import ForecastFallbackFeature, OutOfSampleForecastFeature
 
 
 ML_FEATURE_SCHEMA_VERSION = "candidate_meta_feature_schema_v1"
 MISSING_CATEGORY = "__MISSING__"
 MARKET_OPEN = time(9, 30)
 MARKET_CLOSE = time(16, 0)
+FAMILY_ORDER: tuple[StrategyFamily, ...] = (
+    StrategyFamily.TREND,
+    StrategyFamily.BREAKOUT,
+    StrategyFamily.REVERSAL,
+    StrategyFamily.MEAN_REVERSION,
+    StrategyFamily.GAP_SESSION,
+)
+META_STRATEGY_DIRECTIONAL_STRATEGY_IDS: tuple[str, ...] = (
+    "multi_timeframe_trend_alignment",
+    "first_pullback_after_open",
+    "vwap_trend_continuation",
+    "opening_range_breakout",
+    "volatility_breakout",
+    "failed_breakout_reversal",
+    "liquidity_sweep_reversal",
+    "vwap_mean_reversion",
+    "bollinger_atr_reversion",
+    "gap_continuation_gap_fade",
+)
 
 
 class ForbiddenMLFeatureFieldError(ValueError):
@@ -341,6 +358,10 @@ def _family_signed_scores(snapshot: DecisionSnapshotV2) -> dict[str, float | Non
     for score in snapshot.ensembleDecision.familyScores:
         scores[str(score.family)] = round(float(score.buyScore) - float(score.sellScore), 6)
     return scores
+
+
+def directional_strategy_input_ids() -> tuple[str, ...]:
+    return META_STRATEGY_DIRECTIONAL_STRATEGY_IDS
 
 
 def _strongest_weakest(scores: dict[str, float | None]) -> tuple[tuple[str | None, float | None], tuple[str | None, float | None]]:

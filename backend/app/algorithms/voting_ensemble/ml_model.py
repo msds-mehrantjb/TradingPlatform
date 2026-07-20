@@ -9,7 +9,7 @@ from backend.app.algorithms.voting_ensemble.model_calibration import (
     voting_ensemble_model_calibration_artifact,
 )
 from backend.app.domain.models import OperatingMode
-from backend.app.ml.inference import SafeMLInferenceConfig
+from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceConfig
 
 
 VOTING_ENSEMBLE_ML_MODEL_VERSION = "voting_ensemble_ml_model_v1"

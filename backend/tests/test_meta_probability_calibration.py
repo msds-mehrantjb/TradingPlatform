@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from backend.app.meta_strategy_training import (
+from backend.app.algorithms.meta_strategy.training.training_core import (
     apply_probability_calibration_model,
     tune_probability_calibration_from_probability_rows,
 )
@@ -84,4 +84,3 @@ class MetaProbabilityCalibrationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

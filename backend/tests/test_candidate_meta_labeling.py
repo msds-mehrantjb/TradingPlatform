@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from backend.app.domain.feature_engine import MarketCandle
 from backend.app.domain.models import OrderPlan, Signal
-from backend.app.ml.meta_labeling import META_LABEL_VERSION, MetaLabelExecutionConfig, create_candidate_meta_label
+from backend.app.algorithms.meta_strategy.labeling.candidate_meta_labeling import META_LABEL_VERSION, MetaLabelExecutionConfig, create_candidate_meta_label
 from backend.tests.test_decision_snapshot_v2_archive import CONFIG_HASH, NOW, ensemble, snapshot
 
 

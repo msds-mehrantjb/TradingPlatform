@@ -6,12 +6,12 @@ from typing import Any, Literal
 from pydantic import Field
 
 from backend.app.domain.models import DomainModel, OperatingMode, Signal
-from backend.app.ml.features import MLFeatureSet
-from backend.app.meta_strategy_training import (
+from backend.app.algorithms.meta_strategy.training.training_core import (
     apply_probability_calibration_model,
     load_meta_strategy_model_artifact_data,
     predict_softmax_logistic_probabilities,
 )
+from backend.app.algorithms.meta_strategy.ml_features import MLFeatureSet
 
 
 class SafeMLInferenceConfig(DomainModel):

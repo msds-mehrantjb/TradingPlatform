@@ -358,6 +358,13 @@ type TradeSummaryResponse = {
   symbol: string;
   summary: TradeSummary;
   warning?: string;
+  ollamaHealth?: {
+    status: string;
+    baseUrl: string;
+    model: string;
+    detail?: string;
+    action?: string;
+  };
 };
 
 type AlgoSignal = "Buy" | "Sell" | "Hold";
@@ -2278,7 +2285,7 @@ function buildDecisionRecorderSnapshot(reason: string) {
   const confidence = wcaBackendDecisionAsConfidenceResult();
   const regime = calculateRegimeSelection();
   const regimeTargetOrder = buildBackendRegimeOrderRecommendation(regime);
-  const meta = calculateMetaStrategy();
+  const meta = metaStrategyPresentationResult();
   const activeMode = state.tradingWindowMode;
   const candles = latestRegularSessionCandles().length ? latestRegularSessionCandles() : state.candles.slice(-DECISION_SNAPSHOT_MAX_CANDLES);
   const weightedOneMinuteCandles = latestRegularSessionCandlesFrom(state.weightedMarketData.timeframeCandles["1Min"] ?? []);
@@ -4526,7 +4533,7 @@ metaMlReadinessBox.addEventListener("click", (event) => {
   if (!button) {
     return;
   }
-  void loadMetaStrategyTrainingStatus({ train: button.dataset.metaTrainingAction === "train" });
+  void loadMetaStrategyTrainingStatus();
 });
 
 weightedStrategiesToggle.addEventListener("click", () => {
@@ -9828,7 +9835,7 @@ function mlArtifactEvidence(): OrderEvidenceSnapshot["mlArtifact"] {
 
 function decisionEvidence(mode: TradingWindowMode, order: ManualOrderRecommendation | null): OrderEvidenceSnapshot["decision"] {
   if (mode === "meta") {
-    const result = calculateMetaStrategy();
+    const result = metaStrategyPresentationResult();
     return {
       winner: result.signal,
       confidence: `${result.decisionLabel} net ${result.netScore.toFixed(2)}, edge ${result.edge.toFixed(2)}, active ${result.activeDirectionalCount}/${metaStrategyCatalog.length}`,
@@ -10440,24 +10447,18 @@ function renderMetaChecksExpandedState() {
   metaChecksToggleIcon.textContent = state.metaChecksExpanded ? "-" : "+";
 }
 
-async function loadMetaStrategyTrainingStatus(options: { train?: boolean } = {}) {
+async function loadMetaStrategyTrainingStatus() {
   state.metaTrainingStatus = "loading";
   state.metaTrainingWarning = "";
   renderMetaMlReadiness();
   try {
-    const response = await fetch(`${API_BASE}${options.train ? "/api/meta-strategy/train-baselines" : "/api/meta-strategy/training-status"}`, {
-      method: options.train ? "POST" : "GET",
-      headers: options.train ? { "Content-Type": "application/json" } : undefined,
-      body: options.train ? JSON.stringify({ symbol: state.symbol, minRows: 30 }) : undefined,
-    });
+    const response = await fetch(`${API_BASE}/api/meta-strategy/status`, { method: "GET" });
     if (!response.ok) {
       if (response.status === 404) {
         state.metaTrainingResult = {
           status: "endpoint_unavailable",
           trusted: false,
-          message: options.train
-            ? "Train endpoint is unavailable in the running backend. Restart the backend so the Meta-Strategy training route is loaded."
-            : "Training status endpoint is unavailable in the running backend. Restart the backend so the Meta-Strategy status route is loaded.",
+          message: "Meta-Strategy status endpoint is unavailable in the running backend. Restart the backend so the dedicated Meta-Strategy router is loaded.",
         };
         state.metaTrainingStatus = "ready";
         renderMetaMlReadiness();
@@ -10465,7 +10466,17 @@ async function loadMetaStrategyTrainingStatus(options: { train?: boolean } = {})
       }
       throw new Error(await readableResponseError(response));
     }
-    state.metaTrainingResult = (await response.json()) as MetaStrategyTrainingStatus;
+    const envelope = (await response.json()) as {
+      status?: string;
+      payload?: { modelStatus?: { status?: string; mode?: string; reasonCodes?: string[] } };
+      reasonCodes?: string[];
+    };
+    const modelStatus = envelope.payload?.modelStatus ?? {};
+    state.metaTrainingResult = {
+      status: modelStatus.status ?? envelope.status ?? "unknown",
+      trusted: false,
+      message: [...(modelStatus.reasonCodes ?? []), ...(envelope.reasonCodes ?? [])].join("; ") || `Mode ${modelStatus.mode ?? "unknown"}`,
+    };
     state.metaTrainingStatus = "ready";
   } catch (error) {
     state.metaTrainingStatus = "error";
@@ -10515,7 +10526,6 @@ function renderMetaMlReadiness() {
       <small>${escapeHtml(state.metaTrainingWarning || "Training status unavailable.")}</small>
       <div class="meta-ml-readiness-actions">
         <button type="button" data-meta-training-action="refresh">Refresh</button>
-        <button type="button" data-meta-training-action="train">Train</button>
       </div>
     `;
     return;
@@ -10533,7 +10543,6 @@ function renderMetaMlReadiness() {
       </div>
       <div class="meta-ml-readiness-actions">
         <button type="button" data-meta-training-action="refresh">Refresh</button>
-        <button type="button" data-meta-training-action="train">Train</button>
       </div>
     `;
     return;
@@ -10571,7 +10580,6 @@ function renderMetaMlReadiness() {
     <small>${escapeHtml(renderMetaTrainingLabels(result))}</small>
     <div class="meta-ml-readiness-actions">
       <button type="button" data-meta-training-action="refresh">Refresh</button>
-      <button type="button" data-meta-training-action="train">Train</button>
     </div>
   `;
 }
@@ -13752,8 +13760,8 @@ function renderConfidenceStrategies(strategies: ConfidenceStrategyResult[]) {
 }
 
 function updateMetaStrategyPanel() {
-  const result = calculateMetaStrategy();
-  state.currentMetaTargetOrder = metaTargetOrderRecommendation(result);
+  const result = metaStrategyPresentationResult();
+  state.currentMetaTargetOrder = null;
   metaFinalSignal.textContent = result.decisionLabel;
   metaFinalSignal.className = `algo-final ${result.signal.toLowerCase()}`;
   metaScoreGrid.innerHTML = renderMetaScoreGrid(result);
@@ -13776,287 +13784,8 @@ function updateMetaStrategyPanel() {
   renderMetaChecksExpandedState();
 }
 
-function metaTargetOrderRecommendation(result: MetaStrategyResult): ManualOrderRecommendation | null {
-  const market = confidenceMarketSnapshot();
-  const latest = latestExecutionCandleForMode("meta");
-  if (!market || !latest) {
-    return null;
-  }
-  const settings = state.metaTradingSettings;
-  const submitMode = (state.metaTargetOrderOverrides.submitMode as SubmitOrderMode | undefined) ?? DEFAULT_SUBMIT_MODE;
-  const sizing = confidencePositionSizing(market, result.signal, result.netScore, { mode: "meta" });
-  const failedGates = result.safetyGates.filter((gate) => gate.status === "fail").map((gate) => `${gate.label}: ${gate.detail}`);
-  if (result.signal === "Hold") {
-    failedGates.push(`Signal: Meta-Strategy final signal is ${result.decisionLabel}`);
-  }
-  if (sizing.blockedReason) {
-    failedGates.push(`Sizing: ${sizing.blockedReason}`);
-  }
-  const side: AlgoSignal = failedGates.length ? "Hold" : result.signal;
-  const priceValue = latest.close;
-  const pricingSide: Exclude<AlgoSignal, "Hold"> = side === "Buy" || side === "Sell" ? side : result.netScore < 0 ? "Sell" : "Buy";
-  const triggerPrice =
-    pricingSide === "Buy"
-      ? roundNumber(priceValue + settings.slippagePerShare, 2)
-      : roundNumber(Math.max(0, priceValue - settings.slippagePerShare), 2);
-  const limitPrice =
-    pricingSide === "Buy"
-      ? roundNumber(triggerPrice + settings.slippagePerShare, 2)
-      : roundNumber(Math.max(0, triggerPrice - settings.slippagePerShare), 2);
-  const stopPrice =
-    pricingSide === "Buy"
-      ? roundNumber(Math.max(0, triggerPrice - sizing.stopDistance), 2)
-      : roundNumber(triggerPrice + sizing.stopDistance, 2);
-  const quantity = side === "Hold" ? 0 : sizing.finalQuantity;
-  const targetDistance = targetProfitDistancePerShare(quantity, sizing.stopDistance, settings.takeProfitR);
-  const targetPrice =
-    pricingSide === "Buy"
-      ? roundNumber(triggerPrice + targetDistance, 2)
-      : roundNumber(Math.max(0, triggerPrice - targetDistance), 2);
-  const orderNotional = roundNumber(quantity * triggerPrice, 2);
-  const plannedStopRiskDollars = roundNumber(quantity * Math.abs(triggerPrice - stopPrice), 2);
-  const estimatedSlippage = roundNumber(quantity * settings.slippagePerShare * 2, 2);
-  const eligible = side !== "Hold" && quantity > 0 && failedGates.length === 0;
-  const orderType = eligible ? `${side} stop-limit` : "No order";
-  const summary =
-    eligible
-      ? `${orderType} ${state.symbol}, ${quantity} shares, trigger ${price(triggerPrice)}, limit ${price(limitPrice)}, stop ${price(stopPrice)}, target ${price(targetPrice)}.`
-      : `No order: ${uniqueStrings(failedGates).join(", ") || "Meta-Strategy final signal is Hold"}.`;
-  return applyMetaTargetOrderOverrides({
-    eligible,
-    side,
-    orderType,
-    symbol: state.symbol,
-    quantity,
-    triggerPrice,
-    limitPrice,
-    stopPrice,
-    targetPrice,
-    accountBalance: sizing.accountEquity,
-    orderLimitDollars: sizing.accountEquity * (settings.orderAllocationPercent / 100),
-    dailyLimitDollars: sizing.availableBuyingPower + sizing.currentPositionValue,
-    riskDollars: sizing.riskDollars,
-    orderNotional,
-    plannedStopRiskDollars,
-    estimatedSlippage,
-    timeInForce: "Day",
-    cutoff: "No new trades after 15:30 ET",
-    submitMode,
-    failedGates: uniqueStrings(failedGates),
-    gates: result.safetyGates.map((gate) => ({
-      layer: gate.label,
-      status: gate.status,
-      signal: result.decisionLabel,
-      detail: gate.detail,
-    })),
-    levels: {
-      last: priceValue,
-      vwap: market.vwap,
-      openingHigh: market.openingRange.high,
-      openingLow: market.openingRange.low,
-      lastTime: latest.timestamp,
-    },
-    summary,
-  });
-}
-
-function applyMetaTargetOrderOverrides(order: ManualOrderRecommendation): ManualOrderRecommendation {
-  const overrides = state.metaTargetOrderOverrides;
-  const settings = state.metaTradingSettings;
-  const useDefaults = settings.useDefaultSizingSettings;
-  const quantity = order.quantity;
-  const triggerPrice = useDefaults ? order.triggerPrice : overrides.triggerPrice === null ? null : Number(overrides.triggerPrice ?? order.triggerPrice);
-  const limitPrice = useDefaults ? order.limitPrice : overrides.limitPrice === null ? null : Number(overrides.limitPrice ?? order.limitPrice);
-  const stopPrice = useDefaults ? order.stopPrice : overrides.stopPrice === null ? null : Number(overrides.stopPrice ?? order.stopPrice);
-  const targetPrice = useDefaults ? order.targetPrice : overrides.targetPrice === null ? null : Number(overrides.targetPrice ?? order.targetPrice);
-  const orderNotional =
-    useDefaults
-      ? order.orderNotional
-      : Number.isFinite(Number(overrides.orderNotional))
-        ? Number(overrides.orderNotional)
-        : triggerPrice !== null && Number.isFinite(triggerPrice)
-          ? roundNumber(quantity * triggerPrice, 2)
-          : order.orderNotional;
-  const plannedStopRiskDollars =
-    useDefaults
-      ? order.plannedStopRiskDollars
-      : Number.isFinite(Number(overrides.plannedStopRiskDollars))
-        ? Number(overrides.plannedStopRiskDollars)
-        : triggerPrice !== null && stopPrice !== null && Number.isFinite(triggerPrice) && Number.isFinite(stopPrice)
-          ? roundNumber(quantity * Math.abs(triggerPrice - stopPrice), 2)
-          : order.plannedStopRiskDollars;
-  const estimatedSlippage = useDefaults
-    ? order.estimatedSlippage
-    : Number.isFinite(Number(overrides.estimatedSlippage))
-      ? Number(overrides.estimatedSlippage)
-      : roundNumber(quantity * settings.slippagePerShare * 2, 2);
-  const submitMode = (overrides.submitMode as SubmitOrderMode | undefined) ?? order.submitMode;
-  const side = useDefaults ? order.side : (overrides.side as AlgoSignal | undefined) ?? order.side;
-  return {
-    ...order,
-    side,
-    orderType: useDefaults ? order.orderType : String(overrides.orderType ?? order.orderType),
-    symbol: String((useDefaults ? order.symbol : overrides.symbol ?? order.symbol)).toUpperCase(),
-    quantity,
-    triggerPrice: triggerPrice !== null && Number.isFinite(triggerPrice) ? triggerPrice : null,
-    limitPrice: limitPrice !== null && Number.isFinite(limitPrice) ? limitPrice : null,
-    stopPrice: stopPrice !== null && Number.isFinite(stopPrice) ? stopPrice : null,
-    targetPrice: targetPrice !== null && Number.isFinite(targetPrice) ? targetPrice : null,
-    accountBalance: roundNumber(useDefaults ? order.accountBalance : Number(overrides.accountBalance ?? order.accountBalance), 2),
-    orderLimitDollars: roundNumber(useDefaults ? order.orderLimitDollars : Number(overrides.orderLimitDollars ?? order.orderLimitDollars), 2),
-    dailyLimitDollars: roundNumberUp(useDefaults ? order.dailyLimitDollars : Number(overrides.dailyLimitDollars ?? order.dailyLimitDollars), 2),
-    riskDollars: roundNumber(useDefaults ? order.riskDollars : Number(overrides.riskDollars ?? order.riskDollars), 2),
-    orderNotional,
-    plannedStopRiskDollars,
-    estimatedSlippage,
-    timeInForce: useDefaults ? order.timeInForce : String(overrides.timeInForce ?? order.timeInForce),
-    cutoff: useDefaults ? order.cutoff : String(overrides.cutoff ?? order.cutoff),
-    submitMode,
-  };
-}
-
-function calculateMetaStrategy(): MetaStrategyResult {
-  const market = confidenceMarketSnapshot();
-  if (!market) {
-    return emptyMetaStrategyResult("Waiting for session candles");
-  }
-
-  const ensembleVotes = new Map(strategyEnsembleSignals(state.marketContext).map((vote) => [vote.strategy, vote]));
-  const rawFeatures = metaStrategyCatalog.map((definition) => metaStrategyFeature(definition, market, ensembleVotes));
-  const families = emptyMetaFamilyScores();
-  const familyRawTotals = new Map<MetaStrategyFamily, number>();
-
-  rawFeatures.forEach((feature) => {
-    if (feature.role !== "directional") {
-      return;
-    }
-    const weight = metaRoleWeight(feature.role);
-    const strength = feature.confidence * weight;
-    if (feature.direction === 1) {
-      families[feature.family].buy += strength;
-    } else if (feature.direction === -1) {
-      families[feature.family].sell += strength;
-    } else {
-      families[feature.family].hold += Math.max(0.05, feature.confidence * 0.25);
-    }
-    familyRawTotals.set(feature.family, (familyRawTotals.get(feature.family) ?? 0) + Math.abs(strength));
-  });
-
-  const familyCap = 0.36;
-  for (const family of metaStrategyFamilies()) {
-    const directionalTotal = families[family].buy + families[family].sell;
-    if (directionalTotal > familyCap) {
-      const scale = familyCap / directionalTotal;
-      families[family].buy = roundNumber(families[family].buy * scale, 4);
-      families[family].sell = roundNumber(families[family].sell * scale, 4);
-      families[family].capped = true;
-    }
-    families[family].hold = roundNumber(families[family].hold, 4);
-  }
-
-  const contextFeatures = rawFeatures.filter((feature) => feature.role === "context");
-  const buyContext = contextFeatures.filter((feature) => feature.direction === 1).reduce((sum, feature) => sum + feature.confidence * 0.07, 0);
-  const sellContext = contextFeatures.filter((feature) => feature.direction === -1).reduce((sum, feature) => sum + feature.confidence * 0.07, 0);
-  const familyAggregation = metaFamilyAggregationScores(families, contextFeatures);
-  const contextMultiplier = clampNumber(1 + Math.max(buyContext, sellContext) - Math.min(buyContext, sellContext) * 0.5, 0.85, 1.18);
-  const buyContextMultiplier = clampNumber(1 + buyContext - sellContext * 0.5, 0.75, 1.2);
-  const sellContextMultiplier = clampNumber(1 + sellContext - buyContext * 0.5, 0.75, 1.2);
-
-  let buyScore = roundNumber(metaStrategyFamilies().reduce((sum, family) => sum + families[family].buy, 0) * buyContextMultiplier, 4);
-  let sellScore = roundNumber(metaStrategyFamilies().reduce((sum, family) => sum + families[family].sell, 0) * sellContextMultiplier, 4);
-  const holdScore = roundNumber(metaStrategyFamilies().reduce((sum, family) => sum + families[family].hold, 0), 4);
-
-  const aggregateDirectionalTotal = buyScore + sellScore;
-  const aggregateScale = aggregateDirectionalTotal > 1 ? 1 / aggregateDirectionalTotal : 1;
-  if (aggregateScale < 1) {
-    buyScore = roundNumber(buyScore * aggregateScale, 4);
-    sellScore = roundNumber(sellScore * aggregateScale, 4);
-  }
-
-  const cashFeature = rawFeatures.find((feature) => feature.name === "Cash / Avoid Trading Filter");
-  const cashBlocked = Boolean(cashFeature && cashFeature.confidence >= 0.75);
-  const netScore = roundNumber(clampNumber(buyScore - sellScore, -1, 1), 4);
-  const edge = roundNumber(Math.min(1, Math.abs(netScore)), 4);
-  const rawSignal: AlgoSignal = edge >= 0.08 && Math.max(buyScore, sellScore) >= 0.22 ? (netScore > 0 ? "Buy" : "Sell") : "Hold";
-  const signal: AlgoSignal = cashBlocked ? "Hold" : rawSignal;
-  const decisionLabel: ConfidenceDecisionLabel =
-    signal === "Buy" && edge >= 0.18
-      ? "Strong Buy"
-      : signal === "Buy"
-        ? "Buy"
-        : signal === "Sell" && edge >= 0.18
-          ? "Strong Sell"
-          : signal === "Sell"
-            ? "Sell"
-            : "Hold";
-
-  const activeDirectionalCount = rawFeatures.filter((feature) => feature.role === "directional" && feature.direction !== 0).length;
-  const cappedFamilies = metaStrategyFamilies().filter((family) => families[family].capped);
-  const safetyGates = [
-    {
-      label: "Cash filter",
-      status: cashBlocked ? "fail" : "pass",
-      detail: cashFeature ? cashFeature.reason : "Cash filter unavailable",
-    },
-    {
-      label: "Edge",
-      status: rawSignal === "Hold" ? "info" : "pass",
-      detail: `Net ${netScore.toFixed(2)} with edge ${edge.toFixed(2)} after family and aggregate caps`,
-    },
-    {
-      label: "Family caps",
-      status: cappedFamilies.length ? "info" : "pass",
-      detail: cappedFamilies.length ? `${cappedFamilies.map(metaFamilyLabel).join(", ")} capped at ${formatProbability(familyCap)}` : "No family hit the cap",
-    },
-    {
-      label: "Aggregate cap",
-      status: aggregateScale < 1 ? "info" : "pass",
-      detail:
-        aggregateScale < 1
-          ? `Buy/sell total normalized by ${aggregateScale.toFixed(2)}x to stay within 1.00`
-          : "Buy/sell total stayed within 1.00",
-    },
-    {
-      label: "Context",
-      status: contextFeatures.some((feature) => feature.direction !== 0) ? "pass" : "info",
-      detail: `${contextFeatures.filter((feature) => feature.direction !== 0).length}/${contextFeatures.length} context modifiers active`,
-    },
-  ] satisfies MetaStrategyResult["safetyGates"];
-
-  const effectiveFeatures = rawFeatures.map((feature) => {
-    if (feature.role !== "directional") {
-      return feature;
-    }
-    const rawTotal = familyRawTotals.get(feature.family) ?? 0;
-    const cappedTotal = families[feature.family].buy + families[feature.family].sell;
-    const scale = (rawTotal > 0 ? Math.min(1, cappedTotal / rawTotal) : 1) * aggregateScale;
-    return { ...feature, effectiveContribution: roundNumber(feature.contribution * scale, 4) };
-  });
-  const familyDisplayScores = metaFamilyDisplayScores(rawFeatures, familyAggregation);
-
-  return {
-    signal,
-    decisionLabel,
-    buyScore,
-    sellScore,
-    holdScore,
-    netScore,
-    edge,
-    contextMultiplier: roundNumber(contextMultiplier, 4),
-    aggregateScale: roundNumber(aggregateScale, 4),
-    activeDirectionalCount,
-    familyAggregation,
-    familyScores: families,
-    familyDisplayScores,
-    safetyGates,
-    strategies: effectiveFeatures,
-    reasons: [
-      `${activeDirectionalCount} directional strategy outputs are active across ${metaStrategyFamilies().length} capped families.`,
-      `Context modifiers adjusted buy/sell by ${buyContextMultiplier.toFixed(2)}x/${sellContextMultiplier.toFixed(2)}x.`,
-      aggregateScale < 1 ? `Aggregate directional score normalized by ${aggregateScale.toFixed(2)}x.` : "Aggregate directional score stayed within the 1.00 cap.",
-      cashBlocked ? "Cash / Avoid Trading Filter forced Hold." : `Final signal ${decisionLabel} from net score ${netScore.toFixed(2)}.`,
-    ],
-  };
+function metaStrategyPresentationResult(): MetaStrategyResult {
+  return emptyMetaStrategyResult("Backend Meta-Strategy service is authoritative; frontend displays returned status, predictions, evidence, backtests, promotions, and diagnostics only.");
 }
 
 function emptyMetaStrategyResult(reason: string): MetaStrategyResult {
@@ -14091,71 +13820,6 @@ function emptyMetaStrategyResult(reason: string): MetaStrategyResult {
   };
 }
 
-function metaStrategyFeature(
-  definition: MetaStrategyDefinition,
-  market: ConfidenceMarket,
-  ensembleVotes: Map<string, AlgoVote>,
-): MetaStrategyFeature {
-  const ensembleVote = ensembleVotes.get(definition.name);
-  if (definition.source === "ensemble" && ensembleVote) {
-    const confidence = isEligibleStrategyVote(ensembleVote) ? clampNumber((ensembleVote.score ?? 0) / 100, 0, 1) : 0;
-    const signal = confidenceContractSignal(confidence > 0 ? ensembleVote.signal : "Hold");
-    const direction = confidenceSignalDirection(signal);
-    const contribution = roundNumber(direction * confidence * metaRoleWeight(definition.role), 4);
-    return {
-      name: definition.name,
-      role: definition.role,
-      family: definition.family,
-      signal,
-      confidence,
-      direction,
-      contribution,
-      effectiveContribution: contribution,
-      source: "Voting Ensemble",
-      reason: ensembleVote.detail,
-    };
-  }
-
-  const sourceName = definition.alias ?? definition.name;
-  const confidenceStrategy = regimeSelectionStrategies.find((strategy) => strategy.name === sourceName);
-  if (!confidenceStrategy) {
-    return {
-      name: definition.name,
-      role: definition.role,
-      family: definition.family,
-      signal: "hold",
-      confidence: 0,
-      direction: 0,
-      contribution: 0,
-      effectiveContribution: 0,
-      source: definition.source,
-      reason: "No isolated read-only source is available",
-    };
-  }
-
-  const raw = confidenceStrategy.signal(market);
-  const signal = confidenceContractSignal(raw.signal);
-  const confidence = clampNumber(raw.confidence, 0, 1);
-  const direction = confidenceSignalDirection(signal);
-  const contribution = roundNumber(direction * confidence * metaRoleWeight(definition.role), 4);
-  return {
-    name: definition.name,
-    role: definition.role,
-    family: definition.family,
-    signal,
-    confidence,
-    direction,
-    contribution,
-    effectiveContribution: contribution,
-    source: definition.alias ? `${sourceName} copy` : "WCA/Regime output",
-    reason: raw.reason,
-  };
-}
-
-function metaRoleWeight(role: MetaStrategyRole) {
-  return role === "directional" ? 1 : role === "context" ? 0.35 : 0.2;
-}
-
 function metaStrategyFamilies(): MetaStrategyFamily[] {
   return ["trend", "breakout", "mean_reversion", "reversal", "volume_confirmation", "market_regime", "vwap", "event", "safety"];
 }
@@ -14183,47 +13847,6 @@ function emptyMetaFamilyAggregationScores(): MetaFamilyAggregationScores {
     reversal_sell_score: 0,
     confirmation_score: 0,
     regime_score: 0,
-  };
-}
-
-function metaFamilyDisplayScores(features: MetaStrategyFeature[], aggregation: MetaFamilyAggregationScores): Partial<Record<MetaStrategyFamily, MetaFamilyDisplayScore>> {
-  const signedAverage = (family: MetaStrategyFamily) => {
-    const familyFeatures = features.filter((feature) => feature.family === family && feature.role !== "directional");
-    if (!familyFeatures.length) {
-      return 0;
-    }
-    return roundNumber(familyFeatures.reduce((sum, feature) => sum + feature.direction * feature.confidence, 0) / familyFeatures.length, 4);
-  };
-  const safetyFeature = features.find((feature) => feature.family === "safety" && feature.name === "Cash / Avoid Trading Filter");
-  return {
-    volume_confirmation: { label: "Confirm", value: signedAverage("volume_confirmation") },
-    market_regime: { label: "Regime", value: aggregation.regime_score },
-    event: { label: "Event", value: signedAverage("event") },
-    safety: { label: "Gate", value: safetyFeature ? roundNumber(safetyFeature.confidence, 4) : 0 },
-  };
-}
-
-function metaFamilyAggregationScores(
-  families: Record<MetaStrategyFamily, { buy: number; sell: number; hold: number; capped: boolean }>,
-  contextFeatures: MetaStrategyFeature[],
-): MetaFamilyAggregationScores {
-  const signedAverage = (features: MetaStrategyFeature[]) => {
-    if (!features.length) {
-      return 0;
-    }
-    return roundNumber(features.reduce((sum, feature) => sum + feature.direction * feature.confidence, 0) / features.length, 4);
-  };
-  return {
-    trend_buy_score: roundNumber(families.trend.buy, 4),
-    trend_sell_score: roundNumber(families.trend.sell, 4),
-    breakout_buy_score: roundNumber(families.breakout.buy, 4),
-    breakout_sell_score: roundNumber(families.breakout.sell, 4),
-    mean_reversion_buy_score: roundNumber(families.mean_reversion.buy, 4),
-    mean_reversion_sell_score: roundNumber(families.mean_reversion.sell, 4),
-    reversal_buy_score: roundNumber(families.reversal.buy, 4),
-    reversal_sell_score: roundNumber(families.reversal.sell, 4),
-    confirmation_score: signedAverage(contextFeatures),
-    regime_score: signedAverage(contextFeatures.filter((feature) => feature.family === "market_regime")),
   };
 }
 

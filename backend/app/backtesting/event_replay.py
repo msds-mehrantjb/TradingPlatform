@@ -39,8 +39,8 @@ from backend.app.domain.trading_settings import trading_settings_configuration_h
 from backend.app.ensemble.family_aware import FamilyAwareDeterministicEnsemble
 from backend.app.execution.simulation import ExecutionSimulationConfig, RealisticExecutionSimulator
 from backend.app.gates import BrokerAccountSnapshot, BrokerPositionState, GlobalGateEngine, GlobalGateInput, aggregate_global_account_risk
-from backend.app.ml.features import MLFeatureSet
-from backend.app.ml.inference import SafeMLInferenceConfig, SafeMLInferenceResult, apply_safe_ml_inference
+from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceConfig, SafeMLInferenceResult, apply_safe_ml_inference
+from backend.app.algorithms.meta_strategy.ml_features import MLFeatureSet
 from backend.app.strategies.base import StrategyEvaluationContext
 from backend.app.strategies.safety import (
     CashAvoidTradingSafety,

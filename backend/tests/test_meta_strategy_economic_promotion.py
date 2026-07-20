@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from backend.app.meta_strategy_training import (
+from backend.app.algorithms.meta_strategy.training.training_core import (
     MetaTrainingConfig,
     evaluate_economic_promotion,
     train_meta_strategy_baselines,

@@ -15,7 +15,7 @@ from backend.app.domain.models import (
     StrategyFamily,
 )
 from backend.app.ensemble import FamilyAwareDeterministicEnsemble, FamilyAwareEnsembleConfig
-from backend.app.ml.inference import SafeMLInferenceConfig
+from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceConfig
 from backend.app.strategies.base import StrategyEvaluationContext, hold_signal, strategy_signal
 from backend.app.strategies.registry import directional_strategy_input_ids, resolve_strategy
 

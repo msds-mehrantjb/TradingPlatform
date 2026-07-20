@@ -5,7 +5,7 @@ from math import floor
 
 from backend.app.algorithms.voting_ensemble.exit_policy import VOTING_ENSEMBLE_DEFAULT_MAX_HOLDING_MINUTES
 from backend.app.domain.models import EffectiveTradePolicy, GlobalGateDecision, OrderPlan, TradeCandidate
-from backend.app.ml.inference import SafeMLInferenceResult
+from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceResult
 
 
 VOTING_ENSEMBLE_ORDER_PLANNER_VERSION = "voting_ensemble_order_planner_v1"
