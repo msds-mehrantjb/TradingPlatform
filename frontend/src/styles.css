@@ -74,7 +74,7 @@ select {
   grid-area: chart;
   height: 100%;
   display: grid;
-  grid-template-rows: 54px 46px auto minmax(0, 1fr) 88px;
+  grid-template-rows: 54px 46px minmax(0, 1fr) auto;
 }
 
 .chart-shell > * {
@@ -6176,15 +6176,33 @@ canvas.dragging {
 }
 
 @media (max-width: 1740px) {
+  body {
+    height: auto;
+    overflow: auto;
+  }
+
+  .workspace {
+    height: auto;
+    min-height: 100vh;
+    align-items: start;
+    overflow: visible;
+  }
+
   .dashboard-layout {
     width: 100%;
+    height: auto;
     grid-template-columns: minmax(0, 0.9fr) minmax(330px, 374px);
-    grid-template-rows: auto minmax(0, 1fr) auto;
+    grid-template-rows: auto auto auto auto;
     grid-template-areas:
       "layers quote"
       "chart quote"
       "left ."
       "right .";
+  }
+
+  .chart-shell {
+    height: auto;
+    min-height: 620px;
   }
 }
 
@@ -6238,7 +6256,7 @@ canvas.dragging {
 
   .chart-shell {
     min-height: 520px;
-    grid-template-rows: auto auto auto minmax(340px, 1fr) minmax(88px, auto);
+    grid-template-rows: auto auto minmax(340px, 1fr) minmax(88px, auto);
   }
 
   .context-stack {
