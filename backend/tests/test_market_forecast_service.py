@@ -94,6 +94,11 @@ def test_service_never_applies_heuristic_when_approved_model_is_missing() -> Non
     assert forecast["probabilityTimeout"] is None
     assert forecast["probability_buy"] is None
     assert forecast["probability_sell"] is None
+    assert forecast["multiHorizonForecast"]["status"] == FORECAST_STATUS_MODEL_UNAVAILABLE
+    assert forecast["multiHorizonForecast"]["forecastAppliedToOrder"] is False
+    assert forecast["multiHorizonForecast"]["positionManagementAppliedToOrder"] is False
+    assert [row["horizonMinutes"] for row in forecast["multiHorizonForecast"]["horizons"]] == [5, 10, 15]
+    assert all(row["probabilityUp"] is None for row in forecast["multiHorizonForecast"]["horizons"])
     assert forecast["allowed"] is False
     assert forecast["inference_performed"] is False
     assert forecast["forecast_applied_to_order"] is False
@@ -104,6 +109,57 @@ def test_service_never_applies_heuristic_when_approved_model_is_missing() -> Non
     assert forecast["heuristicEstimate"]["forecast_applied_to_order"] is False
     assert forecast["heuristicEstimate"]["probabilityBuySuccess"] is not None
     assert forecast["heuristicEstimate"]["probabilitySellSuccess"] is not None
+
+
+def test_market_forecast_returns_passive_ml_multi_horizon_position_advice() -> None:
+    horizon_model = {
+        "modelKind": "logistic",
+        "approved": True,
+        "weightsByClass": {
+            market_forecast.OUTCOME_TARGET: {"bias": 3.0},
+            market_forecast.OUTCOME_STOP: {"bias": -2.0},
+            market_forecast.OUTCOME_TIMEOUT: {"bias": -2.0},
+        },
+        "threshold": 0.55,
+        "label": {
+            "profitTargetDollars": 0.08,
+            "stopLossDollars": 0.08,
+            "minTargetPct": 0.0,
+            "minStopPct": 0.0,
+            "targetAtrMultiplier": 0.0,
+            "stopAtrMultiplier": 0.0,
+        },
+    }
+    artifact = {
+        "version": market_forecast.MODEL_VERSION,
+        "artifactId": "multi-horizon-test",
+        "modelKind": "logistic",
+        "lifecycleState": MODEL_STATE_ACTIVE,
+        "approved": True,
+        "weightsByClass": horizon_model["weightsByClass"],
+        "threshold": 0.55,
+        "label": horizon_model["label"],
+        "horizonModels": {
+            "5": horizon_model,
+            "10": horizon_model,
+            "15": horizon_model,
+        },
+    }
+
+    with patch("backend.app.market_forecast.load_market_forecast_artifact", return_value=artifact):
+        forecast = MarketForecastService().predict(candles(90), spread=0.01, slippage=0.001, fees=0.0)
+
+    multi = forecast["multiHorizonForecast"]
+    assert multi["status"] == "ready"
+    assert multi["activationPolicy"] == "advisory_only_until_live_paper_validation"
+    assert multi["entryAuthorization"] is False
+    assert multi["forecastAppliedToOrder"] is False
+    assert multi["positionManagementAppliedToOrder"] is False
+    assert [row["horizonMinutes"] for row in multi["horizons"]] == [5, 10, 15]
+    assert all(row["status"] == "ready" for row in multi["horizons"])
+    assert all(row["probabilityUp"] > row["probabilityDown"] for row in multi["horizons"])
+    assert all(row["advice"]["longPosition"] == "KEEP" for row in multi["horizons"])
+    assert all(row["advice"]["newLongEntry"] == "CONSIDER_AFTER_STRATEGY_SIGNAL" for row in multi["horizons"])
 
 
 def test_artifact_selection_is_separate_from_inference_and_requires_approval() -> None:

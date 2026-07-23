@@ -15,6 +15,8 @@ from backend.app.execution.cost_model import EXECUTION_COST_MODEL_SERVICE
 
 
 FORECAST_HORIZON_MINUTES = 5
+MARKET_FORECAST_POSITION_HORIZONS_MINUTES = (5, 10, 15)
+MULTI_HORIZON_POSITION_FORECAST_POLICY = "advisory_only_until_live_paper_validation"
 PREDICTION_LOG_INTERVAL_MINUTES = 5
 LEDGER_NUMBER_DECIMAL_PLACES = 2
 MIN_FEATURE_FORECAST_CANDLES = 2
@@ -245,6 +247,11 @@ def _market_forecast_prediction(
                 "probabilitySellSuccess": None,
                 "probabilityTimeout": None,
             },
+            "multiHorizonForecast": inactive_multi_horizon_forecast(
+                normalized[-1]["close"] if normalized else None,
+                status=forecast_status,
+                reason="Not enough finalized one-minute candles for ML horizon inference.",
+            ),
             "outcome": {
                 "predicted": OUTCOME_TIMEOUT,
                 "probabilities": {name: None for name in OUTCOME_ORDER},
@@ -408,6 +415,14 @@ def run_forecast_inference(artifact: ApprovedForecastArtifact, feature_snapshot:
         barriers=barriers,
         market_regime=market_regime,
     )
+    multi_horizon_forecast = build_multi_horizon_forecast(
+        artifact,
+        feature_snapshot,
+        execution_cost_inputs=execution_cost_inputs,
+        primary_probabilities=probabilities,
+        primary_barriers=barriers,
+        primary_market_regime=market_regime,
+    )
     regime_allows = regime_allows_forecast(features, market_regime)
     base_threshold = forecast_probability_threshold(artifact_payload)
     decision = forecast_trade_decision(
@@ -483,6 +498,7 @@ def run_forecast_inference(artifact: ApprovedForecastArtifact, feature_snapshot:
         },
         "expectedMove": round(expected_move, 4),
         "futurePricePrediction": future_price_prediction,
+        "multiHorizonForecast": multi_horizon_forecast,
         "costs": execution_adjusted_costs,
         "baseCosts": costs,
         "executionQuality": execution_quality,
@@ -500,6 +516,310 @@ def run_forecast_inference(artifact: ApprovedForecastArtifact, feature_snapshot:
         "topDrivers": forecast_drivers(features, probabilities, decision, regime_allows),
         "missingInputs": feature_snapshot.get("missingInputs") or [],
         "updatedAt": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+def build_multi_horizon_forecast(
+    artifact: ApprovedForecastArtifact,
+    feature_snapshot: dict[str, Any],
+    *,
+    execution_cost_inputs: dict[str, Any],
+    primary_probabilities: dict[str, float],
+    primary_barriers: dict[str, float],
+    primary_market_regime: dict[str, Any],
+) -> dict[str, Any]:
+    features = feature_snapshot["features"]
+    latest = feature_snapshot["latest"]
+    artifact_payload = artifact.payload
+    horizons = [
+        horizon_forecast_row(
+            artifact,
+            feature_snapshot,
+            horizon_minutes=horizon,
+            execution_cost_inputs=execution_cost_inputs,
+            primary_probabilities=primary_probabilities,
+            primary_barriers=primary_barriers,
+            primary_market_regime=primary_market_regime,
+        )
+        for horizon in MARKET_FORECAST_POSITION_HORIZONS_MINUTES
+    ]
+    ready_count = sum(1 for row in horizons if row["status"] == "ready")
+    return {
+        "status": "ready" if ready_count else FORECAST_STATUS_MODEL_UNAVAILABLE,
+        "forecastStatus": "ready" if ready_count else FORECAST_STATUS_MODEL_UNAVAILABLE,
+        "activationPolicy": MULTI_HORIZON_POSITION_FORECAST_POLICY,
+        "positionManagementAuthority": "advisory_only",
+        "entryAuthorization": False,
+        "forecastAppliedToOrder": False,
+        "positionManagementAppliedToOrder": False,
+        "horizons": horizons,
+        "summary": multi_horizon_summary(horizons),
+        "latestPrice": round(float(latest["close"]), 4),
+        "featureSchemaHash": forecast_feature_schema_hash(features),
+        "artifactId": artifact_payload.get("artifactId"),
+        "supportedHorizonsMinutes": list(MARKET_FORECAST_POSITION_HORIZONS_MINUTES),
+    }
+
+
+def horizon_forecast_row(
+    artifact: ApprovedForecastArtifact,
+    feature_snapshot: dict[str, Any],
+    *,
+    horizon_minutes: int,
+    execution_cost_inputs: dict[str, Any],
+    primary_probabilities: dict[str, float],
+    primary_barriers: dict[str, float],
+    primary_market_regime: dict[str, Any],
+) -> dict[str, Any]:
+    features = feature_snapshot["features"]
+    latest = feature_snapshot["latest"]
+    horizon_payload = horizon_model_payload(artifact.payload, horizon_minutes)
+    if horizon_payload is None:
+        return inactive_horizon_row(
+            latest["close"],
+            horizon_minutes=horizon_minutes,
+            status=FORECAST_STATUS_MODEL_UNAVAILABLE,
+            reason=f"No approved ML horizon head is available for {horizon_minutes} minutes.",
+        )
+
+    if horizon_minutes == FORECAST_HORIZON_MINUTES and horizon_payload is artifact.payload:
+        ensemble = uncertainty_summary([{"name": "primary_5m_ml", "probabilities": primary_probabilities}])
+        probabilities = primary_probabilities
+        barriers = primary_barriers
+        market_regime = primary_market_regime
+    else:
+        ensemble = ensemble_probabilities(features, horizon_payload)
+        probabilities = ensemble["probabilities"]
+        barriers = volatility_adjusted_barriers(features, latest["close"], artifact=horizon_payload, horizon_minutes=horizon_minutes)
+        market_regime = market_regime_profile(features)
+
+    buy_probability = float(probabilities[OUTCOME_TARGET])
+    sell_probability = float(probabilities[OUTCOME_STOP])
+    timeout_probability = float(probabilities[OUTCOME_TIMEOUT])
+    execution_quality = estimate_execution_quality(
+        features,
+        latest,
+        barriers,
+        spread=execution_cost_inputs.get("spread"),
+        slippage=float(execution_cost_inputs.get("slippage") if execution_cost_inputs.get("slippage") is not None else 0.02),
+        fees=float(execution_cost_inputs.get("fees") if execution_cost_inputs.get("fees") is not None else 0.0),
+        horizon_minutes=horizon_minutes,
+    )
+    execution_cost = float(execution_quality["totalEstimatedCost"])
+    execution_multiplier = float(execution_quality["expectedExecutionMultiplier"])
+    buy_ev = round(((buy_probability * barriers["targetDistance"]) - (sell_probability * barriers["stopDistance"])) * execution_multiplier - execution_cost, 4)
+    sell_ev = round(((sell_probability * barriers["targetDistance"]) - (buy_probability * barriers["stopDistance"])) * execution_multiplier - execution_cost, 4)
+    threshold = forecast_probability_threshold(horizon_payload)
+    edge_gap = abs(buy_probability - sell_probability)
+    minimum_edge_gap = DEFAULT_MIN_EDGE_GAP + (0.03 if market_regime.get("trend") == "sideways" else 0.0)
+    future_price_prediction = forecast_future_price_prediction(
+        features,
+        latest["close"],
+        probabilities=probabilities,
+        barriers=barriers,
+        market_regime=market_regime,
+        horizon_minutes=horizon_minutes,
+    )
+    advice = multi_horizon_position_advice(
+        buy_probability=buy_probability,
+        sell_probability=sell_probability,
+        timeout_probability=timeout_probability,
+        buy_expected_value=buy_ev,
+        sell_expected_value=sell_ev,
+        threshold=threshold,
+        minimum_edge_gap=minimum_edge_gap,
+    )
+    return {
+        "status": "ready",
+        "forecastStatus": "ready",
+        "horizonMinutes": horizon_minutes,
+        "modelApplied": True,
+        "modelKind": horizon_payload.get("modelKind") or artifact.payload.get("modelKind") or "unknown",
+        "artifactId": horizon_payload.get("artifactId") or artifact.payload.get("artifactId"),
+        "featureSchemaHash": (
+            horizon_payload.get("featureSchemaHash")
+            or artifact.payload.get("featureSchemaHash")
+            or forecast_feature_schema_hash(features)
+        ),
+        "probabilityBuySuccess": round(buy_probability, 4),
+        "probabilitySellSuccess": round(sell_probability, 4),
+        "probabilityTimeout": round(timeout_probability, 4),
+        "probabilityUp": round(buy_probability, 4),
+        "probabilityDown": round(sell_probability, 4),
+        "probabilityFlatOrNoEdge": round(timeout_probability, 4),
+        "threshold": round(threshold, 4),
+        "edgeGap": round(edge_gap, 4),
+        "minimumEdgeGap": round(minimum_edge_gap, 4),
+        "buyExpectedValue": buy_ev,
+        "sellExpectedValue": sell_ev,
+        "futurePricePrediction": future_price_prediction,
+        "predictedDirection": future_price_prediction["direction"],
+        "predictedPrice": future_price_prediction["predictedPrice"],
+        "predictedChangeDollars": future_price_prediction["predictedChangeDollars"],
+        "expectedExecutionCost": round(execution_cost, 4),
+        "executionQuality": execution_quality,
+        "uncertainty": ensemble,
+        "advice": advice,
+        "entryAuthorization": False,
+        "forecastAppliedToOrder": False,
+        "positionManagementAppliedToOrder": False,
+        "activationPolicy": MULTI_HORIZON_POSITION_FORECAST_POLICY,
+    }
+
+
+def horizon_model_payload(artifact_payload: dict[str, Any], horizon_minutes: int) -> dict[str, Any] | None:
+    containers = (
+        artifact_payload.get("horizonModels"),
+        artifact_payload.get("multiHorizonModels"),
+        (artifact_payload.get("multiHorizonForecast") or {}).get("horizonModels")
+        if isinstance(artifact_payload.get("multiHorizonForecast"), dict)
+        else None,
+    )
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        payload = container.get(str(horizon_minutes)) or container.get(horizon_minutes) or container.get(f"{horizon_minutes}m")
+        if isinstance(payload, dict) and payload.get("approved", True) is not False:
+            return {**artifact_payload, **payload, "horizonMinutes": horizon_minutes}
+    if horizon_minutes == FORECAST_HORIZON_MINUTES:
+        return artifact_payload
+    return None
+
+
+def multi_horizon_position_advice(
+    *,
+    buy_probability: float,
+    sell_probability: float,
+    timeout_probability: float,
+    buy_expected_value: float,
+    sell_expected_value: float,
+    threshold: float,
+    minimum_edge_gap: float,
+) -> dict[str, Any]:
+    up_edge = buy_probability - sell_probability
+    down_edge = sell_probability - buy_probability
+    up_confirmed = buy_probability >= threshold and up_edge >= minimum_edge_gap and buy_expected_value > 0
+    down_confirmed = sell_probability >= threshold and down_edge >= minimum_edge_gap and sell_expected_value > 0
+    no_edge = timeout_probability >= max(buy_probability, sell_probability)
+    return {
+        "longPosition": "KEEP" if up_confirmed else "CLOSE_REVIEW" if down_confirmed or buy_expected_value < 0 else "MONITOR",
+        "shortPosition": "KEEP" if down_confirmed else "CLOSE_REVIEW" if up_confirmed or sell_expected_value < 0 else "MONITOR",
+        "newLongEntry": "CONSIDER_AFTER_STRATEGY_SIGNAL" if up_confirmed else "WAIT",
+        "newShortEntry": "CONSIDER_AFTER_STRATEGY_SIGNAL" if down_confirmed else "WAIT",
+        "flatMarket": "WAIT" if no_edge else "DIRECTIONAL_EDGE_PRESENT",
+        "reasonCodes": multi_horizon_reason_codes(
+            up_confirmed=up_confirmed,
+            down_confirmed=down_confirmed,
+            no_edge=no_edge,
+            buy_expected_value=buy_expected_value,
+            sell_expected_value=sell_expected_value,
+        ),
+    }
+
+
+def multi_horizon_reason_codes(
+    *,
+    up_confirmed: bool,
+    down_confirmed: bool,
+    no_edge: bool,
+    buy_expected_value: float,
+    sell_expected_value: float,
+) -> list[str]:
+    if up_confirmed:
+        return ["ml_horizon_up_edge_confirmed", "long_position_keep_bias", "new_short_wait_bias"]
+    if down_confirmed:
+        return ["ml_horizon_down_edge_confirmed", "long_position_close_review_bias", "new_long_wait_bias"]
+    reasons = ["ml_horizon_edge_not_confirmed"]
+    if no_edge:
+        reasons.append("timeout_or_no_edge_probability_dominant")
+    if buy_expected_value <= 0:
+        reasons.append("long_expected_value_not_positive_after_execution_costs")
+    if sell_expected_value <= 0:
+        reasons.append("short_expected_value_not_positive_after_execution_costs")
+    return reasons
+
+
+def multi_horizon_summary(horizons: list[dict[str, Any]]) -> dict[str, Any]:
+    ready = [row for row in horizons if row.get("status") == "ready"]
+    if not ready:
+        return {
+            "primaryBias": "MODEL_UNAVAILABLE",
+            "longPosition": "NO_ML_ADVICE",
+            "newLongEntry": "WAIT_FOR_VALIDATED_MODEL",
+            "readyHorizons": 0,
+        }
+    up_count = sum(1 for row in ready if row.get("advice", {}).get("longPosition") == "KEEP")
+    down_count = sum(1 for row in ready if row.get("advice", {}).get("shortPosition") == "KEEP")
+    wait_count = sum(1 for row in ready if row.get("advice", {}).get("newLongEntry") == "WAIT")
+    if up_count > down_count:
+        bias = "UP"
+    elif down_count > up_count:
+        bias = "DOWN"
+    else:
+        bias = "MIXED"
+    return {
+        "primaryBias": bias,
+        "longPosition": "KEEP" if up_count >= max(1, len(ready) // 2) else "CLOSE_REVIEW" if down_count >= max(1, len(ready) // 2) else "MONITOR",
+        "shortPosition": "KEEP" if down_count >= max(1, len(ready) // 2) else "CLOSE_REVIEW" if up_count >= max(1, len(ready) // 2) else "MONITOR",
+        "newLongEntry": "WAIT" if wait_count >= max(1, len(ready) // 2) else "CONSIDER_AFTER_STRATEGY_SIGNAL",
+        "readyHorizons": len(ready),
+    }
+
+
+def inactive_multi_horizon_forecast(latest_close: Any, *, status: str, reason: str) -> dict[str, Any]:
+    horizons = [
+        inactive_horizon_row(latest_close, horizon_minutes=horizon, status=status, reason=reason)
+        for horizon in MARKET_FORECAST_POSITION_HORIZONS_MINUTES
+    ]
+    return {
+        "status": status,
+        "forecastStatus": status,
+        "activationPolicy": MULTI_HORIZON_POSITION_FORECAST_POLICY,
+        "positionManagementAuthority": "advisory_only",
+        "entryAuthorization": False,
+        "forecastAppliedToOrder": False,
+        "positionManagementAppliedToOrder": False,
+        "horizons": horizons,
+        "summary": multi_horizon_summary(horizons),
+        "supportedHorizonsMinutes": list(MARKET_FORECAST_POSITION_HORIZONS_MINUTES),
+        "reason": reason,
+    }
+
+
+def inactive_horizon_row(latest_close: Any, *, horizon_minutes: int, status: str, reason: str) -> dict[str, Any]:
+    return {
+        "status": status,
+        "forecastStatus": status,
+        "horizonMinutes": horizon_minutes,
+        "modelApplied": False,
+        "probabilityBuySuccess": None,
+        "probabilitySellSuccess": None,
+        "probabilityTimeout": None,
+        "probabilityUp": None,
+        "probabilityDown": None,
+        "probabilityFlatOrNoEdge": None,
+        "threshold": None,
+        "edgeGap": None,
+        "minimumEdgeGap": None,
+        "buyExpectedValue": None,
+        "sellExpectedValue": None,
+        "futurePricePrediction": no_edge_future_price_prediction(latest_close or 0.0, reason, horizon_minutes=horizon_minutes),
+        "predictedDirection": "unavailable",
+        "predictedPrice": None,
+        "predictedChangeDollars": None,
+        "advice": {
+            "longPosition": "NO_ML_ADVICE",
+            "shortPosition": "NO_ML_ADVICE",
+            "newLongEntry": "WAIT_FOR_VALIDATED_MODEL",
+            "newShortEntry": "WAIT_FOR_VALIDATED_MODEL",
+            "flatMarket": "WAIT_FOR_VALIDATED_MODEL",
+            "reasonCodes": ["ml_horizon_model_unavailable"],
+        },
+        "entryAuthorization": False,
+        "forecastAppliedToOrder": False,
+        "positionManagementAppliedToOrder": False,
+        "activationPolicy": MULTI_HORIZON_POSITION_FORECAST_POLICY,
+        "reason": reason,
     }
 
 
@@ -585,6 +905,11 @@ def inference_not_run_forecast(
             "probabilitySellSuccess": None,
             "probabilityTimeout": None,
         },
+        "multiHorizonForecast": inactive_multi_horizon_forecast(
+            latest["close"],
+            status=FORECAST_STATUS_MODEL_UNAVAILABLE,
+            reason=unavailable_reason,
+        ),
         "outcome": {
             "predicted": OUTCOME_TIMEOUT,
             "probabilities": {name: None for name in OUTCOME_ORDER},
@@ -938,6 +1263,7 @@ def build_market_forecast_prediction_record(
             },
             "predictedFutureMarket": predicted_future,
             "futurePricePrediction": future_price_prediction,
+            "multiHorizonForecast": forecast.get("multiHorizonForecast") or {},
             "priceComparison": price_comparison_snapshot(latest, predicted_future),
             "expectedCosts": {
                 "costs": numeric(forecast.get("costs")),
@@ -2454,13 +2780,19 @@ def fallback_probabilities(features: dict[str, Any]) -> dict[str, float]:
     return softmax_scores({OUTCOME_STOP: stop_score, OUTCOME_TIMEOUT: timeout_score, OUTCOME_TARGET: target_score})
 
 
-def expected_success_move(features: dict[str, Any], latest_close: float) -> float:
+def expected_success_move(features: dict[str, Any], latest_close: float, *, horizon_minutes: int = FORECAST_HORIZON_MINUTES) -> float:
     atr_value = features["volatility"]["atr_1m"]
-    realized = features["volatility"]["realized_volatility"] * latest_close * math.sqrt(FORECAST_HORIZON_MINUTES)
+    realized = features["volatility"]["realized_volatility"] * latest_close * math.sqrt(horizon_minutes)
     return max(0.05, atr_value, realized)
 
 
-def volatility_adjusted_barriers(features: dict[str, Any], latest_close: float, *, artifact: dict[str, Any] | None = None) -> dict[str, float]:
+def volatility_adjusted_barriers(
+    features: dict[str, Any],
+    latest_close: float,
+    *,
+    artifact: dict[str, Any] | None = None,
+    horizon_minutes: int = FORECAST_HORIZON_MINUTES,
+) -> dict[str, float]:
     label_config = (artifact or {}).get("label") or {}
     configured_fixed_target = numeric(label_config.get("profitTargetDollars"))
     fixed_target = max(configured_fixed_target, DEFAULT_PROFIT_TARGET_DOLLARS)
@@ -2470,18 +2802,20 @@ def volatility_adjusted_barriers(features: dict[str, Any], latest_close: float, 
     target_multiplier = numeric(label_config.get("targetAtrMultiplier")) or DEFAULT_TARGET_ATR_MULTIPLIER
     stop_multiplier = numeric(label_config.get("stopAtrMultiplier")) or DEFAULT_STOP_ATR_MULTIPLIER
     atr_value = float(features["volatility"]["atr_1m"])
-    realized = float(features["volatility"]["realized_volatility"]) * latest_close * math.sqrt(FORECAST_HORIZON_MINUTES)
-    atr_5m = max(atr_value * math.sqrt(FORECAST_HORIZON_MINUTES), realized, 0.01)
+    realized = float(features["volatility"]["realized_volatility"]) * latest_close * math.sqrt(horizon_minutes)
+    atr_horizon = max(atr_value * math.sqrt(horizon_minutes), realized, 0.01)
     return {
-        "targetDistance": max(fixed_target, latest_close * min_target_pct, atr_5m * target_multiplier),
-        "stopDistance": max(fixed_stop, latest_close * min_stop_pct, atr_5m * stop_multiplier),
+        "targetDistance": max(fixed_target, latest_close * min_target_pct, atr_horizon * target_multiplier),
+        "stopDistance": max(fixed_stop, latest_close * min_stop_pct, atr_horizon * stop_multiplier),
         "minTargetPct": min_target_pct,
         "minStopPct": min_stop_pct,
         "targetAtrMultiplier": target_multiplier,
         "stopAtrMultiplier": stop_multiplier,
         "fixedTargetDollars": fixed_target,
         "fixedStopDollars": fixed_stop,
-        "atr5m": atr_5m,
+        "atr5m": atr_horizon,
+        "atrHorizon": atr_horizon,
+        "horizonMinutes": horizon_minutes,
     }
 
 
@@ -2494,6 +2828,7 @@ def estimate_execution_quality(
     slippage: float,
     fees: float,
     latency_seconds: float = DEFAULT_DECISION_TO_SUBMISSION_LATENCY_SECONDS,
+    horizon_minutes: int = FORECAST_HORIZON_MINUTES,
 ) -> dict[str, Any]:
     micro = features.get("microstructure") or {}
     volatility = features.get("volatility") or {}
@@ -2527,7 +2862,7 @@ def estimate_execution_quality(
     partial_fill_probability = clamp(0.06 + spread_atr * 0.22 + max(0.0, 1.0 - relative_volume) * 0.10 + volatility_penalty * 0.25, 0.02, 0.45)
     expected_partial_fill_fraction = clamp(1.0 - (partial_fill_probability * 0.45), 0.55, 1.0)
     stop_limit_miss_probability = clamp(0.02 + max_spread_atr * 0.20 + volatility_penalty * 0.35 + quote_imbalance * 0.04, 0.01, 0.45)
-    opportunity_decay = clamp((latency_minutes / max(FORECAST_HORIZON_MINUTES, 1)) * (1 + range_expansion * 0.75) + limit_order_non_fill_probability * 0.12, 0.0, 0.6)
+    opportunity_decay = clamp((latency_minutes / max(horizon_minutes, 1)) * (1 + range_expansion * 0.75) + limit_order_non_fill_probability * 0.12, 0.0, 0.6)
     adverse_selection_cost = max(0.0, observed_spread * 0.5 + quote_movement * 0.35 + atr_1m * volatility_penalty * 0.15)
     quote_movement_cost = quote_movement * 0.5
     cancel_replace_cost = observed_spread * limit_order_non_fill_probability * 0.35
@@ -2568,6 +2903,7 @@ def estimate_execution_quality(
             "fees": round(max(0.0, float(fees)), 6),
             "atr1m": round(atr_1m, 6),
             "latestClose": round(latest_close, 6),
+            "horizonMinutes": horizon_minutes,
         },
     }
 
@@ -2579,6 +2915,7 @@ def forecast_future_price_prediction(
     probabilities: dict[str, float],
     barriers: dict[str, float],
     market_regime: dict[str, Any],
+    horizon_minutes: int = FORECAST_HORIZON_MINUTES,
 ) -> dict[str, Any]:
     algorithm = features.get("algorithm") or {}
     trend = features.get("trend") or {}
@@ -2647,7 +2984,7 @@ def forecast_future_price_prediction(
     predicted_change = clamp(directional_score * move_scale, -atr_5m, atr_5m)
     predicted_price = max(0.01, latest_close + predicted_change)
     return {
-        "horizonMinutes": FORECAST_HORIZON_MINUTES,
+        "horizonMinutes": horizon_minutes,
         "predictedPrice": round(predicted_price, 4),
         "predictedChangeDollars": round(predicted_change, 4),
         "predictedReturnPct": round(safe_return(predicted_price, latest_close), 6),
@@ -2665,14 +3002,19 @@ def forecast_future_price_prediction(
             "volatilityMultiplier": round(volatility_multiplier, 4),
             "confidenceMultiplier": round(confidence_multiplier, 4),
         },
-        "basis": "5-minute expected close from probabilities, trend indicators, strategy scores, regime, volatility, and session.",
+        "basis": f"{horizon_minutes}-minute expected close from probabilities, trend indicators, strategy scores, regime, volatility, and session.",
     }
 
 
-def no_edge_future_price_prediction(latest_close: float, reason: str) -> dict[str, Any]:
+def no_edge_future_price_prediction(
+    latest_close: float,
+    reason: str,
+    *,
+    horizon_minutes: int = FORECAST_HORIZON_MINUTES,
+) -> dict[str, Any]:
     latest_close = max(numeric(latest_close), 0.01)
     return {
-        "horizonMinutes": FORECAST_HORIZON_MINUTES,
+        "horizonMinutes": horizon_minutes,
         "predictedPrice": round(latest_close, 4),
         "predictedChangeDollars": 0.0,
         "predictedReturnPct": 0.0,
@@ -2690,7 +3032,7 @@ def no_edge_future_price_prediction(latest_close: float, reason: str) -> dict[st
             "volatilityMultiplier": 0.0,
             "confidenceMultiplier": 0.0,
         },
-        "basis": f"5-minute neutral expected close. {reason}.",
+        "basis": f"{horizon_minutes}-minute neutral expected close. {reason}.",
     }
 
 

@@ -88,6 +88,54 @@ type MarketForecastPrediction = {
     atr5m?: number;
   };
   expectedMove: number | null;
+  futurePricePrediction?: {
+    horizonMinutes?: number;
+    predictedPrice?: number | null;
+    predictedChangeDollars?: number | null;
+    direction?: string;
+  };
+  multiHorizonForecast?: {
+    status: "ready" | "INFERENCE_NOT_RUN" | "MODEL_UNAVAILABLE" | "insufficient_data" | "error";
+    forecastStatus?: "ready" | "INFERENCE_NOT_RUN" | "MODEL_UNAVAILABLE" | "insufficient_data" | "error";
+    activationPolicy: string;
+    positionManagementAuthority: "advisory_only";
+    entryAuthorization: false;
+    forecastAppliedToOrder: false;
+    positionManagementAppliedToOrder: false;
+    summary?: {
+      primaryBias?: "UP" | "DOWN" | "MIXED" | "MODEL_UNAVAILABLE";
+      longPosition?: string;
+      shortPosition?: string;
+      newLongEntry?: string;
+      readyHorizons?: number;
+    };
+    horizons: Array<{
+      status: "ready" | "INFERENCE_NOT_RUN" | "MODEL_UNAVAILABLE" | "insufficient_data" | "error";
+      horizonMinutes: number;
+      modelApplied: boolean;
+      probabilityUp: number | null;
+      probabilityDown: number | null;
+      probabilityFlatOrNoEdge: number | null;
+      probabilityBuySuccess?: number | null;
+      probabilitySellSuccess?: number | null;
+      probabilityTimeout?: number | null;
+      predictedDirection: string;
+      predictedPrice: number | null;
+      predictedChangeDollars: number | null;
+      buyExpectedValue: number | null;
+      sellExpectedValue: number | null;
+      advice: {
+        longPosition: "KEEP" | "CLOSE_REVIEW" | "MONITOR" | "NO_ML_ADVICE";
+        shortPosition: "KEEP" | "CLOSE_REVIEW" | "MONITOR" | "NO_ML_ADVICE";
+        newLongEntry: "CONSIDER_AFTER_STRATEGY_SIGNAL" | "WAIT" | "WAIT_FOR_VALIDATED_MODEL";
+        newShortEntry: "CONSIDER_AFTER_STRATEGY_SIGNAL" | "WAIT" | "WAIT_FOR_VALIDATED_MODEL";
+        flatMarket: string;
+        reasonCodes: string[];
+      };
+      activationPolicy: string;
+      reason?: string;
+    }>;
+  };
   costs: number;
   allowed: boolean;
   inferencePerformed?: boolean;
@@ -20598,6 +20646,92 @@ function renderMarketForecastItem(label: string, value: string, impact: MarketFo
   return `<span class="market-forecast-item" data-impact="${impact}"><b>${escapeHtml(label)}</b>${escapeHtml(value)}</span>`;
 }
 
+function formatNullableProbability(value: number | null | undefined) {
+  return value == null ? "NA" : formatProbability(value);
+}
+
+function marketForecastHorizonRows(forecast: MarketForecastPrediction) {
+  const backendRows = forecast.multiHorizonForecast?.horizons ?? [];
+  if (backendRows.length) {
+    return backendRows;
+  }
+  const modelApplied =
+    forecast.model.status === "ready" &&
+    forecast.inferencePerformed !== false &&
+    forecast.inference_performed !== false &&
+    forecast.status !== "MODEL_UNAVAILABLE" &&
+    forecast.status !== "INFERENCE_NOT_RUN";
+  return [5, 10, 15].map((horizonMinutes) => {
+    const isPrimary = horizonMinutes === 5;
+    return {
+      status: isPrimary ? forecast.status : "MODEL_UNAVAILABLE",
+      horizonMinutes,
+      modelApplied: isPrimary && modelApplied,
+      probabilityUp: isPrimary ? forecast.probabilityBuySuccess ?? forecast.probabilitySuccess : null,
+      probabilityDown: isPrimary ? forecast.probabilitySellSuccess ?? forecast.probabilityStop : null,
+      probabilityFlatOrNoEdge: isPrimary ? forecast.probabilityTimeout : null,
+      probabilityBuySuccess: isPrimary ? forecast.probabilityBuySuccess ?? forecast.probabilitySuccess : null,
+      probabilitySellSuccess: isPrimary ? forecast.probabilitySellSuccess ?? forecast.probabilityStop : null,
+      probabilityTimeout: isPrimary ? forecast.probabilityTimeout : null,
+      predictedDirection: isPrimary ? forecast.futurePricePrediction?.direction ?? forecast.decision.candidateAction : "pending",
+      predictedPrice: isPrimary ? forecast.futurePricePrediction?.predictedPrice ?? null : null,
+      predictedChangeDollars: isPrimary ? forecast.futurePricePrediction?.predictedChangeDollars ?? null : null,
+      buyExpectedValue: isPrimary ? forecast.buyExpectedValue ?? forecast.expectedValue : null,
+      sellExpectedValue: isPrimary ? forecast.sellExpectedValue ?? null : null,
+      advice: {
+        longPosition:
+          isPrimary && forecast.probabilityBuySuccess != null && forecast.probabilitySellSuccess != null && forecast.probabilityBuySuccess > forecast.probabilitySellSuccess
+            ? "KEEP"
+            : isPrimary && forecast.probabilitySellSuccess != null && forecast.probabilityBuySuccess != null && forecast.probabilitySellSuccess > forecast.probabilityBuySuccess
+              ? "CLOSE_REVIEW"
+              : "NO_ML_ADVICE",
+        shortPosition: "NO_ML_ADVICE",
+        newLongEntry: isPrimary && forecast.decision.action === "buy" ? "CONSIDER_AFTER_STRATEGY_SIGNAL" : "WAIT_FOR_VALIDATED_MODEL",
+        newShortEntry: isPrimary && forecast.decision.action === "sell" ? "CONSIDER_AFTER_STRATEGY_SIGNAL" : "WAIT_FOR_VALIDATED_MODEL",
+        flatMarket: "WAIT_FOR_VALIDATED_MODEL",
+        reasonCodes: ["backend_multi_horizon_forecast_not_loaded"],
+      },
+      activationPolicy: "advisory_only_until_live_paper_validation",
+      reason: isPrimary ? "Primary 5-minute forecast shown; restart backend for authoritative multi-horizon response." : "Approved ML horizon head is not loaded.",
+    };
+  });
+}
+
+function renderMultiHorizonForecastStrip(forecast: MarketForecastPrediction) {
+  const rows = marketForecastHorizonRows(forecast);
+  return `
+    <div class="market-forecast-horizon-strip" aria-label="ML multi-horizon position forecast">
+      ${rows
+        .map((horizon) => {
+          const up = horizon.probabilityUp ?? horizon.probabilityBuySuccess;
+          const down = horizon.probabilityDown ?? horizon.probabilitySellSuccess;
+          const change =
+            horizon.predictedChangeDollars == null
+              ? "NA"
+              : `${horizon.predictedChangeDollars >= 0 ? "+" : ""}${currency(horizon.predictedChangeDollars)}`;
+          const direction = horizon.modelApplied ? horizon.predictedDirection.replaceAll("_", " ") : "ML unavailable";
+          const impact: MarketForecastImpact =
+            horizon.advice.longPosition === "KEEP"
+              ? "positive"
+              : horizon.advice.longPosition === "CLOSE_REVIEW" || !horizon.modelApplied
+                ? "negative"
+                : "neutral";
+          return `
+            <div class="market-forecast-horizon-card" data-impact="${impact}">
+              <b>${horizon.horizonMinutes}m ML</b>
+              <strong>${escapeHtml(direction)}</strong>
+              <span>P up/down ${escapeHtml(`${formatNullableProbability(up)} / ${formatNullableProbability(down)}`)}</span>
+              <span>Long ${escapeHtml(horizon.advice.longPosition.replaceAll("_", " "))}</span>
+              <span>New long ${escapeHtml(horizon.advice.newLongEntry.replaceAll("_", " "))}</span>
+              <span>Move ${escapeHtml(change)}</span>
+            </div>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
 function thresholdImpact(value: number | null | undefined, threshold: number | null | undefined, higherIsBetter = true): MarketForecastImpact {
   if (value == null || threshold == null) {
     return "neutral";
@@ -20709,6 +20843,7 @@ function renderMarketForecastPanel() {
       <span>Future Market Forecast</span>
       <strong>${escapeHtml(statusLabel)}</strong>
     </div>
+    ${renderMultiHorizonForecastStrip(forecast)}
     <div class="market-forecast-grid">
       ${renderMarketForecastItem("P(buy success)", `${buyProbability} / need ${formatProbability(forecast.threshold)}`, forecast.decision.action === "buy" ? thresholdImpact(buyProbabilityValue, forecast.threshold) : "neutral")}
       ${renderMarketForecastItem("P(sell success)", sellProbability, forecast.decision.action === "sell" ? thresholdImpact(sellProbabilityValue, forecast.threshold) : "neutral")}

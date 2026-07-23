@@ -5321,6 +5321,69 @@ select {
   gap: 5px;
 }
 
+.market-forecast-horizon-strip {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+  margin-bottom: 5px;
+}
+
+.market-forecast-horizon-card {
+  min-width: 0;
+  border: 1px solid #dbeafe;
+  border-radius: 5px;
+  background: #ffffff;
+  color: #334155;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.25;
+  padding: 6px;
+  overflow-wrap: anywhere;
+}
+
+.market-forecast-horizon-card b,
+.market-forecast-horizon-card strong,
+.market-forecast-horizon-card span {
+  display: block;
+  min-width: 0;
+}
+
+.market-forecast-horizon-card b {
+  color: #1d4ed8;
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.market-forecast-horizon-card strong {
+  color: #111827;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: capitalize;
+}
+
+.market-forecast-horizon-card[data-impact="positive"] {
+  border-color: #86efac;
+  background: #dcfce7;
+  color: #047857;
+}
+
+.market-forecast-horizon-card[data-impact="negative"] {
+  border-color: #fecdd3;
+  background: #fff1f2;
+  color: #be123c;
+}
+
+.market-forecast-horizon-card[data-impact="positive"] b,
+.market-forecast-horizon-card[data-impact="positive"] strong {
+  color: #047857;
+}
+
+.market-forecast-horizon-card[data-impact="negative"] b,
+.market-forecast-horizon-card[data-impact="negative"] strong {
+  color: #be123c;
+}
+
 .market-forecast-item {
   min-width: 0;
   border: 1px solid #dbeafe;
