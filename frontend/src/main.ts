@@ -40,7 +40,9 @@ type CandleResponse = {
 };
 
 type MarketForecastPrediction = {
-  status: "ready" | "fallback" | "insufficient_data" | "error";
+  status: "ready" | "INFERENCE_NOT_RUN" | "MODEL_UNAVAILABLE" | "insufficient_data" | "error";
+  forecastStatus?: "ready" | "INFERENCE_NOT_RUN" | "MODEL_UNAVAILABLE" | "insufficient_data" | "error";
+  forecast_status?: "ready" | "INFERENCE_NOT_RUN" | "MODEL_UNAVAILABLE" | "insufficient_data" | "error";
   symbol: string;
   horizonMinutes: number;
   probabilitySuccess: number | null;
@@ -88,6 +90,10 @@ type MarketForecastPrediction = {
   expectedMove: number | null;
   costs: number;
   allowed: boolean;
+  inferencePerformed?: boolean;
+  inference_performed?: boolean;
+  forecastAppliedToOrder?: boolean;
+  forecast_applied_to_order?: boolean;
   model: {
     status: string;
     kind: string;
@@ -130,6 +136,16 @@ type MarketForecastPrediction = {
     modelDisagreement: number | null;
     maximumModelDisagreement: number;
     members: Array<{ name: string; buy: number; sell: number; timeout: number }>;
+  };
+  heuristicEstimate?: {
+    status: "HEURISTIC_ESTIMATE_NOT_ML";
+    forecastAppliedToOrder: false;
+    probabilityBuySuccess: number;
+    probabilitySellSuccess: number;
+    probabilityTimeout: number;
+    decision?: MarketForecastPrediction["decision"];
+    buyExpectedValue?: number | null;
+    sellExpectedValue?: number | null;
   };
   features: Record<string, unknown>;
   topDrivers: string[];
@@ -20648,8 +20664,20 @@ function renderMarketForecastPanel() {
   const algoScoreLabel = algoScores
     ? `B ${formatProbability(algoScores.buy ?? 0)} / S ${formatProbability(algoScores.sell ?? 0)} / H ${formatProbability(algoScores.hold ?? 0)}`
     : "NA";
-  const statusLabel = forecast.decision.action === "buy" ? "Buy edge" : forecast.decision.action === "sell" ? "Sell edge" : forecast.status === "insufficient_data" ? "Need data" : "No trade";
-  const modelLabel = forecast.model.status === "ready" ? forecast.model.kind : "Fallback";
+  const statusLabel =
+    forecast.status === "INFERENCE_NOT_RUN" || forecast.status === "MODEL_UNAVAILABLE"
+      ? "Inference not run"
+      : forecast.decision.action === "buy"
+        ? "Buy edge"
+        : forecast.decision.action === "sell"
+          ? "Sell edge"
+          : forecast.status === "insufficient_data"
+            ? "Need data"
+            : "No trade";
+  const modelLabel =
+    forecast.model.status === "ready"
+      ? forecast.model.kind
+      : forecast.heuristicEstimate?.status ?? forecast.model.kind ?? "MODEL_UNAVAILABLE";
   const edgeGap = forecast.decision.edgeGap === null ? "NA" : formatProbability(forecast.decision.edgeGap);
   const modelDisagreement = forecast.uncertainty?.modelDisagreement ?? forecast.decision.modelDisagreement;
   const maxDisagreement = forecast.uncertainty?.maximumModelDisagreement ?? forecast.decision.maximumModelDisagreement ?? 0.1;
@@ -20667,7 +20695,7 @@ function renderMarketForecastPanel() {
         ? forecast.marketRegime?.allowedShort ? "positive" : "negative"
         : "negative";
   const sizeImpact = forecast.decision.positionSizeMultiplier > 0 ? "positive" : "negative";
-  const modelImpact = forecast.model.status === "ready" ? "positive" : forecast.status === "fallback" ? "negative" : "neutral";
+  const modelImpact = forecast.model.status === "ready" ? "positive" : forecast.status === "INFERENCE_NOT_RUN" || forecast.status === "MODEL_UNAVAILABLE" ? "negative" : "neutral";
   const algoScoresImpact = algoScores
     ? forecast.decision.action === "buy"
       ? (algoScores.buy ?? 0) > Math.max(algoScores.sell ?? 0, algoScores.hold ?? 0) ? "positive" : "negative"
@@ -20694,7 +20722,12 @@ function renderMarketForecastPanel() {
       ${renderMarketForecastItem("Algo Scores", algoScoreLabel, algoScoresImpact)}
       ${renderMarketForecastItem("Model", modelLabel, modelImpact)}
     </div>
-    <div class="market-forecast-note">${escapeHtml(forecast.topDrivers.slice(0, 3).join(" | "))}</div>
+    <div class="market-forecast-note">${escapeHtml(
+      [
+        ...forecast.topDrivers.slice(0, 3),
+        ...(forecast.heuristicEstimate ? ["HEURISTIC_ESTIMATE_NOT_ML only; not applied to orders"] : []),
+      ].join(" | "),
+    )}</div>
   `;
 }
 

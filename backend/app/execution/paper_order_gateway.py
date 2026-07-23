@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol
 from pydantic import Field, field_validator
 
 from backend.app.domain.models import DomainModel, Signal, _require_utc
+from backend.app.execution.cost_model import record_execution_cost_observation_from_order_log
 from backend.app.gates import AppliedGlobalGateDecision, GlobalOrderProposal
 from backend.app.risk.manager import GlobalPortfolioRiskManager
 from backend.app.risk.types import AccountSnapshot, GlobalGateDecision as PortfolioGateDecision, GlobalOrderIntent, MarketSnapshot, PortfolioSnapshot
@@ -231,6 +232,7 @@ class PaperOrderGateway:
         self.store.write_snapshot(_intent_key(proposal.orderIntentId), final_intent.model_dump(mode="json"))
         result = self._result(proposal, client_order_id, mode, submitted, False, status, tuple(reason_codes), "Paper order submission was reconciled through the shared gateway.", evaluated_at, ack=ack, fill=fill, protective=protective)
         self.store.write_snapshot(_result_key(proposal.orderIntentId), result.model_dump(mode="json"))
+        self._record_execution_cost_observation(verified, result)
         if global_risk_decision.reservationId:
             if submitted and ack.brokerOrderId:
                 self.global_risk_manager.commit_reservation(global_risk_decision.reservationId, broker_order_id=ack.brokerOrderId)
@@ -422,6 +424,29 @@ class PaperOrderGateway:
             configurationHash=_hash_payload({"clientOrderId": client_order_id, "status": status, "reasonCodes": reason_codes}),
         )
 
+    def _record_execution_cost_observation(self, intent: PaperOrderIntentRecord, result: PaperOrderGatewayResult) -> None:
+        try:
+            observation = record_execution_cost_observation_from_order_log(
+                {
+                    "intent": intent,
+                    "result": result,
+                    "sourceMode": "paper",
+                    "orderSubmissionTimestamp": result.brokerAck.acceptedAt if result.brokerAck and result.brokerAck.acceptedAt else result.evaluatedAt,
+                }
+            )
+            self.store.write_snapshot(_execution_cost_observation_key(intent.orderIntentId), observation)
+        except Exception as exc:
+            self.store.write_snapshot(
+                _execution_cost_observation_error_key(intent.orderIntentId),
+                {
+                    "status": "EXECUTION_COST_OBSERVATION_NOT_RECORDED",
+                    "orderIntentId": intent.orderIntentId,
+                    "clientOrderId": intent.clientOrderId,
+                    "error": str(exc),
+                    "recordedAt": evaluated_error_time(),
+                },
+            )
+
 
 def deterministic_gateway_client_order_id(proposal: GlobalOrderProposal) -> str:
     payload = {
@@ -471,6 +496,14 @@ def _result_key(order_intent_id: str) -> str:
     return f"paper_order_gateway.result.{order_intent_id}"
 
 
+def _execution_cost_observation_key(order_intent_id: str) -> str:
+    return f"paper_order_gateway.execution_cost_observation.{order_intent_id}"
+
+
+def _execution_cost_observation_error_key(order_intent_id: str) -> str:
+    return f"paper_order_gateway.execution_cost_observation_error.{order_intent_id}"
+
+
 def _global_risk_key(order_intent_id: str) -> str:
     return f"paper_order_gateway.global_risk.{order_intent_id}"
 
@@ -497,6 +530,10 @@ def _store_items(store: PaperOrderGatewayStore):
 
 def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+
+
+def evaluated_error_time() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _jsonable(value: Any) -> Any:

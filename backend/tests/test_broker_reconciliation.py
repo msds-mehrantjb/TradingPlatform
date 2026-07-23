@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import unittest
+import shutil
+import uuid
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 from backend.app.domain.models import AccountRiskState, Direction, EnsembleDecision, OrderPlan, Signal, TradeCandidate
+from backend.app.execution import cost_model
 from backend.app.execution import BrokerFillUpdate, BrokerOrderAck, BrokerReconciliationEngine, BrokerSubmissionRequest, deterministic_client_order_id
 from backend.app.gates import BrokerAccountSnapshot, BrokerOrderState, BrokerPositionState, GlobalGateInput
 
@@ -13,6 +17,29 @@ SESSION_DATE = date(2026, 1, 5)
 
 
 class BrokerReconciliationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.scratch = Path("backend/.test_artifacts") / f"broker_execution_cost_{uuid.uuid4().hex}"
+        shutil.rmtree(self.scratch, ignore_errors=True)
+        self.previous_dirs = (
+            cost_model.EXECUTION_COST_LEDGER_DIR,
+            cost_model.EXECUTION_COST_CANDIDATE_DIR,
+            cost_model.EXECUTION_COST_ACTIVE_DIR,
+            cost_model.EXECUTION_COST_ACTIVE_HISTORY_DIR,
+        )
+        cost_model.EXECUTION_COST_LEDGER_DIR = self.scratch / "ledger"
+        cost_model.EXECUTION_COST_CANDIDATE_DIR = self.scratch / "artifacts" / "candidates"
+        cost_model.EXECUTION_COST_ACTIVE_DIR = self.scratch / "artifacts" / "active"
+        cost_model.EXECUTION_COST_ACTIVE_HISTORY_DIR = self.scratch / "artifacts" / "active_history"
+
+    def tearDown(self) -> None:
+        (
+            cost_model.EXECUTION_COST_LEDGER_DIR,
+            cost_model.EXECUTION_COST_CANDIDATE_DIR,
+            cost_model.EXECUTION_COST_ACTIVE_DIR,
+            cost_model.EXECUTION_COST_ACTIVE_HISTORY_DIR,
+        ) = self.previous_dirs
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
     def test_replaying_same_submission_request_is_idempotent(self) -> None:
         broker = FakePaperBroker(ack_status="ACCEPTED")
         engine = BrokerReconciliationEngine(broker)
@@ -45,6 +72,14 @@ class BrokerReconciliationTest(unittest.TestCase):
         self.assertTrue(result.brokerAccepted)
         self.assertEqual(result.fillUpdate.filledQuantity, 4)
         self.assertEqual(result.protectiveOrder.quantity, 4)
+        self.assertEqual(result.orderSubmissionTimestamp, NOW)
+        self.assertEqual(result.actualBrokerFillLifecycle["sourceAuthority"], "broker")
+        self.assertEqual(result.actualBrokerFillLifecycle["filledQuantity"], 4)
+        self.assertIsNotNone(result.executionCostObservation)
+        rows = cost_model.load_observations("SPY")
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["labels"]["partialFill"])
+        self.assertEqual(rows[0]["orderSubmissionTimestamp"], NOW.isoformat())
         self.assertTrue(result.localPositionCreated)
         self.assertIn("broker.partial_fill_tracked", result.reasonCodes)
         self.assertIn("broker.protective_quantity_matches_fill", result.reasonCodes)

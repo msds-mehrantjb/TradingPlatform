@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any
@@ -29,8 +29,14 @@ from .market_forecast import (
     extract_market_forecast_features,
     flatten_forecast_features,
     market_forecast_artifact_path,
+    market_forecast_candidate_artifact_path,
+    market_forecast_candidate_model_path,
+    market_forecast_fold_model_path,
+    market_forecast_promotion_validation_gates,
+    MODEL_STATE_TRAINED_CANDIDATE,
     normalize_candles,
 )
+from .tick_data import first_barrier_hit_from_ticks, load_quote_trade_ticks, parse_timestamp
 
 
 BACKTEST_EXPORT_DIR = Path(__file__).resolve().parents[1] / "data" / "backtests"
@@ -42,6 +48,9 @@ DEFAULT_ATR_LOOKBACK_MINUTES = 5
 DEFAULT_WALK_FORWARD_FOLDS = 4
 DEFAULT_EMBARGO_MINUTES = FORECAST_HORIZON_MINUTES
 DEFAULT_TRAINING_COST = 0.03
+DEFAULT_EXECUTION_LATENCY_CANDLES = 1
+AMBIGUOUS_LABEL_POLICY = "resolve_with_quote_trade_ticks_else_exclude_from_training"
+ENTRY_PRICE_POLICY = "first_executable_price_after_decision_latency_order_validation"
 
 
 def main() -> None:
@@ -104,6 +113,8 @@ def train_market_forecast_model(
     max_rows: int,
     model_kind: str,
 ) -> dict[str, Any]:
+    trained_at = datetime.now(UTC).isoformat()
+    artifact_id = market_forecast_candidate_artifact_id(symbol=symbol, trained_at=trained_at, model_kind=model_kind)
     manifest = latest_manifest(symbol)
     candle_path = Path(str(manifest.get("files", {}).get("continuous1mJsonl") or ""))
     if not candle_path.exists():
@@ -124,30 +135,37 @@ def train_market_forecast_model(
         max_rows=max_rows,
         microstructure_by_timestamp=microstructure_by_timestamp,
         require_microstructure=model_kind == "xgboost",
+        symbol=symbol,
+        feed=feed,
     )
     if len(rows) < 1_000:
         raise ValueError(f"Need at least 1,000 labeled rows; found {len(rows)}")
 
+    partitions = chronological_forecast_partitions(rows)
+    train_rows = partitions["training"]
+    calibration_rows = partitions["calibration"]
+    threshold_rows = partitions["thresholdSelection"]
+    final_holdout_rows = partitions["finalUntouchedTest"]
     walk_forward = walk_forward_validate(
-        rows,
+        train_rows + calibration_rows + threshold_rows,
         requested_folds=walk_forward_folds,
         embargo_minutes=embargo_minutes,
         model_kind=model_kind,
         symbol=symbol,
+        artifact_id=artifact_id,
     )
-    deployment_split_index = max(1, int(len(rows) * 0.8))
-    train_rows = rows[:deployment_split_index]
-    test_rows = rows[deployment_split_index:]
     feature_names = sorted({key for row in train_rows for key in row["features"]})
     model_file: str | None = None
     means: dict[str, float] = {}
     scales: dict[str, float] = {}
 
     if model_kind == "xgboost":
-        model, train_metrics, test_metrics = train_xgboost_model(train_rows, test_rows, feature_names, symbol=symbol)
+        model, raw_train_metrics, raw_calibration_metrics = train_xgboost_model(train_rows, calibration_rows, feature_names, symbol=symbol, artifact_id=artifact_id)
         model_file = model["modelFile"]
         raw_train_probabilities = xgboost_saved_probabilities(train_rows, feature_names, model_file)
-        raw_test_probabilities = xgboost_saved_probabilities(test_rows, feature_names, model_file)
+        raw_calibration_probabilities = xgboost_saved_probabilities(calibration_rows, feature_names, model_file)
+        raw_threshold_probabilities = xgboost_saved_probabilities(threshold_rows, feature_names, model_file)
+        raw_final_holdout_probabilities = xgboost_saved_probabilities(final_holdout_rows, feature_names, model_file)
     else:
         means, scales = feature_stats(train_rows, feature_names)
         model = train_logistic_model(train_rows, feature_names, means, scales)
@@ -155,16 +173,26 @@ def train_market_forecast_model(
             score_probabilities(row["features"], model["weightsByClass"], model["intercepts"], feature_names, means, scales)
             for row in train_rows
         ]
-        raw_test_probabilities = [
+        raw_calibration_probabilities = [
             score_probabilities(row["features"], model["weightsByClass"], model["intercepts"], feature_names, means, scales)
-            for row in test_rows
+            for row in calibration_rows
         ]
-        train_metrics = evaluate_outcome_probabilities(zip(raw_train_probabilities, labels(train_rows), row_economics(train_rows)))
-        test_metrics = evaluate_outcome_probabilities(zip(raw_test_probabilities, labels(test_rows), row_economics(test_rows)))
+        raw_threshold_probabilities = [
+            score_probabilities(row["features"], model["weightsByClass"], model["intercepts"], feature_names, means, scales)
+            for row in threshold_rows
+        ]
+        raw_final_holdout_probabilities = [
+            score_probabilities(row["features"], model["weightsByClass"], model["intercepts"], feature_names, means, scales)
+            for row in final_holdout_rows
+        ]
+        raw_train_metrics = evaluate_outcome_probabilities(zip(raw_train_probabilities, labels(train_rows), row_economics(train_rows)))
+        raw_calibration_metrics = evaluate_outcome_probabilities(zip(raw_calibration_probabilities, labels(calibration_rows), row_economics(calibration_rows)))
 
-    calibration = fit_probability_calibration(raw_train_probabilities, labels(train_rows))
+    calibration = fit_probability_calibration(raw_calibration_probabilities, labels(calibration_rows))
     calibrated_train_probabilities = [apply_probability_calibration(probabilities, calibration) for probabilities in raw_train_probabilities]
-    calibrated_test_probabilities = [apply_probability_calibration(probabilities, calibration) for probabilities in raw_test_probabilities]
+    calibrated_calibration_probabilities = [apply_probability_calibration(probabilities, calibration) for probabilities in raw_calibration_probabilities]
+    calibrated_threshold_probabilities = [apply_probability_calibration(probabilities, calibration) for probabilities in raw_threshold_probabilities]
+    calibrated_final_holdout_probabilities = [apply_probability_calibration(probabilities, calibration) for probabilities in raw_final_holdout_probabilities]
     uncertainty_ensemble = train_uncertainty_ensemble(train_rows, feature_names)
     ensemble_train_probabilities = combine_member_probabilities(
         calibrated_train_probabilities,
@@ -173,25 +201,49 @@ def train_market_forecast_model(
             for member in uncertainty_ensemble["members"]
         ],
     )
-    ensemble_test_probabilities = combine_member_probabilities(
-        calibrated_test_probabilities,
+    ensemble_calibration_probabilities = combine_member_probabilities(
+        calibrated_calibration_probabilities,
         [
-            member_probabilities(test_rows, member)
+            member_probabilities(calibration_rows, member)
             for member in uncertainty_ensemble["members"]
         ],
     )
-    raw_train_metrics = train_metrics
-    raw_test_metrics = test_metrics
+    ensemble_threshold_probabilities = combine_member_probabilities(
+        calibrated_threshold_probabilities,
+        [
+            member_probabilities(threshold_rows, member)
+            for member in uncertainty_ensemble["members"]
+        ],
+    )
+    ensemble_final_holdout_probabilities = combine_member_probabilities(
+        calibrated_final_holdout_probabilities,
+        [
+            member_probabilities(final_holdout_rows, member)
+            for member in uncertainty_ensemble["members"]
+        ],
+    )
     calibrated_train_metrics = evaluate_outcome_probabilities(zip(calibrated_train_probabilities, labels(train_rows), row_economics(train_rows)))
-    calibrated_test_metrics = evaluate_outcome_probabilities(zip(calibrated_test_probabilities, labels(test_rows), row_economics(test_rows)))
+    calibrated_calibration_metrics = evaluate_outcome_probabilities(zip(calibrated_calibration_probabilities, labels(calibration_rows), row_economics(calibration_rows)))
+    threshold_selection_metrics = evaluate_outcome_probabilities(zip(ensemble_threshold_probabilities, labels(threshold_rows), row_economics(threshold_rows)))
+    optimized_probability_threshold = max(DEFAULT_SUCCESS_THRESHOLD, float(threshold_selection_metrics.get("evOptimizedThreshold") or DEFAULT_SUCCESS_THRESHOLD))
+    final_holdout_metrics = evaluate_outcome_probabilities(
+        zip(ensemble_final_holdout_probabilities, labels(final_holdout_rows), row_economics(final_holdout_rows)),
+        threshold=optimized_probability_threshold,
+        include_threshold_optimization=False,
+    )
+    out_of_sample_execution_value_proof = market_forecast_oos_execution_value_proof(final_holdout_metrics)
     train_metrics = evaluate_outcome_probabilities(zip(ensemble_train_probabilities, labels(train_rows), row_economics(train_rows)))
-    test_metrics = evaluate_outcome_probabilities(zip(ensemble_test_probabilities, labels(test_rows), row_economics(test_rows)))
-    optimized_probability_threshold = max(DEFAULT_SUCCESS_THRESHOLD, float(test_metrics.get("evOptimizedThreshold") or DEFAULT_SUCCESS_THRESHOLD))
+    calibration_metrics = evaluate_outcome_probabilities(zip(ensemble_calibration_probabilities, labels(calibration_rows), row_economics(calibration_rows)))
 
     artifact = {
         "version": MODEL_VERSION,
+        "artifactId": artifact_id,
         "modelKind": model_kind if model_kind == "xgboost" else "sparse-softmax-baseline",
-        "trainedAt": datetime.now(UTC).isoformat(),
+        "trainingModelKind": model_kind,
+        "lifecycleState": MODEL_STATE_TRAINED_CANDIDATE,
+        "promotionStatus": MODEL_STATE_TRAINED_CANDIDATE,
+        "approved": False,
+        "trainedAt": trained_at,
         "symbol": symbol,
         "feed": feed,
         "sourceManifest": manifest.get("manifest"),
@@ -209,21 +261,85 @@ def train_market_forecast_model(
             "stopAtrMultiplier": stop_atr_multiplier,
             "atrLookbackMinutes": atr_lookback_minutes,
             "trainingCostDollars": training_cost,
+            "entryPricePolicy": ENTRY_PRICE_POLICY,
+            "executionLatencyCandles": DEFAULT_EXECUTION_LATENCY_CANDLES,
+            "sameCandleTargetStopAmbiguityPolicy": AMBIGUOUS_LABEL_POLICY,
             "labels": OUTCOME_LABELS,
             "decisionLabels": {
                 "buy_success": 1,
                 "sell_success": -1,
                 "no_trade": 0,
             },
-            "rule": "+1 when the volatility-adjusted upper barrier is hit first; -1 when the volatility-adjusted lower barrier is hit first; 0 when neither barrier hits within the next 5 one-minute bars. Distances use max(fixed dollar floor, entry price percent floor, recent ATR times multiplier). The serving layer converts weak or close Buy/Sell probabilities into no_trade.",
+            "rule": "+1 when the volatility-adjusted upper barrier is hit first after the first executable entry price; -1 when the lower barrier is hit first; 0 when neither barrier hits inside the horizon. Same-candle target/stop collisions are resolved with chronological quote/trade ticks when available and otherwise excluded from training. Distances use max(fixed dollar floor, entry price percent floor, recent ATR times multiplier). The serving layer converts weak or close Buy/Sell probabilities into no_trade.",
         },
         "threshold": round(optimized_probability_threshold, 4),
+        "expectedValueThreshold": 0.0,
+        "validationDeploymentParity": {
+            "featureSchemaHash": feature_schema_hash(feature_names),
+            "featureSchema": "sorted_flatten_forecast_features_from_training_partition",
+            "modelFamily": model_kind,
+            "hyperparameters": model_hyperparameters(model_kind),
+            "normalization": "feature_stats_from_training_partition" if model_kind == "logistic" else "xgboost_raw_flattened_features",
+            "calibrator": calibration.get("method"),
+            "thresholdPolicy": "expected_value_optimized_threshold",
+            "thresholdPolicySource": "threshold_selection_partition",
+            "barrierDefinitions": {
+                "name": "trade_decision_triple_barrier_5m",
+                "profitTargetDollars": profit_target,
+                "stopLossDollars": stop_loss,
+                "minTargetPct": min_target_pct,
+                "minStopPct": min_stop_pct,
+                "targetAtrMultiplier": target_atr_multiplier,
+                "stopAtrMultiplier": stop_atr_multiplier,
+                "atrLookbackMinutes": atr_lookback_minutes,
+                "entryPricePolicy": ENTRY_PRICE_POLICY,
+                "executionLatencyCandles": DEFAULT_EXECUTION_LATENCY_CANDLES,
+                "sameCandleTargetStopAmbiguityPolicy": AMBIGUOUS_LABEL_POLICY,
+            },
+            "costAssumptions": {
+                "trainingCostDollars": training_cost,
+                "baseServingFormula": "spread + two_way_slippage + fees",
+                "servingFormula": "base_cost + adverse_selection + quote_movement_during_latency + cancel_replace_cost + expected_stop_limit_miss_cost + realized_vs_estimated_cost_error_reserve",
+                "executionQualityInputs": [
+                    "fill_probability",
+                    "limit_order_non_fill_probability",
+                    "stop_limit_miss_probability",
+                    "partial_fill_fraction",
+                    "adverse_selection_cost",
+                    "decision_to_submission_latency",
+                    "quote_movement_during_latency",
+                    "opportunity_decay",
+                    "cancel_replace_cost",
+                    "realized_vs_estimated_cost_error_reserve",
+                ],
+                "optimizationMetric": "incremental_realized_net_value_after_execution_costs",
+            },
+            "finalHoldoutRole": "report_only_never_tuning",
+        },
+        "partitionPolicy": {
+            "method": "chronological_four_way_split",
+            "partitions": [
+                {"name": "training", "purpose": "fit_model", "rows": len(train_rows), "start": partition_start(train_rows), "end": partition_end(train_rows)},
+                {"name": "calibration", "purpose": "calibrate_probabilities", "rows": len(calibration_rows), "start": partition_start(calibration_rows), "end": partition_end(calibration_rows)},
+                {"name": "threshold_selection", "purpose": "select_confidence_and_ev_thresholds", "rows": len(threshold_rows), "start": partition_start(threshold_rows), "end": partition_end(threshold_rows)},
+                {"name": "final_untouched_test", "purpose": "report_final_performance_only", "rows": len(final_holdout_rows), "start": partition_start(final_holdout_rows), "end": partition_end(final_holdout_rows)},
+            ],
+            "finalHoldoutForbiddenUses": [
+                "probability_threshold",
+                "feature_set",
+                "hyperparameters",
+                "barrier_distances",
+                "model_family",
+                "cost_assumptions",
+            ],
+        },
         "validationPolicy": {
             "method": "walk_forward_purged_embargo",
             "requestedFolds": walk_forward_folds,
             "embargoMinutes": embargo_minutes,
             "labelHorizonMinutes": FORECAST_HORIZON_MINUTES,
-            "note": "Each validation fold is later in time than its training fold; training observations whose label interval overlaps or falls inside the embargo window are removed.",
+            "sourceRows": "training_calibration_threshold_selection_only",
+            "note": "Each validation fold is later in time than its training fold; training observations whose label interval overlaps or falls inside the embargo window are removed. Final untouched test rows are excluded from walk-forward validation and all tuning.",
         },
         "regimePolicy": {
             "mode": "regime_as_features_with_serving_gates",
@@ -256,15 +372,17 @@ def train_market_forecast_model(
             ],
         },
         "algorithmFeaturePolicy": {
-            "mode": "strategy_outputs_as_trade_quality_features",
-            "algorithms": [
-                "RSI Mean Reversion",
-                "Breakout Strategy",
-                "MACD Strategy",
-            ],
+            "mode": "stable_algorithm_owned_signal_contracts_only",
+            "source": "backend algorithm registries and deterministic decision-time signal contracts",
+            "isolationRule": "Market forecast features may consume strategy_id, strategy_version, signal, confidence_or_setup_quality, family, eligibility, reason_codes, and regime_compatibility; they must not consume another algorithm's mutable weights, performance history, learned state, calibrated probabilities, or promoted model artifacts.",
             "features": [
-                "algorithm_n_signal",
-                "algorithm_n_confidence",
+                "strategy__<strategy_id>__signal",
+                "strategy__<strategy_id>__confidence_or_setup_quality",
+                "strategy__<strategy_id>__eligible",
+                "strategy__<strategy_id>__regime_compatibility",
+                "strategy__<strategy_id>__version_hash",
+                "strategy__<strategy_id>__family_hash",
+                "strategy__<strategy_id>__reason_code_hash",
                 "weighted_buy_score",
                 "weighted_sell_score",
                 "weighted_hold_score",
@@ -280,9 +398,11 @@ def train_market_forecast_model(
         },
         "optimizationPolicy": {
             "objective": "expected_value",
-            "formula": "P(success) * target_profit - P(adverse_stop) * stop_loss - spread_slippage_cost",
+            "formula": "((P(success) * target_profit) - (P(adverse_stop) * stop_loss)) * expected_execution_multiplier - total_estimated_execution_cost",
+            "metric": "incremental_realized_net_value_after_execution_costs",
             "minimumExpectedValue": 0,
-            "thresholdSource": "test_ev_optimized_threshold",
+            "thresholdSource": "threshold_selection_ev_optimized_threshold",
+            "finalHoldoutRole": "report_only_never_tuning",
             "defaultMinimumProbability": DEFAULT_SUCCESS_THRESHOLD,
         },
         "uncertaintyPolicy": {
@@ -292,7 +412,10 @@ def train_market_forecast_model(
             "rule": "No trade when top-side final probability is below threshold, model disagreement exceeds 0.10, or expected value is non-positive.",
         },
         "trainingRows": len(train_rows),
-        "testRows": len(test_rows),
+        "calibrationRows": len(calibration_rows),
+        "thresholdSelectionRows": len(threshold_rows),
+        "finalUntouchedTestRows": len(final_holdout_rows),
+        "testRows": len(final_holdout_rows),
         "positiveRate": round(label_rate(rows, 1), 4),
         "outcomeRates": outcome_rates(rows),
         "featureNames": feature_names,
@@ -307,32 +430,48 @@ def train_market_forecast_model(
         "uncertaintyEnsemble": uncertainty_ensemble,
         "metrics": {
             "train": train_metrics,
-            "test": test_metrics,
+            "calibration": calibration_metrics,
+            "thresholdSelection": threshold_selection_metrics,
+            "finalUntouchedTest": final_holdout_metrics,
             "rawTrain": raw_train_metrics,
-            "rawTest": raw_test_metrics,
+            "rawCalibration": raw_calibration_metrics,
             "calibratedTrain": calibrated_train_metrics,
-            "calibratedTest": calibrated_test_metrics,
-            "accuracy": test_metrics["accuracy"],
-            "auc": test_metrics["auc"],
-            "brier": test_metrics["brier"],
+            "calibratedCalibration": calibrated_calibration_metrics,
+            "accuracy": final_holdout_metrics["accuracy"],
+            "auc": final_holdout_metrics["auc"],
+            "brier": final_holdout_metrics["brier"],
             "walkForward": walk_forward["summary"],
         },
+        "outOfSampleExecutionValueProof": out_of_sample_execution_value_proof,
         "walkForwardValidation": walk_forward,
         "topFeatures": model.get("topFeatures") or top_softmax_weights(model.get("weightsByClass") or {}, limit=20),
     }
-    path = market_forecast_artifact_path(symbol)
+    artifact["promotionValidationGates"] = market_forecast_promotion_validation_gates(artifact)
+    path = market_forecast_candidate_artifact_path(artifact_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
     return {
-        "status": "trained",
+        "status": MODEL_STATE_TRAINED_CANDIDATE,
+        "artifactId": artifact_id,
         "artifact": str(path),
+        "candidateArtifactPath": str(path),
+        "activeArtifactPath": str(market_forecast_artifact_path(symbol)),
+        "promotionRequired": True,
         "symbol": symbol,
         "rows": len(rows),
         "trainingRows": len(train_rows),
-        "testRows": len(test_rows),
+        "calibrationRows": len(calibration_rows),
+        "thresholdSelectionRows": len(threshold_rows),
+        "finalUntouchedTestRows": len(final_holdout_rows),
+        "testRows": len(final_holdout_rows),
         "positiveRate": artifact["positiveRate"],
         "outcomeRates": artifact["outcomeRates"],
-        "test": test_metrics,
+        "threshold": artifact["threshold"],
+        "thresholdSelection": threshold_selection_metrics,
+        "finalUntouchedTest": final_holdout_metrics,
+        "outOfSampleExecutionValueProof": out_of_sample_execution_value_proof,
+        "promotionValidationGates": artifact["promotionValidationGates"],
+        "test": final_holdout_metrics,
         "walkForward": walk_forward["summary"],
         "topFeatures": artifact["topFeatures"][:8],
     }
@@ -358,6 +497,11 @@ def latest_manifest(symbol: str) -> dict[str, Any]:
     if not candidates:
         raise FileNotFoundError(f"No manifest files found under {root}")
     return sorted(candidates, key=lambda item: (item[0], item[1], str(item[2])), reverse=True)[0][3]
+
+
+def market_forecast_candidate_artifact_id(*, symbol: str, trained_at: str, model_kind: str) -> str:
+    timestamp = trained_at.replace(":", "").replace("+", "_").replace(".", "_")
+    return f"{MODEL_VERSION}_{symbol.upper()}_{model_kind}_{timestamp}"
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -397,6 +541,33 @@ def load_microstructure_by_timestamp(*, symbol: str, feed: str) -> dict[str, dic
     return rows
 
 
+def chronological_forecast_partitions(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    if len(rows) < 1_000:
+        raise ValueError(f"Need at least 1,000 labeled rows; found {len(rows)}")
+    total = len(rows)
+    training_end = max(1, int(total * 0.60))
+    calibration_end = max(training_end + 1, int(total * 0.75))
+    threshold_end = max(calibration_end + 1, int(total * 0.90))
+    partitions = {
+        "training": rows[:training_end],
+        "calibration": rows[training_end:calibration_end],
+        "thresholdSelection": rows[calibration_end:threshold_end],
+        "finalUntouchedTest": rows[threshold_end:],
+    }
+    too_small = [name for name, partition_rows in partitions.items() if len(partition_rows) < 50]
+    if too_small:
+        raise ValueError(f"Chronological forecast partitions are too small: {', '.join(too_small)}")
+    return partitions
+
+
+def partition_start(rows: list[dict[str, Any]]) -> str | None:
+    return str(rows[0].get("timestamp")) if rows else None
+
+
+def partition_end(rows: list[dict[str, Any]]) -> str | None:
+    return str(rows[-1].get("timestamp")) if rows else None
+
+
 def walk_forward_validate(
     rows: list[dict[str, Any]],
     *,
@@ -404,6 +575,7 @@ def walk_forward_validate(
     embargo_minutes: int,
     model_kind: str,
     symbol: str,
+    artifact_id: str,
 ) -> dict[str, Any]:
     folds = walk_forward_folds(rows, requested_folds=max(1, requested_folds), embargo_minutes=max(0, embargo_minutes))
     results: list[dict[str, Any]] = []
@@ -414,8 +586,8 @@ def walk_forward_validate(
             results.append({**fold_metadata(fold), "status": "skipped_insufficient_rows"})
             continue
         feature_names = sorted({key for row in train_rows for key in row["features"]})
-        metrics = train_and_score_validation_fold(train_rows, validation_rows, feature_names)
-        results.append({**fold_metadata(fold), "status": "validated", "metrics": metrics})
+        metrics = train_and_score_validation_fold(train_rows, validation_rows, feature_names, model_kind=model_kind, symbol=symbol, fold=fold["fold"], artifact_id=artifact_id)
+        results.append({**fold_metadata(fold), "status": "validated", "modelKind": model_kind, "metrics": metrics})
     validated = [result for result in results if result.get("status") == "validated"]
     return {
         "method": "walk_forward_purged_embargo",
@@ -458,22 +630,52 @@ def walk_forward_folds(rows: list[dict[str, Any]], *, requested_folds: int, emba
     return folds
 
 
-def train_and_score_validation_fold(train_rows: list[dict[str, Any]], validation_rows: list[dict[str, Any]], feature_names: list[str]) -> dict[str, Any]:
+def train_and_score_validation_fold(
+    train_rows: list[dict[str, Any]],
+    validation_rows: list[dict[str, Any]],
+    feature_names: list[str],
+    *,
+    model_kind: str,
+    symbol: str = "SPY",
+    fold: int = 0,
+    artifact_id: str = "market_forecast_candidate",
+) -> dict[str, Any]:
     means, scales = feature_stats(train_rows, feature_names)
-    model = train_logistic_model(train_rows, feature_names, means, scales, epochs=24, learning_rate=0.03)
-    raw_train = [
-        score_probabilities(row["features"], model["weightsByClass"], model["intercepts"], feature_names, means, scales)
-        for row in train_rows
-    ]
+    model_file: str | None = None
+    if model_kind == "xgboost":
+        model = train_xgboost_fold_model(train_rows, feature_names, symbol=symbol, fold=fold, artifact_id=artifact_id)
+        model_file = model["modelFile"]
+        raw_train = xgboost_saved_probabilities(train_rows, feature_names, model_file)
+        raw_validation = xgboost_saved_probabilities(validation_rows, feature_names, model_file)
+    elif model_kind == "logistic":
+        model = train_logistic_model(train_rows, feature_names, means, scales, epochs=24, learning_rate=0.03)
+        raw_train = [
+            score_probabilities(row["features"], model["weightsByClass"], model["intercepts"], feature_names, means, scales)
+            for row in train_rows
+        ]
+        raw_validation = [
+            score_probabilities(row["features"], model["weightsByClass"], model["intercepts"], feature_names, means, scales)
+            for row in validation_rows
+        ]
+    else:
+        raise ValueError(f"Unsupported market forecast model kind for validation: {model_kind}")
     calibration = fit_probability_calibration(raw_train, labels(train_rows))
-    validation_probabilities = [
-        apply_probability_calibration(
-            score_probabilities(row["features"], model["weightsByClass"], model["intercepts"], feature_names, means, scales),
-            calibration,
-        )
-        for row in validation_rows
-    ]
-    return evaluate_outcome_probabilities(zip(validation_probabilities, labels(validation_rows), row_economics(validation_rows)))
+    validation_probabilities = [apply_probability_calibration(probabilities, calibration) for probabilities in raw_validation]
+    metrics = evaluate_outcome_probabilities(zip(validation_probabilities, labels(validation_rows), row_economics(validation_rows)))
+    metrics["validationParity"] = {
+        "modelFamily": model_kind,
+        "featureSchemaHash": feature_schema_hash(feature_names),
+        "featureCount": len(feature_names),
+        "normalization": "feature_stats_from_fold_training_rows",
+        "calibrator": calibration.get("method"),
+        "thresholdPolicy": "expected_value_optimized_threshold",
+        "thresholdPolicySource": "walk_forward_validation_fold",
+        "barrierDefinitions": "row_economics_from_shared_triple_barrier_labels",
+        "costAssumptions": "row_economics_tradingCost",
+        "hyperparameters": model_hyperparameters(model_kind),
+        "modelFile": model_file,
+    }
+    return metrics
 
 
 def fold_metadata(fold: dict[str, Any]) -> dict[str, Any]:
@@ -503,6 +705,36 @@ def walk_forward_summary(validated: list[dict[str, Any]]) -> dict[str, Any]:
     summary["totalEvSelected"] = round(sum(selected_ev), 6)
     summary["averageEvSelected"] = round(mean(selected_ev_per_trade), 6)
     return summary
+
+
+def market_forecast_oos_execution_value_proof(final_holdout_metrics: dict[str, Any]) -> dict[str, Any]:
+    expected_value = final_holdout_metrics.get("expectedValue") or {}
+    selected_trades = int(expected_value.get("selectedTrades") or 0)
+    average_selected = float(expected_value.get("averageEvSelected") or 0.0)
+    total_selected = float(expected_value.get("totalEvSelected") or 0.0)
+    rows = int(final_holdout_metrics.get("rows") or 0)
+    passed = rows > 0 and selected_trades > 0 and average_selected > 0 and total_selected > 0
+    reason_codes = []
+    if rows <= 0:
+        reason_codes.append("market_forecast.oos.no_final_untouched_test_rows")
+    if selected_trades <= 0:
+        reason_codes.append("market_forecast.oos.no_selected_final_holdout_trades")
+    if average_selected <= 0:
+        reason_codes.append("market_forecast.oos.average_net_value_not_positive")
+    if total_selected <= 0:
+        reason_codes.append("market_forecast.oos.total_net_value_not_positive")
+    return {
+        "status": "passed" if passed else "failed",
+        "passed": passed,
+        "metric": "incremental_realized_net_value_after_execution_costs",
+        "method": "final_untouched_test_report_only",
+        "rows": rows,
+        "selectedTrades": selected_trades,
+        "averageNetValueSelectedRows": round(average_selected, 6),
+        "totalNetValueSelectedRows": round(total_selected, 6),
+        "source": "metrics.finalUntouchedTest.expectedValue",
+        "reasonCodes": tuple(reason_codes or ["market_forecast.oos.positive_after_execution_costs"]),
+    }
 
 
 def row_event_start_minutes(row: dict[str, Any]) -> float:
@@ -538,6 +770,9 @@ def build_training_rows(
     max_rows: int,
     microstructure_by_timestamp: dict[str, dict[str, Any]] | None = None,
     require_microstructure: bool = False,
+    symbol: str = DEFAULT_SYMBOL,
+    feed: str = "iex",
+    use_quote_trade_ticks: bool = True,
 ) -> list[dict[str, Any]]:
     start_index = 60
     end_index = len(candles) - FORECAST_HORIZON_MINUTES - 1
@@ -550,9 +785,13 @@ def build_training_rows(
         microstructure = (microstructure_by_timestamp or {}).get(str(candles[index]["timestamp"]))
         if require_microstructure and not microstructure:
             continue
+        executable_entry = first_executable_entry(candles, index)
+        if executable_entry is None:
+            continue
         barriers = volatility_adjusted_label_barriers(
             candles,
             index,
+            entry_price=executable_entry["entryPrice"],
             profit_target=profit_target,
             stop_loss=stop_loss,
             min_target_pct=min_target_pct,
@@ -571,14 +810,25 @@ def build_training_rows(
             target_atr_multiplier=target_atr_multiplier,
             stop_atr_multiplier=stop_atr_multiplier,
             atr_lookback_minutes=atr_lookback_minutes,
+            symbol=symbol,
+            feed=feed,
+            use_quote_trade_ticks=use_quote_trade_ticks,
         )
+        if label is None:
+            continue
         feature_groups = attach_microstructure_features(extract_market_forecast_features(window), microstructure)
         features = flatten_forecast_features(feature_groups)
         rows.append(
             {
                 "timestamp": candles[index]["timestamp"],
-                "labelStart": candles[index]["timestamp"],
-                "labelEnd": candles[min(len(candles) - 1, index + FORECAST_HORIZON_MINUTES)]["timestamp"],
+                "decisionTimestamp": candles[index]["timestamp"],
+                "labelStart": executable_entry["entryTimestamp"],
+                "labelEnd": candles[min(len(candles) - 1, int(executable_entry["entryIndex"]) + FORECAST_HORIZON_MINUTES - 1)]["timestamp"],
+                "entryTimestamp": executable_entry["entryTimestamp"],
+                "entryPrice": executable_entry["entryPrice"],
+                "entryPricePolicy": ENTRY_PRICE_POLICY,
+                "executionLatencyCandles": DEFAULT_EXECUTION_LATENCY_CANDLES,
+                "sameCandleTargetStopAmbiguityPolicy": AMBIGUOUS_LABEL_POLICY,
                 "targetProfit": barriers["targetDistance"],
                 "stopLoss": barriers["stopDistance"],
                 "tradingCost": max(0.0, training_cost),
@@ -587,6 +837,18 @@ def build_training_rows(
             }
         )
     return rows
+
+
+def first_executable_entry(candles: list[dict[str, Any]], decision_index: int, *, latency_candles: int = DEFAULT_EXECUTION_LATENCY_CANDLES) -> dict[str, Any] | None:
+    entry_index = decision_index + max(1, latency_candles)
+    if entry_index >= len(candles):
+        return None
+    entry_candle = candles[entry_index]
+    return {
+        "entryIndex": entry_index,
+        "entryTimestamp": entry_candle["timestamp"],
+        "entryPrice": float(entry_candle["open"]),
+    }
 
 
 def future_trade_outcome_label(
@@ -600,11 +862,19 @@ def future_trade_outcome_label(
     target_atr_multiplier: float = DEFAULT_TARGET_ATR_MULTIPLIER,
     stop_atr_multiplier: float = DEFAULT_STOP_ATR_MULTIPLIER,
     atr_lookback_minutes: int = DEFAULT_ATR_LOOKBACK_MINUTES,
-) -> int:
-    entry = float(candles[index]["close"])
+    symbol: str = DEFAULT_SYMBOL,
+    feed: str = "iex",
+    use_quote_trade_ticks: bool = True,
+) -> int | None:
+    executable_entry = first_executable_entry(candles, index)
+    if executable_entry is None:
+        return None
+    entry_index = int(executable_entry["entryIndex"])
+    entry = float(executable_entry["entryPrice"])
     barriers = volatility_adjusted_label_barriers(
         candles,
         index,
+        entry_price=entry,
         profit_target=profit_target,
         stop_loss=stop_loss,
         min_target_pct=min_target_pct,
@@ -615,11 +885,21 @@ def future_trade_outcome_label(
     )
     target = entry + barriers["targetDistance"]
     stop = entry - barriers["stopDistance"]
-    for future in candles[index + 1 : index + 1 + FORECAST_HORIZON_MINUTES]:
+    for future in candles[entry_index : entry_index + FORECAST_HORIZON_MINUTES]:
         hit_target = float(future["high"]) >= target
         hit_stop = float(future["low"]) <= stop
         if hit_target and hit_stop:
-            return 1 if float(future["close"]) >= entry else -1
+            if use_quote_trade_ticks:
+                resolution = quote_trade_tick_barrier_resolution(
+                    symbol=symbol,
+                    feed=feed,
+                    candle=future,
+                    target=target,
+                    stop=stop,
+                )
+                if resolution.get("label") is not None:
+                    return int(resolution["label"])
+            return None
         if hit_target:
             return 1
         if hit_stop:
@@ -627,14 +907,42 @@ def future_trade_outcome_label(
     return 0
 
 
-def future_target_before_stop_label(candles: list[dict[str, Any]], index: int, *, profit_target: float, stop_loss: float) -> int:
-    return 1 if future_trade_outcome_label(candles, index, profit_target=profit_target, stop_loss=stop_loss) == 1 else 0
+def quote_trade_tick_barrier_resolution(
+    *,
+    symbol: str,
+    feed: str,
+    candle: dict[str, Any],
+    target: float,
+    stop: float,
+) -> dict[str, Any]:
+    start = str(candle.get("timestamp") or "")
+    end = one_minute_later(start)
+    if not start or not end:
+        return {"status": "unavailable", "label": None, "reason": "tick_data.invalid_candle_timestamp"}
+    ticks = load_quote_trade_ticks(symbol=symbol, feed=feed, start=start, end=end)
+    return {
+        **first_barrier_hit_from_ticks(ticks, start=start, end=end, target=target, stop=stop),
+        "policy": AMBIGUOUS_LABEL_POLICY,
+    }
+
+
+def one_minute_later(timestamp: str) -> str | None:
+    parsed = parse_timestamp(timestamp)
+    if parsed is None:
+        return None
+    return (parsed.replace(tzinfo=UTC) + timedelta(minutes=1)).isoformat()
+
+
+def future_target_before_stop_label(candles: list[dict[str, Any]], index: int, *, profit_target: float, stop_loss: float) -> int | None:
+    label = future_trade_outcome_label(candles, index, profit_target=profit_target, stop_loss=stop_loss)
+    return None if label is None else 1 if label == 1 else 0
 
 
 def volatility_adjusted_label_barriers(
     candles: list[dict[str, Any]],
     index: int,
     *,
+    entry_price: float | None = None,
     profit_target: float,
     stop_loss: float,
     min_target_pct: float,
@@ -643,7 +951,7 @@ def volatility_adjusted_label_barriers(
     stop_atr_multiplier: float,
     atr_lookback_minutes: int,
 ) -> dict[str, float]:
-    entry = float(candles[index]["close"])
+    entry = float(entry_price if entry_price is not None else candles[index]["close"])
     atr_value = recent_average_true_range(candles, index, max(1, atr_lookback_minutes))
     return {
         "targetDistance": max(float(profit_target), entry * max(0.0, min_target_pct), atr_value * max(0.0, target_atr_multiplier)),
@@ -679,21 +987,15 @@ def feature_stats(rows: list[dict[str, Any]], feature_names: list[str]) -> tuple
     return means, scales
 
 
-def train_xgboost_model(
-    train_rows: list[dict[str, Any]],
-    test_rows: list[dict[str, Any]],
-    feature_names: list[str],
-    *,
-    symbol: str,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    try:
-        import xgboost as xgb
-    except ImportError as exc:
-        raise RuntimeError("xgboost is not installed in the backend Python environment") from exc
+def feature_schema_hash(feature_names: list[str]) -> str:
+    import hashlib
 
-    train_matrix = xgb.DMatrix(feature_matrix(train_rows, feature_names), label=xgboost_labels(train_rows), feature_names=feature_names)
-    test_matrix = xgb.DMatrix(feature_matrix(test_rows, feature_names), label=xgboost_labels(test_rows), feature_names=feature_names)
-    params = {
+    payload = json.dumps(sorted(feature_names), separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def xgboost_hyperparameters() -> dict[str, Any]:
+    return {
         "objective": "multi:softprob",
         "num_class": 3,
         "eval_metric": "mlogloss",
@@ -708,6 +1010,36 @@ def train_xgboost_model(
         "seed": 42,
         "nthread": 4,
     }
+
+
+def logistic_hyperparameters() -> dict[str, Any]:
+    return {
+        "epochs": 35,
+        "learning_rate": 0.035,
+        "l2": 0.0005,
+    }
+
+
+def model_hyperparameters(model_kind: str) -> dict[str, Any]:
+    return xgboost_hyperparameters() if model_kind == "xgboost" else logistic_hyperparameters()
+
+
+def train_xgboost_model(
+    train_rows: list[dict[str, Any]],
+    test_rows: list[dict[str, Any]],
+    feature_names: list[str],
+    *,
+    symbol: str,
+    artifact_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    try:
+        import xgboost as xgb
+    except ImportError as exc:
+        raise RuntimeError("xgboost is not installed in the backend Python environment") from exc
+
+    train_matrix = xgb.DMatrix(feature_matrix(train_rows, feature_names), label=xgboost_labels(train_rows), feature_names=feature_names)
+    test_matrix = xgb.DMatrix(feature_matrix(test_rows, feature_names), label=xgboost_labels(test_rows), feature_names=feature_names)
+    params = xgboost_hyperparameters()
     booster = xgb.train(
         params,
         train_matrix,
@@ -715,7 +1047,7 @@ def train_xgboost_model(
         evals=[(test_matrix, "test")],
         verbose_eval=False,
     )
-    model_file = market_forecast_artifact_path(symbol).with_suffix(".xgboost.json")
+    model_file = market_forecast_candidate_model_path(artifact_id)
     model_file.parent.mkdir(parents=True, exist_ok=True)
     booster.save_model(str(model_file))
     train_metrics = evaluate_outcome_probabilities(zip(map(outcome_probabilities_from_xgboost, booster.predict(train_matrix)), labels(train_rows), row_economics(train_rows)))
@@ -728,6 +1060,27 @@ def train_xgboost_model(
         train_metrics,
         test_metrics,
     )
+
+
+def train_xgboost_fold_model(train_rows: list[dict[str, Any]], feature_names: list[str], *, symbol: str, fold: int, artifact_id: str) -> dict[str, Any]:
+    try:
+        import xgboost as xgb
+    except ImportError as exc:
+        raise RuntimeError("xgboost is not installed in the backend Python environment") from exc
+    train_matrix = xgb.DMatrix(feature_matrix(train_rows, feature_names), label=xgboost_labels(train_rows), feature_names=feature_names)
+    booster = xgb.train(
+        xgboost_hyperparameters(),
+        train_matrix,
+        num_boost_round=180,
+        verbose_eval=False,
+    )
+    model_file = market_forecast_fold_model_path(artifact_id, fold)
+    model_file.parent.mkdir(parents=True, exist_ok=True)
+    booster.save_model(str(model_file))
+    return {
+        "modelFile": str(model_file),
+        "topFeatures": top_xgboost_features(booster, limit=20),
+    }
 
 
 def xgboost_saved_probabilities(rows: list[dict[str, Any]], feature_names: list[str], model_file: str) -> list[dict[str, float]]:
@@ -919,9 +1272,13 @@ def evaluate_model(
     )
 
 
-def evaluate_outcome_probabilities(scored_iterable: Any) -> dict[str, Any]:
+def evaluate_outcome_probabilities(
+    scored_iterable: Any,
+    *,
+    threshold: float = DEFAULT_SUCCESS_THRESHOLD,
+    include_threshold_optimization: bool = True,
+) -> dict[str, Any]:
     scored = [normalize_scored_item(item) for item in scored_iterable]
-    threshold = DEFAULT_SUCCESS_THRESHOLD
     tp = sum(1 for probabilities, target, _ in scored if probabilities[OUTCOME_TARGET] >= threshold and target == 1)
     fp = sum(1 for probabilities, target, _ in scored if probabilities[OUTCOME_TARGET] >= threshold and target != 1)
     tn = sum(1 for probabilities, target, _ in scored if probabilities[OUTCOME_TARGET] < threshold and target != 1)
@@ -929,9 +1286,9 @@ def evaluate_outcome_probabilities(scored_iterable: Any) -> dict[str, Any]:
     total = max(1, len(scored))
     correct = sum(1 for probabilities, target, _ in scored if OUTCOME_LABELS[max(probabilities.items(), key=lambda item: item[1])[0]] == target)
     ev_at_threshold = expected_value_metrics(scored, threshold=threshold)
-    ev_optimized = optimize_expected_value_threshold(scored)
-    return {
+    metrics = {
         "rows": len(scored),
+        "threshold": round(threshold, 4),
         "positiveRate": round(sum(1 for _, target, _ in scored if target == 1) / total, 4),
         "outcomeRates": outcome_rates([{"target": target} for _, target, _ in scored]),
         "accuracy": round(correct / total, 4),
@@ -943,9 +1300,14 @@ def evaluate_outcome_probabilities(scored_iterable: Any) -> dict[str, Any]:
         "classBrier": class_brier_scores(scored),
         "calibrationCurve": calibration_curves(scored),
         "expectedValue": ev_at_threshold,
-        "evOptimizedThreshold": ev_optimized["threshold"],
-        "evOptimized": ev_optimized,
     }
+    if include_threshold_optimization:
+        ev_optimized = optimize_expected_value_threshold(scored)
+        metrics["evOptimizedThreshold"] = ev_optimized["threshold"]
+        metrics["evOptimized"] = ev_optimized
+    else:
+        metrics["thresholdOptimization"] = "disabled_report_only"
+    return metrics
 
 
 def evaluate_probabilities(scored_iterable: Any) -> dict[str, Any]:
@@ -975,13 +1337,14 @@ def expected_value_for_candidate(probabilities: dict[str, float], economics: dic
     sell_probability = float(probabilities[OUTCOME_STOP])
     target_profit = float(economics.get("targetProfit", 1.0))
     stop_loss = float(economics.get("stopLoss", 1.0))
-    trading_cost = float(economics.get("tradingCost", 0.0))
+    trading_cost = float(economics.get("totalEstimatedExecutionCost", economics.get("tradingCost", 0.0)))
+    execution_multiplier = float(economics.get("expectedExecutionMultiplier", 1.0))
     if buy_probability >= sell_probability:
         confidence = buy_probability
-        ev = (buy_probability * target_profit) - (sell_probability * stop_loss) - trading_cost
+        ev = (((buy_probability * target_profit) - (sell_probability * stop_loss)) * execution_multiplier) - trading_cost
         return "buy", confidence, ev
     confidence = sell_probability
-    ev = (sell_probability * target_profit) - (buy_probability * stop_loss) - trading_cost
+    ev = (((sell_probability * target_profit) - (buy_probability * stop_loss)) * execution_multiplier) - trading_cost
     return "sell", confidence, ev
 
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import unittest
+import shutil
+import uuid
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedGateEvaluationMode, WeightedVotingGatePipelineResult
 from backend.app.algorithms.weighted_voting.execution_gateway import (
@@ -16,6 +19,7 @@ from backend.app.algorithms.weighted_voting.execution_gateway import (
 from backend.app.algorithms.weighted_voting.models import WeightedGateResult, WeightedGateStatus
 from backend.app.algorithms.weighted_voting.rollout import WeightedVotingRolloutFlags, WeightedVotingRolloutValidation
 from backend.app.domain.models import Signal
+from backend.app.execution import cost_model
 from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill, PaperOrderGateway, PaperOrderGatewayResult
 from backend.app.gates import AppliedGlobalGateDecision, GlobalGateResponse, GlobalOrderProposal, apply_global_gate_response
 
@@ -25,6 +29,29 @@ SESSION_DATE = date(2026, 7, 14)
 
 
 class WeightedVotingPaperOrderGatewayTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.scratch = Path("backend/.test_artifacts") / f"weighted_gateway_execution_cost_{uuid.uuid4().hex}"
+        shutil.rmtree(self.scratch, ignore_errors=True)
+        self.previous_dirs = (
+            cost_model.EXECUTION_COST_LEDGER_DIR,
+            cost_model.EXECUTION_COST_CANDIDATE_DIR,
+            cost_model.EXECUTION_COST_ACTIVE_DIR,
+            cost_model.EXECUTION_COST_ACTIVE_HISTORY_DIR,
+        )
+        cost_model.EXECUTION_COST_LEDGER_DIR = self.scratch / "ledger"
+        cost_model.EXECUTION_COST_CANDIDATE_DIR = self.scratch / "artifacts" / "candidates"
+        cost_model.EXECUTION_COST_ACTIVE_DIR = self.scratch / "artifacts" / "active"
+        cost_model.EXECUTION_COST_ACTIVE_HISTORY_DIR = self.scratch / "artifacts" / "active_history"
+
+    def tearDown(self) -> None:
+        (
+            cost_model.EXECUTION_COST_LEDGER_DIR,
+            cost_model.EXECUTION_COST_CANDIDATE_DIR,
+            cost_model.EXECUTION_COST_ACTIVE_DIR,
+            cost_model.EXECUTION_COST_ACTIVE_HISTORY_DIR,
+        ) = self.previous_dirs
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
     def test_duplicate_submissions_are_prevented_and_intent_is_persisted_before_submit(self) -> None:
         broker = FakePaperBroker()
         store = MemoryStore()

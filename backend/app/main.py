@@ -34,20 +34,38 @@ from .algorithms.weighted_voting.api import router as weighted_voting_router
 from .api.v2 import router as api_v2_router
 from .config import get_settings
 from .database import CandleStore
+from .execution.cost_model import (
+    MODEL_STATE_ACTIVE as EXECUTION_COST_MODEL_STATE_ACTIVE,
+    active_artifact_path as execution_cost_active_artifact_path,
+    execution_cost_candidate_validation_gate_report,
+    promote_execution_cost_candidate,
+    record_execution_cost_observation,
+    record_execution_cost_observation_from_order_log,
+    record_execution_cost_observations_from_order_logs,
+    select_approved_execution_cost_artifact,
+    train_execution_cost_candidate,
+)
 from .risk.api import router as risk_router
 from .market_forecast import (
     FUTURE_MARKET_PREDICTION_LEDGER_NAME,
     FUTURE_MARKET_PREDICTION_LEDGER_TITLE,
+    MARKET_FORECAST_SERVICE,
+    MODEL_STATE_ACTIVE,
     MODEL_VERSION as MARKET_FORECAST_MODEL_VERSION,
     load_microstructure_rows_for_candles,
-    market_forecast_prediction,
+    load_market_forecast_candidate_artifact,
     market_forecast_artifact_path,
+    market_forecast_promotion_validation_gates,
+    promote_market_forecast_candidate,
     prediction_log_day,
     read_market_forecast_prediction_log,
     record_market_forecast_prediction,
     resolve_market_forecast_prediction_day,
+    rollback_active_market_forecast_artifact,
 )
+from .market_forecast_monitoring import market_forecast_monitoring_alerts
 from .market_context import STRATEGY_CLASSIFICATION, compute_market_context
+from .tick_data import append_quote_trade_ticks
 
 
 settings = get_settings()
@@ -966,7 +984,7 @@ def historical_meta_strategy_records_for_session(
             continue
         if sampler_scan_due:
             last_buy_candidate_scan = timestamp
-        forecast = market_forecast_prediction(normalized[: index + 1], microstructure_rows=[])
+        forecast = MARKET_FORECAST_SERVICE.predict(normalized[: index + 1], microstructure_rows=[])
         if forecast.get("status") == "insufficient_data":
             continue
         buy_candidate = buy_candidate_snapshot_reason(forecast, min_score=buy_candidate_min_score)
@@ -1660,7 +1678,7 @@ async def market_forecast_prediction_endpoint(
             candles_for_prediction = cached
 
     microstructure_rows = load_microstructure_rows_for_candles(normalized_symbol, feed, candles_for_prediction)
-    forecast = market_forecast_prediction(candles_for_prediction, microstructure_rows=microstructure_rows)
+    forecast = MARKET_FORECAST_SERVICE.predict(candles_for_prediction, microstructure_rows=microstructure_rows)
     forecast["performanceLog"] = record_market_forecast_prediction(
         normalized_symbol,
         feed,
@@ -1686,6 +1704,148 @@ async def market_forecast_history_endpoint(
         timeframe=timeframe,
         limit=limit,
     )
+
+
+@app.get("/api/market-forecast/monitoring/alerts")
+def market_forecast_monitoring_alerts_endpoint(
+    symbol: str = Query("SPY", min_length=1, max_length=12),
+    limit: int = Query(500, ge=20, le=5000),
+) -> dict:
+    return market_forecast_monitoring_alerts(symbol.upper(), limit=limit)
+
+
+@app.post("/api/market-forecast/artifacts/promote")
+def promote_market_forecast_artifact_endpoint(payload: dict = Body(...)) -> dict:
+    artifact_id = str(payload.get("artifactId") or payload.get("artifact_id") or "").strip()
+    if not artifact_id:
+        raise HTTPException(status_code=400, detail="artifactId is required")
+    symbol = str(payload.get("symbol") or "SPY").upper()
+    target_state = str(payload.get("targetState") or payload.get("target_state") or MODEL_STATE_ACTIVE).upper()
+    promoted_by = str(payload.get("promotedBy") or payload.get("promoted_by") or "manual")
+    reason = str(payload.get("reason") or payload.get("promotionReason") or "")
+    try:
+        return promote_market_forecast_candidate(
+            artifact_id,
+            symbol=symbol,
+            target_state=target_state,
+            promoted_by=promoted_by,
+            reason=reason,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/market-forecast/artifacts/{artifact_id}/validation-gates")
+def market_forecast_artifact_validation_gates_endpoint(artifact_id: str) -> dict:
+    candidate = load_market_forecast_candidate_artifact(artifact_id)
+    if not candidate:
+        raise HTTPException(status_code=404, detail=f"Candidate market forecast artifact not found: {artifact_id}")
+    return market_forecast_promotion_validation_gates(candidate)
+
+
+@app.post("/api/market-forecast/artifacts/rollback")
+def rollback_market_forecast_artifact_endpoint(payload: dict = Body(...)) -> dict:
+    symbol = str(payload.get("symbol") or "SPY").upper()
+    rollback_artifact_path = str(payload.get("rollbackArtifactPath") or payload.get("rollback_artifact_path") or "").strip()
+    if not rollback_artifact_path:
+        raise HTTPException(status_code=400, detail="rollbackArtifactPath is required")
+    rolled_back_by = str(payload.get("rolledBackBy") or payload.get("rolled_back_by") or "manual")
+    reason = str(payload.get("reason") or payload.get("rollbackReason") or "")
+    try:
+        return rollback_active_market_forecast_artifact(
+            symbol=symbol,
+            rollback_artifact_path=rollback_artifact_path,
+            rolled_back_by=rolled_back_by,
+            reason=reason,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/execution-cost-model/status")
+def execution_cost_model_status_endpoint(symbol: str = Query("SPY", min_length=1, max_length=12)) -> dict:
+    normalized_symbol = symbol.upper()
+    active = select_approved_execution_cost_artifact(normalized_symbol)
+    active_path = execution_cost_active_artifact_path(normalized_symbol)
+    payload = active.payload if active else None
+    return {
+        "symbol": normalized_symbol,
+        "status": EXECUTION_COST_MODEL_STATE_ACTIVE if payload else "CONSERVATIVE_FALLBACK_MODEL_INACTIVE",
+        "modelAppliedByDefault": payload is not None,
+        "activeArtifactId": payload.get("artifactId") if payload else None,
+        "activeArtifactPath": str(active_path),
+        "activeArtifactExists": active_path.exists(),
+        "activationPolicy": "paper_or_live_fill_validated_artifact_requires_explicit_promotion",
+    }
+
+
+@app.post("/api/execution-cost-model/observations")
+def record_execution_cost_observation_endpoint(payload: dict = Body(...)) -> dict:
+    try:
+        return record_execution_cost_observation(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/execution-cost-model/order-logs/ingest")
+def ingest_execution_cost_order_logs_endpoint(payload: dict = Body(...)) -> dict:
+    try:
+        logs = payload.get("logs")
+        if isinstance(logs, list):
+            return record_execution_cost_observations_from_order_logs([log for log in logs if isinstance(log, dict)])
+        return record_execution_cost_observation_from_order_log(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/microstructure/ticks/ingest")
+def ingest_quote_trade_ticks_endpoint(payload: dict = Body(...)) -> dict:
+    symbol = str(payload.get("symbol") or "SPY").upper()
+    feed = str(payload.get("feed") or "iex").lower()
+    quotes = payload.get("quotes") if isinstance(payload.get("quotes"), list) else []
+    trades = payload.get("trades") if isinstance(payload.get("trades"), list) else []
+    return append_quote_trade_ticks(symbol=symbol, feed=feed, quotes=quotes, trades=trades)
+
+
+@app.post("/api/execution-cost-model/train")
+def train_execution_cost_candidate_endpoint(payload: dict = Body(...)) -> dict:
+    symbol = str(payload.get("symbol") or "SPY").upper()
+    min_rows = int(payload.get("minRows") or payload.get("min_rows") or 20)
+    try:
+        return train_execution_cost_candidate(symbol, min_rows=min_rows)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/execution-cost-model/artifacts/promote")
+def promote_execution_cost_candidate_endpoint(payload: dict = Body(...)) -> dict:
+    artifact_id = str(payload.get("artifactId") or payload.get("artifact_id") or "").strip()
+    if not artifact_id:
+        raise HTTPException(status_code=400, detail="artifactId is required")
+    symbol = str(payload.get("symbol") or "SPY").upper()
+    promoted_by = str(payload.get("promotedBy") or payload.get("promoted_by") or "manual")
+    reason = str(payload.get("reason") or payload.get("promotionReason") or "")
+    try:
+        return promote_execution_cost_candidate(
+            artifact_id,
+            symbol=symbol,
+            promoted_by=promoted_by,
+            reason=reason,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/execution-cost-model/artifacts/{artifact_id}/validation-gates")
+def execution_cost_artifact_validation_gates_endpoint(artifact_id: str) -> dict:
+    try:
+        return execution_cost_candidate_validation_gate_report(artifact_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/market-forecast/ledger/status")
@@ -2423,7 +2583,7 @@ async def run_market_forecast_ledger_tick(market_status: dict) -> float:
 
     if is_open:
         microstructure_rows = load_microstructure_rows_for_candles(normalized_symbol, MARKET_FORECAST_LEDGER_FEED, candles)
-        forecast = market_forecast_prediction(candles, microstructure_rows=microstructure_rows)
+        forecast = MARKET_FORECAST_SERVICE.predict(candles, microstructure_rows=microstructure_rows)
         result = record_market_forecast_prediction(
             normalized_symbol,
             MARKET_FORECAST_LEDGER_FEED,
@@ -2441,7 +2601,7 @@ async def run_market_forecast_ledger_tick(market_status: dict) -> float:
                 "lastResult": result,
                 "nextRunAt": (now + timedelta(seconds=wait_seconds)).isoformat().replace("+00:00", "Z"),
                 "marketStatus": market_status,
-                "message": "Future Market Prediction Ledger is recording 5-minute prediction rows while the market is open.",
+                "message": "Future Market Prediction Ledger is recording every finalized one-minute forecast invocation while the market is open.",
             }
         )
         return wait_seconds
@@ -3332,22 +3492,7 @@ def latest_market_forecast_training_job_status(*, symbol: str, start_date: str, 
 
 
 def market_forecast_artifact_ready(*, symbol: str, end_date: str) -> tuple[bool, str, dict | None]:
-    artifact_path = market_forecast_artifact_path(symbol)
-    if not artifact_path.exists():
-        return False, f"{MARKET_FORECAST_MODEL_VERSION} artifact is missing.", None
-    try:
-        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return False, f"{MARKET_FORECAST_MODEL_VERSION} artifact cannot be read: {exc}", None
-    if artifact.get("version") != MARKET_FORECAST_MODEL_VERSION:
-        return False, f"Forecast artifact version is {artifact.get('version')}; expected {MARKET_FORECAST_MODEL_VERSION}.", artifact
-    artifact_end = str(((artifact.get("dateRange") or {}).get("endDate")) or "")[:10]
-    if artifact_end and artifact_end < end_date:
-        return False, f"Forecast artifact ends at {artifact_end}; needs {end_date}.", artifact
-    model_file = str(artifact.get("modelFile") or "")
-    if model_file and not Path(model_file).exists():
-        return False, f"Forecast model file is missing: {model_file}", artifact
-    return True, "Future market forecast model is ready.", artifact
+    return MARKET_FORECAST_SERVICE.artifact_ready(symbol, end_date)
 
 
 def required_daily_ml_artifact_paths(*, manifest: dict, symbol: str, start_date: str, end_date: str) -> list[Path]:
@@ -3671,13 +3816,16 @@ def start_market_forecast_training_job(
             "startDate": start_date,
             "endDate": end_date,
             "modelVersion": MARKET_FORECAST_MODEL_VERSION,
-            "artifactPath": str(market_forecast_artifact_path(symbol)),
+            "artifactPath": None,
+            "candidateArtifactPath": None,
+            "activeArtifactPath": str(market_forecast_artifact_path(symbol)),
+            "promotionRequired": True,
             "logPath": str(ARTIFACT_JOB_DIR / f"{job_id}.log"),
             "createdAt": created_at,
             "startedAt": None,
             "completedAt": None,
             "pid": None,
-            "message": "Future market forecast retraining queued.",
+            "message": "Future market forecast candidate training queued; explicit promotion is required before activation.",
             "summary": None,
             "error": None,
         },

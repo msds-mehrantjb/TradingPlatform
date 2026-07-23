@@ -16,7 +16,7 @@ from backend.app.algorithms.voting_ensemble.models import (
     VotingEnsembleEvaluateResponse,
     VotingStrategyVote,
 )
-from backend.app.algorithms.voting_ensemble.strategies.registry import VOTING_ENSEMBLE_MODULE_INVENTORY
+from backend.app.algorithms.voting_ensemble.strategies.registry import VOTING_ENSEMBLE_MODULE_INVENTORY, canonical_strategy_id
 
 
 VOTING_ENSEMBLE_SERVICE_VERSION = "voting_ensemble_backend_v1"
@@ -547,7 +547,7 @@ def _data_ready_from_reason(reason_code: str, score: int) -> bool:
 
 
 def _apply_strategy_fit(vote: VotingStrategyVote, request: VotingEnsembleEvaluateRequest) -> VotingStrategyVote:
-    fit = _strategy_fit_record(request, vote.strategy)
+    fit = _strategy_fit_record(request, vote)
     if fit is None:
         return vote
     fit_score = _fit_number(fit.get("score"))
@@ -563,13 +563,24 @@ def _apply_strategy_fit(vote: VotingStrategyVote, request: VotingEnsembleEvaluat
     return vote.model_copy(update={"reliability": reliability, "eligible": eligible, "features": features})
 
 
-def _strategy_fit_record(request: VotingEnsembleEvaluateRequest, strategy_name: str) -> dict | None:
+def _strategy_fit_record(request: VotingEnsembleEvaluateRequest, vote: VotingStrategyVote) -> dict | None:
     context = request.market_context or {}
     strategies = context.get("strategies")
     if not isinstance(strategies, list):
         return None
+    try:
+        vote_strategy_id = canonical_strategy_id(vote.strategy)
+    except KeyError:
+        vote_strategy_id = vote.strategy
     for item in strategies:
-        if isinstance(item, dict) and item.get("name") == strategy_name:
+        if not isinstance(item, dict):
+            continue
+        candidate = str(item.get("strategyId") or item.get("strategy_id") or item.get("id") or item.get("name") or "")
+        try:
+            candidate_id = canonical_strategy_id(candidate)
+        except KeyError:
+            candidate_id = candidate
+        if candidate_id == vote_strategy_id:
             return item
     return None
 
@@ -651,9 +662,9 @@ def _apply_context_to_candidate(family_decision: dict, context_signals: tuple[Vo
     base_signal: AlgoSignal = family_decision["signal"]
     base_score = float(family_decision["base_score"])
     tracked_context = {
-        signal.strategy: signal
+        _vote_strategy_id(signal): signal
         for signal in context_signals
-        if signal.strategy in {"Relative Strength vs QQQ/IWM", "Market Breadth Momentum"} and signal.dataReady
+        if _vote_strategy_id(signal) in {"relative_strength_qqq_iwm", "market_breadth_momentum"} and signal.dataReady
     }
     if base_signal == "Hold":
         return {
@@ -710,7 +721,7 @@ def _apply_context_to_candidate(family_decision: dict, context_signals: tuple[Vo
 
 
 def _context_confirmation(candidate: AlgoSignal, context_signals: tuple[VotingStrategyVote, ...]) -> VotingContextConfirmation:
-    evidence = tuple(f"{signal.strategy}: {signal.signal} - {signal.reason}" for signal in context_signals)
+    evidence = tuple(f"{_vote_strategy_id(signal)}: {signal.signal} - {signal.reason}" for signal in context_signals)
     if candidate == "Hold":
         return VotingContextConfirmation(
             outcome="not_applicable",
@@ -745,6 +756,13 @@ def _context_confirmation(candidate: AlgoSignal, context_signals: tuple[VotingSt
         confirmations=confirmations,
         conflicts=conflicts,
     )
+
+
+def _vote_strategy_id(vote: VotingStrategyVote) -> str:
+    try:
+        return canonical_strategy_id(vote.strategy)
+    except KeyError:
+        return vote.strategy
 
 
 def _external_breadth_feed(request: VotingEnsembleEvaluateRequest) -> dict | None:

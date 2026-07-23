@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import math
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any
+
+from backend.app.algorithms.voting_ensemble.strategies.registry import VOTING_ENSEMBLE_ACTIVE_DIRECTIONAL_STRATEGIES
+from backend.app.execution.cost_model import EXECUTION_COST_MODEL_SERVICE
 
 
 FORECAST_HORIZON_MINUTES = 5
@@ -22,12 +27,22 @@ DEFAULT_MIN_TARGET_PCT = 0.0
 DEFAULT_MIN_STOP_PCT = 0.0025
 DEFAULT_TARGET_ATR_MULTIPLIER = 1.0
 DEFAULT_STOP_ATR_MULTIPLIER = 1.0
+DEFAULT_DECISION_TO_SUBMISSION_LATENCY_SECONDS = 0.35
+MIN_EXECUTION_FILL_PROBABILITY = 0.45
+MAX_LIMIT_ORDER_NON_FILL_PROBABILITY = 0.55
+MAX_STOP_LIMIT_MISS_PROBABILITY = 0.25
+MAX_OPPORTUNITY_DECAY = 0.35
 HIGH_VOLATILITY_THRESHOLD_ADJUSTMENT = 0.08
 SIDEWAYS_THRESHOLD_ADJUSTMENT = 0.05
 HIGH_VOLATILITY_POSITION_SIZE_MULTIPLIER = 0.5
 SIDEWAYS_POSITION_SIZE_MULTIPLIER = 0.65
 MODEL_VERSION = "market_forecast_v11"
 MODEL_ARTIFACT_DIR = Path(__file__).resolve().parents[1] / "data" / "market_forecast"
+FORECAST_ARTIFACT_ROOT = MODEL_ARTIFACT_DIR / "artifacts"
+FORECAST_CANDIDATE_ARTIFACT_DIR = FORECAST_ARTIFACT_ROOT / "candidates"
+FORECAST_ACTIVE_ARTIFACT_DIR = FORECAST_ARTIFACT_ROOT / "active"
+FORECAST_ACTIVE_HISTORY_DIR = FORECAST_ARTIFACT_ROOT / "active_history"
+FORECAST_REJECTED_ARTIFACT_DIR = FORECAST_ARTIFACT_ROOT / "rejected"
 FUTURE_MARKET_PREDICTION_LEDGER_NAME = "future_market_prediction_ledger"
 FUTURE_MARKET_PREDICTION_LEDGER_TITLE = "Future Market Prediction Ledger"
 FUTURE_MARKET_PREDICTION_LEDGER_RULE = (
@@ -50,6 +65,26 @@ OUTCOME_ORDER = [OUTCOME_STOP, OUTCOME_TIMEOUT, OUTCOME_TARGET]
 DECISION_BUY = "buy"
 DECISION_SELL = "sell"
 DECISION_NO_TRADE = "no_trade"
+FORECAST_STATUS_MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
+FORECAST_STATUS_INFERENCE_NOT_RUN = "INFERENCE_NOT_RUN"
+HEURISTIC_ESTIMATE_NOT_ML = "HEURISTIC_ESTIMATE_NOT_ML"
+MODEL_STATE_TRAINED_CANDIDATE = "TRAINED_CANDIDATE"
+MODEL_STATE_VALIDATED = "VALIDATED"
+MODEL_STATE_SHADOW = "SHADOW"
+MODEL_STATE_PAPER_APPROVED = "PAPER_APPROVED"
+MODEL_STATE_ACTIVE = "ACTIVE"
+MODEL_STATE_RETIRED = "RETIRED"
+MODEL_STATE_REJECTED = "REJECTED"
+MIN_MARKET_FORECAST_OOS_SELECTED_TRADES = 1
+MODEL_LIFECYCLE_STATES = (
+    MODEL_STATE_TRAINED_CANDIDATE,
+    MODEL_STATE_VALIDATED,
+    MODEL_STATE_SHADOW,
+    MODEL_STATE_PAPER_APPROVED,
+    MODEL_STATE_ACTIVE,
+    MODEL_STATE_RETIRED,
+    MODEL_STATE_REJECTED,
+)
 SKIPPED_RAW_FEATURES = {
     "microstructure.avg_spread",
     "microstructure.avg_spread_pct",
@@ -63,6 +98,82 @@ SKIPPED_RAW_FEATURES = {
 }
 
 
+@dataclass(frozen=True)
+class ApprovedForecastArtifact:
+    symbol: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class MarketForecastAlgorithmSignalContract:
+    strategy_id: str
+    strategy_version: str
+    signal: str
+    confidence_or_setup_quality: float
+    family: str
+    eligibility: bool
+    reason_codes: tuple[str, ...]
+    regime_compatibility: float
+
+
+ForecastPrediction = dict[str, Any]
+
+
+class MarketForecastService:
+    """Authoritative market forecast boundary for live, paper, replay, backtest, and monitoring."""
+
+    def predict(
+        self,
+        candles: list[dict[str, Any]],
+        *,
+        microstructure_rows: list[dict[str, Any]] | None = None,
+        spread: float | None = None,
+        slippage: float = 0.02,
+        fees: float = 0.0,
+    ) -> dict[str, Any]:
+        return _market_forecast_prediction(
+            candles,
+            microstructure_rows=microstructure_rows,
+            spread=spread,
+            slippage=slippage,
+            fees=fees,
+        )
+
+    def select_approved_forecast_artifact(self, symbol: str) -> ApprovedForecastArtifact | None:
+        return select_approved_forecast_artifact(symbol)
+
+    def approved_model(self, symbol: str) -> dict[str, Any] | None:
+        artifact = self.select_approved_forecast_artifact(symbol)
+        return artifact.payload if artifact else None
+
+    def runtime_status(self, symbol: str = "SPY") -> dict[str, Any]:
+        return model_runtime_status(symbol)
+
+    def artifact_ready(self, symbol: str, end_date: str) -> tuple[bool, str, dict[str, Any] | None]:
+        artifact = self.approved_model(symbol)
+        if not artifact:
+            return False, f"{MODEL_VERSION} approved forecast model is unavailable.", load_market_forecast_artifact(symbol)
+        artifact_end = str(((artifact.get("dateRange") or {}).get("endDate")) or "")[:10]
+        if artifact_end and artifact_end < end_date:
+            return False, f"Approved forecast artifact ends at {artifact_end}; needs {end_date}.", artifact
+        return True, "Approved future market forecast model is ready.", artifact
+
+
+MARKET_FORECAST_SERVICE = MarketForecastService()
+
+
+def utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def forecast_feature_schema_hash(features: dict[str, Any] | None) -> str | None:
+    if not features:
+        return None
+    keys = sorted(flatten_forecast_features(features).keys())
+    payload = json.dumps(keys, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def market_forecast_prediction(
     candles: list[dict[str, Any]],
     *,
@@ -71,12 +182,33 @@ def market_forecast_prediction(
     slippage: float = 0.02,
     fees: float = 0.0,
 ) -> dict[str, Any]:
+    return MARKET_FORECAST_SERVICE.predict(
+        candles,
+        microstructure_rows=microstructure_rows,
+        spread=spread,
+        slippage=slippage,
+        fees=fees,
+    )
+
+
+def _market_forecast_prediction(
+    candles: list[dict[str, Any]],
+    *,
+    microstructure_rows: list[dict[str, Any]] | None = None,
+    spread: float | None = None,
+    slippage: float = 0.02,
+    fees: float = 0.0,
+) -> dict[str, Any]:
+    invocation_started_at = utc_now_iso()
     normalized = normalize_candles(candles)
     symbol = normalized[-1]["symbol"] if normalized else "SPY"
+    invocation_id = f"{symbol}|{invocation_started_at}|{hashlib.sha256(json.dumps(normalized[-1] if normalized else {}, sort_keys=True).encode('utf-8')).hexdigest()[:12]}"
     missing_inputs = missing_runtime_inputs(symbol)
     model_status = model_runtime_status(symbol)
+    approved_artifact = MARKET_FORECAST_SERVICE.select_approved_forecast_artifact(symbol)
 
     if len(normalized) < MIN_FEATURE_FORECAST_CANDLES:
+        forecast_status = FORECAST_STATUS_MODEL_UNAVAILABLE if approved_artifact is None else "insufficient_data"
         future_price_prediction = (
             no_edge_future_price_prediction(
                 normalized[-1]["close"],
@@ -86,7 +218,17 @@ def market_forecast_prediction(
             else None
         )
         return {
-            "status": "insufficient_data",
+            "forecastInvocationId": invocation_id,
+            "eventTimestamp": normalized[-1]["timestamp"] if normalized else None,
+            "barFinalizationTimestamp": normalized[-1]["timestamp"] if normalized else None,
+            "featureReadyTimestamp": None,
+            "inferenceStartTimestamp": None,
+            "inferenceEndTimestamp": None,
+            "decisionTimestamp": invocation_started_at,
+            "orderSubmissionTimestamp": None,
+            "status": forecast_status,
+            "forecastStatus": forecast_status,
+            "forecast_status": forecast_status,
             "symbol": normalized[-1]["symbol"] if normalized else "SPY",
             "horizonMinutes": FORECAST_HORIZON_MINUTES,
             "probabilitySuccess": None,
@@ -94,6 +236,15 @@ def market_forecast_prediction(
             "probabilitySellSuccess": None,
             "probabilityStop": None,
             "probabilityTimeout": None,
+            "probability_buy": None,
+            "probability_sell": None,
+            "inferenceStatus": FORECAST_STATUS_INFERENCE_NOT_RUN,
+            "inference": {
+                "status": FORECAST_STATUS_INFERENCE_NOT_RUN,
+                "probabilityBuySuccess": None,
+                "probabilitySellSuccess": None,
+                "probabilityTimeout": None,
+            },
             "outcome": {
                 "predicted": OUTCOME_TIMEOUT,
                 "probabilities": {name: None for name in OUTCOME_ORDER},
@@ -128,7 +279,16 @@ def market_forecast_prediction(
             "expectedMove": None,
             "futurePricePrediction": future_price_prediction,
             "costs": round((spread or 0) + (slippage * 2) + fees, 4),
+            "executionQuality": {
+                "metric": "incremental_realized_net_value_after_execution_costs",
+                "status": "not_estimated",
+                "reason": "insufficient_data",
+            },
             "allowed": False,
+            "inferencePerformed": False,
+            "inference_performed": False,
+            "forecastAppliedToOrder": False,
+            "forecast_applied_to_order": False,
             "model": model_status,
             "regime": {"trend": "unknown", "volatility": "unknown", "vwap": "unknown", "timeOfDay": "unknown"},
             "marketRegime": {
@@ -149,27 +309,97 @@ def market_forecast_prediction(
                 "members": [],
             },
             "features": {},
+            "featureSchemaHash": None,
             "topDrivers": [f"Need at least {MIN_FEATURE_FORECAST_CANDLES} one-minute candles for baseline forecast"],
             "missingInputs": missing_inputs,
-            "updatedAt": datetime.utcnow().isoformat() + "Z",
+            "updatedAt": invocation_started_at,
         }
 
     latest_microstructure = latest_microstructure_for_candle(normalized[-1], microstructure_rows or [])
     features = attach_microstructure_features(extract_market_forecast_features(normalized), latest_microstructure)
-    artifact = load_market_forecast_artifact(normalized[-1]["symbol"])
-    ensemble = ensemble_probabilities(features, artifact) if artifact else fallback_ensemble_probabilities(features)
+    feature_ready_at = utc_now_iso()
+    if approved_artifact is None:
+        return inference_not_run_forecast(
+            normalized,
+            features,
+            missing_inputs=missing_inputs,
+            spread=spread,
+            slippage=slippage,
+            fees=fees,
+            invocation_id=invocation_id,
+            invocation_started_at=invocation_started_at,
+            feature_ready_at=feature_ready_at,
+        )
+
+    latest = normalized[-1]
+    costs = round((spread if spread is not None else 0) + (slippage * 2) + fees, 4)
+    inference_started_at = utc_now_iso()
+    return run_forecast_inference(
+        approved_artifact,
+        {
+            "features": features,
+            "latest": latest,
+            "costs": costs,
+            "executionCostInputs": {
+                "spread": spread,
+                "slippage": slippage,
+                "fees": fees,
+            },
+            "missingInputs": missing_inputs,
+            "model": model_runtime_status(normalized[-1]["symbol"]),
+            "forecastInvocationId": invocation_id,
+            "eventTimestamp": latest["timestamp"],
+            "barFinalizationTimestamp": latest["timestamp"],
+            "featureReadyTimestamp": feature_ready_at,
+            "inferenceStartTimestamp": inference_started_at,
+        },
+    )
+
+
+def run_forecast_inference(artifact: ApprovedForecastArtifact, feature_snapshot: dict[str, Any]) -> ForecastPrediction:
+    features = feature_snapshot["features"]
+    latest = feature_snapshot["latest"]
+    costs = float(feature_snapshot.get("costs") or 0.0)
+    artifact_payload = artifact.payload
+    ensemble = ensemble_probabilities(features, artifact_payload)
     probabilities = ensemble["probabilities"]
     buy_probability = probabilities[OUTCOME_TARGET]
     sell_probability = probabilities[OUTCOME_STOP]
     timeout_probability = probabilities[OUTCOME_TIMEOUT]
     predicted_outcome = max(probabilities.items(), key=lambda item: item[1])[0]
-    latest = normalized[-1]
-    costs = round((spread if spread is not None else 0) + (slippage * 2) + fees, 4)
-    barriers = volatility_adjusted_barriers(features, latest["close"], artifact=artifact)
+    barriers = volatility_adjusted_barriers(features, latest["close"], artifact=artifact_payload)
     expected_move = barriers["targetDistance"]
     expected_loss = barriers["stopDistance"]
-    buy_expected_value = round((buy_probability * expected_move) - (sell_probability * expected_loss) - costs, 4)
-    sell_expected_value = round((sell_probability * expected_move) - (buy_probability * expected_loss) - costs, 4)
+    execution_cost_inputs = feature_snapshot.get("executionCostInputs") or {}
+    conservative_execution_quality = estimate_execution_quality(
+        features,
+        latest,
+        barriers,
+        spread=execution_cost_inputs.get("spread"),
+        slippage=float(execution_cost_inputs.get("slippage") if execution_cost_inputs.get("slippage") is not None else 0.02),
+        fees=float(execution_cost_inputs.get("fees") if execution_cost_inputs.get("fees") is not None else 0.0),
+    )
+    candidate_side = DECISION_BUY if buy_probability >= sell_probability else DECISION_SELL
+    execution_quality = EXECUTION_COST_MODEL_SERVICE.estimate(
+        symbol=str(latest.get("symbol") or artifact.symbol),
+        side=candidate_side,
+        order_type=str(execution_cost_inputs.get("orderType") or "limit"),
+        feature_snapshot={
+            "features": features,
+            "latest": latest,
+            "barriers": barriers,
+            "probabilities": probabilities,
+            "candidateSide": candidate_side,
+            "baseCosts": costs,
+        },
+        conservative_fallback=conservative_execution_quality,
+    )
+    execution_adjusted_costs = float(execution_quality["totalEstimatedCost"])
+    execution_multiplier = float(execution_quality["expectedExecutionMultiplier"])
+    buy_gross_expected_value = (buy_probability * expected_move) - (sell_probability * expected_loss)
+    sell_gross_expected_value = (sell_probability * expected_move) - (buy_probability * expected_loss)
+    buy_expected_value = round((buy_gross_expected_value * execution_multiplier) - execution_adjusted_costs, 4)
+    sell_expected_value = round((sell_gross_expected_value * execution_multiplier) - execution_adjusted_costs, 4)
     market_regime = market_regime_profile(features)
     future_price_prediction = forecast_future_price_prediction(
         features,
@@ -179,7 +409,7 @@ def market_forecast_prediction(
         market_regime=market_regime,
     )
     regime_allows = regime_allows_forecast(features, market_regime)
-    base_threshold = forecast_probability_threshold(artifact)
+    base_threshold = forecast_probability_threshold(artifact_payload)
     decision = forecast_trade_decision(
         probabilities,
         buy_expected_value=buy_expected_value,
@@ -189,10 +419,22 @@ def market_forecast_prediction(
         uncertainty=ensemble,
         features=features,
         base_threshold=base_threshold,
+        execution_quality=execution_quality,
     )
+    inference_ended_at = utc_now_iso()
 
     return {
-        "status": "ready" if artifact else "fallback",
+        "forecastInvocationId": feature_snapshot.get("forecastInvocationId"),
+        "eventTimestamp": feature_snapshot.get("eventTimestamp"),
+        "barFinalizationTimestamp": feature_snapshot.get("barFinalizationTimestamp"),
+        "featureReadyTimestamp": feature_snapshot.get("featureReadyTimestamp"),
+        "inferenceStartTimestamp": feature_snapshot.get("inferenceStartTimestamp"),
+        "inferenceEndTimestamp": inference_ended_at,
+        "decisionTimestamp": inference_ended_at,
+        "orderSubmissionTimestamp": None,
+        "status": "ready",
+        "forecastStatus": "ready",
+        "forecast_status": "ready",
         "symbol": latest["symbol"],
         "horizonMinutes": FORECAST_HORIZON_MINUTES,
         "probabilitySuccess": round(buy_probability, 4),
@@ -200,6 +442,19 @@ def market_forecast_prediction(
         "probabilitySellSuccess": round(sell_probability, 4),
         "probabilityStop": round(sell_probability, 4),
         "probabilityTimeout": round(timeout_probability, 4),
+        "artifactId": artifact_payload.get("artifactId"),
+        "featureSchemaHash": (
+            artifact_payload.get("featureSchemaHash")
+            or ((artifact_payload.get("validationDeploymentParity") or {}).get("featureSchemaHash"))
+            or forecast_feature_schema_hash(features)
+        ),
+        "inferenceStatus": "ready",
+        "inference": {
+            "status": "ready",
+            "probabilityBuySuccess": round(buy_probability, 4),
+            "probabilitySellSuccess": round(sell_probability, 4),
+            "probabilityTimeout": round(timeout_probability, 4),
+        },
         "outcome": {
             "predicted": predicted_outcome,
             "probabilities": {name: round(probabilities[name], 4) for name in OUTCOME_ORDER},
@@ -212,6 +467,9 @@ def market_forecast_prediction(
         "expectedValue": decision["expectedValue"],
         "buyExpectedValue": buy_expected_value,
         "sellExpectedValue": sell_expected_value,
+        "buyGrossExpectedValueBeforeExecution": round(buy_gross_expected_value, 4),
+        "sellGrossExpectedValueBeforeExecution": round(sell_gross_expected_value, 4),
+        "incrementalExpectedNetValueAfterExecutionCosts": decision["expectedValue"],
         "barriers": {
             "targetDistance": round(barriers["targetDistance"], 4),
             "stopDistance": round(barriers["stopDistance"], 4),
@@ -225,17 +483,203 @@ def market_forecast_prediction(
         },
         "expectedMove": round(expected_move, 4),
         "futurePricePrediction": future_price_prediction,
-        "costs": costs,
+        "costs": execution_adjusted_costs,
+        "baseCosts": costs,
+        "executionQuality": execution_quality,
         "allowed": decision["action"] in {DECISION_BUY, DECISION_SELL},
-        "model": model_runtime_status(normalized[-1]["symbol"]),
+        "forecastAppliedToOrder": decision["action"] in {DECISION_BUY, DECISION_SELL},
+        "forecast_applied_to_order": decision["action"] in {DECISION_BUY, DECISION_SELL},
+        "inferencePerformed": True,
+        "inference_performed": True,
+        "model": feature_snapshot.get("model") or model_runtime_status(artifact.symbol),
         "regime": forecast_regime(features),
         "marketRegime": market_regime,
         "algorithmSignals": algorithm_signal_summary(features),
         "uncertainty": ensemble,
         "features": features,
         "topDrivers": forecast_drivers(features, probabilities, decision, regime_allows),
-        "missingInputs": missing_inputs,
+        "missingInputs": feature_snapshot.get("missingInputs") or [],
         "updatedAt": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+def inference_not_run_forecast(
+    normalized: list[dict[str, Any]],
+    features: dict[str, Any],
+    *,
+    missing_inputs: list[str],
+    spread: float | None,
+    slippage: float,
+    fees: float,
+    invocation_id: str,
+    invocation_started_at: str,
+    feature_ready_at: str,
+) -> dict[str, Any]:
+    latest = normalized[-1]
+    costs = round((spread if spread is not None else 0) + (slippage * 2) + fees, 4)
+    heuristic_ensemble = fallback_ensemble_probabilities(features)
+    heuristic_probabilities = heuristic_ensemble["probabilities"]
+    heuristic_barriers = volatility_adjusted_barriers(features, latest["close"], artifact=None)
+    heuristic_buy_probability = heuristic_probabilities[OUTCOME_TARGET]
+    heuristic_sell_probability = heuristic_probabilities[OUTCOME_STOP]
+    heuristic_timeout_probability = heuristic_probabilities[OUTCOME_TIMEOUT]
+    heuristic_buy_expected_value = round(
+        (heuristic_buy_probability * heuristic_barriers["targetDistance"])
+        - (heuristic_sell_probability * heuristic_barriers["stopDistance"])
+        - costs,
+        4,
+    )
+    heuristic_sell_expected_value = round(
+        (heuristic_sell_probability * heuristic_barriers["targetDistance"])
+        - (heuristic_buy_probability * heuristic_barriers["stopDistance"])
+        - costs,
+        4,
+    )
+    market_regime = market_regime_profile(features)
+    regime_allows = regime_allows_forecast(features, market_regime)
+    heuristic_decision = forecast_trade_decision(
+        heuristic_probabilities,
+        buy_expected_value=heuristic_buy_expected_value,
+        sell_expected_value=heuristic_sell_expected_value,
+        regime_allows=regime_allows,
+        market_regime=market_regime,
+        uncertainty=heuristic_ensemble,
+        features=features,
+        base_threshold=DEFAULT_SUCCESS_THRESHOLD,
+    )
+    heuristic_future_price_prediction = forecast_future_price_prediction(
+        features,
+        latest["close"],
+        probabilities=heuristic_probabilities,
+        barriers=heuristic_barriers,
+        market_regime=market_regime,
+    )
+    unavailable_reason = "No explicitly approved market-forecast model is loaded; heuristic estimate is UI diagnostics only."
+    return {
+        "forecastInvocationId": invocation_id,
+        "eventTimestamp": latest["timestamp"],
+        "barFinalizationTimestamp": latest["timestamp"],
+        "featureReadyTimestamp": feature_ready_at,
+        "inferenceStartTimestamp": None,
+        "inferenceEndTimestamp": None,
+        "decisionTimestamp": feature_ready_at,
+        "orderSubmissionTimestamp": None,
+        "status": FORECAST_STATUS_MODEL_UNAVAILABLE,
+        "forecastStatus": FORECAST_STATUS_MODEL_UNAVAILABLE,
+        "forecast_status": FORECAST_STATUS_MODEL_UNAVAILABLE,
+        "symbol": latest["symbol"],
+        "horizonMinutes": FORECAST_HORIZON_MINUTES,
+        "probabilitySuccess": None,
+        "probabilityBuySuccess": None,
+        "probabilitySellSuccess": None,
+        "probabilityStop": None,
+        "probabilityTimeout": None,
+        "probability_buy": None,
+        "probability_sell": None,
+        "artifactId": None,
+        "featureSchemaHash": forecast_feature_schema_hash(features),
+        "inferenceStatus": FORECAST_STATUS_INFERENCE_NOT_RUN,
+        "inference": {
+            "status": FORECAST_STATUS_INFERENCE_NOT_RUN,
+            "probabilityBuySuccess": None,
+            "probabilitySellSuccess": None,
+            "probabilityTimeout": None,
+        },
+        "outcome": {
+            "predicted": OUTCOME_TIMEOUT,
+            "probabilities": {name: None for name in OUTCOME_ORDER},
+            "labels": OUTCOME_LABELS,
+        },
+        "decision": {
+            "action": DECISION_NO_TRADE,
+            "candidateAction": DECISION_NO_TRADE,
+            "confidence": None,
+            "edgeGap": None,
+            "minimumConfidence": DEFAULT_SUCCESS_THRESHOLD,
+            "minimumEdgeGap": DEFAULT_MIN_EDGE_GAP,
+            "modelDisagreement": None,
+            "maximumModelDisagreement": DEFAULT_MAX_MODEL_DISAGREEMENT,
+            "spreadAtr": None,
+            "maximumSpreadAtr": DEFAULT_MAX_SPREAD_ATR,
+            "expectedValue": None,
+            "positionSizeMultiplier": 0.0,
+            "reasons": [unavailable_reason],
+        },
+        "threshold": DEFAULT_SUCCESS_THRESHOLD,
+        "minimumEdgeGap": DEFAULT_MIN_EDGE_GAP,
+        "maximumModelDisagreement": DEFAULT_MAX_MODEL_DISAGREEMENT,
+        "expectedValue": None,
+        "buyExpectedValue": None,
+        "sellExpectedValue": None,
+        "barriers": {
+            "targetDistance": None,
+            "stopDistance": None,
+            "fixedTargetDollars": DEFAULT_PROFIT_TARGET_DOLLARS,
+            "minTargetPct": DEFAULT_MIN_TARGET_PCT,
+            "minStopPct": DEFAULT_MIN_STOP_PCT,
+            "targetAtrMultiplier": DEFAULT_TARGET_ATR_MULTIPLIER,
+            "stopAtrMultiplier": DEFAULT_STOP_ATR_MULTIPLIER,
+        },
+        "expectedMove": None,
+        "futurePricePrediction": no_edge_future_price_prediction(latest["close"], unavailable_reason),
+        "costs": costs,
+        "executionQuality": {
+            "metric": "incremental_realized_net_value_after_execution_costs",
+            "status": "not_estimated",
+            "reason": "model_unavailable",
+        },
+        "allowed": False,
+        "inferencePerformed": False,
+        "inference_performed": False,
+        "forecastAppliedToOrder": False,
+        "forecast_applied_to_order": False,
+        "model": model_runtime_status(latest["symbol"]),
+        "regime": forecast_regime(features),
+        "marketRegime": {
+            **market_regime,
+            "allowedLong": False,
+            "allowedShort": False,
+            "positionSizeMultiplier": 0.0,
+            "notes": [*list(market_regime.get("notes") or []), unavailable_reason],
+        },
+        "algorithmSignals": algorithm_signal_summary(features),
+        "uncertainty": {
+            "modelCount": 0,
+            "modelDisagreement": None,
+            "maximumModelDisagreement": DEFAULT_MAX_MODEL_DISAGREEMENT,
+            "members": [],
+        },
+        "features": features,
+        "topDrivers": [unavailable_reason, HEURISTIC_ESTIMATE_NOT_ML],
+        "missingInputs": missing_inputs,
+        "heuristicEstimate": {
+            "status": HEURISTIC_ESTIMATE_NOT_ML,
+            "forecastAppliedToOrder": False,
+            "forecast_applied_to_order": False,
+            "probabilityBuySuccess": round(heuristic_buy_probability, 4),
+            "probabilitySellSuccess": round(heuristic_sell_probability, 4),
+            "probabilityTimeout": round(heuristic_timeout_probability, 4),
+            "probability_buy": round(heuristic_buy_probability, 4),
+            "probability_sell": round(heuristic_sell_probability, 4),
+            "decision": heuristic_decision,
+            "buyExpectedValue": heuristic_buy_expected_value,
+            "sellExpectedValue": heuristic_sell_expected_value,
+            "barriers": {
+                "targetDistance": round(heuristic_barriers["targetDistance"], 4),
+                "stopDistance": round(heuristic_barriers["stopDistance"], 4),
+                "minTargetPct": heuristic_barriers["minTargetPct"],
+                "minStopPct": heuristic_barriers["minStopPct"],
+                "targetAtrMultiplier": heuristic_barriers["targetAtrMultiplier"],
+                "stopAtrMultiplier": heuristic_barriers["stopAtrMultiplier"],
+                "fixedTargetDollars": heuristic_barriers["fixedTargetDollars"],
+                "fixedStopDollars": heuristic_barriers["fixedStopDollars"],
+                "atr5m": round(heuristic_barriers["atr5m"], 4),
+            },
+            "futurePricePrediction": heuristic_future_price_prediction,
+            "uncertainty": heuristic_ensemble,
+            "topDrivers": forecast_drivers(features, heuristic_probabilities, heuristic_decision, regime_allows),
+        },
+        "updatedAt": invocation_started_at,
     }
 
 
@@ -289,20 +733,6 @@ def record_market_forecast_prediction(
         pending_count += result["pending"]
 
     latest = normalized[-1]
-    if not is_prediction_log_cadence(latest["timestamp"]):
-        return {
-            "saved": False,
-            "reason": f"Waiting for the next {PREDICTION_LOG_INTERVAL_MINUTES}-minute prediction log boundary",
-            "ledgerName": FUTURE_MARKET_PREDICTION_LEDGER_NAME,
-            "ledgerTitle": FUTURE_MARKET_PREDICTION_LEDGER_TITLE,
-            "intervalMinutes": PREDICTION_LOG_INTERVAL_MINUTES,
-            "latestCandleTimestamp": latest["timestamp"],
-            "nextRecordAt": next_prediction_log_boundary(latest["timestamp"]),
-            "updatedFiles": updated_files,
-            "resolvedRecords": resolved_count,
-            "pendingRecords": pending_count,
-        }
-
     record = build_market_forecast_prediction_record(symbol, feed, timeframe, latest, forecast)
     day = prediction_log_day(record["predictionTimestamp"])
     document = read_prediction_log_document(symbol, day)
@@ -348,7 +778,9 @@ def record_market_forecast_prediction(
         "recordId": record["id"],
         "predictionTimestamp": record["predictionTimestamp"],
         "date": day,
-        "intervalMinutes": PREDICTION_LOG_INTERVAL_MINUTES,
+        "intervalMinutes": 1,
+        "recordingPolicy": "every_forecast_invocation_from_finalized_one_minute_events",
+        "dashboardAggregationPolicy": "five_minute_rows_are_derived_after_authoritative_event_logging",
         "updatedFiles": updated_files,
         "resolvedRecords": resolved_count,
         "pendingRecords": pending_count,
@@ -429,9 +861,16 @@ def build_market_forecast_prediction_record(
     forecast: dict[str, Any],
 ) -> dict[str, Any]:
     timestamp = str(latest["timestamp"])
+    invocation_id = str(forecast.get("forecastInvocationId") or f"{symbol.upper()}|{feed}|{timeframe}|{timestamp}|{utc_now_iso()}")
     barriers = forecast.get("barriers") or {}
     decision = forecast.get("decision") or {}
     outcome = forecast.get("outcome") or {}
+    probabilities = {
+        "probabilityBuySuccess": forecast.get("probabilityBuySuccess"),
+        "probabilitySellSuccess": forecast.get("probabilitySellSuccess"),
+        "probabilityTimeout": forecast.get("probabilityTimeout"),
+        "outcomeProbabilities": outcome.get("probabilities"),
+    }
     future_price_prediction = forecast.get("futurePricePrediction") or {}
     predicted_future = predicted_future_market_snapshot(
         latest,
@@ -443,32 +882,47 @@ def build_market_forecast_prediction_record(
     )
     return json_safe(
         {
-            "id": f"{symbol.upper()}|{feed}|{timeframe}|{timestamp}|{MODEL_VERSION}",
+            "id": f"{symbol.upper()}|{feed}|{timeframe}|{timestamp}|{MODEL_VERSION}|{safe_artifact_id(invocation_id)}",
+            "forecastInvocationId": invocation_id,
             "symbol": symbol.upper(),
             "feed": feed,
             "timeframe": timeframe,
             "ledgerName": FUTURE_MARKET_PREDICTION_LEDGER_NAME,
             "ledgerTitle": FUTURE_MARKET_PREDICTION_LEDGER_TITLE,
             "ledgerRule": FUTURE_MARKET_PREDICTION_LEDGER_RULE,
+            "recordingPolicy": "every_forecast_invocation_from_finalized_one_minute_events",
             "modelVersion": MODEL_VERSION,
+            "artifactId": forecast.get("artifactId"),
+            "featureSchemaHash": forecast.get("featureSchemaHash"),
+            "eventTimestamp": forecast.get("eventTimestamp") or timestamp,
+            "barFinalizationTimestamp": forecast.get("barFinalizationTimestamp") or timestamp,
+            "featureReadyTimestamp": forecast.get("featureReadyTimestamp"),
+            "inferenceStartTimestamp": forecast.get("inferenceStartTimestamp"),
+            "inferenceEndTimestamp": forecast.get("inferenceEndTimestamp"),
+            "decisionTimestamp": forecast.get("decisionTimestamp") or forecast.get("updatedAt"),
+            "orderSubmissionTimestamp": forecast.get("orderSubmissionTimestamp"),
             "predictionTimestamp": timestamp,
             "generatedAt": forecast.get("updatedAt") or datetime.utcnow().isoformat() + "Z",
             "horizonMinutes": int(forecast.get("horizonMinutes") or FORECAST_HORIZON_MINUTES),
             "entryPrice": round(float(latest["close"]), 4),
             "predictionMarket": candle_market_snapshot(latest),
+            "predictionProbabilities": probabilities,
             "prediction": {
                 "status": forecast.get("status"),
+                "forecastStatus": forecast.get("forecastStatus") or forecast.get("forecast_status") or forecast.get("status"),
+                "forecastAppliedToOrder": bool(forecast.get("forecastAppliedToOrder") or forecast.get("forecast_applied_to_order")),
+                "heuristicStatus": (forecast.get("heuristicEstimate") or {}).get("status"),
                 "predictedOutcome": outcome.get("predicted"),
-                "probabilityBuySuccess": forecast.get("probabilityBuySuccess"),
-                "probabilitySellSuccess": forecast.get("probabilitySellSuccess"),
-                "probabilityTimeout": forecast.get("probabilityTimeout"),
+                **probabilities,
                 "decisionAction": decision.get("action"),
                 "candidateAction": decision.get("candidateAction"),
                 "confidence": decision.get("confidence"),
                 "edgeGap": decision.get("edgeGap"),
                 "expectedValue": decision.get("expectedValue"),
+                "expectedValueMetric": decision.get("expectedValueMetric"),
                 "buyExpectedValue": forecast.get("buyExpectedValue"),
                 "sellExpectedValue": forecast.get("sellExpectedValue"),
+                "incrementalExpectedNetValueAfterExecutionCosts": forecast.get("incrementalExpectedNetValueAfterExecutionCosts"),
                 "allowed": forecast.get("allowed"),
                 "reasons": decision.get("reasons") or [],
                 "topDrivers": forecast.get("topDrivers") or [],
@@ -485,7 +939,14 @@ def build_market_forecast_prediction_record(
             "predictedFutureMarket": predicted_future,
             "futurePricePrediction": future_price_prediction,
             "priceComparison": price_comparison_snapshot(latest, predicted_future),
+            "expectedCosts": {
+                "costs": numeric(forecast.get("costs")),
+                "baseCosts": numeric(forecast.get("baseCosts")),
+                "executionQuality": forecast.get("executionQuality") or {},
+            },
             "costs": numeric(forecast.get("costs")),
+            "baseCosts": numeric(forecast.get("baseCosts")),
+            "executionQuality": forecast.get("executionQuality") or {},
             "marketRegime": forecast.get("marketRegime") or {},
             "regime": forecast.get("regime") or {},
             "algorithmSignals": forecast.get("algorithmSignals") or {},
@@ -494,6 +955,15 @@ def build_market_forecast_prediction_record(
             "actual": {
                 "status": "pending",
                 "outcome": None,
+                "realizedOutcome": None,
+                "actualFill": {
+                    "status": "pending",
+                    "orderSubmissionTimestamp": forecast.get("orderSubmissionTimestamp"),
+                    "fillTimestamp": None,
+                    "filledQuantity": None,
+                    "averageFillPrice": None,
+                    "partialFillFraction": None,
+                },
                 "resolvedAt": None,
                 "expectedAt": add_minutes_iso(timestamp, int(forecast.get("horizonMinutes") or FORECAST_HORIZON_MINUTES)),
                 "actualFutureMarket": None,
@@ -570,8 +1040,21 @@ def resolve_market_forecast_record(record: dict[str, Any], candles: list[dict[st
     bars_held = int(candidate_resolution["barsHeld"] if outcome != OUTCOME_TIMEOUT else len(future))
     exit_price = float(candidate_resolution["exitPrice"] if outcome != OUTCOME_TIMEOUT else future[-1]["close"])
     costs = numeric(record.get("costs"))
+    estimated_execution_cost = numeric((record.get("executionQuality") or {}).get("totalEstimatedCost")) or costs
     buy_value = directional_resolution_value(buy_resolution, entry, float(future[-1]["close"]), target_distance, stop_distance)
     sell_value = directional_resolution_value(sell_resolution, entry, float(future[-1]["close"]), target_distance, stop_distance)
+    realized_execution = realized_execution_cost_snapshot(
+        record,
+        candles,
+        index,
+        action=action,
+        candidate_action=candidate_action,
+        entry=entry,
+        exit_price=exit_price,
+        estimated_execution_cost=estimated_execution_cost,
+        stop_distance=stop_distance,
+    )
+    realized_execution_cost = float(realized_execution["realizedExecutionCost"])
     horizon_candle = future[horizon - 1] if len(future) >= horizon else future[-1]
     horizon_close = float(horizon_candle["close"])
     max_high = max(float(candle["high"]) for candle in future)
@@ -580,6 +1063,7 @@ def resolve_market_forecast_record(record: dict[str, Any], candles: list[dict[st
     actual = {
         "status": "resolved",
         "outcome": outcome,
+        "realizedOutcome": outcome,
         "actualClass": actual_class_name(outcome),
         "resolvedAt": hit_at,
         "expectedAt": add_minutes_iso(timestamp, horizon),
@@ -618,7 +1102,23 @@ def resolve_market_forecast_record(record: dict[str, Any], candles: list[dict[st
         "executedDecisionCorrect": executed_decision_correct(action, outcome),
         "candidateDirectionCorrect": candidate_direction_correct(candidate_action, outcome),
         "tradeResult": realized_trade_result(action, outcome),
+        "actualFill": {
+            "status": realized_execution.get("fillStatus"),
+            "orderSubmissionTimestamp": record.get("orderSubmissionTimestamp"),
+            "fillTimestamp": hit_at if action in {DECISION_BUY, DECISION_SELL} else None,
+            "filledQuantity": None,
+            "averageFillPrice": realized_execution.get("actualExecutableEntryPrice"),
+            "partialFillFraction": realized_execution.get("partialFillFraction"),
+            "realizedExecutionCost": realized_execution.get("realizedExecutionCost"),
+        },
+        "estimatedExecutionCost": round(estimated_execution_cost, 4),
+        "realizedExecution": realized_execution,
         "realizedDecisionValueDollars": round(realized_decision_value(action, buy_value, sell_value, costs), 4),
+        "incrementalRealizedNetValueAfterExecutionCosts": round(
+            realized_decision_value(action, buy_value, sell_value, realized_execution_cost),
+            4,
+        ),
+        "realizedVersusEstimatedCostError": round(realized_execution_cost - estimated_execution_cost, 4),
     }
     record["actual"] = json_safe(actual)
     record["priceComparison"] = json_safe(price_comparison)
@@ -770,6 +1270,63 @@ def realized_decision_value(action: str, buy_value: float, sell_value: float, co
     if action == DECISION_SELL:
         return sell_value - costs
     return 0.0
+
+
+def realized_execution_cost_snapshot(
+    record: dict[str, Any],
+    candles: list[dict[str, Any]],
+    decision_index: int,
+    *,
+    action: str,
+    candidate_action: str,
+    entry: float,
+    exit_price: float,
+    estimated_execution_cost: float,
+    stop_distance: float,
+) -> dict[str, Any]:
+    if action not in {DECISION_BUY, DECISION_SELL}:
+        return {
+            "status": "no_order",
+            "fillStatus": "not_submitted",
+            "fillProbabilityRealized": 0.0,
+            "partialFillFraction": 0.0,
+            "actualExecutableEntryPrice": None,
+            "entryPriceSlippage": 0.0,
+            "exitPrice": None,
+            "estimatedExecutionCost": round(estimated_execution_cost, 6),
+            "realizedExecutionCost": 0.0,
+            "realizedVersusEstimatedCostError": round(-estimated_execution_cost, 6),
+            "metric": "incremental_realized_net_value_after_execution_costs",
+        }
+    executable = candles[decision_index + 1] if decision_index + 1 < len(candles) else candles[decision_index]
+    executable_entry = float(executable.get("open") or executable.get("close") or entry)
+    if action == DECISION_BUY:
+        entry_slippage = max(0.0, executable_entry - entry)
+    else:
+        entry_slippage = max(0.0, entry - executable_entry)
+    exit_slippage = 0.0
+    if candidate_action in {DECISION_BUY, DECISION_SELL}:
+        predicted_cost = numeric(record.get("baseCosts")) or numeric(record.get("costs"))
+    else:
+        predicted_cost = numeric(record.get("costs"))
+    stop_limit_miss_probability = numeric((record.get("executionQuality") or {}).get("stopLimitMissProbability"))
+    stop_limit_miss_realized_cost = stop_distance * stop_limit_miss_probability * 0.25
+    realized_execution_cost = max(0.0, predicted_cost + entry_slippage + exit_slippage + stop_limit_miss_realized_cost)
+    return {
+        "status": "resolved",
+        "fillStatus": "filled",
+        "fillProbabilityRealized": 1.0,
+        "partialFillFraction": 1.0,
+        "actualExecutableEntryPrice": round(executable_entry, 4),
+        "entryPriceSlippage": round(entry_slippage, 6),
+        "exitPrice": round(exit_price, 4),
+        "exitPriceSlippage": round(exit_slippage, 6),
+        "stopLimitMissRealizedCost": round(stop_limit_miss_realized_cost, 6),
+        "estimatedExecutionCost": round(estimated_execution_cost, 6),
+        "realizedExecutionCost": round(realized_execution_cost, 6),
+        "realizedVersusEstimatedCostError": round(realized_execution_cost - estimated_execution_cost, 6),
+        "metric": "incremental_realized_net_value_after_execution_costs",
+    }
 
 
 def candle_market_snapshot(candle: dict[str, Any]) -> dict[str, Any]:
@@ -1023,7 +1580,9 @@ def write_prediction_log_document(symbol: str, day: str, records: list[dict[str,
         "symbol": symbol.upper(),
         "date": day,
         "horizonMinutes": FORECAST_HORIZON_MINUTES,
-        "intervalMinutes": PREDICTION_LOG_INTERVAL_MINUTES,
+        "intervalMinutes": 1,
+        "recordingPolicy": "every_forecast_invocation_from_finalized_one_minute_events",
+        "dashboardAggregationPolicy": "five_minute_rows_are_derived_after_authoritative_event_logging",
         "numberDecimals": LEDGER_NUMBER_DECIMAL_PLACES,
         "updatedAt": datetime.utcnow().isoformat() + "Z",
         "summary": ledger_number_safe(summarize_prediction_log(records)),
@@ -1284,45 +1843,28 @@ def algorithm_signal_features(
     rsi_value: float,
     adx_value: float,
 ) -> dict[str, Any]:
-    votes = [
-        algorithm_rsi_mean_reversion(candles, rsi_value),
-        algorithm_breakout(candles, atr_value),
-        algorithm_macd(candles, atr_value),
-    ]
-    reversal_vote = algorithm_reversal(candles, atr_value)
-    family_scores = algorithm_family_scores(
-        rsi_vote=votes[0],
-        breakout_vote=votes[1],
-        macd_vote=votes[2],
-        reversal_vote=reversal_vote,
+    contracts = market_forecast_algorithm_signal_contracts(
+        candles,
+        atr_value=atr_value,
         regime_profile=regime_profile,
+        rsi_value=rsi_value,
         adx_value=adx_value,
     )
-    weighted = weighted_algorithm_scores(votes)
+    family_scores = algorithm_contract_family_scores(contracts, regime_profile=regime_profile)
+    weighted = algorithm_contract_scores(contracts)
     buy_score = weighted["buy"]
     sell_score = weighted["sell"]
     hold_score = weighted["hold"]
-    winner_score = max(buy_score, sell_score, hold_score)
     sorted_scores = sorted([buy_score, sell_score, hold_score], reverse=True)
     winner_margin = sorted_scores[0] - sorted_scores[1] if len(sorted_scores) >= 2 else 0.0
     disagreement = 1.0 - winner_margin
-    trend = str(regime_profile.get("trend") or "")
-    rsi_vote, breakout_vote, macd_vote = votes
-    return {
-        "algorithm_1_signal": signal_value(rsi_vote["signal"]),
-        "algorithm_1_confidence": rsi_vote["confidence"],
-        "algorithm_2_signal": signal_value(breakout_vote["signal"]),
-        "algorithm_2_confidence": breakout_vote["confidence"],
-        "algorithm_3_signal": signal_value(macd_vote["signal"]),
-        "algorithm_3_confidence": macd_vote["confidence"],
-        "rsi_mean_reversion_signal": signal_value(rsi_vote["signal"]),
-        "rsi_mean_reversion_confidence": rsi_vote["confidence"],
-        "breakout_signal": signal_value(breakout_vote["signal"]),
-        "breakout_confidence": breakout_vote["confidence"],
-        "macd_signal": signal_value(macd_vote["signal"]),
-        "macd_confidence": macd_vote["confidence"],
-        "reversal_signal": signal_value(reversal_vote["signal"]),
-        "reversal_confidence": reversal_vote["confidence"],
+    features: dict[str, Any] = {
+        "contract_schema_version": 1,
+        "contract_count": len(contracts),
+        "eligible_contract_count": sum(1 for contract in contracts if contract.eligibility),
+        "buy_contract_count": sum(1 for contract in contracts if contract.signal == "Buy"),
+        "sell_contract_count": sum(1 for contract in contracts if contract.signal == "Sell"),
+        "hold_contract_count": sum(1 for contract in contracts if contract.signal == "Hold"),
         **family_scores,
         "weighted_buy_score": buy_score,
         "weighted_sell_score": sell_score,
@@ -1330,85 +1872,241 @@ def algorithm_signal_features(
         "buy_minus_sell_score": buy_score - sell_score,
         "winner_score_margin": winner_margin,
         "algorithm_disagreement": disagreement,
-        "buy_vote_count": sum(1 for vote in votes if vote["signal"] == "Buy"),
-        "sell_vote_count": sum(1 for vote in votes if vote["signal"] == "Sell"),
-        "hold_vote_count": sum(1 for vote in votes if vote["signal"] == "Hold"),
-        "all_algorithms_disagree": len({vote["signal"] for vote in votes}) == 3,
-        "breakout_volume_confirmation_agree": breakout_vote["signal"] == "Buy" and breakout_vote["confidence"] >= 0.55,
-        "rsi_buy_in_downtrend": rsi_vote["signal"] == "Buy" and trend in {"strong_downtrend", "weak_downtrend"},
-        "rsi_sell_in_uptrend": rsi_vote["signal"] == "Sell" and trend in {"strong_uptrend", "weak_uptrend"},
-        "mean_reversion_sideways_alignment": trend == "sideways" and rsi_vote["signal"] != "Hold",
-        "trend_confirmation_alignment": breakout_vote["signal"] == macd_vote["signal"] and breakout_vote["signal"] != "Hold" and adx_value >= 20,
+    }
+    for contract in contracts:
+        prefix = f"strategy__{contract.strategy_id}"
+        features[f"{prefix}__signal"] = signal_value(contract.signal)
+        features[f"{prefix}__confidence_or_setup_quality"] = contract.confidence_or_setup_quality
+        features[f"{prefix}__eligible"] = contract.eligibility
+        features[f"{prefix}__regime_compatibility"] = contract.regime_compatibility
+        features[f"{prefix}__version_hash"] = stable_text_feature(contract.strategy_version)
+        features[f"{prefix}__family_hash"] = stable_text_feature(contract.family)
+        features[f"{prefix}__reason_code_hash"] = stable_text_feature("|".join(contract.reason_codes))
+    return features
+
+
+def market_forecast_algorithm_signal_contracts(
+    candles: list[dict[str, Any]],
+    *,
+    atr_value: float,
+    regime_profile: dict[str, Any],
+    rsi_value: float,
+    adx_value: float,
+) -> list[MarketForecastAlgorithmSignalContract]:
+    setup_by_id = {
+        "multi_timeframe_trend_alignment": market_forecast_trend_alignment_setup(candles, atr_value, adx_value),
+        "first_pullback_after_open": market_forecast_first_pullback_setup(candles, atr_value),
+        "failed_breakout_reversal": market_forecast_failed_breakout_reversal_setup(candles, atr_value),
+        "liquidity_sweep_reversal": market_forecast_liquidity_sweep_reversal_setup(candles, atr_value),
+        "bollinger_atr_reversion": market_forecast_bollinger_atr_reversion_setup(candles, rsi_value),
+    }
+    contracts: list[MarketForecastAlgorithmSignalContract] = []
+    for entry in VOTING_ENSEMBLE_ACTIVE_DIRECTIONAL_STRATEGIES:
+        setup = setup_by_id.get(entry.strategyId, market_forecast_hold_setup(f"market_forecast.contract.{entry.strategyId}.not_implemented"))
+        signal = str(setup["signal"])
+        setup_quality = clamp(float(setup.get("confidence_or_setup_quality") or 0.0), 0.0, 1.0)
+        family = strategy_family_value(entry.family)
+        regime_compatibility = contract_regime_compatibility(family, signal, regime_profile, adx_value)
+        eligible = bool(setup.get("eligibility")) and signal != "Hold" and regime_compatibility >= 0.35
+        reason_codes = tuple(str(code) for code in setup.get("reason_codes", ()) if code)
+        contracts.append(
+            MarketForecastAlgorithmSignalContract(
+                strategy_id=entry.strategyId,
+                strategy_version=entry.strategyVersion,
+                signal=signal,
+                confidence_or_setup_quality=setup_quality,
+                family=family,
+                eligibility=eligible,
+                reason_codes=reason_codes or (f"market_forecast.contract.{entry.strategyId}.evaluated",),
+                regime_compatibility=regime_compatibility,
+            )
+        )
+    return contracts
+
+
+def market_forecast_hold_setup(reason_code: str) -> dict[str, Any]:
+    return {
+        "signal": "Hold",
+        "confidence_or_setup_quality": 0.0,
+        "eligibility": False,
+        "reason_codes": (reason_code,),
     }
 
 
-def algorithm_rsi_mean_reversion(candles: list[dict[str, Any]], rsi_value: float) -> dict[str, Any]:
-    if len(candles) <= 14:
-        return {"signal": "Hold", "confidence": 0.0}
-    if rsi_value <= 30:
-        return {"signal": "Buy", "confidence": clamp((30 - rsi_value) / 30, 0.15, 1.0)}
-    if rsi_value >= 70:
-        return {"signal": "Sell", "confidence": clamp((rsi_value - 70) / 30, 0.15, 1.0)}
-    return {"signal": "Hold", "confidence": clamp(1 - abs(rsi_value - 50) / 20, 0.0, 0.5)}
+def strategy_family_value(family: Any) -> str:
+    return str(getattr(family, "value", family)).upper()
 
 
-def algorithm_breakout(candles: list[dict[str, Any]], atr_value: float) -> dict[str, Any]:
-    if len(candles) < 21:
-        return {"signal": "Hold", "confidence": 0.0}
-    latest = candles[-1]
-    prior = candles[-21:-1]
-    prior_high = max(float(candle["high"]) for candle in prior)
-    prior_low = min(float(candle["low"]) for candle in prior)
-    latest_close = float(latest["close"])
-    if latest_close > prior_high:
-        return {"signal": "Buy", "confidence": clamp((latest_close - prior_high) / max(atr_value, 0.01), 0.15, 1.0)}
-    if latest_close < prior_low:
-        return {"signal": "Sell", "confidence": clamp((prior_low - latest_close) / max(atr_value, 0.01), 0.15, 1.0)}
-    range_width = max(prior_high - prior_low, 0.01)
-    range_position = (latest_close - prior_low) / range_width
-    return {"signal": "Hold", "confidence": clamp(1 - abs(range_position - 0.5) * 2, 0.0, 0.75)}
-
-
-def algorithm_macd(candles: list[dict[str, Any]], atr_value: float) -> dict[str, Any]:
+def market_forecast_trend_alignment_setup(candles: list[dict[str, Any]], atr_value: float, adx_value: float) -> dict[str, Any]:
+    if len(candles) < 50:
+        return market_forecast_hold_setup("market_forecast.contract.multi_timeframe_trend_alignment.insufficient_history")
     closes = [float(candle["close"]) for candle in candles]
-    macd = macd_snapshot(closes)
-    if macd is None:
-        return {"signal": "Hold", "confidence": 0.0}
-    confidence = clamp(abs(macd["histogram"]) / max(atr_value, 0.01), 0.05, 1.0)
-    if macd["macd"] > macd["signal"] and macd["histogram"] > 0:
-        return {"signal": "Buy", "confidence": confidence}
-    if macd["macd"] < macd["signal"] and macd["histogram"] < 0:
-        return {"signal": "Sell", "confidence": confidence}
-    return {"signal": "Hold", "confidence": clamp(1 - confidence, 0.0, 0.5)}
+    ema9 = ema(closes, 9)
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
+    short_slope = slope(ema9[-6:]) / max(closes[-1], 0.01)
+    medium_slope = slope(ema20[-10:]) / max(closes[-1], 0.01)
+    trend_quality = clamp((abs(short_slope) * 900) + (abs(medium_slope) * 1200) + max(0.0, adx_value - 18) / 30, 0.0, 1.0)
+    if ema9[-1] > ema20[-1] > ema50[-1] and short_slope > 0 and medium_slope > 0:
+        return {
+            "signal": "Buy",
+            "confidence_or_setup_quality": max(0.35, trend_quality),
+            "eligibility": trend_quality >= 0.35,
+            "reason_codes": ("market_forecast.contract.multi_timeframe_trend_alignment.buy",),
+        }
+    if ema9[-1] < ema20[-1] < ema50[-1] and short_slope < 0 and medium_slope < 0:
+        return {
+            "signal": "Sell",
+            "confidence_or_setup_quality": max(0.35, trend_quality),
+            "eligibility": trend_quality >= 0.35,
+            "reason_codes": ("market_forecast.contract.multi_timeframe_trend_alignment.sell",),
+        }
+    return {
+        "signal": "Hold",
+        "confidence_or_setup_quality": clamp(1 - abs(ema9[-1] - ema20[-1]) / max(atr_value, 0.01), 0.0, 0.55),
+        "eligibility": False,
+        "reason_codes": ("market_forecast.contract.multi_timeframe_trend_alignment.no_alignment",),
+    }
 
 
-def algorithm_reversal(candles: list[dict[str, Any]], atr_value: float) -> dict[str, Any]:
-    if len(candles) < 21:
-        return {"signal": "Hold", "confidence": 0.0}
+def market_forecast_first_pullback_setup(candles: list[dict[str, Any]], atr_value: float) -> dict[str, Any]:
+    if len(candles) < 12:
+        return market_forecast_hold_setup("market_forecast.contract.first_pullback_after_open.insufficient_history")
     latest = candles[-1]
-    prior = candles[-21:-1]
+    prior = candles[-6:-1]
+    impulse = float(prior[-1]["close"]) - float(prior[0]["open"])
+    pullback = float(latest["close"]) - float(prior[-1]["close"])
+    quality = clamp(abs(impulse) / max(atr_value * 1.5, 0.01), 0.0, 1.0)
+    if impulse > atr_value and -atr_value <= pullback <= 0 and float(latest["close"]) > float(latest["open"]):
+        return {
+            "signal": "Buy",
+            "confidence_or_setup_quality": max(0.35, quality),
+            "eligibility": quality >= 0.35,
+            "reason_codes": ("market_forecast.contract.first_pullback_after_open.buy",),
+        }
+    if impulse < -atr_value and 0 <= pullback <= atr_value and float(latest["close"]) < float(latest["open"]):
+        return {
+            "signal": "Sell",
+            "confidence_or_setup_quality": max(0.35, quality),
+            "eligibility": quality >= 0.35,
+            "reason_codes": ("market_forecast.contract.first_pullback_after_open.sell",),
+        }
+    return {
+        "signal": "Hold",
+        "confidence_or_setup_quality": quality * 0.5,
+        "eligibility": False,
+        "reason_codes": ("market_forecast.contract.first_pullback_after_open.no_setup",),
+    }
+
+
+def market_forecast_failed_breakout_reversal_setup(candles: list[dict[str, Any]], atr_value: float) -> dict[str, Any]:
+    if len(candles) < 22:
+        return market_forecast_hold_setup("market_forecast.contract.failed_breakout_reversal.insufficient_history")
+    latest = candles[-1]
+    prior = candles[-22:-2]
     prior_high = max(float(candle["high"]) for candle in prior)
     prior_low = min(float(candle["low"]) for candle in prior)
     close = float(latest["close"])
-    failed_high = float(latest["high"]) > prior_high and close < prior_high
-    failed_low = float(latest["low"]) < prior_low and close > prior_low
-    if failed_high:
-        confidence = clamp((float(latest["high"]) - close) / max(atr_value, 0.01), 0.15, 1.0)
-        return {"signal": "Sell", "confidence": confidence}
-    if failed_low:
-        confidence = clamp((close - float(latest["low"])) / max(atr_value, 0.01), 0.15, 1.0)
-        return {"signal": "Buy", "confidence": confidence}
-    return {"signal": "Hold", "confidence": 0.0}
+    quality = clamp((float(latest["high"]) - float(latest["low"])) / max(atr_value, 0.01), 0.0, 1.0)
+    if float(latest["high"]) > prior_high and close < prior_high:
+        return {
+            "signal": "Sell",
+            "confidence_or_setup_quality": max(0.35, quality),
+            "eligibility": quality >= 0.35,
+            "reason_codes": ("market_forecast.contract.failed_breakout_reversal.sell",),
+        }
+    if float(latest["low"]) < prior_low and close > prior_low:
+        return {
+            "signal": "Buy",
+            "confidence_or_setup_quality": max(0.35, quality),
+            "eligibility": quality >= 0.35,
+            "reason_codes": ("market_forecast.contract.failed_breakout_reversal.buy",),
+        }
+    return {
+        "signal": "Hold",
+        "confidence_or_setup_quality": quality * 0.4,
+        "eligibility": False,
+        "reason_codes": ("market_forecast.contract.failed_breakout_reversal.no_failed_break",),
+    }
 
 
-def algorithm_family_scores(
+def market_forecast_liquidity_sweep_reversal_setup(candles: list[dict[str, Any]], atr_value: float) -> dict[str, Any]:
+    if len(candles) < 10:
+        return market_forecast_hold_setup("market_forecast.contract.liquidity_sweep_reversal.insufficient_history")
+    latest = candles[-1]
+    prior = candles[-10:-1]
+    prior_high = max(float(candle["high"]) for candle in prior)
+    prior_low = min(float(candle["low"]) for candle in prior)
+    close = float(latest["close"])
+    upper_rejection = float(latest["high"]) - max(float(latest["open"]), close)
+    lower_rejection = min(float(latest["open"]), close) - float(latest["low"])
+    if float(latest["high"]) > prior_high and upper_rejection >= atr_value * 0.35:
+        return {
+            "signal": "Sell",
+            "confidence_or_setup_quality": clamp(upper_rejection / max(atr_value, 0.01), 0.35, 1.0),
+            "eligibility": True,
+            "reason_codes": ("market_forecast.contract.liquidity_sweep_reversal.sell",),
+        }
+    if float(latest["low"]) < prior_low and lower_rejection >= atr_value * 0.35:
+        return {
+            "signal": "Buy",
+            "confidence_or_setup_quality": clamp(lower_rejection / max(atr_value, 0.01), 0.35, 1.0),
+            "eligibility": True,
+            "reason_codes": ("market_forecast.contract.liquidity_sweep_reversal.buy",),
+        }
+    return {
+        "signal": "Hold",
+        "confidence_or_setup_quality": clamp(max(upper_rejection, lower_rejection) / max(atr_value, 0.01), 0.0, 0.5),
+        "eligibility": False,
+        "reason_codes": ("market_forecast.contract.liquidity_sweep_reversal.no_sweep",),
+    }
+
+
+def market_forecast_bollinger_atr_reversion_setup(candles: list[dict[str, Any]], rsi_value: float) -> dict[str, Any]:
+    closes = [float(candle["close"]) for candle in candles]
+    if len(closes) < 20:
+        return market_forecast_hold_setup("market_forecast.contract.bollinger_atr_reversion.insufficient_history")
+    band_position = bollinger_band_position(closes, 20, 2)
+    if band_position <= 0.05 or rsi_value <= 30:
+        return {
+            "signal": "Buy",
+            "confidence_or_setup_quality": clamp(max(0.05 - band_position, 30 - rsi_value) / 30, 0.35, 1.0),
+            "eligibility": True,
+            "reason_codes": ("market_forecast.contract.bollinger_atr_reversion.buy",),
+        }
+    if band_position >= 0.95 or rsi_value >= 70:
+        return {
+            "signal": "Sell",
+            "confidence_or_setup_quality": clamp(max(band_position - 0.95, rsi_value - 70) / 30, 0.35, 1.0),
+            "eligibility": True,
+            "reason_codes": ("market_forecast.contract.bollinger_atr_reversion.sell",),
+        }
+    return {
+        "signal": "Hold",
+        "confidence_or_setup_quality": clamp(abs(band_position - 0.5), 0.0, 0.5),
+        "eligibility": False,
+        "reason_codes": ("market_forecast.contract.bollinger_atr_reversion.no_reversion_extreme",),
+    }
+
+
+def contract_regime_compatibility(family: str, signal: str, regime_profile: dict[str, Any], adx_value: float) -> float:
+    if signal == "Hold":
+        return 0.0
+    trend = str(regime_profile.get("trend") or "")
+    normalized_family = family.upper()
+    if normalized_family == "TREND":
+        return 0.85 if trend in {"strong_uptrend", "strong_downtrend", "weak_uptrend", "weak_downtrend"} else 0.45
+    if normalized_family in {"REVERSAL", "MEAN_REVERSION"}:
+        return 0.85 if adx_value < 28 else 0.45
+    if normalized_family == "BREAKOUT":
+        return 0.75 if adx_value >= 18 else 0.45
+    return 0.5
+
+
+def algorithm_contract_family_scores(
+    contracts: list[MarketForecastAlgorithmSignalContract],
     *,
-    rsi_vote: dict[str, Any],
-    breakout_vote: dict[str, Any],
-    macd_vote: dict[str, Any],
-    reversal_vote: dict[str, Any],
     regime_profile: dict[str, Any],
-    adx_value: float,
 ) -> dict[str, float]:
     scores = {
         "trend_buy_score": 0.0,
@@ -1422,30 +2120,25 @@ def algorithm_family_scores(
         "confirmation_score": 0.0,
         "regime_score": 0.0,
     }
-
-    def add_vote(prefix: str, vote: dict[str, Any]) -> None:
-        signal = str(vote.get("signal") or "Hold")
-        confidence = float(vote.get("confidence") or 0.0)
-        if signal == "Buy":
-            scores[f"{prefix}_buy_score"] += confidence
-        elif signal == "Sell":
-            scores[f"{prefix}_sell_score"] += confidence
-
-    add_vote("trend", macd_vote)
-    add_vote("breakout", breakout_vote)
-    add_vote("mean_reversion", rsi_vote)
-    add_vote("reversal", reversal_vote)
-
-    signed_votes = [
-        signal_value(vote["signal"]) * float(vote.get("confidence") or 0.0)
-        for vote in [rsi_vote, breakout_vote, macd_vote, reversal_vote]
-        if str(vote.get("signal") or "Hold") != "Hold"
-    ]
-    confirmation = (sum(signed_votes) / len(signed_votes)) if signed_votes else 0.0
-    if breakout_vote["signal"] == macd_vote["signal"] and breakout_vote["signal"] != "Hold" and adx_value >= 20:
-        confirmation += 0.25 * signal_value(str(breakout_vote["signal"]))
-    scores["confirmation_score"] = clamp(confirmation, -1.0, 1.0)
-
+    family_map = {
+        "TREND": "trend",
+        "BREAKOUT": "breakout",
+        "MEAN_REVERSION": "mean_reversion",
+        "REVERSAL": "reversal",
+    }
+    signed: list[float] = []
+    for contract in contracts:
+        prefix = family_map.get(contract.family.upper())
+        if not prefix:
+            continue
+        contribution = contract.confidence_or_setup_quality * contract.regime_compatibility
+        if contract.signal == "Buy":
+            scores[f"{prefix}_buy_score"] += contribution
+            signed.append(contribution)
+        elif contract.signal == "Sell":
+            scores[f"{prefix}_sell_score"] += contribution
+            signed.append(-contribution)
+    scores["confirmation_score"] = clamp(sum(signed) / len(signed), -1.0, 1.0) if signed else 0.0
     trend = str(regime_profile.get("trend") or "")
     if trend == "strong_uptrend":
         scores["regime_score"] = 0.8
@@ -1455,27 +2148,32 @@ def algorithm_family_scores(
         scores["regime_score"] = -0.8
     elif trend == "weak_downtrend":
         scores["regime_score"] = -0.45
-
     return {key: round(value, 6) for key, value in scores.items()}
 
 
-def weighted_algorithm_scores(votes: list[dict[str, Any]]) -> dict[str, float]:
+def algorithm_contract_scores(contracts: list[MarketForecastAlgorithmSignalContract]) -> dict[str, float]:
     scores = {"buy": 0.0, "sell": 0.0, "hold": 0.0}
-    if not votes:
+    if not contracts:
         return {"buy": 0.0, "sell": 0.0, "hold": 1.0}
-    for vote in votes:
-        confidence = float(vote.get("confidence") or 0.0)
-        signal = str(vote.get("signal") or "Hold")
-        if signal == "Buy":
-            scores["buy"] += confidence
-            scores["hold"] += 1 - confidence
-        elif signal == "Sell":
-            scores["sell"] += confidence
-            scores["hold"] += 1 - confidence
+    for contract in contracts:
+        contribution = contract.confidence_or_setup_quality * contract.regime_compatibility
+        if contract.signal == "Buy" and contract.eligibility:
+            scores["buy"] += contribution
+            scores["hold"] += 1 - contribution
+        elif contract.signal == "Sell" and contract.eligibility:
+            scores["sell"] += contribution
+            scores["hold"] += 1 - contribution
         else:
-            scores["hold"] += max(confidence, 0.5)
+            scores["hold"] += max(0.5, 1 - contribution)
     total = sum(scores.values()) or 1
     return {key: value / total for key, value in scores.items()}
+
+
+def stable_text_feature(value: str) -> float:
+    import hashlib
+
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return int(digest, 16) / float(0xFFFFFFFFFFFF)
 
 
 def signal_value(signal: str) -> float:
@@ -1484,20 +2182,6 @@ def signal_value(signal: str) -> float:
     if signal == "Sell":
         return -1.0
     return 0.0
-
-
-def macd_snapshot(values: list[float]) -> dict[str, float] | None:
-    if len(values) < 35:
-        return None
-    ema12 = ema(values, 12)
-    ema26 = ema(values, 26)
-    macd_line = [fast - slow for fast, slow in zip(ema12, ema26)]
-    signal_line = ema(macd_line, 9)
-    return {
-        "macd": macd_line[-1],
-        "signal": signal_line[-1],
-        "histogram": macd_line[-1] - signal_line[-1],
-    }
 
 
 def detect_market_regime(
@@ -1801,6 +2485,93 @@ def volatility_adjusted_barriers(features: dict[str, Any], latest_close: float, 
     }
 
 
+def estimate_execution_quality(
+    features: dict[str, Any],
+    latest: dict[str, Any],
+    barriers: dict[str, Any],
+    *,
+    spread: float | None,
+    slippage: float,
+    fees: float,
+    latency_seconds: float = DEFAULT_DECISION_TO_SUBMISSION_LATENCY_SECONDS,
+) -> dict[str, Any]:
+    micro = features.get("microstructure") or {}
+    volatility = features.get("volatility") or {}
+    volume = features.get("volume") or {}
+    atr_1m = max(float(volatility.get("atr_1m") or 0.0), 0.01)
+    latest_close = max(float(latest.get("close") or 0.0), 0.01)
+    observed_spread = max(0.0, float(spread if spread is not None else micro.get("avg_spread") or 0.0))
+    base_cost = round(observed_spread + (max(0.0, float(slippage)) * 2) + max(0.0, float(fees)), 6)
+    spread_atr = observed_spread / atr_1m
+    max_spread_atr = max(float(micro.get("max_spread_atr") or 0.0), spread_atr)
+    range_expansion = max(0.0, float(volatility.get("range_expansion") or 1.0))
+    relative_volume = max(0.0, float(volume.get("relative_volume") or volume.get("volume_vs_20_bar_average") or 1.0))
+    realized_volatility = max(0.0, float(volatility.get("realized_volatility") or 0.0))
+    quote_imbalance = abs(float(micro.get("quote_imbalance") or 0.0))
+    latency_minutes = max(0.0, latency_seconds) / 60.0
+    quote_movement = atr_1m * math.sqrt(max(latency_minutes, 1 / 600))
+    target_distance = max(float(barriers.get("targetDistance") or DEFAULT_PROFIT_TARGET_DOLLARS), 0.01)
+    stop_distance = max(float(barriers.get("stopDistance") or DEFAULT_PROFIT_TARGET_DOLLARS), 0.01)
+    volatility_penalty = clamp((range_expansion - 1.0) * 0.12 + realized_volatility * 180 + max_spread_atr * 0.18, 0.0, 0.45)
+    liquidity_credit = clamp((relative_volume - 1.0) * 0.08, 0.0, 0.18)
+    fill_probability = clamp(
+        0.88
+        - (spread_atr * 0.45)
+        - (quote_movement / target_distance * 0.25)
+        - volatility_penalty
+        + liquidity_credit,
+        0.15,
+        0.98,
+    )
+    limit_order_non_fill_probability = 1.0 - fill_probability
+    partial_fill_probability = clamp(0.06 + spread_atr * 0.22 + max(0.0, 1.0 - relative_volume) * 0.10 + volatility_penalty * 0.25, 0.02, 0.45)
+    expected_partial_fill_fraction = clamp(1.0 - (partial_fill_probability * 0.45), 0.55, 1.0)
+    stop_limit_miss_probability = clamp(0.02 + max_spread_atr * 0.20 + volatility_penalty * 0.35 + quote_imbalance * 0.04, 0.01, 0.45)
+    opportunity_decay = clamp((latency_minutes / max(FORECAST_HORIZON_MINUTES, 1)) * (1 + range_expansion * 0.75) + limit_order_non_fill_probability * 0.12, 0.0, 0.6)
+    adverse_selection_cost = max(0.0, observed_spread * 0.5 + quote_movement * 0.35 + atr_1m * volatility_penalty * 0.15)
+    quote_movement_cost = quote_movement * 0.5
+    cancel_replace_cost = observed_spread * limit_order_non_fill_probability * 0.35
+    expected_stop_limit_miss_cost = stop_distance * stop_limit_miss_probability * 0.5
+    realized_cost_error_reserve = max(observed_spread * 0.25, quote_movement * 0.25, base_cost * 0.10)
+    total_estimated_cost = (
+        base_cost
+        + adverse_selection_cost
+        + quote_movement_cost
+        + cancel_replace_cost
+        + expected_stop_limit_miss_cost
+        + realized_cost_error_reserve
+    )
+    expected_execution_multiplier = fill_probability * expected_partial_fill_fraction * (1.0 - opportunity_decay)
+    return {
+        "metric": "incremental_realized_net_value_after_execution_costs",
+        "baseCostFormula": "spread + 2*slippage + fees",
+        "baseCost": round(base_cost, 6),
+        "totalEstimatedCost": round(total_estimated_cost, 6),
+        "fillProbability": round(fill_probability, 4),
+        "limitOrderNonFillProbability": round(limit_order_non_fill_probability, 4),
+        "partialFillProbability": round(partial_fill_probability, 4),
+        "expectedPartialFillFraction": round(expected_partial_fill_fraction, 4),
+        "stopLimitMissProbability": round(stop_limit_miss_probability, 4),
+        "decisionToSubmissionLatencySeconds": round(max(0.0, latency_seconds), 4),
+        "quoteMovementDuringLatency": round(quote_movement, 6),
+        "opportunityDecay": round(opportunity_decay, 4),
+        "adverseSelectionCost": round(adverse_selection_cost, 6),
+        "cancelReplaceCost": round(cancel_replace_cost, 6),
+        "expectedStopLimitMissCost": round(expected_stop_limit_miss_cost, 6),
+        "realizedVsEstimatedCostErrorReserve": round(realized_cost_error_reserve, 6),
+        "expectedExecutionMultiplier": round(expected_execution_multiplier, 4),
+        "spreadAtr": round(spread_atr, 4),
+        "maxSpreadAtr": round(max_spread_atr, 4),
+        "inputs": {
+            "spread": round(observed_spread, 6),
+            "slippagePerShare": round(max(0.0, float(slippage)), 6),
+            "fees": round(max(0.0, float(fees)), 6),
+            "atr1m": round(atr_1m, 6),
+            "latestClose": round(latest_close, 6),
+        },
+    }
+
+
 def forecast_future_price_prediction(
     features: dict[str, Any],
     latest_close: float,
@@ -1952,6 +2723,7 @@ def forecast_trade_decision(
     uncertainty: dict[str, Any],
     features: dict[str, Any],
     base_threshold: float,
+    execution_quality: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     buy_probability = probabilities[OUTCOME_TARGET]
     sell_probability = probabilities[OUTCOME_STOP]
@@ -1969,6 +2741,11 @@ def forecast_trade_decision(
     minimum_confidence = base_threshold + float(market_regime.get("thresholdAdjustment") or 0.0)
     minimum_edge_gap = DEFAULT_MIN_EDGE_GAP + (0.03 if market_regime.get("trend") == "sideways" else 0.0)
     spread_atr = float((features.get("microstructure") or {}).get("avg_spread_atr") or 0.0)
+    execution_quality = execution_quality or {}
+    fill_probability = float(execution_quality.get("fillProbability") if execution_quality.get("fillProbability") is not None else 1.0)
+    non_fill_probability = float(execution_quality.get("limitOrderNonFillProbability") if execution_quality.get("limitOrderNonFillProbability") is not None else 0.0)
+    stop_limit_miss_probability = float(execution_quality.get("stopLimitMissProbability") if execution_quality.get("stopLimitMissProbability") is not None else 0.0)
+    opportunity_decay = float(execution_quality.get("opportunityDecay") if execution_quality.get("opportunityDecay") is not None else 0.0)
     reasons: list[str] = []
     if candidate_action == DECISION_BUY and not market_regime.get("allowedLong", True):
         reasons.append(f"Regime {market_regime.get('trend')} blocks long/buy predictions")
@@ -1984,9 +2761,17 @@ def forecast_trade_decision(
     if timeout_probability >= confidence:
         reasons.append("Timeout/no-edge probability is the strongest class")
     if expected_value <= 0:
-        reasons.append(f"Expected value {expected_value:+.2f}/share is not positive")
+        reasons.append(f"Execution-adjusted net expected value {expected_value:+.2f}/share is not positive")
     if spread_atr > DEFAULT_MAX_SPREAD_ATR:
         reasons.append(f"Spread/ATR {spread_atr:.1%} is above {DEFAULT_MAX_SPREAD_ATR:.0%}")
+    if fill_probability < MIN_EXECUTION_FILL_PROBABILITY:
+        reasons.append(f"Fill probability {fill_probability:.1%} is below {MIN_EXECUTION_FILL_PROBABILITY:.0%}")
+    if non_fill_probability > MAX_LIMIT_ORDER_NON_FILL_PROBABILITY:
+        reasons.append(f"Limit-order non-fill probability {non_fill_probability:.1%} is above {MAX_LIMIT_ORDER_NON_FILL_PROBABILITY:.0%}")
+    if stop_limit_miss_probability > MAX_STOP_LIMIT_MISS_PROBABILITY:
+        reasons.append(f"Stop-limit miss probability {stop_limit_miss_probability:.1%} is above {MAX_STOP_LIMIT_MISS_PROBABILITY:.0%}")
+    if opportunity_decay > MAX_OPPORTUNITY_DECAY:
+        reasons.append(f"Opportunity decay {opportunity_decay:.1%} is above {MAX_OPPORTUNITY_DECAY:.0%}")
     if not regime_allows:
         reasons.append("Regime filter blocks forecast edge")
 
@@ -2002,9 +2787,18 @@ def forecast_trade_decision(
         "maximumModelDisagreement": DEFAULT_MAX_MODEL_DISAGREEMENT,
         "spreadAtr": round(spread_atr, 4),
         "maximumSpreadAtr": DEFAULT_MAX_SPREAD_ATR,
+        "fillProbability": round(fill_probability, 4),
+        "minimumFillProbability": MIN_EXECUTION_FILL_PROBABILITY,
+        "limitOrderNonFillProbability": round(non_fill_probability, 4),
+        "maximumLimitOrderNonFillProbability": MAX_LIMIT_ORDER_NON_FILL_PROBABILITY,
+        "stopLimitMissProbability": round(stop_limit_miss_probability, 4),
+        "maximumStopLimitMissProbability": MAX_STOP_LIMIT_MISS_PROBABILITY,
+        "opportunityDecay": round(opportunity_decay, 4),
+        "maximumOpportunityDecay": MAX_OPPORTUNITY_DECAY,
         "expectedValue": expected_value if action != DECISION_NO_TRADE else max(buy_expected_value, sell_expected_value),
+        "expectedValueMetric": "incremental_realized_net_value_after_execution_costs",
         "positionSizeMultiplier": float(market_regime.get("positionSizeMultiplier") or 0.0) if action != DECISION_NO_TRADE else 0.0,
-        "reasons": reasons or [f"{candidate_action.title()} edge passed confidence, gap, expectancy, and regime gates"],
+        "reasons": reasons or [f"{candidate_action.title()} edge passed confidence, gap, execution-adjusted expectancy, fill, and regime gates"],
     }
 
 
@@ -2042,7 +2836,7 @@ def forecast_drivers(features: dict[str, Any], probabilities: dict[str, float], 
         f"P(timeout/no edge) {probabilities[OUTCOME_TIMEOUT]:.1%}",
         f"Edge gap {float(decision['edgeGap'] or 0):.1%}",
         f"Model disagreement {float(decision.get('modelDisagreement') or 0):.1%}",
-        f"Expected value {float(decision['expectedValue']):+.2f}/share after costs",
+        f"Incremental net EV {float(decision['expectedValue']):+.2f}/share after execution costs",
         f"VWAP distance {price['distance_from_vwap']:+.3%}",
         f"EMA9 slope {trend['ema_9_slope']:+.3%}",
         f"Volume {volume['volume_vs_20_bar_average']:.2f}x 20-bar average",
@@ -2056,19 +2850,24 @@ def forecast_drivers(features: dict[str, Any], probabilities: dict[str, float], 
 
 def algorithm_signal_summary(features: dict[str, Any]) -> dict[str, Any]:
     algorithm = features.get("algorithm") or {}
+    contracts = []
+    for entry in VOTING_ENSEMBLE_ACTIVE_DIRECTIONAL_STRATEGIES:
+        prefix = f"strategy__{entry.strategyId}"
+        contracts.append(
+            {
+                "strategyId": entry.strategyId,
+                "strategyVersion": entry.strategyVersion,
+                "signal": signal_label(float(algorithm.get(f"{prefix}__signal") or 0)),
+                "confidenceOrSetupQuality": algorithm.get(f"{prefix}__confidence_or_setup_quality"),
+                "family": strategy_family_value(entry.family),
+                "eligibility": bool(algorithm.get(f"{prefix}__eligible")),
+                "regimeCompatibility": algorithm.get(f"{prefix}__regime_compatibility"),
+                "reasonCodeHash": algorithm.get(f"{prefix}__reason_code_hash"),
+            }
+        )
     return {
-        "rsiMeanReversion": {
-            "signal": signal_label(float(algorithm.get("rsi_mean_reversion_signal") or 0)),
-            "confidence": algorithm.get("rsi_mean_reversion_confidence"),
-        },
-        "breakout": {
-            "signal": signal_label(float(algorithm.get("breakout_signal") or 0)),
-            "confidence": algorithm.get("breakout_confidence"),
-        },
-        "macd": {
-            "signal": signal_label(float(algorithm.get("macd_signal") or 0)),
-            "confidence": algorithm.get("macd_confidence"),
-        },
+        "contractSchemaVersion": algorithm.get("contract_schema_version"),
+        "contracts": contracts,
         "weightedScores": {
             "buy": algorithm.get("weighted_buy_score"),
             "sell": algorithm.get("weighted_sell_score"),
@@ -2101,13 +2900,38 @@ def signal_label(value: float) -> str:
 
 
 def market_forecast_artifact_path(symbol: str) -> Path:
+    return FORECAST_ACTIVE_ARTIFACT_DIR / f"{symbol.upper()}.json"
+
+
+def legacy_market_forecast_artifact_path(symbol: str) -> Path:
     return MODEL_ARTIFACT_DIR / f"{MODEL_VERSION}_{symbol.upper()}.json"
+
+
+def market_forecast_candidate_artifact_path(artifact_id: str) -> Path:
+    return FORECAST_CANDIDATE_ARTIFACT_DIR / f"{safe_artifact_id(artifact_id)}.json"
+
+
+def market_forecast_candidate_model_path(artifact_id: str) -> Path:
+    return FORECAST_CANDIDATE_ARTIFACT_DIR / f"{safe_artifact_id(artifact_id)}.xgboost.json"
+
+
+def market_forecast_fold_model_path(artifact_id: str, fold: int) -> Path:
+    return FORECAST_CANDIDATE_ARTIFACT_DIR / f"{safe_artifact_id(artifact_id)}.fold{int(fold)}.xgboost.json"
+
+
+def safe_artifact_id(value: str) -> str:
+    normalized = "".join(character if character.isalnum() or character in {"-", "_", "."} else "_" for character in str(value))
+    return normalized.strip("._") or "market_forecast_candidate"
 
 
 def load_market_forecast_artifact(symbol: str) -> dict[str, Any] | None:
     path = market_forecast_artifact_path(symbol)
     if not path.exists():
         return None
+    return load_market_forecast_artifact_file(path)
+
+
+def load_market_forecast_artifact_file(path: Path) -> dict[str, Any] | None:
     try:
         artifact = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -2126,6 +2950,245 @@ def load_market_forecast_artifact(symbol: str) -> dict[str, Any] | None:
     if not isinstance(artifact.get("weights"), dict) and not isinstance(artifact.get("weightsByClass"), dict):
         return None
     return artifact
+
+
+def load_market_forecast_candidate_artifact(artifact_id: str) -> dict[str, Any] | None:
+    return load_market_forecast_artifact_file(market_forecast_candidate_artifact_path(artifact_id))
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def promote_market_forecast_candidate(
+    artifact_id: str,
+    *,
+    symbol: str,
+    target_state: str = MODEL_STATE_ACTIVE,
+    promoted_by: str = "manual",
+    reason: str = "",
+) -> dict[str, Any]:
+    if target_state != MODEL_STATE_ACTIVE:
+        raise ValueError("Only ACTIVE promotion updates artifacts/active/<SYMBOL>.json")
+    candidate = load_market_forecast_candidate_artifact(artifact_id)
+    if not candidate:
+        raise FileNotFoundError(f"Candidate market forecast artifact not found: {artifact_id}")
+    if str(candidate.get("lifecycleState") or "") not in {
+        MODEL_STATE_TRAINED_CANDIDATE,
+        MODEL_STATE_VALIDATED,
+        MODEL_STATE_SHADOW,
+        MODEL_STATE_PAPER_APPROVED,
+    }:
+        raise ValueError(f"Candidate state cannot be promoted: {candidate.get('lifecycleState')}")
+    gate_report = market_forecast_promotion_validation_gates(candidate)
+    if gate_report["passed"] is not True:
+        failed = ", ".join(gate["id"] for gate in gate_report["gates"] if not gate["passed"])
+        raise ValueError(f"Market forecast candidate cannot become ACTIVE until validation gates pass: {failed}")
+    oos_proof = gate_report["outOfSampleExecutionValueProof"]
+    normalized_symbol = symbol.upper()
+    active_path = market_forecast_artifact_path(normalized_symbol)
+    promoted_at = datetime.now(UTC).isoformat()
+    rollback_path: Path | None = None
+    if active_path.exists():
+        previous = load_market_forecast_artifact_file(active_path)
+        previous_id = safe_artifact_id(str((previous or {}).get("artifactId") or "previous_active"))
+        rollback_path = FORECAST_ACTIVE_HISTORY_DIR / normalized_symbol / f"{promoted_at.replace(':', '').replace('+', '_')}_{previous_id}.json"
+        rollback_payload = {
+            **(previous or {}),
+            "lifecycleState": MODEL_STATE_RETIRED,
+            "retiredAt": promoted_at,
+            "retiredByPromotionArtifactId": artifact_id,
+        }
+        write_json_atomic(rollback_path, rollback_payload)
+    active_payload = {
+        **candidate,
+        "lifecycleState": MODEL_STATE_ACTIVE,
+        "promotionStatus": MODEL_STATE_ACTIVE,
+        "approved": True,
+        "activeSymbol": normalized_symbol,
+        "promotedAt": promoted_at,
+        "promotedBy": promoted_by,
+        "promotionReason": reason,
+        "outOfSampleExecutionValueProof": oos_proof,
+        "promotionValidationGates": gate_report,
+        "sourceCandidatePath": str(market_forecast_candidate_artifact_path(artifact_id)),
+        "rollbackArtifactPath": str(rollback_path) if rollback_path else None,
+    }
+    write_json_atomic(active_path, active_payload)
+    return {
+        "status": "promoted",
+        "artifactId": artifact_id,
+        "symbol": normalized_symbol,
+        "activePath": str(active_path),
+        "rollbackArtifactPath": str(rollback_path) if rollback_path else None,
+        "reversible": rollback_path is not None,
+        "outOfSampleExecutionValueProof": oos_proof,
+        "promotionValidationGates": gate_report,
+    }
+
+
+def market_forecast_promotion_validation_gates(candidate: dict[str, Any]) -> dict[str, Any]:
+    oos_proof = market_forecast_out_of_sample_execution_value_proof(candidate)
+    lifecycle_state = str(candidate.get("lifecycleState") or "")
+    metrics = candidate.get("metrics") or {}
+    final_metrics = metrics.get("finalUntouchedTest") or candidate.get("finalUntouchedTest") or {}
+    threshold_source = str(((candidate.get("optimizationPolicy") or {}).get("thresholdSource") or ""))
+    validation_parity = candidate.get("validationDeploymentParity") or {}
+    walk_forward = candidate.get("walkForwardValidation") or {}
+    calibration = candidate.get("calibration") or {}
+    feature_names = candidate.get("featureNames") or []
+    gates = [
+        promotion_validation_gate(
+            "market_forecast.lifecycle.promotable_state",
+            lifecycle_state in {MODEL_STATE_TRAINED_CANDIDATE, MODEL_STATE_VALIDATED, MODEL_STATE_SHADOW, MODEL_STATE_PAPER_APPROVED},
+            f"Candidate lifecycle state is {lifecycle_state}.",
+        ),
+        promotion_validation_gate(
+            "market_forecast.oos.positive_incremental_net_value",
+            oos_proof.get("passed") is True,
+            f"OOS proof status is {oos_proof.get('status')}; metric {oos_proof.get('metric')}.",
+        ),
+        promotion_validation_gate(
+            "market_forecast.oos.final_holdout_rows_present",
+            int(final_metrics.get("rows") or candidate.get("finalUntouchedTestRows") or 0) > 0,
+            "Final untouched test rows must be present.",
+        ),
+        promotion_validation_gate(
+            "market_forecast.threshold.not_selected_from_final_holdout",
+            threshold_source != "final_untouched_test",
+            f"Threshold source is {threshold_source or 'unspecified'}.",
+        ),
+        promotion_validation_gate(
+            "market_forecast.validation.walk_forward_present",
+            bool(walk_forward.get("summary") or metrics.get("walkForward")),
+            "Walk-forward validation summary must be present.",
+        ),
+        promotion_validation_gate(
+            "market_forecast.validation.deployment_parity_present",
+            bool(validation_parity or candidate.get("trainingModelKind")),
+            "Validation/deployment parity metadata must be present.",
+        ),
+        promotion_validation_gate(
+            "market_forecast.calibration.present",
+            bool(calibration),
+            "Probability calibration metadata must be present.",
+        ),
+        promotion_validation_gate(
+            "market_forecast.features.schema_present",
+            bool(feature_names or candidate.get("featureSchemaHash") or validation_parity.get("featureSchemaHash")),
+            "Feature schema identity must be present.",
+        ),
+    ]
+    passed = all(gate["passed"] for gate in gates)
+    return {
+        "passed": passed,
+        "gateSet": "market_forecast_active_promotion_v1",
+        "checkedAt": utc_now_iso(),
+        "gates": gates,
+        "failedGateIds": [gate["id"] for gate in gates if not gate["passed"]],
+        "outOfSampleExecutionValueProof": oos_proof,
+        "policy": "manual_promotion_is_allowed_only_after_all_validation_gates_pass",
+    }
+
+
+def promotion_validation_gate(gate_id: str, passed: bool, detail: str) -> dict[str, Any]:
+    return {"id": gate_id, "passed": bool(passed), "detail": detail}
+
+
+def market_forecast_out_of_sample_execution_value_proof(artifact: dict[str, Any]) -> dict[str, Any]:
+    explicit = artifact.get("outOfSampleExecutionValueProof")
+    if isinstance(explicit, dict) and explicit.get("metric") == "incremental_realized_net_value_after_execution_costs":
+        return explicit
+    final_metrics = ((artifact.get("metrics") or {}).get("finalUntouchedTest") or artifact.get("finalUntouchedTest") or {})
+    expected_value = final_metrics.get("expectedValue") or {}
+    selected_trades = int(expected_value.get("selectedTrades") or 0)
+    average_selected = numeric(expected_value.get("averageEvSelected"))
+    total_selected = numeric(expected_value.get("totalEvSelected"))
+    rows = int(final_metrics.get("rows") or artifact.get("finalUntouchedTestRows") or 0)
+    passed = (
+        rows > 0
+        and selected_trades >= MIN_MARKET_FORECAST_OOS_SELECTED_TRADES
+        and average_selected > 0
+        and total_selected > 0
+    )
+    reason_codes = []
+    if rows <= 0:
+        reason_codes.append("market_forecast.oos.no_final_untouched_test_rows")
+    if selected_trades < MIN_MARKET_FORECAST_OOS_SELECTED_TRADES:
+        reason_codes.append("market_forecast.oos.no_selected_final_holdout_trades")
+    if average_selected <= 0:
+        reason_codes.append("market_forecast.oos.average_net_value_not_positive")
+    if total_selected <= 0:
+        reason_codes.append("market_forecast.oos.total_net_value_not_positive")
+    return {
+        "status": "passed" if passed else "failed",
+        "passed": passed,
+        "metric": "incremental_realized_net_value_after_execution_costs",
+        "method": "final_untouched_test_report_only",
+        "rows": rows,
+        "selectedTrades": selected_trades,
+        "averageNetValueSelectedRows": round(average_selected, 6),
+        "totalNetValueSelectedRows": round(total_selected, 6),
+        "source": "metrics.finalUntouchedTest.expectedValue",
+        "reasonCodes": tuple(reason_codes or ["market_forecast.oos.positive_after_execution_costs"]),
+    }
+
+
+def rollback_active_market_forecast_artifact(
+    *,
+    symbol: str,
+    rollback_artifact_path: str,
+    rolled_back_by: str = "manual",
+    reason: str = "",
+) -> dict[str, Any]:
+    normalized_symbol = symbol.upper()
+    source = Path(rollback_artifact_path)
+    previous = load_market_forecast_artifact_file(source)
+    if not previous:
+        raise FileNotFoundError(f"Rollback market forecast artifact not found: {rollback_artifact_path}")
+    active_path = market_forecast_artifact_path(normalized_symbol)
+    rolled_back_at = datetime.now(UTC).isoformat()
+    rollback_payload = {
+        **previous,
+        "lifecycleState": MODEL_STATE_ACTIVE,
+        "promotionStatus": MODEL_STATE_ACTIVE,
+        "approved": True,
+        "activeSymbol": normalized_symbol,
+        "rolledBackAt": rolled_back_at,
+        "rolledBackBy": rolled_back_by,
+        "rollbackReason": reason,
+        "rollbackSourcePath": str(source),
+    }
+    write_json_atomic(active_path, rollback_payload)
+    return {
+        "status": "rolled_back",
+        "symbol": normalized_symbol,
+        "activePath": str(active_path),
+        "rollbackSourcePath": str(source),
+    }
+
+
+def is_approved_market_forecast_artifact(artifact: dict[str, Any] | None) -> bool:
+    if not artifact:
+        return False
+    promotion_status = str(artifact.get("promotionStatus") or artifact.get("status") or "").lower()
+    lifecycle_state = str(artifact.get("lifecycleState") or "").upper()
+    return artifact.get("approved") is True and (lifecycle_state == MODEL_STATE_ACTIVE or promotion_status == MODEL_STATE_ACTIVE.lower())
+
+
+def select_approved_forecast_artifact(symbol: str) -> ApprovedForecastArtifact | None:
+    artifact = load_market_forecast_artifact(symbol)
+    if not is_approved_market_forecast_artifact(artifact):
+        return None
+    return ApprovedForecastArtifact(symbol=symbol.upper(), payload=artifact)
+
+
+def load_approved_market_forecast_artifact(symbol: str) -> dict[str, Any] | None:
+    artifact = select_approved_forecast_artifact(symbol)
+    return artifact.payload if artifact else None
 
 
 def flatten_forecast_features(features: dict[str, Any]) -> dict[str, float]:
@@ -2337,7 +3400,9 @@ def model_runtime_status(symbol: str = "SPY") -> dict[str, Any]:
     }
     installed = [name for name, available in libraries.items() if available]
     artifact = load_market_forecast_artifact(symbol)
-    if artifact:
+    approved_artifact = artifact if is_approved_market_forecast_artifact(artifact) else None
+    if approved_artifact:
+        artifact = approved_artifact
         metrics = artifact.get("metrics") or {}
         return {
             "status": "ready",
@@ -2355,22 +3420,39 @@ def model_runtime_status(symbol: str = "SPY") -> dict[str, Any]:
             "installedLibraries": installed,
             "message": "Trained isolated market forecast artifact is available.",
         }
+    if artifact:
+        return {
+            "status": "model_unapproved",
+            "kind": str(artifact.get("modelKind") or "trained-unapproved"),
+            "version": MODEL_VERSION,
+            "trainedAt": artifact.get("trainedAt"),
+            "trainingRows": artifact.get("trainingRows"),
+            "testRows": artifact.get("testRows"),
+            "calibration": (artifact.get("calibration") or {}).get("method"),
+            "uncertaintyMembers": 0,
+            "libraryCandidates": libraries,
+            "installedLibraries": installed,
+            "message": "A trained market forecast artifact exists, but it is not explicitly approved for order authorization.",
+        }
     return {
-        "status": "model_artifact_missing",
-        "kind": "fallback-baseline",
+        "status": "model_unavailable",
+        "kind": HEURISTIC_ESTIMATE_NOT_ML,
         "version": MODEL_VERSION,
         "calibration": None,
-        "uncertaintyMembers": 1,
+        "uncertaintyMembers": 0,
         "libraryCandidates": libraries,
         "installedLibraries": installed,
-        "message": "No trained LightGBM/XGBoost/CatBoost artifact is available yet; using isolated heuristic baseline.",
+        "message": "No approved market forecast model is available; heuristic estimate is UI diagnostics only.",
     }
 
 
 def missing_runtime_inputs(symbol: str = "SPY") -> list[str]:
     missing: list[str] = []
-    if not load_market_forecast_artifact(symbol):
-        missing.insert(0, "trained LightGBM/XGBoost/CatBoost model artifact")
+    artifact = load_market_forecast_artifact(symbol)
+    if not artifact:
+        missing.insert(0, "approved LightGBM/XGBoost/CatBoost model artifact")
+    elif not is_approved_market_forecast_artifact(artifact):
+        missing.insert(0, "explicit market forecast model approval")
     if not any(importlib.util.find_spec(name) is not None for name in ("lightgbm", "xgboost", "catboost")):
         missing.append("LightGBM/XGBoost/CatBoost Python package")
     return missing
