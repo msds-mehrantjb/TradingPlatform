@@ -14,7 +14,7 @@ REGIME_ALGORITHM_ID = "regime"
 REGIME_ALGORITHM_VERSION = "regime_algorithm_v3_backend_authoritative"
 REGIME_SETTINGS_VERSION = "regime_base_settings_v2"
 REGIME_STRATEGY_CATALOG_VERSION = "regime_strategy_catalog_v3_backend"
-REGIME_PROFILE_VERSION = "regime_profile_matrix_v2_backend"
+REGIME_PROFILE_VERSION = "regime_profile_matrix_v3_backend"
 
 RegimeSignal = Literal["Buy", "Sell", "Hold"]
 StrategyRole = Literal["directional", "confirmation", "regime_context", "safety_gate"]

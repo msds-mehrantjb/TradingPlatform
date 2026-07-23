@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from backend.app.algorithms.regime.backtest.engine import run_regime_backtest
@@ -14,11 +15,13 @@ ROOT = Path(__file__).resolve().parents[2]
 def fixture_candles(count: int = 70) -> list[dict[str, float | str]]:
     candles: list[dict[str, float | str]] = []
     price = 100.0
+    start = datetime(2026, 7, 23, 16, 0, tzinfo=UTC)
     for index in range(count):
         price += 0.08
+        timestamp = (start + timedelta(minutes=index)).isoformat().replace("+00:00", "Z")
         candles.append(
             {
-                "timestamp": f"2026-07-18T15:{index % 60:02d}:00Z",
+                "timestamp": timestamp,
                 "open": price - 0.03,
                 "high": price + 0.12,
                 "low": price - 0.12,
@@ -51,7 +54,11 @@ class RegimeBackendAuthoritativeRuntimeTest(unittest.TestCase):
         self.assertEqual(result["decision"]["algorithm_id"], "regime")
         self.assertEqual(result["decision"]["raw_classification"]["raw_regime"] in result["decision"]["confirmed_state"]["confirmed_regime"], True)
         self.assertIsInstance(result["decision"]["strategy_outputs"], list)
-        self.assertGreaterEqual(len(result["decision"]["strategy_outputs"]), 18)
+        self.assertGreaterEqual(len(result["decision"]["strategy_outputs"]), 2)
+        self.assertEqual(
+            {item["strategy_id"] for item in result["decision"]["strategy_outputs"]},
+            {"adx_atr_regime_classifier", "cash_avoid_filter"},
+        )
         self.assertIn(result["decision"]["signal"], {"Buy", "Sell", "Hold"})
         self.assertIn("valid", result["orderValidation"])
 
@@ -68,11 +75,14 @@ class RegimeBackendAuthoritativeRuntimeTest(unittest.TestCase):
     def test_backend_strategy_catalog_has_dedicated_role_inventory(self) -> None:
         inventory = regime_strategy_inventory()
 
-        self.assertEqual(inventory["directionalCount"], 14)
-        self.assertEqual(inventory["confirmationCount"], 2)
-        self.assertEqual(inventory["contextCount"], 2)
-        self.assertEqual(inventory["safetyCount"], 10)
-        self.assertEqual(inventory["aliases"]["bollinger_atr_reversion"], "bollinger_band_mean_reversion")
+        self.assertEqual(inventory["strategyCount"], 2)
+        self.assertEqual(inventory["directionalCount"], 0)
+        self.assertEqual(inventory["confirmationCount"], 0)
+        self.assertEqual(inventory["contextCount"], 1)
+        self.assertEqual(inventory["safetyCount"], 1)
+        self.assertEqual(inventory["moduleInventory"]["regime"][0]["id"], "adx_atr_regime_classifier")
+        self.assertEqual(inventory["moduleInventory"]["safety"][0]["id"], "cash_avoid_filter")
+        self.assertEqual(inventory["aliases"]["adx_trend_strength_regime"], "adx_atr_regime_classifier")
 
     def test_backend_regime_package_does_not_import_frontend_runtime(self) -> None:
         backend_files = list((ROOT / "backend" / "app" / "algorithms" / "regime").rglob("*.py"))

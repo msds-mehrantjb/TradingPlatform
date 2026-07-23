@@ -11,3 +11,14 @@ class LocalGatesTest(unittest.TestCase):
         clear = evaluate_regime_local_gates({"activeStrategyCount": 3, "activeFamilyCount": 2, "winningScore": 0.8, "winningEdge": 0.3, "abstentionRate": 0}, classification(confidence=0.8), None, settings)
         self.assertEqual(clear, ())
 
+    def test_profile_no_entry_and_minimum_net_expected_edge_are_enforced(self):
+        settings = validate_regime_settings({"minimumNetExpectedEdge": 0.35})
+        blocked = evaluate_regime_local_gates(
+            {"activeStrategyCount": 3, "activeFamilyCount": 3, "winningScore": 0.8, "winningEdge": 0.30, "abstentionRate": 0},
+            classification(confidence=0.8),
+            None,
+            {**settings, "noNewEntries": True},
+        )
+
+        self.assertIn("regime.local_gate.profile_no_new_entries", blocked)
+        self.assertIn("regime.local_gate.minimum_net_expected_edge", blocked)

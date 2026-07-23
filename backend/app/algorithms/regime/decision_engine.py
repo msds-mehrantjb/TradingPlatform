@@ -34,7 +34,7 @@ def calculate_regime_decision(
     classification = classify_market_regime(snapshot)
     state = confirm_regime_transition(classification, previous_state, validated_settings)
     effective_profile = resolve_effective_regime_profile(validated_settings, state.confirmed_regime)
-    routing = route_regime_strategies(snapshot, classification)
+    routing = route_regime_strategies(snapshot, classification, effective_profile)
     outputs = routing["outputs"]
     aggregation = aggregate_family_scores(outputs)
     blockers = evaluate_regime_local_gates(aggregation, classification, state, effective_profile)
@@ -65,4 +65,3 @@ def calculate_regime_decision(
 def _decision_id(symbol: str, timestamp: str, regime: str) -> str:
     digest = sha256(f"{symbol}:{timestamp}:{regime}".encode("utf-8")).hexdigest()[:16]
     return f"regime-decision-{digest}"
-

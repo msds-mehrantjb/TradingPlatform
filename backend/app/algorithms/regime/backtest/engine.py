@@ -44,7 +44,7 @@ def run_regime_backtest(payload: dict[str, Any]) -> dict[str, Any]:
         decisions.append(decision_record)
         next_candle = candles[index + 1] if index + 1 < len(candles) else None
         intent = output["orderIntent"]
-        if open_trade is None and next_candle and intent and output["orderValidation"]["valid"]:
+        if open_trade is None and next_candle is not None and intent is not None and output["orderValidation"].get("valid"):
             fill = simulate_next_bar_fill(intent, next_candle)
             if fill["filledQuantity"] > 0:
                 open_trade = {
