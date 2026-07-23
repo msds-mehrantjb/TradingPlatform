@@ -12,24 +12,18 @@ from backend.app.algorithms.voting_ensemble.exit_policy import VotingEnsembleExe
 from backend.app.algorithms.voting_ensemble.profit_target_policy import initial_target_price, profit_target_reason_codes
 from backend.app.algorithms.voting_ensemble.service import VotingEnsembleService
 from backend.app.algorithms.voting_ensemble.stop_loss_policy import initial_stop_price, stop_loss_reason_codes
+from backend.app.algorithms.voting_ensemble.strategies.registry import (
+    VOTING_ENSEMBLE_ACTIVE_CONTEXT_STRATEGIES,
+    VOTING_ENSEMBLE_ACTIVE_DIRECTIONAL_STRATEGIES,
+    VOTING_ENSEMBLE_MODULE_INVENTORY,
+)
 from backend.app.domain.feature_engine import MarketCandle
 from backend.app.domain.models import OrderPlan, Signal
 
 
 VOTING_ENSEMBLE_BACKTEST_VERSION = "voting_ensemble_dedicated_backtest_v1"
-VOTING_ENSEMBLE_DIRECTIONAL_CATALOG = (
-    "Multi-Timeframe Trend Alignment",
-    "First Pullback After Open",
-    "Failed Breakout Strategy",
-    "Liquidity Sweep Reversal",
-    "Bollinger Band Reversion",
-    "ATR Overextension Reversion",
-    "Economic Event Reaction Strategy",
-)
-VOTING_ENSEMBLE_CONTEXT_CATALOG = (
-    "Relative Strength vs QQQ/IWM",
-    "Market Breadth Momentum",
-)
+VOTING_ENSEMBLE_DIRECTIONAL_CATALOG = tuple(entry.strategyName for entry in VOTING_ENSEMBLE_ACTIVE_DIRECTIONAL_STRATEGIES)
+VOTING_ENSEMBLE_CONTEXT_CATALOG = tuple(entry.strategyName for entry in VOTING_ENSEMBLE_ACTIVE_CONTEXT_STRATEGIES)
 
 
 class VotingBacktestService(Protocol):
@@ -139,6 +133,7 @@ class VotingEnsembleBacktestRunner:
             "strategyCatalog": {
                 "directional": list(VOTING_ENSEMBLE_DIRECTIONAL_CATALOG),
                 "context": list(VOTING_ENSEMBLE_CONTEXT_CATALOG),
+                "moduleInventory": VOTING_ENSEMBLE_MODULE_INVENTORY.model_dump(mode="json"),
                 "removedVoters": ["Ensemble Strategy Voting"],
             },
             "dataQuality": self._data_quality(five_minute, fifteen_minute, qqq, iwm, breadth, bool(spy_15m_candles)),
@@ -362,6 +357,7 @@ class VotingEnsembleBacktestRunner:
             "strategyCatalog": {
                 "directional": list(VOTING_ENSEMBLE_DIRECTIONAL_CATALOG),
                 "context": list(VOTING_ENSEMBLE_CONTEXT_CATALOG),
+                "moduleInventory": VOTING_ENSEMBLE_MODULE_INVENTORY.model_dump(mode="json"),
                 "removedVoters": ["Ensemble Strategy Voting"],
             },
             "dataQuality": data_quality,

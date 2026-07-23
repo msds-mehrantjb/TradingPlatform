@@ -84,33 +84,6 @@ DIRECTIONAL_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
         ("spy_1m_candles", "spy_1m_features", "session_vwap"),
     ),
     _entry(
-        "vwap_trend_continuation",
-        "VWAP Trend Continuation",
-        "2.0.0",
-        StrategyFamily.TREND,
-        StrategyRole.DIRECTIONAL,
-        StrategyCollection.DIRECTIONAL,
-        ("spy_1m_candles", "spy_1m_features", "session_vwap", "vwap_slope"),
-    ),
-    _entry(
-        "opening_range_breakout",
-        "Opening Range Breakout",
-        "2.0.0",
-        StrategyFamily.BREAKOUT,
-        StrategyRole.DIRECTIONAL,
-        StrategyCollection.DIRECTIONAL,
-        ("spy_1m_candles", "opening_range", "atr", "spread", "relative_volume"),
-    ),
-    _entry(
-        "volatility_breakout",
-        "Volatility Breakout",
-        "2.0.0",
-        StrategyFamily.BREAKOUT,
-        StrategyRole.DIRECTIONAL,
-        StrategyCollection.DIRECTIONAL,
-        ("spy_1m_candles", "atr", "realized_volatility", "bollinger_width", "spread", "relative_volume"),
-    ),
-    _entry(
         "failed_breakout_reversal",
         "Failed Breakout Reversal",
         "2.0.0",
@@ -129,15 +102,6 @@ DIRECTIONAL_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
         ("spy_1m_candles", "liquidity_levels", "atr", "spread", "activity"),
     ),
     _entry(
-        "vwap_mean_reversion",
-        "VWAP Mean Reversion",
-        "2.0.0",
-        StrategyFamily.MEAN_REVERSION,
-        StrategyRole.DIRECTIONAL,
-        StrategyCollection.DIRECTIONAL,
-        ("spy_1m_candles", "session_vwap", "distance_from_vwap", "adx", "vwap_slope", "volume_behavior"),
-    ),
-    _entry(
         "bollinger_atr_reversion",
         "Bollinger/ATR Reversion",
         "2.0.0",
@@ -146,31 +110,17 @@ DIRECTIONAL_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
         StrategyCollection.DIRECTIONAL,
         ("spy_1m_candles", "bollinger_bands", "atr", "adx", "band_width", "equilibrium_distance"),
     ),
-    _entry(
-        "gap_continuation_gap_fade",
-        "Gap Continuation / Gap Fade",
-        "2.0.0",
-        StrategyFamily.GAP_SESSION,
-        StrategyRole.DIRECTIONAL,
-        StrategyCollection.DIRECTIONAL,
-        ("prior_regular_session_close", "spy_1m_candles", "regular_session_open", "premarket_range", "atr", "initial_volume", "market_context", "event_context"),
-    ),
 )
 
 
 CONTEXT_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
     _entry("relative_strength_qqq_iwm", "Relative Strength vs QQQ/IWM", "2.0.0", StrategyFamily.MARKET_CONTEXT, StrategyRole.CONTEXT, StrategyCollection.CONTEXT, ("spy_candles", "qqq_candles", "iwm_candles")),
     _entry("market_breadth_momentum", "Market Breadth Momentum", "2.0.0", StrategyFamily.MARKET_CONTEXT, StrategyRole.CONTEXT, StrategyCollection.CONTEXT, ("external_breadth_feed_or_proxy_basket", "component_candles", "component_volume", "component_vwap", "component_ema20")),
-    _entry("economic_event_context", "Economic Event Context", "2.0.0", StrategyFamily.MARKET_CONTEXT, StrategyRole.CONTEXT, StrategyCollection.CONTEXT, ("economic_event_state", "session_clock", "spread", "volatility")),
-    _entry("market_structure_context", "Market Structure Context", "2.0.0", StrategyFamily.MARKET_CONTEXT, StrategyRole.CONTEXT, StrategyCollection.CONTEXT, ("spy_1m_candles", "rolling_levels", "market_structure", "atr")),
-    _entry("volume_confirmation", "Volume Confirmation", "2.0.0", StrategyFamily.MARKET_CONTEXT, StrategyRole.CONTEXT, StrategyCollection.CONTEXT, ("spy_1m_candles", "relative_volume", "volume_history")),
-    _entry("vwap_position_context", "VWAP Position Context", "2.0.0", StrategyFamily.MARKET_CONTEXT, StrategyRole.CONTEXT, StrategyCollection.CONTEXT, ("spy_1m_candles", "session_vwap", "distance_from_vwap", "vwap_slope")),
 )
 
 
 REGIME_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
-    _entry("adx_trend_strength_regime", "ADX Trend Strength Regime", "2.0.0", StrategyFamily.MARKET_CONTEXT, StrategyRole.REGIME, StrategyCollection.REGIME, ("spy_1m_candles", "adx", "market_structure", "atr_percentile", "realized_volatility")),
-    _entry("atr_volatility_regime", "ATR Volatility Regime", "2.0.0", StrategyFamily.MARKET_CONTEXT, StrategyRole.REGIME, StrategyCollection.REGIME, ("spy_1m_candles", "atr", "atr_percentile", "realized_volatility", "economic_event_state")),
+    _entry("adx_atr_regime_classifier", "ADX/ATR Regime Classifier", "2.0.0", StrategyFamily.MARKET_CONTEXT, StrategyRole.REGIME, StrategyCollection.REGIME, ("spy_1m_candles", "adx", "atr", "market_structure", "liquidity_state", "session_state", "economic_event_state")),
 )
 
 
@@ -198,12 +148,12 @@ STRATEGY_ALIAS_MAP: dict[str, str] = {
     "Bollinger Band Reversion": "bollinger_atr_reversion",
     "ATR Overextension Reversion": "bollinger_atr_reversion",
     "Bollinger/ATR Reversion": "bollinger_atr_reversion",
-    "Economic Event Reaction Strategy": "economic_event_context",
-    "Economic Event Context": "economic_event_context",
-    "VWAP Position Strategy": "vwap_position_context",
-    "VWAP Position Context": "vwap_position_context",
-    "ADX Trend Strength Filter": "adx_trend_strength_regime",
-    "ADX Trend Strength Regime": "adx_trend_strength_regime",
+    "adx_trend_strength_regime": "adx_atr_regime_classifier",
+    "atr_volatility_regime": "adx_atr_regime_classifier",
+    "ADX Trend Strength Filter": "adx_atr_regime_classifier",
+    "ADX Trend Strength Regime": "adx_atr_regime_classifier",
+    "ATR Volatility Regime": "adx_atr_regime_classifier",
+    "ADX/ATR Regime Classifier": "adx_atr_regime_classifier",
     "Ensemble Strategy Voting": "ensemble_strategy_voting",
 }
 

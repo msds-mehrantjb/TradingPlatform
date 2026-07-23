@@ -15,6 +15,7 @@ from backend.app.algorithms.meta_strategy.versions import META_STRATEGY_STRATEGY
 META_STRATEGY_REGISTRY_VERSION = "meta_strategy_registry_v1"
 META_STRATEGY_STRATEGY_VERSION = "meta_strategy_strategy_v1"
 META_STRATEGY_STRATEGY_PACKAGE = "backend.app.algorithms.meta_strategy.strategies"
+MetaStrategyModuleLifecycleStatus = Literal["active", "shadow", "disabled", "unavailable", "not_data_ready", "deprecated_alias"]
 
 
 class MetaStrategyRole(str, Enum):
@@ -39,6 +40,31 @@ class MetaStrategyDirection(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
     HOLD = "HOLD"
+
+
+class MetaStrategyModuleStatus(MetaStrategyContractModel):
+    id: str = Field(min_length=1)
+    status: MetaStrategyModuleLifecycleStatus
+
+
+class MetaStrategyInventory(MetaStrategyContractModel):
+    algorithm_id: Literal["meta_strategy"] = ALGORITHM_ID
+    directional: tuple[MetaStrategyModuleStatus, ...]
+    context: tuple[MetaStrategyModuleStatus, ...]
+    regime: tuple[MetaStrategyModuleStatus, ...]
+    safety: tuple[MetaStrategyModuleStatus, ...]
+
+    @model_validator(mode="after")
+    def module_ids_are_unique(self) -> MetaStrategyInventory:
+        ids = [
+            module.id
+            for collection in (self.directional, self.context, self.regime, self.safety)
+            for module in collection
+        ]
+        duplicates = tuple(sorted(module_id for module_id in set(ids) if ids.count(module_id) > 1))
+        if duplicates:
+            raise ValueError(f"duplicate Meta-Strategy module ids: {', '.join(duplicates)}")
+        return self
 
 
 class MetaStrategyConfigurationSchema(MetaStrategyContractModel):
@@ -182,41 +208,22 @@ CONTEXT_DIRECTIONS = (MetaStrategyDirection.HOLD,)
 DIRECTIONAL_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (
     _entry("multi_timeframe_trend_alignment", "Multi-Timeframe Trend Alignment", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.TREND, ("candles", "moving_averages", "vwap", "atr", "adx"), 50, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.multi_timeframe_trend_alignment", "MultiTimeframeTrendAlignmentStrategy"),
     _entry("first_pullback_after_open", "First Pullback After Open", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.TREND, ("candles", "session_phase", "vwap", "relative_volume"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.first_pullback_after_open", "FirstPullbackAfterOpenStrategy"),
-    _entry("vwap_trend_continuation", "VWAP Trend Continuation", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.TREND, ("candles", "vwap", "moving_averages", "relative_volume"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.vwap_trend_continuation", "VwapTrendContinuationStrategy"),
-    _entry("opening_range_breakout", "Opening Range Breakout", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.BREAKOUT, ("candles", "atr", "relative_volume", "spread", "liquidity", "openingRangeHigh", "openingRangeLow"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.opening_range_breakout", "OpeningRangeBreakoutStrategy"),
-    _entry("volatility_breakout", "Volatility Breakout", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.BREAKOUT, ("candles", "atr", "bollinger_bands", "relative_volume", "spread"), 50, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.volatility_breakout", "VolatilityBreakoutStrategy"),
     _entry("failed_breakout_reversal", "Failed Breakout Reversal", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.REVERSAL, ("candles", "atr", "spread", "liquidity", "failedBreakoutSide"), 40, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.failed_breakout_reversal", "FailedBreakoutReversalStrategy", aliases=("Failed Breakout Strategy", "Failed Breakout Reversal")),
     _entry("liquidity_sweep_reversal", "Liquidity Sweep Reversal", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.REVERSAL, ("candles", "liquidity", "spread", "volume", "sweepSide"), 40, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.liquidity_sweep_reversal", "LiquiditySweepReversalStrategy"),
-    _entry("vwap_mean_reversion", "VWAP Mean Reversion", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.MEAN_REVERSION, ("candles", "vwap", "adx", "rsi", "volume"), 40, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.vwap_mean_reversion", "VwapMeanReversionStrategy"),
     _entry("bollinger_atr_reversion", "Bollinger/ATR Reversion", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.MEAN_REVERSION, ("candles", "bollinger_bands", "atr", "adx", "rsi"), 50, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.bollinger_atr_reversion", "BollingerAtrReversionStrategy", aliases=("Bollinger Band Reversion", "ATR Overextension Reversion", "Bollinger/ATR Reversion")),
-    _entry("gap_continuation_gap_fade", "Gap Continuation / Gap Fade", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.GAP_SESSION, ("candles", "gap_state", "session_phase", "qqq_iwm_context", "economic_event_state"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.gap_continuation_gap_fade", "GapContinuationGapFadeStrategy"),
 )
 
 CONTEXT_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (
     _entry("relative_strength_qqq_iwm", "Relative Strength vs QQQ/IWM", MetaStrategyRole.CONTEXT, MetaStrategyFamily.MARKET_CONTEXT, ("qqq_iwm_context",), 20, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.context.relative_strength_qqq_iwm", "RelativeStrengthQqqIwmStrategy"),
     _entry("market_breadth_momentum", "Market Breadth Momentum", MetaStrategyRole.CONTEXT, MetaStrategyFamily.MARKET_CONTEXT, ("breadth",), 20, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.context.market_breadth_momentum", "MarketBreadthMomentumStrategy"),
-    _entry("economic_event_context", "Economic Event Context", MetaStrategyRole.CONTEXT, MetaStrategyFamily.MARKET_CONTEXT, ("economic_event_state", "session_phase", "spread"), 0, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.context.economic_event_context", "EconomicEventContextStrategy", aliases=("Economic Event Reaction Strategy", "Economic Event Context")),
-    _entry("market_structure_context", "Market Structure Context", MetaStrategyRole.CONTEXT, MetaStrategyFamily.MARKET_CONTEXT, ("candles", "moving_averages", "atr"), 30, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.context.market_structure_context", "MarketStructureContextStrategy"),
-    _entry("volume_confirmation", "Volume Confirmation", MetaStrategyRole.CONTEXT, MetaStrategyFamily.MARKET_CONTEXT, ("volume", "relative_volume"), 20, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.context.volume_confirmation", "VolumeConfirmationStrategy"),
-    _entry("vwap_position_context", "VWAP Position Context", MetaStrategyRole.CONTEXT, MetaStrategyFamily.MARKET_CONTEXT, ("vwap", "moving_averages"), 20, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.context.vwap_position_context", "VwapPositionContextStrategy", aliases=("VWAP Position Strategy", "VWAP Position Context")),
 )
 
 REGIME_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (
-    _entry("adx_trend_strength_regime", "ADX Trend Strength Regime", MetaStrategyRole.REGIME, MetaStrategyFamily.REGIME, ("adx", "atr", "moving_averages"), 50, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.regime.adx_trend_strength", "AdxTrendStrengthRegimeStrategy", aliases=("ADX Trend Strength Filter", "ADX Trend Strength Regime")),
-    _entry("atr_volatility_regime", "ATR Volatility Regime", MetaStrategyRole.REGIME, MetaStrategyFamily.REGIME, ("atr", "relative_volume", "economic_event_state"), 50, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.regime.atr_volatility_regime", "AtrVolatilityRegimeStrategy"),
+    _entry("adx_atr_regime_classifier", "ADX/ATR Regime Classifier", MetaStrategyRole.REGIME, MetaStrategyFamily.REGIME, ("adx", "atr", "moving_averages", "relative_volume", "economic_event_state"), 50, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.regime.adx_atr_regime_classifier", "AdxAtrRegimeClassifierStrategy", aliases=("ADX Trend Strength Filter", "ADX Trend Strength Regime", "ATR Volatility Regime", "ADX/ATR Regime Classifier")),
 )
 
 SAFETY_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (
     _entry("cash_avoid_trading_filter", "Cash / Avoid Trading Filter", MetaStrategyRole.SAFETY, MetaStrategyFamily.SAFETY, ("cash_available", "avoid_trading"), 0, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.safety.cash_avoid_trading", "CashAvoidTradingFilterStrategy"),
-    _entry("missing_critical_data_filter", "Missing Critical Data", MetaStrategyRole.SAFETY, MetaStrategyFamily.SAFETY, ("critical_data",), 0, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.safety.missing_critical_data", "MissingCriticalDataFilterStrategy"),
-    _entry("stale_market_data_filter", "Stale Market Data", MetaStrategyRole.SAFETY, MetaStrategyFamily.SAFETY, ("source_cutoff_timestamp",), 0, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.safety.stale_market_data", "StaleMarketDataFilterStrategy"),
-    _entry("excessive_spread_filter", "Excessive Spread", MetaStrategyRole.SAFETY, MetaStrategyFamily.SAFETY, ("spread",), 0, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.safety.excessive_spread", "ExcessiveSpreadFilterStrategy"),
-    _entry("insufficient_liquidity_filter", "Insufficient Liquidity", MetaStrategyRole.SAFETY, MetaStrategyFamily.SAFETY, ("liquidity",), 0, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.safety.insufficient_liquidity", "InsufficientLiquidityFilterStrategy"),
-    _entry("extreme_volatility_filter", "Extreme Volatility", MetaStrategyRole.SAFETY, MetaStrategyFamily.SAFETY, ("atr", "relative_volume"), 0, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.safety.extreme_volatility", "ExtremeVolatilityFilterStrategy"),
-    _entry("economic_event_blackout_filter", "Economic Event Blackout", MetaStrategyRole.SAFETY, MetaStrategyFamily.SAFETY, ("economic_event_state",), 0, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.safety.economic_event_blackout", "EconomicEventBlackoutFilterStrategy"),
-    _entry("unsupported_session_filter", "Unsupported Session", MetaStrategyRole.SAFETY, MetaStrategyFamily.SAFETY, ("session_phase",), 0, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.safety.unsupported_session", "UnsupportedSessionFilterStrategy"),
-    _entry("halt_luld_filter", "Halt / LULD", MetaStrategyRole.SAFETY, MetaStrategyFamily.SAFETY, ("halt_luld_state",), 0, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.safety.halt_luld", "HaltLuldFilterStrategy"),
-    _entry("operational_health_filter", "Operational Health", MetaStrategyRole.SAFETY, MetaStrategyFamily.SAFETY, ("operational_health",), 0, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.safety.operational_health", "OperationalHealthFilterStrategy"),
 )
 
 ALL_META_STRATEGY_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (
@@ -224,6 +231,18 @@ ALL_META_STRATEGY_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (
     *CONTEXT_STRATEGIES,
     *REGIME_STRATEGIES,
     *SAFETY_STRATEGIES,
+)
+
+
+def _module_status(entry: MetaStrategyRegistryEntry) -> MetaStrategyModuleStatus:
+    return MetaStrategyModuleStatus(id=entry.strategy_id, status="active" if entry.enabled else "disabled")
+
+
+META_STRATEGY_MODULE_INVENTORY = MetaStrategyInventory(
+    directional=tuple(_module_status(entry) for entry in DIRECTIONAL_STRATEGIES),
+    context=tuple(_module_status(entry) for entry in CONTEXT_STRATEGIES),
+    regime=tuple(_module_status(entry) for entry in REGIME_STRATEGIES),
+    safety=tuple(_module_status(entry) for entry in SAFETY_STRATEGIES),
 )
 
 META_STRATEGY_BY_ID = {entry.strategy_id: entry for entry in ALL_META_STRATEGY_STRATEGIES}
@@ -240,6 +259,7 @@ __all__ = [
     "CONTEXT_STRATEGIES",
     "DIRECTIONAL_STRATEGIES",
     "META_STRATEGY_ALIAS_MAP",
+    "META_STRATEGY_MODULE_INVENTORY",
     "META_STRATEGY_REGISTRY_VERSION",
     "META_STRATEGY_STRATEGY_PACKAGE",
     "META_STRATEGY_STRATEGY_VERSION",
@@ -248,6 +268,9 @@ __all__ = [
     "MetaStrategyConfigurationSchema",
     "MetaStrategyDirection",
     "MetaStrategyFamily",
+    "MetaStrategyInventory",
+    "MetaStrategyModuleLifecycleStatus",
+    "MetaStrategyModuleStatus",
     "MetaStrategyRegistryEntry",
     "MetaStrategyRole",
     "canonical_strategy_id",

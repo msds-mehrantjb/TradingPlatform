@@ -11,7 +11,7 @@ class LiquiditySweepReversalStrategy:
     name = "Liquidity Sweep Reversal"
     family = "reversal"
     version = "wca_liquidity_sweep_reversal_v1"
-    base_weight = 0.09
+    base_weight = 0.25
     configuration = StrategyConfig()
     minimum_data_requirements = ("22 completed regular-session candles", "volume expansion")
     performance_history_identifier = "wca.liquidity_sweep_reversal.performance.v1"

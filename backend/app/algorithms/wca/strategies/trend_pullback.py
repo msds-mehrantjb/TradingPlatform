@@ -11,7 +11,7 @@ class TrendPullbackStrategy:
     name = "Trend Pullback"
     family = "trend"
     version = "wca_trend_pullback_v1"
-    base_weight = 0.09
+    base_weight = 0.25
     configuration = StrategyConfig()
     minimum_data_requirements = ("30 completed regular-session candles",)
     performance_history_identifier = "wca.trend_pullback.performance.v1"

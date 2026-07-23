@@ -45,6 +45,29 @@ from backend.app.domain.models import (
 from backend.app.ensemble import FamilyAwareDeterministicEnsemble
 from backend.app.gates import GLOBAL_GATE_ENGINE_VERSION, GlobalGateEngine, GlobalGateInput
 from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceConfig
+from backend.app.algorithms.meta_strategy.strategy_registry import (
+    CONTEXT_STRATEGIES as META_STRATEGY_CONTEXT_STRATEGIES,
+    DIRECTIONAL_STRATEGIES as META_STRATEGY_DIRECTIONAL_STRATEGIES,
+    REGIME_STRATEGIES as META_STRATEGY_REGIME_STRATEGIES,
+    SAFETY_STRATEGIES as META_STRATEGY_SAFETY_STRATEGIES,
+    MetaStrategyRegistryEntry,
+)
+from backend.app.algorithms.meta_strategy.versions import META_STRATEGY_ALGORITHM_VERSION
+from backend.app.algorithms.regime.strategy_registry import REGIME_STRATEGY_ALIASES, REGIME_STRATEGY_DEFINITIONS
+from backend.app.algorithms.voting_ensemble.strategies.registry import (
+    STRATEGY_ALIAS_MAP as VOTING_ENSEMBLE_ALIAS_MAP,
+    StrategyRegistryEntry as VotingEnsembleStrategyRegistryEntry,
+    VOTING_ENSEMBLE_AGGREGATOR_STRATEGIES,
+    VOTING_ENSEMBLE_CONTEXT_STRATEGIES,
+    VOTING_ENSEMBLE_DIRECTIONAL_STRATEGIES,
+    VOTING_ENSEMBLE_REGIME_STRATEGIES,
+    VOTING_ENSEMBLE_SAFETY_STRATEGIES,
+    resolve_strategy as resolve_voting_ensemble_strategy,
+)
+from backend.app.algorithms.wca.engine import WCA_ENGINE_VERSION
+from backend.app.algorithms.wca.strategy_registry import WCA_HARD_FILTER_REGISTRY, WCA_MODIFIER_REGISTRY, WCA_STRATEGY_REGISTRY
+from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_STRATEGY_CATALOG
+from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_SERVICE_VERSION
 from backend.app.strategies import StrategyEvaluationContext, resolve_strategy
 from backend.app.strategies.context import (
     MarketBreadthMomentumContext,
@@ -54,13 +77,8 @@ from backend.app.strategies.directional import (
     BollingerAtrReversionStrategy,
     FailedBreakoutReversalStrategy,
     FirstPullbackAfterOpenStrategy,
-    GapContinuationFadeStrategy,
     LiquiditySweepReversalStrategy,
     MultiTimeframeTrendAlignmentStrategy,
-    OpeningRangeBreakoutStrategy,
-    VolatilityBreakoutStrategy,
-    VwapMeanReversionStrategy,
-    VwapTrendContinuationStrategy,
 )
 from backend.app.strategies.regime import AdxAtrRegimeClassifier
 from backend.app.trading_policy import DynamicPolicyInputs, DynamicTradingPolicyEngine
@@ -147,6 +165,82 @@ class HistoricalShadowComparisonRequest(BacktestRunRequest):
 
 class PaperShadowEvaluateRequest(ReplayDecisionEvaluateRequest):
     baselineDecision: CurrentBaselineDecision | None = None
+
+
+@router.get("/algorithms/voting-ensemble/inventory")
+def voting_ensemble_inventory() -> dict[str, Any]:
+    return {
+        "algorithmId": "voting_ensemble",
+        "engineVersion": "voting_ensemble_v2",
+        "modules": {
+            "directional": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_DIRECTIONAL_STRATEGIES],
+            "context": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_CONTEXT_STRATEGIES],
+            "regime": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_REGIME_STRATEGIES],
+            "safety": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_SAFETY_STRATEGIES],
+            "aggregator": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_AGGREGATOR_STRATEGIES],
+        },
+    }
+
+
+@router.get("/algorithms/meta-strategy/inventory")
+def meta_strategy_inventory() -> dict[str, Any]:
+    return {
+        "algorithmId": "meta_strategy",
+        "engineVersion": META_STRATEGY_ALGORITHM_VERSION,
+        "modules": {
+            "directional": [_meta_strategy_module_payload(entry) for entry in META_STRATEGY_DIRECTIONAL_STRATEGIES],
+            "context": [_meta_strategy_module_payload(entry) for entry in META_STRATEGY_CONTEXT_STRATEGIES],
+            "regime": [_meta_strategy_module_payload(entry) for entry in META_STRATEGY_REGIME_STRATEGIES],
+            "safety": [_meta_strategy_module_payload(entry) for entry in META_STRATEGY_SAFETY_STRATEGIES],
+            "aggregator": [],
+        },
+    }
+
+
+@router.get("/algorithms/regime/inventory")
+def regime_inventory() -> dict[str, Any]:
+    return {
+        "algorithmId": "regime",
+        "engineVersion": "regime_strategy_catalog_v3_backend",
+        "modules": {
+            "directional": [_regime_module_payload(entry, "directional") for entry in REGIME_STRATEGY_DEFINITIONS if entry.role == "directional"],
+            "context": [_regime_module_payload(entry, "context") for entry in REGIME_STRATEGY_DEFINITIONS if entry.role == "confirmation"],
+            "regime": [_regime_module_payload(entry, "regime") for entry in REGIME_STRATEGY_DEFINITIONS if entry.role == "regime_context"],
+            "safety": [_regime_module_payload(entry, "safety") for entry in REGIME_STRATEGY_DEFINITIONS if entry.role == "safety_gate"],
+            "aggregator": [],
+        },
+    }
+
+
+@router.get("/algorithms/wca/inventory")
+def wca_inventory() -> dict[str, Any]:
+    regime_modifier_ids = {"adx_trend_strength", "atr_volatility_regime"}
+    return {
+        "algorithmId": "wca",
+        "engineVersion": WCA_ENGINE_VERSION,
+        "modules": {
+            "directional": [_wca_module_payload(entry, "directional", entry.slug) for entry in WCA_STRATEGY_REGISTRY],
+            "context": [_wca_module_payload(entry, "context", entry.slug) for entry in WCA_MODIFIER_REGISTRY if entry.slug not in regime_modifier_ids],
+            "regime": [_wca_module_payload(entry, "regime", entry.slug) for entry in WCA_MODIFIER_REGISTRY if entry.slug in regime_modifier_ids],
+            "safety": [_wca_module_payload(entry, "safety", entry.slug) for entry in WCA_HARD_FILTER_REGISTRY],
+            "aggregator": [],
+        },
+    }
+
+
+@router.get("/algorithms/weighted-voting/inventory")
+def weighted_voting_inventory() -> dict[str, Any]:
+    return {
+        "algorithmId": "weighted_voting",
+        "engineVersion": WEIGHTED_VOTING_SERVICE_VERSION,
+        "modules": {
+            "directional": [_weighted_voting_module_payload(entry) for entry in WEIGHTED_VOTING_STRATEGY_CATALOG],
+            "context": [],
+            "regime": [],
+            "safety": [],
+            "aggregator": [],
+        },
+    }
 
 
 @router.post("/features/evaluate")
@@ -411,17 +505,18 @@ def build_directional_strategies(strategy_ids: list[str] | None) -> list[Any]:
     factories = {
         "multi_timeframe_trend_alignment": MultiTimeframeTrendAlignmentStrategy,
         "first_pullback_after_open": FirstPullbackAfterOpenStrategy,
-        "vwap_trend_continuation": VwapTrendContinuationStrategy,
-        "opening_range_breakout": OpeningRangeBreakoutStrategy,
-        "volatility_breakout": VolatilityBreakoutStrategy,
         "failed_breakout_reversal": FailedBreakoutReversalStrategy,
         "liquidity_sweep_reversal": LiquiditySweepReversalStrategy,
-        "vwap_mean_reversion": VwapMeanReversionStrategy,
         "bollinger_atr_reversion": BollingerAtrReversionStrategy,
-        "gap_continuation_gap_fade": GapContinuationFadeStrategy,
     }
     ids = strategy_ids or list(APPROVED_VOTING_ENSEMBLE_DIRECTIONAL_IDS)
-    return [factories[resolve_strategy(strategy_id).strategyId]() for strategy_id in ids]
+    strategies: list[Any] = []
+    for strategy_id in ids:
+        canonical_id = resolve_strategy(strategy_id).strategyId
+        if canonical_id not in factories:
+            raise HTTPException(status_code=400, detail=f"Strategy is not in the production Voting Ensemble inventory: {strategy_id}")
+        strategies.append(factories[canonical_id]())
+    return strategies
 
 
 def pass_gate_decision(checked_at: datetime, session_date: date) -> GlobalGateDecision:
@@ -509,6 +604,107 @@ def envelope(*, endpoint_version: str, payload: dict[str, Any], configuration_ha
         payload=payload,
         explanation=explanation,
     )
+
+
+def _voting_ensemble_module_payload(entry: VotingEnsembleStrategyRegistryEntry) -> dict[str, Any]:
+    return {
+        "id": entry.strategyId,
+        "name": entry.strategyName,
+        "version": entry.strategyVersion,
+        "family": entry.family,
+        "role": entry.role,
+        "collection": _enum_value(entry.collection).lower(),
+        "status": entry.status,
+        "enabled": entry.enabled,
+        "requiredInputs": list(entry.requiredInputs),
+        "evidence": list(entry.evidence),
+        "aliases": _voting_ensemble_alias_metadata(entry.strategyId),
+    }
+
+
+def _voting_ensemble_alias_metadata(target_id: str) -> list[dict[str, Any]]:
+    aliases: list[dict[str, Any]] = []
+    for alias, canonical_id in VOTING_ENSEMBLE_ALIAS_MAP.items():
+        entry = resolve_voting_ensemble_strategy(canonical_id)
+        if entry.strategyId != target_id or alias in {entry.strategyId, entry.strategyName}:
+            continue
+        aliases.append(_alias_metadata(alias, entry.strategyId))
+    return aliases
+
+
+def _meta_strategy_module_payload(entry: MetaStrategyRegistryEntry) -> dict[str, Any]:
+    return {
+        "id": entry.strategy_id,
+        "name": entry.strategy_name,
+        "version": entry.strategy_version,
+        "family": _enum_value(entry.family),
+        "role": _enum_value(entry.role),
+        "collection": _enum_value(entry.role).lower(),
+        "status": "active" if entry.enabled else "shadow",
+        "enabled": entry.enabled,
+        "requiredInputs": list(entry.required_inputs),
+        "minimumWarmup": entry.minimum_warmup,
+        "aliases": [_alias_metadata(alias, entry.strategy_id) for alias in entry.aliases if alias not in {entry.strategy_id, entry.strategy_name}],
+    }
+
+
+def _regime_module_payload(entry: Any, collection: str) -> dict[str, Any]:
+    return {
+        "id": entry.strategy_id,
+        "name": entry.name,
+        "version": "regime_strategy_catalog_v3_backend",
+        "family": entry.family,
+        "role": entry.role,
+        "collection": collection,
+        "status": "active",
+        "enabled": True,
+        "requiredInputs": [],
+        "minimumWarmup": entry.minimum_bars,
+        "aliases": [_alias_metadata(alias, entry.strategy_id) for alias, canonical_id in REGIME_STRATEGY_ALIASES.items() if canonical_id == entry.strategy_id],
+    }
+
+
+def _wca_module_payload(entry: Any, collection: str, module_id: str) -> dict[str, Any]:
+    return {
+        "id": module_id,
+        "name": entry.name,
+        "version": WCA_ENGINE_VERSION,
+        "family": entry.family,
+        "role": _enum_value(entry.role),
+        "collection": collection,
+        "status": "active",
+        "enabled": True,
+        "requiredInputs": [],
+        "aliases": [_alias_metadata(entry.strategy_id, entry.slug)] if collection == "directional" else [],
+    }
+
+
+def _weighted_voting_module_payload(entry: Any) -> dict[str, Any]:
+    return {
+        "id": entry.strategy_id,
+        "name": entry.name,
+        "version": entry.version,
+        "family": _enum_value(entry.family),
+        "role": "DIRECTIONAL",
+        "collection": "directional",
+        "status": "active" if entry.enabled else "shadow",
+        "enabled": entry.enabled,
+        "requiredInputs": list(entry.required_data),
+        "minimumWarmup": entry.minimum_warmup,
+        "aliases": [],
+    }
+
+
+def _alias_metadata(alias: str, canonical_id: str) -> dict[str, Any]:
+    return {
+        "name": alias,
+        "status": "deprecated_alias",
+        "aliasFor": canonical_id,
+    }
+
+
+def _enum_value(value: Any) -> Any:
+    return value.value if hasattr(value, "value") else value
 
 
 def hash_payload(payload: Any) -> str:

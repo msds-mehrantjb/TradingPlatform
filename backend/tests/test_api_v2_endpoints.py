@@ -28,6 +28,115 @@ class ApiV2EndpointsTest(unittest.TestCase):
         self.assertTrue(body["configurationHash"])
         self.assertEqual(body["payload"]["featureSnapshot"]["engineVersion"], "point_in_time_feature_engine_v1")
 
+    def test_voting_ensemble_inventory_endpoint_returns_algorithm_owned_modules(self) -> None:
+        response = self.client.get("/api/v2/algorithms/voting-ensemble/inventory")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["algorithmId"], "voting_ensemble")
+        self.assertEqual(body["engineVersion"], "voting_ensemble_v2")
+        self.assertEqual(set(body["modules"]), {"directional", "context", "regime", "safety", "aggregator"})
+        directional = body["modules"]["directional"]
+        context = body["modules"]["context"]
+        regime = body["modules"]["regime"]
+        safety = body["modules"]["safety"]
+        aggregator = body["modules"]["aggregator"]
+        self.assertEqual(directional[0]["id"], "multi_timeframe_trend_alignment")
+        self.assertEqual(directional[0]["status"], "active")
+        directional_names = {module["name"] for module in directional}
+        directional_ids = {module["id"] for module in directional}
+        self.assertNotIn("Economic Event Reaction Strategy", directional_names)
+        self.assertNotIn("ATR Overextension Reversion", directional_names)
+        self.assertNotIn("opening_range_breakout", directional_ids)
+        self.assertNotIn("vwap_trend_continuation", directional_ids)
+        self.assertNotIn("vwap_mean_reversion", directional_ids)
+        self.assertNotIn("volatility_breakout", directional_ids)
+        self.assertNotIn("gap_continuation_gap_fade", directional_ids)
+        bollinger = next(module for module in directional if module["id"] == "bollinger_atr_reversion")
+        self.assertEqual(bollinger["name"], "Bollinger/ATR Reversion")
+        self.assertEqual({alias["name"] for alias in bollinger["aliases"]}, {"Bollinger Band Reversion", "ATR Overextension Reversion"})
+        self.assertIn("relative_strength_qqq_iwm", {module["id"] for module in context})
+        self.assertIn("market_breadth_momentum", {module["id"] for module in context})
+        self.assertNotIn("economic_event_context", {module["id"] for module in context})
+        self.assertEqual([module["id"] for module in regime], ["adx_atr_regime_classifier"])
+        self.assertEqual(regime[0]["name"], "ADX/ATR Regime Classifier")
+        self.assertEqual(regime[0]["evidence"], ["Trend strength", "Volatility level", "Structure", "Liquidity", "Session", "Event risk"])
+        self.assertEqual([module["id"] for module in safety], ["cash_avoid_trading_filter"])
+        self.assertEqual([module["id"] for module in aggregator], ["ensemble_strategy_voting"])
+        non_aggregators = directional + context + regime + safety
+        self.assertNotIn("ensemble_strategy_voting", {module["id"] for module in non_aggregators})
+
+    def test_algorithm_inventory_endpoints_share_v2_module_shape(self) -> None:
+        allowed_statuses = {"active", "shadow", "disabled", "unavailable", "not_data_ready", "deprecated_alias"}
+        expected = {
+            "meta-strategy": ("meta_strategy", "directional"),
+            "regime": ("regime", "safety"),
+            "wca": ("wca", "context"),
+            "weighted-voting": ("weighted_voting", "directional"),
+        }
+        for path_id, (algorithm_id, populated_group) in expected.items():
+            with self.subTest(path_id=path_id):
+                response = self.client.get(f"/api/v2/algorithms/{path_id}/inventory")
+
+                self.assertEqual(response.status_code, 200, response.text)
+                body = response.json()
+                self.assertEqual(body["algorithmId"], algorithm_id)
+                self.assertTrue(body["engineVersion"])
+                self.assertEqual(set(body["modules"]), {"directional", "context", "regime", "safety", "aggregator"})
+                self.assertGreater(len(body["modules"][populated_group]), 0)
+                first = body["modules"][populated_group][0]
+                self.assertIn(first["status"], allowed_statuses)
+                self.assertIn("id", first)
+                self.assertIn("enabled", first)
+        wca_body = self.client.get("/api/v2/algorithms/wca/inventory").json()
+        wca_directional = wca_body["modules"]["directional"]
+        self.assertNotIn("alias:C1", {module["id"] for module in wca_directional})
+        self.assertNotIn("moving_average_trend", {module["id"] for module in wca_directional})
+        self.assertEqual({module["id"] for module in wca_body["modules"]["context"]}, {"relative_strength_vs_qqq_iwm", "market_breadth"})
+        self.assertEqual({module["id"] for module in wca_body["modules"]["regime"]}, {"adx_trend_strength", "atr_volatility_regime"})
+
+        expected_modules = {
+            "voting-ensemble": {
+                "directional": ["multi_timeframe_trend_alignment", "first_pullback_after_open", "failed_breakout_reversal", "liquidity_sweep_reversal", "bollinger_atr_reversion"],
+                "context": ["relative_strength_qqq_iwm", "market_breadth_momentum"],
+                "regime": ["adx_atr_regime_classifier"],
+                "safety": ["cash_avoid_trading_filter"],
+                "aggregator": ["ensemble_strategy_voting"],
+            },
+            "meta-strategy": {
+                "directional": ["multi_timeframe_trend_alignment", "first_pullback_after_open", "failed_breakout_reversal", "liquidity_sweep_reversal", "bollinger_atr_reversion"],
+                "context": ["relative_strength_qqq_iwm", "market_breadth_momentum"],
+                "regime": ["adx_atr_regime_classifier"],
+                "safety": ["cash_avoid_trading_filter"],
+                "aggregator": [],
+            },
+            "regime": {
+                "directional": [],
+                "context": [],
+                "regime": ["adx_atr_regime_classifier"],
+                "safety": ["cash_avoid_filter"],
+                "aggregator": [],
+            },
+            "wca": {
+                "directional": ["trend_pullback", "bollinger_atr_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal"],
+                "context": ["relative_strength_vs_qqq_iwm", "market_breadth"],
+                "regime": ["adx_trend_strength", "atr_volatility_regime"],
+                "safety": ["cash_avoid_trading"],
+                "aggregator": [],
+            },
+            "weighted-voting": {
+                "directional": ["S2", "S5", "S6", "S7"],
+                "context": [],
+                "regime": [],
+                "safety": [],
+                "aggregator": [],
+            },
+        }
+        for path_id, expected in expected_modules.items():
+            with self.subTest(path_id=path_id, exact_modules=True):
+                modules = self.client.get(f"/api/v2/algorithms/{path_id}/inventory").json()["modules"]
+                self.assertEqual({group: [module["id"] for module in rows] for group, rows in modules.items()}, expected)
+
     def test_paper_decision_endpoint_runs_complete_sequence_without_submission(self) -> None:
         payload = paper_decision_request(candles(24))
 

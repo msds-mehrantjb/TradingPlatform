@@ -1890,11 +1890,60 @@ select {
 }
 
 .algo-vote-card strong {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
   color: #06162f;
   font-size: 12px;
   font-weight: 900;
   line-height: 1.2;
+}
+
+.module-status-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  padding: 2px 6px;
+  background: #f8fafc;
+  color: #334155;
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.module-status-badge[data-module-status="active"] {
+  border-color: #86efac;
+  background: #f0fdf4;
+  color: #166534;
+}
+
+.module-status-badge[data-module-status="shadow"] {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.module-status-badge[data-module-status="disabled"],
+.module-status-badge[data-module-status="unavailable"] {
+  border-color: #fecdd3;
+  background: #fff1f2;
+  color: #be123c;
+}
+
+.module-status-badge[data-module-status="not_data_ready"] {
+  border-color: #fed7aa;
+  background: #fff7ed;
+  color: #c2410c;
+}
+
+.module-status-badge[data-module-status="deprecated_alias"] {
+  border-color: #d8b4fe;
+  background: #faf5ff;
+  color: #7e22ce;
 }
 
 .algo-vote-card span {
@@ -4826,6 +4875,10 @@ select {
 
 .strategy-main strong {
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
   color: #111827;
   font-size: 11px;
   line-height: 1.2;

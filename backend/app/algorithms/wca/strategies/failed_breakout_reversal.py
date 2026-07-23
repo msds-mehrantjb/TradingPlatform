@@ -11,7 +11,7 @@ class FailedBreakoutReversalStrategy:
     name = "Failed Breakout Reversal"
     family = "reversal"
     version = "wca_failed_breakout_reversal_v1"
-    base_weight = 0.09
+    base_weight = 0.25
     configuration = StrategyConfig()
     minimum_data_requirements = ("22 completed regular-session candles",)
     performance_history_identifier = "wca.failed_breakout_reversal.performance.v1"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from backend.app.algorithms.wca.contracts import WcaMarketSnapshot, WcaStrategyEvaluation
 
@@ -36,6 +36,23 @@ class WcaCatalogRole(str, Enum):
     HARD_FILTER = "hard_filter"
 
 
+WcaModuleLifecycleStatus = Literal["active", "shadow", "disabled", "unavailable", "not_data_ready", "deprecated_alias"]
+
+
+@dataclass(frozen=True)
+class WcaModuleStatus:
+    id: str
+    status: WcaModuleLifecycleStatus
+
+
+@dataclass(frozen=True)
+class WcaModuleInventory:
+    algorithm_id: str
+    primary_voters: tuple[WcaModuleStatus, ...]
+    modifiers: tuple[WcaModuleStatus, ...]
+    hard_filters: tuple[WcaModuleStatus, ...]
+
+
 @dataclass(frozen=True)
 class WcaStrategyDefinition:
     strategy_id: str
@@ -63,44 +80,58 @@ class WcaHardFilterDefinition:
 
 
 WCA_STRATEGY_REGISTRY: tuple[WcaStrategyDefinition, ...] = (
-    WcaStrategyDefinition("C1", "moving_average_trend", "Moving Average Trend", "trend", 0.10),
-    WcaStrategyDefinition("C2", "trend_pullback", "Trend Pullback", "trend", 0.09),
-    WcaStrategyDefinition("C3", "vwap_trend_continuation", "VWAP Trend Continuation", "trend", 0.09),
-    WcaStrategyDefinition("C4", "vwap_mean_reversion", "VWAP Mean Reversion", "mean_reversion", 0.08),
-    WcaStrategyDefinition("C5", "rsi_mean_reversion", "RSI Mean Reversion", "mean_reversion", 0.08),
-    WcaStrategyDefinition("C6", "bollinger_atr_reversion", "Bollinger/ATR Reversion", "mean_reversion", 0.08),
-    WcaStrategyDefinition("C7", "opening_range_breakout", "Opening Range Breakout", "breakout", 0.10),
-    WcaStrategyDefinition("C8", "intraday_volatility_breakout", "Intraday/Volatility Breakout", "breakout", 0.10),
-    WcaStrategyDefinition("C9", "failed_breakout_reversal", "Failed Breakout Reversal", "reversal", 0.09),
-    WcaStrategyDefinition("C10", "liquidity_sweep_reversal", "Liquidity Sweep Reversal", "reversal", 0.09),
-    WcaStrategyDefinition("C11", "gap_continuation_fade", "Gap Continuation/Fade", "event", 0.10),
+    WcaStrategyDefinition("C2", "trend_pullback", "First Pullback After Open", "trend", 0.25),
+    WcaStrategyDefinition("C6", "bollinger_atr_reversion", "Bollinger/ATR Reversion", "mean_reversion", 0.25),
+    WcaStrategyDefinition("C9", "failed_breakout_reversal", "Failed Breakout Reversal", "reversal", 0.25),
+    WcaStrategyDefinition("C10", "liquidity_sweep_reversal", "Liquidity Sweep Reversal", "reversal", 0.25),
 )
 
 WCA_MODIFIER_REGISTRY: tuple[WcaModifierDefinition, ...] = (
-    WcaModifierDefinition("vwap_position", "VWAP Position", "vwap"),
-    WcaModifierDefinition("volume_confirmation", "Volume Confirmation", "volume"),
-    WcaModifierDefinition("macd_momentum", "MACD Momentum", "momentum"),
-    WcaModifierDefinition("market_structure", "Market Structure", "structure"),
     WcaModifierDefinition("adx_trend_strength", "ADX Trend Strength", "trend"),
     WcaModifierDefinition("atr_volatility_regime", "ATR Volatility Regime", "volatility"),
-    WcaModifierDefinition("multi_timeframe_trend_alignment", "Multi-Timeframe Trend Alignment", "trend"),
     WcaModifierDefinition("relative_strength_vs_qqq_iwm", "Relative Strength vs QQQ/IWM", "relative_strength"),
     WcaModifierDefinition("market_breadth", "Market Breadth", "breadth"),
-    WcaModifierDefinition("session_phase", "Session Phase", "session"),
-    WcaModifierDefinition("spread_liquidity", "Spread/Liquidity", "liquidity"),
 )
 
 WCA_HARD_FILTER_REGISTRY: tuple[WcaHardFilterDefinition, ...] = (
     WcaHardFilterDefinition("cash_avoid_trading", "Cash/Avoid Trading"),
-    WcaHardFilterDefinition("economic_event_risk", "Economic Event Risk"),
-    WcaHardFilterDefinition("invalid_or_stale_data", "Invalid or Stale Data"),
-    WcaHardFilterDefinition("unsafe_spread", "Unsafe Spread"),
-    WcaHardFilterDefinition("unsafe_liquidity", "Unsafe Liquidity"),
-    WcaHardFilterDefinition("extreme_volatility", "Extreme Volatility"),
-    WcaHardFilterDefinition("session_entry_block", "Session Entry Block"),
 )
 
 WCA_PRIMARY_VOTER_SLUGS = frozenset(strategy.slug for strategy in WCA_STRATEGY_REGISTRY)
 WCA_STRATEGY_IDS = frozenset(strategy.strategy_id for strategy in WCA_STRATEGY_REGISTRY)
 WCA_MODIFIER_SLUGS = frozenset(modifier.slug for modifier in WCA_MODIFIER_REGISTRY)
 WCA_HARD_FILTER_SLUGS = frozenset(hard_filter.slug for hard_filter in WCA_HARD_FILTER_REGISTRY)
+
+
+WCA_MODULE_INVENTORY = WcaModuleInventory(
+    algorithm_id="wca",
+    primary_voters=tuple(WcaModuleStatus(id=strategy.slug, status="active") for strategy in WCA_STRATEGY_REGISTRY),
+    modifiers=tuple(WcaModuleStatus(id=modifier.slug, status="active") for modifier in WCA_MODIFIER_REGISTRY),
+    hard_filters=tuple(WcaModuleStatus(id=hard_filter.slug, status="active") for hard_filter in WCA_HARD_FILTER_REGISTRY),
+)
+
+
+def wca_module_inventory() -> WcaModuleInventory:
+    return WCA_MODULE_INVENTORY
+
+
+__all__ = [
+    "StrategyConfig",
+    "WCA_HARD_FILTER_REGISTRY",
+    "WCA_HARD_FILTER_SLUGS",
+    "WCA_MODIFIER_REGISTRY",
+    "WCA_MODIFIER_SLUGS",
+    "WCA_MODULE_INVENTORY",
+    "WCA_PRIMARY_VOTER_SLUGS",
+    "WCA_STRATEGY_IDS",
+    "WCA_STRATEGY_REGISTRY",
+    "WcaCatalogRole",
+    "WcaHardFilterDefinition",
+    "WcaModifierDefinition",
+    "WcaModuleInventory",
+    "WcaModuleLifecycleStatus",
+    "WcaModuleStatus",
+    "WcaStrategy",
+    "WcaStrategyDefinition",
+    "wca_module_inventory",
+]

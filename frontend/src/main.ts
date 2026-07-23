@@ -1,5 +1,5 @@
 ﻿import "./styles.css";
-import { API_BASE, BACKTEST_API_CANDIDATES } from "./api/client";
+import { API_BASE, BACKTEST_API_CANDIDATES, TRADING_ALGORITHM_INVENTORY_ENDPOINTS } from "./api/client";
 import { directionalSignal, isEligibleStrategyVote, winningVoteSignal } from "./domain/tradingSignals";
 import type { RegimeBacktestResult } from "./features/regime/types";
 import { evaluateRegimeOnBackend, runRegimeBacktestOnBackend } from "./features/regime/api";
@@ -385,6 +385,7 @@ type AlgoVote = {
   signal: AlgoSignal;
   detail: string;
   status?: StrategyFit["status"];
+  moduleStatus?: VotingEnsembleInventoryStatus;
   score?: number;
 };
 
@@ -444,24 +445,46 @@ type ConfidenceStrategy = {
   signal: (market: ConfidenceMarket) => ConfidenceStrategyRawSignal;
 };
 
-type MetaStrategyRole = "directional" | "context" | "meta_safety";
+type MetaStrategyRole = "directional" | "context" | "regime" | "safety" | "meta_safety";
 type MetaStrategyFamily =
   | "trend"
   | "breakout"
   | "mean_reversion"
   | "reversal"
-  | "volume_confirmation"
   | "market_regime"
-  | "vwap"
-  | "event"
   | "safety";
 
 type MetaStrategyDefinition = {
   name: string;
   role: MetaStrategyRole;
   family: MetaStrategyFamily;
-  source: "ensemble" | "confidence" | "alias";
+  source: "ensemble" | "confidence" | "alias" | "backend";
+  moduleStatus: VotingEnsembleInventoryStatus;
+  evidence: string[];
   alias?: string;
+};
+
+type VotingEnsembleInventoryStatus = "active" | "shadow" | "disabled" | "unavailable" | "not_data_ready" | "deprecated_alias";
+type VotingEnsembleInventoryCollection = "directional" | "context" | "regime" | "safety" | "aggregator";
+
+type VotingEnsembleInventoryModule = {
+  id: string;
+  name: string;
+  version: string;
+  family: string;
+  role: string;
+  collection: VotingEnsembleInventoryCollection;
+  status: VotingEnsembleInventoryStatus;
+  enabled: boolean;
+  requiredInputs: string[];
+  evidence: string[];
+  aliases: Array<{ name: string; status: "deprecated_alias"; aliasFor: string }>;
+};
+
+type VotingEnsembleInventoryResponse = {
+  algorithmId: string;
+  engineVersion: string;
+  modules: Record<VotingEnsembleInventoryCollection, VotingEnsembleInventoryModule[]>;
 };
 
 type ConfidenceStrategySignal = "buy" | "sell" | "hold";
@@ -829,6 +852,7 @@ type MetaStrategyFeature = {
   name: string;
   role: MetaStrategyRole;
   family: MetaStrategyFamily;
+  moduleStatus?: VotingEnsembleInventoryStatus;
   signal: ConfidenceStrategySignal;
   confidence: number;
   direction: ConfidenceStrategyDirection;
@@ -2135,6 +2159,7 @@ type StrategyFit = {
   role?: MetaStrategyRole;
   family?: MetaStrategyFamily | "uncategorized";
   strategy_family?: MetaStrategyFamily | "uncategorized";
+  moduleStatus?: VotingEnsembleInventoryStatus;
   status: "Strong Fit" | "Allowed" | "Watch" | "Avoid";
   score: number;
   matches: string[];
@@ -2775,86 +2800,47 @@ const fallbackTradeSummary: TradeSummaryResponse = {
 };
 
 const weightedAlphaStrategies: WeightedAlphaStrategy[] = [
-  { key: "S1", name: "Opening Range Breakout", family: "breakout" },
   { key: "S2", name: "First Pullback After Open", family: "trend" },
-  { key: "S3", name: "VWAP Trend Continuation", family: "trend" },
-  { key: "S4", name: "VWAP Mean Reversion", family: "mean_reversion" },
   { key: "S5", name: "Failed Breakout Reversal", family: "reversal" },
   { key: "S6", name: "Liquidity Sweep Reversal", family: "reversal" },
   { key: "S7", name: "Bollinger/ATR Reversion", family: "mean_reversion" },
-  { key: "S8", name: "Volatility Breakout", family: "breakout" },
 ];
 
 const confidenceBaseWeights = {
-  moving_average_trend: 0.11,
-  vwap_position: 0.11,
-  trend_pullback: 0.1,
-  rsi_mean_reversion: 0.07,
-  bollinger_band_mean_reversion: 0.07,
-  opening_range_breakout: 0.1,
-  intraday_breakout: 0.1,
-  macd_momentum: 0.08,
-  market_structure: 0.12,
-  gap_continuation_fade: 0.06,
-  volume_confirmation: 0.08,
+  trend_pullback: 0.25,
+  bollinger_band_mean_reversion: 0.25,
+  failed_breakout_reversal: 0.25,
+  liquidity_sweep_reversal: 0.25,
 } satisfies Record<string, number>;
 
 const confidenceAggregationStrategies: ConfidenceStrategy[] = [
-  { key: "C1", slug: "moving_average_trend", name: "Moving Average Trend", baseWeight: confidenceBaseWeights.moving_average_trend, signal: confidenceMovingAverageTrend },
-  { key: "C2", slug: "vwap_position", name: "VWAP Position Strategy", baseWeight: confidenceBaseWeights.vwap_position, signal: confidenceVwapPosition },
-  { key: "C3", slug: "trend_pullback", name: "Trend Pullback Strategy", baseWeight: confidenceBaseWeights.trend_pullback, signal: confidenceTrendPullback },
-  { key: "C4", slug: "rsi_mean_reversion", name: "RSI Mean Reversion", baseWeight: confidenceBaseWeights.rsi_mean_reversion, signal: confidenceRsiMeanReversion },
-  { key: "C5", slug: "bollinger_band_mean_reversion", name: "Bollinger Band Mean Reversion", baseWeight: confidenceBaseWeights.bollinger_band_mean_reversion, signal: confidenceBollingerMeanReversion },
-  { key: "C6", slug: "opening_range_breakout", name: "Opening Range Breakout", baseWeight: confidenceBaseWeights.opening_range_breakout, signal: confidenceOpeningRangeBreakout },
-  { key: "C7", slug: "intraday_breakout", name: "Intraday Breakout Strategy", baseWeight: confidenceBaseWeights.intraday_breakout, signal: confidenceIntradayBreakout },
-  { key: "C8", slug: "macd_momentum", name: "MACD Momentum", baseWeight: confidenceBaseWeights.macd_momentum, signal: confidenceMacdMomentum },
-  { key: "C9", slug: "market_structure", name: "Market Structure Strategy", baseWeight: confidenceBaseWeights.market_structure, signal: confidenceMarketStructure },
-  { key: "C10", slug: "gap_continuation_fade", name: "Gap Continuation / Gap Fade", baseWeight: confidenceBaseWeights.gap_continuation_fade, signal: confidenceGapContinuationFade },
-  { key: "C11", slug: "volume_confirmation", name: "Volume Confirmation", baseWeight: confidenceBaseWeights.volume_confirmation, signal: confidenceVolumeConfirmation },
+  { key: "C1", slug: "trend_pullback", name: "First Pullback After Open", baseWeight: confidenceBaseWeights.trend_pullback, signal: confidenceTrendPullback },
+  { key: "C2", slug: "failed_breakout_reversal", name: "Failed Breakout Reversal", baseWeight: confidenceBaseWeights.failed_breakout_reversal, signal: confidenceFailedBreakoutReversal },
+  { key: "C3", slug: "liquidity_sweep_reversal", name: "Liquidity Sweep Reversal", baseWeight: confidenceBaseWeights.liquidity_sweep_reversal, signal: confidenceLiquiditySweepReversal },
+  { key: "C4", slug: "bollinger_band_mean_reversion", name: "Bollinger/ATR Reversion", baseWeight: confidenceBaseWeights.bollinger_band_mean_reversion, signal: confidenceBollingerMeanReversion },
 ];
 
 const regimeSelectionStrategies: ConfidenceStrategy[] = [
   ...confidenceAggregationStrategies,
-  { key: "R1", slug: "vwap_trend_continuation", name: "VWAP Trend Continuation", baseWeight: 0.1, signal: confidenceVwapTrendContinuation },
-  { key: "R2", slug: "vwap_mean_reversion", name: "VWAP Mean Reversion", baseWeight: 0.09, signal: confidenceVwapMeanReversion },
-  { key: "R3", slug: "failed_breakout_reversal", name: "Failed Breakout Reversal", baseWeight: 0.08, signal: confidenceFailedBreakoutReversal },
-  { key: "R4", slug: "liquidity_sweep_reversal", name: "Liquidity Sweep Reversal", baseWeight: 0.08, signal: confidenceLiquiditySweepReversal },
-  { key: "R5", slug: "adx_trend_strength", name: "ADX Trend Strength Filter", baseWeight: 0.08, signal: confidenceAdxTrendStrength },
-  { key: "R6", slug: "atr_volatility_regime", name: "ATR Volatility Regime", baseWeight: 0.07, signal: confidenceAtrVolatilityRegime },
-  { key: "R7", slug: "volatility_breakout", name: "Volatility Breakout", baseWeight: 0.08, signal: confidenceVolatilityBreakout },
+  { key: "R5", slug: "adx_atr_regime_classifier", name: "ADX/ATR Regime Classifier", baseWeight: 0.08, signal: confidenceAdxTrendStrength },
   { key: "R8", slug: "cash_avoid_filter", name: "Cash / Avoid Trading Filter", baseWeight: 0.04, signal: confidenceCashAvoidFilter },
 ];
 
-const metaStrategyCatalog: MetaStrategyDefinition[] = [
-  { name: "Multi-Timeframe Trend Alignment", role: "directional", family: "trend", source: "ensemble" },
-  { name: "First Pullback After Open", role: "directional", family: "trend", source: "ensemble" },
-  { name: "Failed Breakout Strategy", role: "directional", family: "reversal", source: "ensemble" },
-  { name: "Liquidity Sweep Reversal", role: "directional", family: "reversal", source: "ensemble" },
-  { name: "Bollinger Band Reversion", role: "directional", family: "mean_reversion", source: "alias", alias: "Bollinger Band Mean Reversion" },
-  { name: "ATR Overextension Reversion", role: "directional", family: "mean_reversion", source: "ensemble" },
-  { name: "Moving Average Trend", role: "directional", family: "trend", source: "confidence" },
-  { name: "Trend Pullback Strategy", role: "directional", family: "trend", source: "confidence" },
-  { name: "RSI Mean Reversion", role: "directional", family: "mean_reversion", source: "confidence" },
-  { name: "Bollinger Band Mean Reversion", role: "directional", family: "mean_reversion", source: "confidence" },
-  { name: "Opening Range Breakout", role: "directional", family: "breakout", source: "confidence" },
-  { name: "Intraday Breakout Strategy", role: "directional", family: "breakout", source: "confidence" },
-  { name: "MACD Momentum", role: "directional", family: "trend", source: "confidence" },
-  { name: "Market Structure Strategy", role: "directional", family: "trend", source: "confidence" },
-  { name: "Gap Continuation / Gap Fade", role: "directional", family: "event", source: "confidence" },
-  { name: "VWAP Trend Continuation", role: "directional", family: "vwap", source: "confidence" },
-  { name: "VWAP Mean Reversion", role: "directional", family: "mean_reversion", source: "confidence" },
-  { name: "Failed Breakout Reversal", role: "directional", family: "reversal", source: "confidence" },
-  { name: "Bollinger/ATR Reversion", role: "directional", family: "mean_reversion", source: "alias", alias: "Bollinger Band Mean Reversion" },
-  { name: "Volatility Breakout", role: "directional", family: "breakout", source: "confidence" },
-  { name: "Relative Strength vs QQQ/IWM", role: "context", family: "market_regime", source: "ensemble" },
-  { name: "Market Breadth Momentum", role: "context", family: "market_regime", source: "ensemble" },
-  { name: "Economic Event Reaction Strategy", role: "context", family: "event", source: "ensemble" },
-  { name: "VWAP Position Strategy", role: "context", family: "vwap", source: "confidence" },
-  { name: "Volume Confirmation", role: "context", family: "volume_confirmation", source: "confidence" },
-  { name: "ADX Trend Strength Filter", role: "context", family: "market_regime", source: "confidence" },
-  { name: "ATR Volatility Regime", role: "context", family: "market_regime", source: "confidence" },
-  { name: "Cash / Avoid Trading Filter", role: "meta_safety", family: "safety", source: "confidence" },
-];
+function emptyVotingEnsembleInventory(): VotingEnsembleInventoryResponse {
+  return {
+    algorithmId: "voting_ensemble",
+    engineVersion: "voting_ensemble_v2",
+    modules: {
+      directional: [],
+      context: [],
+      regime: [],
+      safety: [],
+      aggregator: [],
+    },
+  };
+}
+
+const votingEnsembleInventoryCollections = ["directional", "context", "regime", "safety", "aggregator"] as const;
 
 const weightedRelativeStrengthSymbols = ["QQQ", "IWM"];
 const weightedSectorEtfSymbols = ["XLK", "XLF", "XLV", "XLY", "XLP", "XLI", "XLE", "XLU", "XLB", "XLRE", "XLC"];
@@ -2902,6 +2888,9 @@ const state = {
   votingEnsembleBackendStatus: "idle" as "idle" | "loading" | "ready" | "error",
   votingEnsembleBackendWarning: "",
   votingEnsembleBackendKey: "",
+  votingEnsembleInventory: emptyVotingEnsembleInventory(),
+  votingEnsembleInventoryStatus: "idle" as "idle" | "loading" | "ready" | "error",
+  votingEnsembleInventoryWarning: "",
   algoIntradayTradesExpanded:
     persistedUiState.algoIntradayTradesExpanded ?? ["1Min", "5Min"].includes(visibleAlgoBacktestTimeframe(persistedUiState.algoBacktestTimeframe)),
   algoVotesExpanded: persistedUiState.algoVotesExpanded ?? false,
@@ -9838,7 +9827,7 @@ function decisionEvidence(mode: TradingWindowMode, order: ManualOrderRecommendat
     const result = metaStrategyPresentationResult();
     return {
       winner: result.signal,
-      confidence: `${result.decisionLabel} net ${result.netScore.toFixed(2)}, edge ${result.edge.toFixed(2)}, active ${result.activeDirectionalCount}/${metaStrategyCatalog.length}`,
+      confidence: `${result.decisionLabel} net ${result.netScore.toFixed(2)}, edge ${result.edge.toFixed(2)}, active ${result.activeDirectionalCount}/${votingEnsembleMetaStrategyDefinitions().length}`,
       strategies: result.strategies
         .filter((strategy) => strategy.signal !== "hold")
         .slice(0, 6)
@@ -11942,7 +11931,7 @@ function confidenceAdxWeightMultiplier(strategy: ConfidenceStrategy, signal: Con
   const againstTrend = trendDirection !== 0 && signalDirection === -trendDirection;
 
   if (market.adx.regime === "range") {
-    return family === "mean_reversion" ? 1.25 : family === "vwap" ? 1.1 : family === "trend" || family === "breakout" ? 0.7 : 1;
+    return family === "mean_reversion" || family === "reversal" ? 1.25 : family === "trend" ? 0.7 : 1;
   }
   if (market.adx.regime === "mixed") {
     return 1;
@@ -11951,31 +11940,25 @@ function confidenceAdxWeightMultiplier(strategy: ConfidenceStrategy, signal: Con
     if (family === "trend") {
       return veryStrongTrend ? (againstTrend ? 0.5 : alignedWithTrend ? 1.35 : 1.15) : againstTrend ? 0.65 : alignedWithTrend ? 1.25 : 1.1;
     }
-    if (family === "breakout") {
-      return veryStrongTrend ? (againstTrend ? 0.55 : alignedWithTrend ? 1.25 : 1.1) : againstTrend ? 0.7 : alignedWithTrend ? 1.2 : 1.05;
-    }
     if (family === "mean_reversion") {
       return veryStrongTrend ? (againstTrend ? 0.5 : 0.65) : againstTrend ? 0.65 : 0.8;
     }
-    if (family === "vwap") {
-      return veryStrongTrend ? 1.2 : 1.15;
+    if (family === "reversal") {
+      return againstTrend ? 1.1 : 0.8;
     }
   }
   return 1;
 }
 
-function confidenceStrategyFamily(slug: string): "trend" | "breakout" | "mean_reversion" | "vwap" | "filter" {
-  if (["moving_average_trend", "trend_pullback", "macd_momentum", "market_structure", "vwap_trend_continuation"].includes(slug)) {
+function confidenceStrategyFamily(slug: string): "trend" | "mean_reversion" | "reversal" | "filter" {
+  if (["trend_pullback"].includes(slug)) {
     return "trend";
   }
-  if (["opening_range_breakout", "intraday_breakout", "volatility_breakout"].includes(slug)) {
-    return "breakout";
-  }
-  if (["rsi_mean_reversion", "bollinger_band_mean_reversion", "vwap_mean_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal"].includes(slug)) {
+  if (["bollinger_band_mean_reversion"].includes(slug)) {
     return "mean_reversion";
   }
-  if (["vwap_position", "gap_continuation_fade"].includes(slug)) {
-    return "vwap";
+  if (["failed_breakout_reversal", "liquidity_sweep_reversal"].includes(slug)) {
+    return "reversal";
   }
   return "filter";
 }
@@ -11983,10 +11966,10 @@ function confidenceStrategyFamily(slug: string): "trend" | "breakout" | "mean_re
 function confidenceAtrWeightMultiplier(strategy: ConfidenceStrategy, market: ConfidenceMarket) {
   const family = confidenceStrategyFamily(strategy.slug);
   if (market.atr.regime === "too_low") {
-    return family === "breakout" || family === "trend" ? 0.65 : family === "mean_reversion" ? 0.95 : 0.85;
+    return family === "trend" ? 0.65 : family === "mean_reversion" ? 0.95 : 0.85;
   }
   if (market.atr.regime === "high") {
-    return family === "breakout" || ["failed_breakout_reversal", "liquidity_sweep_reversal"].includes(strategy.slug) ? 1.05 : 0.85;
+    return family === "reversal" ? 1.05 : 0.85;
   }
   if (market.atr.regime === "extreme") {
     return 0.35;
@@ -11996,10 +11979,7 @@ function confidenceAtrWeightMultiplier(strategy: ConfidenceStrategy, market: Con
 
 function confidenceVolumeWeightMultiplier(strategy: ConfidenceStrategy, market: ConfidenceMarket) {
   const family = confidenceStrategyFamily(strategy.slug);
-  if (family === "breakout" && (market.volume.weakVolume || market.volume.smallCandle)) {
-    return 0.55;
-  }
-  if ((family === "breakout" || family === "trend") && market.volume.volumeSpike && !market.volume.smallCandle) {
+  if (family === "trend" && market.volume.volumeSpike && !market.volume.smallCandle) {
     return 1.08;
   }
   return 1;
@@ -12008,10 +11988,10 @@ function confidenceVolumeWeightMultiplier(strategy: ConfidenceStrategy, market: 
 function confidenceTimeOfDayWeightMultiplier(strategy: ConfidenceStrategy, market: ConfidenceMarket) {
   const family = confidenceStrategyFamily(strategy.slug);
   const base = market.timeOfDay.weightMultiplier;
-  if (market.timeOfDay.label === "Opening drive" && (family === "breakout" || strategy.slug === "gap_continuation_fade")) {
+  if (market.timeOfDay.label === "Opening drive" && family === "trend") {
     return roundNumber(base * 1.08, 4);
   }
-  if (market.timeOfDay.label === "Midday" && (family === "breakout" || family === "trend")) {
+  if (market.timeOfDay.label === "Midday" && family === "trend") {
     return roundNumber(base * 0.9, 4);
   }
   return base;
@@ -13804,10 +13784,11 @@ function emptyMetaStrategyResult(reason: string): MetaStrategyResult {
     familyScores: emptyMetaFamilyScores(),
     familyDisplayScores: {},
     safetyGates: [{ label: "Market data", status: "info", detail: reason }],
-    strategies: metaStrategyCatalog.map((definition) => ({
+    strategies: votingEnsembleMetaStrategyDefinitions().map((definition) => ({
       name: definition.name,
       role: definition.role,
       family: definition.family,
+      moduleStatus: definition.moduleStatus,
       signal: "hold",
       confidence: 0,
       direction: 0,
@@ -13821,11 +13802,11 @@ function emptyMetaStrategyResult(reason: string): MetaStrategyResult {
 }
 
 function metaStrategyFamilies(): MetaStrategyFamily[] {
-  return ["trend", "breakout", "mean_reversion", "reversal", "volume_confirmation", "market_regime", "vwap", "event", "safety"];
+  return ["trend", "breakout", "mean_reversion", "reversal", "market_regime", "safety"];
 }
 
 function metaFamilyUsesDisplayScore(family: MetaStrategyFamily) {
-  return family === "volume_confirmation" || family === "market_regime" || family === "event" || family === "safety";
+  return family === "market_regime" || family === "safety";
 }
 
 function emptyMetaFamilyScores(): Record<MetaStrategyFamily, { buy: number; sell: number; hold: number; capped: boolean }> {
@@ -13969,7 +13950,7 @@ function renderMetaStrategies(strategies: MetaStrategyFeature[]) {
           .map(
             (strategy, strategyIndex) => `
               <tr class="weighted-strategy-name-row" data-tone="${strategyIndex % 4}" data-disabled="${String(strategy.signal === "hold")}">
-                <td colspan="5">${escapeHtml(strategy.name)}</td>
+                <td colspan="5">${escapeHtml(strategy.name)} ${moduleStatusBadge(strategy.moduleStatus)}</td>
                 <td>${escapeHtml(strategy.signal)}</td>
               </tr>
               <tr class="weighted-strategy-detail-row" data-tone="${strategyIndex % 4}" data-disabled="${String(strategy.signal === "hold")}">
@@ -14120,6 +14101,193 @@ async function fetchVotingEnsembleDecision(payload: ReturnType<typeof votingEnse
     }
   }
   throw new Error(lastMessage);
+}
+
+async function loadVotingEnsembleInventory() {
+  state.votingEnsembleInventoryStatus = state.votingEnsembleInventoryStatus === "ready" ? "ready" : "loading";
+  state.votingEnsembleInventoryWarning = "";
+  let lastMessage = "Voting Ensemble inventory route unavailable";
+  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+    try {
+      const response = await fetchWithTimeout(`${baseUrl}${TRADING_ALGORITHM_INVENTORY_ENDPOINTS.votingEnsemble}`, 10000);
+      if (response.ok) {
+        state.votingEnsembleInventory = normalizeVotingEnsembleInventory(await response.json());
+        state.votingEnsembleInventoryStatus = "ready";
+        state.votingEnsembleInventoryWarning = "";
+        updateMarketContext();
+        updateAlgorithmPanel(visibleCandles());
+        return;
+      }
+      lastMessage =
+        response.status === 404
+          ? `Voting Ensemble inventory route not loaded on ${baseUrl}; restart the FastAPI backend.`
+          : await readableResponseError(response);
+      if (response.status !== 404) {
+        throw new Error(lastMessage);
+      }
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : lastMessage;
+    }
+  }
+  state.votingEnsembleInventoryStatus = "error";
+  state.votingEnsembleInventoryWarning = lastMessage;
+  updateAlgorithmPanel(visibleCandles());
+}
+
+function normalizeVotingEnsembleInventory(raw: unknown): VotingEnsembleInventoryResponse {
+  const record = isRecord(raw) ? raw : {};
+  const modules = childRecord(record, "modules");
+  const normalized = emptyVotingEnsembleInventory();
+  normalized.algorithmId = stringFromUnknown(record.algorithmId, normalized.algorithmId);
+  normalized.engineVersion = stringFromUnknown(record.engineVersion, normalized.engineVersion);
+  for (const collection of votingEnsembleInventoryCollections) {
+    normalized.modules[collection] = arrayFromUnknown(modules?.[collection])
+      .map((value) => normalizeVotingEnsembleInventoryModule(value, collection))
+      .filter((module): module is VotingEnsembleInventoryModule => Boolean(module));
+  }
+  return normalized;
+}
+
+function normalizeVotingEnsembleInventoryModule(value: unknown, collection: VotingEnsembleInventoryCollection): VotingEnsembleInventoryModule | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const id = stringFromUnknown(value.id ?? value.strategyId).trim();
+  if (!id) {
+    return null;
+  }
+  const status = votingEnsembleModuleStatusFromUnknown(value.status, value.enabled);
+  return {
+    id,
+    name: stringFromUnknown(value.name ?? value.strategyName, id),
+    version: stringFromUnknown(value.version ?? value.strategyVersion),
+    family: stringFromUnknown(value.family),
+    role: stringFromUnknown(value.role),
+    collection,
+    status,
+    enabled: typeof value.enabled === "boolean" ? value.enabled : status === "active",
+    requiredInputs: arrayFromUnknown(value.requiredInputs ?? value.required_inputs).map((item) => stringFromUnknown(item)).filter(Boolean),
+    evidence: arrayFromUnknown(value.evidence).map((item) => stringFromUnknown(item)).filter(Boolean),
+    aliases: arrayFromUnknown(value.aliases).filter(isRecord).map((alias) => ({
+      name: stringFromUnknown(alias.name),
+      status: "deprecated_alias" as const,
+      aliasFor: stringFromUnknown(alias.aliasFor),
+    })).filter((alias) => alias.name && alias.aliasFor),
+  };
+}
+
+function votingEnsembleInventoryModules(collection: VotingEnsembleInventoryCollection, options: { activeOnly?: boolean } = {}) {
+  const modules = state.votingEnsembleInventory.modules[collection] ?? [];
+  return options.activeOnly ? modules.filter((module) => module.status === "active" && module.enabled) : modules;
+}
+
+function votingEnsembleInventoryNames(collection: VotingEnsembleInventoryCollection, options: { activeOnly?: boolean } = {}) {
+  return votingEnsembleInventoryModules(collection, options).map((module) => module.name);
+}
+
+function votingEnsembleMetaStrategyDefinitions(): MetaStrategyDefinition[] {
+  return (["directional", "context", "regime", "safety"] as const).flatMap((collection) =>
+    votingEnsembleInventoryModules(collection).map((module) => ({
+      name: module.name,
+      role: metaRoleFromVotingEnsembleModule(module, collection),
+      family: metaFamilyFromVotingEnsembleModule(module),
+      source: "backend" as const,
+      moduleStatus: module.status,
+      evidence: module.evidence,
+    })),
+  );
+}
+
+function votingEnsembleModuleStatusFromUnknown(value: unknown, enabled: unknown): VotingEnsembleInventoryStatus {
+  const normalized = stringFromUnknown(value).toLowerCase().replaceAll("-", "_").replaceAll(" ", "_");
+  if (
+    normalized === "active" ||
+    normalized === "shadow" ||
+    normalized === "disabled" ||
+    normalized === "unavailable" ||
+    normalized === "not_data_ready" ||
+    normalized === "deprecated_alias"
+  ) {
+    return normalized;
+  }
+  return enabled === false ? "disabled" : "active";
+}
+
+function moduleStatusLabel(status: VotingEnsembleInventoryStatus | undefined) {
+  if (status === "shadow") {
+    return "Shadow";
+  }
+  if (status === "disabled") {
+    return "Disabled";
+  }
+  if (status === "unavailable") {
+    return "Unavailable";
+  }
+  if (status === "not_data_ready") {
+    return "Not data-ready";
+  }
+  if (status === "deprecated_alias") {
+    return "Deprecated/alias";
+  }
+  return "Active";
+}
+
+function moduleStatusBadge(status: VotingEnsembleInventoryStatus | undefined) {
+  const normalized = status ?? "active";
+  return `<span class="module-status-badge" data-module-status="${normalized}">${escapeHtml(moduleStatusLabel(normalized))}</span>`;
+}
+
+function moduleStatusByInventoryName() {
+  return new Map(
+    votingEnsembleInventoryCollections.flatMap((collection) =>
+      votingEnsembleInventoryModules(collection).map((module) => [module.name, module.status] as const),
+    ),
+  );
+}
+
+function moduleStatusForBackendVote(vote: VotingEnsembleBackendVote, inventoryStatus?: VotingEnsembleInventoryStatus): VotingEnsembleInventoryStatus {
+  if (!vote.dataReady) {
+    return "not_data_ready";
+  }
+  if (!vote.active) {
+    return "disabled";
+  }
+  return inventoryStatus ?? "active";
+}
+
+function metaRoleFromVotingEnsembleModule(
+  module: VotingEnsembleInventoryModule,
+  collection: Exclude<VotingEnsembleInventoryCollection, "aggregator">,
+): MetaStrategyRole {
+  const role = module.role.toLowerCase();
+  if (collection === "safety" || role === "safety") {
+    return "safety";
+  }
+  if (collection === "regime" || role === "regime") {
+    return "regime";
+  }
+  return collection === "directional" || role === "directional" ? "directional" : "context";
+}
+
+function metaFamilyFromVotingEnsembleModule(module: VotingEnsembleInventoryModule): MetaStrategyFamily {
+  const id = module.id.toLowerCase();
+  const family = module.family.toLowerCase();
+  if (id.includes("cash") || family === "safety") {
+    return "safety";
+  }
+  if (family === "trend") {
+    return "trend";
+  }
+  if (family === "breakout") {
+    return "breakout";
+  }
+  if (family === "mean_reversion") {
+    return "mean_reversion";
+  }
+  if (family === "reversal") {
+    return "reversal";
+  }
+  return "market_regime";
 }
 
 function votingEnsembleEvaluatePayload() {
@@ -14867,24 +15035,28 @@ function renderWeightedGate(gate: { label: string; status: "pass" | "fail" | "in
 function strategyEnsembleSignals(context: MarketContext | null): AlgoVote[] {
   const backendVotes = state.votingEnsembleBackend?.votes;
   if (backendVotes?.length) {
+    const inventoryStatuses = moduleStatusByInventoryName();
     return backendVotes.map((vote) => ({
       strategy: vote.strategy,
       signal: vote.signal,
       detail: vote.reason,
       status: strategyStatusFromSignal(vote),
+      moduleStatus: moduleStatusForBackendVote(vote, inventoryStatuses.get(vote.strategy)),
       score: Math.round(clampNumber(vote.confidence, 0, 1) * 100),
     }));
   }
   const status = state.votingEnsembleBackendStatus === "error" ? "Avoid" : "Watch";
+  const moduleStatus: VotingEnsembleInventoryStatus = state.votingEnsembleBackendStatus === "error" ? "unavailable" : "not_data_ready";
   const detail =
     state.votingEnsembleBackendStatus === "error"
       ? state.votingEnsembleBackendWarning || "Backend Voting Ensemble unavailable"
       : "Waiting for backend Voting Ensemble evaluation";
-  return directionalVoteCatalog.map((name) => ({
-    strategy: name,
+  return votingEnsembleInventoryModules("directional", { activeOnly: true }).map((module) => ({
+    strategy: module.name,
     signal: "Hold",
     detail,
     status,
+    moduleStatus,
     score: 0,
   }));
 }
@@ -14902,28 +15074,13 @@ function strategyStatusFromSignal(vote: VotingEnsembleBackendVote): StrategyFit[
   return "Watch";
 }
 
-const directionalVoteCatalog = [
-  "Multi-Timeframe Trend Alignment",
-  "First Pullback After Open",
-  "Failed Breakout Strategy",
-  "Liquidity Sweep Reversal",
-  "Bollinger Band Reversion",
-  "ATR Overextension Reversion",
-  "Economic Event Reaction Strategy",
-] as const;
-
-const contextSignalCatalog = [
-  "Relative Strength vs QQQ/IWM",
-  "Market Breadth Momentum",
-] as const;
-
 function renderAlgoVoteRow(vote: AlgoVote) {
   const statusText = vote.status && typeof vote.score === "number" ? ` - ${vote.status} ${vote.score}%` : "";
   const eligible = isEligibleStrategyVote(vote);
   return `
     <article class="algo-vote-card" data-signal="${vote.signal.toLowerCase()}" data-eligible="${String(eligible)}">
       <div>
-        <strong>${escapeHtml(vote.strategy)}</strong>
+        <strong>${escapeHtml(vote.strategy)} ${moduleStatusBadge(vote.moduleStatus)}</strong>
         <span>${escapeHtml(`${vote.detail}${statusText}`)}</span>
       </div>
       <b class="algo-signal-badge">${eligible ? vote.signal : "Excluded"}</b>
@@ -18196,7 +18353,6 @@ function historicalWinnerSignal(history: Candle[], priorClose: number): AlgoSign
 function historicalStrategyVotes(history: Candle[], priorClose: number): AlgoVote[] {
   const closes = history.map((candle) => candle.close);
   const latest = history[history.length - 1];
-  const dayOpen = history[0].open;
   const sma20 = simpleMovingAverage(closes, 20);
   const sma50 = simpleMovingAverage(closes, 50);
   const rsi = relativeStrengthIndex(closes, 14);
@@ -18206,7 +18362,6 @@ function historicalStrategyVotes(history: Candle[], priorClose: number): AlgoVot
   const priorHigh = priorRange.length ? Math.max(...priorRange.map((candle) => candle.high)) : latest.high;
   const priorLow = priorRange.length ? Math.min(...priorRange.map((candle) => candle.low)) : latest.low;
   const averageVolume = simpleMovingAverage(history.map((candle) => candle.volume), Math.min(20, history.length)) ?? latest.volume;
-  const gapPercent = priorClose ? ((dayOpen - priorClose) / priorClose) * 100 : 0;
   const atr = averageTrueRange(history, Math.min(14, history.length - 1));
   const bands = bollingerBands(closes, 20, 2);
   const recentBase = closes[Math.max(0, closes.length - 20)];
@@ -18242,29 +18397,14 @@ function historicalStrategyVotes(history: Candle[], priorClose: number): AlgoVot
       detail: "Fades volume-backed liquidity sweep",
     },
     {
-      strategy: "Bollinger Band Reversion",
+      strategy: "Bollinger/ATR Reversion",
       signal:
-        bands && rsi !== null && latest.close < bands.lower && rsi < 45
+        (bands && rsi !== null && latest.close < bands.lower && rsi < 45) || (atr && sma20 !== null && latest.close < sma20 - atr * 1.25)
           ? "Buy"
-          : bands && rsi !== null && latest.close > bands.upper && rsi > 55
+          : (bands && rsi !== null && latest.close > bands.upper && rsi > 55) || (atr && sma20 !== null && latest.close > sma20 + atr * 1.25)
             ? "Sell"
             : "Hold",
-      detail: "Fades Bollinger extension with RSI confirmation",
-    },
-    {
-      strategy: "ATR Overextension Reversion",
-      signal:
-        atr && sma20 !== null && latest.close < sma20 - atr * 1.25
-          ? "Buy"
-          : atr && sma20 !== null && latest.close > sma20 + atr * 1.25
-            ? "Sell"
-            : "Hold",
-      detail: "Fades ATR distance from 20 SMA",
-    },
-    {
-      strategy: "Economic Event Reaction Strategy",
-      signal: gapPercent > 0.15 && latest.close > openingRange.high ? "Buy" : gapPercent < -0.15 && latest.close < openingRange.low ? "Sell" : "Hold",
-      detail: "Gap/opening-range event reaction",
+      detail: "Fades Bollinger/ATR overextension with RSI or distance confirmation",
     },
   ];
   return rawVotes;
@@ -20237,73 +20377,137 @@ function candleWindowLabel(layer: MarketLayer) {
 }
 
 function renderStrategies(context: MarketContext) {
+  const liveDefinitions = defaultDecisionInventoryDefinitions();
+  if (!liveDefinitions.length) {
+    renderStrategyInventoryPending();
+    return;
+  }
   const visibleStrategies = strategyFitDisplayRows(context.strategies);
   const strong = visibleStrategies.filter((strategy) => strategy.status === "Strong Fit").length;
   strategySummary.textContent = strong
-    ? `${strong} strong fit${strong === 1 ? "" : "s"} - ${visibleStrategies.length} strategies`
-    : `${visibleStrategies.length} strategies ranked`;
+    ? `${strong} strong fit${strong === 1 ? "" : "s"} - ${visibleStrategies.length} live modules`
+    : `${visibleStrategies.length} live modules ranked`;
   contextUpdatedAt.textContent = context.updatedAt ? `updated ${formatDate(context.updatedAt)}` : "updated --";
   strategyList.innerHTML = visibleStrategies
     .map(
-      (strategy) => `
-        <article class="strategy-card" data-status="${strategy.status.toLowerCase().replaceAll(" ", "-")}">
+      (strategy) => {
+        const name = stringFromUnknown(strategy.name, "Strategy");
+        const status = strategy.status ?? "Watch";
+        const score = numberFromUnknown(strategy.score, 0);
+        const matches = Array.isArray(strategy.matches) ? strategy.matches.map((match) => stringFromUnknown(match)).filter(Boolean) : [];
+        const risks = Array.isArray(strategy.risks) ? strategy.risks.map((risk) => stringFromUnknown(risk)).filter(Boolean) : [];
+        return `
+        <article class="strategy-card" data-status="${status.toLowerCase().replaceAll(" ", "-")}">
           <div class="strategy-main">
-            <strong>${escapeHtml(strategy.name)}</strong>
-            <span>${strategy.status} - ${strategy.score}%</span>
+            <strong>${escapeHtml(name)} ${moduleStatusBadge(strategy.moduleStatus)}</strong>
+            <span>${status} - ${score}%</span>
           </div>
           <div class="strategy-detail">
-            <span>${strategy.matches.length ? escapeHtml(strategy.matches.join(" - ")) : "No strong confirming condition"}</span>
+            <span>${matches.length ? escapeHtml(matches.join(" - ")) : "No strong confirming condition"}</span>
             ${
-              strategy.risks.length
-                ? `<span class="strategy-risk">${escapeHtml(strategy.risks.join(" - "))}</span>`
+              risks.length
+                ? `<span class="strategy-risk">${escapeHtml(risks.join(" - "))}</span>`
                 : `<span class="strategy-clear">No major blocker</span>`
             }
           </div>
         </article>
-      `,
+      `;
+      },
     )
     .join("");
 }
 
+function renderStrategyInventoryPending() {
+  if (state.votingEnsembleInventoryStatus === "error") {
+    strategySummary.textContent = "Strategy inventory unavailable";
+    contextUpdatedAt.textContent = "updated --";
+    strategyList.innerHTML = strategyInventoryMessageCard(
+      "Inventory unavailable",
+      state.votingEnsembleInventoryWarning || "Backend strategy inventory endpoint did not return live modules.",
+      "unavailable",
+    );
+    return;
+  }
+
+  if (state.votingEnsembleInventoryStatus === "ready") {
+    strategySummary.textContent = "No live modules returned";
+    contextUpdatedAt.textContent = "updated --";
+    strategyList.innerHTML = strategyInventoryMessageCard(
+      "No live modules",
+      "Backend inventory returned zero active decision modules.",
+      "disabled",
+    );
+    return;
+  }
+
+  strategySummary.textContent = "Loading strategy inventory";
+  contextUpdatedAt.textContent = "updated --";
+  strategyList.innerHTML = skeletonStrategies("Waiting for backend inventory");
+}
+
+function strategyInventoryMessageCard(title: string, detail: string, moduleStatus: VotingEnsembleInventoryStatus) {
+  return `
+    <article class="strategy-card" data-status="watch">
+      <div class="strategy-main">
+        <strong>${escapeHtml(title)} ${moduleStatusBadge(moduleStatus)}</strong>
+        <span>--</span>
+      </div>
+      <div class="strategy-detail">
+        <span>${escapeHtml(detail)}</span>
+      </div>
+    </article>
+  `;
+}
+
 function strategyFitDisplayRows(sourceStrategies: StrategyFit[]) {
-  const byName = new Map(sourceStrategies.map((strategy) => [strategy.name, strategy]));
+  const inventoryStatuses = moduleStatusByInventoryName();
+  const liveDefinitions = defaultDecisionInventoryDefinitions();
+  const liveNames = new Set(liveDefinitions.map((definition) => definition.name));
+  const enrichedSourceStrategies = sourceStrategies
+    .filter((strategy) => liveNames.has(strategy.name))
+    .map((strategy) => ({
+      ...strategy,
+      moduleStatus: strategy.moduleStatus ?? inventoryStatuses.get(strategy.name),
+    }));
+  const byName = new Map(enrichedSourceStrategies.map((strategy) => [strategy.name, strategy]));
   return [
-    ...sourceStrategies,
-    ...allAlgorithmStrategyFitNames()
-      .filter((name) => !byName.has(name))
+    ...enrichedSourceStrategies,
+    ...liveDefinitions
+      .filter((definition) => !byName.has(definition.name))
       .map(
-        (name): StrategyFit => ({
-          name,
-          role: metaStrategyCatalog.find((strategy) => strategy.name === name)?.role,
-          family: metaStrategyCatalog.find((strategy) => strategy.name === name)?.family,
-          strategy_family: metaStrategyCatalog.find((strategy) => strategy.name === name)?.family,
+        (definition): StrategyFit => ({
+          name: definition.name,
+          role: definition.role,
+          family: definition.family,
+          strategy_family: definition.family,
+          moduleStatus: definition.moduleStatus,
           status: "Watch",
           score: 45,
-          matches: ["Used by algorithm", "Waiting for backend fit score"],
+          matches: [
+            `${moduleStatusLabel(definition.moduleStatus)} module`,
+            ...(definition.evidence.length ? [`Evidence: ${definition.evidence.join(", ")}`] : []),
+            "Waiting for backend fit score",
+          ],
           risks: [],
         }),
       ),
   ];
 }
 
-function allAlgorithmStrategyFitNames() {
-  return Array.from(
-    new Set([
-      ...directionalVoteCatalog,
-      ...contextSignalCatalog,
-      ...weightedAlphaStrategies.map((strategy) => strategy.name),
-      ...confidenceAggregationStrategies.map((strategy) => strategy.name),
-      ...regimeSelectionStrategies.map((strategy) => strategy.name),
-      ...metaStrategyCatalog.map((strategy) => strategy.name),
-      "ADX Trend Strength Filter",
-      "ATR Volatility Regime",
-      "Breakout Strategy",
-      "MACD Strategy",
-    ]),
+function defaultDecisionInventoryDefinitions(): MetaStrategyDefinition[] {
+  return (["directional", "context", "regime"] as const).flatMap((collection) =>
+    votingEnsembleInventoryModules(collection, { activeOnly: true }).map((module) => ({
+      name: module.name,
+      role: metaRoleFromVotingEnsembleModule(module, collection),
+      family: metaFamilyFromVotingEnsembleModule(module),
+      source: "backend" as const,
+      moduleStatus: module.status,
+      evidence: module.evidence,
+    })),
   );
 }
 
-function skeletonStrategies() {
+function skeletonStrategies(detail = "Waiting for context computation") {
   return [1, 2, 3]
     .map(
       () => `
@@ -20313,7 +20517,7 @@ function skeletonStrategies() {
             <span>--</span>
           </div>
           <div class="strategy-detail">
-            <span>Waiting for context computation</span>
+            <span>${escapeHtml(detail)}</span>
           </div>
         </article>
       `,
@@ -20575,6 +20779,7 @@ void loadMocImbalance();
 void loadVixRisk();
 void loadSpyNews();
 void loadEsSnapshot();
+void loadVotingEnsembleInventory();
 void loadMarketContext();
 void loadCandles();
 void loadLatestDynamicTradingArtifact();

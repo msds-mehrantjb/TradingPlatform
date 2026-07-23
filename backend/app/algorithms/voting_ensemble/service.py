@@ -16,6 +16,7 @@ from backend.app.algorithms.voting_ensemble.models import (
     VotingEnsembleEvaluateResponse,
     VotingStrategyVote,
 )
+from backend.app.algorithms.voting_ensemble.strategies.registry import VOTING_ENSEMBLE_MODULE_INVENTORY
 
 
 VOTING_ENSEMBLE_SERVICE_VERSION = "voting_ensemble_backend_v1"
@@ -83,6 +84,7 @@ class VotingEnsembleService:
             "serviceVersion": self.version,
             "status": "ready",
             "isolated": True,
+            "moduleInventory": VOTING_ENSEMBLE_MODULE_INVENTORY.model_dump(mode="json"),
             "directionalStrategies": [evaluator.__name__.removeprefix("evaluate_") for evaluator in DIRECTIONAL_STRATEGIES],
             "dynamicRoleStrategies": [evaluator.__name__.removeprefix("evaluate_") for evaluator in DYNAMIC_ROLE_STRATEGIES],
             "contextSignals": [evaluator.__name__.removeprefix("evaluate_") for evaluator in CONTEXT_STRATEGIES],
@@ -434,12 +436,9 @@ DIRECTIONAL_STRATEGIES: tuple[StrategyEvaluator, ...] = (
     evaluate_failed_breakout_strategy,
     evaluate_liquidity_sweep_reversal,
     evaluate_bollinger_band_reversion,
-    evaluate_atr_overextension_reversion,
 )
 
-DYNAMIC_ROLE_STRATEGIES: tuple[StrategyEvaluator, ...] = (
-    evaluate_economic_event_reaction,
-)
+DYNAMIC_ROLE_STRATEGIES: tuple[StrategyEvaluator, ...] = ()
 
 CONTEXT_STRATEGIES: tuple[StrategyEvaluator, ...] = (
     evaluate_relative_strength,

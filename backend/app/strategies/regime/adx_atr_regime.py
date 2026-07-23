@@ -72,7 +72,7 @@ class RegimeEvidence:
 
 
 class AdxAtrRegimeClassifier:
-    registryEntry = resolve_strategy("adx_trend_strength_regime")
+    registryEntry = resolve_strategy("adx_atr_regime_classifier")
 
     def __init__(self, config: AdxAtrRegimeConfig | None = None) -> None:
         self.config = config or AdxAtrRegimeConfig()

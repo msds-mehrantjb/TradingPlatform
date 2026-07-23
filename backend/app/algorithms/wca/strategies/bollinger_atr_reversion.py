@@ -11,7 +11,7 @@ class BollingerAtrReversionStrategy:
     name = "Bollinger/ATR Reversion"
     family = "mean_reversion"
     version = "wca_bollinger_atr_reversion_v1"
-    base_weight = 0.08
+    base_weight = 0.25
     configuration = StrategyConfig()
     minimum_data_requirements = ("21 completed regular-session candles",)
     performance_history_identifier = "wca.bollinger_atr_reversion.performance.v1"

@@ -21,8 +21,16 @@ from backend.app.algorithms.regime.ml import (
 )
 from backend.app.algorithms.regime.repository import RegimeRepository, regime_repository_inventory
 from backend.app.algorithms.regime.service import RegimeApplicationService, regime_backend_inventory
+from backend.app.algorithms.regime.strategy_registry import (
+    REGIME_MODULE_INVENTORY,
+    RegimeModuleInventory,
+    RegimeModuleLifecycleStatus,
+    RegimeModuleStatus,
+    regime_strategy_inventory,
+)
 
 __all__ = [
+    "REGIME_MODULE_INVENTORY",
     "RegimeApplicationService",
     "RegimeBrokerSubmission",
     "RegimeGlobalRiskApproval",
@@ -30,6 +38,9 @@ __all__ = [
     "RegimeMlCandidateArtifact",
     "RegimeMlPromotionDecision",
     "RegimeMlPromotionEvidence",
+    "RegimeModuleInventory",
+    "RegimeModuleLifecycleStatus",
+    "RegimeModuleStatus",
     "RegimeRepository",
     "REGIME_ALGORITHM_ID",
     "REGIME_ALGORITHM_VERSION",
@@ -41,4 +52,5 @@ __all__ = [
     "regime_broker_adapter_inventory",
     "regime_global_risk_adapter_inventory",
     "regime_repository_inventory",
+    "regime_strategy_inventory",
 ]

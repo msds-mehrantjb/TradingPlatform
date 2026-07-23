@@ -193,6 +193,11 @@ from .settings import (
     risk_config_hash,
     resolve_dynamic_trading_profile,
 )
+from .strategies.registry import (
+    ModuleStatus,
+    VOTING_ENSEMBLE_MODULE_INVENTORY,
+    VotingEnsembleInventory,
+)
 from .strategy_performance import (
     VOTING_ENSEMBLE_PERFORMANCE_TRACKER_VERSION,
     StrategyReliabilityEstimate,
@@ -230,6 +235,7 @@ __all__ = [
     "VOTING_ENSEMBLE_ML_MODEL_VERSION",
     "VOTING_ENSEMBLE_ML_THRESHOLDS_VERSION",
     "VOTING_ENSEMBLE_MODEL_CALIBRATION_VERSION",
+    "VOTING_ENSEMBLE_MODULE_INVENTORY",
     "VOTING_ENSEMBLE_CONTEXT_CATALOG",
     "VOTING_ENSEMBLE_DIRECTIONAL_CATALOG",
     "VOTING_ENSEMBLE_ENTRY_POLICY_VERSION",
@@ -265,6 +271,7 @@ __all__ = [
     "VOTING_ENSEMBLE_MINIMUM_STOP_DISTANCE",
     "VOTING_ENSEMBLE_STOP_LOSS_POLICY_VERSION",
     "VOTING_ENSEMBLE_VOTE_EDGE_SIZING_VERSION",
+    "ModuleStatus",
     "VotingEnsembleBacktestConfig",
     "VotingEnsembleBacktestRunEnvelope",
     "VotingEnsembleBacktestRunner",
@@ -272,6 +279,7 @@ __all__ = [
     "VotingEnsembleArtifactEnvelope",
     "VotingEnsembleCandidateDatasetBuilder",
     "VotingEnsembleLocalGateEngine",
+    "VotingEnsembleInventory",
     "VotingEnsembleOrderPlanner",
     "VotingEnsembleOrderValidator",
     "VotingEnsembleParameterTuningConfig",
