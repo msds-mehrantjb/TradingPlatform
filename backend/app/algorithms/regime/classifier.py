@@ -53,6 +53,23 @@ LIQUIDITY_POLICY = {
     "maximumParticipationRate": 0.10,
 }
 
+INDICATOR_WARMUP_REQUIREMENTS = {
+    "ema20": 20,
+    "ema20Slope": 26,
+    "ema50": 50,
+    "ema50Slope": 56,
+    "vwap": 1,
+    "vwapSlope": 6,
+    "atr": 15,
+    "adx": 15,
+    "directionalMovementSpread": 15,
+    "efficiencyRatio": 21,
+    "realizedVolatility": 21,
+    "marketStructure": 4,
+    "breakOfStructure": 6,
+    "openingRange": 30,
+}
+
 
 def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassification:
     candles = snapshot.candles
@@ -86,7 +103,17 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
     direction_axis = _direction_axis(direction_evidence["score"], trend_strength_evidence["score"])
     bull_score = max(0, round(direction_evidence["score"] * 5))
     bear_score = max(0, round(-direction_evidence["score"] * 5))
-    missing = tuple(name for name, value in {"ema20": ema20, "ema50": ema50, "atr": latest_atr}.items() if value is None)
+    missing = _missing_indicator_inputs(
+        snapshot,
+        ema20=ema20,
+        ema50=ema50,
+        latest_atr=latest_atr,
+        latest_rv=latest_rv,
+        movement=movement,
+        efficiency=efficiency,
+        direction_evidence=direction_evidence,
+        volatility_evidence=volatility_evidence,
+    )
     no_trade = _no_trade_reasons(snapshot, volatility_evidence, liquidity_evidence)
     structure_evidence = _structure_evidence(
         snapshot,
@@ -208,6 +235,20 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
         "liquidityEvidence": liquidity_evidence,
         "eventEvidence": event_evidence,
         "confidenceEvidence": confidence_evidence,
+        "indicatorReadiness": _indicator_readiness(
+            snapshot,
+            ema20=ema20,
+            ema50=ema50,
+            latest_atr=latest_atr,
+            latest_rv=latest_rv,
+            movement=movement,
+            efficiency=efficiency,
+            direction_evidence=direction_evidence,
+            volatility_evidence=volatility_evidence,
+            structure_evidence=structure_evidence,
+            liquidity_evidence=liquidity_evidence,
+            event_evidence=event_evidence,
+        ),
         "noTradeReasons": no_trade,
     }
     return RegimeClassification(
@@ -258,17 +299,18 @@ def _direction_evidence(
     computed_vwap: float,
     previous_vwap: float | None,
 ) -> dict:
+    observations = len(snapshot.candles)
     ema20_slope = ((ema20 - previous_ema20) / max(latest_close, 0.01)) if ema20 is not None and previous_ema20 is not None else None
     ema50_slope = ((ema50 - previous_ema50) / max(latest_close, 0.01)) if ema50 is not None and previous_ema50 is not None else None
     vwap_slope = ((computed_vwap - previous_vwap) / max(latest_close, 0.01)) if previous_vwap is not None else None
     vwap_location = (latest_close - computed_vwap) / max(latest_close, 0.01)
     structure_score = 1.0 if _higher_highs_and_lows(snapshot.candles) else -1.0 if _lower_highs_and_lows(snapshot.candles) else 0.0
     components = {
-        "ema20Slope": {"value": ema20_slope, "score": _scaled_score(ema20_slope, 0.0015)},
-        "ema50Slope": {"value": ema50_slope, "score": _scaled_score(ema50_slope, 0.0010)},
-        "vwapSlope": {"value": vwap_slope, "score": _scaled_score(vwap_slope, 0.0010)},
-        "vwapLocation": {"value": vwap_location, "score": _scaled_score(vwap_location, 0.004)},
-        "marketStructure": {"value": structure_score, "score": structure_score},
+        "ema20Slope": _ready_component(ema20_slope, _scaled_score(ema20_slope, 0.0015), observations, "ema20Slope"),
+        "ema50Slope": _ready_component(ema50_slope, _scaled_score(ema50_slope, 0.0010), observations, "ema50Slope"),
+        "vwapSlope": _ready_component(vwap_slope, _scaled_score(vwap_slope, 0.0010), observations, "vwapSlope"),
+        "vwapLocation": _ready_component(vwap_location, _scaled_score(vwap_location, 0.004), observations, "vwap", source="computed_or_explicit_vwap"),
+        "marketStructure": _ready_component(structure_score, structure_score, observations, "marketStructure"),
     }
     score = (
         components["ema20Slope"]["score"] * 0.25
@@ -289,10 +331,11 @@ def _direction_evidence(
 def _trend_strength_evidence(movement: dict, efficiency: float | None) -> dict:
     adx = movement.get("adx")
     spread = abs(float(movement.get("directionalMovementSpread") or 0.0)) if movement.get("directionalMovementSpread") is not None else None
+    observations = int(movement.get("observations") or 0)
     components = {
-        "adx": {"value": adx, "score": _scaled_score(adx, 35.0, floor=12.0)},
-        "directionalMovementSpread": {"value": spread, "score": _scaled_score(spread, 0.35)},
-        "efficiencyRatio": {"value": efficiency, "score": _scaled_score(efficiency, 0.65)},
+        "adx": _ready_component(adx, _scaled_score(adx, 35.0, floor=12.0), observations, "adx"),
+        "directionalMovementSpread": _ready_component(spread, _scaled_score(spread, 0.35), observations, "directionalMovementSpread"),
+        "efficiencyRatio": _ready_component(efficiency, _scaled_score(efficiency, 0.65), observations, "efficiencyRatio"),
     }
     available = [component["score"] for component in components.values() if component["value"] is not None]
     score = sum(available) / len(available) if available else 0.0
@@ -433,6 +476,142 @@ def _scaled_score(value, scale: float, *, floor: float = 0.0) -> float:
     return _clamp(number / max(scale, 0.000001), -1.0, 1.0)
 
 
+def _ready_component(
+    value,
+    score: float,
+    observations_available: int,
+    requirement_key: str,
+    *,
+    source: str = "computed_from_completed_candles",
+) -> dict:
+    return {
+        "value": value,
+        "score": score,
+        **_readiness(observations_available, requirement_key, value, source=source),
+    }
+
+
+def _readiness(
+    observations_available: int,
+    requirement_key: str,
+    value,
+    *,
+    source: str = "computed_from_completed_candles",
+    observation_label: str = "observationsAvailable",
+) -> dict:
+    required = INDICATOR_WARMUP_REQUIREMENTS[requirement_key]
+    return {
+        "dataReady": value is not None and observations_available >= required,
+        "requiredObservations": required,
+        observation_label: observations_available,
+        "source": source,
+    }
+
+
+def _opening_range_ready(snapshot: RegimeMarketSnapshot, reference_levels: list[dict]) -> bool:
+    has_range = _level_value(reference_levels, "opening_range_high") is not None and _level_value(reference_levels, "opening_range_low") is not None
+    if not has_range:
+        return False
+    context_levels = snapshot.context_feeds.get("marketStructureLevels") or {}
+    if context_levels.get("openingRangeHigh") is not None and context_levels.get("openingRangeLow") is not None:
+        return True
+    minutes_from_open = exchange_session(snapshot.latest.timestamp).minutes_from_open
+    return minutes_from_open is not None and minutes_from_open >= INDICATOR_WARMUP_REQUIREMENTS["openingRange"]
+
+
+def _missing_indicator_inputs(
+    snapshot: RegimeMarketSnapshot,
+    *,
+    ema20: float | None,
+    ema50: float | None,
+    latest_atr: float | None,
+    latest_rv: float | None,
+    movement: dict,
+    efficiency: float | None,
+    direction_evidence: dict,
+    volatility_evidence: dict,
+) -> tuple[str, ...]:
+    missing: list[str] = []
+    checks = {
+        "ema20": ema20,
+        "ema50": ema50,
+        "atr": latest_atr,
+        "realizedVolatility": latest_rv,
+        "adx": movement.get("adx"),
+        "plusDi": movement.get("plusDi"),
+        "minusDi": movement.get("minusDi"),
+        "directionalMovementSpread": movement.get("directionalMovementSpread"),
+        "efficiencyRatio": efficiency,
+        "vwapSlope": direction_evidence["components"]["vwapSlope"]["value"],
+    }
+    for name, value in checks.items():
+        if value is None:
+            missing.append(name)
+    return tuple(dict.fromkeys(missing))
+
+
+def _indicator_readiness(
+    snapshot: RegimeMarketSnapshot,
+    *,
+    ema20: float | None,
+    ema50: float | None,
+    latest_atr: float | None,
+    latest_rv: float | None,
+    movement: dict,
+    efficiency: float | None,
+    direction_evidence: dict,
+    volatility_evidence: dict,
+    structure_evidence: dict,
+    liquidity_evidence: dict,
+    event_evidence: dict,
+) -> dict:
+    observations = len(snapshot.candles)
+    movement_observations = int(movement.get("observations") or observations)
+    readiness = {
+        "ema20": _readiness(observations, "ema20", ema20),
+        "ema20Slope": direction_evidence["components"]["ema20Slope"],
+        "ema50": _readiness(observations, "ema50", ema50),
+        "ema50Slope": direction_evidence["components"]["ema50Slope"],
+        "vwap": _readiness(observations, "vwap", direction_evidence["components"]["vwapLocation"]["value"], source="computed_or_explicit_vwap"),
+        "vwapSlope": direction_evidence["components"]["vwapSlope"],
+        "atr": _readiness(observations, "atr", latest_atr),
+        "adx": _readiness(movement_observations, "adx", movement.get("adx")),
+        "plusDi": _readiness(movement_observations, "directionalMovementSpread", movement.get("plusDi")),
+        "minusDi": _readiness(movement_observations, "directionalMovementSpread", movement.get("minusDi")),
+        "directionalMovementSpread": _readiness(movement_observations, "directionalMovementSpread", movement.get("directionalMovementSpread")),
+        "efficiencyRatio": _readiness(observations, "efficiencyRatio", efficiency),
+        "realizedVolatility": _readiness(observations, "realizedVolatility", latest_rv),
+        "volatilityPercentiles": {
+            "dataReady": bool(volatility_evidence.get("percentileDataReady")),
+            "calibrationStatus": volatility_evidence.get("calibrationStatus"),
+            "sampleSize": volatility_evidence.get("sampleSize"),
+            "source": volatility_evidence.get("source"),
+        },
+        "structure": {
+            "dataReady": bool(structure_evidence.get("dataReady")),
+            "componentReadiness": structure_evidence.get("componentReadiness"),
+        },
+        "liquidity": {
+            "dataReady": not bool(liquidity_evidence.get("missingCriticalFields")) and liquidity_evidence.get("status") == "fresh",
+            "blockNewEntries": liquidity_evidence.get("blockNewEntries"),
+            "missingCriticalFields": liquidity_evidence.get("missingCriticalFields"),
+        },
+        "eventRisk": {
+            "dataReady": event_evidence.get("scheduledState") != "unknown",
+            "newEntriesBlocked": event_evidence.get("newEntriesBlocked"),
+        },
+    }
+    return {
+        "overallDataReady": all(
+            bool(readiness[name].get("dataReady"))
+            for name in ("ema20", "ema50", "atr", "adx", "directionalMovementSpread", "efficiencyRatio", "realizedVolatility", "liquidity", "eventRisk")
+        ),
+        "observationsAvailable": observations,
+        "requirements": INDICATOR_WARMUP_REQUIREMENTS,
+        "indicators": readiness,
+    }
+
+
 def _volatility_evidence(
     snapshot: RegimeMarketSnapshot,
     *,
@@ -465,10 +644,13 @@ def _volatility_evidence(
         "calibrationStatus": status,
         "minuteOfSession": _minute_of_session(snapshot.latest.timestamp),
         "atr": latest_atr,
+        "atrDataReady": latest_atr is not None and len(snapshot.candles) >= INDICATOR_WARMUP_REQUIREMENTS["atr"],
         "atrPercent": atr_percent,
         "atrPercentile": _clamp01(atr_percentile),
         "realizedVolatility": rv,
+        "realizedVolatilityDataReady": rv is not None and len(snapshot.candles) >= INDICATOR_WARMUP_REQUIREMENTS["realizedVolatility"],
         "realizedVolatilityPercentile": _clamp01(rv_percentile),
+        "percentileDataReady": atr_percentile is not None and rv_percentile is not None and status == "ready",
         "currentRange": current_range,
         "expectedRange": expected_range,
         "currentRangeVsExpected": range_vs_expected,
@@ -476,6 +658,12 @@ def _volatility_evidence(
         "expectedVolume": expected_volume,
         "currentVolumeVsExpected": volume_vs_expected,
         "sampleSize": sample_size,
+        "dataReady": bool(
+            latest_atr is not None
+            and rv is not None
+            and len(snapshot.candles) >= INDICATOR_WARMUP_REQUIREMENTS["realizedVolatility"]
+            and (atr_percentile is not None or rv_percentile is not None or range_vs_expected is not None)
+        ),
         "source": "context_feed" if baseline.get("calibrationStatus") not in {None, "missing"} else same_minute.get("source", "unavailable"),
     }
     decision = _volatility_decision(evidence)
@@ -525,6 +713,7 @@ def _structure_evidence(
     directional_efficiency: float | None = None,
 ) -> dict:
     candles = snapshot.candles
+    observations = len(candles)
     latest = snapshot.latest
     prior = candles[:-1]
     recent = prior[-8:]
@@ -581,6 +770,9 @@ def _structure_evidence(
         "openingRange": {
             "high": _level_value(reference_levels, "opening_range_high"),
             "low": _level_value(reference_levels, "opening_range_low"),
+            "dataReady": _opening_range_ready(snapshot, reference_levels),
+            "requiredMinutesFromOpen": INDICATOR_WARMUP_REQUIREMENTS["openingRange"],
+            "minutesFromOpen": exchange_session(snapshot.latest.timestamp).minutes_from_open,
         },
         "priorDay": {
             "high": _level_value(reference_levels, "prior_day_high"),
@@ -597,6 +789,19 @@ def _structure_evidence(
         "rejectionCandle": rejection,
         "failedAcceptance": failed_acceptance,
         "vwapCrossingFrequency": vwap_crosses,
+        "dataReady": observations >= INDICATOR_WARMUP_REQUIREMENTS["marketStructure"],
+        "componentReadiness": {
+            "orderedStructure": _readiness(observations, "marketStructure", higher_highs_lows or lower_highs_lows),
+            "breakOfStructure": _readiness(observations, "breakOfStructure", break_of_structure["direction"] != "none"),
+            "changeOfCharacter": _readiness(observations, "breakOfStructure", change_of_character),
+            "vwapCrossingFrequency": _readiness(observations, "vwapSlope", vwap_crosses),
+            "openingRange": _readiness(
+                exchange_session(snapshot.latest.timestamp).minutes_from_open or 0,
+                "openingRange",
+                True if _opening_range_ready(snapshot, reference_levels) else None,
+                observation_label="minutesFromOpen",
+            ),
+        },
         "directionalEfficiency": efficiency,
         "reasonCodes": _structure_reason_codes(axis, active_reference, failed_acceptance, rejection, change_of_character),
         "rule": (
@@ -663,7 +868,7 @@ def _computed_session_reference_levels(snapshot: RegimeMarketSnapshot) -> list[d
         for candle in regular_candles
         if (exchange_session(candle.timestamp).minutes_from_open or 0) < 30 and candle.timestamp < snapshot.latest.timestamp
     ]
-    if opening_candles:
+    if opening_candles and latest_session.minutes_from_open is not None and latest_session.minutes_from_open >= INDICATOR_WARMUP_REQUIREMENTS["openingRange"]:
         levels.append({"type": "opening_range_high", "side": "high", "price": max(c.high for c in opening_candles), "source": "computed_one_minute_candles"})
         levels.append({"type": "opening_range_low", "side": "low", "price": min(c.low for c in opening_candles), "source": "computed_one_minute_candles"})
 

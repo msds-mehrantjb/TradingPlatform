@@ -11056,29 +11056,87 @@ function regimeBackendStrategyAsUiStrategy(row: Record<string, unknown>): Regime
 }
 
 function regimeBackendFeaturesForUi(features: Record<string, unknown>, evidence: Record<string, unknown>): RegimeSelectionFeature[] {
-  const rows: Array<[string, unknown]> = [
-    ["Close", evidence.close],
-    ["VWAP", features.vwap],
-    ["EMA 20", features.ema20],
-    ["EMA 50", features.ema50],
-    ["ATR", features.atr],
-    ["ATR %", features.atrPercent],
-    ["RSI", features.rsi],
-    ["MACD histogram", features.macdHistogram],
-    ["Relative volume", features.relativeVolume],
-    ["Quote freshness", evidence.quoteFreshness],
-    ["QQQ relative strength", evidence.qqqRelativeStrength],
-    ["IWM relative strength", evidence.iwmRelativeStrength],
-    ["Market breadth", evidence.marketBreadth],
-    ["VIX", evidence.vixState],
-    ["ES futures", evidence.esFuturesState],
-    ["Scheduled event", evidence.scheduledEventState],
+  const readiness = childRecord(childRecord(evidence, "indicatorReadiness"), "indicators") ?? {};
+  const structureReadiness = childRecord(childRecord(readiness, "structure"), "componentReadiness") ?? {};
+  const structureEvidence = childRecord(evidence, "structureEvidence") ?? {};
+  const openingRange = childRecord(structureEvidence, "openingRange") ?? {};
+  const openingRangeValue =
+    openingRange.high !== null && openingRange.high !== undefined && openingRange.low !== null && openingRange.low !== undefined
+      ? `${formatRegimeFeatureNumber(openingRange.high)} / ${formatRegimeFeatureNumber(openingRange.low)}`
+      : null;
+  const rows: RegimeSelectionFeature[] = [
+    regimeFeatureRow("Close", evidence.close),
+    regimeFeatureRow("VWAP", features.vwap, childRecord(readiness, "vwap")),
+    regimeFeatureRow("VWAP slope", features.vwapSlope, childRecord(readiness, "vwapSlope")),
+    regimeFeatureRow("EMA 20", features.ema20, childRecord(readiness, "ema20")),
+    regimeFeatureRow("EMA 20 slope", features.ema20Slope, childRecord(readiness, "ema20Slope")),
+    regimeFeatureRow("EMA 50", features.ema50, childRecord(readiness, "ema50")),
+    regimeFeatureRow("EMA 50 slope", features.ema50Slope, childRecord(readiness, "ema50Slope")),
+    regimeFeatureRow("ATR", features.atr, childRecord(readiness, "atr")),
+    regimeFeatureRow("ATR %", features.atrPercent, childRecord(readiness, "atr")),
+    regimeFeatureRow("ATR percentile", features.atrPercentile, childRecord(readiness, "volatilityPercentiles")),
+    regimeFeatureRow("Realized volatility", features.realizedVolatility, childRecord(readiness, "realizedVolatility")),
+    regimeFeatureRow("RV percentile", features.realizedVolatilityPercentile, childRecord(readiness, "volatilityPercentiles")),
+    regimeFeatureRow("ADX", features.adx, childRecord(readiness, "adx")),
+    regimeFeatureRow("+DI / -DI", `${formatRegimeFeatureNumber(features.plusDi)} / ${formatRegimeFeatureNumber(features.minusDi)}`, childRecord(readiness, "directionalMovementSpread")),
+    regimeFeatureRow("DI spread", features.directionalMovementSpread, childRecord(readiness, "directionalMovementSpread")),
+    regimeFeatureRow("Efficiency ratio", features.efficiencyRatio, childRecord(readiness, "efficiencyRatio")),
+    regimeFeatureRow("Structure", features.structureLabel, childRecord(readiness, "structure")),
+    regimeFeatureRow("Opening range", openingRangeValue, childRecord(structureReadiness, "openingRange")),
+    regimeFeatureRow("VWAP crossings", features.vwapCrossingFrequency, childRecord(structureReadiness, "vwapCrossingFrequency")),
+    regimeFeatureRow("Liquidity", features.liquidityStatus, childRecord(readiness, "liquidity")),
+    regimeFeatureRow("Quote age", features.quoteAgeMs, childRecord(readiness, "liquidity")),
+    regimeFeatureRow("Spread bps", features.spreadBps, childRecord(readiness, "liquidity")),
+    regimeFeatureRow("Relative volume", features.relativeVolume),
+    regimeFeatureRow("QQQ relative strength", evidence.qqqRelativeStrength),
+    regimeFeatureRow("IWM relative strength", evidence.iwmRelativeStrength),
+    regimeFeatureRow("Market breadth", evidence.marketBreadth),
+    regimeFeatureRow("VIX", evidence.vixState),
+    regimeFeatureRow("ES futures", evidence.esFuturesState),
+    regimeFeatureRow("Session", features.minutesFromOpen, null, `Open +${formatRegimeFeatureNumber(features.minutesFromOpen)} min`),
+    regimeFeatureRow("Scheduled event", evidence.scheduledEventState, childRecord(readiness, "eventRisk")),
   ];
-  return rows.map(([name, value]) => ({
+  return rows;
+}
+
+function regimeFeatureRow(
+  name: string,
+  value: unknown,
+  readiness?: Record<string, unknown> | null,
+  overrideValue?: string,
+): RegimeSelectionFeature {
+  const hasValue = value !== null && value !== undefined && value !== "unknown";
+  const baseValue = overrideValue ?? formatRegimeFeatureNumber(value);
+  if (!readiness) {
+    return {
+      name,
+      value: baseValue,
+      status: hasValue ? "ok" : "na",
+    };
+  }
+  const dataReady = readiness.dataReady === true;
+  const required = readiness.requiredObservations ?? readiness.requiredMinutesFromOpen;
+  const available = readiness.observationsAvailable ?? readiness.minutesFromOpen;
+  const sampleSize = readiness.sampleSize;
+  const calibrationStatus = stringFromUnknown(readiness.calibrationStatus, "");
+  const readinessDetail =
+    required !== undefined && available !== undefined
+      ? `${formatRegimeFeatureNumber(available)}/${formatRegimeFeatureNumber(required)}`
+      : sampleSize !== undefined
+        ? `samples ${formatRegimeFeatureNumber(sampleSize)}`
+        : calibrationStatus
+          ? calibrationStatus
+          : "";
+  const readinessLabel = dataReady ? "Ready" : calibrationStatus === "missing" ? "Unavailable" : "Not data-ready";
+  return {
     name,
-    value: typeof value === "number" ? roundNumber(value, 4).toString() : String(value ?? "unknown"),
-    status: value === null || value === undefined || value === "unknown" ? "na" : "ok",
-  }));
+    value: `${baseValue} | ${readinessLabel}${readinessDetail ? `, ${readinessDetail}` : ""}`,
+    status: dataReady ? "ok" : calibrationStatus === "missing" ? "na" : "block",
+  };
+}
+
+function formatRegimeFeatureNumber(value: unknown) {
+  return typeof value === "number" ? roundNumber(value, 4).toString() : String(value ?? "unknown");
 }
 
 function regimeBackendSizingForUi(sizing: Record<string, unknown> | null, approval: Record<string, unknown> | null, signal: RegimeDecisionSignal): RegimePositionSizingResult {

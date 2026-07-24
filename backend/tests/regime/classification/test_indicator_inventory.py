@@ -1,5 +1,7 @@
 import unittest
 
+from backend.app.algorithms.regime.classifier import classify_market_regime
+from backend.app.algorithms.regime.market_snapshot import build_regime_market_snapshot
 from backend.tests.regime.fixtures.market_snapshots import classified_snapshot
 
 
@@ -55,6 +57,51 @@ class IndicatorInventoryTest(unittest.TestCase):
         self.assertNotIn("rateOfChange", classification.features)
         self.assertNotIn("momentumEvidence", classification.evidence)
         self.assertNotIn("exhaustionEvidence", classification.evidence)
+
+    def test_market_open_values_are_not_marked_ready_without_warmup(self):
+        classification = classify_market_regime(
+            build_regime_market_snapshot(
+                {
+                    "symbol": "SPY",
+                    "primaryCandles": [
+                        {
+                            "timestamp": "2026-07-23T13:30:00Z",
+                            "open": 100.0,
+                            "high": 100.15,
+                            "low": 99.95,
+                            "close": 100.05,
+                            "volume": 120000,
+                        }
+                    ],
+                    "contextFeeds": {
+                        "quoteFreshness": {
+                            "status": "fresh",
+                            "ageMs": 500,
+                            "bid": 100.04,
+                            "ask": 100.06,
+                            "tradeCount": 200,
+                            "expectedFillQuantity": 100,
+                        },
+                        "scheduledEconomicEvent": {"state": "none"},
+                    },
+                }
+            )
+        )
+
+        readiness = classification.evidence["indicatorReadiness"]["indicators"]
+
+        self.assertIsNotNone(classification.features["vwap"])
+        self.assertTrue(readiness["vwap"]["dataReady"])
+        self.assertFalse(readiness["ema20"]["dataReady"])
+        self.assertFalse(readiness["ema50"]["dataReady"])
+        self.assertFalse(readiness["atr"]["dataReady"])
+        self.assertFalse(readiness["adx"]["dataReady"])
+        self.assertFalse(readiness["realizedVolatility"]["dataReady"])
+        self.assertFalse(readiness["volatilityPercentiles"]["dataReady"])
+        self.assertFalse(readiness["structure"]["componentReadiness"]["openingRange"]["dataReady"])
+        self.assertIn("ema20", classification.missing_inputs)
+        self.assertIn("adx", classification.missing_inputs)
+        self.assertIn("realizedVolatility", classification.missing_inputs)
 
 
 if __name__ == "__main__":

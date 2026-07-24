@@ -35,7 +35,7 @@ def atr(candles: tuple[RegimeCandle, ...], period: int = 14) -> float | None:
 
 def directional_movement(candles: tuple[RegimeCandle, ...], period: int = 14) -> dict[str, float | None]:
     if len(candles) < period + 1:
-        return {"adx": None, "plusDi": None, "minusDi": None, "directionalMovementSpread": None}
+        return {"adx": None, "plusDi": None, "minusDi": None, "directionalMovementSpread": None, "observations": len(candles)}
     plus_dm: list[float] = []
     minus_dm: list[float] = []
     true_ranges: list[float] = []
@@ -49,7 +49,7 @@ def directional_movement(candles: tuple[RegimeCandle, ...], period: int = 14) ->
         true_ranges.append(max(current.high - current.low, abs(current.high - previous.close), abs(current.low - previous.close)))
     recent_tr = sum(true_ranges[-period:])
     if recent_tr <= 0:
-        return {"adx": 0.0, "plusDi": 0.0, "minusDi": 0.0, "directionalMovementSpread": 0.0}
+        return {"adx": 0.0, "plusDi": 0.0, "minusDi": 0.0, "directionalMovementSpread": 0.0, "observations": len(candles)}
     plus_di = 100 * sum(plus_dm[-period:]) / recent_tr
     minus_di = 100 * sum(minus_dm[-period:]) / recent_tr
     dx_values: list[float] = []
@@ -67,6 +67,7 @@ def directional_movement(candles: tuple[RegimeCandle, ...], period: int = 14) ->
         "plusDi": plus_di,
         "minusDi": minus_di,
         "directionalMovementSpread": (plus_di - minus_di) / 100,
+        "observations": len(candles),
     }
 
 
