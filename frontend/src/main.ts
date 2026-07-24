@@ -2218,6 +2218,44 @@ type MarketLayer = {
   validUntil?: string | null;
 };
 
+type SessionAuthoritativePayload = {
+  classification?: Record<string, unknown>;
+  profile?: Record<string, unknown>;
+  routePermissions?: Record<string, unknown>;
+  orderAffectingStatus?: Record<string, unknown> | string;
+  display?: {
+    phase?: string;
+    behavior?: string;
+    volatility?: string;
+    liquidity?: string;
+    readiness?: string;
+    reasonCodes?: string[];
+    unknownOrStale?: boolean;
+  };
+  transitionState?: Record<string, unknown>;
+  outputMode?: string;
+  phase?: string;
+  behavior?: string;
+  volatilityState?: string;
+  liquidityState?: string;
+  dataQualityState?: string;
+  eventRiskState?: string;
+  directionBias?: string;
+  overallConfidence?: number;
+  reasonCodes?: string[];
+  safetyBlocks?: Record<string, unknown>;
+};
+
+type SessionCurrentResponse = {
+  apiVersion: string;
+  subsystemVersion: string;
+  symbol: string;
+  status: "ready" | "unavailable";
+  current: SessionAuthoritativePayload;
+  orderAffectingStatus: Record<string, unknown> | string;
+  reasonCodes: string[];
+};
+
 type StrategyFit = {
   name: string;
   role?: MetaStrategyRole;
@@ -2235,6 +2273,7 @@ type MarketContext = {
   updatedAt?: string | null;
   regime: MarketLayer;
   session: MarketLayer;
+  sessionAuthoritative?: SessionAuthoritativePayload | null;
   event: MarketLayer;
   strategies: StrategyFit[];
 };
@@ -3059,6 +3098,9 @@ const state = {
   dynamicArtifactSettingsKey: "",
   marketStatus: "checking",
   marketContext: null as MarketContext | null,
+  sessionCurrent: null as SessionAuthoritativePayload | null,
+  sessionCurrentStatus: "idle" as "idle" | "loading" | "ready" | "error",
+  sessionCurrentError: "",
   macroEvents: [] as MacroEvent[],
   macroExpanded: persistedUiState.macroExpanded ?? false,
   macroStatus: "loading",
@@ -6848,7 +6890,13 @@ async function loadMarketContext(options: { showLoading?: boolean; refresh?: boo
     if (!response.ok) {
       throw new Error(await response.text());
     }
-    state.marketContext = (await response.json()) as MarketContext;
+    const context = (await response.json()) as MarketContext;
+    state.marketContext = context;
+    if (context.sessionAuthoritative) {
+      state.sessionCurrent = context.sessionAuthoritative;
+      state.sessionCurrentStatus = "ready";
+      state.sessionCurrentError = "";
+    }
     state.contextStatus = "ready";
     state.contextError = "";
     state.contextAsOf = asOf;
@@ -6858,7 +6906,40 @@ async function loadMarketContext(options: { showLoading?: boolean; refresh?: boo
   }
 
   updateMarketContext();
+  void fetchSessionCurrent({ showLoading: false });
   void ensureVotingEnsembleBackendDecision({ force: true });
+}
+
+async function fetchSessionCurrent(options: { showLoading?: boolean; sessionDate?: string } = {}) {
+  if ((options.showLoading ?? true) && !state.sessionCurrent) {
+    state.sessionCurrentStatus = "loading";
+    state.sessionCurrentError = "";
+    updateMarketContext();
+  }
+
+  const params = new URLSearchParams({ symbol: state.symbol });
+  if (options.sessionDate) {
+    params.set("session_date", options.sessionDate);
+  }
+
+  try {
+    const response = await fetch(`${API_BASE}${TRADING_ALGORITHM_INVENTORY_ENDPOINTS.session}?${params.toString()}`);
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+    const payload = (await response.json()) as SessionCurrentResponse;
+    if (payload.status === "ready" || !state.sessionCurrent) {
+      state.sessionCurrent = payload.current;
+    }
+    state.sessionCurrentStatus = payload.status === "ready" ? "ready" : "error";
+    state.sessionCurrentError =
+      payload.status === "ready" ? "" : payload.reasonCodes.map(humanReasonCode).filter(Boolean).join(" - ");
+  } catch (error) {
+    state.sessionCurrentStatus = "error";
+    state.sessionCurrentError = error instanceof Error ? error.message : "Session inventory unavailable";
+  }
+
+  updateMarketContext();
 }
 
 function updateSpyNews() {
@@ -20456,11 +20537,160 @@ function updateMarketContext() {
   }
 
   renderLayer(regimeLayer, context.regime);
-  renderLayer(sessionLayer, context.session);
+  renderAuthoritativeSessionLayer(sessionLayer, state.sessionCurrent ?? context.sessionAuthoritative ?? null, context.session);
   renderLayer(eventLayer, context.event);
   renderStrategies(context);
   renderDecision(context);
   updateAlgorithmPanel(visibleCandles());
+}
+
+function renderAuthoritativeSessionLayer(
+  element: HTMLElement,
+  session: SessionAuthoritativePayload | null,
+  fallback: MarketLayer,
+) {
+  if (!session) {
+    renderLayer(element, fallback);
+    return;
+  }
+
+  const classification = sessionClassificationPayload(session);
+  const display = session.display ?? {};
+  const phaseRaw = stringFromUnknown(sessionPayloadField(classification, session, "phase"), "unknown");
+  const behaviorRaw = stringFromUnknown(sessionPayloadField(classification, session, "behavior"), "unknown");
+  const volatilityRaw = stringFromUnknown(
+    sessionPayloadField(classification, session, "volatilityState", "volatility_state"),
+    "unknown",
+  );
+  const liquidityRaw = stringFromUnknown(
+    sessionPayloadField(classification, session, "liquidityState", "liquidity_state"),
+    "unknown",
+  );
+  const readinessRaw = stringFromUnknown(
+    sessionPayloadField(classification, session, "dataQualityState", "data_quality_state"),
+    "unknown",
+  );
+  const directionRaw = stringFromUnknown(
+    sessionPayloadField(classification, session, "directionBias", "direction_bias"),
+    "neutral",
+  );
+  const confidenceValue = numberFromUnknown(
+    sessionPayloadField(classification, session, "overallConfidence", "overall_confidence"),
+    0,
+  );
+  const phase = display.phase || humanSessionValue(phaseRaw);
+  const behavior = display.behavior || humanSessionValue(behaviorRaw);
+  const volatility = display.volatility || humanSessionValue(volatilityRaw);
+  const liquidity = display.liquidity || humanSessionValue(liquidityRaw);
+  const readiness = display.readiness || humanSessionValue(readinessRaw);
+  const reasonCodes = sessionReasonCodes(session, classification, display);
+  const unknownOrStale = sessionUnknownOrStale(session, {
+    volatility: volatilityRaw,
+    liquidity: liquidityRaw,
+    readiness: readinessRaw,
+  });
+  const orderStatus = sessionOrderAffectingStatus(session);
+  const transitionLabel = sessionTransitionLabel(session.transitionState);
+
+  element.classList.remove("loading", "error");
+  element.dataset.bias = directionRaw;
+  element.dataset.volatility = volatilityRaw;
+  element.dataset.status = unknownOrStale ? "unknown" : orderStatus.enabled ? "order-affecting" : "shadow";
+  element.querySelector(".layer-heading strong")!.textContent = `${phase} / ${behavior}`;
+  element.querySelector(".layer-metrics")!.innerHTML = `
+    <span class="metric ${directionRaw}">${escapeHtml(humanSessionValue(directionRaw))}</span>
+    <span class="metric ${volatilityRaw}">${escapeHtml(volatility)}</span>
+    <span class="metric confidence">${confidence(confidenceValue)}</span>
+    <span class="metric neutral">Readiness ${escapeHtml(readiness)}</span>
+    <span class="metric neutral">Order affecting ${orderStatus.enabled ? "Enabled" : escapeHtml(humanSessionValue(orderStatus.status))}</span>
+    <span class="metric neutral">Transition ${escapeHtml(transitionLabel)}</span>
+  `;
+  element.querySelector(".layer-reasons")!.innerHTML = [
+    unknownOrStale ? "Unknown / stale evidence" : "",
+    ...reasonCodes,
+    state.sessionCurrentStatus === "error" ? state.sessionCurrentError : "",
+  ]
+    .filter(Boolean)
+    .map((reason) => `<span class="reason-chip">${escapeHtml(reason)}</span>`)
+    .join("");
+  element.querySelector(".layer-signals")!.innerHTML = `
+    <span class="signal-chip" data-status="${phaseRaw === "unknown" ? "unknown" : "ok"}"><span>Phase</span><strong>${escapeHtml(phase)}</strong></span>
+    <span class="signal-chip" data-status="${behaviorRaw === "unknown" ? "unknown" : "ok"}"><span>Behavior</span><strong>${escapeHtml(behavior)}</strong></span>
+    <span class="signal-chip" data-status="${volatilityRaw === "unknown" ? "unknown" : "ok"}"><span>Volatility</span><strong>${escapeHtml(volatility)}</strong></span>
+    <span class="signal-chip" data-status="${["unknown", "stale"].includes(liquidityRaw) ? "unknown" : "ok"}"><span>Liquidity</span><strong>${escapeHtml(liquidity)}</strong></span>
+    <span class="signal-chip" data-status="${["unknown", "stale", "incomplete", "invalid"].includes(readinessRaw) ? "unknown" : "ok"}"><span>Readiness</span><strong>${escapeHtml(readiness)}</strong></span>
+    ${unknownOrStale ? `<span class="signal-chip" data-status="unknown"><span>Evidence</span><strong>Unknown / stale</strong></span>` : ""}
+  `;
+}
+
+function sessionClassificationPayload(session: SessionAuthoritativePayload): Record<string, unknown> {
+  return isRecord(session.classification) ? session.classification : (session as Record<string, unknown>);
+}
+
+function sessionPayloadField(
+  classification: Record<string, unknown>,
+  session: SessionAuthoritativePayload,
+  camelKey: string,
+  snakeKey = camelKey,
+) {
+  return classification[snakeKey] ?? classification[camelKey] ?? (session as Record<string, unknown>)[camelKey] ?? (session as Record<string, unknown>)[snakeKey];
+}
+
+function sessionReasonCodes(
+  session: SessionAuthoritativePayload,
+  classification: Record<string, unknown>,
+  display: SessionAuthoritativePayload["display"],
+) {
+  const displayCodes = Array.isArray(display?.reasonCodes) ? display.reasonCodes : [];
+  const rawCodes = arrayFromUnknown(
+    classification.reason_codes ?? classification.reasonCodes ?? session.reasonCodes,
+  ).map(humanReasonCode);
+  return (displayCodes.length ? displayCodes : rawCodes).filter(Boolean);
+}
+
+function humanReasonCode(value: unknown) {
+  return humanSessionValue(stringFromUnknown(value).replace(/^session[._]/i, "").replace(/^SESSION_/i, ""));
+}
+
+function humanSessionValue(value: unknown) {
+  const text = stringFromUnknown(value, "unknown").replaceAll(".", " ").replaceAll("_", " ").trim();
+  return text ? text.replace(/\b\w/g, (letter) => letter.toUpperCase()) : "Unknown";
+}
+
+function sessionUnknownOrStale(
+  session: SessionAuthoritativePayload,
+  states: { volatility: string; liquidity: string; readiness: string },
+) {
+  if (session.display?.unknownOrStale) {
+    return true;
+  }
+  return (
+    ["unknown", "stale"].includes(states.liquidity) ||
+    ["unknown", "stale", "incomplete", "invalid"].includes(states.readiness) ||
+    states.volatility === "unknown"
+  );
+}
+
+function sessionOrderAffectingStatus(session: SessionAuthoritativePayload) {
+  const raw = session.orderAffectingStatus;
+  if (isRecord(raw)) {
+    return {
+      enabled: Boolean(raw.enabled),
+      status: stringFromUnknown(raw.status, Boolean(raw.enabled) ? "enabled" : "disabled"),
+    };
+  }
+  const status = stringFromUnknown(raw, session.outputMode ?? "display_only");
+  return {
+    enabled: ["enabled", "paper_affecting", "active"].includes(status.toLowerCase()),
+    status,
+  };
+}
+
+function sessionTransitionLabel(transitionState: Record<string, unknown> | undefined) {
+  if (!transitionState) {
+    return "Not reported";
+  }
+  return humanReasonCode(transitionState.transitionReason ?? transitionState.transition_reason ?? transitionState.currentBehavior ?? "not reported");
 }
 
 function renderLayer(element: HTMLElement, layer: MarketLayer) {
@@ -21006,6 +21236,7 @@ void loadVixRisk();
 void loadSpyNews();
 void loadEsSnapshot();
 void loadVotingEnsembleInventory();
+void fetchSessionCurrent();
 void loadMarketContext();
 void loadCandles();
 void loadLatestDynamicTradingArtifact();

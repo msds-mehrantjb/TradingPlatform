@@ -10,6 +10,7 @@ export const TRADING_ALGORITHM_INVENTORY_ENDPOINTS = {
   regime: "/api/v2/algorithms/regime/inventory",
   wca: "/api/v2/algorithms/wca/inventory",
   weightedVoting: "/api/v2/algorithms/weighted-voting/inventory",
+  session: "/api/session/current",
 } as const;
 
 export type TradingAlgorithmInventoryKey = keyof typeof TRADING_ALGORITHM_INVENTORY_ENDPOINTS;

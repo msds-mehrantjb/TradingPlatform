@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .alpaca import AlpacaClient, demo_bars, local_market_status
 from .algorithms.regime.api import router as regime_router
 from .algorithms.regime.api import REGIME_REPOSITORY
+from .algorithms.session.api import router as session_router
 from .algorithms.meta_strategy.api import router as meta_strategy_router
 from .algorithms.voting_ensemble.api import router as voting_ensemble_router
 from .algorithms.wca.api import router as wca_router
@@ -85,6 +86,7 @@ app.include_router(voting_ensemble_router)
 app.include_router(weighted_voting_router)
 app.include_router(wca_router)
 app.include_router(regime_router)
+app.include_router(session_router)
 app.include_router(meta_strategy_router)
 app.include_router(risk_router)
 

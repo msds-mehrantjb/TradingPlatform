@@ -4594,6 +4594,11 @@ select {
   background: #ecfdf5;
 }
 
+.context-layer[data-layer="session"][data-status="unknown"] {
+  background: #fff7ed;
+  border-color: #fed7aa;
+}
+
 .context-layer[data-layer="event"] {
   background: #fff7ed;
 }
@@ -4716,6 +4721,15 @@ select {
 
 .signal-chip[data-status="na"] strong {
   color: #98a2b3;
+}
+
+.signal-chip[data-status="unknown"] {
+  background: #fff7ed;
+  border-color: #fdba74;
+}
+
+.signal-chip[data-status="unknown"] strong {
+  color: #9a3412;
 }
 
 .metric {

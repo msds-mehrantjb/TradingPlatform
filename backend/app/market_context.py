@@ -6,6 +6,17 @@ from math import sqrt
 from statistics import mean
 from typing import Any, Literal
 
+from backend.app.algorithms.session import (
+    SESSION_SIGNAL_NAMES as AUTHORITATIVE_SESSION_SIGNAL_NAMES,
+    classify_session,
+    legacy_failed_breakouts,
+    legacy_liquidity_stress_signal,
+    legacy_volume_pace,
+    resolve_session_profile,
+    session_classification_to_layer_result,
+    session_route_permissions,
+)
+
 
 LayerName = Literal["regime", "session", "event"]
 Bias = Literal["long", "short", "neutral", "cash"]
@@ -33,22 +44,7 @@ REGIME_SIGNAL_NAMES = [
     "Price vs MAs",
 ]
 
-SESSION_SIGNAL_NAMES = [
-    "Opening range 5m",
-    "Opening range 15m",
-    "Opening range 30m",
-    "VWAP",
-    "VWAP slope",
-    "VWAP crosses",
-    "Range vs avg daily range",
-    "Realized intraday vol",
-    "Directional efficiency",
-    "Volume pace vs session avg",
-    "Failed breakouts",
-    "Liquidity stress",
-    "Pullback depth",
-    "Same-time volume avg",
-]
+SESSION_SIGNAL_NAMES = list(AUTHORITATIVE_SESSION_SIGNAL_NAMES)
 
 EVENT_SIGNAL_NAMES = [
     "Previous close vs open",
@@ -130,7 +126,8 @@ def compute_market_context(symbol: str, daily: list[dict], intraday: list[dict])
     intraday_bars = _latest_session(sorted(intraday, key=lambda candle: candle["timestamp"]))
 
     regime = _compute_regime(daily_bars)
-    session = _compute_session(intraday_bars, daily_bars)
+    session_classification = classify_session(symbol, intraday_bars, daily_bars)
+    session = session_classification_to_layer_result(session_classification, LayerResult)
     event = _compute_event(daily_bars, intraday_bars)
     strategies = _score_strategies(regime, session, event)
 
@@ -145,6 +142,7 @@ def compute_market_context(symbol: str, daily: list[dict], intraday: list[dict])
         "updatedAt": latest_timestamp,
         "regime": regime.as_dict(),
         "session": session.as_dict(),
+        "sessionAuthoritative": _session_authoritative_payload(session_classification),
         "event": event.as_dict(),
         "strategies": strategies,
     }
@@ -295,129 +293,42 @@ def _compute_regime(candles: list[dict]) -> LayerResult:
     )
 
 
-def _compute_session(candles: list[dict], daily: list[dict]) -> LayerResult:
-    if len(candles) < 10:
-        return LayerResult(
-            layer="session",
-            label="Session Building",
-            direction_bias="neutral",
-            volatility="normal",
-            confidence=0.25,
-            reasons=["Need more intraday candles"],
-            strategy_tags=["wait"],
-            candle_window=_candle_window("1Min", candles, "Today's intraday candles"),
-            signals=_na_signals(SESSION_SIGNAL_NAMES),
-        )
+def _compute_session(symbol: str, candles: list[dict], daily: list[dict]) -> LayerResult:
+    classification = classify_session(symbol, candles, daily)
+    return session_classification_to_layer_result(classification, LayerResult)
 
-    first = candles[0]
-    latest = candles[-1]
-    closes = [float(candle["close"]) for candle in candles]
-    highs = [float(candle["high"]) for candle in candles]
-    lows = [float(candle["low"]) for candle in candles]
-    volumes = [float(candle["volume"]) for candle in candles]
-    session_high = max(highs)
-    session_low = min(lows)
-    session_range = max(session_high - session_low, 0.01)
-    move = float(latest["close"]) - float(first["open"])
-    efficiency = abs(move) / session_range
-    vwap = _session_vwap(candles)
-    vwap_slope = _vwap_slope(candles)
-    vwap_crosses = _level_crosses(closes, vwap) if vwap else 0
-    recent_vol = _average_range(candles[-15:])
-    base_vol = _average_range(candles[:-15] or candles)
-    avg_daily_range = _average_daily_range(daily, 20)
-    range_vs_avg_daily = session_range / avg_daily_range if avg_daily_range else None
-    realized_intraday_vol = _intraday_realized_vol(closes)
-    opening = candles[: min(30, len(candles))]
-    opening_5 = candles[: min(5, len(candles))]
-    opening_15 = candles[: min(15, len(candles))]
-    opening_high = max(float(candle["high"]) for candle in opening)
-    opening_low = min(float(candle["low"]) for candle in opening)
-    above_vwap = bool(vwap and float(latest["close"]) > vwap)
-    below_vwap = bool(vwap and float(latest["close"]) < vwap)
-    volume_pace = _volume_pace(volumes)
-    failed_breakouts = _failed_breakouts(candles, opening_high, opening_low)
-    liquidity_stress = _liquidity_stress(candles)
-    signals = [
-        _signal("Opening range 5m", _range_value(opening_5)),
-        _signal("Opening range 15m", _range_value(opening_15)),
-        _signal("Opening range 30m", _range_value(opening)),
-        _signal("VWAP", _money_value(vwap)),
-        _signal("VWAP slope", _pct_value(vwap_slope)),
-        _signal("VWAP crosses", str(vwap_crosses)),
-        _signal("Range vs avg daily range", _multiple_value(range_vs_avg_daily)),
-        _signal("Realized intraday vol", _pct_value(realized_intraday_vol)),
-        _signal("Directional efficiency", _pct_value(efficiency)),
-        _signal("Volume pace vs session avg", _multiple_value(volume_pace)),
-        _signal("Failed breakouts", failed_breakouts),
-        _signal("Liquidity stress", liquidity_stress),
-        _signal("Pullback depth", "NA"),
-        _signal("Same-time volume avg", "NA"),
-    ]
 
-    reasons: list[str] = []
-    tags: list[str] = []
-    label = "Balanced Session"
-    bias: Bias = "neutral"
-    volatility: Volatility = "normal"
+def _session_authoritative_payload(classification: Any) -> dict[str, Any]:
+    profile = resolve_session_profile(classification)
+    return {
+        "classification": classification.model_dump(mode="json"),
+        "profile": profile.as_dict(),
+        "routePermissions": session_route_permissions(classification),
+        "orderAffectingStatus": {
+            "enabled": False,
+            "status": "shadow",
+            "reasonCodes": ("session.market_context.order_affecting_disabled",),
+        },
+        "display": {
+            "phase": _humanize_session_value(classification.phase.value),
+            "behavior": _humanize_session_value(classification.behavior.value),
+            "volatility": _humanize_session_value(classification.volatility_state.value),
+            "liquidity": _humanize_session_value(classification.liquidity_state.value),
+            "readiness": _humanize_session_value(classification.data_quality_state.value),
+            "reasonCodes": [_humanize_session_reason(code) for code in classification.reason_codes],
+            "unknownOrStale": classification.liquidity_state.value in {"unknown", "stale"}
+            or classification.data_quality_state.value in {"unknown", "stale", "incomplete", "invalid"},
+        },
+    }
 
-    if efficiency > 0.62 and above_vwap and float(latest["close"]) > opening_high:
-        label = "Trend Day Up"
-        bias = "long"
-        tags.extend(["trend-day", "long-bias", "above-vwap"])
-        reasons.extend(["Price is above VWAP", "Opening range high is cleared"])
-    elif efficiency > 0.62 and below_vwap and float(latest["close"]) < opening_low:
-        label = "Trend Day Down"
-        bias = "short"
-        tags.extend(["trend-day", "short-bias", "below-vwap"])
-        reasons.extend(["Price is below VWAP", "Opening range low is cleared"])
-    elif vwap_crosses >= 5 and efficiency < 0.38:
-        label = "Choppy Whipsaw Day"
-        tags.extend(["chop", "avoid-breakout"])
-        reasons.append("Price has crossed VWAP repeatedly")
-    elif efficiency < 0.42 and vwap_crosses >= 2:
-        label = "Mean-Reversion Day"
-        tags.extend(["mean-reversion", "vwap-reversion"])
-        reasons.append("Price keeps rotating around VWAP")
-    else:
-        reasons.append("Intraday trend and rotation signals are mixed")
-        tags.append("balanced")
 
-    if recent_vol > base_vol * 1.35:
-        volatility = "expanding"
-        tags.append("volatility-expansion")
-        reasons.append("Recent candle range is expanding")
-    elif recent_vol < base_vol * 0.7:
-        volatility = "contracting"
-        tags.append("volatility-contraction")
-        reasons.append("Recent candle range is contracting")
+def _humanize_session_value(value: str) -> str:
+    return value.replace("_", " ").title()
 
-    if sum(volumes[-10:]) > (sum(volumes[:-10]) / max(len(volumes[:-10]), 1)) * 10 * 1.7:
-        tags.append("liquidity-watch")
-        reasons.append("Recent volume pace is elevated")
 
-    confidence = _confidence(
-        [
-            efficiency > 0.5,
-            vwap_crosses <= 2 if "trend-day" in tags else vwap_crosses >= 2,
-            abs(vwap_slope) > 0.01,
-            recent_vol != base_vol,
-            len(candles) >= 30,
-        ],
-        floor=0.42,
-    )
-
-    return LayerResult(
-        layer="session",
-        label=label,
-        direction_bias=bias,
-        volatility=volatility,
-        confidence=confidence,
-        reasons=reasons,
-        strategy_tags=_unique(tags),
-        candle_window=_candle_window("1Min", candles, "Today's 1-minute candles"),
-        signals=signals,
-    )
+def _humanize_session_reason(value: str) -> str:
+    text = str(value).replace("session.", "").replace("SESSION_", "")
+    return text.replace(".", " ").replace("_", " ").strip().title()
 
 
 def _compute_event(daily: list[dict], candles: list[dict]) -> LayerResult:
@@ -814,10 +725,10 @@ def _slope(values: list[float], period: int) -> float:
     return (values[-1] - previous) / previous
 
 
-def _session_vwap(candles: list[dict]) -> float:
+def _session_vwap(candles: list[dict]) -> float | None:
     total_volume = sum(float(candle["volume"]) for candle in candles)
     if total_volume <= 0:
-        return 0
+        return None
     return (
         sum(
             ((float(candle["high"]) + float(candle["low"]) + float(candle["close"])) / 3)
@@ -828,13 +739,13 @@ def _session_vwap(candles: list[dict]) -> float:
     )
 
 
-def _vwap_slope(candles: list[dict]) -> float:
+def _vwap_slope(candles: list[dict]) -> float | None:
     if len(candles) < 20:
-        return 0
+        return None
     early = _session_vwap(candles[: len(candles) // 2])
     late = _session_vwap(candles[len(candles) // 2 :])
-    if early == 0:
-        return 0
+    if early is None or late is None or early == 0:
+        return None
     return (late - early) / early
 
 
@@ -871,7 +782,7 @@ def _na_signals(names: list[str]) -> list[dict[str, str]]:
 
 
 def _signal(name: str, value: str) -> dict[str, str]:
-    return {"name": name, "value": value, "status": "na" if value == "NA" else "ok"}
+    return {"name": name, "value": value, "status": "na" if value in {"NA", "unknown"} else "ok"}
 
 
 def _money_value(value: float | None) -> str:
@@ -983,40 +894,15 @@ def _intraday_realized_vol(values: list[float]) -> float | None:
 
 
 def _volume_pace(volumes: list[float]) -> float | None:
-    if len(volumes) < 20:
-        return None
-    recent = mean(volumes[-10:])
-    baseline = mean(volumes[:-10])
-    if baseline <= 0:
-        return None
-    return recent / baseline
+    return legacy_volume_pace(volumes)
 
 
 def _failed_breakouts(candles: list[dict], opening_high: float, opening_low: float) -> str:
-    if len(candles) < 15:
-        return "NA"
-    failures = 0
-    for candle in candles[15:]:
-        high = float(candle["high"])
-        low = float(candle["low"])
-        close = float(candle["close"])
-        if high > opening_high and close < opening_high:
-            failures += 1
-        if low < opening_low and close > opening_low:
-            failures += 1
-    return str(failures)
+    return legacy_failed_breakouts(candles, opening_high, opening_low)
 
 
 def _liquidity_stress(candles: list[dict]) -> str:
-    if len(candles) < 20:
-        return "NA"
-    recent = candles[-5:]
-    baseline = candles[:-5]
-    range_ratio = _average_range(recent) / _average_range(baseline)
-    recent_volume = mean(float(candle["volume"]) for candle in recent)
-    baseline_volume = mean(float(candle["volume"]) for candle in baseline)
-    volume_ratio = recent_volume / baseline_volume if baseline_volume else 0
-    return "Active" if range_ratio >= 1.8 and volume_ratio >= 1.8 else "Inactive"
+    return legacy_liquidity_stress_signal(candles)
 
 
 def _large_body_range_spike(candles: list[dict]) -> str:
