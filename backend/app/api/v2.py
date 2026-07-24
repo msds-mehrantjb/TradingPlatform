@@ -70,8 +70,12 @@ from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_STRAT
 from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_SERVICE_VERSION
 from backend.app.strategies import StrategyEvaluationContext, resolve_strategy
 from backend.app.strategies.context import (
+    EconomicEventContext,
     MarketBreadthMomentumContext,
+    MarketStructureContext,
     RelativeStrengthQqqIwmContext,
+    VolumeConfirmationContext,
+    VwapPositionContext,
 )
 from backend.app.strategies.directional import (
     BollingerAtrReversionStrategy,
@@ -490,8 +494,12 @@ def build_replay_engine(
         ReplayComponents(
             directionalStrategies=tuple(build_directional_strategies(None)),
             contextModules=(
+                EconomicEventContext(),
                 RelativeStrengthQqqIwmContext(),
                 MarketBreadthMomentumContext(),
+                MarketStructureContext(),
+                VolumeConfirmationContext(),
+                VwapPositionContext(),
             ),
             regimeModule=AdxAtrRegimeClassifier(),
             mlConfig=ml_config or SafeMLInferenceConfig(),

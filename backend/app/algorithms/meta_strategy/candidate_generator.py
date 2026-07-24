@@ -64,11 +64,16 @@ def generate_deterministic_candidate(
     settings = config or CandidateGenerationConfig()
     directional_outputs = evaluate_registry_group(snapshot, DIRECTIONAL_STRATEGIES)
     context_outputs = evaluate_registry_group(snapshot, CONTEXT_STRATEGIES)
+    active_context_outputs = tuple(
+        output
+        for output, entry in zip(context_outputs, CONTEXT_STRATEGIES, strict=True)
+        if entry.enabled
+    )
     regime_outputs = evaluate_registry_group(snapshot, REGIME_STRATEGIES)
     safety_outputs = evaluate_registry_group(snapshot, SAFETY_STRATEGIES)
     safety_blockers = tuple(output for output in safety_outputs if bool((output.evidence or {}).get("blocksNewEntries")))
     aggregation = aggregate_family_scores(
-        _directional_contributions(directional_outputs, DIRECTIONAL_STRATEGIES, context_outputs, regime_outputs),
+        _directional_contributions(directional_outputs, DIRECTIONAL_STRATEGIES, active_context_outputs, regime_outputs),
         config=settings.aggregation,
     )
     safety_blocks = settings.block_new_entries_on_safety_failure and bool(safety_blockers)

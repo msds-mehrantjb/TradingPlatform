@@ -53,3 +53,19 @@ test("backend Regime paths are the only authoritative Regime runtime paths", () 
   assert.doesNotMatch(frontendText, /frontend\/src\/algorithms\/regime\/backtest\/engine\.ts/);
   assert.doesNotMatch(frontendText, /runRegimeBacktest\(/);
 });
+
+test("frontend does not own Economic Event trading decisions", () => {
+  const main = read("frontend/src/main.ts");
+  const backendContext = read("backend/app/strategies/context/economic_event_context.py");
+  const backendPolicy = read("backend/app/trading_policy/risk_caps.py");
+
+  assert.match(backendContext, /class EconomicEventContext/);
+  assert.match(backendContext, /class EconomicEventPolicy/);
+  assert.match(backendPolicy, /_event_cap/);
+  assert.doesNotMatch(main, /\beventModeGate\(/);
+  assert.doesNotMatch(main, /directionalSignal\(context\.event/);
+  assert.doesNotMatch(main, /eventSignal !== intendedSide/);
+  assert.doesNotMatch(main, /eventActive \? \["Event"\]/);
+  assert.match(main, /backendEventContextDisplayGate/);
+  assert.match(main, /frontend displays backend context only/);
+});

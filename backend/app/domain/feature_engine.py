@@ -109,6 +109,106 @@ class FeatureValue(DomainModel):
         return _require_utc(value) if value else None
 
 
+class EconomicEventState(DomainModel):
+    event_id: str | None = None
+    event_type: str | None = None
+    event_category: str | None = None
+    importance: Literal["low", "medium", "high", "unknown"] = "unknown"
+    scheduled_at: datetime | None = None
+    released_at: datetime | None = None
+    provider_timestamp: datetime | None = None
+    received_at: datetime | None = None
+    provider: str | None = None
+    status: Literal["none", "scheduled", "active", "released", "cancelled", "postponed", "blackout", "unknown"] = "unknown"
+    actual: float | str | None = None
+    forecast: float | str | None = None
+    previous: float | str | None = None
+    revised_previous: float | str | None = None
+    surprise_raw: float | None = None
+    surprise_pct: float | None = None
+    surprise_zscore: float | None = None
+    surprise_mean: float | None = None
+    surprise_stddev: float | None = Field(default=None, ge=0)
+    surprise_sample_count: int | None = Field(default=None, ge=0)
+    affected_symbols: tuple[str, ...] = ()
+    feed_health: Literal["healthy", "degraded", "stale", "unavailable", "unknown"] = "unknown"
+    event_phase: str | None = None
+    malformed: bool = False
+    duplicate_of: str | None = None
+    revision_number: int | None = Field(default=None, ge=0)
+    unexpected_breaking_event: bool = False
+    day_type: str | None = None
+    volatility_regime: str | None = None
+    baseline_version: str | None = None
+    simultaneous_events: tuple[dict[str, Any], ...] = ()
+    market_reaction: dict[str, Any] = Field(default_factory=dict)
+    latency: dict[str, Any] = Field(default_factory=dict)
+    execution_economics: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_event_payloads(cls, value: Any) -> Any:
+        if isinstance(value, EconomicEventState):
+            return value
+        if not isinstance(value, dict):
+            return value
+        status = str(value.get("status") or value.get("state") or "").lower()
+        active = value.get("active")
+        if active is True and status in {"", "none", "no_event"}:
+            status = "active"
+        if status in {"", "no_event"}:
+            status = "none" if value.get("category") == "none" else "unknown"
+        importance = str(value.get("importance") or value.get("impact") or value.get("severity") or "unknown").lower()
+        if importance in {"critical"}:
+            importance = "high"
+        if importance not in {"low", "medium", "high"}:
+            importance = "unknown"
+        feed_health = str(value.get("feed_health") or value.get("feedHealth") or "unknown").lower()
+        if feed_health not in {"healthy", "degraded", "stale", "unavailable"}:
+            feed_health = "unknown"
+        return {
+            "event_id": value.get("event_id") or value.get("eventId") or value.get("id"),
+            "event_type": value.get("event_type") or value.get("eventType") or value.get("type"),
+            "event_category": value.get("event_category") or value.get("eventCategory") or value.get("category"),
+            "importance": importance,
+            "scheduled_at": value.get("scheduled_at") or value.get("scheduledAt") or value.get("scheduledReleaseTime") or value.get("eventTimestamp") or value.get("eventTime"),
+            "released_at": value.get("released_at") or value.get("releasedAt") or value.get("releaseTime"),
+            "provider_timestamp": value.get("provider_timestamp") or value.get("providerTimestamp"),
+            "received_at": value.get("received_at") or value.get("receivedAt") or value.get("receiptTimestamp"),
+            "provider": value.get("provider") or value.get("source"),
+            "status": status if status in {"none", "scheduled", "active", "released", "cancelled", "postponed", "blackout"} else "unknown",
+            "actual": value.get("actual"),
+            "forecast": value.get("forecast") or value.get("consensus"),
+            "previous": value.get("previous"),
+            "revised_previous": value.get("revised_previous") or value.get("revisedPrevious"),
+            "surprise_raw": value.get("surprise_raw") or value.get("surpriseRaw"),
+            "surprise_pct": value.get("surprise_pct") or value.get("surprisePct"),
+            "surprise_zscore": value.get("surprise_zscore") or value.get("surpriseZscore"),
+            "surprise_mean": value.get("surprise_mean") or value.get("surpriseMean") or (value.get("surprise_baseline") or value.get("surpriseBaseline") or {}).get("mean"),
+            "surprise_stddev": value.get("surprise_stddev") or value.get("surpriseStddev") or value.get("surprise_standard_deviation") or value.get("surpriseStandardDeviation") or (value.get("surprise_baseline") or value.get("surpriseBaseline") or {}).get("stddev"),
+            "surprise_sample_count": value.get("surprise_sample_count") or value.get("surpriseSampleCount") or (value.get("surprise_baseline") or value.get("surpriseBaseline") or {}).get("sampleCount"),
+            "affected_symbols": _symbols_tuple(value.get("affected_symbols") or value.get("affectedSymbols") or ()),
+            "feed_health": feed_health,
+            "event_phase": value.get("event_phase") or value.get("eventPhase"),
+            "malformed": bool(value.get("malformed", False)),
+            "duplicate_of": value.get("duplicate_of") or value.get("duplicateOf"),
+            "revision_number": value.get("revision_number") or value.get("revisionNumber"),
+            "unexpected_breaking_event": bool(value.get("unexpected_breaking_event") or value.get("unexpectedBreakingEvent") or False),
+            "day_type": value.get("day_type") or value.get("dayType"),
+            "volatility_regime": value.get("volatility_regime") or value.get("volatilityRegime"),
+            "baseline_version": value.get("baseline_version") or value.get("baselineVersion"),
+            "simultaneous_events": tuple(value.get("simultaneous_events") or value.get("simultaneousEvents") or ()),
+            "market_reaction": dict(value.get("market_reaction") or value.get("marketReaction") or {}),
+            "latency": dict(value.get("latency") or {}),
+            "execution_economics": dict(value.get("execution_economics") or value.get("executionEconomics") or {}),
+        }
+
+    @field_validator("scheduled_at", "released_at", "provider_timestamp", "received_at")
+    @classmethod
+    def event_timestamps_must_be_utc(cls, value: datetime | None) -> datetime | None:
+        return _require_utc(value) if value else None
+
+
 class PointInTimeFeatureRequest(DomainModel):
     evaluationTimestamp: datetime
     sessionDate: date
@@ -123,7 +223,7 @@ class PointInTimeFeatureRequest(DomainModel):
     premarket: PremarketLevels | None = None
     openingRange: OpeningRangeLevels | None = None
     quote: BidAskQuote | None = None
-    economicEventState: dict[str, Any] = Field(default_factory=dict)
+    economicEventState: EconomicEventState = Field(default_factory=EconomicEventState)
     breadthComponents: dict[str, list[MarketCandle]] = Field(default_factory=dict)
     externalBreadthFeed: dict[str, Any] = Field(default_factory=dict)
     maxAuxiliaryAgeSeconds: int = Field(default=300, ge=0)
@@ -296,7 +396,13 @@ class PointInTimeFeatureEngine:
         features["relativeStrengthQqq"] = _feature(_relative_strength(latest, qqq), latest_at if qqq else None, qqq_quality, "SPY close divided by aligned QQQ close.")
         features["relativeStrengthIwm"] = _feature(_relative_strength(latest, iwm), latest_at if iwm else None, iwm_quality, "SPY close divided by aligned IWM close.")
         features["breadthProxyAverageReturn"] = _feature(_breadth_proxy_return(breadth_latest), anchor_timestamp, breadth_quality, "Average same-timestamp breadth proxy return.")
-        features["economicEventState"] = _feature(request.economicEventState or {}, request.evaluationTimestamp, FeatureQuality.READY, "Economic-event state supplied by caller.")
+        event_feature, event_reasons = _economic_event_feature(
+            request.economicEventState,
+            request.evaluationTimestamp,
+            request.maxAuxiliaryAgeSeconds,
+        )
+        features["economicEventState"] = event_feature
+        reason_codes.extend(event_reasons)
 
         if request.premarket:
             features["premarketHigh"] = _feature(request.premarket.high, request.premarket.sourceTimestamp, _quality_for_value(request.premarket.high), "Premarket high.")
@@ -590,6 +696,101 @@ def _feature(value: Any, timestamp: datetime | None, quality: FeatureQuality, ex
     return FeatureValue(value=value, sourceTimestamp=timestamp, quality=quality, explanation=explanation)
 
 
+def _economic_event_feature(
+    event: EconomicEventState,
+    evaluation_timestamp: datetime,
+    max_age_seconds: int,
+) -> tuple[FeatureValue, list[str]]:
+    reasons: list[str] = []
+    source_timestamp = event.provider_timestamp
+    quality = FeatureQuality.READY
+    if source_timestamp is None:
+        quality = FeatureQuality.MISSING
+        reasons.append("economic_event_provider_timestamp_missing")
+    else:
+        age_seconds = abs((evaluation_timestamp - source_timestamp).total_seconds())
+        if age_seconds > max_age_seconds:
+            quality = FeatureQuality.STALE
+            reasons.append("economic_event_stale")
+    if event.malformed or (event.status == "released" and event.actual is None):
+        quality = FeatureQuality.INVALID
+        reasons.append("economic_event_malformed_release")
+    if event.provider_timestamp and event.received_at:
+        clock_skew = abs((event.received_at - event.provider_timestamp).total_seconds())
+        if clock_skew > max_age_seconds:
+            quality = FeatureQuality.STALE
+            reasons.append("economic_event_provider_clock_disagreement")
+    if event.feed_health in {"stale", "unavailable"}:
+        quality = FeatureQuality.STALE if event.feed_health == "stale" else FeatureQuality.MISSING
+        reasons.append(f"economic_event_feed_{event.feed_health}")
+    elif event.feed_health in {"unknown", "degraded"}:
+        reasons.append(f"economic_event_feed_{event.feed_health}")
+    return (
+            _feature(
+            _economic_event_payload(event, evaluation_timestamp=evaluation_timestamp),
+            source_timestamp,
+            quality,
+            "Typed economic-event state; freshness is measured from provider_timestamp.",
+        ),
+        reasons,
+    )
+
+
+def _economic_event_payload(event: EconomicEventState, evaluation_timestamp: datetime | None = None) -> dict[str, Any]:
+    payload = event.model_dump(mode="json")
+    release_timestamp = event.released_at or event.scheduled_at
+    release_values_visible = release_timestamp is None or evaluation_timestamp is None or release_timestamp <= evaluation_timestamp
+    if not release_values_visible:
+        payload.update(
+            {
+                "actual": None,
+                "revised_previous": None,
+                "surprise_raw": None,
+                "surprise_pct": None,
+                "surprise_zscore": None,
+                "surprise_mean": None,
+                "surprise_stddev": None,
+                "surprise_sample_count": None,
+            }
+        )
+    payload.update(
+        {
+            "eventId": payload["event_id"],
+            "eventType": payload["event_type"],
+            "eventCategory": payload["event_category"],
+            "scheduledAt": payload["scheduled_at"],
+            "releasedAt": payload["released_at"],
+            "providerTimestamp": payload["provider_timestamp"],
+            "receivedAt": payload["received_at"],
+            "revisedPrevious": payload["revised_previous"],
+            "surpriseRaw": payload["surprise_raw"],
+            "surprisePct": payload["surprise_pct"],
+            "surpriseZscore": payload["surprise_zscore"],
+            "surpriseMean": payload["surprise_mean"],
+            "surpriseStddev": payload["surprise_stddev"],
+            "surpriseSampleCount": payload["surprise_sample_count"],
+            "affectedSymbols": list(payload["affected_symbols"]),
+            "feedHealth": payload["feed_health"],
+            "state": payload["status"],
+            "category": payload["event_category"],
+            "severity": payload["importance"],
+            "active": payload["status"] in {"active", "blackout"},
+            "eventTimestamp": payload["scheduled_at"] or payload["released_at"],
+            "eventPhase": payload["event_phase"],
+            "duplicateOf": payload["duplicate_of"],
+            "revisionNumber": payload["revision_number"],
+            "unexpectedBreakingEvent": payload["unexpected_breaking_event"],
+            "dayType": payload["day_type"],
+            "volatilityRegime": payload["volatility_regime"],
+            "baselineVersion": payload["baseline_version"],
+            "simultaneousEvents": list(payload["simultaneous_events"]),
+            "marketReaction": payload["market_reaction"],
+            "executionEconomics": payload["execution_economics"],
+        }
+    )
+    return payload
+
+
 def _quality_for_value(value: Any) -> FeatureQuality:
     return FeatureQuality.MISSING if value is None else FeatureQuality.READY
 
@@ -769,6 +970,16 @@ def _last(values: list[Any]) -> Any:
     return values[-1] if values else None
 
 
+def _symbols_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value.upper(),)
+    if isinstance(value, (list, tuple, set)):
+        return tuple(str(item).upper() for item in value if item)
+    return ()
+
+
 def _unique(values: list[str]) -> list[str]:
     result: list[str] = []
     for value in values:
@@ -820,7 +1031,7 @@ def _raw_inputs(
         "premarket": request.premarket.model_dump(mode="json") if request.premarket else None,
         "openingRange": request.openingRange.model_dump(mode="json") if request.openingRange else None,
         "quote": request.quote.model_dump(mode="json") if request.quote else None,
-        "economicEventState": request.economicEventState,
+        "economicEventState": _economic_event_payload(request.economicEventState, evaluation_timestamp=request.evaluationTimestamp),
         "breadthComponents": {name: candle.model_dump(mode="json") for name, candle in breadth.items()},
         "breadthComponentCandles": breadth_component_candles,
         "externalBreadthFeed": request.externalBreadthFeed,

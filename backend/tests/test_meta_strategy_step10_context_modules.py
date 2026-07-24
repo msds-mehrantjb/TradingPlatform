@@ -77,7 +77,7 @@ class MetaStrategyStep10ContextModulesTest(unittest.TestCase):
             "market_breadth_momentum": "context.market_breadth_momentum",
             "economic_event_context": "context.economic_event_context",
             "market_structure_context": "context.market_structure_context",
-            "volume_confirmation": "context.volume_confirmation",
+            "volume_confirmation_context": "context.volume_confirmation",
             "vwap_position_context": "context.vwap_position_context",
         }
         for entry in CONTEXT_STRATEGIES:
@@ -171,7 +171,7 @@ def extreme_overrides(strategy_id: str) -> dict[str, Any]:
             "atr": {"1m": 0.01},
             "candles": {"1m": candles(60, 101.0)},
         },
-        "volume_confirmation": {"volume": 1, "relative_volume": {"1m": 50.0}},
+        "volume_confirmation_context": {"volume": 1, "relative_volume": {"1m": 50.0}},
         "vwap_position_context": {"price": 200.0, "vwap": 1.0, "moving_averages": {"1m": {"ema20": 1.0}}},
     }[strategy_id]
 
@@ -182,7 +182,7 @@ def missing_overrides(strategy_id: str) -> dict[str, Any]:
         "market_breadth_momentum": {"breadth": {}},
         "economic_event_context": {"economic_event_state": {}, "session_phase": "", "spread": {}},
         "market_structure_context": {"candles": {}, "moving_averages": {}, "atr": {}},
-        "volume_confirmation": {"volume": 0, "relative_volume": {}},
+        "volume_confirmation_context": {"volume": 0, "relative_volume": {}},
         "vwap_position_context": {"vwap": None, "moving_averages": {}},
     }[strategy_id]
 

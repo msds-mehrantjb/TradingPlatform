@@ -24,9 +24,13 @@ from backend.app.domain.feature_engine import MarketCandle, PriorDayOHLC
 from backend.app.domain.models import Signal
 from backend.app.ensemble import v1 as ensemble_v1
 from backend.app.execution import v1 as execution_v1
-from backend.app.algorithms.voting_ensemble.strategies.context import (
+from backend.app.strategies.context import (
+    EconomicEventContext,
     MarketBreadthMomentumContext,
+    MarketStructureContext,
     RelativeStrengthQqqIwmContext,
+    VolumeConfirmationContext,
+    VwapPositionContext,
 )
 from backend.app.algorithms.voting_ensemble.strategies.directional import (
     BollingerAtrReversionStrategy,
@@ -101,8 +105,12 @@ class V2TradingEngine:
                     BollingerAtrReversionStrategy(),
                 ),
                 contextModules=(
+                    EconomicEventContext(),
                     RelativeStrengthQqqIwmContext(),
                     MarketBreadthMomentumContext(),
+                    MarketStructureContext(),
+                    VolumeConfirmationContext(),
+                    VwapPositionContext(),
                 ),
                 regimeModule=AdxAtrRegimeClassifier(),
                 familyEnsemble=FamilyAwareDeterministicEnsemble(),

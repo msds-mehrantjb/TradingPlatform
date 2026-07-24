@@ -76,18 +76,20 @@ class VwapPositionContext:
             feature = features.get(name)
             if not feature or feature.quality != FeatureQuality.READY.value:
                 return _missing([f"vwap_position.missing_or_unready:{name}"])
-        distance = _number(features["distanceFromVwapAtr"].value)
+        reported_distance = _number(features["distanceFromVwapAtr"].value)
         slope = _number(features["sessionVwapSlope"].value)
         session_vwap = _number(features["sessionVwap"].value)
         atr = _number(features["spy1mAtr14"].value)
         candles = _candles(context.featureSnapshot.rawInputs.get("spy1mCandles") or [])
-        if None in {distance, slope, session_vwap, atr} or len(candles) < self.config.reclaimLookbackCandles:
+        if None in {reported_distance, slope, session_vwap, atr} or len(candles) < self.config.reclaimLookbackCandles:
             return _missing(["vwap_position.insufficient_inputs"])
-        assert distance is not None
+        assert reported_distance is not None
         assert slope is not None
         assert session_vwap is not None
         assert atr is not None
         latest = candles[-1]
+        close = float(latest["close"])
+        distance = (close - session_vwap) / atr if atr > 0 else reported_distance
         position = "above_vwap" if distance > 0 else "below_vwap" if distance < 0 else "at_vwap"
         recent = candles[-self.config.reclaimLookbackCandles :]
         buffer = atr * self.config.rejectionAtrBuffer

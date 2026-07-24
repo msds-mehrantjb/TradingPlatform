@@ -57,7 +57,17 @@ class ApiV2EndpointsTest(unittest.TestCase):
         self.assertEqual({alias["name"] for alias in bollinger["aliases"]}, {"Bollinger Band Reversion", "ATR Overextension Reversion"})
         self.assertIn("relative_strength_qqq_iwm", {module["id"] for module in context})
         self.assertIn("market_breadth_momentum", {module["id"] for module in context})
-        self.assertNotIn("economic_event_context", {module["id"] for module in context})
+        self.assertEqual(
+            {module["id"]: module["status"] for module in context},
+            {
+                "relative_strength_qqq_iwm": "active",
+                "market_breadth_momentum": "active",
+                "economic_event_context": "shadow",
+                "market_structure_context": "shadow",
+                "volume_confirmation_context": "shadow",
+                "vwap_position_context": "shadow",
+            },
+        )
         self.assertEqual([module["id"] for module in regime], ["adx_atr_regime_classifier"])
         self.assertEqual(regime[0]["name"], "ADX/ATR Regime Classifier")
         self.assertEqual(regime[0]["evidence"], ["Trend strength", "Volatility level", "Structure", "Liquidity", "Session", "Event risk"])
@@ -98,14 +108,14 @@ class ApiV2EndpointsTest(unittest.TestCase):
         expected_modules = {
             "voting-ensemble": {
                 "directional": ["multi_timeframe_trend_alignment", "first_pullback_after_open", "failed_breakout_reversal", "liquidity_sweep_reversal", "bollinger_atr_reversion"],
-                "context": ["relative_strength_qqq_iwm", "market_breadth_momentum"],
+                "context": ["relative_strength_qqq_iwm", "market_breadth_momentum", "economic_event_context", "market_structure_context", "volume_confirmation_context", "vwap_position_context"],
                 "regime": ["adx_atr_regime_classifier"],
                 "safety": ["cash_avoid_trading_filter"],
                 "aggregator": ["ensemble_strategy_voting"],
             },
             "meta-strategy": {
                 "directional": ["multi_timeframe_trend_alignment", "first_pullback_after_open", "failed_breakout_reversal", "liquidity_sweep_reversal", "bollinger_atr_reversion"],
-                "context": ["relative_strength_qqq_iwm", "market_breadth_momentum"],
+                "context": ["economic_event_context", "relative_strength_qqq_iwm", "market_breadth_momentum", "market_structure_context", "volume_confirmation_context", "vwap_position_context"],
                 "regime": ["adx_atr_regime_classifier"],
                 "safety": ["cash_avoid_trading_filter"],
                 "aggregator": [],

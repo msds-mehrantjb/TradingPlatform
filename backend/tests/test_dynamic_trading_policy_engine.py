@@ -83,6 +83,68 @@ class DynamicTradingPolicyEngineTest(unittest.TestCase):
         self.assertEqual(decision.capBreakdown.limitingRiskCap, "eventCap")
         self.assertGreaterEqual(len(decision.capBreakdown.appliedCaps), 1)
 
+    def test_hold_event_context_with_shock_controls_still_caps_trade_risk(self) -> None:
+        inputs = policy_inputs(
+            candidate_confidence=1.0,
+            meta_probability=0.99,
+            context_signals=[
+                context_signal(
+                    "economic_event_context",
+                    Signal.HOLD,
+                    Direction.FLAT,
+                    "Event context detected spread shock but does not create direction.",
+                    features={
+                        "contextEffect": "reduce_risk",
+                        "recommendedRiskCap": 1.0,
+                        "recommendedSizeMultiplier": 0.4,
+                        "minimumEdgeMultiplier": 1.5,
+                        "allowNewEntries": True,
+                        "allowPositionIncrease": False,
+                        "eventBlackout": False,
+                        "executionMode": "reduce_only",
+                    },
+                ),
+            ],
+        )
+
+        decision = DynamicTradingPolicyEngine(DynamicTradingPolicyConfig(mode=OperatingMode.ACTIVE)).evaluate(inputs)
+
+        self.assertTrue(decision.tradeAllowed)
+        self.assertEqual(decision.effectiveRiskMultiplier, 0.4)
+        self.assertEqual(decision.capBreakdown.limitingRiskCap, "eventCap")
+        self.assertIn("policy.cap.event_risk", decision.reasonCodes)
+        self.assertIn("policy.cap.event_minimum_edge_increased", decision.reasonCodes)
+
+    def test_event_controls_can_block_new_entries_without_directional_signal(self) -> None:
+        inputs = policy_inputs(
+            candidate_confidence=1.0,
+            meta_probability=0.99,
+            context_signals=[
+                context_signal(
+                    "economic_event_context",
+                    Signal.HOLD,
+                    Direction.FLAT,
+                    "Event context is in blackout.",
+                    features={
+                        "allow_new_entries": False,
+                        "allow_position_increase": False,
+                        "event_blackout": True,
+                        "recommended_risk_cap": 0.0,
+                        "recommended_size_multiplier": 0.0,
+                        "execution_mode": "blackout",
+                    },
+                ),
+            ],
+        )
+
+        decision = DynamicTradingPolicyEngine(DynamicTradingPolicyConfig(mode=OperatingMode.ACTIVE)).evaluate(inputs)
+
+        self.assertFalse(decision.tradeAllowed)
+        self.assertEqual(decision.effectiveRiskMultiplier, 0.0)
+        self.assertEqual(decision.capBreakdown.limitingRiskCap, "eventCap")
+        self.assertIn("policy.cap.event_blackout", decision.reasonCodes)
+        self.assertIn("policy.cap.event_new_entries_disabled", decision.reasonCodes)
+
     def test_one_severe_adverse_cap_reduces_complete_trade_risk(self) -> None:
         inputs = policy_inputs(
             candidate_confidence=1.0,

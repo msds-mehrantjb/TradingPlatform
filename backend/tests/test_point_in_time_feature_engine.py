@@ -81,6 +81,7 @@ def request_with(
     execution_style: str = "live",
     for_training: bool = False,
     session_date: date = SESSION_DATE,
+    economic_event_state: dict | None = None,
 ) -> PointInTimeFeatureRequest:
     spy_1m = candles(symbol="SPY", timeframe="1Min", count=70, step_minutes=1, provider=provider)
     spy_5m = candles(symbol="SPY", timeframe="5Min", count=70, step_minutes=5, provider=provider)
@@ -110,7 +111,20 @@ def request_with(
             endTimestamp=datetime(2026, 1, 5, 14, 45, tzinfo=UTC),
         ),
         quote=BidAskQuote(bid=102.38, ask=102.4, timestamp=EVALUATION),
-        economicEventState={"active": False, "category": "none"},
+        economicEventState=economic_event_state
+        or {
+            "event_id": "no-event-1",
+            "event_type": "none",
+            "event_category": "none",
+            "importance": "low",
+            "scheduled_at": EVALUATION,
+            "provider_timestamp": EVALUATION,
+            "received_at": EVALUATION,
+            "provider": "fixture_calendar",
+            "status": "none",
+            "affected_symbols": ["SPY"],
+            "feed_health": "healthy",
+        },
         breadthComponents=breadth,
         maxAuxiliaryAgeSeconds=300,
         executionStyle=execution_style,  # type: ignore[arg-type]
@@ -170,6 +184,112 @@ class PointInTimeFeatureEngineTest(unittest.TestCase):
         self.assertTrue(snapshot.executionDataReady)
         self.assertIn("qqq_stale", snapshot.reasonCodes)
         self.assertEqual(snapshot.features["qqqClose"].quality, FeatureQuality.STALE.value)
+
+    def test_economic_event_state_uses_typed_provider_timestamp_contract(self) -> None:
+        provider_time = EVALUATION - timedelta(seconds=30)
+        snapshot = self.engine.compute(
+            request_with(
+                economic_event_state={
+                    "event_id": "econ-fomc-1",
+                    "event_type": "FOMC",
+                    "event_category": "fed",
+                    "importance": "high",
+                    "scheduled_at": EVALUATION + timedelta(minutes=20),
+                    "provider_timestamp": provider_time,
+                    "received_at": provider_time + timedelta(seconds=1),
+                    "provider": "fixture_calendar",
+                    "status": "scheduled",
+                    "actual": None,
+                    "forecast": 5.25,
+                    "previous": 5.0,
+                    "revised_previous": 5.1,
+                    "surprise_raw": None,
+                    "surprise_pct": None,
+                    "surprise_zscore": None,
+                    "affected_symbols": ["SPY", "QQQ"],
+                    "feed_health": "healthy",
+                }
+            )
+        )
+
+        event_feature = snapshot.features["economicEventState"]
+        self.assertEqual(event_feature.quality, FeatureQuality.READY.value)
+        self.assertEqual(event_feature.sourceTimestamp, provider_time)
+        self.assertEqual(event_feature.value["event_id"], "econ-fomc-1")
+        self.assertEqual(event_feature.value["providerTimestamp"], provider_time.isoformat().replace("+00:00", "Z"))
+        self.assertEqual(event_feature.value["affectedSymbols"], ["SPY", "QQQ"])
+        self.assertNotIn("economic_event_provider_timestamp_missing", snapshot.reasonCodes)
+
+    def test_economic_event_missing_provider_timestamp_is_not_ready(self) -> None:
+        snapshot = self.engine.compute(
+            request_with(
+                economic_event_state={
+                    "event_id": "econ-cpi-1",
+                    "event_type": "CPI",
+                    "event_category": "inflation",
+                    "importance": "high",
+                    "scheduled_at": EVALUATION + timedelta(minutes=15),
+                    "provider": "fixture_calendar",
+                    "status": "scheduled",
+                    "affected_symbols": ["SPY"],
+                    "feed_health": "healthy",
+                }
+            )
+        )
+
+        self.assertEqual(snapshot.features["economicEventState"].quality, FeatureQuality.MISSING.value)
+        self.assertIsNone(snapshot.features["economicEventState"].sourceTimestamp)
+        self.assertIn("economic_event_provider_timestamp_missing", snapshot.reasonCodes)
+
+    def test_economic_event_stale_provider_timestamp_is_stale(self) -> None:
+        provider_time = EVALUATION - timedelta(minutes=15)
+        snapshot = self.engine.compute(
+            request_with(
+                economic_event_state={
+                    "event_id": "econ-jobs-1",
+                    "event_type": "NFP",
+                    "event_category": "jobs",
+                    "importance": "high",
+                    "scheduled_at": EVALUATION + timedelta(minutes=15),
+                    "provider_timestamp": provider_time,
+                    "received_at": provider_time,
+                    "provider": "fixture_calendar",
+                    "status": "scheduled",
+                    "affected_symbols": ["SPY"],
+                    "feed_health": "healthy",
+                }
+            )
+        )
+
+        self.assertEqual(snapshot.features["economicEventState"].quality, FeatureQuality.STALE.value)
+        self.assertEqual(snapshot.features["economicEventState"].sourceTimestamp, provider_time)
+        self.assertIn("economic_event_stale", snapshot.reasonCodes)
+
+    def test_malformed_released_event_is_invalid(self) -> None:
+        provider_time = EVALUATION - timedelta(seconds=15)
+        snapshot = self.engine.compute(
+            request_with(
+                economic_event_state={
+                    "event_id": "econ-malformed-1",
+                    "event_type": "CPI",
+                    "event_category": "inflation",
+                    "importance": "high",
+                    "scheduled_at": EVALUATION - timedelta(minutes=1),
+                    "released_at": EVALUATION - timedelta(seconds=20),
+                    "provider_timestamp": provider_time,
+                    "received_at": provider_time,
+                    "provider": "fixture_calendar",
+                    "status": "released",
+                    "actual": None,
+                    "forecast": 0.2,
+                    "affected_symbols": ["SPY"],
+                    "feed_health": "healthy",
+                }
+            )
+        )
+
+        self.assertEqual(snapshot.features["economicEventState"].quality, FeatureQuality.INVALID.value)
+        self.assertIn("economic_event_malformed_release", snapshot.reasonCodes)
 
     def test_live_and_replay_styles_have_identical_features_for_same_prefix(self) -> None:
         live = self.engine.compute(request_with(execution_style="live"))

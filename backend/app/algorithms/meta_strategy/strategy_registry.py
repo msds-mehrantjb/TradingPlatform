@@ -214,8 +214,58 @@ DIRECTIONAL_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (
 )
 
 CONTEXT_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (
+    _entry(
+        "economic_event_context",
+        "Economic Event Context",
+        MetaStrategyRole.CONTEXT,
+        MetaStrategyFamily.MARKET_CONTEXT,
+        ("economic_event_state", "session_phase", "spread"),
+        0,
+        CONTEXT_DIRECTIONS,
+        f"{META_STRATEGY_STRATEGY_PACKAGE}.context.economic_event_context",
+        "EconomicEventContextStrategy",
+        enabled=False,
+    ),
     _entry("relative_strength_qqq_iwm", "Relative Strength vs QQQ/IWM", MetaStrategyRole.CONTEXT, MetaStrategyFamily.MARKET_CONTEXT, ("qqq_iwm_context",), 20, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.context.relative_strength_qqq_iwm", "RelativeStrengthQqqIwmStrategy"),
     _entry("market_breadth_momentum", "Market Breadth Momentum", MetaStrategyRole.CONTEXT, MetaStrategyFamily.MARKET_CONTEXT, ("breadth",), 20, CONTEXT_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.context.market_breadth_momentum", "MarketBreadthMomentumStrategy"),
+    _entry(
+        "market_structure_context",
+        "Market Structure Context",
+        MetaStrategyRole.CONTEXT,
+        MetaStrategyFamily.MARKET_CONTEXT,
+        ("candles", "moving_averages", "atr"),
+        20,
+        CONTEXT_DIRECTIONS,
+        f"{META_STRATEGY_STRATEGY_PACKAGE}.context.market_structure_context",
+        "MarketStructureContextStrategy",
+        enabled=False,
+    ),
+    _entry(
+        "volume_confirmation_context",
+        "Volume Confirmation",
+        MetaStrategyRole.CONTEXT,
+        MetaStrategyFamily.MARKET_CONTEXT,
+        ("volume", "relative_volume"),
+        20,
+        CONTEXT_DIRECTIONS,
+        f"{META_STRATEGY_STRATEGY_PACKAGE}.context.volume_confirmation",
+        "VolumeConfirmationStrategy",
+        enabled=False,
+        aliases=("volume_confirmation",),
+    ),
+    _entry(
+        "vwap_position_context",
+        "VWAP Position Context",
+        MetaStrategyRole.CONTEXT,
+        MetaStrategyFamily.MARKET_CONTEXT,
+        ("vwap", "moving_averages"),
+        20,
+        CONTEXT_DIRECTIONS,
+        f"{META_STRATEGY_STRATEGY_PACKAGE}.context.vwap_position_context",
+        "VwapPositionContextStrategy",
+        enabled=False,
+        aliases=("VWAP Position Strategy",),
+    ),
 )
 
 REGIME_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (
@@ -235,7 +285,7 @@ ALL_META_STRATEGY_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (
 
 
 def _module_status(entry: MetaStrategyRegistryEntry) -> MetaStrategyModuleStatus:
-    return MetaStrategyModuleStatus(id=entry.strategy_id, status="active" if entry.enabled else "disabled")
+    return MetaStrategyModuleStatus(id=entry.strategy_id, status="active" if entry.enabled else "shadow")
 
 
 META_STRATEGY_MODULE_INVENTORY = MetaStrategyInventory(

@@ -37,6 +37,10 @@ class VotingEnsembleModuleInventoryTest(unittest.TestCase):
             (
                 ("relative_strength_qqq_iwm", "active"),
                 ("market_breadth_momentum", "active"),
+                ("economic_event_context", "shadow"),
+                ("market_structure_context", "shadow"),
+                ("volume_confirmation_context", "shadow"),
+                ("vwap_position_context", "shadow"),
             ),
         )
         self.assertEqual(
@@ -87,9 +91,17 @@ class VotingEnsembleModuleInventoryTest(unittest.TestCase):
             (),
         )
 
-    def test_removed_modules_are_not_registered_as_runtime_inventory_rows(self) -> None:
+    def test_shadow_context_modules_are_registered_but_not_active(self) -> None:
         self.assertEqual(active_module_ids(StrategyCollection.CONTEXT), ("relative_strength_qqq_iwm", "market_breadth_momentum"))
-        self.assertEqual(shadow_module_ids(StrategyCollection.CONTEXT), ())
+        self.assertEqual(
+            shadow_module_ids(StrategyCollection.CONTEXT),
+            (
+                "economic_event_context",
+                "market_structure_context",
+                "volume_confirmation_context",
+                "vwap_position_context",
+            ),
+        )
 
         with self.assertRaises(KeyError):
             resolve_strategy("VWAP Trend Continuation")

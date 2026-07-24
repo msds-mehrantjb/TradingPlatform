@@ -15838,23 +15838,18 @@ function oneHourDirectionCandles() {
   return aggregateCandlesToMinutes(latestRegularSessionCandles(), 60, "1Hour");
 }
 
-function eventModeGate(context: MarketContext | null, intendedSide: AlgoSignal): TradeLayerGate & { active: boolean } {
+function backendEventContextDisplayGate(context: MarketContext | null): TradeLayerGate & { active: false } {
   if (!context) {
-    return { layer: "Event Mode", status: "info", signal: "Inactive", detail: "No event context available", active: false };
+    return { layer: "Backend Event Context", status: "info", signal: "Unavailable", detail: "No backend event context available", active: false };
   }
-  const eventTags = new Set(context.event.strategyTags);
-  const eventSignal = directionalSignal(context.event.directionBias, "neutral");
-  const active = eventTags.has("event-rules") || eventSignal !== "Hold";
-  if (!active) {
-    return { layer: "Event Mode", status: "info", signal: "Inactive", detail: `${context.event.label}: normal rules`, active: false };
-  }
-  if (eventSignal === "Hold") {
-    return { layer: "Event Mode", status: "caution", signal: "Watch", detail: `${context.event.label}: catalyst present without directional bias`, active: true };
-  }
-  if (intendedSide !== "Hold" && eventSignal !== intendedSide) {
-    return { layer: "Event Mode", status: "fail", signal: eventSignal, detail: `${context.event.label} points ${eventSignal}, not ${intendedSide}`, active: true };
-  }
-  return { layer: "Event Mode", status: "pass", signal: eventSignal, detail: `${context.event.label}: catalyst mode agrees`, active: true };
+  const eventStatus = context.event.strategyTags.includes("event-rules") ? "Backend event controls present" : "Display only";
+  return {
+    layer: "Backend Event Context",
+    status: "info",
+    signal: eventStatus,
+    detail: `${context.event.label}: frontend displays backend context only; event risk, blackout, side agreement, cost gates, and order controls are backend-owned.`,
+    active: false,
+  };
 }
 
 function executionGate(side: AlgoSignal): TradeLayerGate & { chart: ReturnType<typeof liveChartConfirmation> } {
@@ -15887,7 +15882,7 @@ function executionGate(side: AlgoSignal): TradeLayerGate & { chart: ReturnType<t
   };
 }
 
-function mlQualityGate(side: AlgoSignal, eventActive: boolean): TradeLayerGate {
+function mlQualityGate(side: AlgoSignal): TradeLayerGate {
   const settingsKey = tradingSettingsKey(state.tradingSettings);
   const artifactMatches = state.dynamicArtifactStatus === "ready" && state.dynamicArtifactSettingsKey === settingsKey;
   if (state.dynamicArtifactStatus === "loading") {
@@ -15896,7 +15891,7 @@ function mlQualityGate(side: AlgoSignal, eventActive: boolean): TradeLayerGate {
   if (!artifactMatches || !state.dynamicArtifact) {
     return { layer: "ML Quality", status: "caution", signal: "Not ready", detail: "Matching backtest and ML artifact is not ready; using 1m/5m live gates meanwhile" };
   }
-  const relevantTimeframes = eventActive ? ["Event"] : ["1Min", "5Min"];
+  const relevantTimeframes = ["1Min", "5Min"];
   const rows = (state.dynamicArtifact.mlComparison?.bestByTimeframe ?? []).filter((row) => relevantTimeframes.includes(row.timeframe));
   const best =
     rows.find((row) => row.verdict === "Improved") ??
@@ -15985,11 +15980,10 @@ function manualOrderRecommendation(
   const symbol = state.symbol;
   const settings = state.tradingSettings;
   const voteWinner = votingEnsembleScoreSummary().winner;
-  const eventProbe = eventModeGate(state.marketContext, "Hold");
   const structuralSide = voteWinner;
-  const event = eventModeGate(state.marketContext, structuralSide);
+  const event = backendEventContextDisplayGate(state.marketContext);
   const execution = executionGate(structuralSide);
-  const mlQuality = mlQualityGate(structuralSide, event.active);
+  const mlQuality = mlQualityGate(structuralSide);
   const historicalBias = bestMatch ? historicalBiasFromRagSource(bestMatch, answer.bias) : "Mixed";
   const historicalGate: TradeLayerGate = {
     layer: "Historical Context",
@@ -16759,8 +16753,7 @@ function tradingDecisionMlResult(finalSignal: AlgoSignal, timeframe: BacktestRes
       blocked: false,
     };
   }
-  const eventActive = eventModeGate(state.marketContext, finalSignal).active;
-  const gate = mlQualityGate(finalSignal, eventActive);
+  const gate = mlQualityGate(finalSignal);
   return {
     outcome: gate.status === "fail" ? "Filtered" : gate.status === "caution" ? "Caution" : gate.status === "pass" ? "Accepted" : "Shadow / info",
     result: gate.detail,

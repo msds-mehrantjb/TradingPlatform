@@ -61,7 +61,7 @@ class MetaStrategyStep8StrategyRegistryTest(unittest.TestCase):
 
         self.assertEqual(catalog, ALL_META_STRATEGY_STRATEGIES)
         self.assertTrue(validation["valid"])
-        self.assertGreaterEqual(len(catalog), 19)
+        self.assertEqual(len(catalog), 13)
         self.assertEqual(len(directional_strategy_input_ids()), len(DIRECTIONAL_STRATEGIES))
         for entry in catalog:
             with self.subTest(strategy=entry.strategy_id):

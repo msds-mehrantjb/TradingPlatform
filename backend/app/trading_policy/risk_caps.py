@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from backend.app.domain.models import AccountRiskState, BaselineTradingSettings, ContextSignal, DynamicPolicyBounds, HardRiskLimits, MetaModelPrediction, RegimeState, Signal, TradeCandidate
 from backend.app.trading_policy.models import DynamicRiskCap, DynamicTradingPolicyConfig
@@ -63,7 +63,7 @@ def dynamic_risk_caps(
         _regime_cap(regime, config),
         _volatility_cap(regime, config),
         _liquidity_cap(account),
-        _event_cap(context_signals, config),
+        _event_cap(context_signals, config, evaluated_at),
         _time_of_day_cap(evaluated_at, hard_limits, config),
         _drawdown_cap(account, hard_limits),
         _ml_cap(prediction, config),
@@ -142,16 +142,11 @@ def _liquidity_cap(account: AccountRiskState) -> DynamicRiskCap:
     )
 
 
-def _event_cap(context_signals: list[ContextSignal], config: DynamicTradingPolicyConfig) -> DynamicRiskCap:
+def _event_cap(context_signals: list[ContextSignal], config: DynamicTradingPolicyConfig, evaluated_at: datetime) -> DynamicRiskCap:
     event_contexts = [
         context
         for context in context_signals
-        if "event" in context.contextId.lower()
-        and (
-            context.signal != Signal.HOLD.value
-            or float(context.features.get("recommendedRiskCap", 1.0)) < 1.0
-            or bool(context.features.get("eventBlackout", False))
-        )
+        if "event" in context.contextId.lower() and _event_context_has_controls(context, evaluated_at=evaluated_at)
     ]
     if not event_contexts:
         return DynamicRiskCap(
@@ -160,13 +155,80 @@ def _event_cap(context_signals: list[ContextSignal], config: DynamicTradingPolic
             reasonCodes=["policy.cap.event_clear"],
             explanation="Event cap permits baseline risk because no adverse event context is present.",
         )
-    explicit_caps = [float(context.features.get("recommendedRiskCap", config.eventRiskCap)) for context in event_contexts]
+    explicit_caps = [_event_control_multiplier(context, config, evaluated_at=evaluated_at) for context in event_contexts]
+    reason_codes = ["policy.cap.event_risk"]
+    if any(_event_bool(context, "event_blackout", "eventBlackout") for context in event_contexts):
+        reason_codes.append("policy.cap.event_blackout")
+    if any(not _event_bool(context, "allow_new_entries", "allowNewEntries", default=True) for context in event_contexts):
+        reason_codes.append("policy.cap.event_new_entries_disabled")
+    if any(_event_value(context, "cooldown_until", "cooldownUntil") for context in event_contexts):
+        reason_codes.append("policy.cap.event_cooldown")
+    if any(float(_event_value(context, "minimum_edge_multiplier", "minimumEdgeMultiplier", default=1.0) or 1.0) > 1.0 for context in event_contexts):
+        reason_codes.append("policy.cap.event_minimum_edge_increased")
     return DynamicRiskCap(
         capName="eventCap",
         multiplier=min(1.0, max(0.0, min(explicit_caps))),
-        reasonCodes=["policy.cap.event_risk"],
-        explanation="Economic-event context limits risk with its configured event cap.",
+        reasonCodes=reason_codes,
+        explanation="Economic-event context limits risk using explicit event trading controls.",
     )
+
+
+def _event_context_has_controls(context: ContextSignal, *, evaluated_at: datetime) -> bool:
+    return bool(
+        context.signal != Signal.HOLD.value
+        or _event_bool(context, "event_blackout", "eventBlackout")
+        or not _event_bool(context, "allow_new_entries", "allowNewEntries", default=True)
+        or not _event_bool(context, "allow_position_increase", "allowPositionIncrease", default=True)
+        or float(_event_value(context, "recommended_risk_cap", "recommendedRiskCap", default=1.0) or 1.0) < 1.0
+        or float(_event_value(context, "recommended_size_multiplier", "recommendedSizeMultiplier", default=1.0) or 1.0) < 1.0
+        or float(_event_value(context, "minimum_edge_multiplier", "minimumEdgeMultiplier", default=1.0) or 1.0) > 1.0
+        or str(_event_value(context, "execution_mode", "executionMode", default="normal")).lower() not in {"", "normal"}
+        or _event_cooldown_active(context, evaluated_at)
+    )
+
+
+def _event_control_multiplier(context: ContextSignal, config: DynamicTradingPolicyConfig, *, evaluated_at: datetime) -> float:
+    if _event_bool(context, "event_blackout", "eventBlackout"):
+        return 0.0
+    if not _event_bool(context, "allow_new_entries", "allowNewEntries", default=True):
+        return 0.0
+    if _event_cooldown_active(context, evaluated_at):
+        return 0.0
+    mode = str(_event_value(context, "execution_mode", "executionMode", default="normal")).lower()
+    if mode in {"blackout", "no_new_entries", "halt"}:
+        return 0.0
+    risk_cap = float(_event_value(context, "recommended_risk_cap", "recommendedRiskCap", default=config.eventRiskCap) or config.eventRiskCap)
+    size_multiplier = float(_event_value(context, "recommended_size_multiplier", "recommendedSizeMultiplier", default=1.0) or 1.0)
+    return min(risk_cap, size_multiplier)
+
+
+def _event_bool(context: ContextSignal, *keys: str, default: bool = False) -> bool:
+    value = _event_value(context, *keys, default=default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _event_value(context: ContextSignal, *keys: str, default: object = None) -> object:
+    for key in keys:
+        if key in context.features:
+            return context.features[key]
+    return default
+
+
+def _event_cooldown_active(context: ContextSignal, evaluated_at: datetime) -> bool:
+    value = _event_value(context, "cooldown_until", "cooldownUntil")
+    if not value:
+        return False
+    try:
+        cooldown_until = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if cooldown_until.tzinfo is None:
+        cooldown_until = cooldown_until.replace(tzinfo=UTC)
+    return evaluated_at < cooldown_until.astimezone(UTC)
 
 
 def _time_of_day_cap(evaluated_at: datetime, hard_limits: HardRiskLimits, config: DynamicTradingPolicyConfig) -> DynamicRiskCap:

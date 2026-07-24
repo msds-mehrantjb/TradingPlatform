@@ -51,6 +51,10 @@ VOTING_ENSEMBLE_MODULE_INVENTORY = VotingEnsembleInventory(
     context=(
         ModuleStatus(id="relative_strength_qqq_iwm", status="active"),
         ModuleStatus(id="market_breadth_momentum", status="active"),
+        ModuleStatus(id="economic_event_context", status="shadow"),
+        ModuleStatus(id="market_structure_context", status="shadow"),
+        ModuleStatus(id="volume_confirmation_context", status="shadow"),
+        ModuleStatus(id="vwap_position_context", status="shadow"),
     ),
     regime=(
         ModuleStatus(id="adx_atr_regime_classifier", status="active"),
@@ -206,6 +210,42 @@ VOTING_ENSEMBLE_CONTEXT_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
         StrategyCollection.CONTEXT,
         ("external_breadth_feed_or_proxy_basket", "component_candles", "component_volume", "component_vwap", "component_ema20"),
     ),
+    _entry(
+        "economic_event_context",
+        "Economic Event Context",
+        "2.0.0",
+        StrategyFamily.MARKET_CONTEXT,
+        StrategyRole.CONTEXT,
+        StrategyCollection.CONTEXT,
+        ("economic_event_state", "scheduled_events", "market_clock", "spread"),
+    ),
+    _entry(
+        "market_structure_context",
+        "Market Structure Context",
+        "2.0.0",
+        StrategyFamily.MARKET_CONTEXT,
+        StrategyRole.CONTEXT,
+        StrategyCollection.CONTEXT,
+        ("spy_1m_candles", "prior_day_ohlc", "premarket_levels", "opening_range", "session_vwap"),
+    ),
+    _entry(
+        "volume_confirmation_context",
+        "Volume Confirmation",
+        "2.0.0",
+        StrategyFamily.MARKET_CONTEXT,
+        StrategyRole.CONTEXT,
+        StrategyCollection.CONTEXT,
+        ("spy_1m_relative_volume", "spy_1m_candles", "volume_baseline"),
+    ),
+    _entry(
+        "vwap_position_context",
+        "VWAP Position Context",
+        "2.0.0",
+        StrategyFamily.MARKET_CONTEXT,
+        StrategyRole.CONTEXT,
+        StrategyCollection.CONTEXT,
+        ("session_vwap", "session_vwap_slope", "spy_1m_candles"),
+    ),
 )
 
 
@@ -285,6 +325,12 @@ STRATEGY_ALIAS_MAP: dict[str, str] = {
     "ATR Volatility Regime": "adx_atr_regime_classifier",
     "ADX/ATR Regime Classifier": "adx_atr_regime_classifier",
     "Ensemble Strategy Voting": "ensemble_strategy_voting",
+    "Economic Event Context": "economic_event_context",
+    "Market Structure Context": "market_structure_context",
+    "Volume Confirmation": "volume_confirmation_context",
+    "volume_confirmation": "volume_confirmation_context",
+    "VWAP Position Context": "vwap_position_context",
+    "VWAP Position Strategy": "vwap_position_context",
 }
 
 

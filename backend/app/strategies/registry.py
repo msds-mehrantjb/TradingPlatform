@@ -114,8 +114,48 @@ DIRECTIONAL_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
 
 
 CONTEXT_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
+    _entry(
+        "economic_event_context",
+        "Economic Event Context",
+        "2.0.0",
+        StrategyFamily.MARKET_CONTEXT,
+        StrategyRole.CONTEXT,
+        StrategyCollection.CONTEXT,
+        ("economic_event_state", "scheduled_events", "market_clock", "spread"),
+        enabled=False,
+    ),
     _entry("relative_strength_qqq_iwm", "Relative Strength vs QQQ/IWM", "2.0.0", StrategyFamily.MARKET_CONTEXT, StrategyRole.CONTEXT, StrategyCollection.CONTEXT, ("spy_candles", "qqq_candles", "iwm_candles")),
     _entry("market_breadth_momentum", "Market Breadth Momentum", "2.0.0", StrategyFamily.MARKET_CONTEXT, StrategyRole.CONTEXT, StrategyCollection.CONTEXT, ("external_breadth_feed_or_proxy_basket", "component_candles", "component_volume", "component_vwap", "component_ema20")),
+    _entry(
+        "market_structure_context",
+        "Market Structure Context",
+        "2.0.0",
+        StrategyFamily.MARKET_CONTEXT,
+        StrategyRole.CONTEXT,
+        StrategyCollection.CONTEXT,
+        ("spy_1m_candles", "prior_day_ohlc", "premarket_levels", "opening_range", "session_vwap"),
+        enabled=False,
+    ),
+    _entry(
+        "volume_confirmation_context",
+        "Volume Confirmation",
+        "2.0.0",
+        StrategyFamily.MARKET_CONTEXT,
+        StrategyRole.CONTEXT,
+        StrategyCollection.CONTEXT,
+        ("spy_1m_relative_volume", "spy_1m_candles", "volume_baseline"),
+        enabled=False,
+    ),
+    _entry(
+        "vwap_position_context",
+        "VWAP Position Context",
+        "2.0.0",
+        StrategyFamily.MARKET_CONTEXT,
+        StrategyRole.CONTEXT,
+        StrategyCollection.CONTEXT,
+        ("session_vwap", "session_vwap_slope", "spy_1m_candles"),
+        enabled=False,
+    ),
 )
 
 
@@ -155,6 +195,12 @@ STRATEGY_ALIAS_MAP: dict[str, str] = {
     "ATR Volatility Regime": "adx_atr_regime_classifier",
     "ADX/ATR Regime Classifier": "adx_atr_regime_classifier",
     "Ensemble Strategy Voting": "ensemble_strategy_voting",
+    "Economic Event Context": "economic_event_context",
+    "Market Structure Context": "market_structure_context",
+    "Volume Confirmation": "volume_confirmation_context",
+    "volume_confirmation": "volume_confirmation_context",
+    "VWAP Position Context": "vwap_position_context",
+    "VWAP Position Strategy": "vwap_position_context",
 }
 
 

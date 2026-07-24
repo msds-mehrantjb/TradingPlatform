@@ -9,7 +9,7 @@ from backend.app.algorithms.meta_strategy.strategies.context.common import Conte
 
 
 class VolumeConfirmationStrategy(ContextSnapshotStrategy):
-    strategy_id = "volume_confirmation"
+    strategy_id = "volume_confirmation_context"
     required_inputs = ("volume", "relative_volume")
 
     def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
