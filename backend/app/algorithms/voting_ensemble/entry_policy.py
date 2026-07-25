@@ -16,7 +16,7 @@ from backend.app.domain.models import (
     TradeCandidate,
 )
 from backend.app.domain.trading_settings import trading_settings_configuration_hash
-from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceResult
+from backend.app.algorithms.voting_ensemble.ml_contracts import SafeMLInferenceResult
 from backend.app.algorithms.voting_ensemble.exit_policy import VOTING_ENSEMBLE_EXIT_POLICY_VERSION
 from backend.app.algorithms.voting_ensemble.order_planner import (
     VOTING_ENSEMBLE_ORDER_PLANNER_VERSION,
@@ -130,9 +130,9 @@ class VotingEnsembleOrderValidator:
         candidate: TradeCandidate | None,
         policy: EffectiveTradePolicy,
         gateDecision: GlobalGateDecision,
-        mlDecision: SafeMLInferenceResult,
         decidedAt: datetime,
         sessionDate: date,
+        mlDecision: SafeMLInferenceResult | None = None,
     ) -> OrderPlan | None:
         return self.order_planner.order_plan(
             candidate=candidate,

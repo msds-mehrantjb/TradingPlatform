@@ -5,13 +5,6 @@ from typing import Any
 
 from pydantic import Field
 
-from backend.app.backtesting.parameter_tuning import (
-    ParameterTuningConfig,
-    ParameterTuningFoldInput,
-    ParameterTuningReport,
-    build_parameter_tuning_report,
-    select_parameters_for_fold,
-)
 from backend.app.domain.models import DomainModel
 
 
@@ -38,7 +31,9 @@ class VotingEnsembleParameterTuningConfig(DomainModel):
     unstableScoreRange: float = Field(default=0.08, ge=0)
     minimumStableValues: int = Field(default=2, ge=1)
 
-    def to_shared_config(self) -> ParameterTuningConfig:
+    def to_shared_config(self):
+        from backend.app.backtesting.parameter_tuning import ParameterTuningConfig
+
         return ParameterTuningConfig(
             tuningVersion=self.tuningVersion,
             objectiveMetricName=self.objectiveMetricName,
@@ -54,20 +49,22 @@ class VotingEnsembleParameterTuningConfig(DomainModel):
 class VotingEnsembleParameterTuningReport(DomainModel):
     tuningVersion: str
     generatedAt: datetime
-    sharedReport: ParameterTuningReport
+    sharedReport: Any
     frozenConfigurationHash: str
     reasonCodes: list[str]
     explanation: str
 
 
 def build_voting_ensemble_parameter_tuning_report(
-    fold_inputs: list[ParameterTuningFoldInput] | list[dict[str, Any]],
+    fold_inputs: list[Any] | list[dict[str, Any]],
     *,
     tuning_config: VotingEnsembleParameterTuningConfig | None = None,
     generated_at: datetime | None = None,
     choices_frozen_at: datetime | None = None,
     final_test_loaded_at: datetime | None = None,
 ) -> VotingEnsembleParameterTuningReport:
+    from backend.app.backtesting.parameter_tuning import build_parameter_tuning_report
+
     config = tuning_config or VotingEnsembleParameterTuningConfig()
     generated = generated_at or datetime.now(UTC)
     shared = build_parameter_tuning_report(
@@ -91,10 +88,11 @@ def build_voting_ensemble_parameter_tuning_report(
 
 
 def select_voting_ensemble_parameters_for_fold(
-    fold: ParameterTuningFoldInput | dict[str, Any],
+    fold: Any | dict[str, Any],
     *,
     tuning_config: VotingEnsembleParameterTuningConfig | None = None,
 ):
+    from backend.app.backtesting.parameter_tuning import select_parameters_for_fold
+
     config = tuning_config or VotingEnsembleParameterTuningConfig()
     return select_parameters_for_fold(fold, tuning_config=config.to_shared_config())
-

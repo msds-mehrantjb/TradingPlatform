@@ -16,10 +16,82 @@ from backend.app.algorithms.voting_ensemble.strategies.base import (
     unavailable_signal,
 )
 from backend.app.algorithms.voting_ensemble.strategies.registry import resolve_strategy
+from backend.app.algorithms.voting_ensemble.snapshot.models import VotingEnsembleEvaluationSnapshot
+from backend.app.algorithms.voting_ensemble.strategies.directional.signal_contract import (
+    DirectionalStrategySignal as SnapshotDirectionalStrategySignal,
+    directional_signal as snapshot_directional_signal,
+    hold_signal as snapshot_hold_signal,
+)
+from backend.app.algorithms.voting_ensemble.strategies.directional.snapshot_helpers import (
+    fifteen_minute_candles as snapshot_fifteen_minute_candles,
+    five_minute_candles as snapshot_five_minute_candles,
+    trend_score as snapshot_trend_score,
+    spy_candles as snapshot_spy_candles,
+)
 
 
 TIMEFRAMES: tuple[Literal["1m", "5m", "15m"], ...] = ("1m", "5m", "15m")
 SetupState = Literal["IDLE", "PERMISSION_ACTIVE", "CONFIRMATION_ACTIVE", "WAITING_FOR_TRIGGER", "TRIGGERED", "SIGNAL_EMITTED", "INVALIDATED", "COOLDOWN"]
+
+
+class SnapshotMultiTimeframeTrendAlignmentStrategy:
+    strategyId = "multi_timeframe_trend_alignment"
+    strategyName = "Multi-Timeframe Trend Alignment"
+    strategyVersion = "multi_timeframe_trend_alignment_snapshot_v1"
+    family = "trend"
+
+    def __init__(self, bullish_threshold: float = 0.08, bearish_threshold: float = -0.08) -> None:
+        self.bullish_threshold = bullish_threshold
+        self.bearish_threshold = bearish_threshold
+
+    def evaluate(self, snapshot: VotingEnsembleEvaluationSnapshot, *, correlation_id: str) -> SnapshotDirectionalStrategySignal:
+        one = snapshot_trend_score(snapshot_spy_candles(snapshot), 12)
+        five = snapshot_trend_score(snapshot_five_minute_candles(snapshot), 4)
+        fifteen = snapshot_trend_score(snapshot_fifteen_minute_candles(snapshot), 2)
+        if not snapshot_spy_candles(snapshot) or not snapshot_five_minute_candles(snapshot) or not snapshot_fifteen_minute_candles(snapshot):
+            return self._hold(snapshot, correlation_id, "Completed 1m/5m/15m trend evidence is unavailable.", "multi_timeframe_trend_alignment.data_unavailable", data_ready=False)
+        if one >= self.bullish_threshold and five >= self.bullish_threshold and fifteen >= self.bearish_threshold:
+            return snapshot_directional_signal(
+                strategy_id=self.strategyId,
+                strategy_name=self.strategyName,
+                strategy_version=self.strategyVersion,
+                family=self.family,
+                signal="Buy",
+                confidence=min(0.9, 0.45 + abs(one + five + fifteen) / 3),
+                evaluated_at=snapshot.evaluationTimestamp,
+                correlation_id=correlation_id,
+                evidence=(f"1m trend {one:+.2f}, 5m confirmation {five:+.2f}, 15m permission {fifteen:+.2f}.",),
+                reason_codes=("multi_timeframe_trend_alignment.buy_hierarchy",),
+                features={"trend1m": round(one, 4), "trend5m": round(five, 4), "trend15m": round(fifteen, 4)},
+            )
+        if one <= self.bearish_threshold and five <= self.bearish_threshold and fifteen <= self.bullish_threshold:
+            return snapshot_directional_signal(
+                strategy_id=self.strategyId,
+                strategy_name=self.strategyName,
+                strategy_version=self.strategyVersion,
+                family=self.family,
+                signal="Sell",
+                confidence=min(0.9, 0.45 + abs(one + five + fifteen) / 3),
+                evaluated_at=snapshot.evaluationTimestamp,
+                correlation_id=correlation_id,
+                evidence=(f"1m trend {one:+.2f}, 5m confirmation {five:+.2f}, 15m permission {fifteen:+.2f}.",),
+                reason_codes=("multi_timeframe_trend_alignment.sell_hierarchy",),
+                features={"trend1m": round(one, 4), "trend5m": round(five, 4), "trend15m": round(fifteen, 4)},
+            )
+        return self._hold(snapshot, correlation_id, f"No hierarchy alignment: 1m {one:+.2f}, 5m {five:+.2f}, 15m {fifteen:+.2f}.", "multi_timeframe_trend_alignment.no_alignment")
+
+    def _hold(self, snapshot: VotingEnsembleEvaluationSnapshot, correlation_id: str, reason: str, code: str, *, data_ready: bool = True) -> SnapshotDirectionalStrategySignal:
+        return snapshot_hold_signal(
+            strategy_id=self.strategyId,
+            strategy_name=self.strategyName,
+            strategy_version=self.strategyVersion,
+            family=self.family,
+            evaluated_at=snapshot.evaluationTimestamp,
+            correlation_id=correlation_id,
+            reason=reason,
+            reason_code=code,
+            data_ready=data_ready,
+        )
 
 
 class TimeframeTrendParameters(BaseModel):

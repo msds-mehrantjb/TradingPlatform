@@ -11,7 +11,6 @@ from typing import Any, Iterator, Protocol
 
 from pydantic import Field, field_validator
 
-from backend.app.backtesting.event_replay import ReplayDecisionSnapshot, ReplayTrade
 from backend.app.config import get_settings
 from backend.app.database import _sqlite_path
 from backend.app.domain.models import DomainModel, _require_utc

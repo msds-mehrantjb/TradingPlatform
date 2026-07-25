@@ -42,7 +42,7 @@ from backend.app.domain.models import (
     Signal,
     StrategySignal,
 )
-from backend.app.ensemble import FamilyAwareDeterministicEnsemble
+from backend.app.algorithms.voting_ensemble.ensemble import FamilyAwareDeterministicEnsemble
 from backend.app.gates import GLOBAL_GATE_ENGINE_VERSION, GlobalGateEngine, GlobalGateInput
 from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceConfig
 from backend.app.algorithms.meta_strategy.strategy_registry import (
@@ -68,23 +68,17 @@ from backend.app.algorithms.wca.engine import WCA_ENGINE_VERSION
 from backend.app.algorithms.wca.strategy_registry import WCA_HARD_FILTER_REGISTRY, WCA_MODIFIER_REGISTRY, WCA_STRATEGY_REGISTRY
 from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_STRATEGY_CATALOG
 from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_SERVICE_VERSION
-from backend.app.strategies import StrategyEvaluationContext, resolve_strategy
-from backend.app.strategies.context import (
-    EconomicEventContext,
-    MarketBreadthMomentumContext,
-    MarketStructureContext,
-    RelativeStrengthQqqIwmContext,
-    VolumeConfirmationContext,
-    VwapPositionContext,
-)
-from backend.app.strategies.directional import (
+from backend.app.algorithms.voting_ensemble.strategies.base import StrategyEvaluationContext
+from backend.app.algorithms.voting_ensemble.strategies.context import MarketBreadthMomentumContext, RelativeStrengthQqqIwmContext
+from backend.app.algorithms.voting_ensemble.strategies.directional import (
+    AtrOverextensionReplayCompatibilityStrategy,
     BollingerAtrReversionStrategy,
     FailedBreakoutReversalStrategy,
     FirstPullbackAfterOpenStrategy,
     LiquiditySweepReversalStrategy,
     MultiTimeframeTrendAlignmentStrategy,
 )
-from backend.app.strategies.regime import AdxAtrRegimeClassifier
+from backend.app.algorithms.voting_ensemble.strategies.regime import AdxAtrRegimeClassifier
 from backend.app.trading_policy import DynamicPolicyInputs, DynamicTradingPolicyEngine
 
 
@@ -95,7 +89,8 @@ APPROVED_VOTING_ENSEMBLE_DIRECTIONAL_IDS = (
     "first_pullback_after_open",
     "failed_breakout_reversal",
     "liquidity_sweep_reversal",
-    "bollinger_atr_reversion",
+    "bollinger_band_reversion",
+    "atr_overextension_reversion",
 )
 
 router = APIRouter(prefix="/api/v2", tags=["api-v2"])
@@ -177,7 +172,7 @@ def voting_ensemble_inventory() -> dict[str, Any]:
         "algorithmId": "voting_ensemble",
         "engineVersion": "voting_ensemble_v2",
         "modules": {
-            "directional": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_DIRECTIONAL_STRATEGIES],
+            "directional": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_DIRECTIONAL_STRATEGIES if entry.enabled],
             "context": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_CONTEXT_STRATEGIES],
             "regime": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_REGIME_STRATEGIES],
             "safety": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_SAFETY_STRATEGIES],
@@ -494,12 +489,8 @@ def build_replay_engine(
         ReplayComponents(
             directionalStrategies=tuple(build_directional_strategies(None)),
             contextModules=(
-                EconomicEventContext(),
                 RelativeStrengthQqqIwmContext(),
                 MarketBreadthMomentumContext(),
-                MarketStructureContext(),
-                VolumeConfirmationContext(),
-                VwapPositionContext(),
             ),
             regimeModule=AdxAtrRegimeClassifier(),
             mlConfig=ml_config or SafeMLInferenceConfig(),
@@ -515,12 +506,13 @@ def build_directional_strategies(strategy_ids: list[str] | None) -> list[Any]:
         "first_pullback_after_open": FirstPullbackAfterOpenStrategy,
         "failed_breakout_reversal": FailedBreakoutReversalStrategy,
         "liquidity_sweep_reversal": LiquiditySweepReversalStrategy,
-        "bollinger_atr_reversion": BollingerAtrReversionStrategy,
+        "bollinger_band_reversion": BollingerAtrReversionStrategy,
+        "atr_overextension_reversion": AtrOverextensionReplayCompatibilityStrategy,
     }
     ids = strategy_ids or list(APPROVED_VOTING_ENSEMBLE_DIRECTIONAL_IDS)
     strategies: list[Any] = []
     for strategy_id in ids:
-        canonical_id = resolve_strategy(strategy_id).strategyId
+        canonical_id = resolve_voting_ensemble_strategy(strategy_id).strategyId
         if canonical_id not in factories:
             raise HTTPException(status_code=400, detail=f"Strategy is not in the production Voting Ensemble inventory: {strategy_id}")
         strategies.append(factories[canonical_id]())

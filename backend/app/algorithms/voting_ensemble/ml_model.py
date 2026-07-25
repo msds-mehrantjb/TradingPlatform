@@ -9,7 +9,7 @@ from backend.app.algorithms.voting_ensemble.model_calibration import (
     voting_ensemble_model_calibration_artifact,
 )
 from backend.app.domain.models import OperatingMode
-from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceConfig
+from backend.app.algorithms.voting_ensemble.ml_contracts import SafeMLInferenceConfig
 
 
 VOTING_ENSEMBLE_ML_MODEL_VERSION = "voting_ensemble_ml_model_v1"
@@ -32,7 +32,7 @@ def ml_model_reason_codes() -> tuple[str, ...]:
 def voting_ensemble_ml_config() -> SafeMLInferenceConfig:
     return SafeMLInferenceConfig(
         mode=OperatingMode.OFF,
-        fallbackBehavior="NO_TRADE",
+        fallbackBehavior="DETERMINISTIC_BASELINE",
         fallbackOnModelUnavailable=True,
         fallbackOnSchemaMismatch=True,
         minSuccessProbability=0.52,

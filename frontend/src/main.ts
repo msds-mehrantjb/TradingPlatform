@@ -499,6 +499,18 @@ type VotingEnsembleBackendResult = {
   reason_codes: string[];
 };
 
+type VotingEnsembleEvaluationJob = {
+  algorithmId: "voting_ensemble";
+  jobId: string;
+  commandKind?: string;
+  jobType?: "evaluate";
+  status: "queued" | "running" | "completed" | "blocked" | "expired" | "failed";
+  statusUrl?: string;
+  resultUrl?: string;
+  result?: VotingEnsembleBackendResult;
+  error?: string | null;
+};
+
 type ConfidenceStrategyKey = string;
 
 type ConfidenceStrategy = {
@@ -14289,7 +14301,14 @@ async function fetchVotingEnsembleDecision(payload: ReturnType<typeof votingEnse
         body: JSON.stringify(payload),
       });
       if (response.ok) {
-        return (await response.json()) as VotingEnsembleBackendResult;
+        const body = await response.json();
+        if (isVotingEnsembleBackendResult(body)) {
+          return body;
+        }
+        if (isVotingEnsembleEvaluationJob(body)) {
+          return await pollVotingEnsembleEvaluationJob(baseUrl, body);
+        }
+        throw new Error("Voting Ensemble backend returned an unknown evaluation response.");
       }
       const text = await response.text();
       lastMessage =
@@ -14304,6 +14323,81 @@ async function fetchVotingEnsembleDecision(payload: ReturnType<typeof votingEnse
     }
   }
   throw new Error(lastMessage);
+}
+
+async function pollVotingEnsembleEvaluationJob(baseUrl: string, job: VotingEnsembleEvaluationJob) {
+  const resultPath = job.resultUrl ?? `/api/voting-ensemble/evaluate/jobs/${encodeURIComponent(job.jobId)}/result`;
+  const statusPath = job.statusUrl ?? `/api/voting-ensemble/evaluate/jobs/${encodeURIComponent(job.jobId)}`;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const statusJob = attempt === 0 ? job : await fetchVotingEnsembleEvaluationJob(baseUrl, statusPath);
+    if (statusJob.status === "completed" && statusJob.result) {
+      const inlineResult = unwrapVotingEnsembleEvaluationResult(statusJob.result);
+      if (inlineResult) {
+        return inlineResult;
+      }
+    }
+    if (statusJob.status === "completed") {
+      const result = await fetchVotingEnsembleEvaluationResult(baseUrl, resultPath);
+      if (isVotingEnsembleBackendResult(result)) {
+        return result;
+      }
+      throw new Error("Voting Ensemble evaluation result did not match the expected contract.");
+    }
+    if (statusJob.status === "failed" || statusJob.status === "blocked" || statusJob.status === "expired") {
+      throw new Error(statusJob.error || "Voting Ensemble evaluation job failed.");
+    }
+    await waitForVotingEnsembleJobPoll(attempt < 4 ? 250 : 500);
+  }
+  throw new Error(`Voting Ensemble evaluation job ${job.jobId} did not finish before the dashboard timeout.`);
+}
+
+async function fetchVotingEnsembleEvaluationJob(baseUrl: string, path: string) {
+  const response = await fetchWithTimeout(`${baseUrl}${path}`, 5000);
+  if (!response.ok) {
+    throw new Error(await readableResponseError(response));
+  }
+  const body = await response.json();
+  if (!isVotingEnsembleEvaluationJob(body)) {
+    throw new Error("Voting Ensemble job status response did not match the expected contract.");
+  }
+  return body;
+}
+
+async function fetchVotingEnsembleEvaluationResult(baseUrl: string, path: string) {
+  const response = await fetchWithTimeout(`${baseUrl}${path}`, 5000);
+  if (!response.ok) {
+    throw new Error(await readableResponseError(response));
+  }
+  const body = await response.json();
+  if (isRecord(body) && body.result !== undefined) {
+    return unwrapVotingEnsembleEvaluationResult(body.result) ?? body.result;
+  }
+  return body;
+}
+
+function waitForVotingEnsembleJobPoll(delayMs: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
+}
+
+function isVotingEnsembleEvaluationJob(value: unknown): value is VotingEnsembleEvaluationJob {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return value.algorithmId === "voting_ensemble" && typeof value.jobId === "string" && typeof value.status === "string";
+}
+
+function unwrapVotingEnsembleEvaluationResult(value: unknown) {
+  if (isVotingEnsembleBackendResult(value)) {
+    return value;
+  }
+  if (isRecord(value) && isVotingEnsembleBackendResult(value.decision)) {
+    return value.decision;
+  }
+  return null;
+}
+
+function isVotingEnsembleBackendResult(value: unknown): value is VotingEnsembleBackendResult {
+  return isRecord(value) && value.algorithm_id === "voting_ensemble" && typeof value.service_version === "string" && typeof value.final_signal === "string" && Array.isArray(value.votes);
 }
 
 async function loadVotingEnsembleInventory() {

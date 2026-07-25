@@ -31,11 +31,20 @@ class VotingEnsembleBacktestRunnerTest(unittest.TestCase):
             voting_candle(6, 100.90, 101.50, 100.85, 101.45, 150000),
         )
 
-        vote = evaluate_first_pullback_after_open(VotingEnsembleEvaluateRequest(candles=rows, data_timestamp=rows[-1].timestamp))
+        vote = evaluate_first_pullback_after_open(
+            VotingEnsembleEvaluateRequest(
+                candles=rows,
+                data_timestamp=rows[-1].timestamp,
+                qqq_candles=rows,
+                iwm_candles=rows,
+                external_breadth_feed=breadth(rows[-1].timestamp),
+                nbbo=nbbo(rows[-1].timestamp),
+            )
+        )
 
         self.assertEqual(vote.signal, "Buy")
         self.assertTrue(vote.eligible)
-        self.assertEqual(vote.features["reasonCode"], "voting_ensemble.first_pullback.completed_buy")
+        self.assertEqual(vote.features["reasonCode"], "first_pullback_after_open.buy_confirmed")
 
     def test_runner_uses_only_voting_ensemble_catalog(self) -> None:
         runner = VotingEnsembleBacktestRunner(config=VotingEnsembleBacktestConfig(warmupCandles=5, includeDecisionRecords=True))
@@ -68,9 +77,9 @@ class VotingEnsembleBacktestRunnerTest(unittest.TestCase):
         self.assertIn("qqq_candles", result["dataQuality"]["missingInputs"])
         self.assertIn("iwm_candles", result["dataQuality"]["missingInputs"])
         first = result["decisionRecords"][0]
-        relative_strength = [signal for signal in first["contextSignals"] if signal["strategy"] == "Relative Strength vs QQQ/IWM"][0]
-        self.assertEqual(relative_strength["signal"], "Hold")
-        self.assertFalse(relative_strength["dataReady"])
+        self.assertEqual(first["finalSignal"], "Hold")
+        self.assertIn("voting_ensemble.evaluate.fail_closed_data_readiness", first["reasonCodes"])
+        self.assertEqual(first["contextSignals"], [])
 
     def test_runner_accepts_real_independent_timeframes_and_auxiliary_streams(self) -> None:
         runner = VotingEnsembleBacktestRunner(config=VotingEnsembleBacktestConfig(warmupCandles=5, includeDecisionRecords=True))
@@ -116,7 +125,8 @@ class VotingEnsembleBacktestRunnerTest(unittest.TestCase):
         trade = result["trades"][0]
         self.assertGreater(trade["entryAt"], trade["decisionTimestampUtc"])
         first_record = result["decisionRecords"][0]
-        self.assertIn("execution.market_entry_next_executable", first_record["fill"]["reasonCodes"])
+        self.assertEqual(first_record["candidate"]["orderType"], "LIMIT")
+        self.assertIn("execution.limit_entry_touched", first_record["fill"]["reasonCodes"])
 
     def test_replay_stage_result_exports_v2_training_snapshot(self) -> None:
         runner = VotingEnsembleBacktestRunner(
@@ -201,7 +211,8 @@ class VotingEnsembleBacktestRunnerTest(unittest.TestCase):
                 "First Pullback After Open",
                 "Failed Breakout Reversal",
                 "Liquidity Sweep Reversal",
-                "Bollinger/ATR Reversion",
+                "Bollinger Band Reversion",
+                "ATR Overextension Reversion",
             ],
         )
         self.assertEqual(context_names, ["Relative Strength vs QQQ/IWM", "Market Breadth Momentum"])
@@ -214,7 +225,12 @@ class VotingEnsembleBacktestRunnerTest(unittest.TestCase):
 
 class AlwaysBuyService:
     def evaluate(self, payload: dict[str, Any]) -> dict[str, Any]:
-        timestamp = payload["data_timestamp"]
+        raw_timestamp = payload["data_timestamp"]
+        timestamp = raw_timestamp if isinstance(raw_timestamp, datetime) else datetime.fromisoformat(str(raw_timestamp).replace("Z", "+00:00"))
+        latest = payload["candles"][-1]
+        entry = float(latest["close"])
+        stop = round(entry - 0.20, 4)
+        target = round(entry + 0.20, 4)
         vote = {
             "strategy": "Multi-Timeframe Trend Alignment",
             "family": "trend",
@@ -255,6 +271,51 @@ class AlwaysBuyService:
             "context_adjustment_reason": "test",
             "family_support": {"Buy": 1, "Sell": 0, "Hold": 0},
             "safety_gate_failed": False,
+            "risk_budget": {
+                "quantity": 1,
+                "planned_risk": 0.2,
+                "order_limit": entry,
+                "configuration_hash": "test-risk-budget",
+                "reason_codes": ["test.risk_budget"],
+            },
+            "candidate": {
+                "candidateId": f"candidate-{timestamp}",
+                "symbol": "SPY",
+                "signal": "Buy",
+                "direction": "LONG",
+                "entryPrice": entry,
+                "stopPrice": stop,
+                "targetPrice": target,
+                "quantity": 1,
+                "confidence": 0.8,
+                "expectedValue": 0.2,
+                "features": {},
+                "reasonCodes": ["test.buy"],
+                "explanation": "Synthetic candidate from test service.",
+                "generatedAt": timestamp,
+                "sessionDate": timestamp.date(),
+                "configurationHash": "test-candidate",
+            },
+            "order_plan": {
+                "orderPlanId": f"order-{int(timestamp.timestamp())}",
+                "candidateId": f"candidate-{timestamp}",
+                "symbol": "SPY",
+                "side": "BUY",
+                "orderType": "LIMIT",
+                "quantity": 1,
+                "entryPrice": entry,
+                "stopPrice": stop,
+                "targetPrice": target,
+                "limitPrice": entry,
+                "maximumHoldingMinutes": 30,
+                "timeInForce": "DAY",
+                "eligible": True,
+                "validationErrors": [],
+                "explanation": "Synthetic order plan from shared test service.",
+                "generatedAt": timestamp,
+                "sessionDate": timestamp.date(),
+                "configurationHash": "test-order-plan",
+            },
             "removed_voters": ["Ensemble Strategy Voting"],
             "reason_codes": ["test.buy"],
         }
@@ -291,6 +352,27 @@ def voting_candle(index: int, open_: float, high: float, low: float, close: floa
         close=close,
         volume=volume,
     )
+
+
+def nbbo(timestamp: datetime) -> dict[str, Any]:
+    return {
+        "bid": 101.44,
+        "ask": 101.46,
+        "bidSize": 1000,
+        "askSize": 1000,
+        "quoteTimestamp": timestamp.isoformat(),
+        "lastTradeTimestamp": timestamp.isoformat(),
+        "marketDataReceiptTimestamp": timestamp.isoformat(),
+    }
+
+
+def breadth(timestamp: datetime) -> dict[str, Any]:
+    return {
+        "providerTimestamp": timestamp.isoformat(),
+        "receiptTimestamp": timestamp.isoformat(),
+        "percentageAdvancing": 0.55,
+        "dataCoverage": 0.90,
+    }
 
 
 if __name__ == "__main__":

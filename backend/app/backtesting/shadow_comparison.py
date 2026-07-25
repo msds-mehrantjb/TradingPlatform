@@ -12,7 +12,7 @@ from backend.app.ensemble.diagnostics import (
     StrategyDiversityDiagnosticsReport,
     strategy_diversity_diagnostics,
 )
-from backend.app.strategies.registry import directional_strategy_input_ids
+from backend.app.algorithms.voting_ensemble.strategies.registry import directional_strategy_input_ids
 
 from .event_replay import ReplayDecisionSnapshot, ReplayResult
 
@@ -26,8 +26,6 @@ FORBIDDEN_V2_PROXY_NAMES = frozenset(
         "strategyVoteCatalog",
         "strategyVote",
         "Failed Breakout Strategy",
-        "Bollinger Band Reversion",
-        "ATR Overextension Reversion",
         "Economic Event Reaction Strategy",
         "VWAP Position Strategy",
         "ADX Trend Strength Filter",

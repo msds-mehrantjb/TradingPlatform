@@ -23,6 +23,20 @@ def backtest_config_reason_codes() -> tuple[str, ...]:
     )
 
 
+def voting_ensemble_execution_stress_scenarios() -> tuple[ExecutionSimulationConfig, ...]:
+    baseline = voting_ensemble_execution_config()
+    return (
+        baseline.model_copy(update={"scenarioName": "baseline_costs"}),
+        baseline.model_copy(update={"scenarioName": "two_times_costs", "costMultiplier": 2.0}),
+        baseline.model_copy(update={"scenarioName": "three_times_costs", "costMultiplier": 3.0}),
+        baseline.model_copy(update={"scenarioName": "elevated_latency", "queueLatencySeconds": 3, "routingLatencySeconds": 2}),
+        baseline.model_copy(update={"scenarioName": "stale_quotes", "quoteAgeSeconds": 10.0, "maxQuoteAgeSeconds": 5.0}),
+        baseline.model_copy(update={"scenarioName": "thin_liquidity", "liquidityHaircut": 0.10, "partialFillRatio": 0.25}),
+        baseline.model_copy(update={"scenarioName": "high_volatility_event_period", "eventShock": True, "volatilitySlippageMultiplier": 2.0, "spreadWideningMultiplier": 2.0}),
+        baseline.model_copy(update={"scenarioName": "opening_session_spread_expansion", "openingSessionSpreadMultiplier": 3.0, "spreadWideningMultiplier": 1.5}),
+    )
+
+
 class VotingEnsembleBacktestConfig(DomainModel):
     startingCapital: float = Field(default=100_000.0, gt=0)
     warmupCandles: int = Field(default=40, ge=2)
@@ -33,5 +47,6 @@ class VotingEnsembleBacktestConfig(DomainModel):
     includeDecisionRecords: bool = True
     maximumDecisionRecords: int | None = Field(default=None, ge=0)
     execution: ExecutionSimulationConfig = Field(default_factory=voting_ensemble_execution_config)
+    executionStressScenarios: tuple[ExecutionSimulationConfig, ...] = Field(default_factory=voting_ensemble_execution_stress_scenarios)
     configVersion: str = VOTING_ENSEMBLE_BACKTEST_CONFIG_VERSION
 

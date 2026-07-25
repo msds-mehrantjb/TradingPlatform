@@ -24,22 +24,16 @@ from backend.app.domain.feature_engine import MarketCandle, PriorDayOHLC
 from backend.app.domain.models import Signal
 from backend.app.ensemble import v1 as ensemble_v1
 from backend.app.execution import v1 as execution_v1
-from backend.app.strategies.context import (
-    EconomicEventContext,
-    MarketBreadthMomentumContext,
-    MarketStructureContext,
-    RelativeStrengthQqqIwmContext,
-    VolumeConfirmationContext,
-    VwapPositionContext,
-)
+from backend.app.algorithms.voting_ensemble.strategies.context import MarketBreadthMomentumContext, RelativeStrengthQqqIwmContext
 from backend.app.algorithms.voting_ensemble.strategies.directional import (
+    AtrOverextensionReplayCompatibilityStrategy,
     BollingerAtrReversionStrategy,
     FailedBreakoutReversalStrategy,
     FirstPullbackAfterOpenStrategy,
     LiquiditySweepReversalStrategy,
     MultiTimeframeTrendAlignmentStrategy,
 )
-from backend.app.strategies.regime import AdxAtrRegimeClassifier
+from backend.app.algorithms.voting_ensemble.strategies.regime import AdxAtrRegimeClassifier
 from backend.app.strategies import v1 as strategies_v1
 from backend.app.trading_policy import v1 as trading_policy_v1
 
@@ -103,14 +97,11 @@ class V2TradingEngine:
                     FailedBreakoutReversalStrategy(),
                     LiquiditySweepReversalStrategy(),
                     BollingerAtrReversionStrategy(),
+                    AtrOverextensionReplayCompatibilityStrategy(),
                 ),
                 contextModules=(
-                    EconomicEventContext(),
                     RelativeStrengthQqqIwmContext(),
                     MarketBreadthMomentumContext(),
-                    MarketStructureContext(),
-                    VolumeConfirmationContext(),
-                    VwapPositionContext(),
                 ),
                 regimeModule=AdxAtrRegimeClassifier(),
                 familyEnsemble=FamilyAwareDeterministicEnsemble(),

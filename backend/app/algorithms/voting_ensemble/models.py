@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 AlgoSignal = Literal["Buy", "Sell", "Hold"]
-SignalFamily = Literal["trend", "breakout", "reversal", "mean_reversion", "event"]
+SignalFamily = Literal["trend", "breakout", "reversal", "mean_reversion", "gap_session", "event"]
 SignalRole = Literal["directional", "context", "safety"]
 SignalDirection = Literal[-1, 0, 1]
 FeatureValue = int | float | bool | str
@@ -33,7 +33,7 @@ class VotingCandle(BaseModel):
 
 
 class VotingEnsembleEvaluateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     symbol: str = Field(default="SPY", min_length=1)
     data_timestamp: datetime | None = None
@@ -45,6 +45,9 @@ class VotingEnsembleEvaluateRequest(BaseModel):
     iwm_candles: tuple[VotingCandle, ...] = ()
     breadth_components: dict[str, tuple[VotingCandle, ...]] = Field(default_factory=dict)
     external_breadth_feed: dict[str, Any] | None = None
+    nbbo: dict[str, Any] | None = None
+    settings: dict[str, Any] | None = None
+    tradingSettings: dict[str, Any] | None = None
 
 
 class VotingStrategyVote(BaseModel):
@@ -85,7 +88,9 @@ class VotingEnsembleEvaluateResponse(BaseModel):
     data_timestamp: datetime
     final_signal: AlgoSignal
     votes: tuple[VotingStrategyVote, ...]
+    shadow_directional_votes: tuple[VotingStrategyVote, ...] = ()
     context_signals: tuple[VotingStrategyVote, ...]
+    shadow_context_signals: tuple[VotingStrategyVote, ...] = ()
     context_confirmation: VotingContextConfirmation
     counts: dict[str, int]
     eligible_counts: dict[str, int]
@@ -96,6 +101,17 @@ class VotingEnsembleEvaluateResponse(BaseModel):
     context_conflicts: int = 0
     context_adjustment_reason: str = ""
     family_support: dict[str, int] = Field(default_factory=dict)
+    family_opposition: dict[str, int] = Field(default_factory=dict)
+    eligible_strategy_count: int = 0
     safety_gate_failed: bool = False
+    blocked_gate_ids: tuple[str, ...] = ()
+    decision_trace: tuple[dict[str, Any], ...] = ()
+    local_gate_decision: dict[str, Any] | None = None
+    upstream_global_gate_decision: dict[str, Any] | None = None
+    resolved_trading_profile: dict[str, Any] | None = None
+    execution_economics: dict[str, Any] | None = None
+    risk_budget: dict[str, Any] | None = None
+    candidate: dict[str, Any] | None = None
+    order_plan: dict[str, Any] | None = None
     removed_voters: tuple[str, ...] = ("Ensemble Strategy Voting",)
     reason_codes: tuple[str, ...] = ()

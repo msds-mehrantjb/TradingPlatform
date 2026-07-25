@@ -15,12 +15,22 @@ from backend.app.domain.indicator_service import PointInTimeIndicatorService
 from backend.app.domain.models import Signal, StrategySignal
 from backend.app.domain.relative_volume import PointInTimeRelativeVolumeService
 from backend.app.algorithms.voting_ensemble.strategy_performance import StrategyReliabilityEstimate, VotingEnsembleStrategyPerformanceTracker
+from backend.app.algorithms.voting_ensemble.snapshot.models import VotingEnsembleEvaluationSnapshot
 from backend.app.algorithms.voting_ensemble.strategies.base import (
     StrategyEvaluationContext,
     hold_signal,
     required_features_ready,
     strategy_signal,
     unavailable_signal,
+)
+from backend.app.algorithms.voting_ensemble.strategies.directional.signal_contract import (
+    DirectionalStrategySignal as SnapshotDirectionalStrategySignal,
+    directional_signal as snapshot_directional_signal,
+    hold_signal as snapshot_hold_signal,
+)
+from backend.app.algorithms.voting_ensemble.strategies.directional.snapshot_helpers import (
+    close_location as snapshot_close_location,
+    spy_candles as snapshot_spy_candles,
 )
 from backend.app.algorithms.voting_ensemble.strategies.registry import resolve_strategy
 
@@ -67,6 +77,93 @@ class VwapPreservationMode(str, Enum):
 class RelativeVolumeEvidenceMode(str, Enum):
     STRICT = "strict"
     OPTIONAL = "optional"
+
+
+class SnapshotFirstPullbackAfterOpenStrategy:
+    strategyId = "first_pullback_after_open"
+    strategyName = "First Pullback After Open"
+    strategyVersion = "first_pullback_after_open_snapshot_v1"
+    family = "trend"
+
+    def __init__(self, min_impulse_candles: int = 3, max_pullback_age: int = 4) -> None:
+        self.min_impulse_candles = min_impulse_candles
+        self.max_pullback_age = max_pullback_age
+
+    def evaluate(self, snapshot: VotingEnsembleEvaluationSnapshot, *, correlation_id: str) -> SnapshotDirectionalStrategySignal:
+        candles = snapshot_spy_candles(snapshot)
+        if len(candles) < self.min_impulse_candles + 4:
+            return self._hold(snapshot, correlation_id, "Need completed opening impulse, pullback, and confirmation candles.", "first_pullback_after_open.insufficient_data", data_ready=False)
+
+        impulse_window = candles[: min(8, len(candles) - 3)]
+        impulse_start = impulse_window[0]
+        impulse_end = impulse_window[-1]
+        impulse_move = impulse_end.close - impulse_start.open
+        impulse_range = max(max(candle.high for candle in impulse_window) - min(candle.low for candle in impulse_window), 0.01)
+        side: AlgoSignal | None = "Buy" if impulse_move > impulse_range * 0.35 else "Sell" if impulse_move < -impulse_range * 0.35 else None
+        if side is None:
+            return self._hold(snapshot, correlation_id, "No explicit opening impulse; session state alone is not directional evidence.", "first_pullback_after_open.no_opening_impulse")
+
+        latest = candles[-1]
+        previous = candles[-2]
+        pullback_window = candles[len(impulse_window) : -1]
+        if not pullback_window:
+            return self._hold(snapshot, correlation_id, "Opening impulse exists but no completed pullback is available.", "first_pullback_after_open.no_pullback")
+        if len(pullback_window) > self.max_pullback_age:
+            return self._hold(snapshot, correlation_id, "The first pullback window has expired.", "first_pullback_after_open.pullback_expired")
+
+        impulse_volume = sum(candle.volume for candle in impulse_window) / len(impulse_window)
+        pullback_volume = sum(candle.volume for candle in pullback_window) / len(pullback_window)
+        vwap = snapshot.features.vwap
+        if vwap is None:
+            return self._hold(snapshot, correlation_id, "Session VWAP is unavailable for pullback validation.", "first_pullback_after_open.missing_vwap", data_ready=False)
+
+        if side == "Buy":
+            retraced = min(candle.low for candle in pullback_window) < impulse_end.close
+            confirmed = latest.close > latest.open and latest.close > previous.high and latest.close > vwap
+            signal = "Buy"
+        else:
+            retraced = max(candle.high for candle in pullback_window) > impulse_end.close
+            confirmed = latest.close < latest.open and latest.close < previous.low and latest.close < vwap
+            signal = "Sell"
+
+        if not retraced:
+            return self._hold(snapshot, correlation_id, "Opening impulse exists, but the first completed pullback has not retraced.", "first_pullback_after_open.no_retracement")
+        if pullback_volume >= impulse_volume:
+            return self._hold(snapshot, correlation_id, "Pullback volume is not lower than opening impulse volume.", "first_pullback_after_open.pullback_volume_too_high")
+        if not confirmed:
+            return self._hold(snapshot, correlation_id, "First pullback is present, but rejection/continuation confirmation is incomplete.", "first_pullback_after_open.waiting_for_confirmation")
+
+        return snapshot_directional_signal(
+            strategy_id=self.strategyId,
+            strategy_name=self.strategyName,
+            strategy_version=self.strategyVersion,
+            family=self.family,
+            signal=signal,
+            confidence=0.78,
+            evaluated_at=snapshot.evaluationTimestamp,
+            correlation_id=correlation_id,
+            evidence=(f"{signal} opening impulse, lower-volume first pullback, VWAP preservation, and confirmation candle.",),
+            reason_codes=(f"first_pullback_after_open.{signal.lower()}_confirmed",),
+            features={
+                "impulseMove": round(impulse_move, 4),
+                "impulseVolume": round(impulse_volume, 2),
+                "pullbackVolume": round(pullback_volume, 2),
+                "closeLocation": round(snapshot_close_location(latest), 4),
+            },
+        )
+
+    def _hold(self, snapshot: VotingEnsembleEvaluationSnapshot, correlation_id: str, reason: str, code: str, *, data_ready: bool = True) -> SnapshotDirectionalStrategySignal:
+        return snapshot_hold_signal(
+            strategy_id=self.strategyId,
+            strategy_name=self.strategyName,
+            strategy_version=self.strategyVersion,
+            family=self.family,
+            evaluated_at=snapshot.evaluationTimestamp,
+            correlation_id=correlation_id,
+            reason=reason,
+            reason_code=code,
+            data_ready=data_ready,
+        )
 
 
 class FirstPullbackAfterOpenConfig(BaseModel):

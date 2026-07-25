@@ -113,6 +113,104 @@ DIRECTIONAL_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
 )
 
 
+REGISTERED_DISABLED_DIRECTIONAL_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
+    _entry(
+        "opening_range_breakout",
+        "Opening Range Breakout",
+        "1.0.0",
+        StrategyFamily.BREAKOUT,
+        StrategyRole.DIRECTIONAL,
+        StrategyCollection.DIRECTIONAL,
+        ("spy1mAtr14", "spy1mRelativeVolume", "spreadDollars", "timeSinceMarketOpenMinutes"),
+        enabled=False,
+    ),
+    _entry(
+        "volatility_breakout",
+        "Volatility Breakout",
+        "1.0.0",
+        StrategyFamily.BREAKOUT,
+        StrategyRole.DIRECTIONAL,
+        StrategyCollection.DIRECTIONAL,
+        (
+            "spy1mAtr14",
+            "spy1mBollingerWidthPercentile",
+            "spy1mRealizedVolatilityPercentile",
+            "spy1mRelativeVolume",
+            "spy1mRollingHigh20",
+            "spy1mRollingLow20",
+            "spreadDollars",
+            "spreadBasisPoints",
+        ),
+        enabled=False,
+    ),
+    _entry(
+        "vwap_trend_continuation",
+        "VWAP Trend Continuation",
+        "1.0.0",
+        StrategyFamily.TREND,
+        StrategyRole.DIRECTIONAL,
+        StrategyCollection.DIRECTIONAL,
+        (
+            "sessionVwap",
+            "sessionVwapSlope",
+            "distanceFromVwapAtr",
+            "spy1mEma9",
+            "spy1mEma20",
+            "spy1mEma9Slope",
+            "spy1mEma20Slope",
+            "spy1mAtr14",
+            "spy1mRelativeVolume",
+            "spy1mHigherHighHigherLow",
+            "spy1mLowerHighLowerLow",
+            "spy1mRollingHigh20",
+            "spy1mRollingLow20",
+        ),
+        enabled=False,
+    ),
+    _entry(
+        "vwap_mean_reversion",
+        "VWAP Mean Reversion",
+        "1.0.0",
+        StrategyFamily.MEAN_REVERSION,
+        StrategyRole.DIRECTIONAL,
+        StrategyCollection.DIRECTIONAL,
+        (
+            "sessionVwap",
+            "sessionVwapSlope",
+            "distanceFromVwapAtr",
+            "spy1mAtr14",
+            "spy1mAdx14",
+            "spy1mRelativeVolume",
+            "spy1mRollingHigh20",
+            "spy1mRollingLow20",
+        ),
+        enabled=False,
+    ),
+    _entry(
+        "gap_continuation_gap_fade",
+        "Gap Continuation / Gap Fade",
+        "1.0.0",
+        StrategyFamily.GAP_SESSION,
+        StrategyRole.DIRECTIONAL,
+        StrategyCollection.DIRECTIONAL,
+        (
+            "gapPercent",
+            "spy1mAtr14",
+            "spy1mAdx14",
+            "spy1mRelativeVolume",
+            "premarketHigh",
+            "premarketLow",
+            "timeSinceMarketOpenMinutes",
+            "breadthProxyAverageReturn",
+            "relativeStrengthQqq",
+            "relativeStrengthIwm",
+            "economicEventState",
+        ),
+        enabled=False,
+    ),
+)
+
+
 CONTEXT_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
     _entry(
         "economic_event_context",
@@ -188,6 +286,12 @@ STRATEGY_ALIAS_MAP: dict[str, str] = {
     "Bollinger Band Reversion": "bollinger_atr_reversion",
     "ATR Overextension Reversion": "bollinger_atr_reversion",
     "Bollinger/ATR Reversion": "bollinger_atr_reversion",
+    "Opening Range Breakout": "opening_range_breakout",
+    "Volatility Breakout": "volatility_breakout",
+    "VWAP Trend Continuation": "vwap_trend_continuation",
+    "VWAP Mean Reversion": "vwap_mean_reversion",
+    "Gap Continuation / Gap Fade": "gap_continuation_gap_fade",
+    "Gap Continuation/Fade": "gap_continuation_gap_fade",
     "adx_trend_strength_regime": "adx_atr_regime_classifier",
     "atr_volatility_regime": "adx_atr_regime_classifier",
     "ADX Trend Strength Filter": "adx_atr_regime_classifier",
@@ -206,6 +310,7 @@ STRATEGY_ALIAS_MAP: dict[str, str] = {
 
 ALL_STRATEGIES: tuple[StrategyRegistryEntry, ...] = (
     *DIRECTIONAL_STRATEGIES,
+    *REGISTERED_DISABLED_DIRECTIONAL_STRATEGIES,
     *CONTEXT_STRATEGIES,
     *REGIME_STRATEGIES,
     *SAFETY_STRATEGIES,
@@ -243,11 +348,11 @@ def resolve_strategy_list(names_or_ids: list[str] | tuple[str, ...]) -> list[Str
 
 
 def directional_strategy_inputs() -> list[StrategyRegistryEntry]:
-    return list(DIRECTIONAL_STRATEGIES)
+    return [entry for entry in DIRECTIONAL_STRATEGIES if entry.enabled]
 
 
 def directional_strategy_input_ids() -> list[str]:
-    return [entry.strategyId for entry in DIRECTIONAL_STRATEGIES]
+    return [entry.strategyId for entry in DIRECTIONAL_STRATEGIES if entry.enabled]
 
 
 def assert_directional_voter(entry: StrategyRegistryEntry) -> StrategyRegistryEntry:

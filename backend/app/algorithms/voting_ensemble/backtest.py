@@ -9,9 +9,10 @@ from typing import Any, Protocol
 from backend.app.algorithms.voting_ensemble.backtest_config import VotingEnsembleBacktestConfig, backtest_config_reason_codes
 from backend.app.algorithms.voting_ensemble.models import AlgoSignal, VotingCandle
 from backend.app.algorithms.voting_ensemble.exit_policy import VotingEnsembleExecutionSimulator, exit_policy_reason_codes
-from backend.app.algorithms.voting_ensemble.profit_target_policy import initial_target_price, profit_target_reason_codes
-from backend.app.algorithms.voting_ensemble.service import VotingEnsembleService
-from backend.app.algorithms.voting_ensemble.stop_loss_policy import initial_stop_price, stop_loss_reason_codes
+from backend.app.algorithms.voting_ensemble.pipeline import VotingEnsemblePipeline
+from backend.app.algorithms.voting_ensemble.profit_target_policy import profit_target_reason_codes
+from backend.app.algorithms.voting_ensemble.snapshot.builder import build_backtest_snapshot
+from backend.app.algorithms.voting_ensemble.stop_loss_policy import stop_loss_reason_codes
 from backend.app.algorithms.voting_ensemble.strategies.registry import (
     VOTING_ENSEMBLE_ACTIVE_CONTEXT_STRATEGIES,
     VOTING_ENSEMBLE_ACTIVE_DIRECTIONAL_STRATEGIES,
@@ -33,7 +34,7 @@ class VotingBacktestService(Protocol):
 
 @dataclass
 class VotingEnsembleBacktestRunner:
-    service: VotingBacktestService = field(default_factory=VotingEnsembleService)
+    service: VotingBacktestService = field(default_factory=VotingEnsemblePipeline)
     config: VotingEnsembleBacktestConfig = field(default_factory=VotingEnsembleBacktestConfig)
 
     def run(
@@ -63,6 +64,7 @@ class VotingEnsembleBacktestRunner:
 
         trades: list[dict[str, Any]] = []
         stage_results: list[dict[str, Any]] = []
+        stress_results: list[dict[str, Any]] = []
         decision_count = 0
         active_until: datetime | None = None
         simulator = VotingEnsembleExecutionSimulator(self.config.execution)
@@ -87,6 +89,15 @@ class VotingEnsembleBacktestRunner:
                 order_plan = None if position_active else self._order_plan(symbol, evaluation, candle, session_date)
                 future_candles = [_market_candle_from_voting(item, symbol=symbol, timeframe="1Min") for item in session_candles[index + 1 :]]
                 execution = simulator.simulate(order_plan, future_candles, candle.timestamp) if order_plan else None
+                stress_results.extend(
+                    self._stress_results(
+                        symbol=symbol,
+                        timestamp=candle.timestamp,
+                        evaluation=evaluation,
+                        order_plan=order_plan,
+                        future_candles=future_candles,
+                    )
+                )
                 record = self._stage_result(
                     symbol=symbol,
                     timestamp=candle.timestamp,
@@ -129,7 +140,7 @@ class VotingEnsembleBacktestRunner:
             "backtestVersion": VOTING_ENSEMBLE_BACKTEST_VERSION,
             "backtestConfigVersion": self.config.configVersion,
             "backtestConfigReasonCodes": list(backtest_config_reason_codes()),
-            "algorithmVersion": "voting_ensemble_backend_v1",
+            "algorithmVersion": "voting_ensemble_backend_v2",
             "strategyCatalog": {
                 "directional": list(VOTING_ENSEMBLE_DIRECTIONAL_CATALOG),
                 "context": list(VOTING_ENSEMBLE_CONTEXT_CATALOG),
@@ -137,11 +148,12 @@ class VotingEnsembleBacktestRunner:
                 "removedVoters": ["Ensemble Strategy Voting"],
             },
             "dataQuality": self._data_quality(five_minute, fifteen_minute, qqq, iwm, breadth, bool(spy_15m_candles)),
+            "costStress": _stress_summary(stress_results),
             "decisionCount": decision_count,
             "stageResultCount": decision_count,
             "stageResults": stage_results,
             "decisionRecords": stage_results,
-            "explanation": "Dedicated Voting Ensemble backtest used the isolated backend VotingEnsembleService, the Voting Ensemble-only catalog, point-in-time prefixes, and shared realistic execution simulation.",
+            "explanation": "Dedicated Voting Ensemble backtest used the unified Voting Ensemble pipeline for pre-execution decisions and limited backtest work to point-in-time event delivery, deterministic synthetic quotes, simulated fills, and reporting.",
         }
 
     def _evaluate_at(
@@ -170,39 +182,25 @@ class VotingEnsembleBacktestRunner:
                 for name, component in breadth.items()
             },
             "external_breadth_feed": external_breadth_feed,
+            "nbbo": _synthetic_backtest_nbbo(candles[-1], timestamp),
         }
-        return self.service.evaluate(payload)
+        snapshot = build_backtest_snapshot(payload)
+        evaluate_payload = snapshot.to_evaluate_payload()
+        if hasattr(self.service, "run"):
+            envelope = self.service.run(evaluate_payload, mode="backtest")
+            decision = dict(envelope["decision"])
+            decision["pipeline_envelope"] = {key: value for key, value in envelope.items() if key != "decision"}
+            return decision
+        return self.service.evaluate(evaluate_payload)
 
     def _order_plan(self, symbol: str, evaluation: dict[str, Any], candle: VotingCandle, session_date: date) -> OrderPlan | None:
-        final_signal = _normalize_algo_signal(evaluation.get("final_signal"))
-        if final_signal == "Hold":
+        order_payload = evaluation.get("order_plan")
+        if not isinstance(order_payload, dict):
             return None
-        side = Signal.BUY if final_signal == "Buy" else Signal.SELL
-        entry = candle.close
-        if side == Signal.BUY:
-            stop = initial_stop_price(side=side, entry_price=entry, stop_distance=self.config.stopDistance)
-            target = initial_target_price(side=side, entry_price=entry, target_distance=self.config.targetDistance)
-        else:
-            stop = initial_stop_price(side=side, entry_price=entry, stop_distance=self.config.stopDistance)
-            target = initial_target_price(side=side, entry_price=entry, target_distance=self.config.targetDistance)
-        return OrderPlan(
-            orderPlanId=f"voting-ensemble-order-{int(candle.timestamp.timestamp())}",
-            candidateId=f"voting-ensemble-candidate-{int(candle.timestamp.timestamp())}",
-            symbol=symbol.upper(),
-            side=side,
-            orderType="MARKET",
-            quantity=self.config.quantity,
-            entryPrice=entry,
-            stopPrice=stop,
-            targetPrice=target,
-            maximumHoldingMinutes=self.config.maximumHoldingMinutes,
-            timeInForce="DAY",
-            eligible=True,
-            explanation="Dedicated Voting Ensemble backtest market order generated with Voting Ensemble stop-loss policy.",
-            generatedAt=candle.timestamp,
-            sessionDate=session_date,
-            configurationHash=f"{VOTING_ENSEMBLE_BACKTEST_VERSION}:{self.config.configVersion}:{','.join((*backtest_config_reason_codes(), *stop_loss_reason_codes(), *profit_target_reason_codes(), *exit_policy_reason_codes()))}",
-        )
+        order_plan = OrderPlan.model_validate(order_payload)
+        if not order_plan.eligible or order_plan.orderType == "NO_ORDER" or order_plan.quantity <= 0:
+            return None
+        return order_plan
 
     def _input_stage(
         self,
@@ -274,6 +272,7 @@ class VotingEnsembleBacktestRunner:
                     "reason": safety_reason,
                 },
                 "candidateOrder": order_plan.model_dump(mode="json") if order_plan else None,
+                "riskBudget": evaluation.get("risk_budget"),
                 "execution": {
                     "fill": execution.fill.model_dump(mode="json") if execution else None,
                     "exit": execution.exit.model_dump(mode="json") if execution and execution.exit else None,
@@ -288,6 +287,7 @@ class VotingEnsembleBacktestRunner:
             "strategyOutputs": evaluation.get("votes", []),
             "contextSignals": evaluation.get("context_signals", []),
             "candidate": order_plan.model_dump(mode="json") if order_plan else None,
+            "riskBudget": evaluation.get("risk_budget"),
             "fill": execution.fill.model_dump(mode="json") if execution else None,
             "exit": execution.exit.model_dump(mode="json") if execution and execution.exit else None,
             "reasonCodes": evaluation.get("reason_codes", []),
@@ -296,6 +296,8 @@ class VotingEnsembleBacktestRunner:
     def _trade_record(self, record: dict[str, Any], order_plan: OrderPlan, execution: Any) -> dict[str, Any]:
         side = "Long" if order_plan.side == Signal.BUY.value else "Short"
         exit_result = execution.exit
+        gross_pnl = float(exit_result.grossPnl if exit_result else 0.0)
+        net_pnl = float(exit_result.pnl if exit_result else 0.0)
         return {
             "side": side,
             "decisionTimestampUtc": record["decisionTimestampUtc"],
@@ -304,25 +306,74 @@ class VotingEnsembleBacktestRunner:
             "entryPrice": execution.fill.averagePrice,
             "exitPrice": exit_result.exitPrice if exit_result else None,
             "quantity": execution.fill.filledQuantity,
-            "pnl": round(exit_result.pnl if exit_result else 0.0, 2),
+            "grossPnl": round(gross_pnl, 2),
+            "netPnl": round(net_pnl, 2),
+            "pnl": round(net_pnl, 2),
             "expenses": round(execution.fill.costs.get("total", 0.0) + (exit_result.costs.get("total", 0.0) if exit_result else 0.0), 2),
             "exitReason": exit_result.exitReason if exit_result else "open",
             "strategy": "Voting Ensemble V2",
+            "family": _record_family(record),
+            "regime": _record_regime(record),
+            "session": record["decisionTimestampUtc"][:10],
             "reasonCodes": execution.reasonCodes,
         }
 
+    def _stress_results(
+        self,
+        *,
+        symbol: str,
+        timestamp: datetime,
+        evaluation: dict[str, Any],
+        order_plan: OrderPlan | None,
+        future_candles: list[MarketCandle],
+    ) -> list[dict[str, Any]]:
+        if order_plan is None:
+            return []
+        rows: list[dict[str, Any]] = []
+        for scenario in self.config.executionStressScenarios:
+            execution = VotingEnsembleExecutionSimulator(scenario).simulate(order_plan, future_candles, timestamp)
+            exit_result = execution.exit
+            gross = float(exit_result.grossPnl if exit_result else 0.0)
+            net = float(exit_result.pnl if exit_result else 0.0)
+            rows.append(
+                {
+                    "scenario": scenario.scenarioName,
+                    "symbol": symbol.upper(),
+                    "timestampUtc": timestamp.isoformat().replace("+00:00", "Z"),
+                    "strategy": _evaluation_strategy(evaluation),
+                    "family": _evaluation_family(evaluation),
+                    "regime": _evaluation_regime(evaluation),
+                    "session": timestamp.date().isoformat(),
+                    "fillStatus": execution.fill.status,
+                    "exitStatus": exit_result.status if exit_result else None,
+                    "grossPnl": round(gross, 6),
+                    "netPnl": round(net, 6),
+                    "costs": {
+                        "entry": execution.fill.costs,
+                        "exit": exit_result.costs if exit_result else {},
+                        "total": round(float(execution.fill.costs.get("total", 0.0)) + float((exit_result.costs if exit_result else {}).get("total", 0.0)), 6),
+                    },
+                    "promotionBlocked": net <= 0.0 or execution.fill.status in {"UNFILLED", "EXPIRED"},
+                    "reasonCodes": execution.reasonCodes,
+                }
+            )
+        return rows
+
     def _metrics(self, *, trades: list[dict[str, Any]], bars: int, sessions: int, timeframe: str, date_label: str) -> dict[str, Any]:
-        total_pnl = round(sum(float(trade.get("pnl") or 0.0) for trade in trades), 2)
-        gross_profit = round(sum(float(trade.get("pnl") or 0.0) for trade in trades if float(trade.get("pnl") or 0.0) > 0), 2)
-        gross_loss = round(abs(sum(float(trade.get("pnl") or 0.0) for trade in trades if float(trade.get("pnl") or 0.0) < 0)), 2)
-        winners = sum(1 for trade in trades if float(trade.get("pnl") or 0.0) > 0)
-        losers = sum(1 for trade in trades if float(trade.get("pnl") or 0.0) < 0)
-        final_equity = round(self.config.startingCapital + total_pnl, 2)
-        max_drawdown = abs(min(0.0, total_pnl))
+        net_total_pnl = round(sum(float(trade.get("netPnl") if trade.get("netPnl") is not None else trade.get("pnl") or 0.0) for trade in trades), 2)
+        gross_total_pnl = round(sum(float(trade.get("grossPnl") or 0.0) for trade in trades), 2)
+        gross_profit = round(sum(float(trade.get("netPnl") if trade.get("netPnl") is not None else trade.get("pnl") or 0.0) for trade in trades if float(trade.get("netPnl") if trade.get("netPnl") is not None else trade.get("pnl") or 0.0) > 0), 2)
+        gross_loss = round(abs(sum(float(trade.get("netPnl") if trade.get("netPnl") is not None else trade.get("pnl") or 0.0) for trade in trades if float(trade.get("netPnl") if trade.get("netPnl") is not None else trade.get("pnl") or 0.0) < 0)), 2)
+        winners = sum(1 for trade in trades if float(trade.get("netPnl") if trade.get("netPnl") is not None else trade.get("pnl") or 0.0) > 0)
+        losers = sum(1 for trade in trades if float(trade.get("netPnl") if trade.get("netPnl") is not None else trade.get("pnl") or 0.0) < 0)
+        final_equity = round(self.config.startingCapital + net_total_pnl, 2)
+        max_drawdown = abs(min(0.0, net_total_pnl))
         return {
             "dateLabel": date_label,
             "trades": trades,
-            "totalPnl": total_pnl,
+            "grossTotalPnl": gross_total_pnl,
+            "netTotalPnl": net_total_pnl,
+            "totalPnl": net_total_pnl,
             "totalReturnPercent": round(((final_equity - self.config.startingCapital) / self.config.startingCapital) * 100, 2),
             "startingCapital": self.config.startingCapital,
             "finalEquity": final_equity,
@@ -334,7 +385,7 @@ class VotingEnsembleBacktestRunner:
             "profitFactor": round(gross_profit / gross_loss, 2) if gross_loss else None,
             "averageWin": round(gross_profit / winners, 2) if winners else 0,
             "averageLoss": round(gross_loss / losers, 2) if losers else 0,
-            "expectancy": round(total_pnl / len(trades), 2) if trades else 0,
+            "expectancy": round(net_total_pnl / len(trades), 2) if trades else 0,
             "winners": winners,
             "losers": losers,
             "bars": bars,
@@ -343,6 +394,10 @@ class VotingEnsembleBacktestRunner:
             "timeframe": timeframe,
             "strategyDescription": "Dedicated Voting Ensemble backend backtest",
             "totalTrades": len(trades),
+            "netPerformanceByStrategy": _aggregate_trade_performance(trades, "strategy"),
+            "netPerformanceByFamily": _aggregate_trade_performance(trades, "family"),
+            "netPerformanceByRegime": _aggregate_trade_performance(trades, "regime"),
+            "netPerformanceBySession": _aggregate_trade_performance(trades, "session"),
         }
 
     def _empty_result(self, *, symbol: str, timeframe: str, data_quality: dict[str, Any]) -> dict[str, Any]:
@@ -352,7 +407,7 @@ class VotingEnsembleBacktestRunner:
             "backtestVersion": VOTING_ENSEMBLE_BACKTEST_VERSION,
             "backtestConfigVersion": self.config.configVersion,
             "backtestConfigReasonCodes": list(backtest_config_reason_codes()),
-            "algorithmVersion": "voting_ensemble_backend_v1",
+            "algorithmVersion": "voting_ensemble_backend_v2",
             "symbol": symbol.upper(),
             "strategyCatalog": {
                 "directional": list(VOTING_ENSEMBLE_DIRECTIONAL_CATALOG),
@@ -361,6 +416,7 @@ class VotingEnsembleBacktestRunner:
                 "removedVoters": ["Ensemble Strategy Voting"],
             },
             "dataQuality": data_quality,
+            "costStress": _stress_summary([]),
             "decisionCount": 0,
             "stageResultCount": 0,
             "stageResults": [],
@@ -468,6 +524,23 @@ def _aggregate_voting_candles(candles: tuple[VotingCandle, ...], size: int) -> t
     )
 
 
+def _synthetic_backtest_nbbo(candle: VotingCandle, timestamp: datetime) -> dict[str, Any]:
+    midpoint = candle.close
+    half_spread = 0.01
+    return {
+        "bid": round(max(0.01, midpoint - half_spread), 6),
+        "ask": round(midpoint + half_spread, 6),
+        "bidSize": 1000,
+        "askSize": 1000,
+        "quoteTimestamp": timestamp.isoformat(),
+        "lastTradeTimestamp": timestamp.isoformat(),
+        "marketDataReceiptTimestamp": timestamp.isoformat(),
+        "maxQuoteAgeSeconds": 5,
+        "maxReceiptAgeSeconds": 5,
+        "source": "backtest_fixed_quote_model_not_candle_range_or_volume",
+    }
+
+
 def _market_candle_from_voting(candle: VotingCandle, *, symbol: str, timeframe: str) -> MarketCandle:
     normalized_timeframe = timeframe if timeframe in {"1Min", "5Min", "15Min"} else None
     return MarketCandle(
@@ -486,3 +559,106 @@ def _normalize_algo_signal(value: Any) -> AlgoSignal:
     if value in {"Buy", "Sell"}:
         return value
     return "Hold"
+
+
+def _evaluation_strategy(evaluation: dict[str, Any]) -> str:
+    votes = evaluation.get("votes")
+    if isinstance(votes, list) and votes:
+        first = votes[0]
+        if isinstance(first, dict):
+            return str(first.get("strategy") or "Voting Ensemble V2")
+    return "Voting Ensemble V2"
+
+
+def _evaluation_family(evaluation: dict[str, Any]) -> str:
+    support = evaluation.get("family_support")
+    if isinstance(support, dict) and support:
+        return str(next(iter(support)))
+    votes = evaluation.get("votes")
+    if isinstance(votes, list) and votes:
+        first = votes[0]
+        if isinstance(first, dict):
+            return str(first.get("family") or "unknown_family")
+    return "unknown_family"
+
+
+def _evaluation_regime(evaluation: dict[str, Any]) -> str:
+    profile = evaluation.get("resolved_trading_profile")
+    if isinstance(profile, dict):
+        overlays = profile.get("activeOverlays")
+        if isinstance(overlays, list | tuple) and overlays:
+            return str(overlays[0])
+    return "unknown_regime"
+
+
+def _record_family(record: dict[str, Any]) -> str:
+    return _evaluation_family({"family_support": record.get("familySupport"), "votes": record.get("strategyOutputs")})
+
+
+def _record_regime(record: dict[str, Any]) -> str:
+    return "unknown_regime"
+
+
+def _aggregate_trade_performance(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, float | int]]:
+    grouped: dict[str, dict[str, float | int]] = {}
+    for row in rows:
+        name = str(row.get(key) or "unknown")
+        bucket = grouped.setdefault(name, {"trades": 0, "grossPnl": 0.0, "netPnl": 0.0, "costs": 0.0})
+        bucket["trades"] = int(bucket["trades"]) + 1
+        bucket["grossPnl"] = round(float(bucket["grossPnl"]) + float(row.get("grossPnl") or 0.0), 6)
+        bucket["netPnl"] = round(float(bucket["netPnl"]) + float(row.get("netPnl") if row.get("netPnl") is not None else row.get("pnl") or 0.0), 6)
+        bucket["costs"] = round(float(bucket["costs"]) + float(row.get("expenses") or 0.0), 6)
+    return grouped
+
+
+def _stress_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_scenario: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_scenario.setdefault(str(row.get("scenario") or "unknown"), []).append(row)
+    scenario_summary = {
+        scenario: {
+            "trades": len(items),
+            "filledTrades": sum(1 for item in items if item.get("fillStatus") in {"FILLED", "PARTIAL"}),
+            "grossPnl": round(sum(float(item.get("grossPnl") or 0.0) for item in items), 6),
+            "netPnl": round(sum(float(item.get("netPnl") or 0.0) for item in items), 6),
+            "costs": round(sum(float((item.get("costs") or {}).get("total") or 0.0) for item in items), 6),
+            "promotionBlocked": any(bool(item.get("promotionBlocked")) for item in items),
+        }
+        for scenario, items in sorted(by_scenario.items())
+    }
+    promotion_blocked = any(summary["promotionBlocked"] for summary in scenario_summary.values())
+    return {
+        "scenarioDriven": True,
+        "scenarioResults": scenario_summary,
+        "netPerformanceByStrategy": _aggregate_stress_performance(rows, "strategy"),
+        "netPerformanceByFamily": _aggregate_stress_performance(rows, "family"),
+        "netPerformanceByRegime": _aggregate_stress_performance(rows, "regime"),
+        "netPerformanceBySession": _aggregate_stress_performance(rows, "session"),
+        "promotionGate": {
+            "promotionBlocked": promotion_blocked,
+            "basis": "net_performance_after_estimated_costs",
+            "reasonCodes": ["voting_ensemble.backtest.promotion_requires_net_stress_performance"],
+        },
+        "reasonCodes": ["voting_ensemble.backtest.execution_stress_scenarios_evaluated"],
+    }
+
+
+def _aggregate_stress_performance(rows: list[dict[str, Any]], key: str) -> dict[str, dict[str, float | int]]:
+    grouped: dict[str, dict[str, float | int]] = {}
+    for row in rows:
+        name = str(row.get(key) or "unknown")
+        bucket = grouped.setdefault(name, {"trades": 0, "grossPnl": 0.0, "netPnl": 0.0, "costs": 0.0, "blockedScenarios": 0})
+        bucket["trades"] = int(bucket["trades"]) + 1
+        bucket["grossPnl"] = round(float(bucket["grossPnl"]) + float(row.get("grossPnl") or 0.0), 6)
+        bucket["netPnl"] = round(float(bucket["netPnl"]) + float(row.get("netPnl") or 0.0), 6)
+        bucket["costs"] = round(float(bucket["costs"]) + float((row.get("costs") or {}).get("total") or 0.0), 6)
+        bucket["blockedScenarios"] = int(bucket["blockedScenarios"]) + (1 if row.get("promotionBlocked") else 0)
+    return grouped
+
+
+def _number(payload: dict[str, Any], key: str) -> float | None:
+    try:
+        value = payload.get(key)
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None

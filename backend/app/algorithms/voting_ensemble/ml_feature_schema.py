@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from backend.app.algorithms.meta_strategy.ml_features import MLFeatureSpec
+from backend.app.algorithms.voting_ensemble.ml_contracts import MLFeatureSpec
 
 
 VOTING_ENSEMBLE_ML_FEATURE_SCHEMA_VERSION = "voting_ensemble_ml_feature_schema_v1"

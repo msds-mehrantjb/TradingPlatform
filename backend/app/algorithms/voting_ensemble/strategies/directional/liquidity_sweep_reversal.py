@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.app.algorithms.voting_ensemble.snapshot.models import VotingEnsembleEvaluationSnapshot
 from backend.app.domain.models import Signal, StrategySignal
 from backend.app.algorithms.voting_ensemble.strategies.base import (
     StrategyEvaluationContext,
@@ -16,6 +17,18 @@ from backend.app.algorithms.voting_ensemble.strategies.base import (
     required_features_ready,
     strategy_signal,
     unavailable_signal,
+)
+from backend.app.algorithms.voting_ensemble.strategies.directional.signal_contract import (
+    DirectionalStrategySignal as SnapshotDirectionalStrategySignal,
+    directional_signal as snapshot_directional_signal,
+    hold_signal as snapshot_hold_signal,
+)
+from backend.app.algorithms.voting_ensemble.strategies.directional.snapshot_helpers import (
+    lower_wick_ratio as snapshot_lower_wick_ratio,
+    reference_highs as snapshot_reference_highs,
+    reference_lows as snapshot_reference_lows,
+    spy_candles as snapshot_spy_candles,
+    upper_wick_ratio as snapshot_upper_wick_ratio,
 )
 from backend.app.algorithms.voting_ensemble.strategies.registry import resolve_strategy
 
@@ -80,6 +93,83 @@ class SweepEvidence:
     bufferDollars: float
     sweptAt: datetime | None
     structuralInvalidationPrice: float | None
+
+
+class SnapshotLiquiditySweepReversalStrategy:
+    strategyId = "liquidity_sweep_reversal"
+    strategyName = "Liquidity Sweep Reversal"
+    strategyVersion = "liquidity_sweep_reversal_snapshot_v1"
+    family = "reversal"
+
+    def __init__(self, min_sweep_dollars: float = 0.01, min_wick_ratio: float = 0.35) -> None:
+        self.min_sweep_dollars = min_sweep_dollars
+        self.min_wick_ratio = min_wick_ratio
+
+    def evaluate(self, snapshot: VotingEnsembleEvaluationSnapshot, *, correlation_id: str) -> SnapshotDirectionalStrategySignal:
+        candles = snapshot_spy_candles(snapshot)
+        if len(candles) < 3:
+            return self._hold(snapshot, correlation_id, "Need completed candles and point-in-time liquidity reference levels.", "liquidity_sweep_reversal.insufficient_data", data_ready=False)
+        if snapshot.nbbo is None:
+            return self._hold(snapshot, correlation_id, "NBBO spread is mandatory for sweep eligibility.", "liquidity_sweep_reversal.missing_nbbo", data_ready=False)
+
+        latest = candles[-1]
+        sweep_buffer = max(snapshot.nbbo.spreadDollars, self.min_sweep_dollars)
+        volume_window = candles[-min(20, len(candles)) : -1]
+        baseline_volume = sum(candle.volume for candle in volume_window) / max(len(volume_window), 1)
+        volume_ratio = latest.volume / max(baseline_volume, 1.0)
+
+        for name, level in snapshot_reference_lows(snapshot):
+            swept = latest.low <= level - sweep_buffer
+            reclaimed = latest.close > level
+            wick_ratio = snapshot_lower_wick_ratio(latest)
+            if swept and reclaimed and wick_ratio >= self.min_wick_ratio:
+                return snapshot_directional_signal(
+                    strategy_id=self.strategyId,
+                    strategy_name=self.strategyName,
+                    strategy_version=self.strategyVersion,
+                    family=self.family,
+                    signal="Buy",
+                    confidence=0.72,
+                    evaluated_at=snapshot.evaluationTimestamp,
+                    correlation_id=correlation_id,
+                    evidence=(f"Swept liquidity below {name} {level:.2f}, reclaimed the level, and left a lower rejection wick.",),
+                    reason_codes=("liquidity_sweep_reversal.buy_low_sweep",),
+                    features={"liquidityLevel": round(level, 4), "sweepDistance": round(level - latest.low, 4), "wickRatio": round(wick_ratio, 4), "volumeRatio": round(volume_ratio, 4)},
+                )
+
+        for name, level in snapshot_reference_highs(snapshot):
+            swept = latest.high >= level + sweep_buffer
+            reclaimed = latest.close < level
+            wick_ratio = snapshot_upper_wick_ratio(latest)
+            if swept and reclaimed and wick_ratio >= self.min_wick_ratio:
+                return snapshot_directional_signal(
+                    strategy_id=self.strategyId,
+                    strategy_name=self.strategyName,
+                    strategy_version=self.strategyVersion,
+                    family=self.family,
+                    signal="Sell",
+                    confidence=0.72,
+                    evaluated_at=snapshot.evaluationTimestamp,
+                    correlation_id=correlation_id,
+                    evidence=(f"Swept liquidity above {name} {level:.2f}, reclaimed below the level, and left an upper rejection wick.",),
+                    reason_codes=("liquidity_sweep_reversal.sell_high_sweep",),
+                    features={"liquidityLevel": round(level, 4), "sweepDistance": round(latest.high - level, 4), "wickRatio": round(wick_ratio, 4), "volumeRatio": round(volume_ratio, 4)},
+                )
+
+        return self._hold(snapshot, correlation_id, "No completed liquidity sweep and reclaim setup.", "liquidity_sweep_reversal.no_sweep")
+
+    def _hold(self, snapshot: VotingEnsembleEvaluationSnapshot, correlation_id: str, reason: str, code: str, *, data_ready: bool = True) -> SnapshotDirectionalStrategySignal:
+        return snapshot_hold_signal(
+            strategy_id=self.strategyId,
+            strategy_name=self.strategyName,
+            strategy_version=self.strategyVersion,
+            family=self.family,
+            evaluated_at=snapshot.evaluationTimestamp,
+            correlation_id=correlation_id,
+            reason=reason,
+            reason_code=code,
+            data_ready=data_ready,
+        )
 
 
 class LiquiditySweepReversalStrategy:

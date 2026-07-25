@@ -674,6 +674,10 @@ class EventDrivenReplayEngine:
                 "marketOpen": True,
                 "entryWindowOpen": True,
                 "validSession": True,
+                "feedDegraded": False,
+                "clockDisagreement": False,
+                "executionFailureCooldownActive": False,
+                "eventRiskState": "event_risk_active" if bool((feature_snapshot.rawInputs.get("economicEventState") or {}).get("active", False)) else "event_risk_clear",
             },
             dataState={
                 "freshCandle": feature_snapshot.dataReady,
@@ -683,6 +687,8 @@ class EventDrivenReplayEngine:
                 "requiredTimeframeSynchronized": not any(code.startswith("missing_spy") for code in feature_snapshot.reasonCodes),
                 "requiredAuxiliaryDataReady": not any(code.startswith(("qqq_", "iwm_", "breadth_")) for code in feature_snapshot.reasonCodes),
                 "featureSchemaValid": bool(feature_snapshot.engineVersion),
+                "feedHealthy": feature_snapshot.dataReady,
+                "clockSynchronized": True,
             },
             brokerState=broker_state or {
                 "brokerConnected": True,
@@ -698,7 +704,10 @@ class EventDrivenReplayEngine:
                 "luldPause": False,
                 "marketWideCircuitBreaker": False,
                 "lockedOrCrossedQuote": False,
+                "eventBlackout": bool((feature_snapshot.rawInputs.get("economicEventState") or {}).get("eventBlackoutActive", False)),
                 "spreadBps": spread_bps,
+                "spreadDollars": feature_number(feature_snapshot, "spreadDollars"),
+                "maximumSpreadDollars": 0.25,
                 "realizedVolatilityPercentile": realized_volatility,
             },
             executionState={
@@ -720,6 +729,7 @@ class EventDrivenReplayEngine:
                 "totalSpyNotionalPercent": 0.0,
                 "sameDirectionExposurePercent": 0.0,
                 "consecutiveLosses": 0,
+                "existingPositionConflict": False,
                 "modelHealthy": True,
             },
         )

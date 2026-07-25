@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.app.algorithms.voting_ensemble.snapshot.models import VotingEnsembleEvaluationSnapshot
 from backend.app.domain.models import Signal, StrategySignal
 from backend.app.algorithms.voting_ensemble.strategies.base import (
     StrategyEvaluationContext,
@@ -16,6 +17,17 @@ from backend.app.algorithms.voting_ensemble.strategies.base import (
     required_features_ready,
     strategy_signal,
     unavailable_signal,
+)
+from backend.app.algorithms.voting_ensemble.strategies.directional.signal_contract import (
+    DirectionalStrategySignal as SnapshotDirectionalStrategySignal,
+    directional_signal as snapshot_directional_signal,
+    hold_signal as snapshot_hold_signal,
+)
+from backend.app.algorithms.voting_ensemble.strategies.directional.snapshot_helpers import (
+    candle_range as snapshot_candle_range,
+    reference_highs as snapshot_reference_highs,
+    reference_lows as snapshot_reference_lows,
+    spy_candles as snapshot_spy_candles,
 )
 from backend.app.algorithms.voting_ensemble.strategies.registry import resolve_strategy
 
@@ -74,6 +86,83 @@ class FailedBreakoutEvidence:
     bufferDollars: float
     failedAt: datetime | None
     structuralInvalidationPrice: float | None
+
+
+class SnapshotFailedBreakoutReversalStrategy:
+    strategyId = "failed_breakout_reversal"
+    strategyName = "Failed Breakout Reversal"
+    strategyVersion = "failed_breakout_reversal_snapshot_v1"
+    family = "reversal"
+
+    def __init__(self, min_penetration: float = 0.01, min_body_to_range: float = 0.35) -> None:
+        self.min_penetration = min_penetration
+        self.min_body_to_range = min_body_to_range
+
+    def evaluate(self, snapshot: VotingEnsembleEvaluationSnapshot, *, correlation_id: str) -> SnapshotDirectionalStrategySignal:
+        candles = snapshot_spy_candles(snapshot)
+        if len(candles) < 4:
+            return self._hold(snapshot, correlation_id, "Need a failed breakout candle and a completed confirmation candle.", "failed_breakout_reversal.insufficient_data", data_ready=False)
+        if snapshot.nbbo is None:
+            return self._hold(snapshot, correlation_id, "NBBO spread is mandatory for failed-breakout eligibility.", "failed_breakout_reversal.missing_nbbo", data_ready=False)
+
+        failed = candles[-2]
+        confirmation = candles[-1]
+        range_dollars = snapshot_candle_range(confirmation)
+        body_ratio = abs(confirmation.close - confirmation.open) / max(range_dollars, 0.01)
+        spread_buffer = max(snapshot.nbbo.spreadDollars, self.min_penetration)
+
+        for name, level in snapshot_reference_highs(snapshot):
+            penetrated = failed.high >= level + spread_buffer
+            closed_back_inside = failed.close < level
+            confirmed = confirmation.close < confirmation.open and confirmation.close < failed.low and body_ratio >= self.min_body_to_range
+            if penetrated and closed_back_inside and confirmed:
+                return snapshot_directional_signal(
+                    strategy_id=self.strategyId,
+                    strategy_name=self.strategyName,
+                    strategy_version=self.strategyVersion,
+                    family=self.family,
+                    signal="Sell",
+                    confidence=0.74,
+                    evaluated_at=snapshot.evaluationTimestamp,
+                    correlation_id=correlation_id,
+                    evidence=(f"Failed breakout above {name} {level:.2f} closed back inside with bearish confirmation.",),
+                    reason_codes=("failed_breakout_reversal.sell_failed_high",),
+                    features={"referenceLevel": round(level, 4), "penetration": round(failed.high - level, 4), "bodyRatio": round(body_ratio, 4)},
+                )
+
+        for name, level in snapshot_reference_lows(snapshot):
+            penetrated = failed.low <= level - spread_buffer
+            closed_back_inside = failed.close > level
+            confirmed = confirmation.close > confirmation.open and confirmation.close > failed.high and body_ratio >= self.min_body_to_range
+            if penetrated and closed_back_inside and confirmed:
+                return snapshot_directional_signal(
+                    strategy_id=self.strategyId,
+                    strategy_name=self.strategyName,
+                    strategy_version=self.strategyVersion,
+                    family=self.family,
+                    signal="Buy",
+                    confidence=0.74,
+                    evaluated_at=snapshot.evaluationTimestamp,
+                    correlation_id=correlation_id,
+                    evidence=(f"Failed breakdown below {name} {level:.2f} closed back inside with bullish confirmation.",),
+                    reason_codes=("failed_breakout_reversal.buy_failed_low",),
+                    features={"referenceLevel": round(level, 4), "penetration": round(level - failed.low, 4), "bodyRatio": round(body_ratio, 4)},
+                )
+
+        return self._hold(snapshot, correlation_id, "No failed breakout with completed next-candle reversal confirmation.", "failed_breakout_reversal.no_failure")
+
+    def _hold(self, snapshot: VotingEnsembleEvaluationSnapshot, correlation_id: str, reason: str, code: str, *, data_ready: bool = True) -> SnapshotDirectionalStrategySignal:
+        return snapshot_hold_signal(
+            strategy_id=self.strategyId,
+            strategy_name=self.strategyName,
+            strategy_version=self.strategyVersion,
+            family=self.family,
+            evaluated_at=snapshot.evaluationTimestamp,
+            correlation_id=correlation_id,
+            reason=reason,
+            reason_code=code,
+            data_ready=data_ready,
+        )
 
 
 class FailedBreakoutReversalStrategy:

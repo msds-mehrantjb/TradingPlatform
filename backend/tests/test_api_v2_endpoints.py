@@ -46,15 +46,17 @@ class ApiV2EndpointsTest(unittest.TestCase):
         directional_names = {module["name"] for module in directional}
         directional_ids = {module["id"] for module in directional}
         self.assertNotIn("Economic Event Reaction Strategy", directional_names)
-        self.assertNotIn("ATR Overextension Reversion", directional_names)
+        self.assertIn("ATR Overextension Reversion", directional_names)
         self.assertNotIn("opening_range_breakout", directional_ids)
         self.assertNotIn("vwap_trend_continuation", directional_ids)
         self.assertNotIn("vwap_mean_reversion", directional_ids)
         self.assertNotIn("volatility_breakout", directional_ids)
         self.assertNotIn("gap_continuation_gap_fade", directional_ids)
-        bollinger = next(module for module in directional if module["id"] == "bollinger_atr_reversion")
-        self.assertEqual(bollinger["name"], "Bollinger/ATR Reversion")
-        self.assertEqual({alias["name"] for alias in bollinger["aliases"]}, {"Bollinger Band Reversion", "ATR Overextension Reversion"})
+        bollinger = next(module for module in directional if module["id"] == "bollinger_band_reversion")
+        self.assertEqual(bollinger["name"], "Bollinger Band Reversion")
+        self.assertEqual({alias["name"] for alias in bollinger["aliases"]}, {"Bollinger/ATR Reversion", "bollinger_atr_reversion"})
+        atr = next(module for module in directional if module["id"] == "atr_overextension_reversion")
+        self.assertEqual(atr["name"], "ATR Overextension Reversion")
         self.assertIn("relative_strength_qqq_iwm", {module["id"] for module in context})
         self.assertIn("market_breadth_momentum", {module["id"] for module in context})
         self.assertEqual(
@@ -107,7 +109,7 @@ class ApiV2EndpointsTest(unittest.TestCase):
 
         expected_modules = {
             "voting-ensemble": {
-                "directional": ["multi_timeframe_trend_alignment", "first_pullback_after_open", "failed_breakout_reversal", "liquidity_sweep_reversal", "bollinger_atr_reversion"],
+                "directional": ["multi_timeframe_trend_alignment", "first_pullback_after_open", "failed_breakout_reversal", "liquidity_sweep_reversal", "bollinger_band_reversion", "atr_overextension_reversion"],
                 "context": ["relative_strength_qqq_iwm", "market_breadth_momentum", "economic_event_context", "market_structure_context", "volume_confirmation_context", "vwap_position_context"],
                 "regime": ["adx_atr_regime_classifier"],
                 "safety": ["cash_avoid_trading_filter"],
