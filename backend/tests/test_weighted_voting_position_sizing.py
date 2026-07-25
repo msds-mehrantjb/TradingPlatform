@@ -146,6 +146,23 @@ class WeightedVotingPositionSizingTest(unittest.TestCase):
         self.assertEqual(long_result.actual_ask, 100.05)
         self.assertEqual(short_result.actual_bid, 100.0)
 
+    def test_full_size_requires_independent_family_support(self) -> None:
+        settings = effective_settings(order_allocation_percent=100.0, maximum_position_percent=100.0, maximum_shares=100000)
+        generous_caps = {
+            "effective_settings": settings,
+            "remaining_weighted_capital_partition": 100000.0,
+            "available_buying_power": 100000.0,
+            "global_available_risk": 5000.0,
+            "global_max_shares": 100000,
+            "average_one_minute_volume": 1000000.0,
+        }
+        multi_family = calculate_weighted_voting_position_size(base_context(**generous_caps))
+        single_family = calculate_weighted_voting_position_size(base_context(**generous_caps, decision=single_family_decision()))
+
+        self.assertLess(single_family.size_multiplier, multi_family.size_multiplier)
+        self.assertLess(single_family.quantity, multi_family.quantity)
+        self.assertIn("weighted_voting.sizing.partial_size_independent_family_support", single_family.reason_codes)
+
 
 def base_context(**overrides) -> WeightedVotingSizingContext:
     values = {
@@ -190,6 +207,10 @@ def directional_decision(side: WeightedSide):
 
 def hold_decision():
     return aggregate_weighted_signals(strategy_signals(WeightedSide.HOLD, p_buy=0.1, p_sell=0.1, p_hold=0.8), decision_timestamp=TS)
+
+
+def single_family_decision():
+    return aggregate_weighted_signals(tuple(signal for signal in strategy_signals(WeightedSide.BUY) if signal.strategy_id == "S2"), decision_timestamp=TS)
 
 
 def strategy_signals(side: WeightedSide, *, p_buy: float | None = None, p_sell: float | None = None, p_hold: float | None = None) -> list[WeightedVotingSignal]:

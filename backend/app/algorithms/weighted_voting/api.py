@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Path
+from fastapi import APIRouter, Body, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.app.algorithms.weighted_voting.identity import (
@@ -14,6 +14,7 @@ from backend.app.algorithms.weighted_voting.identity import (
     WEIGHTED_VOTING_API_TAG,
     WEIGHTED_VOTING_API_VERSION,
 )
+from backend.app.algorithms.weighted_voting.runtime_supervisor import get_weighted_voting_runtime_supervisor, runtime_supervisor_status
 from backend.app.algorithms.weighted_voting.service import WeightedVotingService
 
 router = APIRouter(prefix=WEIGHTED_VOTING_API_NAMESPACE, tags=[WEIGHTED_VOTING_API_TAG])
@@ -43,6 +44,14 @@ WEIGHTED_VOTING_API_INVENTORY = (
     ("GET", "/positions"),
     ("GET", "/trades"),
     ("GET", "/observability/{decision_id}"),
+    ("GET", "/runtime/status"),
+    ("POST", "/runtime/pause"),
+    ("POST", "/runtime/resume"),
+    ("POST", "/runtime/pause-new-entries"),
+    ("POST", "/runtime/resume-new-entries"),
+    ("POST", "/runtime/reconcile"),
+    ("POST", "/runtime/strategies/{strategy_id}/state"),
+    ("POST", "/runtime/emergency-flatten"),
 )
 
 
@@ -72,9 +81,9 @@ class WeightedVotingEvaluateRequest(BaseModel):
     candles: tuple[WeightedVotingCandleRequest, ...] = Field(min_length=1)
     bid: float | None = Field(default=None, gt=0)
     ask: float | None = Field(default=None, gt=0)
-    account_equity: float = Field(default=100_000.0, gt=0)
-    available_buying_power: float = Field(default=100_000.0, ge=0)
-    capital_available: float = Field(default=100_000.0, ge=0)
+    account_equity: float | None = Field(default=None, gt=0, json_schema_extra={"deprecated": True}, description="Deprecated and ignored; account equity comes from a read-only backend account port.")
+    available_buying_power: float | None = Field(default=None, ge=0, json_schema_extra={"deprecated": True}, description="Deprecated and ignored; broker buying power comes from a read-only backend account port.")
+    capital_available: float | None = Field(default=None, ge=0, json_schema_extra={"deprecated": True}, description="Deprecated and ignored; capital availability comes from Weighted Voting inventory.")
 
 
 class WeightedVotingConfigUpdateRequest(BaseModel):
@@ -138,6 +147,21 @@ class WeightedVotingWeightRollbackRequest(BaseModel):
     rollback_timestamp: datetime | None = None
 
 
+class WeightedVotingRuntimeAdminRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(default="api", min_length=1)
+    reason: str = Field(default="weighted_voting.runtime.api.admin_control", min_length=1)
+
+
+class WeightedVotingRuntimeResumeEntriesRequest(WeightedVotingRuntimeAdminRequest):
+    validation_passed: bool = True
+
+
+class WeightedVotingRuntimeStrategyStateRequest(WeightedVotingRuntimeAdminRequest):
+    runtime_state: str = Field(pattern=r"^(shadow|disabled)$")
+
+
 def api_inventory() -> dict[str, Any]:
     return {
         "apiVersion": WEIGHTED_VOTING_API_VERSION,
@@ -171,7 +195,7 @@ def router_status() -> dict[str, Any]:
     "/evaluate",
     responses={400: {"model": WeightedVotingErrorResponse}},
     summary="Evaluate Weighted Voting",
-    description="Evaluate the backend-authoritative Weighted Voting algorithm from neutral market candles only.",
+    description="Evaluate the backend-authoritative Weighted Voting algorithm from market candles only; inventory and safety state are loaded from backend runtime-context ports.",
 )
 def evaluate(payload: WeightedVotingEvaluateRequest) -> dict[str, Any]:
     return _call(lambda: WEIGHTED_VOTING_API_SERVICE.evaluate(payload.model_dump(mode="json")))
@@ -182,6 +206,104 @@ def status() -> dict[str, Any]:
     payload = WEIGHTED_VOTING_API_SERVICE.status()
     payload["apiInventory"] = api_inventory()
     return payload
+
+
+@router.get("/runtime/status", summary="Weighted Voting runtime status", description="Return read-only health and lag metrics for the backend background runtime.")
+def runtime_status() -> dict[str, Any]:
+    supervisor = get_weighted_voting_runtime_supervisor()
+    return {
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "runtimeContract": runtime_supervisor_status(),
+        "health": supervisor.health(),
+    }
+
+
+@router.post("/runtime/pause", summary="Pause Weighted Voting runtime", description="Administrative pause for automatic background processing controls.")
+def runtime_pause(payload: WeightedVotingRuntimeAdminRequest | None = Body(default=None)) -> dict[str, Any]:
+    request = payload or WeightedVotingRuntimeAdminRequest(reason="weighted_voting.runtime.api.pause")
+    supervisor = get_weighted_voting_runtime_supervisor()
+    supervisor.pause(actor=request.actor, reason=request.reason)
+    return {
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "health": supervisor.health(),
+        "reasonCodes": ("weighted_voting.runtime.api.pause",),
+    }
+
+
+@router.post("/runtime/resume", summary="Resume Weighted Voting runtime", description="Administrative resume for backend finalised-bar processing.")
+def runtime_resume(payload: WeightedVotingRuntimeAdminRequest | None = Body(default=None)) -> dict[str, Any]:
+    request = payload or WeightedVotingRuntimeAdminRequest(reason="weighted_voting.runtime.api.resume")
+    supervisor = get_weighted_voting_runtime_supervisor()
+    supervisor.resume(actor=request.actor, reason=request.reason)
+    return {
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "health": supervisor.health(),
+        "reasonCodes": ("weighted_voting.runtime.api.resume",),
+    }
+
+
+@router.post("/runtime/pause-new-entries", summary="Pause Weighted Voting new entries", description="Pause new automatic entries while keeping position protection and reconciliation active.")
+def runtime_pause_new_entries(payload: WeightedVotingRuntimeAdminRequest | None = Body(default=None)) -> dict[str, Any]:
+    request = payload or WeightedVotingRuntimeAdminRequest(reason="weighted_voting.runtime.api.pause_new_entries")
+    supervisor = get_weighted_voting_runtime_supervisor()
+    audit = supervisor.pause_new_entries(actor=request.actor, reason=request.reason)
+    return {
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "audit": audit,
+        "health": supervisor.health(),
+        "reasonCodes": ("weighted_voting.runtime.api.pause_new_entries",),
+    }
+
+
+@router.post("/runtime/resume-new-entries", summary="Resume Weighted Voting new entries", description="Resume new entries after validation without changing background worker ownership.")
+def runtime_resume_new_entries(payload: WeightedVotingRuntimeResumeEntriesRequest | None = Body(default=None)) -> dict[str, Any]:
+    request = payload or WeightedVotingRuntimeResumeEntriesRequest(reason="weighted_voting.runtime.api.resume_new_entries")
+    supervisor = get_weighted_voting_runtime_supervisor()
+    audit = supervisor.resume_new_entries(actor=request.actor, reason=request.reason, validation_passed=request.validation_passed)
+    return {
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "audit": audit,
+        "health": supervisor.health(),
+        "reasonCodes": ("weighted_voting.runtime.api.resume_new_entries",),
+    }
+
+
+@router.post("/runtime/reconcile", summary="Force Weighted Voting reconciliation", description="Request backend reconciliation against the read-only broker observation boundary.")
+def runtime_force_reconciliation(payload: WeightedVotingRuntimeAdminRequest | None = Body(default=None)) -> dict[str, Any]:
+    request = payload or WeightedVotingRuntimeAdminRequest(reason="weighted_voting.runtime.api.force_reconciliation")
+    supervisor = get_weighted_voting_runtime_supervisor()
+    audit = supervisor.force_reconciliation(actor=request.actor, reason=request.reason)
+    return {
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "audit": audit,
+        "health": supervisor.health(),
+        "reasonCodes": ("weighted_voting.runtime.api.force_reconciliation",),
+    }
+
+
+@router.post("/runtime/strategies/{strategy_id}/state", summary="Set Weighted Voting runtime strategy state", description="Audited runtime control for disabling or shadowing a Weighted Voting strategy.")
+def runtime_strategy_state(strategy_id: str = Path(..., min_length=1), payload: WeightedVotingRuntimeStrategyStateRequest = Body(...)) -> dict[str, Any]:
+    supervisor = get_weighted_voting_runtime_supervisor()
+    audit = supervisor.set_strategy_runtime_state(strategy_id, payload.runtime_state, actor=payload.actor, reason=payload.reason)
+    return {
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "audit": audit,
+        "health": supervisor.health(),
+        "reasonCodes": ("weighted_voting.runtime.api.strategy_state",),
+    }
+
+
+@router.post("/runtime/emergency-flatten", summary="Request Weighted Voting emergency flatten", description="Audit an emergency flatten request that must proceed through central risk.")
+def runtime_emergency_flatten(payload: WeightedVotingRuntimeAdminRequest | None = Body(default=None)) -> dict[str, Any]:
+    request = payload or WeightedVotingRuntimeAdminRequest(reason="weighted_voting.runtime.api.emergency_flatten")
+    supervisor = get_weighted_voting_runtime_supervisor()
+    audit = supervisor.emergency_flatten(actor=request.actor, reason=request.reason)
+    return {
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "audit": audit,
+        "health": supervisor.health(),
+        "reasonCodes": ("weighted_voting.runtime.api.emergency_flatten",),
+    }
 
 
 @router.get("/config", summary="Get Weighted Voting config", description="Return backend-authoritative Weighted Voting settings/configuration.")

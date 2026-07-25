@@ -32,6 +32,7 @@ from .algorithms.meta_strategy.api import router as meta_strategy_router
 from .algorithms.voting_ensemble.api import router as voting_ensemble_router
 from .algorithms.wca.api import router as wca_router
 from .algorithms.weighted_voting.api import router as weighted_voting_router
+from .algorithms.weighted_voting.runtime_supervisor import get_weighted_voting_runtime_supervisor
 from .api.v2 import router as api_v2_router
 from .config import get_settings
 from .database import CandleStore
@@ -144,6 +145,12 @@ DEFAULT_TRADING_SETTINGS: dict = {
 async def start_daily_backtest_refresh_scheduler() -> None:
     asyncio.create_task(end_of_day_backtest_refresh_scheduler())
     asyncio.create_task(market_forecast_ledger_scheduler())
+    await get_weighted_voting_runtime_supervisor().start()
+
+
+@app.on_event("shutdown")
+async def stop_weighted_voting_runtime_supervisor() -> None:
+    await get_weighted_voting_runtime_supervisor().shutdown()
 
 
 DEFAULT_LOOKBACKS = {

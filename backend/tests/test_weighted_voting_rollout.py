@@ -4,6 +4,9 @@ import unittest
 from datetime import datetime, timezone
 
 from backend.app.algorithms.weighted_voting.rollout import (
+    CONTROLLED_ROLLOUT_STAGES,
+    ROLLOUT_AUDIT_PREFIX,
+    ROLLOUT_EVIDENCE_PREFIX,
     ROLLOUT_STATE_KEY,
     ROLLBACK_STATE_KEY,
     WEIGHTED_VOTING_AUTO_SUBMIT_ENABLED,
@@ -15,13 +18,19 @@ from backend.app.algorithms.weighted_voting.rollout import (
     ROLLOUT_STAGES,
     WeightedVotingRolloutFlags,
     WeightedVotingRolloutValidation,
+    WeightedVotingControlledRolloutEvidence,
     automatic_submission_allowed,
+    controlled_rollout_status,
+    evaluate_controlled_rollout_promotion,
     evaluate_rollout_stage,
     evaluate_weighted_voting_rollout_control,
+    promote_controlled_rollout_stage,
     record_valid_rollout_state,
+    rollback_controlled_rollout_stage,
     rollback_weighted_voting_rollout,
     rollout_feature_flags,
     rollout_status,
+    small_allocation_guardrails,
 )
 
 
@@ -204,6 +213,115 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertEqual(store.snapshots[ROLLOUT_STATE_KEY]["state_version"], "valid-1")
         self.assertIn("weighted_voting.rollout.rollback_restored_previous_valid_state", restored["reason_codes"])
 
+    def test_controlled_rollout_stages_are_explicit_and_default_auto_submit_is_disabled(self) -> None:
+        store = MemoryStore()
+        status = controlled_rollout_status(store)
+        legacy_status = rollout_status()
+
+        self.assertEqual(
+            CONTROLLED_ROLLOUT_STAGES,
+            (
+                "disabled",
+                "background_observation",
+                "shadow_decisions",
+                "manual_paper_submission",
+                "automatic_paper_small_allocation",
+                "automatic_paper_approved_allocation",
+            ),
+        )
+        self.assertEqual(status["active_stage"], "background_observation")
+        self.assertFalse(status["automatic_paper_submission_allowed"])
+        self.assertFalse(automatic_submission_allowed(store=store))
+        self.assertEqual(tuple(legacy_status["controlled_stages"]), CONTROLLED_ROLLOUT_STAGES)
+        self.assertIn("weighted_voting.rollout.successful_build_not_approval", status["reason_codes"])
+
+    def test_promotion_requires_immutable_evidence_and_persists_stage(self) -> None:
+        store = MemoryStore()
+        blocked, blockers = evaluate_controlled_rollout_promotion(
+            current_stage="manual_paper_submission",
+            target_stage="automatic_paper_small_allocation",
+            evidence=WeightedVotingControlledRolloutEvidence(no_unresolved_isolation_failures=True, global_risk_fail_closed_tests_passing=True, shadow_opportunity_count=100),
+        )
+        self.assertFalse(blocked)
+        self.assertIn("weighted_voting.rollout.inventory_unreconciled", blockers)
+        promotion = promote_controlled_rollout_stage(
+            store,
+            target_stage="shadow_decisions",
+            evidence=passing_evidence(shadow_opportunity_count=75),
+            actor="ops-user",
+            promoted_at=NOW,
+        )
+
+        self.assertTrue(promotion.promoted)
+        self.assertEqual(store.snapshots[ROLLOUT_STATE_KEY]["stage"], "shadow_decisions")
+        self.assertFalse(store.snapshots[ROLLOUT_STATE_KEY]["automatic_paper_submission_allowed"])
+        self.assertTrue(any(key.startswith(ROLLOUT_EVIDENCE_PREFIX) for key in store.snapshots))
+        self.assertTrue(any(key.startswith(ROLLOUT_AUDIT_PREFIX) for key in store.snapshots))
+
+    def test_small_allocation_stage_caps_and_stops_after_reconciliation_discrepancy(self) -> None:
+        guardrails = small_allocation_guardrails()
+        store = MemoryStore()
+        store.write_snapshot(
+            ROLLOUT_STATE_KEY,
+            {
+                "algorithm_id": "weighted_voting",
+                "rollout_version": "weighted_voting_rollout_v2",
+                "stage": "manual_paper_submission",
+                "status": "valid",
+                "automatic_paper_submission_allowed": False,
+            },
+        )
+
+        promotion = promote_controlled_rollout_stage(
+            store,
+            target_stage="automatic_paper_small_allocation",
+            evidence=passing_evidence(shadow_opportunity_count=100, manual_paper_sample_count=25),
+            actor="ops-user",
+            promoted_at=NOW,
+        )
+        status = controlled_rollout_status(store)
+
+        self.assertTrue(promotion.promoted)
+        self.assertTrue(status["automatic_paper_submission_allowed"])
+        self.assertEqual(status["small_allocation_guardrails"]["cap_quantity"], guardrails.cap_quantity)
+        self.assertEqual(status["small_allocation_guardrails"]["cap_daily_trades"], 2)
+        self.assertFalse(status["small_allocation_guardrails"]["pyramiding_enabled"])
+        self.assertLessEqual(status["small_allocation_guardrails"]["maximum_spread_percent"], 0.0005)
+        self.assertTrue(status["small_allocation_guardrails"]["stop_entries_after_reconciliation_discrepancy"])
+        self.assertEqual(tuple(status["small_allocation_guardrails"]["approved_active_strategy_ids"]), ("S2", "S5", "S6", "S7"))
+
+    def test_controlled_rollback_is_immediate_and_safe(self) -> None:
+        store = MemoryStore()
+        store.write_snapshot(
+            ROLLOUT_STATE_KEY,
+            {
+                "algorithm_id": "weighted_voting",
+                "rollout_version": "weighted_voting_rollout_v2",
+                "stage": "automatic_paper_small_allocation",
+                "status": "valid",
+                "automatic_paper_submission_allowed": True,
+                "reason_codes": ("weighted_voting.rollout.stage_persisted",),
+            },
+        )
+        store.write_snapshot(
+            ROLLBACK_STATE_KEY,
+            {
+                "algorithm_id": "weighted_voting",
+                "rollout_version": "weighted_voting_rollout_v2",
+                "stage": "manual_paper_submission",
+                "status": "valid",
+                "automatic_paper_submission_allowed": False,
+                "reason_codes": ("weighted_voting.rollout.stage_persisted",),
+            },
+        )
+
+        restored = rollback_controlled_rollout_stage(store, actor="ops-user", rolled_back_at=NOW)
+
+        self.assertEqual(restored["stage"], "manual_paper_submission")
+        self.assertFalse(restored["automatic_paper_submission_allowed"])
+        self.assertEqual(store.snapshots[ROLLOUT_STATE_KEY]["stage"], "manual_paper_submission")
+        self.assertTrue(any(key.startswith(f"{ROLLOUT_AUDIT_PREFIX}rollback.") for key in store.snapshots))
+
 
 class MemoryStore:
     def __init__(self) -> None:
@@ -231,6 +349,28 @@ def fully_validated_rollout(*, live_trading_enabled: bool = False) -> WeightedVo
         tests_passed=True,
         paper_validations_passed=True,
         live_trading_enabled=live_trading_enabled,
+    )
+
+
+def passing_evidence(*, shadow_opportunity_count: int = 100, manual_paper_sample_count: int = 25) -> WeightedVotingControlledRolloutEvidence:
+    return WeightedVotingControlledRolloutEvidence(
+        no_unresolved_isolation_failures=True,
+        inventory_reconciled=True,
+        no_duplicate_order_incidents=True,
+        worker_reliability_ok=True,
+        decision_latency_ok=True,
+        broker_latency_ok=True,
+        data_freshness_stable=True,
+        global_risk_fail_closed_tests_passing=True,
+        restart_recovery_successful=True,
+        shadow_opportunity_count=shadow_opportunity_count,
+        manual_paper_sample_count=manual_paper_sample_count,
+        transaction_cost_adjusted_paper_stability_ok=True,
+        drawdown_within_limit=True,
+        position_pnl_attribution_accurate=True,
+        protective_order_reliability_ok=True,
+        explicit_configuration_approval=True,
+        evidence_id="weighted_voting.rollout.evidence.test",
     )
 
 

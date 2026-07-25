@@ -54,6 +54,9 @@ class WeightedVotingBacktestEngineTest(unittest.TestCase):
         self.assertEqual(result.configuration_manifest.manifest_hash, result.configuration_manifest.manifest_hash)
         self.assertEqual(result.configuration_manifest.run_id, result.run.run_id)
         self.assertEqual(result.configuration_manifest.cost_model["regulatoryFeePerShare"], 0.0)
+        self.assertEqual(result.configuration_manifest.active_weight_version, result.run.weight_version)
+        self.assertIn("decision_kernel", result.configuration_manifest.code_versions)
+        self.assertEqual(result.configuration_manifest.inventory_namespace, "weighted_voting.inventory")
         self.assertEqual(len(result.reproducibility_hash), 64)
         self.assertIn("evaluate_signals", result.production_function_calls)
         self.assertIn("classify_market_condition", result.production_function_calls)
@@ -75,6 +78,8 @@ class WeightedVotingBacktestEngineTest(unittest.TestCase):
         ):
             self.assertIn(required_call, result.production_function_calls)
         self.assertTrue(all(max(candle.timestamp for candle in snapshot.one_minute_candles) <= snapshot.data_timestamp for snapshot in seen_snapshots))
+        self.assertGreater(max(trace.inventory_snapshot_version for trace in result.decisions), 1)
+        self.assertTrue(all(trace.runtime_context_manifest_hash for trace in result.decisions))
 
     def test_no_lookahead_and_next_candle_entry_are_enforced(self) -> None:
         candles = trending_session()
@@ -91,6 +96,7 @@ class WeightedVotingBacktestEngineTest(unittest.TestCase):
 
         self.assertTrue(result.decisions)
         self.assertTrue(all(trace.completed_candle_count == trace.candle_index + 1 for trace in result.decisions))
+        self.assertTrue(all(trace.inventory_snapshot_version >= 1 for trace in result.decisions))
         self.assertIsNotNone(first_signal_timestamp)
         self.assertGreater(result.trades[0].entry_timestamp, first_signal_timestamp)
         self.assertIn("weighted_voting.backtest.no_lookahead_next_candle_entry", result.reason_codes)

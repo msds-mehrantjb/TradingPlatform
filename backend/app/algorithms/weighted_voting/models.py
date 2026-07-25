@@ -298,18 +298,41 @@ class WeightedStrategySignal(WeightedContractModel):
 
 
 class WeightedStrategyOutcome(WeightedContractModel):
-    contract_version: str = "weighted_strategy_outcome_v1"
+    contract_version: str = "weighted_strategy_outcome_v2"
     algorithm_id: Literal["weighted_voting"] = ALGORITHM_ID
+    outcome_id: str | None = None
+    trade_id: str | None = None
     strategy_id: str = Field(min_length=1)
     side: WeightedSide
     entry_timestamp: datetime
     exit_timestamp: datetime | None = None
     entry_price: float = Field(gt=0)
     exit_price: float | None = Field(default=None, gt=0)
+    is_closed: bool = False
+    fully_reconciled: bool = False
+    gross_return: float | None = None
     outcome_return: float | None = None
+    spread_cost_return: float = Field(default=0.0, ge=0)
+    slippage_cost_return: float = Field(default=0.0, ge=0)
+    fee_cost_return: float = Field(default=0.0, ge=0)
+    total_cost_return: float = Field(default=0.0, ge=0)
+    maximum_favorable_excursion_return: float | None = None
+    maximum_adverse_excursion_return: float | None = None
+    opportunity_count: int = Field(default=1, ge=0)
+    execution_quality: float | None = Field(default=None, ge=0, le=1)
+    regime_label: str | None = None
+    session_label: str | None = None
     exit_reason: WeightedExitReason = WeightedExitReason.NONE
     reason_codes: tuple[str, ...] = ()
     explanation: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_closed_reconciled_outcome(self) -> WeightedStrategyOutcome:
+        if self.fully_reconciled and not self.is_closed:
+            raise ValueError("fully reconciled outcomes must be closed")
+        if self.is_closed and (self.exit_timestamp is None or self.exit_price is None or self.outcome_return is None):
+            raise ValueError("closed outcomes require exit timestamp, exit price and net outcome return")
+        return self
 
 
 class WeightedStrategyStatistics(WeightedContractModel):
@@ -328,7 +351,7 @@ class WeightedStrategyStatistics(WeightedContractModel):
 
 
 class WeightedPerformanceWeightMetric(WeightedContractModel):
-    contract_version: str = "weighted_performance_weight_metric_v1"
+    contract_version: str = "weighted_performance_weight_metric_v2"
     algorithm_id: Literal["weighted_voting"] = ALGORITHM_ID
     strategy_id: str = Field(min_length=1)
     sample_size: int = Field(ge=0)
@@ -345,6 +368,12 @@ class WeightedPerformanceWeightMetric(WeightedContractModel):
     recent_degradation: float = Field(default=0.0, ge=0)
     market_condition_sample_size: int = Field(default=0, ge=0)
     outcome_stability: float = Field(default=0.0, ge=0, le=1)
+    mae_mfe_quality: float = Field(default=0.0, ge=0, le=1)
+    regime_stability: float = Field(default=0.0, ge=0, le=1)
+    session_stability: float = Field(default=0.0, ge=0, le=1)
+    recency_decay_score: float = Field(default=0.0, ge=0, le=1)
+    opportunity_count: int = Field(default=0, ge=0)
+    execution_quality: float = Field(default=0.0, ge=0, le=1)
     recent_performance: float = 0.0
     regime_specific_performance: float = 0.0
     correlation_penalty: float = Field(default=1.0, ge=0, le=1)
@@ -358,7 +387,7 @@ class WeightedPerformanceWeightMetric(WeightedContractModel):
 
 
 class WeightedWeightState(WeightedContractModel):
-    contract_version: str = "weighted_weight_state_v1"
+    contract_version: str = "weighted_weight_state_v2"
     algorithm_id: Literal["weighted_voting"] = ALGORITHM_ID
     weight_version: str = WEIGHTED_VOTING_ACTIVE_WEIGHT_VERSION
     state_status: WeightedWeightStateStatus = WeightedWeightStateStatus.UNSEEDED_EQUAL_WEIGHTS
@@ -367,6 +396,8 @@ class WeightedWeightState(WeightedContractModel):
     performance_metrics: tuple[WeightedPerformanceWeightMetric, ...] = ()
     last_updated_at: datetime
     data_timestamp: datetime
+    input_data_hash: str | None = None
+    output_hash: str | None = None
     reason_codes: tuple[str, ...] = ()
     explanation: str = Field(min_length=1)
 
@@ -434,14 +465,19 @@ class WeightedDefaultSettings(WeightedContractModel):
     maximum_trades: int = Field(default=10, ge=0)
     maximum_daily_loss_percent: float = Field(default=3.0, ge=0, le=100)
     maximum_participation_rate: float = Field(default=0.01, ge=0, le=1)
+    family_exposure_cap: float = Field(default=0.50, ge=0, le=1)
+    correlation_penalty: float = Field(default=0.10, ge=0, le=1)
     minimum_score: float = Field(default=0.58, ge=0, le=1)
     minimum_edge: float = Field(default=0.12, ge=0, le=1)
     minimum_active_strategies: int = Field(default=1, ge=1)
     minimum_directional_strategies: int = Field(default=1, ge=1)
+    minimum_independent_supporting_strategies: int = Field(default=1, ge=1)
+    maximum_opposing_score: float = Field(default=0.45, ge=0, le=1)
     maximum_spread_percent: float = Field(default=0.001, ge=0, le=1)
     minimum_liquidity_volume: float = Field(default=10000.0, ge=0)
     atr_stop_multiplier: float = Field(default=1.5, ge=0)
     minimum_stop_distance_percent: float = Field(default=0.001, ge=0, le=1)
+    maximum_stop_distance_percent: float = Field(default=0.05, ge=0, le=1)
     target_r: float = Field(default=2.0, ge=0)
     entry_buffer_percent: float = Field(default=0.0005, ge=0, le=1)
     break_even_trigger_r: float = Field(default=1.0, ge=0)
@@ -449,9 +485,25 @@ class WeightedDefaultSettings(WeightedContractModel):
     time_stop_minutes: int = Field(default=120, ge=0)
     session_cutoff_minutes: int = Field(default=15, ge=0)
     slippage_allowance_per_share: float = Field(default=0.01, ge=0)
+    fee_per_share: float = Field(default=0.01, ge=0)
     cooldown_seconds: int = Field(default=300, ge=0)
+    stale_data_threshold_seconds: int = Field(default=75, ge=0)
+    quote_freshness_threshold_seconds: int = Field(default=75, ge=0)
+    volatility_multiplier: float = Field(default=1.0, ge=0)
+    liquidity_multiplier: float = Field(default=1.0, ge=0)
+    session_multiplier: float = Field(default=1.0, ge=0)
+    strategy_states: dict[str, str] = Field(default_factory=dict)
     strategy_eligibility: dict[str, bool] = Field(default_factory=dict)
     strategy_risk_multipliers: dict[str, float] = Field(default_factory=dict)
+    baseline_strategy_weights: dict[str, float] = Field(default_factory=dict)
+    minimum_strategy_weights: dict[str, float] = Field(default_factory=dict)
+    maximum_strategy_weights: dict[str, float] = Field(default_factory=dict)
+    family_exposure_caps: dict[str, float] = Field(default_factory=dict)
+    trailing_stop_policy: str = "condition_atr_trailing"
+    strategy_time_stops_minutes: dict[str, int] = Field(default_factory=dict)
+    end_of_day_liquidation_time: str = "15:59 America/New_York"
+    entry_cutoff_time: str = "15:45 America/New_York"
+    event_risk_action: str = "reduce_or_block"
     pyramiding_enabled: bool = False
     max_position_percent: float = Field(default=10.0, ge=0, le=100)
     max_daily_loss_percent: float = Field(default=3.0, ge=0, le=100)
@@ -474,14 +526,19 @@ class WeightedDynamicEnvelope(WeightedContractModel):
     maximum_trades_delta: int = Field(default=0, ge=0)
     maximum_daily_loss_percent_delta: float = Field(default=0.0, ge=0)
     maximum_participation_rate_delta: float = Field(default=0.0, ge=0)
+    family_exposure_cap_delta: float = Field(default=0.0, ge=0, le=1)
+    correlation_penalty_delta: float = Field(default=0.0, ge=0, le=1)
     minimum_score_delta: float = Field(default=0.0, ge=0, le=1)
     minimum_edge_delta: float = Field(default=0.0, ge=0, le=1)
     minimum_active_strategies_delta: int = Field(default=0, ge=0)
     minimum_directional_strategies_delta: int = Field(default=0, ge=0)
+    minimum_independent_supporting_strategies_delta: int = Field(default=0, ge=0)
+    maximum_opposing_score_delta: float = Field(default=0.0, ge=0, le=1)
     maximum_spread_percent_delta: float = Field(default=0.0, ge=0, le=1)
     minimum_liquidity_volume_delta: float = Field(default=0.0, ge=0)
     atr_stop_multiplier_delta: float = Field(default=0.0, ge=0)
     minimum_stop_distance_percent_delta: float = Field(default=0.0, ge=0, le=1)
+    maximum_stop_distance_percent_delta: float = Field(default=0.0, ge=0, le=1)
     target_r_delta: float = Field(default=0.0, ge=0)
     entry_buffer_percent_delta: float = Field(default=0.0, ge=0, le=1)
     break_even_trigger_r_delta: float = Field(default=0.0, ge=0)
@@ -489,7 +546,13 @@ class WeightedDynamicEnvelope(WeightedContractModel):
     time_stop_minutes_delta: int = Field(default=0, ge=0)
     session_cutoff_minutes_delta: int = Field(default=0, ge=0)
     slippage_allowance_per_share_delta: float = Field(default=0.0, ge=0)
+    fee_per_share_delta: float = Field(default=0.0, ge=0)
     cooldown_seconds_delta: int = Field(default=0, ge=0)
+    stale_data_threshold_seconds_delta: int = Field(default=0, ge=0)
+    quote_freshness_threshold_seconds_delta: int = Field(default=0, ge=0)
+    volatility_multiplier_delta: float = Field(default=0.0, ge=0)
+    liquidity_multiplier_delta: float = Field(default=0.0, ge=0)
+    session_multiplier_delta: float = Field(default=0.0, ge=0)
     strategy_risk_multiplier_delta: float = Field(default=0.0, ge=0, le=1)
     pyramiding_may_enable: bool = False
     reason_codes: tuple[str, ...] = ()
@@ -509,12 +572,17 @@ class WeightedHardLimits(WeightedContractModel):
     maximum_trades: int = Field(default=20, ge=0)
     maximum_daily_loss_percent: float = Field(default=5.0, ge=0, le=100)
     maximum_participation_rate: float = Field(default=0.05, ge=0, le=1)
+    maximum_family_exposure_cap: float = Field(default=0.50, ge=0, le=1)
+    maximum_correlation_penalty: float = Field(default=1.0, ge=0, le=1)
     minimum_score_floor: float = Field(default=0.50, ge=0, le=1)
     minimum_score_ceiling: float = Field(default=0.95, ge=0, le=1)
     minimum_edge_floor: float = Field(default=0.02, ge=0, le=1)
     minimum_edge_ceiling: float = Field(default=0.40, ge=0, le=1)
     minimum_active_strategies_floor: int = Field(default=1, ge=1)
     minimum_directional_strategies_floor: int = Field(default=1, ge=1)
+    minimum_independent_supporting_strategies_floor: int = Field(default=1, ge=1)
+    maximum_independent_supporting_strategies: int = Field(default=8, ge=1)
+    maximum_opposing_score: float = Field(default=0.60, ge=0, le=1)
     maximum_spread_percent: float = Field(default=0.003, ge=0, le=1)
     minimum_liquidity_volume_floor: float = Field(default=0.0, ge=0)
     maximum_liquidity_volume_requirement: float = Field(default=10000000.0, ge=0)
@@ -530,7 +598,13 @@ class WeightedHardLimits(WeightedContractModel):
     maximum_time_stop_minutes: int = Field(default=390, ge=0)
     maximum_session_cutoff_minutes: int = Field(default=120, ge=0)
     maximum_slippage_allowance_per_share: float = Field(default=0.05, ge=0)
+    maximum_fee_per_share: float = Field(default=0.05, ge=0)
     maximum_cooldown_seconds: int = Field(default=3600, ge=0)
+    maximum_stale_data_threshold_seconds: int = Field(default=90, ge=0)
+    maximum_quote_freshness_threshold_seconds: int = Field(default=90, ge=0)
+    maximum_volatility_multiplier: float = Field(default=1.5, ge=0)
+    maximum_liquidity_multiplier: float = Field(default=1.5, ge=0)
+    maximum_session_multiplier: float = Field(default=1.5, ge=0)
     maximum_strategy_risk_multiplier: float = Field(default=2.0, ge=0)
     pyramiding_allowed: bool = False
     max_order_quantity: int = Field(default=0, ge=0)
@@ -585,14 +659,19 @@ class WeightedEffectiveSettings(WeightedContractModel):
     maximum_trades: int = Field(default=10, ge=0)
     maximum_daily_loss_percent: float = Field(default=3.0, ge=0, le=100)
     maximum_participation_rate: float = Field(default=0.01, ge=0, le=1)
+    family_exposure_cap: float = Field(default=0.50, ge=0, le=1)
+    correlation_penalty: float = Field(default=0.10, ge=0, le=1)
     minimum_score: float = Field(default=0.58, ge=0, le=1)
     minimum_edge: float = Field(default=0.12, ge=0, le=1)
     minimum_active_strategies: int = Field(default=1, ge=1)
     minimum_directional_strategies: int = Field(default=1, ge=1)
+    minimum_independent_supporting_strategies: int = Field(default=1, ge=1)
+    maximum_opposing_score: float = Field(default=0.45, ge=0, le=1)
     maximum_spread_percent: float = Field(default=0.001, ge=0, le=1)
     minimum_liquidity_volume: float = Field(default=10000.0, ge=0)
     atr_stop_multiplier: float = Field(default=1.5, ge=0)
     minimum_stop_distance_percent: float = Field(default=0.001, ge=0, le=1)
+    maximum_stop_distance_percent: float = Field(default=0.05, ge=0, le=1)
     target_r: float = Field(default=2.0, ge=0)
     entry_buffer_percent: float = Field(default=0.0005, ge=0, le=1)
     break_even_trigger_r: float = Field(default=1.0, ge=0)
@@ -600,9 +679,25 @@ class WeightedEffectiveSettings(WeightedContractModel):
     time_stop_minutes: int = Field(default=120, ge=0)
     session_cutoff_minutes: int = Field(default=15, ge=0)
     slippage_allowance_per_share: float = Field(default=0.01, ge=0)
+    fee_per_share: float = Field(default=0.01, ge=0)
     cooldown_seconds: int = Field(default=300, ge=0)
+    stale_data_threshold_seconds: int = Field(default=75, ge=0)
+    quote_freshness_threshold_seconds: int = Field(default=75, ge=0)
+    volatility_multiplier: float = Field(default=1.0, ge=0)
+    liquidity_multiplier: float = Field(default=1.0, ge=0)
+    session_multiplier: float = Field(default=1.0, ge=0)
+    strategy_states: dict[str, str] = Field(default_factory=dict)
     strategy_eligibility: dict[str, bool] = Field(default_factory=dict)
     strategy_risk_multipliers: dict[str, float] = Field(default_factory=dict)
+    baseline_strategy_weights: dict[str, float] = Field(default_factory=dict)
+    minimum_strategy_weights: dict[str, float] = Field(default_factory=dict)
+    maximum_strategy_weights: dict[str, float] = Field(default_factory=dict)
+    family_exposure_caps: dict[str, float] = Field(default_factory=dict)
+    trailing_stop_policy: str = "condition_atr_trailing"
+    strategy_time_stops_minutes: dict[str, int] = Field(default_factory=dict)
+    end_of_day_liquidation_time: str = "15:59 America/New_York"
+    entry_cutoff_time: str = "15:45 America/New_York"
+    event_risk_action: str = "reduce_or_block"
     pyramiding_enabled: bool = False
     expiration_timestamp: datetime | None = None
     source_evidence: tuple[str, ...] = ()
@@ -629,14 +724,19 @@ class WeightedEffectiveSettings(WeightedContractModel):
             (self.maximum_trades <= limits.maximum_trades, "maximum_trades exceeds hard limit"),
             (self.maximum_daily_loss_percent <= limits.maximum_daily_loss_percent, "maximum_daily_loss_percent exceeds hard limit"),
             (self.maximum_participation_rate <= limits.maximum_participation_rate, "maximum_participation_rate exceeds hard limit"),
+            (self.family_exposure_cap <= limits.maximum_family_exposure_cap, "family_exposure_cap exceeds hard limit"),
+            (self.correlation_penalty <= limits.maximum_correlation_penalty, "correlation_penalty exceeds hard limit"),
             (limits.minimum_score_floor <= self.minimum_score <= limits.minimum_score_ceiling, "minimum_score outside hard limits"),
             (limits.minimum_edge_floor <= self.minimum_edge <= limits.minimum_edge_ceiling, "minimum_edge outside hard limits"),
             (self.minimum_active_strategies >= limits.minimum_active_strategies_floor, "minimum_active_strategies below hard floor"),
             (self.minimum_directional_strategies >= limits.minimum_directional_strategies_floor, "minimum_directional_strategies below hard floor"),
+            (limits.minimum_independent_supporting_strategies_floor <= self.minimum_independent_supporting_strategies <= limits.maximum_independent_supporting_strategies, "minimum_independent_supporting_strategies outside hard limits"),
+            (self.maximum_opposing_score <= limits.maximum_opposing_score, "maximum_opposing_score exceeds hard limit"),
             (self.maximum_spread_percent <= limits.maximum_spread_percent, "maximum_spread_percent exceeds hard limit"),
             (limits.minimum_liquidity_volume_floor <= self.minimum_liquidity_volume <= limits.maximum_liquidity_volume_requirement, "minimum_liquidity_volume outside hard limits"),
             (limits.minimum_atr_stop_multiplier <= self.atr_stop_multiplier <= limits.maximum_atr_stop_multiplier, "atr_stop_multiplier outside hard limits"),
             (limits.minimum_stop_distance_percent_floor <= self.minimum_stop_distance_percent <= limits.maximum_stop_distance_percent, "minimum_stop_distance_percent outside hard limits"),
+            (self.minimum_stop_distance_percent <= self.maximum_stop_distance_percent <= limits.maximum_stop_distance_percent, "maximum_stop_distance_percent outside hard limits"),
             (limits.minimum_target_r <= self.target_r <= limits.maximum_target_r, "target_r outside hard limits"),
             (self.entry_buffer_percent <= limits.maximum_entry_buffer_percent, "entry_buffer_percent exceeds hard limit"),
             (self.break_even_trigger_r <= limits.maximum_break_even_trigger_r, "break_even_trigger_r exceeds hard limit"),
@@ -644,8 +744,16 @@ class WeightedEffectiveSettings(WeightedContractModel):
             (self.time_stop_minutes <= limits.maximum_time_stop_minutes, "time_stop_minutes exceeds hard limit"),
             (self.session_cutoff_minutes <= limits.maximum_session_cutoff_minutes, "session_cutoff_minutes exceeds hard limit"),
             (self.slippage_allowance_per_share <= limits.maximum_slippage_allowance_per_share, "slippage_allowance_per_share exceeds hard limit"),
+            (self.fee_per_share <= limits.maximum_fee_per_share, "fee_per_share exceeds hard limit"),
             (self.cooldown_seconds <= limits.maximum_cooldown_seconds, "cooldown_seconds exceeds hard limit"),
+            (self.stale_data_threshold_seconds <= limits.maximum_stale_data_threshold_seconds, "stale_data_threshold_seconds exceeds hard limit"),
+            (self.quote_freshness_threshold_seconds <= limits.maximum_quote_freshness_threshold_seconds, "quote_freshness_threshold_seconds exceeds hard limit"),
+            (self.volatility_multiplier <= limits.maximum_volatility_multiplier, "volatility_multiplier exceeds hard limit"),
+            (self.liquidity_multiplier <= limits.maximum_liquidity_multiplier, "liquidity_multiplier exceeds hard limit"),
+            (self.session_multiplier <= limits.maximum_session_multiplier, "session_multiplier exceeds hard limit"),
             (all(0 <= multiplier <= limits.maximum_strategy_risk_multiplier for multiplier in self.strategy_risk_multipliers.values()), "strategy_risk_multipliers outside hard limits"),
+            (all(weight <= limits.maximum_family_exposure_cap for weight in self.family_exposure_caps.values()), "family_exposure_caps outside hard limits"),
+            (all(minutes <= limits.maximum_time_stop_minutes for minutes in self.strategy_time_stops_minutes.values()), "strategy_time_stops_minutes outside hard limits"),
             (limits.pyramiding_allowed or not self.pyramiding_enabled, "pyramiding_enabled exceeds hard limit"),
         )
         for valid, message in checks:

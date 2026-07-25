@@ -10,7 +10,10 @@ from backend.app.algorithms.weighted_voting.catalog import (
     WEIGHTED_VOTING_CATALOG_VERSION,
     WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT,
     WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT,
+    WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS,
+    WEIGHTED_VOTING_SHADOW_STRATEGY_IDS,
     WEIGHTED_VOTING_STRATEGY_CATALOG,
+    weighted_voting_active_strategy_catalog,
     weighted_voting_dedicated_strategy_inventory,
     weighted_voting_enabled_strategy_catalog,
 )
@@ -28,6 +31,16 @@ EXPECTED_STRATEGIES = (
     ("S7", "Bollinger/ATR Reversion", WeightedStrategyFamily.MEAN_REVERSION, "bollinger_atr_reversion"),
     ("S8", "Volatility Breakout", WeightedStrategyFamily.BREAKOUT, "volatility_breakout"),
 )
+EXPECTED_LIFECYCLES = {
+    "S1": "shadow",
+    "S2": "active",
+    "S3": "shadow",
+    "S4": "shadow",
+    "S5": "active",
+    "S6": "active",
+    "S7": "active",
+    "S8": "shadow",
+}
 
 
 class WeightedVotingStrategyCatalogTest(unittest.TestCase):
@@ -69,7 +82,12 @@ class WeightedVotingStrategyCatalogTest(unittest.TestCase):
                 self.assertTrue(entry.invalidation_condition.startswith("Invalidate"))
                 self.assertTrue(entry.data_quality_classification.startswith("requires"))
                 self.assertEqual(entry.version, f"weighted_strategy_{entry.strategy_id}_v1")
+                self.assertEqual(entry.lifecycle, EXPECTED_LIFECYCLES[entry.strategy_id])
+                self.assertTrue(entry.lifecycle_reason)
                 self.assertTrue(entry.enabled)
+                self.assertTrue(entry.executes)
+                self.assertEqual(entry.contributes_to_vote, entry.strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS)
+                self.assertEqual(entry.shadow_records_only, entry.strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS)
                 self.assertEqual(entry.display_name, entry.name)
                 self.assertEqual(entry.baseline_weight, WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT)
                 self.assertEqual(entry.minimum_weight, WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT)
@@ -81,15 +99,18 @@ class WeightedVotingStrategyCatalogTest(unittest.TestCase):
                 self.assertEqual(entry.strategy_implementation_version, entry.version)
                 self.assertEqual(entry.dedicated_file, f"backend/app/algorithms/weighted_voting/strategies/{entry.module_name}.py")
 
-    def test_catalog_is_authoritative_for_enabled_strategies_and_weights(self) -> None:
+    def test_catalog_is_authoritative_for_enabled_and_active_strategies(self) -> None:
         enabled = weighted_voting_enabled_strategy_catalog()
+        active = weighted_voting_active_strategy_catalog()
 
         self.assertEqual(enabled, WEIGHTED_VOTING_STRATEGY_CATALOG)
-        self.assertAlmostEqual(sum(entry.baseline_weight for entry in enabled), 1.0, places=10)
+        self.assertEqual(tuple(entry.strategy_id for entry in active), WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS)
+        self.assertEqual(tuple(entry.strategy_id for entry in enabled if entry.shadow_records_only), WEIGHTED_VOTING_SHADOW_STRATEGY_IDS)
         self.assertEqual({entry.minimum_weight for entry in enabled}, {WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT})
         self.assertEqual({entry.maximum_weight for entry in enabled}, {WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT})
         self.assertEqual(len({entry.strategy_id for entry in enabled}), 8)
         self.assertEqual(len({entry.display_name for entry in enabled}), 8)
+        self.assertAlmostEqual(sum(entry.baseline_weight for entry in WEIGHTED_VOTING_STRATEGY_CATALOG), 1.0, places=10)
 
     def test_strategy_modules_match_catalog_without_aliasing_other_algorithms(self) -> None:
         for entry in WEIGHTED_VOTING_STRATEGY_CATALOG:
@@ -154,6 +175,11 @@ class WeightedVotingStrategyCatalogTest(unittest.TestCase):
             "performance_history",
             "state_namespace",
             "dedicated_file",
+            "lifecycle",
+            "lifecycle_reason",
+            "shadow_performance_state",
+            "signal_correlation_state",
+            "return_correlation_state",
         )
 
         for item in weighted_voting_dedicated_strategy_inventory():
@@ -164,6 +190,9 @@ class WeightedVotingStrategyCatalogTest(unittest.TestCase):
 
                 self.assertGreaterEqual(len(item.required_indicators), 3)
                 self.assertTrue(item.enabled)
+                self.assertTrue(item.executes)
+                self.assertEqual(item.lifecycle, EXPECTED_LIFECYCLES[item.strategy_id])
+                self.assertEqual(item.voting_influence, WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT if item.strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS else 0.0)
                 self.assertEqual(item.display_name, item.name)
                 self.assertEqual(item.baseline_weight, WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT)
                 self.assertEqual(item.minimum_weight, WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT)
@@ -175,7 +204,16 @@ class WeightedVotingStrategyCatalogTest(unittest.TestCase):
                 self.assertEqual(item.dedicated_file, item.implementation_path)
                 self.assertIn(item.strategy_id, item.state_namespace)
                 self.assertIn(item.strategy_id, item.performance_history)
+                self.assertIn(item.strategy_id, item.shadow_performance_state)
+                self.assertIn(item.strategy_id, item.signal_correlation_state)
+                self.assertIn(item.strategy_id, item.return_correlation_state)
                 self.assertIn("Weighted Voting", item.explanation)
+
+    def test_catalog_contains_no_duplicate_ensemble_or_context_voters(self) -> None:
+        names = tuple(entry.name.lower() for entry in WEIGHTED_VOTING_STRATEGY_CATALOG)
+
+        self.assertFalse(any("ensemble" in name for name in names))
+        self.assertFalse(any("adx" == name or "atr regime" == name or "spread quality" == name for name in names))
 
 
 if __name__ == "__main__":

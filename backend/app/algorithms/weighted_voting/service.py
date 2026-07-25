@@ -7,16 +7,29 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any
 
+from backend.app.algorithms.weighted_voting.acceptance_suite import build_weighted_voting_system_acceptance_report
 from backend.app.algorithms.weighted_voting.aggregation import aggregate_weighted_signals
+from backend.app.algorithms.weighted_voting.architecture import weighted_voting_architecture_status
 from backend.app.algorithms.weighted_voting.backtest.engine import WeightedBacktestEngineConfig, WeightedBacktestResult, backtest_engine_status, run_weighted_voting_backtest
 from backend.app.algorithms.weighted_voting.backtest.execution_simulator import simulator_status
 from backend.app.algorithms.weighted_voting.backtest.walk_forward import walk_forward_status
 from backend.app.algorithms.weighted_voting.catalog import weighted_voting_dedicated_strategy_inventory
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedFiveMinuteAlignment, WeightedVotingLocalGateInputs, evaluate_local_decision_gates
-from backend.app.algorithms.weighted_voting.dynamic_settings import default_dynamic_envelope, default_hard_limits, default_weighted_settings, resolve_effective_settings
+from backend.app.algorithms.weighted_voting.decision_kernel import WeightedVotingDecisionKernel, decision_kernel_status
+from backend.app.algorithms.weighted_voting.dynamic_settings import DynamicSettingsResolver, default_dynamic_envelope, default_hard_limits, default_weighted_settings, resolve_effective_settings
 from backend.app.algorithms.weighted_voting.final_acceptance import build_weighted_voting_final_acceptance_report
-from backend.app.algorithms.weighted_voting.global_interface import build_global_order_proposal_from_weighted_voting_proposal, apply_global_response_to_weighted_voting_proposal
+from backend.app.algorithms.weighted_voting.global_interface import (
+    WeightedVotingCentralGlobalRiskService,
+    WeightedVotingStaticCentralGlobalRiskService,
+    WeightedVotingUnavailableCentralGlobalRiskService,
+    build_global_order_proposal_from_weighted_voting_proposal,
+    build_weighted_voting_global_risk_request,
+    fail_closed_global_risk_response,
+    global_gate_response_from_weighted_voting_risk,
+    apply_global_response_to_weighted_voting_proposal,
+    validate_weighted_voting_global_risk_response,
+)
 from backend.app.algorithms.weighted_voting.identity import (
     WEIGHTED_VOTING_ALGORITHM_ID,
     WEIGHTED_VOTING_SERVICE_VERSION,
@@ -25,6 +38,7 @@ from backend.app.algorithms.weighted_voting.identity import (
     weighted_voting_service_boundary,
     weighted_voting_shared_service_boundary,
 )
+from backend.app.algorithms.weighted_voting.inventory import WeightedVotingInventoryRepository, WeightedVotingInventorySnapshot, inventory_status
 from backend.app.algorithms.weighted_voting.market_condition import classify_market_condition
 from backend.app.algorithms.weighted_voting.market_snapshot import WeightedVotingMarketSnapshot, build_weighted_voting_market_snapshot
 from backend.app.algorithms.weighted_voting.migration import migration_status
@@ -40,11 +54,24 @@ from backend.app.algorithms.weighted_voting.persistence import (
 )
 from backend.app.algorithms.weighted_voting.position_sizing import WeightedVotingSizingContext, calculate_weighted_voting_position_size
 from backend.app.algorithms.weighted_voting.rollout import rollout_status
+from backend.app.algorithms.weighted_voting.runtime_context import (
+    WeightedVotingRuntimeContext,
+    WeightedVotingRuntimeContextBuilder,
+    WeightedVotingExecutionCostEstimate,
+    WeightedVotingStaticAccountPort,
+    WeightedVotingStaticGlobalRiskPort,
+    WeightedVotingStaticInventorySnapshotPort,
+    WeightedVotingStaticMarketDataPort,
+    WeightedVotingUnavailableAccountPort,
+    WeightedVotingUnavailableGlobalRiskPort,
+    payload_contains_forbidden_authoritative_evaluation_inputs,
+    runtime_context_status,
+)
 from backend.app.algorithms.weighted_voting.scheduler import ACTIVE_WEIGHT_STATE_KEY, WeightedVotingDailySchedulerConfig, run_after_market_daily_weight_update
 from backend.app.algorithms.weighted_voting.signal_engine import evaluate_signals
+from backend.app.algorithms.weighted_voting.strategy_lifecycle import strategy_lifecycle_status
 from backend.app.algorithms.weighted_voting.strategies.common import average_true_range, average_volume
 from backend.app.algorithms.weighted_voting.weight_engine import append_weight_history, create_unseeded_equal_weight_state, rollback_weight_state, update_performance_weight_state, weight_engine_status
-from backend.app.gates import GlobalGateResponse
 
 
 class WeightedVotingService:
@@ -52,9 +79,15 @@ class WeightedVotingService:
 
     version = WEIGHTED_VOTING_SERVICE_VERSION
 
-    def __init__(self, config: WeightedVotingConfig | None = None, store: WeightedVotingStateStore | None = None) -> None:
+    def __init__(
+        self,
+        config: WeightedVotingConfig | None = None,
+        store: WeightedVotingStateStore | None = None,
+        central_risk_service: WeightedVotingCentralGlobalRiskService | None = None,
+    ) -> None:
         self.config = config or WeightedVotingConfig()
         self.store = store or WeightedVotingFilesystemStateStore()
+        self.central_risk_service = central_risk_service or WeightedVotingUnavailableCentralGlobalRiskService()
 
     def aggregate_signals(self, signals: list[WeightedVotingSignal]) -> WeightedVotingDecision:
         return aggregate_weighted_signals(signals, config=self.config)
@@ -63,6 +96,7 @@ class WeightedVotingService:
         return {
             "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
             "serviceVersion": self.version,
+            "architecture": weighted_voting_architecture_status(),
             "serviceBoundary": asdict(weighted_voting_service_boundary()),
             "excludedComponents": weighted_voting_exclusion_inventory(),
             "sharedServiceBoundary": weighted_voting_shared_service_boundary(),
@@ -75,12 +109,17 @@ class WeightedVotingService:
                 "walkForward": walk_forward_status(),
             },
             "observability": observability_status(),
+            "inventory": inventory_status(),
+            "runtimeContext": runtime_context_status(),
+            "decisionKernel": decision_kernel_status(),
+            "strategyLifecycle": strategy_lifecycle_status(),
             "migration": migration_status(),
             "status": "ready",
             "mode": "backtesting_and_paper_trading_only",
             "isolated": True,
             "rollout": rollout_status(),
             "finalAcceptance": build_weighted_voting_final_acceptance_report(),
+            "systemAcceptance": build_weighted_voting_system_acceptance_report(),
             "reasonCodes": (weighted_voting_reason_code("api.ready"),),
             "explanation": "Weighted Voting API is backend-authoritative and isolated from other algorithms.",
         }
@@ -194,81 +233,139 @@ class WeightedVotingService:
         }
 
     def evaluate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate from public/API market data without accepting safety overrides."""
+
         snapshot = build_weighted_voting_market_snapshot(payload)
         active_weight_state = self.active_weight_state()
-        condition = classify_market_condition(snapshot, config=self.config)
-        weighted_signals = tuple(evaluate_signals(snapshot, self.config, active_weight_state, condition))
-        decision = aggregate_weighted_signals(list(weighted_signals), config=self.config, decision_timestamp=snapshot.data_timestamp)
         effective = load_effective_settings(self.store) if _read_optional(self.store, WEIGHTED_VOTING_SETTINGS_KEY) else resolve_effective_settings(timestamp=snapshot.data_timestamp)
-        decision = decision.model_copy(
-            update={
-                "weight_version": active_weight_state.weight_version,
-                "settings_version": effective.settings_version,
-                "data_manifest_hash": snapshot.data_manifest_hash,
-            }
-        )
-        gate_result = evaluate_local_decision_gates(
-            WeightedVotingLocalGateInputs(
-                decision=decision,
-                signals=weighted_signals,
-                market_snapshot=snapshot,
-                five_minute_alignment=WeightedFiveMinuteAlignment.POSITIVE if decision.signal in (WeightedSide.BUY.value, WeightedSide.SELL.value) else WeightedFiveMinuteAlignment.UNAVAILABLE,
-                expected_value_after_costs=_expected_value_after_costs(weighted_signals, decision, snapshot),
-                spread_cost=_spread(snapshot),
-                slippage_cost=0.02,
-                fee_cost=0.01,
-                atr_percent=_atr_percent(snapshot),
-                entry_quality=decision.vote_scores.winner_score,
-                session_allowed=True,
-                weighted_daily_loss_percent=0.0,
-                weighted_daily_trade_count=0,
-                capital_available=float(payload.get("capital_available", 100_000.0)),
-                current_position=None,
-                data_timestamp=snapshot.data_timestamp,
-            ),
-            config=self.config,
-        )
-        sizing = calculate_weighted_voting_position_size(
-            WeightedVotingSizingContext(
-                decision=decision,
-                effective_settings=effective,
-                market_snapshot=snapshot,
-                account_equity=float(payload.get("account_equity", 100_000.0)),
-                available_buying_power=float(payload.get("available_buying_power", 100_000.0)),
-                remaining_weighted_daily_risk=float(payload.get("remaining_weighted_daily_risk", 1_000.0)),
-                remaining_weighted_capital_partition=float(payload.get("remaining_weighted_capital_partition", 30_000.0)),
-                global_available_risk=float(payload.get("global_available_risk", 1_000.0)),
-                global_max_shares=int(payload.get("global_max_shares", 2_147_483_647)),
-                structural_invalidation_price=_structural_invalidation(weighted_signals, decision.proposed_side),
-                atr=average_true_range(snapshot.one_minute_candles, 14),
-                slippage_per_share=float(payload.get("slippage_per_share", 0.01)),
-                current_one_minute_volume=snapshot.one_minute_candles[-1].volume,
-                average_one_minute_volume=average_volume(snapshot.one_minute_candles, 20),
-                local_gate_result=gate_result,
-            )
-        )
-        trigger_price = _proposal_entry_price(snapshot, decision.proposed_side)
-        stop_price = _proposal_stop_price(trigger_price, sizing.stop_distance, decision.proposed_side)
-        target_price = _proposal_target_price(trigger_price, sizing.stop_distance, effective.target_r, decision.proposed_side)
-        order_proposal = build_weighted_voting_order_proposal(
-            decision=decision,
-            sizing=sizing,
+        context = WeightedVotingRuntimeContextBuilder(
+            market_data_port=WeightedVotingStaticMarketDataPort(snapshot),
+            inventory_repository=WeightedVotingInventoryRepository(self.store, symbol=snapshot.symbol),
+            account_port=WeightedVotingUnavailableAccountPort(),
+            global_risk_port=WeightedVotingUnavailableGlobalRiskPort(),
             effective_settings=effective,
-            market_snapshot=snapshot,
-            signals=weighted_signals,
-            trigger_price=trigger_price,
-            limit_price=trigger_price,
-            stop_price=stop_price,
-            target_price=target_price,
-            created_at=snapshot.data_timestamp,
+            active_weight_state=active_weight_state,
+            observed_at=snapshot.data_timestamp,
+            mode="production",
+        ).build()
+        result = self.evaluate_context(context)
+        if payload_contains_forbidden_authoritative_evaluation_inputs(payload):
+            result["deprecatedIgnoredInputs"] = sorted(key for key in payload if payload_contains_forbidden_authoritative_evaluation_inputs({key: payload[key]}))
+            result["reasonCodes"] = tuple(dict.fromkeys((*result["reasonCodes"], "weighted_voting.runtime_context.http_safety_inputs_ignored")))
+        return result
+
+    def evaluate_replay_fixture(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate an explicit replay/test fixture where safety overrides are allowed."""
+
+        fixture_payload = {**payload}
+        fixture_payload.setdefault("session_phase", "morning")
+        snapshot = build_weighted_voting_market_snapshot(fixture_payload)
+        active_weight_state = self.active_weight_state()
+        effective = load_effective_settings(self.store) if _read_optional(self.store, WEIGHTED_VOTING_SETTINGS_KEY) else resolve_effective_settings(timestamp=snapshot.data_timestamp)
+        context = WeightedVotingRuntimeContextBuilder(
+            market_data_port=WeightedVotingStaticMarketDataPort(snapshot),
+            inventory_repository=WeightedVotingStaticInventorySnapshotPort(
+                WeightedVotingInventorySnapshot.empty(
+                    symbol=snapshot.symbol,
+                    allocated_capital=float(payload.get("capital_available", payload.get("capitalAvailable", 100_000.0))),
+                    session_date=snapshot.data_timestamp.date(),
+                    created_at=snapshot.data_timestamp,
+                )
+            ),
+            account_port=WeightedVotingStaticAccountPort(
+                account_equity=float(payload.get("account_equity", payload.get("accountEquity", 100_000.0))),
+                broker_buying_power=float(payload.get("available_buying_power", payload.get("availableBuyingPower", 100_000.0))),
+            ),
+            global_risk_port=WeightedVotingStaticGlobalRiskPort(
+                global_available_risk=float(payload.get("global_available_risk", payload.get("globalAvailableRisk", 1_000.0))),
+                global_max_shares=int(payload.get("global_max_shares", payload.get("globalMaxShares", 2_147_483_647))),
+                gate_response=None,
+            ),
+            effective_settings=effective,
+            active_weight_state=active_weight_state,
+            observed_at=snapshot.data_timestamp,
+            mode="replay_fixture",
+            cost_estimate=WeightedVotingExecutionCostEstimate(
+                slippage_per_share=float(payload.get("slippage_per_share", payload.get("slippagePerShare", effective.slippage_allowance_per_share))),
+                fee_per_share=float(payload.get("fee_per_share", payload.get("feePerShare", self.config.fee_per_share))),
+                observed_at=snapshot.data_timestamp,
+                source_id="weighted_voting.replay_fixture.cost_model",
+                reason_codes=("weighted_voting.replay_fixture.cost_model",),
+            ),
+        ).build()
+        fixture_central_risk = (
+            WeightedVotingStaticCentralGlobalRiskService()
+            if isinstance(self.central_risk_service, WeightedVotingUnavailableCentralGlobalRiskService)
+            else self.central_risk_service
         )
+        return self.evaluate_context(context, central_risk_service=fixture_central_risk)
+
+    def evaluate_context(
+        self,
+        context: WeightedVotingRuntimeContext,
+        *,
+        central_risk_service: WeightedVotingCentralGlobalRiskService | None = None,
+    ) -> dict[str, Any]:
+        kernel_result = WeightedVotingDecisionKernel.evaluate(
+            context,
+            config=self.config,
+            settings_resolver=DynamicSettingsResolver(
+                default_settings=context.effective_settings.default_settings,
+                dynamic_envelope=context.effective_settings.dynamic_envelope,
+                hard_limits=context.effective_settings.hard_limits,
+                baseline_config=self.config,
+            ),
+        )
+        snapshot = kernel_result.market_snapshot
+        active_weight_state = context.active_weight_state
+        condition = kernel_result.market_condition
+        weighted_signals = kernel_result.signals
+        decision = kernel_result.decision
+        effective = kernel_result.effective_settings
+        gate_result = kernel_result.gate_result
+        sizing = kernel_result.sizing_result
+        order_proposal = kernel_result.order_proposal
+        context_failure_reasons = context.context_failure_reason_codes(stale_after_seconds=effective.stale_data_threshold_seconds)
         global_proposal = build_global_order_proposal_from_weighted_voting_proposal(
             proposal=order_proposal,
             decision=decision,
             sizing=sizing,
             effective_settings=effective,
         )
-        global_response = _global_response_from_payload(payload, global_proposal, sizing)
+        global_risk_request = build_weighted_voting_global_risk_request(
+            proposal=global_proposal,
+            inventory_version=context.inventory_snapshot.snapshot_version,
+            current_algorithm_exposure=context.inventory_snapshot.gross_exposure,
+            current_account_exposure=_current_account_exposure(context),
+            daily_algorithm_pnl=context.algorithm_daily_pnl,
+            account_level_risk_observations=_account_level_risk_observations(context),
+            settings_version=effective.settings_version,
+            requested_at=snapshot.data_timestamp,
+        )
+        self.store.write_snapshot(f"weighted_voting.global_risk_requests.{global_risk_request.request_id}", global_risk_request.model_dump(mode="json"))
+        weighted_global_response = (
+            fail_closed_global_risk_response(
+                global_risk_request,
+                reason_codes=tuple(dict.fromkeys((*context_failure_reasons, "weighted_voting.global_risk.skipped_due_context_failure"))),
+                evaluated_at=snapshot.data_timestamp,
+            )
+            if context_failure_reasons
+            else _call_central_global_risk_service(
+                central_risk_service or self.central_risk_service,
+                global_risk_request,
+                evaluated_at=snapshot.data_timestamp,
+            )
+        )
+        weighted_global_response, global_validation_reasons = validate_weighted_voting_global_risk_response(
+            request=global_risk_request,
+            response=weighted_global_response,
+            now=snapshot.data_timestamp,
+        )
+        self.store.write_snapshot(
+            f"weighted_voting.global_risk_responses.{global_risk_request.request_id}",
+            weighted_global_response.model_dump(mode="json"),
+        )
+        global_response = global_gate_response_from_weighted_voting_risk(weighted_global_response)
         global_application = apply_global_response_to_weighted_voting_proposal(global_proposal, global_response)
         decision = decision.model_copy(
             update={
@@ -313,6 +410,8 @@ class WeightedVotingService:
             "sizingResult": _json_ready(sizing),
             "orderProposal": order_proposal.as_dict(),
             "globalOrderProposal": global_proposal.model_dump(mode="json"),
+            "globalRiskRequest": global_risk_request.model_dump(mode="json"),
+            "globalRiskResponse": weighted_global_response.model_dump(mode="json"),
             "globalGateResponse": global_response.model_dump(mode="json"),
             "globalGateApplication": global_application.model_dump(mode="json"),
             "observabilitySnapshot": {
@@ -320,7 +419,19 @@ class WeightedVotingService:
                 "snapshotHash": observability_snapshot["snapshotHash"],
                 "key": f"weighted_voting.observability.decisions.{observability_snapshot['decisionId']}",
             },
-            "reasonCodes": ("weighted_voting.evaluate.completed",),
+            "runtimeContext": {
+                "contextVersion": context.context_version,
+                "manifestHash": context.manifest_hash,
+                "mode": context.mode,
+                "failureReasonCodes": context_failure_reasons,
+                "sourceAttribution": {key: _json_ready(value) for key, value in context.source_attribution.items()},
+            },
+            "decisionKernel": {
+                "kernelVersion": kernel_result.kernel_version,
+                "deterministicResultHash": kernel_result.deterministic_result_hash,
+                "observabilitySnapshotHash": kernel_result.observability_record["snapshotHash"],
+            },
+            "reasonCodes": tuple(dict.fromkeys(("weighted_voting.evaluate.completed", *kernel_result.reason_codes, *context_failure_reasons, *global_validation_reasons))),
         }
 
     def create_backtest(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -576,20 +687,45 @@ def _proposal_target_price(entry_price: float | None, stop_distance: float, targ
     return None
 
 
-def _global_response_from_payload(payload: dict[str, Any], proposal, sizing) -> GlobalGateResponse:
-    response = payload.get("global_gate_response") or payload.get("globalGateResponse") or {}
-    if not isinstance(response, dict):
-        raise ValueError("global gate response must be an object")
-    values = {
-        "action": response.get("action", "ALLOW"),
-        "maximumAllowedQuantity": response.get("maximumAllowedQuantity", response.get("maximum_allowed_quantity", sizing.quantity)),
-        "maximumAdditionalRiskDollars": response.get("maximumAdditionalRiskDollars", response.get("maximum_additional_risk_dollars", sizing.effective_risk_dollars)),
-        "rejectionReasons": tuple(response.get("rejectionReasons", response.get("rejection_reasons", ()))),
-        "emergencyAction": response.get("emergencyAction", response.get("emergency_action")),
-        "evaluatedAt": response.get("evaluatedAt", response.get("evaluated_at", proposal.proposedAt)),
-        "configurationHash": response.get("configurationHash", response.get("configuration_hash", "global_gate_response_default_allow")),
+def _call_central_global_risk_service(
+    service: WeightedVotingCentralGlobalRiskService,
+    request,
+    *,
+    evaluated_at: datetime,
+):
+    try:
+        return service.evaluate(request)
+    except TimeoutError:
+        return fail_closed_global_risk_response(
+            request,
+            reason_codes=("weighted_voting.global_risk.timeout_reject",),
+            evaluated_at=evaluated_at,
+        )
+    except Exception:
+        return fail_closed_global_risk_response(
+            request,
+            reason_codes=("weighted_voting.global_risk.service_failure_reject",),
+            evaluated_at=evaluated_at,
+        )
+
+
+def _current_account_exposure(context: WeightedVotingRuntimeContext) -> float:
+    if context.read_only_account_equity is None or context.read_only_broker_buying_power is None:
+        return 0.0
+    return max(0.0, float(context.read_only_account_equity) - float(context.read_only_broker_buying_power))
+
+
+def _account_level_risk_observations(context: WeightedVotingRuntimeContext) -> dict[str, Any]:
+    return {
+        "accountEquity": context.read_only_account_equity,
+        "brokerBuyingPower": context.read_only_broker_buying_power,
+        "globalRiskServiceAvailable": context.global_risk_service_availability,
+        "globalAvailableRisk": context.global_risk_state.global_available_risk,
+        "globalMaxShares": context.global_risk_state.global_max_shares,
+        "accountExposure": _current_account_exposure(context),
+        "source": context.global_risk_state.source_id,
+        "reasonCodes": context.global_risk_state.reason_codes,
     }
-    return GlobalGateResponse(**values)
 
 
 def _backtest_summary(result: WeightedBacktestResult) -> dict[str, Any]:

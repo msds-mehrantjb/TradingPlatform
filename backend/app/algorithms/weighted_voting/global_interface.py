@@ -2,28 +2,121 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from enum import Enum
-from typing import Any
+from typing import Any, Literal, Protocol
 
 from backend.app.algorithms.weighted_voting.identity import weighted_voting_shared_service_boundary
-from backend.app.algorithms.weighted_voting.models import WeightedDecision, WeightedEffectiveSettings, WeightedSide
+from backend.app.algorithms.weighted_voting.models import WeightedContractModel, WeightedDecision, WeightedEffectiveSettings, WeightedSide
 from backend.app.algorithms.weighted_voting.order_proposal import WeightedVotingOrderProposal, build_weighted_voting_order_proposal
 from backend.app.algorithms.weighted_voting.position_sizing import WeightedVotingSizingResult
 from backend.app.gates import AppliedGlobalGateDecision, GlobalGateResponse, GlobalOrderProposal, apply_global_gate_response
 
 
 WEIGHTED_VOTING_GLOBAL_INTERFACE_VERSION = "weighted_voting_global_interface_v1"
+WEIGHTED_VOTING_GLOBAL_RISK_CONTRACT_VERSION = "weighted_voting_global_risk_contract_v1"
 WEIGHTED_VOTING_CAPITAL_PARTITION_ID = "weighted_voting.paper.default"
+WeightedVotingGlobalRiskAction = Literal["ALLOW", "REDUCE", "REJECT", "EXIT_ONLY", "EMERGENCY_LIQUIDATE"]
 WEIGHTED_VOTING_ALLOWED_GLOBAL_ACTIONS = frozenset(
     {
         "ALLOW",
-        "REDUCE_QUANTITY",
-        "REJECT_NEW_ENTRY",
+        "REDUCE",
+        "REJECT",
         "EXIT_ONLY",
         "EMERGENCY_LIQUIDATE",
     }
 )
+
+
+class WeightedVotingGlobalRiskRequest(WeightedContractModel):
+    contract_version: str = WEIGHTED_VOTING_GLOBAL_RISK_CONTRACT_VERSION
+    algorithm_id: Literal["weighted_voting"] = "weighted_voting"
+    request_id: str
+    proposal_id: str
+    capital_partition_id: str
+    symbol: str
+    side: str
+    proposed_quantity: int
+    proposed_notional: float
+    planned_risk: float
+    current_algorithm_exposure: float
+    current_account_exposure: float
+    daily_algorithm_pnl: float
+    account_level_risk_observations: dict[str, Any]
+    proposal_timestamp: datetime
+    settings_version: str
+    inventory_version: int
+    request_timestamp: datetime
+    request_hash: str = ""
+
+    def with_hash(self) -> "WeightedVotingGlobalRiskRequest":
+        return self.model_copy(update={"request_hash": _hash_payload(self.model_dump(mode="json", exclude={"request_hash"}))})
+
+
+class WeightedVotingGlobalRiskResponse(WeightedContractModel):
+    contract_version: str = WEIGHTED_VOTING_GLOBAL_RISK_CONTRACT_VERSION
+    algorithm_id: Literal["weighted_voting"] = "weighted_voting"
+    request_id: str
+    proposal_id: str
+    action: WeightedVotingGlobalRiskAction
+    maximum_quantity: int
+    maximum_additional_risk: float
+    reason_codes: tuple[str, ...]
+    configuration_hash: str
+    configuration_version: str
+    evaluated_timestamp: datetime
+    expiry_timestamp: datetime
+    response_hash: str = ""
+    signature: str | None = None
+
+    def with_hash(self) -> "WeightedVotingGlobalRiskResponse":
+        return self.model_copy(update={"response_hash": _hash_payload(self.model_dump(mode="json", exclude={"response_hash", "signature"}))})
+
+
+class WeightedVotingCentralGlobalRiskService(Protocol):
+    def evaluate(self, request: WeightedVotingGlobalRiskRequest) -> WeightedVotingGlobalRiskResponse | None:
+        """Return the central global-risk decision for the request."""
+
+
+class WeightedVotingUnavailableCentralGlobalRiskService:
+    def evaluate(self, request: WeightedVotingGlobalRiskRequest) -> WeightedVotingGlobalRiskResponse | None:
+        return None
+
+
+class WeightedVotingStaticCentralGlobalRiskService:
+    def __init__(
+        self,
+        *,
+        action: WeightedVotingGlobalRiskAction = "ALLOW",
+        maximum_quantity: int | None = None,
+        maximum_additional_risk: float | None = None,
+        reason_codes: tuple[str, ...] = ("weighted_voting.global_risk.fixture_response",),
+        configuration_hash: str = "weighted_voting_fixture_central_risk",
+        configuration_version: str = "weighted_voting_fixture_central_risk_v1",
+        expires_after: timedelta = timedelta(seconds=30),
+    ) -> None:
+        self.action = action
+        self.maximum_quantity = maximum_quantity
+        self.maximum_additional_risk = maximum_additional_risk
+        self.reason_codes = reason_codes
+        self.configuration_hash = configuration_hash
+        self.configuration_version = configuration_version
+        self.expires_after = expires_after
+
+    def evaluate(self, request: WeightedVotingGlobalRiskRequest) -> WeightedVotingGlobalRiskResponse:
+        response = WeightedVotingGlobalRiskResponse(
+            request_id=request.request_id,
+            proposal_id=request.proposal_id,
+            action=self.action,
+            maximum_quantity=request.proposed_quantity if self.maximum_quantity is None else self.maximum_quantity,
+            maximum_additional_risk=request.planned_risk if self.maximum_additional_risk is None else self.maximum_additional_risk,
+            reason_codes=self.reason_codes,
+            configuration_hash=self.configuration_hash,
+            configuration_version=self.configuration_version,
+            evaluated_timestamp=request.request_timestamp,
+            expiry_timestamp=request.request_timestamp + self.expires_after,
+        )
+        return response.with_hash()
 WEIGHTED_VOTING_GLOBAL_IMMUTABILITY_CHECKS = (
     "weighted_voting.global_interface.algorithm_id_locked",
     "weighted_voting.global_interface.capital_partition_locked",
@@ -180,6 +273,112 @@ def apply_global_response_to_weighted_voting_proposal(
     return applied
 
 
+def build_weighted_voting_global_risk_request(
+    *,
+    proposal: GlobalOrderProposal,
+    inventory_version: int,
+    current_algorithm_exposure: float,
+    current_account_exposure: float,
+    daily_algorithm_pnl: float,
+    account_level_risk_observations: dict[str, Any],
+    settings_version: str,
+    requested_at: datetime,
+) -> WeightedVotingGlobalRiskRequest:
+    _validate_global_order_proposal(proposal)
+    request = WeightedVotingGlobalRiskRequest(
+        request_id=f"{proposal.orderIntentId}.global_risk.{requested_at.isoformat()}",
+        proposal_id=proposal.orderIntentId,
+        capital_partition_id=proposal.capitalPartitionId,
+        symbol=proposal.symbol,
+        side=proposal.side,
+        proposed_quantity=proposal.quantity,
+        proposed_notional=round(max(0.0, float(proposal.quantity) * float(proposal.limitPrice or proposal.triggerPrice or 0.0)), 10),
+        planned_risk=proposal.plannedRiskDollars,
+        current_algorithm_exposure=current_algorithm_exposure,
+        current_account_exposure=current_account_exposure,
+        daily_algorithm_pnl=daily_algorithm_pnl,
+        account_level_risk_observations=account_level_risk_observations,
+        proposal_timestamp=proposal.proposedAt,
+        settings_version=settings_version,
+        inventory_version=inventory_version,
+        request_timestamp=requested_at,
+    )
+    return request.with_hash()
+
+
+def fail_closed_global_risk_response(
+    request: WeightedVotingGlobalRiskRequest,
+    *,
+    reason_codes: tuple[str, ...],
+    evaluated_at: datetime,
+) -> WeightedVotingGlobalRiskResponse:
+    response = WeightedVotingGlobalRiskResponse(
+        request_id=request.request_id,
+        proposal_id=request.proposal_id,
+        action="REJECT",
+        maximum_quantity=0,
+        maximum_additional_risk=0.0,
+        reason_codes=tuple(dict.fromkeys(reason_codes)),
+        configuration_hash="weighted_voting_global_risk_fail_closed",
+        configuration_version=WEIGHTED_VOTING_GLOBAL_RISK_CONTRACT_VERSION,
+        evaluated_timestamp=evaluated_at,
+        expiry_timestamp=evaluated_at + timedelta(seconds=30),
+    )
+    return response.with_hash()
+
+
+def validate_weighted_voting_global_risk_response(
+    *,
+    request: WeightedVotingGlobalRiskRequest,
+    response: WeightedVotingGlobalRiskResponse | None,
+    now: datetime,
+) -> tuple[WeightedVotingGlobalRiskResponse, tuple[str, ...]]:
+    if response is None:
+        rejected = fail_closed_global_risk_response(
+            request,
+            reason_codes=("weighted_voting.global_risk.missing_response",),
+            evaluated_at=now,
+        )
+        return rejected, rejected.reason_codes
+    failures: list[str] = []
+    if response.request_id != request.request_id:
+        failures.append("weighted_voting.global_risk.request_id_mismatch")
+    if response.proposal_id != request.proposal_id:
+        failures.append("weighted_voting.global_risk.proposal_id_mismatch")
+    if response.algorithm_id != "weighted_voting":
+        failures.append("weighted_voting.global_risk.algorithm_id_mismatch")
+    if response.expiry_timestamp <= now:
+        failures.append("weighted_voting.global_risk.response_stale")
+    if response.maximum_quantity > request.proposed_quantity:
+        failures.append("weighted_voting.global_risk.quantity_increase_rejected")
+    if response.maximum_additional_risk > request.planned_risk:
+        failures.append("weighted_voting.global_risk.risk_increase_rejected")
+    if response.action not in WEIGHTED_VOTING_ALLOWED_GLOBAL_ACTIONS:
+        failures.append("weighted_voting.global_risk.action_not_allowed")
+    if response.response_hash:
+        expected_hash = _hash_payload(response.model_dump(mode="json", exclude={"response_hash", "signature"}))
+        if response.response_hash != expected_hash:
+            failures.append("weighted_voting.global_risk.response_hash_invalid")
+    if failures:
+        rejected = fail_closed_global_risk_response(request, reason_codes=tuple(failures), evaluated_at=now)
+        return rejected, tuple(dict.fromkeys((*failures, *response.reason_codes)))
+    return response, response.reason_codes
+
+
+def global_gate_response_from_weighted_voting_risk(
+    response: WeightedVotingGlobalRiskResponse,
+) -> GlobalGateResponse:
+    return GlobalGateResponse(
+        action=_shared_global_action(response.action),
+        maximumAllowedQuantity=response.maximum_quantity,
+        maximumAdditionalRiskDollars=response.maximum_additional_risk,
+        rejectionReasons=response.reason_codes,
+        emergencyAction="liquidate_owned_risk_reducing_positions" if response.action == "EMERGENCY_LIQUIDATE" else None,
+        evaluatedAt=response.evaluated_timestamp,
+        configurationHash=response.configuration_hash,
+    )
+
+
 def global_interface_status() -> dict[str, object]:
     shared_boundary = weighted_voting_shared_service_boundary()
     return {
@@ -187,6 +386,10 @@ def global_interface_status() -> dict[str, object]:
         "algorithmId": "weighted_voting",
         "capitalPartitionId": WEIGHTED_VOTING_CAPITAL_PARTITION_ID,
         "allowedActions": tuple(sorted(WEIGHTED_VOTING_ALLOWED_GLOBAL_ACTIONS)),
+        "requestContract": "WeightedVotingGlobalRiskRequest",
+        "responseContract": "WeightedVotingGlobalRiskResponse",
+        "missingResponseFailsClosed": True,
+        "clientPayloadGlobalRiskAccepted": False,
         "immutabilityChecks": WEIGHTED_VOTING_GLOBAL_IMMUTABILITY_CHECKS,
         "sharedServiceBoundary": shared_boundary,
         "sharedServiceAllowedActions": shared_boundary["allowedSharedServiceActions"],
@@ -238,7 +441,7 @@ def _validate_global_order_proposal(proposal: GlobalOrderProposal) -> None:
 
 
 def _validate_global_response_reduction_only(proposal: GlobalOrderProposal, response: GlobalGateResponse) -> None:
-    if response.action not in WEIGHTED_VOTING_ALLOWED_GLOBAL_ACTIONS:
+    if response.action not in {"ALLOW", "REDUCE_QUANTITY", "REJECT_NEW_ENTRY", "EXIT_ONLY", "EMERGENCY_LIQUIDATE"}:
         raise ValueError("global response action is not allowed for Weighted Voting")
     if response.maximumAllowedQuantity > proposal.quantity:
         raise ValueError("global response attempted to increase Weighted Voting quantity")
@@ -252,6 +455,14 @@ def _global_side(side: str) -> str:
     if side == WeightedSide.SELL.value:
         return "SELL"
     return "HOLD"
+
+
+def _shared_global_action(action: str) -> str:
+    if action == "REDUCE":
+        return "REDUCE_QUANTITY"
+    if action == "REJECT":
+        return "REJECT_NEW_ENTRY"
+    return action
 
 
 def _minimal_snapshot(*, symbol: str, decision: WeightedDecision):
@@ -269,6 +480,11 @@ def _minimal_snapshot(*, symbol: str, decision: WeightedDecision):
 
 
 def _hash_json(value: Any) -> str:
+    serialized = json.dumps(_jsonable(value), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
+def _hash_payload(value: Any) -> str:
     serialized = json.dumps(_jsonable(value), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 

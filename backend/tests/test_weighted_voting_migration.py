@@ -4,6 +4,7 @@ import json
 import unittest
 from datetime import datetime, timezone
 
+from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS, WEIGHTED_VOTING_SHADOW_STRATEGY_IDS
 from backend.app.algorithms.weighted_voting.migration import (
     LEGACY_STRATEGY_PERFORMANCE_KEY,
     LEGACY_UI_STATE_KEY,
@@ -51,7 +52,8 @@ class WeightedVotingMigrationTest(unittest.TestCase):
         active_weights = store.snapshots[WEIGHTED_VOTING_ACTIVE_WEIGHT_STATE_KEY]
         self.assertEqual(active_weights["state_status"], "UNSEEDED_EQUAL_WEIGHTS")
         self.assertEqual(active_weights["reason_codes"], ["weighted_voting.weights.unseeded_equal"])
-        self.assertTrue(all(weight == 0.125 for weight in active_weights["strategy_weights"].values()))
+        self.assertTrue(all(active_weights["strategy_weights"][strategy_id] == 0.25 for strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS))
+        self.assertTrue(all(active_weights["strategy_weights"][strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
 
         archive_keys = [key for key in store.snapshots if key.startswith("weighted_voting.migration.archive.weight_history.")]
         self.assertEqual(len(archive_keys), 1)
@@ -161,7 +163,9 @@ class WeightedVotingMigrationTest(unittest.TestCase):
         self.assertTrue(result.trustworthy_performance_migrated)
         self.assertIn("weighted_voting.weights.history.trusted-wf-v1", store.snapshots)
         self.assertEqual(store.snapshots[WEIGHTED_VOTING_ACTIVE_WEIGHT_STATE_KEY]["state_status"], "UNSEEDED_EQUAL_WEIGHTS")
-        self.assertTrue(all(weight == 0.125 for weight in store.snapshots[WEIGHTED_VOTING_ACTIVE_WEIGHT_STATE_KEY]["strategy_weights"].values()))
+        active = store.snapshots[WEIGHTED_VOTING_ACTIVE_WEIGHT_STATE_KEY]["strategy_weights"]
+        self.assertTrue(all(active[strategy_id] == 0.25 for strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS))
+        self.assertTrue(all(active[strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
 
 
 class MemoryStore:

@@ -10,22 +10,31 @@ from backend.app.algorithms.weighted_voting.strategies.bollinger_atr_reversion i
 from backend.app.algorithms.weighted_voting.strategies.failed_breakout_reversal import FailedBreakoutReversalStrategy
 from backend.app.algorithms.weighted_voting.strategies.first_pullback_after_open import FirstPullbackAfterOpenStrategy
 from backend.app.algorithms.weighted_voting.strategies.liquidity_sweep_reversal import LiquiditySweepReversalStrategy
+from backend.app.algorithms.weighted_voting.strategies.opening_range_breakout import OpeningRangeBreakoutStrategy
+from backend.app.algorithms.weighted_voting.strategies.volatility_breakout import VolatilityBreakoutStrategy
+from backend.app.algorithms.weighted_voting.strategies.vwap_mean_reversion import VwapMeanReversionStrategy
+from backend.app.algorithms.weighted_voting.strategies.vwap_trend_continuation import VwapTrendContinuationStrategy
 
 
 WEIGHTED_VOTING_SIGNAL_ENGINE_VERSION = "weighted_voting_signal_engine_v1"
 
 
 WEIGHTED_VOTING_STRATEGY_CLASSES = (
+    OpeningRangeBreakoutStrategy,
     FirstPullbackAfterOpenStrategy,
+    VwapTrendContinuationStrategy,
+    VwapMeanReversionStrategy,
     FailedBreakoutReversalStrategy,
     LiquiditySweepReversalStrategy,
     BollingerAtrReversionStrategy,
+    VolatilityBreakoutStrategy,
 )
 
-WEIGHTED_VOTING_STRATEGY_CLASS_BY_ID = {
-    entry.strategy_id: strategy_class
-    for entry, strategy_class in zip(WEIGHTED_VOTING_STRATEGY_CATALOG, WEIGHTED_VOTING_STRATEGY_CLASSES)
-}
+WEIGHTED_VOTING_STRATEGY_CLASS_BY_ID = {strategy_class.strategy_id: strategy_class for strategy_class in WEIGHTED_VOTING_STRATEGY_CLASSES}
+_CATALOG_IDS = tuple(entry.strategy_id for entry in WEIGHTED_VOTING_STRATEGY_CATALOG)
+_SIGNAL_ENGINE_IDS = tuple(strategy_class.strategy_id for strategy_class in WEIGHTED_VOTING_STRATEGY_CLASSES)
+if set(_CATALOG_IDS) != set(_SIGNAL_ENGINE_IDS) or len(_SIGNAL_ENGINE_IDS) != len(set(_SIGNAL_ENGINE_IDS)):
+    raise RuntimeError("Weighted Voting strategy catalogue and signal engine registrations disagree")
 
 
 def evaluate_signals(
@@ -37,8 +46,11 @@ def evaluate_signals(
     active_config = config or WeightedVotingConfig()
     signals: list[WeightedVotingSignal] = []
     for entry in WEIGHTED_VOTING_STRATEGY_CATALOG:
-        strategy_class = WEIGHTED_VOTING_STRATEGY_CLASS_BY_ID[entry.strategy_id]
-        raw_signal = strategy_class(active_config).evaluate(snapshot)
+        if not entry.executes:
+            raw_signal = _inactive_lifecycle_signal(entry, snapshot)
+        else:
+            strategy_class = WEIGHTED_VOTING_STRATEGY_CLASS_BY_ID[entry.strategy_id]
+            raw_signal = strategy_class(active_config).evaluate(snapshot)
         signals.append(_standardize_strategy_signal(raw_signal, entry, snapshot, active_weight_state, market_condition))
     return signals
 
@@ -84,15 +96,19 @@ def _standardize_strategy_signal(
     if signal.strategy_id != entry.strategy_id:
         raise ValueError(f"strategy {entry.strategy_id} returned signal for {signal.strategy_id}")
     base_weight = entry.baseline_weight
-    active_weight = _active_weight(entry, active_weight_state)
+    active_weight = _active_weight(entry, active_weight_state) if entry.contributes_to_vote else 0.0
     market_condition_fit = _market_condition_fit(entry, market_condition)
     data_ready = _data_ready(signal, entry, snapshot)
-    eligible = bool(entry.enabled and signal.eligible and data_ready and _direction_allowed(signal, entry))
+    eligible = bool(entry.contributes_to_vote and signal.eligible and data_ready and _direction_allowed(signal, entry))
     active = bool(eligible and active_weight > 0 and market_condition_fit > 0)
     final_weight = min(entry.maximum_weight, active_weight * market_condition_fit) if active else 0.0
     reasons = list(signal.reason_codes)
-    if not entry.enabled:
+    if entry.lifecycle == "shadow":
+        reasons.append("weighted_voting.signal_engine.strategy_shadow_observed_zero_weight")
+    if entry.lifecycle in ("disabled", "retired"):
         reasons.append("weighted_voting.signal_engine.strategy_disabled")
+    if entry.lifecycle == "not_data_ready":
+        reasons.append("weighted_voting.signal_engine.strategy_lifecycle_not_data_ready")
     if not data_ready:
         reasons.append("weighted_voting.signal_engine.data_not_ready")
     if signal.eligible and not _direction_allowed(signal, entry):
@@ -112,7 +128,7 @@ def _standardize_strategy_signal(
             "hold_probability": signal.p_hold,
             "confidence": signal.directional_confidence,
             "expected_return_before_costs": signal.expected_return,
-            "base_weight": base_weight,
+            "base_weight": base_weight if entry.contributes_to_vote else 0.0,
             "active_weight": active_weight,
             "final_weight": round(final_weight, 10),
             "eligible": eligible,
@@ -160,7 +176,14 @@ def _feature_snapshot(
     features: dict[str, float | str | bool | None] = {
         "signal_engine_version": WEIGHTED_VOTING_SIGNAL_ENGINE_VERSION,
         "strategy_id": entry.strategy_id,
+        "strategy_lifecycle": entry.lifecycle,
+        "strategy_lifecycle_reason": entry.lifecycle_reason,
         "strategy_family": _enum_value(entry.family),
+        "strategy_executes": entry.executes,
+        "strategy_contributes_to_vote": entry.contributes_to_vote,
+        "shadow_performance_state": f"weighted_voting.strategies.{entry.strategy_id}.shadow_performance" if entry.shadow_records_only else None,
+        "pairwise_signal_correlation_state": f"weighted_voting.performance_tracker.pairwise_signal_correlation.{entry.strategy_id}",
+        "pairwise_return_correlation_state": f"weighted_voting.performance_tracker.pairwise_return_correlation.{entry.strategy_id}",
         "completed_one_minute_candles": float(sum(1 for candle in snapshot.one_minute_candles if candle.timestamp <= snapshot.data_timestamp)),
         "required_one_minute_candles": float(entry.minimum_warmup),
         "data_freshness_seconds": snapshot.data_freshness_seconds,
@@ -179,6 +202,28 @@ def _feature_snapshot(
             }
         )
     return features
+
+
+def _inactive_lifecycle_signal(entry: WeightedVotingStrategyCatalogEntry, snapshot: WeightedVotingMarketSnapshot) -> WeightedVotingSignal:
+    return WeightedVotingSignal(
+        strategy_id=entry.strategy_id,
+        strategy_name=entry.name,
+        strategy_version=entry.version,
+        family=entry.family,
+        signal=WeightedSide.HOLD,
+        p_buy=0.0,
+        p_sell=0.0,
+        p_hold=1.0,
+        expected_return=0.0,
+        expected_return_after_costs=0.0,
+        strength=0.0,
+        final_weight=0.0,
+        eligible=False,
+        data_ready=False,
+        data_timestamp=snapshot.data_timestamp,
+        reason_codes=(f"weighted_voting.signal_engine.strategy_lifecycle_{entry.lifecycle}",),
+        explanation=f"{entry.name} lifecycle is {entry.lifecycle}; the dedicated implementation was not executed.",
+    )
 
 
 def _enum_value(value) -> str:

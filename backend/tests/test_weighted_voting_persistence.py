@@ -90,10 +90,13 @@ class WeightedVotingPersistenceTest(unittest.TestCase):
             "positions",
             "trades",
             "performance",
+            "strategy_lifecycle",
+            "strategy_lifecycle_audit",
             "backtest_runs",
             "walk_forward_folds",
             "equity_curves",
             "daily_updates",
+            "inventory",
             "observability",
             "migrations",
         }

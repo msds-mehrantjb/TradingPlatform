@@ -8,10 +8,11 @@ from datetime import datetime
 import hashlib
 import json
 from math import sqrt
+from typing import Any
 
-from backend.app.algorithms.weighted_voting.aggregation import aggregate_weighted_signals
 from backend.app.algorithms.weighted_voting.backtest.data_validation import WeightedBacktestDataManifest, validate_historical_data
 from backend.app.algorithms.weighted_voting.backtest.execution_simulator import (
+    WEIGHTED_VOTING_EXECUTION_SIMULATOR_VERSION,
     WeightedBacktestExecutionCostModel,
     WeightedBacktestPendingOrder,
     conservative_exit_price,
@@ -22,12 +23,17 @@ from backend.app.algorithms.weighted_voting.backtest.execution_simulator import 
 from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_CATALOG_VERSION
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.decision_gates import (
-    WeightedFiveMinuteAlignment,
     WeightedVotingGatePipelineResult,
-    WeightedVotingLocalGateInputs,
-    evaluate_local_decision_gates,
 )
-from backend.app.algorithms.weighted_voting.dynamic_settings import DynamicSettingsResolver, default_dynamic_envelope, default_hard_limits, default_weighted_settings
+from backend.app.algorithms.weighted_voting.decision_kernel import WEIGHTED_VOTING_DECISION_KERNEL_VERSION, WeightedVotingDecisionKernel
+from backend.app.algorithms.weighted_voting.dynamic_settings import (
+    WEIGHTED_VOTING_DYNAMIC_SETTINGS_VERSION,
+    DynamicSettingsResolver,
+    default_dynamic_envelope,
+    default_hard_limits,
+    default_weighted_settings,
+    resolve_effective_settings,
+)
 from backend.app.algorithms.weighted_voting.entry_policy import WeightedEntryPolicyResult, evaluate_entry_policy
 from backend.app.algorithms.weighted_voting.exit_policy import (
     WeightedExitAction,
@@ -37,7 +43,14 @@ from backend.app.algorithms.weighted_voting.exit_policy import (
     evaluate_exit_lifecycle,
     open_exit_lifecycle,
 )
-from backend.app.algorithms.weighted_voting.market_condition import classify_market_condition
+from backend.app.domain.exchange_calendar import ExchangeCalendarService
+from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ALGORITHM_ID
+from backend.app.algorithms.weighted_voting.inventory import (
+    WEIGHTED_VOTING_INVENTORY_NAMESPACE,
+    WEIGHTED_VOTING_INVENTORY_VERSION,
+    WeightedVotingInventoryEventType,
+    WeightedVotingInventoryRepository,
+)
 from backend.app.algorithms.weighted_voting.market_snapshot import WeightedVotingCandle, WeightedVotingMarketSnapshot
 from backend.app.algorithms.weighted_voting.models import (
     WeightedBacktestRun,
@@ -49,17 +62,25 @@ from backend.app.algorithms.weighted_voting.models import (
     WeightedHardLimits,
     WeightedMarketCondition,
     WeightedMarketQuality,
-    WeightedPositionState,
+    WeightedSessionPhase,
     WeightedSide,
     WeightedExitReason,
     WeightedStrategyOutcome,
     WeightedWeightState,
     WeightedVotingSignal,
 )
-from backend.app.algorithms.weighted_voting.position_sizing import WeightedVotingSizingContext, WeightedVotingSizingResult, calculate_weighted_voting_position_size
+from backend.app.algorithms.weighted_voting.position_sizing import WeightedVotingSizingResult
+from backend.app.algorithms.weighted_voting.runtime_context import (
+    WEIGHTED_VOTING_RUNTIME_CONTEXT_VERSION,
+    WeightedVotingExecutionCostEstimate,
+    WeightedVotingRuntimeContextBuilder,
+    WeightedVotingStaticAccountPort,
+    WeightedVotingStaticGlobalRiskPort,
+    WeightedVotingStaticMarketDataPort,
+)
 from backend.app.algorithms.weighted_voting.signal_engine import evaluate_signals
-from backend.app.algorithms.weighted_voting.strategies.common import average_true_range, average_volume, eastern_minutes
-from backend.app.algorithms.weighted_voting.weight_engine import create_unseeded_equal_weight_state, update_performance_weight_state
+from backend.app.algorithms.weighted_voting.strategies.common import eastern_minutes
+from backend.app.algorithms.weighted_voting.weight_engine import WEIGHTED_VOTING_WEIGHT_ENGINE_VERSION, create_unseeded_equal_weight_state, update_performance_weight_state
 
 
 WEIGHTED_VOTING_BACKTEST_ENGINE_VERSION = "weighted_voting_backtest_engine_v2"
@@ -101,6 +122,7 @@ WEIGHTED_VOTING_BACKTEST_OWNED_CAPABILITIES = (
 WEIGHTED_VOTING_BACKTEST_PRODUCTION_CALLS = (
     "create_unseeded_equal_weight_state",
     "update_performance_weight_state",
+    "WeightedVotingDecisionKernel.evaluate",
     "classify_market_condition",
     "DynamicSettingsResolver.resolve",
     "evaluate_signals",
@@ -153,6 +175,13 @@ class WeightedBacktestConfigurationManifest:
     use_dynamic_settings: bool
     cost_model: dict[str, float]
     initial_weight_version: str | None
+    active_weight_version: str
+    active_weight_hash: str | None
+    settings_version: str
+    settings_hash: str
+    inventory_version: str
+    inventory_namespace: str
+    code_versions: dict[str, str]
     calibration_outcome_count: int
     source: str
 
@@ -174,6 +203,13 @@ class WeightedBacktestConfigurationManifest:
                 "useDynamicSettings": self.use_dynamic_settings,
                 "costModel": self.cost_model,
                 "initialWeightVersion": self.initial_weight_version,
+                "activeWeightVersion": self.active_weight_version,
+                "activeWeightHash": self.active_weight_hash,
+                "settingsVersion": self.settings_version,
+                "settingsHash": self.settings_hash,
+                "inventoryVersion": self.inventory_version,
+                "inventoryNamespace": self.inventory_namespace,
+                "codeVersions": self.code_versions,
                 "calibrationOutcomeCount": self.calibration_outcome_count,
                 "source": self.source,
             },
@@ -195,6 +231,8 @@ class WeightedBacktestDecisionTrace:
     sizing_result: WeightedVotingSizingResult
     entry_policy: WeightedEntryPolicyResult | None
     market_condition: WeightedMarketCondition
+    inventory_snapshot_version: int
+    runtime_context_manifest_hash: str
     completed_candle_count: int
     reason_codes: tuple[str, ...]
 
@@ -221,6 +259,8 @@ class WeightedBacktestTrade:
     regime_label: str
     session_label: str
     partial_fill: bool
+    settings_version: str
+    configuration_hash: str
     reason_codes: tuple[str, ...]
 
 
@@ -286,6 +326,8 @@ class _OpenBacktestPosition:
     entry_spread_cost: float
     entry_slippage_cost: float
     partial_fill: bool
+    settings_version: str
+    configuration_hash: str
     favorable_excursion: float = 0.0
     adverse_excursion: float = 0.0
 
@@ -318,7 +360,6 @@ def run_weighted_voting_backtest(
         fill_policy="none",
     )
     manifest = validation.manifest
-    configuration_manifest = _configuration_manifest(config, created_at)
     if data_manifest_hash is not None and data_manifest_hash != manifest.manifest_hash:
         raise ValueError("supplied data manifest hash does not match immutable Weighted Voting manifest")
     if validation.blocks_run:
@@ -340,6 +381,18 @@ def run_weighted_voting_backtest(
     pending_order: WeightedBacktestPendingOrder | None = None
     pending_context: tuple[WeightedDecision, tuple[WeightedVotingSignal, ...], WeightedVotingSizingResult, WeightedEffectiveSettings, WeightedMarketCondition] | None = None
     open_position: _OpenBacktestPosition | None = None
+    allocated_capital = config.account_equity * config.weighted_config.daily_allocation_percent / 100.0
+    inventory_store = _RunScopedInventoryStore()
+    inventory_repository = WeightedVotingInventoryRepository(inventory_store, symbol=config.symbol, allocated_capital=allocated_capital)
+    if ordered_candles:
+        inventory_repository.initialize_session(
+            session_date=ordered_candles[0].timestamp.date(),
+            allocated_capital=allocated_capital,
+            cash_available=allocated_capital,
+            occurred_at=ordered_candles[0].timestamp,
+            expected_snapshot_version=inventory_repository.current_snapshot(now=ordered_candles[0].timestamp).snapshot_version,
+            event_id=f"{config.run_id}.session.{ordered_candles[0].timestamp.date().isoformat()}",
+        )
     previous_condition: WeightedMarketCondition | None = None
     daily_trade_count = 0
     realized_pnl = 0.0
@@ -360,6 +413,13 @@ def run_weighted_voting_backtest(
         dynamic_envelope=config.dynamic_envelope or default_dynamic_envelope(timestamp=created_at).model_copy(update={"enabled": bool(config.use_dynamic_settings)}),
         hard_limits=config.hard_limits or default_hard_limits(timestamp=created_at),
     )
+    configuration_manifest = _configuration_manifest(
+        config,
+        created_at,
+        weight_state=weight_state,
+        settings_version=settings_resolver.default_settings.settings_version,
+        settings_hash=settings_resolver.default_settings.deterministic_hash(),
+    )
 
     for index, candle in enumerate(ordered_candles):
         if pending_order is not None and open_position is None:
@@ -368,8 +428,10 @@ def run_weighted_voting_backtest(
             if fill.filled and pending_context is not None and fill.fill_price is not None:
                 decision, signals, sizing, effective_settings, condition = pending_context
                 stop = fill.fill_price - sizing.stop_distance if decision.proposed_side == WeightedSide.BUY.value else fill.fill_price + sizing.stop_distance
+                supporting = tuple(signal.strategy_id for signal in signals if signal.signal == decision.proposed_side and signal.eligible and signal.data_ready)
+                trade_id = f"{config.run_id}-trade-{len(trades) + 1}"
                 lifecycle = open_exit_lifecycle(
-                    trade_id=f"{config.run_id}-trade-{len(trades) + 1}",
+                    trade_id=trade_id,
                     symbol=config.symbol,
                     side=decision.proposed_side,
                     quantity=fill.quantity,
@@ -377,9 +439,28 @@ def run_weighted_voting_backtest(
                     entry_timestamp=candle.timestamp,
                     stop_price=stop,
                     effective_settings=effective_settings,
+                    supporting_strategy_ids=supporting,
                 )
                 production_calls.append("open_exit_lifecycle")
-                supporting = tuple(signal.strategy_id for signal in signals if signal.signal == decision.proposed_side and signal.eligible and signal.data_ready)
+                _record_backtest_fill(
+                    inventory_repository=inventory_repository,
+                    run_id=config.run_id,
+                    trade_id=trade_id,
+                    order=pending_order,
+                    decision=decision,
+                    fill_quantity=fill.quantity,
+                    fill_price=fill.fill_price,
+                    supporting_strategy_ids=supporting,
+                    occurred_at=candle.timestamp,
+                )
+                if fill.partial:
+                    _release_backtest_order(
+                        inventory_repository=inventory_repository,
+                        run_id=config.run_id,
+                        order=pending_order,
+                        occurred_at=candle.timestamp,
+                        suffix="partial-fill-remainder",
+                    )
                 open_position = _OpenBacktestPosition(
                     lifecycle=lifecycle,
                     supporting_strategy_ids=supporting,
@@ -389,15 +470,27 @@ def run_weighted_voting_backtest(
                     entry_spread_cost=fill.quantity * (pending_order.spread / 2.0),
                     entry_slippage_cost=fill.quantity * config.cost_model.entry_slippage_per_share,
                     partial_fill=fill.partial,
+                    settings_version=effective_settings.settings_version,
+                    configuration_hash=effective_settings.configuration_hash,
                 )
                 daily_trade_count += 1
                 position_sizes.append(fill.quantity)
-            if fill.filled or candle.timestamp >= ordered_candles[min(len(ordered_candles) - 1, pending_order.earliest_entry_index)].timestamp:
+            expired = candle.timestamp >= ordered_candles[min(len(ordered_candles) - 1, pending_order.earliest_entry_index)].timestamp
+            if not fill.filled and expired:
+                _release_backtest_order(
+                    inventory_repository=inventory_repository,
+                    run_id=config.run_id,
+                    order=pending_order,
+                    occurred_at=candle.timestamp,
+                    suffix="expired",
+                )
+            if fill.filled or expired:
                 pending_order = None
                 pending_context = None
 
         snapshot = _snapshot(config.symbol, ordered_candles[: index + 1], manifest.manifest_hash)
         if open_position is not None:
+            _mark_backtest_position(inventory_repository=inventory_repository, position=open_position, mark_price=candle.close, occurred_at=candle.timestamp)
             exit_decision, open_position = _evaluate_open_position(
                 open_position=open_position,
                 candle=candle,
@@ -417,6 +510,14 @@ def run_weighted_voting_backtest(
                 trades.append(trade)
                 realized_pnl += trade.net_pnl
                 equity_curve.append((trade.exit_timestamp, config.starting_cash + realized_pnl))
+                _close_backtest_inventory_position(
+                    inventory_repository=inventory_repository,
+                    position=open_position,
+                    exit_price=trade.exit_price,
+                    exit_reason=trade.exit_reason,
+                    occurred_at=trade.exit_timestamp,
+                )
+                daily_trade_count = inventory_repository.current_snapshot(now=trade.exit_timestamp).daily_trade_count
                 for strategy_id in trade.supporting_strategy_ids:
                     strategy_returns[strategy_id].append(trade.net_pnl / config.account_equity)
                     strategy_regime_returns[strategy_id][trade.regime_label].append(trade.net_pnl / config.account_equity)
@@ -431,63 +532,39 @@ def run_weighted_voting_backtest(
         if _is_after_session_cutoff(candle, config):
             continue
 
-        condition = classify_market_condition(snapshot, config=config.weighted_config, previous_condition=previous_condition)
+        context = _runtime_context(
+            snapshot=snapshot,
+            config=config,
+            weight_state=weight_state,
+            inventory_repository=inventory_repository,
+            previous_condition=previous_condition,
+        )
+        kernel_result = WeightedVotingDecisionKernel.evaluate(
+            context,
+            config=config.weighted_config,
+            settings_resolver=settings_resolver,
+            historical_outcomes=tuple(outcomes),
+            signal_evaluator=evaluate_signals,
+        )
+        production_calls.append("WeightedVotingDecisionKernel.evaluate")
         production_calls.append("classify_market_condition")
-        previous_condition = condition
-        effective_settings = settings_resolver.resolve(condition, timestamp=candle.timestamp)
         production_calls.append("DynamicSettingsResolver.resolve")
-        signals = tuple(evaluate_signals(snapshot, config.weighted_config))
         production_calls.append("evaluate_signals")
-        signals = _apply_weight_state(signals, weight_state)
+        production_calls.append("aggregate_weighted_signals")
+        production_calls.append("evaluate_local_decision_gates")
+        production_calls.append("calculate_weighted_voting_position_size")
+        condition = kernel_result.market_condition
+        previous_condition = condition
+        effective_settings = kernel_result.effective_settings
+        signals = kernel_result.signals
         for signal in signals:
             if signal.signal in (WeightedSide.BUY.value, WeightedSide.SELL.value):
                 opportunity_counts[signal.strategy_id] += 1
-        decision = aggregate_weighted_signals(list(signals), config=config.weighted_config, decision_timestamp=candle.timestamp, historical_outcomes=tuple(outcomes))
-        production_calls.append("aggregate_weighted_signals")
-        gate_result = evaluate_local_decision_gates(
-            WeightedVotingLocalGateInputs(
-                decision=decision,
-                signals=signals,
-                market_snapshot=snapshot,
-                five_minute_alignment=_five_minute_alignment(snapshot, decision.proposed_side),
-                expected_value_after_costs=_expected_value_after_costs(signals, decision, snapshot, config),
-                spread_cost=_spread_from_snapshot(snapshot),
-                slippage_cost=config.cost_model.entry_slippage_per_share + config.cost_model.exit_slippage_per_share,
-                fee_cost=config.cost_model.fee_per_share * 2,
-                atr_percent=_atr_percent(snapshot),
-                entry_quality=decision.vote_scores.winner_score,
-                session_allowed=_session_allowed(candle, config),
-                weighted_daily_loss_percent=_daily_loss_percent(realized_pnl, config),
-                weighted_daily_trade_count=daily_trade_count,
-                capital_available=max(0.0, config.starting_cash + realized_pnl),
-                current_position=_position_state(config.symbol, open_position, candle.timestamp),
-                data_timestamp=candle.timestamp,
-            ),
-            config=config.weighted_config,
-        )
-        production_calls.append("evaluate_local_decision_gates")
+        decision = kernel_result.decision
+        gate_result = kernel_result.gate_result
         for reason_code in gate_result.reason_codes:
             gate_rejections[reason_code] += 1
-        sizing = calculate_weighted_voting_position_size(
-            WeightedVotingSizingContext(
-                decision=decision,
-                effective_settings=effective_settings,
-                market_snapshot=snapshot,
-                account_equity=config.account_equity,
-                available_buying_power=max(0.0, config.starting_cash + realized_pnl),
-                remaining_weighted_daily_risk=max(0.0, config.account_equity * effective_settings.maximum_daily_loss_percent / 100.0 + realized_pnl),
-                remaining_weighted_capital_partition=max(0.0, config.account_equity * effective_settings.daily_allocation_percent / 100.0),
-                global_available_risk=max(0.0, config.account_equity * effective_settings.base_risk_per_trade_percent / 100.0),
-                global_max_shares=effective_settings.maximum_shares or 2_147_483_647,
-                structural_invalidation_price=_structural_invalidation(signals, decision.proposed_side),
-                atr=average_true_range(snapshot.one_minute_candles, 14),
-                slippage_per_share=config.cost_model.entry_slippage_per_share,
-                current_one_minute_volume=snapshot.one_minute_candles[-1].volume,
-                average_one_minute_volume=average_volume(snapshot.one_minute_candles, 20),
-                local_gate_result=gate_result,
-            )
-        )
-        production_calls.append("calculate_weighted_voting_position_size")
+        sizing = kernel_result.sizing_result
         entry_policy = None
         if sizing.quantity > 0 and (config.allow_short or decision.proposed_side != WeightedSide.SELL.value):
             entry_policy = evaluate_entry_policy(
@@ -511,6 +588,14 @@ def run_weighted_voting_backtest(
                     reason_codes=("weighted_voting.backtest.next_candle_entry_enforced",),
                 )
                 pending_context = (decision, signals, sizing, effective_settings, condition)
+                _reserve_backtest_order(
+                    inventory_repository=inventory_repository,
+                    run_id=config.run_id,
+                    order=pending_order,
+                    decision=decision,
+                    sizing=sizing,
+                    occurred_at=candle.timestamp,
+                )
         decisions.append(
             WeightedBacktestDecisionTrace(
                 candle_index=index,
@@ -520,6 +605,8 @@ def run_weighted_voting_backtest(
                 sizing_result=sizing,
                 entry_policy=entry_policy,
                 market_condition=condition,
+                inventory_snapshot_version=context.inventory_snapshot.snapshot_version,
+                runtime_context_manifest_hash=context.manifest_hash,
                 completed_candle_count=len(snapshot.one_minute_candles),
                 reason_codes=tuple(dict.fromkeys(decision.reason_codes + gate_result.reason_codes + sizing.reason_codes)),
             )
@@ -538,6 +625,13 @@ def run_weighted_voting_backtest(
         trade = _close_trade(open_position, exit_decision, final_candle, config.cost_model, _spread_from_snapshot(_snapshot(config.symbol, ordered_candles, manifest.manifest_hash)))
         trades.append(trade)
         realized_pnl += trade.net_pnl
+        _close_backtest_inventory_position(
+            inventory_repository=inventory_repository,
+            position=open_position,
+            exit_price=trade.exit_price,
+            exit_reason=trade.exit_reason,
+            occurred_at=trade.exit_timestamp,
+        )
         equity_curve.append((trade.exit_timestamp, config.starting_cash + realized_pnl))
 
     algorithm_results = _algorithm_results(trades, decisions, equity_curve, gate_rejections, position_sizes, config)
@@ -577,7 +671,14 @@ def run_weighted_voting_backtest(
     )
 
 
-def _configuration_manifest(config: WeightedBacktestEngineConfig, created_at: datetime) -> WeightedBacktestConfigurationManifest:
+def _configuration_manifest(
+    config: WeightedBacktestEngineConfig,
+    created_at: datetime,
+    *,
+    weight_state: WeightedWeightState,
+    settings_version: str,
+    settings_hash: str,
+) -> WeightedBacktestConfigurationManifest:
     return WeightedBacktestConfigurationManifest(
         run_id=config.run_id,
         symbol=config.symbol,
@@ -600,6 +701,20 @@ def _configuration_manifest(config: WeightedBacktestEngineConfig, created_at: da
             "minimumFee": config.cost_model.minimum_fee,
         },
         initial_weight_version=config.initial_weight_state.weight_version if config.initial_weight_state is not None else None,
+        active_weight_version=weight_state.weight_version,
+        active_weight_hash=weight_state.output_hash or weight_state.deterministic_hash(),
+        settings_version=settings_version,
+        settings_hash=settings_hash,
+        inventory_version=WEIGHTED_VOTING_INVENTORY_VERSION,
+        inventory_namespace=WEIGHTED_VOTING_INVENTORY_NAMESPACE,
+        code_versions={
+            "backtest_engine": WEIGHTED_VOTING_BACKTEST_ENGINE_VERSION,
+            "decision_kernel": WEIGHTED_VOTING_DECISION_KERNEL_VERSION,
+            "runtime_context": WEIGHTED_VOTING_RUNTIME_CONTEXT_VERSION,
+            "dynamic_settings": WEIGHTED_VOTING_DYNAMIC_SETTINGS_VERSION,
+            "weight_engine": WEIGHTED_VOTING_WEIGHT_ENGINE_VERSION,
+            "execution_simulator": WEIGHTED_VOTING_EXECUTION_SIMULATOR_VERSION,
+        },
         calibration_outcome_count=len(config.calibration_outcomes),
         source=config.source,
     )
@@ -608,19 +723,230 @@ def _configuration_manifest(config: WeightedBacktestEngineConfig, created_at: da
 def _snapshot(symbol: str, candles: tuple[WeightedVotingCandle, ...], manifest_hash: str) -> WeightedVotingMarketSnapshot:
     latest = candles[-1]
     spread = max(0.02, latest.close * 0.0002)
+    exchange_session = ExchangeCalendarService().session_for_date(latest.timestamp.date())
     return WeightedVotingMarketSnapshot(
         symbol=symbol,
         data_timestamp=latest.timestamp,
         one_minute_candles=candles,
         bid=round(latest.close - spread / 2.0, 10),
         ask=round(latest.close + spread / 2.0, 10),
+        spread=round(spread, 10),
+        session_date=exchange_session.sessionDate.isoformat(),
+        session_phase=_weighted_session_phase(latest.timestamp, exchange_session),
+        data_freshness_seconds=0.0,
         data_manifest_hash=manifest_hash,
-        explanation="Weighted Voting backtest snapshot built only from completed historical candles.",
+        explanation="Weighted Voting backtest snapshot built only from completed historical candles and the shared exchange session calendar.",
     )
 
 
-def _apply_weight_state(signals: tuple[WeightedVotingSignal, ...], weight_state) -> tuple[WeightedVotingSignal, ...]:
-    return tuple(signal.model_copy(update={"final_weight": weight_state.strategy_weights.get(signal.strategy_id, signal.final_weight)}) for signal in signals)
+def _runtime_context(
+    *,
+    snapshot: WeightedVotingMarketSnapshot,
+    config: WeightedBacktestEngineConfig,
+    weight_state: WeightedWeightState,
+    inventory_repository: WeightedVotingInventoryRepository,
+    previous_condition: WeightedMarketCondition | None,
+):
+    inventory = inventory_repository.current_snapshot(now=snapshot.data_timestamp, session_date=snapshot.data_timestamp.date())
+    return WeightedVotingRuntimeContextBuilder(
+        market_data_port=WeightedVotingStaticMarketDataPort(snapshot),
+        inventory_repository=inventory_repository,
+        account_port=WeightedVotingStaticAccountPort(
+            account_equity=config.account_equity,
+            broker_buying_power=inventory.cash_available,
+            source_id="weighted_voting.backtest.historical_account_observation",
+        ),
+        global_risk_port=WeightedVotingStaticGlobalRiskPort(
+            global_available_risk=max(0.0, config.account_equity * config.weighted_config.risk_per_trade_baseline_percent / 100.0),
+            global_max_shares=config.weighted_config.maximum_shares or 2_147_483_647,
+            gate_response=None,
+            source_id="weighted_voting.backtest.simulated_global_risk_service",
+        ),
+        effective_settings=resolve_effective_settings(timestamp=snapshot.data_timestamp),
+        active_weight_state=weight_state,
+        observed_at=snapshot.data_timestamp,
+        mode="replay_fixture",
+        cost_estimate=WeightedVotingExecutionCostEstimate(
+            slippage_per_share=config.cost_model.entry_slippage_per_share,
+            fee_per_share=config.cost_model.fee_per_share * 2 + config.cost_model.regulatory_fee_per_share,
+            observed_at=snapshot.data_timestamp,
+            source_id="weighted_voting.backtest.simulated_cost_model",
+            reason_codes=("weighted_voting.backtest.cost_model",),
+        ),
+        previous_market_condition=previous_condition,
+    ).build()
+
+
+class _RunScopedInventoryStore:
+    """In-memory store scoped to a single backtest/replay run."""
+
+    def __init__(self) -> None:
+        self.snapshots: dict[str, dict[str, Any]] = {}
+
+    def read_snapshot(self, key: str) -> dict[str, Any]:
+        if key not in self.snapshots:
+            raise KeyError(key)
+        return self.snapshots[key]
+
+    def write_snapshot(self, key: str, snapshot: dict[str, Any]) -> None:
+        if not key.startswith("weighted_voting.inventory."):
+            raise ValueError("Backtest inventory adapter may only write run-scoped weighted_voting.inventory records")
+        self.snapshots[key] = snapshot
+
+
+def _reserve_backtest_order(
+    *,
+    inventory_repository: WeightedVotingInventoryRepository,
+    run_id: str,
+    order: WeightedBacktestPendingOrder,
+    decision: WeightedDecision,
+    sizing: WeightedVotingSizingResult,
+    occurred_at: datetime,
+) -> None:
+    snapshot = inventory_repository.current_snapshot(now=occurred_at)
+    notional = abs(order.requested_quantity * float(order.entry_policy.limit_price or order.entry_policy.trigger_price or 0.0))
+    inventory_repository.append_event(
+        event_id=f"{run_id}.reserve.{order.order_id}",
+        event_type=WeightedVotingInventoryEventType.ORDER_RESERVED,
+        payload={
+            "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+            "order_id": order.order_id,
+            "symbol": inventory_repository.symbol,
+            "side": str(order.side),
+            "quantity": order.requested_quantity,
+            "reserved_buying_power": round(notional, 10),
+            "planned_risk_dollars": round(float(sizing.effective_risk_dollars or sizing.risk_dollars or 0.0), 10),
+            "decision_id": decision.decision_id,
+            "order_intent_id": order.order_id,
+            "client_order_id": order.order_id,
+            "created_at": occurred_at.isoformat(),
+        },
+        occurred_at=occurred_at,
+        expected_snapshot_version=snapshot.snapshot_version,
+    )
+
+
+def _record_backtest_fill(
+    *,
+    inventory_repository: WeightedVotingInventoryRepository,
+    run_id: str,
+    trade_id: str,
+    order: WeightedBacktestPendingOrder,
+    decision: WeightedDecision,
+    fill_quantity: int,
+    fill_price: float,
+    supporting_strategy_ids: tuple[str, ...],
+    occurred_at: datetime,
+) -> None:
+    snapshot = inventory_repository.current_snapshot(now=occurred_at)
+    signed_quantity = fill_quantity if order.side == WeightedSide.BUY.value else -fill_quantity
+    inventory_repository.append_event(
+        event_id=f"{run_id}.fill.{order.order_id}.{fill_quantity}.{occurred_at.isoformat()}",
+        event_type=WeightedVotingInventoryEventType.FILL_RECORDED,
+        payload={
+            "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+            "fill_id": f"{run_id}.fill.{order.order_id}.{occurred_at.isoformat()}",
+            "position_id": trade_id,
+            "symbol": inventory_repository.symbol,
+            "side": str(order.side),
+            "quantity": signed_quantity,
+            "average_entry_price": fill_price,
+            "opened_at": occurred_at.isoformat(),
+            "decision_id": decision.decision_id,
+            "order_intent_id": order.order_id,
+            "client_order_id": order.order_id,
+            "owning_strategy_ids": supporting_strategy_ids,
+            "source": "weighted_voting.backtest.simulated_broker",
+        },
+        occurred_at=occurred_at,
+        expected_snapshot_version=snapshot.snapshot_version,
+    )
+
+
+def _release_backtest_order(
+    *,
+    inventory_repository: WeightedVotingInventoryRepository,
+    run_id: str,
+    order: WeightedBacktestPendingOrder,
+    occurred_at: datetime,
+    suffix: str,
+) -> None:
+    snapshot = inventory_repository.current_snapshot(now=occurred_at)
+    inventory_repository.append_event(
+        event_id=f"{run_id}.release.{order.order_id}.{suffix}",
+        event_type=WeightedVotingInventoryEventType.ORDER_RELEASED,
+        payload={
+            "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+            "order_id": order.order_id,
+            "client_order_id": order.order_id,
+        },
+        occurred_at=occurred_at,
+        expected_snapshot_version=snapshot.snapshot_version,
+    )
+
+
+def _mark_backtest_position(
+    *,
+    inventory_repository: WeightedVotingInventoryRepository,
+    position: _OpenBacktestPosition,
+    mark_price: float,
+    occurred_at: datetime,
+) -> None:
+    snapshot = inventory_repository.current_snapshot(now=occurred_at)
+    if not any(item.position_id == position.lifecycle.trade_id for item in snapshot.open_positions):
+        return
+    inventory_repository.append_event(
+        event_id=f"{position.lifecycle.trade_id}.mark.{occurred_at.isoformat()}",
+        event_type=WeightedVotingInventoryEventType.POSITION_MARKED,
+        payload={
+            "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+            "position_id": position.lifecycle.trade_id,
+            "mark_price": mark_price,
+        },
+        occurred_at=occurred_at,
+        expected_snapshot_version=snapshot.snapshot_version,
+    )
+
+
+def _close_backtest_inventory_position(
+    *,
+    inventory_repository: WeightedVotingInventoryRepository,
+    position: _OpenBacktestPosition,
+    exit_price: float,
+    exit_reason: str,
+    occurred_at: datetime,
+) -> None:
+    snapshot = inventory_repository.current_snapshot(now=occurred_at)
+    if not any(item.position_id == position.lifecycle.trade_id for item in snapshot.open_positions):
+        return
+    inventory_repository.append_event(
+        event_id=f"{position.lifecycle.trade_id}.close.{occurred_at.isoformat()}",
+        event_type=WeightedVotingInventoryEventType.POSITION_CLOSED,
+        payload={
+            "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+            "position_id": position.lifecycle.trade_id,
+            "exit_price": exit_price,
+            "exit_reason": exit_reason,
+        },
+        occurred_at=occurred_at,
+        expected_snapshot_version=snapshot.snapshot_version,
+    )
+
+
+def _weighted_session_phase(timestamp: datetime, exchange_session) -> WeightedSessionPhase:
+    if not exchange_session.contains_timestamp(timestamp):
+        return WeightedSessionPhase.OUTSIDE_SESSION
+    minute = exchange_session.minutes_after_open(timestamp)
+    minutes_until_close = (exchange_session.closeTimestamp - timestamp).total_seconds() / 60.0 if exchange_session.closeTimestamp else 0.0
+    if minute < 30:
+        return WeightedSessionPhase.OPENING
+    if minutes_until_close <= 15:
+        return WeightedSessionPhase.CLOSING
+    if minute < 150:
+        return WeightedSessionPhase.MORNING
+    if minute < 300:
+        return WeightedSessionPhase.MIDDAY
+    return WeightedSessionPhase.AFTERNOON
 
 
 def _evaluate_open_position(
@@ -709,19 +1035,36 @@ def _close_trade(
         regime_label=position.regime_label,
         session_label=position.session_label,
         partial_fill=position.partial_fill,
+        settings_version=position.settings_version,
+        configuration_hash=position.configuration_hash,
         reason_codes=exit_decision.reason_codes,
     )
 
 
 def _strategy_outcome(strategy_id: str, trade: WeightedBacktestTrade, manifest_hash: str) -> WeightedStrategyOutcome:
+    notional = max(1.0, abs(trade.entry_price * trade.quantity))
     return WeightedStrategyOutcome(
+        outcome_id=f"{trade.trade_id}.{strategy_id}.outcome",
+        trade_id=trade.trade_id,
         strategy_id=strategy_id,
         side=WeightedSide(trade.side),
         entry_timestamp=trade.entry_timestamp,
         exit_timestamp=trade.exit_timestamp,
         entry_price=trade.entry_price,
         exit_price=trade.exit_price,
-        outcome_return=trade.net_pnl / max(1.0, abs(trade.entry_price * trade.quantity)),
+        is_closed=True,
+        fully_reconciled=True,
+        gross_return=trade.gross_pnl / notional,
+        outcome_return=trade.net_pnl / notional,
+        slippage_cost_return=max(0.0, trade.total_costs - trade.entry_fee - trade.exit_fee) / notional,
+        fee_cost_return=(trade.entry_fee + trade.exit_fee) / notional,
+        total_cost_return=trade.total_costs / notional,
+        maximum_favorable_excursion_return=trade.favorable_excursion / notional,
+        maximum_adverse_excursion_return=trade.adverse_excursion / notional,
+        opportunity_count=1,
+        execution_quality=max(0.0, min(1.0, 1.0 - (trade.total_costs / notional) / 0.01)),
+        regime_label=trade.regime_label,
+        session_label=trade.session_label,
         exit_reason=WeightedExitReason(trade.exit_reason) if trade.exit_reason in {reason.value for reason in WeightedExitReason} else WeightedExitReason.RISK_GATE,
         reason_codes=(f"weighted_voting.regime.{trade.regime_label}", f"weighted_voting.session.{trade.session_label}"),
         explanation=f"Backtest trade outcome attributed to a supporting Weighted Voting strategy using manifest {manifest_hash}.",
@@ -793,53 +1136,10 @@ def _strategy_results(
     }
 
 
-def _five_minute_alignment(snapshot: WeightedVotingMarketSnapshot, side: WeightedSide | str) -> WeightedFiveMinuteAlignment:
-    candles = snapshot.one_minute_candles[-5:]
-    if side not in (WeightedSide.BUY.value, WeightedSide.SELL.value) or len(candles) < 5:
-        return WeightedFiveMinuteAlignment.UNAVAILABLE
-    move = candles[-1].close - candles[0].open
-    if abs(move) < candles[-1].close * 0.0002:
-        return WeightedFiveMinuteAlignment.NEUTRAL
-    if side == WeightedSide.BUY.value and move > 0:
-        return WeightedFiveMinuteAlignment.POSITIVE
-    if side == WeightedSide.SELL.value and move < 0:
-        return WeightedFiveMinuteAlignment.POSITIVE
-    return WeightedFiveMinuteAlignment.NEGATIVE
-
-
-def _expected_value_after_costs(signals: tuple[WeightedVotingSignal, ...], decision: WeightedDecision, snapshot: WeightedVotingMarketSnapshot, config: WeightedBacktestEngineConfig) -> float:
-    directional = [signal.expected_return_after_costs for signal in signals if signal.signal == decision.proposed_side]
-    gross = max(directional) if directional else 0.0
-    latest = snapshot.one_minute_candles[-1]
-    cost = (_spread_from_snapshot(snapshot) + config.cost_model.entry_slippage_per_share + config.cost_model.exit_slippage_per_share + config.cost_model.fee_per_share * 2) / latest.close
-    return gross - cost
-
-
-def _atr_percent(snapshot: WeightedVotingMarketSnapshot) -> float | None:
-    atr = average_true_range(snapshot.one_minute_candles, 14)
-    latest = snapshot.one_minute_candles[-1]
-    return atr / latest.close if atr is not None and latest.close > 0 else None
-
-
 def _spread_from_snapshot(snapshot: WeightedVotingMarketSnapshot) -> float:
     if snapshot.bid is None or snapshot.ask is None:
         return 0.0
     return max(0.0, snapshot.ask - snapshot.bid)
-
-
-def _structural_invalidation(signals: tuple[WeightedVotingSignal, ...], side: WeightedSide | str) -> float | None:
-    levels = [signal.invalidation_level for signal in signals if signal.signal == side and signal.invalidation_level is not None]
-    if not levels:
-        return None
-    return max(levels) if side == WeightedSide.BUY.value else min(levels)
-
-
-def _position_state(symbol: str, open_position: _OpenBacktestPosition | None, timestamp: datetime) -> WeightedPositionState | None:
-    if open_position is None:
-        return None
-    lifecycle = open_position.lifecycle
-    quantity = lifecycle.remaining_quantity if lifecycle.side == WeightedSide.BUY.value else -lifecycle.remaining_quantity
-    return WeightedPositionState(symbol=symbol, quantity=quantity, average_entry_price=lifecycle.entry_price, data_timestamp=timestamp, explanation="Weighted Voting backtest open position.")
 
 
 def _session_allowed(candle: WeightedVotingCandle, config: WeightedBacktestEngineConfig) -> bool:

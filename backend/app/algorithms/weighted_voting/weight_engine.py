@@ -5,14 +5,11 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
+import hashlib
+import json
 from math import sqrt
 
-from backend.app.algorithms.weighted_voting.catalog import (
-    WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT,
-    WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT,
-    WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT,
-    WEIGHTED_VOTING_STRATEGY_CATALOG,
-)
+from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS, WEIGHTED_VOTING_STRATEGY_CATALOG
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ALGORITHM_ID
 from backend.app.algorithms.weighted_voting.models import (
@@ -28,14 +25,25 @@ from backend.app.algorithms.weighted_voting.models import (
 
 WEIGHTED_VOTING_WEIGHT_ENGINE_VERSION = "weighted_voting_weight_engine_v3"
 WEIGHTED_VOTING_STRATEGY_IDS = tuple(entry.strategy_id for entry in WEIGHTED_VOTING_STRATEGY_CATALOG)
+WEIGHTED_VOTING_ACTIVE_VOTER_IDS = WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS
 WEIGHTED_VOTING_STRATEGY_FAMILIES = {entry.strategy_id: entry.family for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
-WEIGHTED_VOTING_BASELINE_WEIGHTS = {entry.strategy_id: entry.baseline_weight for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
+WEIGHTED_VOTING_BASELINE_WEIGHTS = {
+    strategy_id: (1.0 / len(WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS) if strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS else 0.0)
+    for strategy_id in WEIGHTED_VOTING_STRATEGY_IDS
+}
 WEIGHTED_VOTING_WEIGHT_HISTORY_KEY = "weighted_voting.weights.history"
 WEIGHTED_VOTING_WEIGHT_UPDATE_RULES = (
     "use_only_weighted_voting_attributed_strategy_outcomes",
+    "use_only_closed_and_fully_reconciled_weighted_voting_trades",
+    "shadow_strategies_retain_zero_voting_weight",
+    "deterministic_input_and_output_hashes",
     "score_out_of_sample_expectancy_after_costs",
     "score_profit_factor_and_win_rate",
     "penalize_drawdown_contribution",
+    "score_mae_mfe_quality",
+    "score_regime_and_session_stability",
+    "apply_recency_decay",
+    "score_opportunity_count_and_execution_quality",
     "apply_confidence_calibration_proxy",
     "shrink_to_equal_weights_for_insufficient_samples",
     "penalize_recent_degradation",
@@ -95,11 +103,13 @@ def create_unseeded_equal_weight_state(
     return WeightedWeightState(
         weight_version="weighted_weights_unseeded_equal_v1",
         state_status=WeightedWeightStateStatus.UNSEEDED_EQUAL_WEIGHTS,
-        strategy_weights=_equal_weights(strategy_ids),
+        strategy_weights=_baseline_weights(strategy_ids),
         last_updated_at=timestamp,
         data_timestamp=data_timestamp or timestamp,
+        input_data_hash=_hash_payload({"source": "unseeded_equal", "strategy_ids": strategy_ids}),
+        output_hash=_hash_payload({"strategy_weights": _baseline_weights(strategy_ids), "status": "UNSEEDED_EQUAL_WEIGHTS"}),
         reason_codes=("weighted_voting.weights.unseeded_equal",),
-        explanation="Initial deterministic equal weights before qualified Weighted Voting outcomes are available.",
+        explanation="Initial deterministic equal active-strategy weights before qualified Weighted Voting outcomes are available; shadow strategies carry zero voting weight.",
     )
 
 
@@ -152,6 +162,8 @@ def rollback_weight_state(
         performance_metrics=target.performance_metrics,
         last_updated_at=rollback_timestamp,
         data_timestamp=target.data_timestamp,
+        input_data_hash=target.input_data_hash,
+        output_hash=target.output_hash,
         reason_codes=tuple(dict.fromkeys(target.reason_codes + ("weighted_voting.weights.rollback_applied",))),
         explanation=f"Weighted Voting active weights rolled back to {target.weight_version}.",
     )
@@ -177,6 +189,7 @@ def update_performance_weight_state(
         _validate_weight_update_config(active_config)
         _validate_weight_state_ownership(previous_state)
         strategy_ids = _ordered_strategy_ids(previous_state.strategy_weights)
+        active_strategy_ids = _active_strategy_ids(strategy_ids)
         previous_weights = _complete_weights(previous_state.strategy_weights, strategy_ids)
         _validate_weight_update_inputs(outcomes, strategy_ids)
         qualified_outcomes = _qualified_outcomes(outcomes, strategy_ids)
@@ -191,18 +204,30 @@ def update_performance_weight_state(
                 explanation="No completed qualified Weighted Voting outcomes were available; last valid active weights were preserved.",
             )
 
+        input_data_hash = _weight_update_input_hash(
+            previous_state=previous_state,
+            outcomes=qualified_outcomes,
+            config=active_config,
+            session_key=session_key,
+            regime_label=regime_label,
+            strategy_ids=strategy_ids,
+        )
         returns_by_strategy = _returns_by_strategy(qualified_outcomes, strategy_ids)
         base_metrics = _performance_metrics(strategy_ids, returns_by_strategy, active_config, regime_label, qualified_outcomes)
-        performance_scores = {metric.strategy_id: metric.raw_performance_score * metric.correlation_penalty for metric in base_metrics}
+        performance_scores = {
+            metric.strategy_id: metric.raw_performance_score * metric.correlation_penalty
+            for metric in base_metrics
+            if metric.strategy_id in active_strategy_ids
+        }
         performance_weights = normalize_weights(performance_scores)
         if sum(performance_weights.values()) <= 0:
-            performance_weights = _equal_weights(strategy_ids)
+            performance_weights = _baseline_weights(strategy_ids)
 
-        equal_weights = _equal_weights(strategy_ids)
+        baseline_weights = _baseline_weights(strategy_ids)
         candidate_weights = normalize_weights(
             {
                 metric.strategy_id: (
-                    equal_weights[metric.strategy_id] * (1.0 - metric.sample_shrinkage)
+                    baseline_weights[metric.strategy_id] * (1.0 - metric.sample_shrinkage)
                     + performance_weights.get(metric.strategy_id, 0.0) * metric.sample_shrinkage
                 )
                 for metric in base_metrics
@@ -219,6 +244,7 @@ def update_performance_weight_state(
         limited_weights = _apply_daily_weight_change_limit(previous_weights, smoothed_weights, active_config.maximum_daily_weight_change)
         final_weights = _normalize_state_weights_with_caps(limited_weights, active_config, strategy_ids)
         final_weights = _apply_daily_weight_change_limit(previous_weights, final_weights, active_config.maximum_daily_weight_change)
+        final_weights = _zero_shadow_and_normalize(final_weights, strategy_ids)
         final_weights = _round_weight_dict(final_weights)
 
         status = (
@@ -236,16 +262,19 @@ def update_performance_weight_state(
             )
             for metric in base_metrics
         )
+        output_hash = _weight_update_output_hash(status=status, weights=final_weights, metrics=metrics, session_key=session_key)
         return WeightedWeightState(
-            weight_version=f"weighted_weights_performance_{session_key}",
+            weight_version=f"weighted_weights_performance_{session_key}_{input_data_hash[:12]}",
             state_status=status,
             strategy_weights=final_weights,
             active_session_date=session_key,
             performance_metrics=metrics,
             last_updated_at=update_timestamp,
             data_timestamp=effective_data_timestamp,
-            reason_codes=("weighted_voting.weights.performance_update",),
-            explanation="Deterministic performance-derived weights updated once for the trading session.",
+            input_data_hash=input_data_hash,
+            output_hash=output_hash,
+            reason_codes=("weighted_voting.weights.performance_update", "weighted_voting.weights.closed_reconciled_inputs"),
+            explanation="Deterministic performance-derived weights updated once after-market from closed, fully reconciled Weighted Voting outcomes.",
         )
     except Exception as exc:
         return _preserve_weight_state(
@@ -266,7 +295,15 @@ def apply_weight_controls(
     historical_outcomes: tuple[WeightedStrategyOutcome, ...] = (),
 ) -> WeightedWeightResult:
     active_config = config or WeightedVotingConfig()
-    enabled = [signal for signal in signals if signal.eligible and signal.data_ready and signal.data_quality_status != WeightedDataQualityStatus.UNAVAILABLE.value]
+    active_voter_ids = set(WEIGHTED_VOTING_ACTIVE_VOTER_IDS)
+    enabled = [
+        signal
+        for signal in signals
+        if signal.strategy_id in active_voter_ids
+        and signal.eligible
+        and signal.data_ready
+        and signal.data_quality_status != WeightedDataQualityStatus.UNAVAILABLE.value
+    ]
     enabled_ids = {signal.strategy_id for signal in enabled}
     original_weights = _original_frozen_weights(signals, enabled_ids)
     correlation_penalties = _correlation_penalties(signals, historical_outcomes)
@@ -298,6 +335,19 @@ def _equal_weights(strategy_ids: tuple[str, ...]) -> dict[str, float]:
         return {}
     equal = 1.0 / len(strategy_ids)
     return _round_weight_dict({strategy_id: equal for strategy_id in strategy_ids})
+
+
+def _active_strategy_ids(strategy_ids: tuple[str, ...]) -> tuple[str, ...]:
+    active = tuple(strategy_id for strategy_id in strategy_ids if strategy_id in WEIGHTED_VOTING_ACTIVE_VOTER_IDS)
+    return active or strategy_ids
+
+
+def _baseline_weights(strategy_ids: tuple[str, ...]) -> dict[str, float]:
+    if not strategy_ids:
+        return {}
+    active = _active_strategy_ids(strategy_ids)
+    active_equal = 1.0 / len(active) if active else 0.0
+    return _round_weight_dict({strategy_id: active_equal if strategy_id in active else 0.0 for strategy_id in strategy_ids})
 
 
 def _session_key(session_date: date | str | None, update_timestamp: datetime) -> str:
@@ -353,10 +403,11 @@ def _complete_weights(weights: dict[str, float], strategy_ids: tuple[str, ...]) 
         strategy_id: max(0.0, weights.get(strategy_id, WEIGHTED_VOTING_BASELINE_WEIGHTS.get(strategy_id, 0.0)))
         for strategy_id in strategy_ids
     }
+    completed = {strategy_id: completed[strategy_id] if strategy_id in WEIGHTED_VOTING_ACTIVE_VOTER_IDS else 0.0 for strategy_id in strategy_ids}
     normalized = normalize_weights(completed)
     if sum(normalized.values()) <= 0:
-        return _equal_weights(strategy_ids)
-    return normalized
+        return _baseline_weights(strategy_ids)
+    return _zero_shadow_and_normalize(normalized, strategy_ids)
 
 
 def _qualified_outcomes(outcomes: tuple[WeightedStrategyOutcome, ...], strategy_ids: tuple[str, ...]) -> tuple[WeightedStrategyOutcome, ...]:
@@ -366,15 +417,38 @@ def _qualified_outcomes(outcomes: tuple[WeightedStrategyOutcome, ...], strategy_
         for outcome in outcomes
         if getattr(outcome, "algorithm_id", None) == WEIGHTED_VOTING_ALGORITHM_ID
         and outcome.strategy_id in strategy_id_set
-        and outcome.outcome_return is not None
+        and _is_closed_reconciled_outcome(outcome)
+        and _net_return_after_costs(outcome) is not None
     )
 
 
 def _returns_by_strategy(outcomes: tuple[WeightedStrategyOutcome, ...], strategy_ids: tuple[str, ...]) -> dict[str, list[float]]:
     returns = {strategy_id: [] for strategy_id in strategy_ids}
     for outcome in outcomes:
-        returns[outcome.strategy_id].append(float(outcome.outcome_return or 0.0))
+        value = _net_return_after_costs(outcome)
+        if value is not None:
+            returns[outcome.strategy_id].append(value)
     return returns
+
+
+def _is_closed_reconciled_outcome(outcome: WeightedStrategyOutcome) -> bool:
+    return bool(
+        outcome.is_closed
+        and outcome.fully_reconciled
+        and outcome.exit_timestamp is not None
+        and outcome.exit_price is not None
+    )
+
+
+def _net_return_after_costs(outcome: WeightedStrategyOutcome) -> float | None:
+    if outcome.outcome_return is not None:
+        return float(outcome.outcome_return)
+    if outcome.gross_return is None:
+        return None
+    total_cost = outcome.total_cost_return or (
+        outcome.spread_cost_return + outcome.slippage_cost_return + outcome.fee_cost_return
+    )
+    return float(outcome.gross_return) - float(total_cost)
 
 
 def _performance_metrics(
@@ -388,6 +462,7 @@ def _performance_metrics(
     regime_returns = _regime_returns_by_strategy(outcomes, strategy_ids, regime_label)
     metrics: list[WeightedPerformanceWeightMetric] = []
     for strategy_id in strategy_ids:
+        strategy_outcomes = [outcome for outcome in outcomes if outcome.strategy_id == strategy_id]
         returns = returns_by_strategy[strategy_id]
         sample_size = len(returns)
         wins = [value for value in returns if value > 0]
@@ -405,6 +480,13 @@ def _performance_metrics(
         recent_degradation = max(0.0, net_expectancy - recent_performance)
         regime_values = regime_returns[strategy_id]
         regime_specific_performance = sum(regime_values) / len(regime_values) if regime_values else net_expectancy
+        mae_mfe_quality = _mae_mfe_quality(strategy_outcomes)
+        regime_stability = _label_stability(strategy_outcomes, label_name="regime")
+        session_stability = _label_stability(strategy_outcomes, label_name="session")
+        recency_decay_score = _recency_decay_score(strategy_outcomes)
+        opportunity_count = sum(outcome.opportunity_count for outcome in strategy_outcomes)
+        opportunity_score = min(1.0, opportunity_count / max(1, config.minimum_qualified_outcomes_for_adaptation))
+        execution_quality = _execution_quality(strategy_outcomes)
         confidence_calibration_score = _confidence_calibration_score(win_rate, profit_factor, sample_size)
         transaction_cost_adjustment = _transaction_cost_adjustment(net_expectancy, average_win, average_loss)
         raw_score = _performance_score(
@@ -420,6 +502,19 @@ def _performance_metrics(
         raw_score *= confidence_calibration_score
         raw_score *= transaction_cost_adjustment
         raw_score *= max(0.50, 1.0 - min(0.50, recent_degradation / 0.02))
+        raw_score *= max(0.40, mae_mfe_quality)
+        raw_score *= max(0.40, (regime_stability + session_stability) / 2.0)
+        raw_score *= max(0.40, recency_decay_score)
+        raw_score *= max(0.40, execution_quality)
+        raw_score *= max(0.25, opportunity_score)
+        reason_codes = []
+        if strategy_id not in WEIGHTED_VOTING_ACTIVE_VOTER_IDS:
+            raw_score = 0.0
+            reason_codes.append("weighted_voting.weights.shadow_zero_weight")
+        if sample_size < config.minimum_qualified_outcomes_for_adaptation:
+            reason_codes.append("weighted_voting.weights.small_sample_shrinkage")
+        if not strategy_outcomes:
+            reason_codes.append("weighted_voting.weights.performance_missing_not_positive")
         shrinkage = min(1.0, sample_size / config.minimum_qualified_outcomes_for_adaptation)
         metrics.append(
             WeightedPerformanceWeightMetric(
@@ -438,11 +533,18 @@ def _performance_metrics(
                 recent_degradation=round(recent_degradation, 10),
                 market_condition_sample_size=len(regime_values),
                 outcome_stability=round(outcome_stability, 10),
+                mae_mfe_quality=round(mae_mfe_quality, 10),
+                regime_stability=round(regime_stability, 10),
+                session_stability=round(session_stability, 10),
+                recency_decay_score=round(recency_decay_score, 10),
+                opportunity_count=opportunity_count,
+                execution_quality=round(execution_quality, 10),
                 recent_performance=round(recent_performance, 10),
                 regime_specific_performance=round(regime_specific_performance, 10),
                 correlation_penalty=correlation_penalties[strategy_id],
                 sample_shrinkage=round(shrinkage, 10),
                 raw_performance_score=round(raw_score, 10),
+                reason_codes=tuple(reason_codes),
                 explanation=f"{strategy_id} deterministic performance metrics for Weighted Voting weight adaptation.",
             )
         )
@@ -459,8 +561,9 @@ def _regime_returns_by_strategy(
         return returns
     regime_code = f"weighted_voting.regime.{regime_label}"
     for outcome in outcomes:
-        if regime_code in outcome.reason_codes:
-            returns[outcome.strategy_id].append(float(outcome.outcome_return or 0.0))
+        value = _net_return_after_costs(outcome)
+        if value is not None and (outcome.regime_label == regime_label or regime_code in outcome.reason_codes):
+            returns[outcome.strategy_id].append(value)
     return returns
 
 
@@ -533,6 +636,67 @@ def _outcome_stability(returns: list[float]) -> float:
     return max(0.0, min(1.0, 1.0 - deviation / (abs(average) + 0.02)))
 
 
+def _mae_mfe_quality(outcomes: list[WeightedStrategyOutcome]) -> float:
+    values: list[float] = []
+    for outcome in outcomes:
+        favorable = max(0.0, float(outcome.maximum_favorable_excursion_return or 0.0))
+        adverse = abs(min(0.0, float(outcome.maximum_adverse_excursion_return or 0.0)))
+        if favorable <= 0 and adverse <= 0:
+            continue
+        values.append(favorable / max(0.000000001, favorable + adverse))
+    if not values:
+        return 0.5 if outcomes else 0.0
+    return max(0.0, min(1.0, sum(values) / len(values)))
+
+
+def _label_stability(outcomes: list[WeightedStrategyOutcome], *, label_name: str) -> float:
+    grouped: dict[str, list[float]] = defaultdict(list)
+    for outcome in outcomes:
+        label = outcome.regime_label if label_name == "regime" else outcome.session_label
+        if not label:
+            prefix = f"weighted_voting.{label_name}."
+            label = next((code.removeprefix(prefix) for code in outcome.reason_codes if code.startswith(prefix)), None)
+        value = _net_return_after_costs(outcome)
+        if label and value is not None:
+            grouped[str(label)].append(value)
+    if not grouped:
+        return 0.5 if outcomes else 0.0
+    if len(grouped) == 1:
+        return 0.75
+    expectancies = [sum(values) / len(values) for values in grouped.values() if values]
+    return _outcome_stability(expectancies)
+
+
+def _recency_decay_score(outcomes: list[WeightedStrategyOutcome]) -> float:
+    ordered = sorted(
+        (outcome for outcome in outcomes if outcome.exit_timestamp is not None and _net_return_after_costs(outcome) is not None),
+        key=lambda outcome: outcome.exit_timestamp,
+    )
+    if not ordered:
+        return 0.0
+    weighted_total = 0.0
+    decay_total = 0.0
+    for index, outcome in enumerate(reversed(ordered)):
+        decay = 0.94 ** index
+        weighted_total += float(_net_return_after_costs(outcome) or 0.0) * decay
+        decay_total += decay
+    return _return_score(weighted_total / decay_total if decay_total else 0.0)
+
+
+def _execution_quality(outcomes: list[WeightedStrategyOutcome]) -> float:
+    explicit = [float(outcome.execution_quality) for outcome in outcomes if outcome.execution_quality is not None]
+    if explicit:
+        return max(0.0, min(1.0, sum(explicit) / len(explicit)))
+    costs = [
+        outcome.total_cost_return or (outcome.spread_cost_return + outcome.slippage_cost_return + outcome.fee_cost_return)
+        for outcome in outcomes
+    ]
+    if not costs:
+        return 0.0
+    average_cost = sum(costs) / len(costs)
+    return max(0.0, min(1.0, 1.0 - average_cost / 0.01))
+
+
 def _correlation_penalties_from_returns(strategy_ids: tuple[str, ...], returns_by_strategy: dict[str, list[float]]) -> dict[str, float]:
     result: dict[str, float] = {}
     for strategy_id in strategy_ids:
@@ -579,7 +743,15 @@ def _normalize_state_weights_with_caps(
         )
         for strategy_id in strategy_ids
     ]
-    return _normalize_with_strategy_and_family_caps(weights, signals, config, set(strategy_ids))
+    return _normalize_with_strategy_and_family_caps(weights, signals, config, set(_active_strategy_ids(strategy_ids)))
+
+
+def _zero_shadow_and_normalize(weights: dict[str, float], strategy_ids: tuple[str, ...]) -> dict[str, float]:
+    zeroed = {strategy_id: weights.get(strategy_id, 0.0) if strategy_id in WEIGHTED_VOTING_ACTIVE_VOTER_IDS else 0.0 for strategy_id in strategy_ids}
+    normalized = normalize_weights(zeroed)
+    if sum(normalized.values()) <= 0:
+        normalized = _baseline_weights(strategy_ids)
+    return normalized
 
 
 def _apply_daily_weight_change_limit(
@@ -640,6 +812,60 @@ def _round_weight_dict(weights: dict[str, float]) -> dict[str, float]:
     return rounded
 
 
+def _weight_update_input_hash(
+    *,
+    previous_state: WeightedWeightState,
+    outcomes: tuple[WeightedStrategyOutcome, ...],
+    config: WeightedVotingConfig,
+    session_key: str,
+    regime_label: str | None,
+    strategy_ids: tuple[str, ...],
+) -> str:
+    outcome_payloads = sorted(
+        (outcome.model_dump(mode="json", exclude_none=True) for outcome in outcomes),
+        key=lambda payload: json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str),
+    )
+    return _hash_payload(
+        {
+            "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+            "engine_version": WEIGHTED_VOTING_WEIGHT_ENGINE_VERSION,
+            "previous_weight_version": previous_state.weight_version,
+            "previous_output_hash": previous_state.output_hash,
+            "previous_weights": _round_weight_dict(_complete_weights(previous_state.strategy_weights, strategy_ids)),
+            "config_hash": config.configuration_hash,
+            "session_key": session_key,
+            "regime_label": regime_label,
+            "strategy_ids": strategy_ids,
+            "outcomes": outcome_payloads,
+            "rules": WEIGHTED_VOTING_WEIGHT_UPDATE_RULES,
+        }
+    )
+
+
+def _weight_update_output_hash(
+    *,
+    status: WeightedWeightStateStatus,
+    weights: dict[str, float],
+    metrics: tuple[WeightedPerformanceWeightMetric, ...],
+    session_key: str,
+) -> str:
+    return _hash_payload(
+        {
+            "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+            "engine_version": WEIGHTED_VOTING_WEIGHT_ENGINE_VERSION,
+            "state_status": status.value if hasattr(status, "value") else str(status),
+            "active_session_date": session_key,
+            "strategy_weights": weights,
+            "metrics": [metric.model_dump(mode="json", exclude_none=True) for metric in metrics],
+        }
+    )
+
+
+def _hash_payload(payload: object) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _preserve_weight_state(
     previous_state: WeightedWeightState,
     *,
@@ -658,6 +884,8 @@ def _preserve_weight_state(
         performance_metrics=previous_state.performance_metrics,
         last_updated_at=update_timestamp,
         data_timestamp=data_timestamp,
+        input_data_hash=previous_state.input_data_hash,
+        output_hash=previous_state.output_hash,
         reason_codes=reason_codes,
         explanation=explanation,
     )
@@ -677,7 +905,7 @@ def _original_frozen_weights(signals: list[WeightedVotingSignal], enabled_ids: s
 def _correlation_penalties(signals: list[WeightedVotingSignal], historical_outcomes: tuple[WeightedStrategyOutcome, ...]) -> dict[str, float]:
     returns_by_strategy: dict[str, list[float]] = defaultdict(list)
     for outcome in historical_outcomes:
-        if outcome.outcome_return is not None:
+        if getattr(outcome, "algorithm_id", None) == WEIGHTED_VOTING_ALGORITHM_ID and outcome.outcome_return is not None:
             returns_by_strategy[outcome.strategy_id].append(float(outcome.outcome_return))
 
     result: dict[str, float] = {}
@@ -823,6 +1051,8 @@ def _adjustment_for(
     reason_codes = []
     if final == 0:
         reason_codes.append("weighted_voting.weight.zero")
+    if signal.strategy_id not in WEIGHTED_VOTING_ACTIVE_VOTER_IDS:
+        reason_codes.append("weighted_voting.weight.lifecycle_non_voter")
     if correlation_penalties.get(signal.strategy_id, 1.0) < 1:
         reason_codes.append("weighted_voting.weight.correlation_penalty")
     if family_cap_adjustment < 1:

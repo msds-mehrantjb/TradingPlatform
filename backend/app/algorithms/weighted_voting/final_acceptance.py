@@ -59,7 +59,7 @@ class WeightedVotingFinalOrderAcceptanceInputs:
     expected_weight_version: str
     existing_order_ids: tuple[str, ...] = ()
     position_algorithm_id: str = WEIGHTED_VOTING_ALGORITHM_ID
-    data_stale_after_seconds: int = 300
+    data_stale_after_seconds: int = 75
 
 
 @dataclass(frozen=True)

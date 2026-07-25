@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime, timedelta, timezone
 
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedGateEvaluationMode, WeightedVotingGatePipelineResult
 from backend.app.algorithms.weighted_voting.execution_gateway import submit_weighted_voting_paper_order
+from backend.app.algorithms.weighted_voting.global_interface import WeightedVotingStaticCentralGlobalRiskService
 from backend.app.algorithms.weighted_voting.observability import (
     DECISION_OBSERVABILITY_PREFIX,
     EXECUTION_OBSERVABILITY_PREFIX,
@@ -29,7 +30,7 @@ SESSION_DATE = date(2026, 7, 14)
 class WeightedVotingObservabilityTest(unittest.TestCase):
     def test_evaluation_records_full_immutable_decision_snapshot_and_metrics(self) -> None:
         store = MemoryStore()
-        result = WeightedVotingService(store=store).evaluate(evaluate_payload())
+        result = WeightedVotingService(store=store).evaluate_replay_fixture(evaluate_payload())
         decision_id = result["decision"]["decision_id"]
 
         snapshot = store.snapshots[f"{DECISION_OBSERVABILITY_PREFIX}{decision_id}"]
@@ -109,16 +110,17 @@ class WeightedVotingObservabilityTest(unittest.TestCase):
     def test_hold_or_rejected_decisions_are_explainable_and_quantities_are_distinct_fields(self) -> None:
         store = MemoryStore()
         payload = evaluate_payload()
-        payload["globalGateResponse"] = {
-            "action": "REJECT_NEW_ENTRY",
-            "maximumAllowedQuantity": 0,
-            "maximumAdditionalRiskDollars": 0,
-            "rejectionReasons": ["global.test_reject"],
-            "evaluatedAt": payload["data_timestamp"],
-            "configurationHash": "global-test-reject",
-        }
 
-        result = WeightedVotingService(store=store).evaluate(payload)
+        result = WeightedVotingService(
+            store=store,
+            central_risk_service=WeightedVotingStaticCentralGlobalRiskService(
+                action="REJECT",
+                maximum_quantity=0,
+                maximum_additional_risk=0.0,
+                reason_codes=("global.test_reject",),
+                configuration_hash="global-test-reject",
+            ),
+        ).evaluate_replay_fixture(payload)
         decision_id = result["decision"]["decision_id"]
         snapshot = store.snapshots[f"{DECISION_OBSERVABILITY_PREFIX}{decision_id}"]
 

@@ -7,6 +7,7 @@ from typing import Callable
 from backend.app.algorithms.weighted_voting.market_condition import classify_market_condition
 from backend.app.algorithms.weighted_voting.market_snapshot import WeightedMarketSnapshot
 from backend.app.algorithms.weighted_voting.models import WeightedCandle, WeightedDataQualityStatus, WeightedSide, WeightedWeightState
+from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS, WEIGHTED_VOTING_SHADOW_STRATEGY_IDS, WEIGHTED_VOTING_STRATEGY_CATALOG
 from backend.app.algorithms.weighted_voting.strategies.bollinger_atr_reversion import BollingerAtrReversionStrategy
 from backend.app.algorithms.weighted_voting.strategies.failed_breakout_reversal import FailedBreakoutReversalStrategy
 from backend.app.algorithms.weighted_voting.strategies.first_pullback_after_open import FirstPullbackAfterOpenStrategy
@@ -15,7 +16,7 @@ from backend.app.algorithms.weighted_voting.strategies.opening_range_breakout im
 from backend.app.algorithms.weighted_voting.strategies.volatility_breakout import VolatilityBreakoutStrategy
 from backend.app.algorithms.weighted_voting.strategies.vwap_mean_reversion import VwapMeanReversionStrategy
 from backend.app.algorithms.weighted_voting.strategies.vwap_trend_continuation import VwapTrendContinuationStrategy
-from backend.app.algorithms.weighted_voting.signal_engine import evaluate_signals
+from backend.app.algorithms.weighted_voting.signal_engine import WEIGHTED_VOTING_STRATEGY_CLASS_BY_ID, evaluate_signals
 
 
 UTC = timezone.utc
@@ -79,9 +80,10 @@ class WeightedVotingStrategyModulesTest(unittest.TestCase):
 
         self.assertEqual([signal.strategy_id for signal in signals], ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"])
         self.assertEqual(len(signals), 8)
+        self.assertEqual(set(WEIGHTED_VOTING_STRATEGY_CLASS_BY_ID), {entry.strategy_id for entry in WEIGHTED_VOTING_STRATEGY_CATALOG})
 
     def test_signal_engine_standardizes_strategy_results_and_attaches_active_weight(self) -> None:
-        market_snapshot = s3_buy_snapshot()
+        market_snapshot = s2_buy_snapshot()
         condition = classify_market_condition(market_snapshot)
         weights = WeightedWeightState(
             strategy_weights={"S1": 0.10, "S2": 0.10, "S3": 0.25, "S4": 0.10, "S5": 0.10, "S6": 0.10, "S7": 0.10, "S8": 0.15},
@@ -91,26 +93,27 @@ class WeightedVotingStrategyModulesTest(unittest.TestCase):
         )
 
         signals = evaluate_signals(market_snapshot, active_weight_state=weights, market_condition=condition)
-        s3 = next(signal for signal in signals if signal.strategy_id == "S3")
+        s2 = next(signal for signal in signals if signal.strategy_id == "S2")
 
-        self.assertEqual(s3.strategy_version, "weighted_strategy_S3_v1")
-        self.assertEqual(s3.direction, s3.signal)
-        self.assertEqual(s3.buy_probability, s3.p_buy)
-        self.assertEqual(s3.sell_probability, s3.p_sell)
-        self.assertEqual(s3.hold_probability, s3.p_hold)
-        self.assertEqual(s3.confidence, s3.directional_confidence)
-        self.assertEqual(s3.expected_return_before_costs, s3.expected_return)
-        self.assertEqual(s3.base_weight, 0.125)
-        self.assertEqual(s3.active_weight, 0.25)
-        self.assertTrue(s3.eligible)
-        self.assertTrue(s3.active)
-        self.assertTrue(s3.data_ready)
-        self.assertGreater(s3.market_condition_fit, 0)
-        self.assertGreater(s3.final_weight, 0)
-        self.assertIn("weighted_voting.signal_engine.strategy_active", s3.reason_codes)
-        self.assertEqual(s3.feature_snapshot["strategy_id"], "S3")
-        self.assertEqual(s3.feature_snapshot["signal_engine_version"], "weighted_voting_signal_engine_v1")
-        self.assertIn("market_quality", s3.feature_snapshot)
+        self.assertEqual(s2.strategy_version, "weighted_strategy_S2_v1")
+        self.assertEqual(s2.direction, s2.signal)
+        self.assertEqual(s2.buy_probability, s2.p_buy)
+        self.assertEqual(s2.sell_probability, s2.p_sell)
+        self.assertEqual(s2.hold_probability, s2.p_hold)
+        self.assertEqual(s2.confidence, s2.directional_confidence)
+        self.assertEqual(s2.expected_return_before_costs, s2.expected_return)
+        self.assertEqual(s2.base_weight, 0.125)
+        self.assertEqual(s2.active_weight, 0.10)
+        self.assertTrue(s2.eligible)
+        self.assertTrue(s2.active)
+        self.assertTrue(s2.data_ready)
+        self.assertGreater(s2.market_condition_fit, 0)
+        self.assertGreater(s2.final_weight, 0)
+        self.assertIn("weighted_voting.signal_engine.strategy_active", s2.reason_codes)
+        self.assertEqual(s2.feature_snapshot["strategy_id"], "S2")
+        self.assertEqual(s2.feature_snapshot["strategy_lifecycle"], "active")
+        self.assertEqual(s2.feature_snapshot["signal_engine_version"], "weighted_voting_signal_engine_v1")
+        self.assertIn("market_quality", s2.feature_snapshot)
 
         for signal in signals:
             with self.subTest(strategy=signal.strategy_id):
@@ -118,6 +121,26 @@ class WeightedVotingStrategyModulesTest(unittest.TestCase):
                 self.assertAlmostEqual(signal.buy_probability + signal.sell_probability + signal.hold_probability, 1.0, delta=0.000001)
                 self.assertIn("completed_one_minute_candles", signal.feature_snapshot)
                 self.assertNotIn("voting_ensemble", str(signal.model_dump(mode="json")))
+
+    def test_shadow_strategies_emit_observable_zero_weight_signals(self) -> None:
+        signals = evaluate_signals(s3_buy_snapshot())
+        by_id = {signal.strategy_id: signal for signal in signals}
+
+        for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS:
+            with self.subTest(strategy_id=strategy_id):
+                signal = by_id[strategy_id]
+                self.assertFalse(signal.eligible)
+                self.assertFalse(signal.active)
+                self.assertEqual(signal.base_weight, 0.0)
+                self.assertEqual(signal.active_weight, 0.0)
+                self.assertEqual(signal.final_weight, 0.0)
+                self.assertEqual(signal.feature_snapshot["strategy_lifecycle"], "shadow")
+                self.assertFalse(signal.feature_snapshot["strategy_contributes_to_vote"])
+                self.assertIn("weighted_voting.signal_engine.strategy_shadow_observed_zero_weight", signal.reason_codes)
+
+        for strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS:
+            with self.subTest(strategy_id=strategy_id):
+                self.assertEqual(by_id[strategy_id].feature_snapshot["strategy_lifecycle"], "active")
 
     def test_strategy_pairs_have_distinct_triggers(self) -> None:
         s1_snapshot = s1_buy_snapshot()

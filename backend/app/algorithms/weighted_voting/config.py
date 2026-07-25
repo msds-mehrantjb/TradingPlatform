@@ -16,7 +16,7 @@ WEIGHTED_VOTING_BASELINE_CONFIGURATION_KEY = "weighted_voting.config.baseline"
 
 
 def _strategy_enablement() -> dict[str, bool]:
-    return {entry.strategy_id: entry.enabled for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
+    return {entry.strategy_id: entry.executes for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
 
 
 def _strategy_baseline_weights() -> dict[str, float]:
@@ -35,6 +35,30 @@ def _strategy_session_windows() -> dict[str, str]:
     return {entry.strategy_id: entry.valid_session_window for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
 
 
+def _strategy_states() -> dict[str, str]:
+    return {entry.strategy_id: entry.lifecycle for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
+
+
+def _strategy_time_stops() -> dict[str, int]:
+    return {
+        entry.strategy_id: {
+            "breakout": 120,
+            "trend": 180,
+            "mean_reversion": 150,
+            "reversal": 120,
+        }.get(_enum_value(entry.family), 60)
+        for entry in WEIGHTED_VOTING_STRATEGY_CATALOG
+    }
+
+
+def _family_exposure_caps() -> dict[str, float]:
+    return {_enum_value(entry.family): 0.50 for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
+
+
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value))
+
+
 @dataclass(frozen=True)
 class WeightedVotingConfig:
     config_version: str = WEIGHTED_VOTING_CONFIG_VERSION
@@ -44,6 +68,9 @@ class WeightedVotingConfig:
     strategy_baseline_weights: dict[str, float] = field(default_factory=_strategy_baseline_weights)
     strategy_minimum_weights: dict[str, float] = field(default_factory=_strategy_minimum_weights)
     strategy_maximum_weights: dict[str, float] = field(default_factory=_strategy_maximum_weights)
+    strategy_states: dict[str, str] = field(default_factory=_strategy_states)
+    strategy_time_stop_minutes: dict[str, int] = field(default_factory=_strategy_time_stops)
+    family_exposure_caps: dict[str, float] = field(default_factory=_family_exposure_caps)
     strategy_session_windows: dict[str, str] = field(default_factory=_strategy_session_windows)
     minimum_score: float = 0.58
     minimum_edge: float = 0.12
@@ -52,6 +79,7 @@ class WeightedVotingConfig:
     minimum_active_weight: float = 0.999999
     aggregation_tie_tolerance: float = 0.000001
     maximum_disagreement_score: float = 0.45
+    correlation_penalty: float = 0.10
     minimum_expected_value_after_costs: float = 0.0
     expected_value_safety_margin: float = 0.0001
     local_max_spread_percent: float = 0.001
@@ -64,7 +92,7 @@ class WeightedVotingConfig:
     minimum_capital_available: float = 1.0
     allow_weighted_pyramiding: bool = False
     maximum_strategy_weight: float = 0.25
-    maximum_family_weight: float = 0.40
+    maximum_family_weight: float = 0.50
     minimum_enabled_strategy_weight: float = 0.02
     equal_seed_weight: float = 0.125
     minimum_qualified_outcomes_for_adaptation: int = 40
@@ -78,10 +106,11 @@ class WeightedVotingConfig:
     stability_score_weight: float = 0.10
     recent_performance_score_weight: float = 0.07
     regime_performance_score_weight: float = 0.03
-    stale_after_seconds: int = 300
+    stale_after_seconds: int = 75
+    quote_freshness_limit_seconds: int = 75
     regular_session_window: str = "09:30-16:00 America/New_York"
     decision_session_window: str = "09:45-15:45 America/New_York"
-    data_freshness_limit_seconds: int = 300
+    data_freshness_limit_seconds: int = 75
     entry_slippage_per_share: float = 0.01
     exit_slippage_per_share: float = 0.01
     fee_per_share: float = 0.01
@@ -95,12 +124,20 @@ class WeightedVotingConfig:
     maximum_participation_rate: float = 0.01
     atr_stop_multiplier: float = 1.5
     minimum_stop_distance_percent: float = 0.001
+    maximum_stop_distance_percent: float = 0.05
     target_r: float = 2.0
     entry_buffer_percent: float = 0.0005
     break_even_trigger_r: float = 1.0
     trailing_stop_atr_multiplier: float = 1.0
+    trailing_stop_policy: str = "condition_atr_trailing"
     time_stop_minutes: int = 120
     session_cutoff_minutes: int = 15
+    end_of_day_liquidation_time: str = "15:59 America/New_York"
+    entry_cutoff_time: str = "15:45 America/New_York"
+    event_risk_action: str = "reduce_or_block"
+    volatility_multiplier: float = 1.0
+    liquidity_multiplier: float = 1.0
+    session_multiplier: float = 1.0
     force_flat_minutes_before_close: int = 1
     backtest_account_equity: float = 100000.0
     backtest_starting_cash: float = 100000.0
@@ -151,6 +188,9 @@ class WeightedVotingConfig:
         strategy_baseline_weights = dict(self.strategy_baseline_weights)
         strategy_minimum_weights = dict(self.strategy_minimum_weights)
         strategy_maximum_weights = dict(self.strategy_maximum_weights)
+        strategy_states = dict(self.strategy_states)
+        strategy_time_stop_minutes = dict(self.strategy_time_stop_minutes)
+        family_exposure_caps = dict(self.family_exposure_caps)
         strategy_session_windows = dict(self.strategy_session_windows)
         payload = {
             "configVersion": self.config_version,
@@ -160,6 +200,9 @@ class WeightedVotingConfig:
             "strategyBaselineWeights": strategy_baseline_weights,
             "strategyMinimumWeights": strategy_minimum_weights,
             "strategyMaximumWeights": strategy_maximum_weights,
+            "strategyStates": strategy_states,
+            "strategyTimeStopMinutes": strategy_time_stop_minutes,
+            "familyExposureCaps": family_exposure_caps,
             "strategySessionWindows": strategy_session_windows,
             "minimumScore": self.minimum_score,
             "minimumEdge": self.minimum_edge,
@@ -168,6 +211,7 @@ class WeightedVotingConfig:
             "minimumActiveWeight": self.minimum_active_weight,
             "aggregationTieTolerance": self.aggregation_tie_tolerance,
             "maximumDisagreementScore": self.maximum_disagreement_score,
+            "correlationPenalty": self.correlation_penalty,
             "minimumExpectedValueAfterCosts": self.minimum_expected_value_after_costs,
             "expectedValueSafetyMargin": self.expected_value_safety_margin,
             "localMaxSpreadPercent": self.local_max_spread_percent,
@@ -181,9 +225,11 @@ class WeightedVotingConfig:
             "allowWeightedPyramiding": self.allow_weighted_pyramiding,
             "baselineSettings": {
                 "strategyEnablement": strategy_enablement,
+                "strategyStates": strategy_states,
                 "baselineWeights": strategy_baseline_weights,
                 "minimumWeights": strategy_minimum_weights,
                 "maximumWeights": strategy_maximum_weights,
+                "familyExposureCaps": family_exposure_caps,
             },
             "decisionThresholds": {
                 "minimumWinningScore": self.minimum_score,
@@ -200,6 +246,7 @@ class WeightedVotingConfig:
             "dataFreshnessLimits": {
                 "marketDataSeconds": self.data_freshness_limit_seconds,
                 "staleAfterSeconds": self.stale_after_seconds,
+                "quoteFreshnessSeconds": self.quote_freshness_limit_seconds,
             },
             "localGateLimits": {
                 "spreadLimitPercent": self.local_max_spread_percent,
@@ -240,6 +287,7 @@ class WeightedVotingConfig:
             "stopRules": {
                 "atrStopMultiplier": self.atr_stop_multiplier,
                 "minimumStopDistancePercent": self.minimum_stop_distance_percent,
+                "maximumStopDistancePercent": self.maximum_stop_distance_percent,
             },
             "targetRules": {
                 "targetR": self.target_r,
@@ -247,9 +295,19 @@ class WeightedVotingConfig:
             },
             "exitRules": {
                 "trailingStopAtrMultiplier": self.trailing_stop_atr_multiplier,
+                "trailingStopPolicy": self.trailing_stop_policy,
                 "timeStopMinutes": self.time_stop_minutes,
+                "strategyTimeStopMinutes": strategy_time_stop_minutes,
                 "sessionCutoffMinutes": self.session_cutoff_minutes,
                 "forceFlatMinutesBeforeClose": self.force_flat_minutes_before_close,
+                "endOfDayLiquidationTime": self.end_of_day_liquidation_time,
+                "entryCutoffTime": self.entry_cutoff_time,
+            },
+            "eventRiskPolicy": {
+                "action": self.event_risk_action,
+                "volatilityMultiplier": self.volatility_multiplier,
+                "liquidityMultiplier": self.liquidity_multiplier,
+                "sessionMultiplier": self.session_multiplier,
             },
             "backtestSettings": {
                 "accountEquity": self.backtest_account_equity,

@@ -125,14 +125,18 @@ def calculate_weighted_voting_position_size(context: WeightedVotingSizingContext
     if stop_distance <= 0:
         reason_codes.append("weighted_voting.sizing.invalid_stop_distance")
         return _zero_result(context, "stop_distance", actual_spread, reason_codes, "Stop distance must be positive.")
-    size_multiplier = _size_multiplier(context)
+    independent_family_factor = _independent_family_support_factor(context)
+    if independent_family_factor < 1.0:
+        reason_codes.append("weighted_voting.sizing.partial_size_independent_family_support")
+    size_multiplier = _size_multiplier(context, independent_family_factor)
     effective_risk_dollars = _effective_risk_dollars(context, size_multiplier)
     risk_based_quantity = floor(effective_risk_dollars / stop_distance)
     capital_partition_quantity = floor(_remaining_capital_partition(context) / entry_price)
     buying_power_quantity = floor(context.available_buying_power / entry_price)
     liquidity_quantity = _liquidity_quantity(context)
     volume_participation_quantity = _participation_quantity(context)
-    algorithm_maximum_quantity = context.effective_settings.maximum_shares if context.effective_settings.maximum_shares > 0 else 2_147_483_647
+    local_capacity_ceiling = max(0, risk_based_quantity, capital_partition_quantity, buying_power_quantity, liquidity_quantity, volume_participation_quantity)
+    algorithm_maximum_quantity = context.effective_settings.maximum_shares if context.effective_settings.maximum_shares > 0 else local_capacity_ceiling
     global_maximum_quantity = min(context.global_max_shares, floor(context.global_available_risk / stop_distance) if stop_distance > 0 else 0)
     caps = (
         _cap("risk", risk_based_quantity, "weighted_voting.sizing.cap.risk", "Shares capped by effective risk dollars and stop distance."),
@@ -221,13 +225,28 @@ def _remaining_capital_partition(context: WeightedVotingSizingContext) -> float:
     return context.remaining_weighted_capital_partition
 
 
-def _size_multiplier(context: WeightedVotingSizingContext) -> float:
+def _size_multiplier(context: WeightedVotingSizingContext, independent_family_factor: float) -> float:
     scores = context.decision.vote_scores
     score_factor = max(0.0, min(1.0, scores.winner_score))
     edge_factor = max(0.0, min(1.0, scores.winner_edge / max(context.effective_settings.minimum_edge, 0.000001)))
     coverage = getattr(scores, "effective_weight_coverage", getattr(scores, "active_weight", 1.0))
     coverage_factor = max(0.0, min(1.0, coverage))
-    return max(0.0, min(1.0, score_factor * edge_factor * coverage_factor))
+    return max(0.0, min(1.0, score_factor * edge_factor * coverage_factor * independent_family_factor))
+
+
+def _independent_family_support_factor(context: WeightedVotingSizingContext) -> float:
+    required = max(2, int(getattr(context.effective_settings, "minimum_independent_supporting_strategies", 1)))
+    side = str(getattr(context.decision.vote_scores.winning_side, "value", context.decision.vote_scores.winning_side))
+    side_key = "buy" if side == WeightedSide.BUY.value else "sell" if side == WeightedSide.SELL.value else ""
+    if not side_key:
+        return 0.0
+    threshold = max(0.0, context.effective_settings.minimum_score * 0.01)
+    supporting_families = {
+        family
+        for family, contributions in context.decision.vote_scores.family_contributions.items()
+        if contributions.get(side_key, 0.0) > threshold
+    }
+    return max(0.0, min(1.0, len(supporting_families) / required))
 
 
 def _stop_components(context: WeightedVotingSizingContext, entry_price: float, actual_spread: float) -> tuple[float | None, float | None, float, float]:

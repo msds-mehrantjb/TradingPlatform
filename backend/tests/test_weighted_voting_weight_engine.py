@@ -5,6 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from backend.app.algorithms.weighted_voting.aggregation import aggregate_weighted_signals
+from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS, WEIGHTED_VOTING_SHADOW_STRATEGY_IDS
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.models import (
     WeightedDataQualityStatus,
@@ -50,8 +51,9 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
         self.assertAlmostEqual(sum(final_weights.values()), 1.0, delta=0.0000001)
         self.assertTrue(all(weight >= 0 for weight in final_weights.values()))
         self.assertTrue(all(weight <= 0.25 + 0.0000001 for weight in final_weights.values()))
-        self.assertTrue(all(weight <= 0.40 + 0.0000001 for weight in family_totals.values()))
-        self.assertLessEqual(family_totals[WeightedStrategyFamily.MEAN_REVERSION.value], 0.40 + 0.0000001)
+        self.assertTrue(all(weight <= 0.50 + 0.0000001 for weight in family_totals.values()))
+        self.assertTrue(all(final_weights[strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
+        self.assertLessEqual(family_totals[WeightedStrategyFamily.REVERSAL.value], 0.50 + 0.0000001)
 
     def test_disabled_and_unavailable_strategies_have_zero_weight(self) -> None:
         signals = strategy_signals({strategy_id: 0.125 for strategy_id in FAMILY_BY_STRATEGY})
@@ -74,6 +76,7 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
 
         self.assertEqual(final_weights["S1"], 0.0)
         self.assertEqual(final_weights["S6"], 0.0)
+        self.assertTrue(all(final_weights[strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
         self.assertAlmostEqual(sum(final_weights.values()), 1.0, delta=0.0000001)
 
     def test_minimum_enabled_weight_and_data_quality_adjustments_are_visible(self) -> None:
@@ -86,7 +89,8 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
         self.assertTrue(all(signal.final_weight >= 0.02 - 0.0000001 for signal in result.signals if signal.final_weight > 0))
         self.assertEqual(adjustments["S6"].data_quality_adjustment, 0.7)
         self.assertIn("weighted_voting.weight.data_quality", adjustments["S6"].reason_codes)
-        self.assertLess(adjustments["S1"].family_cap_adjustment, 1.0)
+        self.assertIn("weighted_voting.weight.lifecycle_non_voter", adjustments["S1"].reason_codes)
+        self.assertTrue(any(adjustments[strategy_id].family_cap_adjustment < 1.0 for strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS))
 
     def test_correlation_penalties_use_weighted_owned_outcomes_only(self) -> None:
         signals = strategy_signals({strategy_id: 0.125 for strategy_id in FAMILY_BY_STRATEGY})
@@ -96,6 +100,7 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
         self.assertLess(adjustments["S4"].correlation_penalty, 1.0)
         self.assertLess(adjustments["S7"].correlation_penalty, 1.0)
         self.assertEqual(adjustments["S1"].correlation_penalty, 1.0)
+        self.assertIn("weighted_voting.weight.lifecycle_non_voter", adjustments["S1"].reason_codes)
 
     def test_aggregation_decision_records_effective_weight_adjustments(self) -> None:
         signals = strategy_signals({strategy_id: 0.125 for strategy_id in FAMILY_BY_STRATEGY})
@@ -105,39 +110,50 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
         self.assertAlmostEqual(sum(adjustment.final_effective_weight for adjustment in decision.weight_adjustments), 1.0, delta=0.0000001)
         self.assertTrue(all(adjustment.original_frozen_weight >= 0 for adjustment in decision.weight_adjustments))
         self.assertTrue(any(adjustment.correlation_penalty < 1 for adjustment in decision.weight_adjustments))
+        final_weights = {adjustment.strategy_id: adjustment.final_effective_weight for adjustment in decision.weight_adjustments}
+        self.assertTrue(all(final_weights[strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
+        self.assertTrue(all(final_weights[strategy_id] > 0.0 for strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS))
 
     def test_initial_weight_state_is_unseeded_equal_weights(self) -> None:
         state = create_unseeded_equal_weight_state(timestamp=TS)
 
         self.assertEqual(state.state_status, WeightedWeightStateStatus.UNSEEDED_EQUAL_WEIGHTS.value)
         self.assertEqual(set(state.strategy_weights), set(FAMILY_BY_STRATEGY))
-        self.assertTrue(all(weight == 0.125 for weight in state.strategy_weights.values()))
+        self.assertTrue(all(state.strategy_weights[strategy_id] == 0.25 for strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS))
+        self.assertTrue(all(state.strategy_weights[strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
         self.assertAlmostEqual(sum(state.strategy_weights.values()), 1.0, delta=0.0000001)
+        self.assertIsNotNone(state.input_data_hash)
+        self.assertIsNotNone(state.output_hash)
 
     def test_weight_engine_status_exposes_owned_rules_and_bounds(self) -> None:
         status = weight_engine_status()
 
         self.assertEqual(status.algorithm_id, "weighted_voting")
-        self.assertEqual(status.baseline_weights, {strategy_id: 0.125 for strategy_id in FAMILY_BY_STRATEGY})
+        self.assertEqual(
+            status.baseline_weights,
+            {strategy_id: (0.25 if strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS else 0.0) for strategy_id in FAMILY_BY_STRATEGY},
+        )
         self.assertEqual(status.minimum_weight, 0.02)
         self.assertEqual(status.maximum_weight, 0.25)
         self.assertEqual(status.maximum_daily_weight_change, 0.025)
         self.assertEqual(status.update_rules, WEIGHTED_VOTING_WEIGHT_UPDATE_RULES)
         self.assertIn("use_only_weighted_voting_attributed_strategy_outcomes", status.update_rules)
+        self.assertIn("use_only_closed_and_fully_reconciled_weighted_voting_trades", status.update_rules)
+        self.assertIn("shadow_strategies_retain_zero_voting_weight", status.update_rules)
         self.assertIn("voting_ensemble", status.forbidden_inputs)
 
     def test_same_session_update_preserves_frozen_active_weights(self) -> None:
         state = create_unseeded_equal_weight_state(timestamp=TS)
         seeded = update_performance_weight_state(
             state,
-            performance_outcomes({"S1": [0.02] * 45, "S4": [-0.01] * 45}),
+            performance_outcomes({"S2": [0.02] * 45, "S5": [-0.01] * 45}),
             update_timestamp=TS,
             session_date="2026-01-05",
         )
 
         intraday_attempt = update_performance_weight_state(
             seeded,
-            performance_outcomes({"S1": [-0.03] * 45, "S4": [0.03] * 45}),
+            performance_outcomes({"S2": [-0.03] * 45, "S5": [0.03] * 45}),
             update_timestamp=TS + timedelta(hours=2),
             session_date="2026-01-05",
         )
@@ -149,21 +165,22 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
         state = create_unseeded_equal_weight_state(timestamp=TS)
         updated = update_performance_weight_state(
             state,
-            performance_outcomes({"S1": [0.03] * 5, "S2": [-0.01] * 5}),
+            performance_outcomes({"S2": [0.03] * 5, "S5": [-0.01] * 5}),
             update_timestamp=TS,
             session_date="2026-01-06",
         )
 
-        self.assertLessEqual(abs(updated.strategy_weights["S1"] - 0.125), 0.025 + 0.0000001)
-        self.assertLess(updated.performance_metrics[0].sample_shrinkage, 1.0)
+        self.assertLessEqual(abs(updated.strategy_weights["S2"] - 0.25), 0.025 + 0.0000001)
+        self.assertLess({metric.strategy_id: metric for metric in updated.performance_metrics}["S2"].sample_shrinkage, 1.0)
         self.assertAlmostEqual(sum(updated.strategy_weights.values()), 1.0, delta=0.0000001)
+        self.assertTrue(all(updated.strategy_weights[strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
 
     def test_daily_weight_changes_respect_configured_limit(self) -> None:
         config = WeightedVotingConfig(maximum_daily_weight_change=0.02)
         state = create_unseeded_equal_weight_state(timestamp=TS)
         updated = update_performance_weight_state(
             state,
-            performance_outcomes({"S1": [0.03] * 60, "S8": [0.025] * 60, "S4": [-0.02] * 60, "S7": [-0.02] * 60}),
+            performance_outcomes({"S2": [0.03] * 60, "S5": [0.025] * 60, "S6": [-0.02] * 60, "S7": [-0.02] * 60}),
             update_timestamp=TS,
             session_date="2026-01-07",
             config=config,
@@ -179,7 +196,7 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
 
         failed = update_performance_weight_state(
             state,
-            performance_outcomes({"S1": [0.03] * 60}),
+            performance_outcomes({"S2": [0.03] * 60}),
             update_timestamp=TS,
             session_date="2026-01-08",
             config=bad_config,
@@ -191,7 +208,7 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
 
     def test_foreign_algorithm_outcomes_cannot_update_weights(self) -> None:
         state = create_unseeded_equal_weight_state(timestamp=TS)
-        foreign = outcome("S1", 0, 0.05).model_copy(update={"algorithm_id": "voting_ensemble"})
+        foreign = outcome("S2", 0, 0.05).model_copy(update={"algorithm_id": "voting_ensemble"})
 
         failed = update_performance_weight_state(
             state,
@@ -206,25 +223,31 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
 
     def test_new_catalog_strategy_missing_from_previous_state_is_initialized(self) -> None:
         state = create_unseeded_equal_weight_state(timestamp=TS)
-        legacy_weights = {strategy_id: 1.0 / 7.0 for strategy_id in FAMILY_BY_STRATEGY if strategy_id != "S8"}
+        legacy_weights = {
+            strategy_id: 1.0 / 3.0
+            for strategy_id in FAMILY_BY_STRATEGY
+            if strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS and strategy_id != "S6"
+        }
+        legacy_weights.update({strategy_id: 0.0 for strategy_id in FAMILY_BY_STRATEGY if strategy_id not in legacy_weights})
         legacy = state.model_copy(update={"strategy_weights": legacy_weights})
 
         updated = update_performance_weight_state(
             legacy,
-            performance_outcomes({"S1": [0.02] * 45}),
+            performance_outcomes({"S2": [0.02] * 45}),
             update_timestamp=TS,
             session_date="2026-01-10",
         )
 
-        self.assertIn("S8", updated.strategy_weights)
-        self.assertGreater(updated.strategy_weights["S8"], 0.0)
+        self.assertIn("S6", updated.strategy_weights)
+        self.assertGreater(updated.strategy_weights["S6"], 0.0)
+        self.assertTrue(all(updated.strategy_weights[strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
         self.assertAlmostEqual(sum(updated.strategy_weights.values()), 1.0, delta=0.0000001)
 
     def test_weight_history_and_rollback_are_weighted_voting_owned(self) -> None:
         state = create_unseeded_equal_weight_state(timestamp=TS)
         updated = update_performance_weight_state(
             state,
-            performance_outcomes({"S1": [0.02] * 45, "S2": [-0.01] * 45}),
+            performance_outcomes({"S2": [0.02] * 45, "S5": [-0.01] * 45}),
             update_timestamp=TS,
             session_date="2026-01-11",
         )
@@ -241,6 +264,43 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
         self.assertEqual(rolled_back.weight_version, state.weight_version)
         self.assertEqual(rolled_back.strategy_weights, state.strategy_weights)
         self.assertIn("weighted_voting.weights.rollback_applied", rolled_back.reason_codes)
+
+    def test_same_input_dataset_produces_deterministic_weight_version_and_hashes(self) -> None:
+        state = create_unseeded_equal_weight_state(timestamp=TS)
+        outcomes = performance_outcomes({"S2": [0.018] * 45, "S5": [-0.006] * 45, "S6": [0.011] * 45})
+
+        first = update_performance_weight_state(state, outcomes, update_timestamp=TS, session_date="2026-01-12")
+        second = update_performance_weight_state(state, outcomes, update_timestamp=TS + timedelta(minutes=30), session_date="2026-01-12")
+
+        self.assertEqual(first.weight_version, second.weight_version)
+        self.assertEqual(first.strategy_weights, second.strategy_weights)
+        self.assertEqual(first.input_data_hash, second.input_data_hash)
+        self.assertEqual(first.output_hash, second.output_hash)
+
+    def test_missing_or_unreconciled_performance_is_not_positive_evidence(self) -> None:
+        state = create_unseeded_equal_weight_state(timestamp=TS)
+        unreconciled = outcome("S2", 0, 0.05).model_copy(update={"fully_reconciled": False})
+
+        updated = update_performance_weight_state(state, (unreconciled,), update_timestamp=TS, session_date="2026-01-13")
+
+        self.assertEqual(updated.state_status, WeightedWeightStateStatus.FROZEN_INSUFFICIENT_DATA.value)
+        self.assertEqual(updated.strategy_weights, state.strategy_weights)
+        self.assertIn("weighted_voting.weights.insufficient_qualified_outcomes", updated.reason_codes)
+
+    def test_shadow_strategy_performance_remains_zero_weight(self) -> None:
+        state = create_unseeded_equal_weight_state(timestamp=TS)
+
+        updated = update_performance_weight_state(
+            state,
+            performance_outcomes({"S1": [0.08] * 80, "S8": [0.08] * 80, "S2": [0.005] * 45, "S5": [0.004] * 45}),
+            update_timestamp=TS,
+            session_date="2026-01-14",
+        )
+
+        self.assertTrue(all(updated.strategy_weights[strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
+        shadow_metrics = [metric for metric in updated.performance_metrics if metric.strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS]
+        self.assertTrue(all(metric.raw_performance_score == 0.0 for metric in shadow_metrics))
+        self.assertTrue(all("weighted_voting.weights.shadow_zero_weight" in metric.reason_codes for metric in shadow_metrics))
 
 
 FAMILY_BY_STRATEGY = {
@@ -313,12 +373,32 @@ def performance_outcomes(returns_by_strategy: dict[str, list[float]]) -> tuple[W
 
 
 def outcome(strategy_id: str, index: int, value: float) -> WeightedStrategyOutcome:
+    entry_price = 100.0
+    exit_price = 100.0 + value * entry_price
     return WeightedStrategyOutcome(
+        outcome_id=f"outcome-{strategy_id}-{index}",
+        trade_id=f"trade-{strategy_id}-{index}",
         strategy_id=strategy_id,
         side=WeightedSide.BUY,
         entry_timestamp=TS + timedelta(minutes=index),
-        entry_price=100,
+        exit_timestamp=TS + timedelta(minutes=index + 1),
+        entry_price=entry_price,
+        exit_price=exit_price,
+        is_closed=True,
+        fully_reconciled=True,
+        gross_return=value + 0.0003,
         outcome_return=value,
+        spread_cost_return=0.0001,
+        slippage_cost_return=0.0001,
+        fee_cost_return=0.0001,
+        total_cost_return=0.0003,
+        maximum_favorable_excursion_return=max(0.001, value + 0.002),
+        maximum_adverse_excursion_return=min(-0.001, value - 0.003),
+        opportunity_count=1,
+        execution_quality=0.92,
+        regime_label="trend",
+        session_label="morning",
+        reason_codes=("weighted_voting.regime.trend", "weighted_voting.session.morning"),
         explanation="Synthetic Weighted-owned completed outcome.",
     )
 

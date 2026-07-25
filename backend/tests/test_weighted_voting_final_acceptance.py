@@ -217,10 +217,10 @@ def weighted_decision():
 def strategy_signals() -> list[WeightedVotingSignal]:
     return [
         WeightedVotingSignal(
-            strategy_id="S1",
-            strategy_name="S1 synthetic",
+            strategy_id="S2",
+            strategy_name="S2 synthetic",
             strategy_version="weighted_strategy_test_v1",
-            family=WeightedStrategyFamily.BREAKOUT,
+            family=WeightedStrategyFamily.TREND,
             signal=WeightedSide.BUY,
             p_buy=0.8,
             p_sell=0.1,

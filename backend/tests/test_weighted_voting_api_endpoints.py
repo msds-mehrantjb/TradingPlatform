@@ -50,6 +50,14 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
             "/api/weighted-voting/positions",
             "/api/weighted-voting/trades",
             "/api/weighted-voting/observability/{decision_id}",
+            "/api/weighted-voting/runtime/status",
+            "/api/weighted-voting/runtime/pause",
+            "/api/weighted-voting/runtime/resume",
+            "/api/weighted-voting/runtime/pause-new-entries",
+            "/api/weighted-voting/runtime/resume-new-entries",
+            "/api/weighted-voting/runtime/reconcile",
+            "/api/weighted-voting/runtime/strategies/{strategy_id}/state",
+            "/api/weighted-voting/runtime/emergency-flatten",
         }
 
         self.assertTrue(expected.issubset(paths))
@@ -65,7 +73,7 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertEqual(status.status_code, 200)
         self.assertEqual(status.json()["algorithmId"], "weighted_voting")
         self.assertEqual(status.json()["apiInventory"]["apiNamespace"], "/api/weighted-voting")
-        self.assertEqual(len(status.json()["apiInventory"]["endpoints"]), 24)
+        self.assertEqual(len(status.json()["apiInventory"]["endpoints"]), 32)
         self.assertEqual(status.json()["sharedServiceBoundary"]["algorithmId"], "weighted_voting")
         self.assertIn("raw_candle_and_quote_service", {item["serviceId"] for item in status.json()["sharedServiceBoundary"]["allowedSharedServices"]})
         self.assertIn("reverse_trade_direction", status.json()["sharedServiceBoundary"]["forbiddenSharedServiceActions"])
@@ -174,6 +182,8 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertIn("strategyPerformance", performance.json())
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(missing.json()["detail"]["algorithm_id"], "weighted_voting")
+        self.assertFalse(any(key.startswith("weighted_voting.inventory.") for key in self.store.snapshots))
+        self.assertIn("weighted_voting.backtests.api-run-1", self.store.snapshots)
 
     def test_daily_update_endpoints_are_weighted_voting_specific(self) -> None:
         initial = self.client.get("/api/weighted-voting/daily-update/status")

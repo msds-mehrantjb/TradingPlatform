@@ -386,6 +386,8 @@ def _finalize_strategy_outcomes(outcomes: tuple[WeightedStrategyOutcome, ...]) -
             raise ValueError("foreign algorithm outcome cannot be finalized by Weighted Voting scheduler")
         if outcome.outcome_return is None:
             continue
+        if not (outcome.is_closed and outcome.fully_reconciled):
+            continue
         finalized.append(outcome)
     return tuple(finalized)
 

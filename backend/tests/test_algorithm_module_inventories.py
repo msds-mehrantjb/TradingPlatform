@@ -71,7 +71,7 @@ class AlgorithmModuleInventoriesTest(unittest.TestCase):
         self.assertEqual(weighted_voting_module_inventory(), WEIGHTED_VOTING_MODULE_INVENTORY)
         self.assertEqual(
             module_pairs(WEIGHTED_VOTING_MODULE_INVENTORY.directional),
-            tuple((item.strategy_id, "active" if item.enabled else "shadow") for item in dedicated),
+            tuple((item.strategy_id, item.lifecycle) for item in dedicated),
         )
         self.assertEqual(WEIGHTED_VOTING_MODULE_INVENTORY.context, ())
         self.assertEqual(WEIGHTED_VOTING_MODULE_INVENTORY.regime, ())

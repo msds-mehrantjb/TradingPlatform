@@ -38,10 +38,13 @@ WEIGHTED_VOTING_REQUIRED_COLLECTIONS = (
     "positions",
     "trades",
     "performance",
+    "strategy_lifecycle",
+    "strategy_lifecycle_audit",
     "backtest_runs",
     "walk_forward_folds",
     "equity_curves",
     "daily_updates",
+    "inventory",
     "observability",
     "migrations",
 )
@@ -296,6 +299,10 @@ def snapshot_collection_for_key(key: str) -> tuple[str, str]:
         return "trades", key
     if key.startswith("weighted_voting.performance_tracker.") or key.startswith("weighted_voting.performance."):
         return "performance", key
+    if key.startswith("weighted_voting.strategy_lifecycle.audit."):
+        return "strategy_lifecycle_audit", key
+    if key.startswith("weighted_voting.strategy_lifecycle."):
+        return "strategy_lifecycle", key
     if key.startswith("weighted_voting.backtests."):
         return "backtest_runs", key
     if key.startswith("weighted_voting.walk_forward."):
@@ -304,6 +311,10 @@ def snapshot_collection_for_key(key: str) -> tuple[str, str]:
         return "equity_curves", key
     if key.startswith("weighted_voting.daily_update.") or key.startswith("weighted_voting.scheduler.daily_update.") or key.startswith("weighted_voting.scheduler.status.") or key.startswith("weighted_voting.scheduler.audit."):
         return "daily_updates", key
+    if key.startswith("weighted_voting.inventory."):
+        if key.startswith("weighted_voting.inventory.positions."):
+            return "positions", key
+        return "inventory", key
     if key.startswith("weighted_voting.migration."):
         return "migrations", key
     return "observability", key

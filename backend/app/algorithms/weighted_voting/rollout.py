@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import hashlib
+import json
 import os
-from typing import Literal, Mapping, Protocol
+from typing import Any, Literal, Mapping, Protocol
 
 
-WEIGHTED_VOTING_ROLLOUT_VERSION = "weighted_voting_rollout_v1"
+WEIGHTED_VOTING_ROLLOUT_VERSION = "weighted_voting_rollout_v2"
 WEIGHTED_VOTING_ROLLOUT_NAMESPACE = "data/algorithms/weighted_voting/rollout/"
 
 WEIGHTED_VOTING_V2_ENABLED = "WEIGHTED_VOTING_V2_ENABLED"
@@ -20,6 +22,26 @@ WEIGHTED_VOTING_AUTO_SUBMIT_ENABLED = "WEIGHTED_VOTING_AUTO_SUBMIT_ENABLED"
 
 ROLLOUT_STATE_KEY = "weighted_voting.rollout.active"
 ROLLBACK_STATE_KEY = "weighted_voting.rollout.previous_valid"
+ROLLOUT_AUDIT_PREFIX = "weighted_voting.rollout.audit."
+ROLLOUT_EVIDENCE_PREFIX = "weighted_voting.rollout.evidence."
+
+WeightedVotingControlledRolloutStage = Literal[
+    "disabled",
+    "background_observation",
+    "shadow_decisions",
+    "manual_paper_submission",
+    "automatic_paper_small_allocation",
+    "automatic_paper_approved_allocation",
+]
+
+CONTROLLED_ROLLOUT_STAGES: tuple[WeightedVotingControlledRolloutStage, ...] = (
+    "disabled",
+    "background_observation",
+    "shadow_decisions",
+    "manual_paper_submission",
+    "automatic_paper_small_allocation",
+    "automatic_paper_approved_allocation",
+)
 
 WeightedVotingRolloutLifecycleState = Literal[
     "disabled",
@@ -162,6 +184,74 @@ class WeightedVotingRolloutValidation:
 
 
 @dataclass(frozen=True)
+class WeightedVotingControlledRolloutEvidence:
+    algorithm_id: Literal["weighted_voting"] = "weighted_voting"
+    no_unresolved_isolation_failures: bool = False
+    inventory_reconciled: bool = False
+    no_duplicate_order_incidents: bool = False
+    worker_reliability_ok: bool = False
+    decision_latency_ok: bool = False
+    broker_latency_ok: bool = False
+    data_freshness_stable: bool = False
+    global_risk_fail_closed_tests_passing: bool = False
+    restart_recovery_successful: bool = False
+    shadow_opportunity_count: int = 0
+    manual_paper_sample_count: int = 0
+    transaction_cost_adjusted_paper_stability_ok: bool = False
+    drawdown_within_limit: bool = False
+    position_pnl_attribution_accurate: bool = False
+    protective_order_reliability_ok: bool = False
+    explicit_configuration_approval: bool = False
+    evidence_id: str = ""
+    evidence_version: str = "weighted_voting_rollout_evidence_v1"
+
+    def __post_init__(self) -> None:
+        if self.algorithm_id != "weighted_voting":
+            raise ValueError("Weighted Voting rollout evidence cannot be supplied for another algorithm")
+
+    def model_dump(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def evidence_hash(self) -> str:
+        return _hash_payload(self.model_dump())
+
+
+@dataclass(frozen=True)
+class WeightedVotingSmallAllocationGuardrails:
+    cap_quantity: int = 10
+    cap_daily_risk_dollars: float = 250.0
+    cap_daily_trades: int = 2
+    approved_active_strategy_ids: tuple[str, ...] = ("S2", "S5", "S6", "S7")
+    pyramiding_enabled: bool = False
+    maximum_spread_percent: float = 0.0005
+    maximum_data_freshness_seconds: int = 65
+    stop_entries_after_reconciliation_discrepancy: bool = True
+    reason_codes: tuple[str, ...] = ("weighted_voting.rollout.small_allocation_guardrails",)
+
+    def model_dump(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class WeightedVotingControlledRolloutPromotion:
+    algorithm_id: Literal["weighted_voting"]
+    from_stage: WeightedVotingControlledRolloutStage
+    to_stage: WeightedVotingControlledRolloutStage
+    promoted: bool
+    evidence_hash: str
+    immutable_audit_id: str
+    actor: str
+    promoted_at: datetime
+    blockers: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+
+    def model_dump(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["promoted_at"] = self.promoted_at.isoformat()
+        return payload
+
+
+@dataclass(frozen=True)
 class WeightedVotingRolloutStageStatus:
     stage: WeightedVotingRolloutStage
     permission: RolloutPermission | str
@@ -184,6 +274,161 @@ class WeightedVotingRolloutStageStatus:
 
 def rollout_feature_flags(environ: Mapping[str, str] | None = None) -> WeightedVotingRolloutFlags:
     return WeightedVotingRolloutFlags.from_env(environ)
+
+
+def default_controlled_rollout_state(*, recorded_at: datetime | None = None) -> dict[str, Any]:
+    timestamp = recorded_at or datetime.now(timezone.utc)
+    return {
+        "algorithm_id": "weighted_voting",
+        "rollout_version": WEIGHTED_VOTING_ROLLOUT_VERSION,
+        "stage": "background_observation",
+        "automatic_paper_submission_allowed": False,
+        "live_trading_allowed": False,
+        "evidence_hash": None,
+        "state_version": f"weighted_voting_rollout_state_{timestamp.strftime('%Y%m%dT%H%M%S')}",
+        "recorded_at": timestamp.isoformat(),
+        "reason_codes": (
+            "weighted_voting.rollout.default_background_observation",
+            "weighted_voting.rollout.default_auto_submit_disabled",
+        ),
+    }
+
+
+def controlled_rollout_status(store: WeightedVotingRolloutStore | None = None) -> dict[str, Any]:
+    state = _read_optional(store, ROLLOUT_STATE_KEY) if store is not None else None
+    active_state = state or default_controlled_rollout_state()
+    stage = str(active_state.get("stage") or "background_observation")
+    return {
+        "algorithm_id": "weighted_voting",
+        "rollout_version": WEIGHTED_VOTING_ROLLOUT_VERSION,
+        "stages": CONTROLLED_ROLLOUT_STAGES,
+        "active_stage": stage,
+        "state": active_state,
+        "automatic_paper_submission_allowed": stage in {"automatic_paper_small_allocation", "automatic_paper_approved_allocation"} and bool(active_state.get("automatic_paper_submission_allowed")),
+        "small_allocation_guardrails": small_allocation_guardrails().model_dump(),
+        "live_trading_allowed": False,
+        "reason_codes": (
+            "weighted_voting.rollout.controlled_stages_explicit",
+            "weighted_voting.rollout.successful_build_not_approval",
+        ),
+    }
+
+
+def evaluate_controlled_rollout_promotion(
+    *,
+    current_stage: WeightedVotingControlledRolloutStage,
+    target_stage: WeightedVotingControlledRolloutStage,
+    evidence: WeightedVotingControlledRolloutEvidence,
+) -> tuple[bool, tuple[str, ...]]:
+    if current_stage not in CONTROLLED_ROLLOUT_STAGES:
+        raise ValueError(f"unknown current Weighted Voting rollout stage: {current_stage}")
+    if target_stage not in CONTROLLED_ROLLOUT_STAGES:
+        raise ValueError(f"unknown target Weighted Voting rollout stage: {target_stage}")
+    if evidence.algorithm_id != "weighted_voting":
+        raise ValueError("Weighted Voting rollout promotion evidence must be attributed to weighted_voting")
+    if CONTROLLED_ROLLOUT_STAGES.index(target_stage) > CONTROLLED_ROLLOUT_STAGES.index(current_stage) + 1:
+        return False, ("weighted_voting.rollout.promotion_must_be_sequential",)
+    blockers = list(_controlled_stage_blockers(target_stage, evidence))
+    return not blockers, tuple(blockers)
+
+
+def promote_controlled_rollout_stage(
+    store: WeightedVotingRolloutStore,
+    *,
+    target_stage: WeightedVotingControlledRolloutStage,
+    evidence: WeightedVotingControlledRolloutEvidence,
+    actor: str,
+    promoted_at: datetime | None = None,
+) -> WeightedVotingControlledRolloutPromotion:
+    timestamp = promoted_at or datetime.now(timezone.utc)
+    current = _read_optional(store, ROLLOUT_STATE_KEY) or default_controlled_rollout_state(recorded_at=timestamp)
+    current_stage = str(current.get("stage") or "background_observation")
+    promoted, blockers = evaluate_controlled_rollout_promotion(
+        current_stage=current_stage,  # type: ignore[arg-type]
+        target_stage=target_stage,
+        evidence=evidence,
+    )
+    evidence_hash = evidence.evidence_hash()
+    audit_id = f"weighted_voting.rollout.audit.{_hash_payload({'from': current_stage, 'to': target_stage, 'evidence': evidence_hash, 'at': timestamp.isoformat(), 'actor': actor})}"
+    promotion = WeightedVotingControlledRolloutPromotion(
+        algorithm_id="weighted_voting",
+        from_stage=current_stage,  # type: ignore[arg-type]
+        to_stage=target_stage,
+        promoted=promoted,
+        evidence_hash=evidence_hash,
+        immutable_audit_id=audit_id,
+        actor=actor,
+        promoted_at=timestamp,
+        blockers=blockers,
+        reason_codes=(
+            "weighted_voting.rollout.promotion_approved"
+            if promoted
+            else "weighted_voting.rollout.promotion_blocked"
+        ,),
+    )
+    store.write_snapshot(f"{ROLLOUT_EVIDENCE_PREFIX}{evidence_hash}", {**evidence.model_dump(), "evidence_hash": evidence_hash})
+    store.write_snapshot(audit_id, promotion.model_dump())
+    if promoted:
+        if current and current.get("status") == "valid":
+            store.write_snapshot(ROLLBACK_STATE_KEY, current)
+        new_state = {
+            "algorithm_id": "weighted_voting",
+            "rollout_version": WEIGHTED_VOTING_ROLLOUT_VERSION,
+            "stage": target_stage,
+            "status": "valid",
+            "automatic_paper_submission_allowed": target_stage in {"automatic_paper_small_allocation", "automatic_paper_approved_allocation"},
+            "live_trading_allowed": False,
+            "evidence_hash": evidence_hash,
+            "state_version": f"weighted_voting_rollout_{target_stage}_{timestamp.strftime('%Y%m%dT%H%M%S')}",
+            "recorded_at": timestamp.isoformat(),
+            "actor": actor,
+            "small_allocation_guardrails": small_allocation_guardrails().model_dump() if target_stage == "automatic_paper_small_allocation" else None,
+            "reason_codes": ("weighted_voting.rollout.stage_persisted",),
+        }
+        store.write_snapshot(ROLLOUT_STATE_KEY, new_state)
+    return promotion
+
+
+def rollback_controlled_rollout_stage(
+    store: WeightedVotingRolloutStore,
+    *,
+    actor: str,
+    rolled_back_at: datetime | None = None,
+) -> dict[str, Any]:
+    timestamp = rolled_back_at or datetime.now(timezone.utc)
+    previous = _read_optional(store, ROLLBACK_STATE_KEY)
+    if previous is None:
+        previous = {
+            **default_controlled_rollout_state(recorded_at=timestamp),
+            "stage": "manual_paper_submission",
+            "automatic_paper_submission_allowed": False,
+            "reason_codes": ("weighted_voting.rollout.rollback_default_manual_paper_safe_state",),
+        }
+    restored = {
+        **previous,
+        "automatic_paper_submission_allowed": False if previous.get("stage") != "automatic_paper_approved_allocation" else bool(previous.get("automatic_paper_submission_allowed", False)),
+        "restored_at": timestamp.isoformat(),
+        "restored_by": actor,
+        "reason_codes": tuple(dict.fromkeys([*(previous.get("reason_codes") or ()), "weighted_voting.rollout.rollback_immediate_safe"])),
+    }
+    store.write_snapshot(ROLLOUT_STATE_KEY, restored)
+    store.write_snapshot(
+        f"{ROLLOUT_AUDIT_PREFIX}rollback.{_hash_payload(restored)}",
+        {
+            "algorithm_id": "weighted_voting",
+            "rollout_version": WEIGHTED_VOTING_ROLLOUT_VERSION,
+            "action": "rollback",
+            "actor": actor,
+            "restored_state": restored,
+            "recorded_at": timestamp.isoformat(),
+            "reason_codes": ("weighted_voting.rollout.rollback_audited",),
+        },
+    )
+    return restored
+
+
+def small_allocation_guardrails() -> WeightedVotingSmallAllocationGuardrails:
+    return WeightedVotingSmallAllocationGuardrails()
 
 
 def evaluate_weighted_voting_rollout_control(
@@ -286,6 +531,8 @@ def rollout_status(
         "rollout_version": WEIGHTED_VOTING_ROLLOUT_VERSION,
         "namespace": WEIGHTED_VOTING_ROLLOUT_NAMESPACE,
         "allowed_states": WEIGHTED_VOTING_ROLLOUT_STATES,
+        "controlled_stages": CONTROLLED_ROLLOUT_STAGES,
+        "controlled_rollout": controlled_rollout_status(),
         "control": control.model_dump(),
         "effective_state": control.effective_state,
         "feature_flags": active_flags.model_dump(),
@@ -309,7 +556,10 @@ def automatic_submission_allowed(
     *,
     flags: WeightedVotingRolloutFlags | None = None,
     validation: WeightedVotingRolloutValidation | None = None,
+    store: WeightedVotingRolloutStore | None = None,
 ) -> bool:
+    if store is not None:
+        return bool(controlled_rollout_status(store)["automatic_paper_submission_allowed"])
     status = evaluate_rollout_stage(
         "automatic_paper_submission",
         flags=flags or rollout_feature_flags(),
@@ -403,6 +653,50 @@ def _stage_blockers(stage: WeightedVotingRolloutStage, flags: WeightedVotingRoll
     return list(dict.fromkeys(blockers))
 
 
+def _controlled_stage_blockers(stage: WeightedVotingControlledRolloutStage, evidence: WeightedVotingControlledRolloutEvidence) -> tuple[str, ...]:
+    if stage == "disabled":
+        return ()
+    checks: list[tuple[bool, str]] = []
+    if stage in {"background_observation", "shadow_decisions", "manual_paper_submission", "automatic_paper_small_allocation", "automatic_paper_approved_allocation"}:
+        checks.extend(
+            (
+                (evidence.no_unresolved_isolation_failures, "weighted_voting.rollout.isolation_failures_unresolved"),
+                (evidence.global_risk_fail_closed_tests_passing, "weighted_voting.rollout.global_risk_fail_closed_tests_missing"),
+            )
+        )
+    if stage in {"shadow_decisions", "manual_paper_submission", "automatic_paper_small_allocation", "automatic_paper_approved_allocation"}:
+        checks.append((evidence.shadow_opportunity_count >= 50, "weighted_voting.rollout.shadow_opportunity_minimum_not_met"))
+    if stage in {"manual_paper_submission", "automatic_paper_small_allocation", "automatic_paper_approved_allocation"}:
+        checks.extend(
+            (
+                (evidence.inventory_reconciled, "weighted_voting.rollout.inventory_unreconciled"),
+                (evidence.no_duplicate_order_incidents, "weighted_voting.rollout.duplicate_order_incidents"),
+                (evidence.worker_reliability_ok, "weighted_voting.rollout.worker_reliability_unacceptable"),
+                (evidence.decision_latency_ok, "weighted_voting.rollout.decision_latency_unacceptable"),
+                (evidence.broker_latency_ok, "weighted_voting.rollout.broker_latency_unacceptable"),
+                (evidence.data_freshness_stable, "weighted_voting.rollout.data_freshness_unstable"),
+                (evidence.restart_recovery_successful, "weighted_voting.rollout.restart_recovery_missing"),
+                (evidence.position_pnl_attribution_accurate, "weighted_voting.rollout.position_pnl_attribution_unverified"),
+                (evidence.protective_order_reliability_ok, "weighted_voting.rollout.protective_order_reliability_unverified"),
+                (evidence.explicit_configuration_approval, "weighted_voting.rollout.explicit_configuration_approval_missing"),
+            )
+        )
+    if stage in {"automatic_paper_small_allocation", "automatic_paper_approved_allocation"}:
+        checks.extend(
+            (
+                (evidence.manual_paper_sample_count >= 20, "weighted_voting.rollout.manual_paper_sample_minimum_not_met"),
+                (evidence.transaction_cost_adjusted_paper_stability_ok, "weighted_voting.rollout.paper_stability_unacceptable"),
+                (evidence.drawdown_within_limit, "weighted_voting.rollout.drawdown_limit_exceeded"),
+            )
+        )
+    return tuple(reason for passed, reason in checks if not passed)
+
+
+def _hash_payload(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
 def _env_bool(source: Mapping[str, str], key: str, default: bool) -> bool:
     raw = source.get(key)
     if raw is None:
@@ -415,3 +709,32 @@ def _read_optional(store: WeightedVotingRolloutStore, key: str) -> dict | None:
         return store.read_snapshot(key)
     except KeyError:
         return None
+
+
+__all__ = [
+    "CONTROLLED_ROLLOUT_STAGES",
+    "ROLLOUT_AUDIT_PREFIX",
+    "ROLLOUT_EVIDENCE_PREFIX",
+    "ROLLOUT_STATE_KEY",
+    "ROLLBACK_STATE_KEY",
+    "WEIGHTED_VOTING_ROLLOUT_STATES",
+    "WEIGHTED_VOTING_ROLLOUT_VERSION",
+    "WeightedVotingControlledRolloutEvidence",
+    "WeightedVotingControlledRolloutPromotion",
+    "WeightedVotingRolloutFlags",
+    "WeightedVotingRolloutValidation",
+    "WeightedVotingSmallAllocationGuardrails",
+    "automatic_submission_allowed",
+    "controlled_rollout_status",
+    "default_controlled_rollout_state",
+    "evaluate_controlled_rollout_promotion",
+    "evaluate_rollout_stage",
+    "evaluate_weighted_voting_rollout_control",
+    "promote_controlled_rollout_stage",
+    "record_valid_rollout_state",
+    "rollback_controlled_rollout_stage",
+    "rollback_weighted_voting_rollout",
+    "rollout_feature_flags",
+    "rollout_status",
+    "small_allocation_guardrails",
+]

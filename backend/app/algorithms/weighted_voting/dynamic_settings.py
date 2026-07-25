@@ -24,6 +24,7 @@ from backend.app.algorithms.weighted_voting.models import (
     WeightedLiquidityLevel,
     WeightedMarketCondition,
     WeightedMarketQuality,
+    WeightedSessionPhase,
     WeightedVolatilityLevel,
 )
 
@@ -50,14 +51,19 @@ SETTING_FIELDS = (
     "maximum_trades",
     "maximum_daily_loss_percent",
     "maximum_participation_rate",
+    "family_exposure_cap",
+    "correlation_penalty",
     "minimum_score",
     "minimum_edge",
     "minimum_active_strategies",
     "minimum_directional_strategies",
+    "minimum_independent_supporting_strategies",
+    "maximum_opposing_score",
     "maximum_spread_percent",
     "minimum_liquidity_volume",
     "atr_stop_multiplier",
     "minimum_stop_distance_percent",
+    "maximum_stop_distance_percent",
     "target_r",
     "entry_buffer_percent",
     "break_even_trigger_r",
@@ -65,7 +71,13 @@ SETTING_FIELDS = (
     "time_stop_minutes",
     "session_cutoff_minutes",
     "slippage_allowance_per_share",
+    "fee_per_share",
     "cooldown_seconds",
+    "stale_data_threshold_seconds",
+    "quote_freshness_threshold_seconds",
+    "volatility_multiplier",
+    "liquidity_multiplier",
+    "session_multiplier",
 )
 
 INTEGER_FIELDS = {
@@ -73,9 +85,12 @@ INTEGER_FIELDS = {
     "maximum_trades",
     "minimum_active_strategies",
     "minimum_directional_strategies",
+    "minimum_independent_supporting_strategies",
     "time_stop_minutes",
     "session_cutoff_minutes",
     "cooldown_seconds",
+    "stale_data_threshold_seconds",
+    "quote_freshness_threshold_seconds",
 }
 
 LEGACY_PERCENT_TO_RATE_FIELDS = {
@@ -105,11 +120,14 @@ LEGACY_FIELD_MAP = {
     "minimumEdge": "minimum_edge",
     "minimumActiveStrategies": "minimum_active_strategies",
     "minimumDirectionalStrategies": "minimum_directional_strategies",
+    "minimumIndependentSupportingStrategies": "minimum_independent_supporting_strategies",
+    "maximumOpposingScore": "maximum_opposing_score",
     "maximumSpreadPercent": "maximum_spread_percent",
     "minimumOneMinuteVolume": "minimum_liquidity_volume",
     "minimumLiquidityVolume": "minimum_liquidity_volume",
     "atrStopMultiplier": "atr_stop_multiplier",
     "minimumStopDistancePercent": "minimum_stop_distance_percent",
+    "maximumStopDistancePercent": "maximum_stop_distance_percent",
     "takeProfitR": "target_r",
     "targetR": "target_r",
     "entryBufferPercent": "entry_buffer_percent",
@@ -117,6 +135,8 @@ LEGACY_FIELD_MAP = {
     "trailingStopAtrMultiplier": "trailing_stop_atr_multiplier",
     "timeStopMinutes": "time_stop_minutes",
     "sessionCutoffMinutes": "session_cutoff_minutes",
+    "staleDataThresholdSeconds": "stale_data_threshold_seconds",
+    "quoteFreshnessThresholdSeconds": "quote_freshness_threshold_seconds",
     "pyramidingEnabled": "pyramiding_enabled",
 }
 
@@ -125,16 +145,21 @@ SETTING_CATEGORY = {
     "maximum_daily_loss_percent": "risk",
     "maximum_position_percent": "position_exposure",
     "maximum_shares": "position_exposure",
+    "family_exposure_cap": "position_exposure",
     "order_allocation_percent": "order_allocation",
     "minimum_score": "entry_strictness",
     "minimum_edge": "entry_strictness",
     "minimum_active_strategies": "entry_strictness",
     "minimum_directional_strategies": "entry_strictness",
+    "minimum_independent_supporting_strategies": "entry_strictness",
+    "maximum_opposing_score": "entry_strictness",
+    "correlation_penalty": "entry_strictness",
     "maximum_spread_percent": "entry_strictness",
     "minimum_liquidity_volume": "entry_strictness",
     "entry_buffer_percent": "entry_strictness",
     "atr_stop_multiplier": "stop_distance",
     "minimum_stop_distance_percent": "stop_distance",
+    "maximum_stop_distance_percent": "stop_distance",
     "trailing_stop_atr_multiplier": "stop_distance",
     "target_r": "target_distance",
     "break_even_trigger_r": "target_distance",
@@ -145,6 +170,12 @@ SETTING_CATEGORY = {
     "session_cutoff_minutes": "trade_frequency",
     "cooldown_seconds": "trade_frequency",
     "slippage_allowance_per_share": "execution_cost",
+    "fee_per_share": "execution_cost",
+    "stale_data_threshold_seconds": "data_freshness",
+    "quote_freshness_threshold_seconds": "data_freshness",
+    "volatility_multiplier": "market_condition_multiplier",
+    "liquidity_multiplier": "market_condition_multiplier",
+    "session_multiplier": "market_condition_multiplier",
 }
 
 TIGHTENING_FIELDS = {
@@ -156,6 +187,9 @@ TIGHTENING_FIELDS = {
     "entry_buffer_percent",
     "minimum_stop_distance_percent",
     "slippage_allowance_per_share",
+    "fee_per_share",
+    "stale_data_threshold_seconds",
+    "quote_freshness_threshold_seconds",
 }
 
 
@@ -172,14 +206,19 @@ def default_weighted_settings(*, timestamp: datetime | None = None, baseline_con
         maximum_trades=baseline.maximum_weighted_daily_trades,
         maximum_daily_loss_percent=baseline.maximum_weighted_daily_loss_percent,
         maximum_participation_rate=baseline.maximum_participation_rate,
+        family_exposure_cap=baseline.maximum_family_weight,
+        correlation_penalty=baseline.correlation_penalty,
         minimum_score=baseline.minimum_score,
         minimum_edge=baseline.minimum_edge,
         minimum_active_strategies=baseline.minimum_active_strategies,
         minimum_directional_strategies=baseline.minimum_directional_strategies,
+        minimum_independent_supporting_strategies=baseline.minimum_directional_strategies,
+        maximum_opposing_score=baseline.maximum_disagreement_score,
         maximum_spread_percent=baseline.local_max_spread_percent,
         minimum_liquidity_volume=baseline.local_minimum_liquidity_volume,
         atr_stop_multiplier=baseline.atr_stop_multiplier,
         minimum_stop_distance_percent=baseline.minimum_stop_distance_percent,
+        maximum_stop_distance_percent=baseline.maximum_stop_distance_percent,
         target_r=baseline.target_r,
         entry_buffer_percent=baseline.entry_buffer_percent,
         break_even_trigger_r=baseline.break_even_trigger_r,
@@ -187,9 +226,25 @@ def default_weighted_settings(*, timestamp: datetime | None = None, baseline_con
         time_stop_minutes=baseline.time_stop_minutes,
         session_cutoff_minutes=baseline.session_cutoff_minutes,
         slippage_allowance_per_share=baseline.entry_slippage_per_share,
+        fee_per_share=baseline.fee_per_share,
         cooldown_seconds=300,
+        stale_data_threshold_seconds=baseline.data_freshness_limit_seconds,
+        quote_freshness_threshold_seconds=baseline.quote_freshness_limit_seconds,
+        volatility_multiplier=baseline.volatility_multiplier,
+        liquidity_multiplier=baseline.liquidity_multiplier,
+        session_multiplier=baseline.session_multiplier,
+        strategy_states=dict(baseline.strategy_states),
         strategy_eligibility=dict(baseline.strategy_enablement),
         strategy_risk_multipliers={strategy_id: 1.0 for strategy_id in baseline.strategy_enablement},
+        baseline_strategy_weights=dict(baseline.strategy_baseline_weights),
+        minimum_strategy_weights=dict(baseline.strategy_minimum_weights),
+        maximum_strategy_weights=dict(baseline.strategy_maximum_weights),
+        family_exposure_caps=dict(baseline.family_exposure_caps),
+        trailing_stop_policy=baseline.trailing_stop_policy,
+        strategy_time_stops_minutes=dict(baseline.strategy_time_stop_minutes),
+        end_of_day_liquidation_time=baseline.end_of_day_liquidation_time,
+        entry_cutoff_time=baseline.entry_cutoff_time,
+        event_risk_action=baseline.event_risk_action,
         pyramiding_enabled=baseline.allow_weighted_pyramiding,
         max_position_percent=baseline.maximum_position_percent,
         max_daily_loss_percent=baseline.maximum_weighted_daily_loss_percent,
@@ -271,6 +326,9 @@ def resolve_effective_settings(
     expires_at = expiration_timestamp or effective_timestamp + timedelta(seconds=WEIGHTED_VOTING_DYNAMIC_SETTINGS_TTL_SECONDS)
     strategy_eligibility = _resolve_strategy_eligibility(defaults, dynamic_values or {}, None, envelope)
     strategy_risk_multipliers = _resolve_strategy_risk_multipliers(defaults, dynamic_values or {}, None, envelope, limits)
+    strategy_states = _resolve_strategy_states(defaults, dynamic_values or {}, None, envelope)
+    strategy_time_stops = _resolve_strategy_time_stops(defaults, dynamic_values or {}, limits, envelope)
+    family_exposure_caps = _resolve_family_exposure_caps(defaults, dynamic_values or {}, limits, envelope)
     settings_version = f"{WEIGHTED_VOTING_EFFECTIVE_SETTINGS_VERSION}_{effective_timestamp.strftime('%Y%m%dT%H%M%S')}"
     configuration_hash = _configuration_hash(
         defaults,
@@ -278,8 +336,18 @@ def resolve_effective_settings(
         limits,
         {
             **resolved,
+            "strategyStates": strategy_states,
             "strategyEligibility": strategy_eligibility,
             "strategyRiskMultipliers": strategy_risk_multipliers,
+            "baselineStrategyWeights": defaults.baseline_strategy_weights,
+            "minimumStrategyWeights": defaults.minimum_strategy_weights,
+            "maximumStrategyWeights": defaults.maximum_strategy_weights,
+            "familyExposureCaps": family_exposure_caps,
+            "trailingStopPolicy": defaults.trailing_stop_policy,
+            "strategyTimeStopsMinutes": strategy_time_stops,
+            "endOfDayLiquidationTime": defaults.end_of_day_liquidation_time,
+            "entryCutoffTime": defaults.entry_cutoff_time,
+            "eventRiskAction": defaults.event_risk_action,
             "baselineConfigurationHash": baseline.configuration_hash,
             "marketConditionInput": market_condition_input or {},
         },
@@ -299,8 +367,18 @@ def resolve_effective_settings(
         hard_limit_version=limits.limits_version,
         configuration_version=configuration_version,
         configuration_hash=configuration_hash,
+        strategy_states=strategy_states,
         strategy_eligibility=strategy_eligibility,
         strategy_risk_multipliers=strategy_risk_multipliers,
+        baseline_strategy_weights=dict(defaults.baseline_strategy_weights),
+        minimum_strategy_weights=dict(defaults.minimum_strategy_weights),
+        maximum_strategy_weights=dict(defaults.maximum_strategy_weights),
+        family_exposure_caps=family_exposure_caps,
+        trailing_stop_policy=defaults.trailing_stop_policy,
+        strategy_time_stops_minutes=strategy_time_stops,
+        end_of_day_liquidation_time=defaults.end_of_day_liquidation_time,
+        entry_cutoff_time=defaults.entry_cutoff_time,
+        event_risk_action=defaults.event_risk_action,
         reason_codes=tuple(dict.fromkeys(reason_codes)),
         explanation="Backend-authoritative Weighted Voting settings resolved from defaults, dynamic envelope, and hard limits.",
         **resolved,
@@ -414,7 +492,14 @@ def resolve_dynamic_settings_for_condition(
     expires_at = effective_timestamp + timedelta(seconds=WEIGHTED_VOTING_DYNAMIC_SETTINGS_TTL_SECONDS)
     strategy_eligibility = _resolve_strategy_eligibility(default_settings, {}, condition, dynamic_envelope)
     strategy_risk_multipliers = _resolve_strategy_risk_multipliers(default_settings, {}, condition, dynamic_envelope, hard_limits)
+    strategy_states = _resolve_strategy_states(default_settings, {}, condition, dynamic_envelope)
+    strategy_time_stops = _resolve_strategy_time_stops(default_settings, {}, hard_limits, dynamic_envelope)
+    family_exposure_caps = _resolve_family_exposure_caps(default_settings, {}, hard_limits, dynamic_envelope)
     condition_input = condition.model_dump(mode="json")
+    profile_token = _profile_token(condition)
+    resolved["volatility_multiplier"] = round(multipliers["risk"], 10)
+    resolved["liquidity_multiplier"] = _liquidity_setting_multiplier(condition)
+    resolved["session_multiplier"] = _session_setting_multiplier(condition)
     configuration_hash = _configuration_hash(
         default_settings,
         dynamic_envelope,
@@ -422,14 +507,24 @@ def resolve_dynamic_settings_for_condition(
         {
             **resolved,
             "condition": condition_input,
+            "strategyStates": strategy_states,
             "strategyEligibility": strategy_eligibility,
             "strategyRiskMultipliers": strategy_risk_multipliers,
+            "baselineStrategyWeights": default_settings.baseline_strategy_weights,
+            "minimumStrategyWeights": default_settings.minimum_strategy_weights,
+            "maximumStrategyWeights": default_settings.maximum_strategy_weights,
+            "familyExposureCaps": family_exposure_caps,
+            "trailingStopPolicy": default_settings.trailing_stop_policy,
+            "strategyTimeStopsMinutes": strategy_time_stops,
+            "endOfDayLiquidationTime": default_settings.end_of_day_liquidation_time,
+            "entryCutoffTime": default_settings.entry_cutoff_time,
+            "eventRiskAction": default_settings.event_risk_action,
             "baselineConfigurationHash": baseline.configuration_hash,
         },
         configuration_version,
     )
     return WeightedEffectiveSettings(
-        settings_version=f"{WEIGHTED_VOTING_EFFECTIVE_SETTINGS_VERSION}_{effective_timestamp.strftime('%Y%m%dT%H%M%S')}",
+        settings_version=f"{WEIGHTED_VOTING_EFFECTIVE_SETTINGS_VERSION}_{profile_token}_{effective_timestamp.strftime('%Y%m%dT%H%M%S')}",
         settings_timestamp=effective_timestamp,
         default_settings=default_settings,
         dynamic_envelope=dynamic_envelope,
@@ -438,12 +533,22 @@ def resolve_dynamic_settings_for_condition(
         source_evidence=tuple(dict.fromkeys(("weighted_voting.baseline_configuration", *condition.reason_codes))),
         market_condition_input=condition_input,
         baseline_configuration_version=baseline.config_version,
-        dynamic_profile_version=dynamic_profile_version,
+        dynamic_profile_version=f"{dynamic_profile_version}_{profile_token}",
         hard_limit_version=hard_limits.limits_version,
         configuration_version=configuration_version,
         configuration_hash=configuration_hash,
+        strategy_states=strategy_states,
         strategy_eligibility=strategy_eligibility,
         strategy_risk_multipliers=strategy_risk_multipliers,
+        baseline_strategy_weights=dict(default_settings.baseline_strategy_weights),
+        minimum_strategy_weights=dict(default_settings.minimum_strategy_weights),
+        maximum_strategy_weights=dict(default_settings.maximum_strategy_weights),
+        family_exposure_caps=family_exposure_caps,
+        trailing_stop_policy=default_settings.trailing_stop_policy,
+        strategy_time_stops_minutes=strategy_time_stops,
+        end_of_day_liquidation_time=default_settings.end_of_day_liquidation_time,
+        entry_cutoff_time=default_settings.entry_cutoff_time,
+        event_risk_action=default_settings.event_risk_action,
         dynamic_adjustments=tuple(adjustments),
         reason_codes=tuple(dict.fromkeys(reason_codes)),
         explanation="Condition-driven Weighted Voting settings resolved deterministically from defaults and market-condition inputs.",
@@ -487,14 +592,19 @@ def _clamp_to_hard_limits(field_name: str, value: Any, limits: WeightedHardLimit
         "maximum_trades": (0, limits.maximum_trades),
         "maximum_daily_loss_percent": (0.0, limits.maximum_daily_loss_percent),
         "maximum_participation_rate": (0.0, limits.maximum_participation_rate),
+        "family_exposure_cap": (0.0, limits.maximum_family_exposure_cap),
+        "correlation_penalty": (0.0, limits.maximum_correlation_penalty),
         "minimum_score": (limits.minimum_score_floor, limits.minimum_score_ceiling),
         "minimum_edge": (limits.minimum_edge_floor, limits.minimum_edge_ceiling),
         "minimum_active_strategies": (limits.minimum_active_strategies_floor, 8),
         "minimum_directional_strategies": (limits.minimum_directional_strategies_floor, 8),
+        "minimum_independent_supporting_strategies": (limits.minimum_independent_supporting_strategies_floor, limits.maximum_independent_supporting_strategies),
+        "maximum_opposing_score": (0.0, limits.maximum_opposing_score),
         "maximum_spread_percent": (0.0, limits.maximum_spread_percent),
         "minimum_liquidity_volume": (limits.minimum_liquidity_volume_floor, limits.maximum_liquidity_volume_requirement),
         "atr_stop_multiplier": (limits.minimum_atr_stop_multiplier, limits.maximum_atr_stop_multiplier),
         "minimum_stop_distance_percent": (limits.minimum_stop_distance_percent_floor, limits.maximum_stop_distance_percent),
+        "maximum_stop_distance_percent": (limits.minimum_stop_distance_percent_floor, limits.maximum_stop_distance_percent),
         "target_r": (limits.minimum_target_r, limits.maximum_target_r),
         "entry_buffer_percent": (0.0, limits.maximum_entry_buffer_percent),
         "break_even_trigger_r": (0.0, limits.maximum_break_even_trigger_r),
@@ -502,7 +612,13 @@ def _clamp_to_hard_limits(field_name: str, value: Any, limits: WeightedHardLimit
         "time_stop_minutes": (0, limits.maximum_time_stop_minutes),
         "session_cutoff_minutes": (0, limits.maximum_session_cutoff_minutes),
         "slippage_allowance_per_share": (0.0, limits.maximum_slippage_allowance_per_share),
+        "fee_per_share": (0.0, limits.maximum_fee_per_share),
         "cooldown_seconds": (0, limits.maximum_cooldown_seconds),
+        "stale_data_threshold_seconds": (0, limits.maximum_stale_data_threshold_seconds),
+        "quote_freshness_threshold_seconds": (0, limits.maximum_quote_freshness_threshold_seconds),
+        "volatility_multiplier": (0.0, limits.maximum_volatility_multiplier),
+        "liquidity_multiplier": (0.0, limits.maximum_liquidity_multiplier),
+        "session_multiplier": (0.0, limits.maximum_session_multiplier),
     }
     lower, upper = bounds[field_name]
     return max(lower, min(upper, value))
@@ -540,14 +656,19 @@ def _hard_limit_value(field_name: str, limits: WeightedHardLimits) -> float | in
         "maximum_trades": limits.maximum_trades,
         "maximum_daily_loss_percent": limits.maximum_daily_loss_percent,
         "maximum_participation_rate": limits.maximum_participation_rate,
+        "family_exposure_cap": limits.maximum_family_exposure_cap,
+        "correlation_penalty": limits.maximum_correlation_penalty,
         "minimum_score": limits.minimum_score_ceiling,
         "minimum_edge": limits.minimum_edge_ceiling,
         "minimum_active_strategies": 8,
         "minimum_directional_strategies": 8,
+        "minimum_independent_supporting_strategies": limits.maximum_independent_supporting_strategies,
+        "maximum_opposing_score": limits.maximum_opposing_score,
         "maximum_spread_percent": limits.maximum_spread_percent,
         "minimum_liquidity_volume": limits.maximum_liquidity_volume_requirement,
         "atr_stop_multiplier": limits.maximum_atr_stop_multiplier,
         "minimum_stop_distance_percent": limits.maximum_stop_distance_percent,
+        "maximum_stop_distance_percent": limits.maximum_stop_distance_percent,
         "target_r": limits.maximum_target_r,
         "entry_buffer_percent": limits.maximum_entry_buffer_percent,
         "break_even_trigger_r": limits.maximum_break_even_trigger_r,
@@ -555,7 +676,13 @@ def _hard_limit_value(field_name: str, limits: WeightedHardLimits) -> float | in
         "time_stop_minutes": limits.maximum_time_stop_minutes,
         "session_cutoff_minutes": limits.maximum_session_cutoff_minutes,
         "slippage_allowance_per_share": limits.maximum_slippage_allowance_per_share,
+        "fee_per_share": limits.maximum_fee_per_share,
         "cooldown_seconds": limits.maximum_cooldown_seconds,
+        "stale_data_threshold_seconds": limits.maximum_stale_data_threshold_seconds,
+        "quote_freshness_threshold_seconds": limits.maximum_quote_freshness_threshold_seconds,
+        "volatility_multiplier": limits.maximum_volatility_multiplier,
+        "liquidity_multiplier": limits.maximum_liquidity_multiplier,
+        "session_multiplier": limits.maximum_session_multiplier,
     }
     return hard_limits[field_name]
 
@@ -571,6 +698,8 @@ def _condition_multipliers(condition: WeightedMarketCondition) -> tuple[dict[str
         "participation_rate": 1.0,
         "trade_frequency": 1.0,
         "execution_cost": 1.0,
+        "data_freshness": 1.0,
+        "market_condition_multiplier": 1.0,
     }
     reasons = ["weighted_voting.dynamic_settings.condition_inputs"]
     quality = str(condition.market_quality)
@@ -598,11 +727,11 @@ def _condition_multipliers(condition: WeightedMarketCondition) -> tuple[dict[str
 
     if volatility == WeightedVolatilityLevel.HIGH.value:
         _scale(multipliers, ("risk", "position_exposure", "order_allocation", "participation_rate"), 0.70)
-        _scale(multipliers, ("entry_strictness", "stop_distance", "execution_cost"), 1.20)
+        _scale(multipliers, ("entry_strictness", "stop_distance", "execution_cost", "data_freshness"), 1.20)
         reasons.append("weighted_voting.dynamic_settings.high_volatility")
     if volatility == WeightedVolatilityLevel.EXTREME.value:
         _zero_new_entry_risk(multipliers)
-        _scale(multipliers, ("entry_strictness", "stop_distance", "execution_cost"), 1.50)
+        _scale(multipliers, ("entry_strictness", "stop_distance", "execution_cost", "data_freshness"), 1.50)
         reasons.append("weighted_voting.dynamic_settings.extreme_volatility_zero_new_entry_risk")
     if liquidity == WeightedLiquidityLevel.REDUCED.value:
         _scale(multipliers, ("risk", "position_exposure", "order_allocation", "participation_rate", "trade_frequency"), 0.65)
@@ -638,6 +767,89 @@ def _scale(multipliers: dict[str, float], categories: tuple[str, ...], factor: f
 def _zero_new_entry_risk(multipliers: dict[str, float]) -> None:
     for category in ("risk", "position_exposure", "order_allocation", "participation_rate", "trade_frequency"):
         multipliers[category] = 0.0
+
+
+def _profile_token(condition: WeightedMarketCondition) -> str:
+    return "_".join(
+        str(part).replace(".", "_")
+        for part in (
+            condition.market_quality,
+            condition.volatility_level,
+            condition.liquidity_level,
+            condition.event_risk,
+            condition.session_phase,
+        )
+    )
+
+
+def _liquidity_setting_multiplier(condition: WeightedMarketCondition) -> float:
+    liquidity = str(condition.liquidity_level)
+    if liquidity == WeightedLiquidityLevel.POOR.value:
+        return 0.0
+    if liquidity == WeightedLiquidityLevel.REDUCED.value:
+        return 0.65
+    return 1.0
+
+
+def _session_setting_multiplier(condition: WeightedMarketCondition) -> float:
+    phase = str(condition.session_phase)
+    if phase in {WeightedSessionPhase.OUTSIDE_SESSION.value, WeightedSessionPhase.UNKNOWN.value}:
+        return 0.0
+    if phase == WeightedSessionPhase.OPENING.value:
+        return 0.75
+    return 1.0
+
+
+def _resolve_strategy_states(
+    defaults: WeightedDefaultSettings,
+    dynamic_values: dict[str, Any],
+    condition: WeightedMarketCondition | None,
+    envelope: WeightedDynamicEnvelope,
+) -> dict[str, str]:
+    catalog_ids = _catalog_strategy_ids()
+    states = {strategy_id: str(defaults.strategy_states.get(strategy_id, "active")) for strategy_id in catalog_ids}
+    requested = dynamic_values.get("strategy_states") if envelope.enabled else None
+    if isinstance(requested, dict):
+        for strategy_id in catalog_ids:
+            candidate = str(requested.get(strategy_id, states[strategy_id])).lower()
+            if candidate in {"active", "shadow", "disabled", "not_data_ready", "retired"}:
+                states[strategy_id] = candidate
+    if condition is not None:
+        eligibility = _resolve_strategy_eligibility(defaults, {}, condition, envelope)
+        states = {strategy_id: states[strategy_id] if eligibility[strategy_id] else "disabled" for strategy_id in catalog_ids}
+    return states
+
+
+def _resolve_strategy_time_stops(
+    defaults: WeightedDefaultSettings,
+    dynamic_values: dict[str, Any],
+    limits: WeightedHardLimits,
+    envelope: WeightedDynamicEnvelope,
+) -> dict[str, int]:
+    catalog_ids = _catalog_strategy_ids()
+    stops = {strategy_id: int(defaults.strategy_time_stops_minutes.get(strategy_id, defaults.time_stop_minutes)) for strategy_id in catalog_ids}
+    requested = dynamic_values.get("strategy_time_stops_minutes") if envelope.enabled else None
+    if isinstance(requested, dict):
+        for strategy_id in catalog_ids:
+            if strategy_id in requested:
+                stops[strategy_id] = int(round(_number(requested[strategy_id], stops[strategy_id])))
+    return {strategy_id: max(0, min(limits.maximum_time_stop_minutes, minutes)) for strategy_id, minutes in stops.items()}
+
+
+def _resolve_family_exposure_caps(
+    defaults: WeightedDefaultSettings,
+    dynamic_values: dict[str, Any],
+    limits: WeightedHardLimits,
+    envelope: WeightedDynamicEnvelope,
+) -> dict[str, float]:
+    families = tuple(dict.fromkeys(_enum_text(entry.family) for entry in WEIGHTED_VOTING_STRATEGY_CATALOG))
+    caps = {family: float(defaults.family_exposure_caps.get(family, defaults.family_exposure_cap)) for family in families}
+    requested = dynamic_values.get("family_exposure_caps") if envelope.enabled else None
+    if isinstance(requested, dict):
+        for family in families:
+            if family in requested:
+                caps[family] = _number(requested[family], caps[family])
+    return {family: round(max(0.0, min(limits.maximum_family_exposure_cap, value)), 10) for family, value in caps.items()}
 
 
 def _resolve_strategy_eligibility(
@@ -722,6 +934,10 @@ def _contains_foreign_dynamic_settings_source(value: Any) -> bool:
     elif isinstance(value, (list, tuple, set)):
         return any(_contains_foreign_dynamic_settings_source(item) for item in value)
     return False
+
+
+def _enum_text(value: Any) -> str:
+    return str(getattr(value, "value", value))
 
 
 def _configuration_hash(

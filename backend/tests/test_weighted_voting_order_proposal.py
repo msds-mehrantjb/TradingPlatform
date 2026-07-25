@@ -79,7 +79,7 @@ class WeightedVotingOrderProposalTest(unittest.TestCase):
         self.assertEqual(proposal.symbol, "SPY")
         self.assertEqual(proposal.side, WeightedSide.BUY.value)
         self.assertEqual(proposal.quantity, 12)
-        self.assertEqual(proposal.strategy_versions, {"S1": "weighted_strategy_test_v1"})
+        self.assertEqual(proposal.strategy_versions, {"S2": "weighted_strategy_test_v1"})
         self.assertEqual(proposal.weight_version, decision.weight_version)
         self.assertEqual(proposal.settings_version, settings.settings_version)
         self.assertEqual(proposal.market_snapshot_hash, snapshot.data_manifest_hash)
@@ -163,10 +163,10 @@ def weighted_decision():
 def strategy_signals() -> list[WeightedVotingSignal]:
     return [
         WeightedVotingSignal(
-            strategy_id="S1",
-            strategy_name="S1 synthetic",
+            strategy_id="S2",
+            strategy_name="S2 synthetic",
             strategy_version="weighted_strategy_test_v1",
-            family=WeightedStrategyFamily.BREAKOUT,
+            family=WeightedStrategyFamily.TREND,
             signal=WeightedSide.BUY,
             p_buy=0.8,
             p_sell=0.1,

@@ -113,6 +113,29 @@ class WeightedVotingSettingsTest(unittest.TestCase):
         self.assertEqual(effective.expiration_timestamp, TS + timedelta(seconds=WEIGHTED_VOTING_DYNAMIC_SETTINGS_TTL_SECONDS))
         self.assertEqual(effective.strategy_eligibility["S1"], defaults.strategy_eligibility["S1"])
 
+    def test_step6_dedicated_settings_surface_is_weighted_voting_owned(self) -> None:
+        config = WeightedVotingConfig()
+        defaults = default_weighted_settings(timestamp=TS, baseline_config=config)
+
+        self.assertEqual(defaults.strategy_states["S1"], "shadow")
+        self.assertEqual(defaults.strategy_states["S2"], "active")
+        self.assertEqual(defaults.strategy_eligibility, config.strategy_enablement)
+        self.assertEqual(defaults.baseline_strategy_weights, config.strategy_baseline_weights)
+        self.assertEqual(defaults.minimum_strategy_weights, config.strategy_minimum_weights)
+        self.assertEqual(defaults.maximum_strategy_weights, config.strategy_maximum_weights)
+        self.assertEqual(defaults.family_exposure_caps, config.family_exposure_caps)
+        self.assertEqual(defaults.correlation_penalty, config.correlation_penalty)
+        self.assertEqual(defaults.fee_per_share, config.fee_per_share)
+        self.assertEqual(defaults.maximum_stop_distance_percent, config.maximum_stop_distance_percent)
+        self.assertEqual(defaults.trailing_stop_policy, config.trailing_stop_policy)
+        self.assertEqual(defaults.strategy_time_stops_minutes, config.strategy_time_stop_minutes)
+        self.assertGreater(len(set(defaults.strategy_time_stops_minutes.values())), 1)
+        self.assertEqual(defaults.end_of_day_liquidation_time, config.end_of_day_liquidation_time)
+        self.assertEqual(defaults.entry_cutoff_time, config.entry_cutoff_time)
+        self.assertEqual(defaults.event_risk_action, config.event_risk_action)
+        self.assertEqual(defaults.stale_data_threshold_seconds, 75)
+        self.assertEqual(defaults.quote_freshness_threshold_seconds, 75)
+
     def test_dynamic_settings_adjust_only_allowed_local_fields_and_strategy_maps(self) -> None:
         config = WeightedVotingConfig()
         defaults = default_weighted_settings(timestamp=TS, baseline_config=config)
@@ -295,7 +318,41 @@ class WeightedVotingSettingsTest(unittest.TestCase):
 
         self.assertEqual(left.deterministic_json(), right.deterministic_json())
         self.assertGreater(left.base_risk_per_trade_percent, defaults.base_risk_per_trade_percent)
+        self.assertIn("clean", left.settings_version)
+        self.assertIn("normal", left.settings_version)
+        self.assertEqual(left.market_condition_input["market_quality"], WeightedMarketQuality.CLEAN.value)
         self.assertTrue(all(adjustment.reason_codes for adjustment in left.dynamic_adjustments))
+
+    def test_step6_hard_limits_clamp_new_dedicated_settings(self) -> None:
+        defaults = default_weighted_settings(timestamp=TS)
+        envelope = generous_envelope().model_copy(
+            update={
+                "fee_per_share_delta": 1.0,
+                "stale_data_threshold_seconds_delta": 300,
+                "quote_freshness_threshold_seconds_delta": 300,
+                "maximum_stop_distance_percent_delta": 1.0,
+            }
+        )
+        limits = WeightedHardLimits(
+            settings_timestamp=TS,
+            maximum_fee_per_share=0.005,
+            maximum_stale_data_threshold_seconds=80,
+            maximum_quote_freshness_threshold_seconds=80,
+            maximum_stop_distance_percent=0.02,
+        )
+
+        effective = resolve_dynamic_settings_for_condition(
+            default_settings=defaults,
+            dynamic_envelope=envelope,
+            hard_limits=limits,
+            condition=clean_confirmed_condition(),
+            timestamp=TS,
+        )
+
+        self.assertEqual(effective.fee_per_share, 0.005)
+        self.assertLessEqual(effective.stale_data_threshold_seconds, 80)
+        self.assertLessEqual(effective.quote_freshness_threshold_seconds, 80)
+        self.assertEqual(effective.maximum_stop_distance_percent, 0.02)
 
     def test_condition_resolver_keeps_values_inside_envelope_hard_limits_and_global_allowances(self) -> None:
         defaults = default_weighted_settings(timestamp=TS)

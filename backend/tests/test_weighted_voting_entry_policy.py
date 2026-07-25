@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from backend.app.algorithms.weighted_voting.aggregation import aggregate_weighted_signals
+from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.dynamic_settings import default_dynamic_envelope, default_hard_limits, default_weighted_settings, resolve_effective_settings
 from backend.app.algorithms.weighted_voting.entry_policy import (
     WEIGHTED_VOTING_ENTRY_POLICY_FRONTEND_MODE,
@@ -129,14 +130,18 @@ def effective_settings():
 
 
 def decision_for(side: WeightedSide, family: WeightedStrategyFamily):
-    return aggregate_weighted_signals(list(signals_for(side, family)), decision_timestamp=TS)
+    return aggregate_weighted_signals(
+        list(signals_for(side, family)),
+        decision_timestamp=TS,
+        config=WeightedVotingConfig(maximum_family_weight=1.0, minimum_active_weight=0.5),
+    )
 
 
 def signals_for(side: WeightedSide, family: WeightedStrategyFamily) -> tuple[WeightedVotingSignal, ...]:
     p_buy, p_sell, p_hold = (0.82, 0.08, 0.10) if side == WeightedSide.BUY else (0.08, 0.82, 0.10)
     return tuple(
         WeightedVotingSignal(
-            strategy_id=f"T{index}",
+            strategy_id=("S2", "S5", "S6", "S7")[index % 4],
             strategy_name=f"{family.value} synthetic {index}",
             strategy_version="weighted_strategy_test_v1",
             family=family,
@@ -157,7 +162,7 @@ def signals_for(side: WeightedSide, family: WeightedStrategyFamily) -> tuple[Wei
             data_timestamp=TS,
             explanation="Synthetic entry signal.",
         )
-        for index in range(8)
+        for index in range(4)
     )
 
 

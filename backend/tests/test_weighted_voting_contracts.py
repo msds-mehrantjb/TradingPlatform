@@ -249,8 +249,8 @@ class WeightedVotingContractsTest(unittest.TestCase):
     def test_aggregation_returns_canonical_decision_without_frontend_types(self) -> None:
         decision = aggregate_weighted_signals(
             [
-                strategy_signal(strategy_id="S1", p_buy=0.7, p_sell=0.1, p_hold=0.2),
-                strategy_signal(strategy_id="S2", p_buy=0.6, p_sell=0.1, p_hold=0.3),
+                strategy_signal(strategy_id="S2", p_buy=0.7, p_sell=0.1, p_hold=0.2),
+                strategy_signal(strategy_id="S5", p_buy=0.6, p_sell=0.1, p_hold=0.3),
             ],
             decision_timestamp=TS,
         )

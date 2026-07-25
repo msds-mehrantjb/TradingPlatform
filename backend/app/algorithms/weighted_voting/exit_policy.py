@@ -102,6 +102,7 @@ def open_exit_lifecycle(
     structural_invalidation: float | None = None,
     atr_fallback_stop: float | None = None,
     minimum_risk_reward: float | None = None,
+    supporting_strategy_ids: tuple[str, ...] = (),
     weighted_allocation_id: str = "weighted_voting",
 ) -> WeightedVotingExitLifecycleState:
     if quantity <= 0:
@@ -114,6 +115,7 @@ def open_exit_lifecycle(
     if target_r < required_rr:
         raise ValueError("Weighted Voting profit target must satisfy the configured risk/reward requirement")
     target = entry_price + risk * target_r if side == WeightedSide.BUY.value else entry_price - risk * target_r
+    lifecycle_settings = _settings_with_strategy_time_stop(effective_settings, supporting_strategy_ids)
     return WeightedVotingExitLifecycleState(
         trade_id=trade_id,
         symbol=symbol,
@@ -128,11 +130,25 @@ def open_exit_lifecycle(
         profit_target=target,
         original_risk_per_share=risk,
         risk_reward_requirement=required_rr,
-        original_effective_settings=effective_settings,
+        original_effective_settings=lifecycle_settings,
         highest_price=entry_price,
         lowest_price=entry_price,
         weighted_allocation_id=weighted_allocation_id,
     )
+
+
+def _settings_with_strategy_time_stop(
+    effective_settings: WeightedEffectiveSettings,
+    supporting_strategy_ids: tuple[str, ...],
+) -> WeightedEffectiveSettings:
+    limits = tuple(
+        int(effective_settings.strategy_time_stops_minutes[strategy_id])
+        for strategy_id in supporting_strategy_ids
+        if strategy_id in effective_settings.strategy_time_stops_minutes
+    )
+    if not limits:
+        return effective_settings
+    return effective_settings.model_copy(update={"time_stop_minutes": min(limits)})
 
 
 def evaluate_exit_lifecycle(inputs: WeightedVotingExitInputs) -> WeightedVotingExitDecision:

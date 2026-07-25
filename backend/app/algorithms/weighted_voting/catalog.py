@@ -10,7 +10,7 @@ from backend.app.algorithms.weighted_voting.models import WeightedVotingStrategy
 
 
 WEIGHTED_VOTING_CATALOG_VERSION = WEIGHTED_VOTING_STRATEGY_VERSION
-WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT = 0.25
+WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT = 0.125
 WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT = 0.02
 WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT = 0.25
 WEIGHTED_VOTING_DEFAULT_ELIGIBLE_MARKET_CONDITIONS = (
@@ -18,6 +18,11 @@ WEIGHTED_VOTING_DEFAULT_ELIGIBLE_MARKET_CONDITIONS = (
     "mixed",
     "strategy_specific_permissions",
 )
+WeightedVotingStrategyLifecycleStatus = Literal["active", "shadow", "disabled", "not_data_ready", "retired"]
+WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS = ("S2", "S5", "S6", "S7")
+WEIGHTED_VOTING_SHADOW_STRATEGY_IDS = ("S1", "S3", "S4", "S8")
+WEIGHTED_VOTING_PAIRWISE_SIGNAL_CORRELATION_NAMESPACE = "weighted_voting.performance_tracker.pairwise_signal_correlation"
+WEIGHTED_VOTING_PAIRWISE_RETURN_CORRELATION_NAMESPACE = "weighted_voting.performance_tracker.pairwise_return_correlation"
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,8 @@ class WeightedVotingStrategyCatalogEntry:
     invalidation_condition: str
     data_quality_classification: str
     version: str
+    lifecycle: WeightedVotingStrategyLifecycleStatus
+    lifecycle_reason: str
     enabled: bool = True
     baseline_weight: float = WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT
     minimum_weight: float = WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT
@@ -58,6 +65,18 @@ class WeightedVotingStrategyCatalogEntry:
     @property
     def strategy_implementation_version(self) -> str:
         return self.version
+
+    @property
+    def executes(self) -> bool:
+        return self.enabled and self.lifecycle in ("active", "shadow")
+
+    @property
+    def contributes_to_vote(self) -> bool:
+        return self.enabled and self.lifecycle == "active"
+
+    @property
+    def shadow_records_only(self) -> bool:
+        return self.lifecycle == "shadow"
 
     @property
     def dedicated_file(self) -> str:
@@ -103,9 +122,16 @@ class WeightedVotingDedicatedStrategyInventoryItem:
     explanation: str
     performance_history: str
     state_namespace: str
+    lifecycle: WeightedVotingStrategyLifecycleStatus
+    lifecycle_reason: str
+    executes: bool
+    voting_influence: float
+    shadow_performance_state: str
+    signal_correlation_state: str
+    return_correlation_state: str
 
 
-WeightedVotingModuleLifecycleStatus = Literal["active", "shadow", "disabled", "unavailable", "not_data_ready", "deprecated_alias"]
+WeightedVotingModuleLifecycleStatus = WeightedVotingStrategyLifecycleStatus
 
 
 @dataclass(frozen=True)
@@ -126,6 +152,27 @@ class WeightedVotingModuleInventory:
 
 WEIGHTED_VOTING_STRATEGY_CATALOG: tuple[WeightedVotingStrategyCatalogEntry, ...] = (
     WeightedVotingStrategyCatalogEntry(
+        strategy_id="S1",
+        name="Opening Range Breakout",
+        family=WeightedVotingStrategyFamily.BREAKOUT,
+        module_name="opening_range_breakout",
+        purpose="Trade confirmed breakouts beyond the regular-session opening range.",
+        required_data=("1m OHLCV candles", "regular-session clock", "opening-range high/low", "ATR", "current volume"),
+        optional_data=("5m confirmation candles", "VWAP"),
+        valid_session_window="09:45-11:00 America/New_York",
+        minimum_warmup=15,
+        invalid_market_conditions=("missing opening range", "low volume confirmation", "overextended ATR breakout", "stale candles"),
+        buy_rule="Buy when price breaks above the opening range high with volume confirmation and acceptable ATR extension.",
+        sell_rule="Sell when price breaks below the opening range low with volume confirmation and acceptable ATR extension.",
+        hold_rule="Hold when breakout distance, volume confirmation, or ATR extension quality is insufficient.",
+        confidence_components=("breakout distance", "volume confirmation", "ATR extension", "opening range quality"),
+        invalidation_condition="Invalidate if price closes back through the opening range breakout level.",
+        data_quality_classification="requires clean 1m OHLCV, session sequencing, opening-range levels, and ATR warm-up",
+        version="weighted_strategy_S1_v1",
+        lifecycle="shadow",
+        lifecycle_reason="Shadow until focused opening-range breakout validation passes.",
+    ),
+    WeightedVotingStrategyCatalogEntry(
         strategy_id="S2",
         name="First Pullback After Open",
         family=WeightedVotingStrategyFamily.TREND,
@@ -143,6 +190,50 @@ WEIGHTED_VOTING_STRATEGY_CATALOG: tuple[WeightedVotingStrategyCatalogEntry, ...]
         invalidation_condition="Invalidate if the pullback breaks the impulse origin or flips through VWAP against the setup.",
         data_quality_classification="requires clean 1m OHLCV, VWAP, and session sequencing",
         version="weighted_strategy_S2_v1",
+        lifecycle="active",
+        lifecycle_reason="Initial validated active Weighted Voting strategy.",
+    ),
+    WeightedVotingStrategyCatalogEntry(
+        strategy_id="S3",
+        name="VWAP Trend Continuation",
+        family=WeightedVotingStrategyFamily.TREND,
+        module_name="vwap_trend_continuation",
+        purpose="Continue established intraday trends when VWAP slope and moving averages align.",
+        required_data=("1m OHLCV candles", "VWAP", "fast moving average", "slow moving average", "recent highs/lows"),
+        optional_data=("5m confirmation candles", "ATR"),
+        valid_session_window="10:00-15:30 America/New_York",
+        minimum_warmup=50,
+        invalid_market_conditions=("flat VWAP slope", "moving averages crossed against setup", "trend continuation absent", "stale candles"),
+        buy_rule="Buy when price is above rising VWAP, fast average is above slow average, and continuation confirms.",
+        sell_rule="Sell when price is below falling VWAP, fast average is below slow average, and continuation confirms.",
+        hold_rule="Hold when VWAP slope, moving-average trend, or continuation setup is missing.",
+        confidence_components=("VWAP slope", "moving-average alignment", "pullback touch", "continuation breakout"),
+        invalidation_condition="Invalidate if price crosses back through VWAP against the continuation side.",
+        data_quality_classification="requires clean 1m OHLCV, VWAP, and moving-average warm-up",
+        version="weighted_strategy_S3_v1",
+        lifecycle="shadow",
+        lifecycle_reason="Shadow until focused VWAP trend-continuation validation passes.",
+    ),
+    WeightedVotingStrategyCatalogEntry(
+        strategy_id="S4",
+        name="VWAP Mean Reversion",
+        family=WeightedVotingStrategyFamily.MEAN_REVERSION,
+        module_name="vwap_mean_reversion",
+        purpose="Fade stretched moves back toward VWAP when trend strength is not excessive.",
+        required_data=("1m OHLCV candles", "VWAP", "ATR", "latest reversal candle", "trend strength"),
+        optional_data=("spread quote", "5m confirmation candles"),
+        valid_session_window="10:00-15:15 America/New_York",
+        minimum_warmup=30,
+        invalid_market_conditions=("strong directional trend", "accelerating away from VWAP", "missing VWAP or ATR", "stale candles"),
+        buy_rule="Buy when price is sufficiently below VWAP and a bullish reversal candle confirms reversion.",
+        sell_rule="Sell when price is sufficiently above VWAP and a bearish reversal candle confirms reversion.",
+        hold_rule="Hold when VWAP distance, trend filter, or reversal confirmation is not sufficient.",
+        confidence_components=("VWAP distance", "ATR context", "reversal candle", "trend-strength filter"),
+        invalidation_condition="Invalidate if price accelerates farther away from VWAP after the reversal setup.",
+        data_quality_classification="requires clean 1m OHLCV, VWAP, ATR, and trend-strength warm-up",
+        version="weighted_strategy_S4_v1",
+        lifecycle="shadow",
+        lifecycle_reason="Shadow until incremental value over Bollinger/ATR Reversion is proven.",
     ),
     WeightedVotingStrategyCatalogEntry(
         strategy_id="S5",
@@ -162,6 +253,8 @@ WEIGHTED_VOTING_STRATEGY_CATALOG: tuple[WeightedVotingStrategyCatalogEntry, ...]
         invalidation_condition="Invalidate if price resumes in the breakout direction beyond the failed-break extreme.",
         data_quality_classification="requires clean 1m OHLCV and deterministic prior range levels",
         version="weighted_strategy_S5_v1",
+        lifecycle="active",
+        lifecycle_reason="Initial validated active Weighted Voting strategy.",
     ),
     WeightedVotingStrategyCatalogEntry(
         strategy_id="S6",
@@ -181,6 +274,8 @@ WEIGHTED_VOTING_STRATEGY_CATALOG: tuple[WeightedVotingStrategyCatalogEntry, ...]
         invalidation_condition="Invalidate if price closes beyond the sweep extreme after the reclaim attempt.",
         data_quality_classification="requires clean 1m OHLCV and reliable swing-level construction",
         version="weighted_strategy_S6_v1",
+        lifecycle="active",
+        lifecycle_reason="Initial validated active Weighted Voting strategy.",
     ),
     WeightedVotingStrategyCatalogEntry(
         strategy_id="S7",
@@ -200,19 +295,60 @@ WEIGHTED_VOTING_STRATEGY_CATALOG: tuple[WeightedVotingStrategyCatalogEntry, ...]
         invalidation_condition="Invalidate if price continues to close outside the band with expanding ATR.",
         data_quality_classification="requires clean 1m OHLCV plus Bollinger and ATR warm-up",
         version="weighted_strategy_S7_v1",
+        lifecycle="active",
+        lifecycle_reason="Initial validated active Weighted Voting strategy.",
+    ),
+    WeightedVotingStrategyCatalogEntry(
+        strategy_id="S8",
+        name="Volatility Breakout",
+        family=WeightedVotingStrategyFamily.BREAKOUT,
+        module_name="volatility_breakout",
+        purpose="Trade compression-to-expansion breakouts after volatility contracts and then expands.",
+        required_data=("1m OHLCV candles", "ATR", "compression range", "expansion range", "current volume"),
+        optional_data=("5m confirmation candles", "VWAP"),
+        valid_session_window="11:00-15:30 America/New_York",
+        minimum_warmup=50,
+        invalid_market_conditions=("insufficient compression window", "no expansion", "low volume confirmation", "stale candles"),
+        buy_rule="Buy when price breaks above a compressed range during confirmed volatility expansion.",
+        sell_rule="Sell when price breaks below a compressed range during confirmed volatility expansion.",
+        hold_rule="Hold when compression, expansion, volume confirmation, or breakout quality is absent.",
+        confidence_components=("compression quality", "expansion range", "breakout distance", "volume confirmation"),
+        invalidation_condition="Invalidate if price closes back inside the compressed range after breakout.",
+        data_quality_classification="requires clean 1m OHLCV, ATR warm-up, and completed compression/expansion windows",
+        version="weighted_strategy_S8_v1",
+        lifecycle="shadow",
+        lifecycle_reason="Shadow until independence from Opening Range Breakout is proven.",
     ),
 )
 
 
 _STRATEGY_CLASS_NAMES = {
+    "opening_range_breakout": "OpeningRangeBreakoutStrategy",
     "first_pullback_after_open": "FirstPullbackAfterOpenStrategy",
+    "vwap_trend_continuation": "VwapTrendContinuationStrategy",
+    "vwap_mean_reversion": "VwapMeanReversionStrategy",
     "failed_breakout_reversal": "FailedBreakoutReversalStrategy",
     "liquidity_sweep_reversal": "LiquiditySweepReversalStrategy",
     "bollinger_atr_reversion": "BollingerAtrReversionStrategy",
+    "volatility_breakout": "VolatilityBreakoutStrategy",
 }
 
 
 _STRATEGY_OWNERSHIP = {
+    "S1": {
+        "required_indicators": ("opening_range_high", "opening_range_low", "atr", "current_volume", "breakout_distance"),
+        "data_readiness_checks": ("minimum 15 completed regular-session candles", "opening range is defined", "ATR is computable", "fresh 1m candle", "volume context available"),
+        "market_condition_permissions": ("regular session 09:45-11:00 America/New_York", "volume above configured minimum", "ATR extension within configured maximum"),
+        "entry_conditions": ("opening range established", "price breaks outside range", "volume confirms breakout"),
+        "buy_conditions": ("close above opening range high", "minimum breakout distance met", "volume confirmation"),
+        "sell_conditions": ("close below opening range low", "minimum breakout distance met", "volume confirmation"),
+        "hold_conditions": ("opening range unavailable", "breakout distance too small", "volume confirmation absent", "ATR extension too large"),
+        "expected_return_estimate": "Breakout distance beyond opening range adjusted by volume confirmation through directional_signal expected_return.",
+        "invalidation_level": "Opening range high for longs and opening range low for shorts.",
+        "stop_reference": "Broken opening-range boundary.",
+        "target_reference": "Breakout extension and active Weighted Voting target-R settings.",
+        "reason_codes": ("weighted_voting.s1.opening_range_breakout_buy", "weighted_voting.s1.opening_range_breakout_sell", "weighted_voting.s1.no_confirmed_opening_breakout"),
+    },
     "S2": {
         "required_indicators": ("opening_impulse", "session_vwap", "pullback_depth", "recent_swing_high_low", "trend_return"),
         "data_readiness_checks": ("minimum 20 completed regular-session candles", "opening impulse exists", "VWAP is computable", "fresh 1m candle", "valid pullback sequence"),
@@ -226,6 +362,34 @@ _STRATEGY_OWNERSHIP = {
         "stop_reference": "First-pullback swing extreme used as structural stop reference.",
         "target_reference": "Impulse continuation distance and active Weighted Voting target-R settings.",
         "reason_codes": ("weighted_voting.s2.first_pullback_buy", "weighted_voting.s2.first_pullback_sell", "weighted_voting.s2.first_pullback_hold"),
+    },
+    "S3": {
+        "required_indicators": ("session_vwap", "vwap_slope", "fast_moving_average", "slow_moving_average", "recent_high_low"),
+        "data_readiness_checks": ("minimum 50 completed candles", "VWAP is computable", "moving averages are warmed up", "fresh 1m candle", "recent continuation window exists"),
+        "market_condition_permissions": ("regular session 10:00-15:30 America/New_York", "VWAP slope supports side", "moving averages align with side"),
+        "entry_conditions": ("price on trend side of VWAP", "fast and slow averages aligned", "pullback or continuation confirms"),
+        "buy_conditions": ("price above rising VWAP", "fast average above slow average", "upward continuation confirmed"),
+        "sell_conditions": ("price below falling VWAP", "fast average below slow average", "downward continuation confirmed"),
+        "hold_conditions": ("flat VWAP", "averages not aligned", "continuation absent", "VWAP unavailable"),
+        "expected_return_estimate": "Distance from VWAP and trend slope scaled through directional_signal expected_return.",
+        "invalidation_level": "Current VWAP level.",
+        "stop_reference": "VWAP trend-continuation failure through VWAP.",
+        "target_reference": "Continuation range and active Weighted Voting target-R settings.",
+        "reason_codes": ("weighted_voting.s3.vwap_trend_continuation_buy", "weighted_voting.s3.vwap_trend_continuation_sell", "weighted_voting.s3.no_vwap_continuation"),
+    },
+    "S4": {
+        "required_indicators": ("session_vwap", "atr", "trend_strength", "vwap_distance", "reversal_candle"),
+        "data_readiness_checks": ("minimum 30 completed candles", "VWAP is computable", "ATR is available", "fresh 1m candle", "previous candle exists"),
+        "market_condition_permissions": ("regular session 10:00-15:15 America/New_York", "strong trend rejected", "acceleration away from VWAP rejected"),
+        "entry_conditions": ("price stretched from VWAP", "trend strength below rejection threshold", "reversal candle confirms"),
+        "buy_conditions": ("price below VWAP by configured distance", "bullish reversal candle", "not accelerating away"),
+        "sell_conditions": ("price above VWAP by configured distance", "bearish reversal candle", "not accelerating away"),
+        "hold_conditions": ("VWAP distance too small", "strong trend", "acceleration away", "reversal absent"),
+        "expected_return_estimate": "VWAP distance and ATR context scaled through directional_signal expected_return.",
+        "invalidation_level": "Latest candle low for longs and latest candle high for shorts.",
+        "stop_reference": "Reversal candle extreme away from VWAP.",
+        "target_reference": "VWAP reversion level plus active Weighted Voting target-R settings.",
+        "reason_codes": ("weighted_voting.s4.vwap_reversion_buy", "weighted_voting.s4.vwap_reversion_sell", "weighted_voting.s4.no_vwap_reversion"),
     },
     "S5": {
         "required_indicators": ("prior_range_high", "prior_range_low", "breakout_attempt", "reentry_close", "current_volume"),
@@ -268,6 +432,20 @@ _STRATEGY_OWNERSHIP = {
         "stop_reference": "Reversion candle extreme outside the band.",
         "target_reference": "Bollinger middle band plus active Weighted Voting target-R settings.",
         "reason_codes": ("weighted_voting.s7.bollinger_atr_reversion_buy", "weighted_voting.s7.bollinger_atr_reversion_sell", "weighted_voting.s7.bollinger_atr_reversion_hold"),
+    },
+    "S8": {
+        "required_indicators": ("atr", "compression_range", "expansion_range", "average_volume", "breakout_distance"),
+        "data_readiness_checks": ("minimum 50 completed candles", "ATR warmup is available", "compression window complete", "expansion window complete", "volume context available"),
+        "market_condition_permissions": ("regular session 11:00-15:30 America/New_York", "compressed range exists", "expansion and volume confirmed"),
+        "entry_conditions": ("prior compression", "current expansion", "price breaks outside compression range"),
+        "buy_conditions": ("close above compression high", "volatility expands", "volume confirms"),
+        "sell_conditions": ("close below compression low", "volatility expands", "volume confirms"),
+        "hold_conditions": ("compression absent", "expansion absent", "volume confirmation absent", "breakout quality insufficient"),
+        "expected_return_estimate": "Compression breakout distance and expansion quality scaled through directional_signal expected_return.",
+        "invalidation_level": "Compression high for longs and compression low for shorts.",
+        "stop_reference": "Broken compression boundary.",
+        "target_reference": "Expansion range and active Weighted Voting target-R settings.",
+        "reason_codes": ("weighted_voting.s8.volatility_breakout_buy", "weighted_voting.s8.volatility_breakout_sell", "weighted_voting.s8.no_volatility_expansion_breakout"),
     },
 }
 
@@ -312,17 +490,32 @@ def weighted_voting_dedicated_strategy_inventory() -> tuple[WeightedVotingDedica
             explanation=f"{entry.name} is owned by Weighted Voting strategy {entry.strategy_id} in its dedicated module and may evolve without changing similarly named strategies in other algorithms.",
             performance_history=f"backend/app/algorithms/weighted_voting/performance_tracker.py and WeightedWeightState.performance_metrics scoped by strategy_id={entry.strategy_id}",
             state_namespace=f"weighted_voting.strategies.{entry.strategy_id}",
+            lifecycle=entry.lifecycle,
+            lifecycle_reason=entry.lifecycle_reason,
+            executes=entry.executes,
+            voting_influence=entry.baseline_weight if entry.contributes_to_vote else 0.0,
+            shadow_performance_state=(
+                f"weighted_voting.strategies.{entry.strategy_id}.shadow_performance"
+                if entry.shadow_records_only
+                else f"weighted_voting.strategies.{entry.strategy_id}.active_performance"
+            ),
+            signal_correlation_state=f"{WEIGHTED_VOTING_PAIRWISE_SIGNAL_CORRELATION_NAMESPACE}.{entry.strategy_id}",
+            return_correlation_state=f"{WEIGHTED_VOTING_PAIRWISE_RETURN_CORRELATION_NAMESPACE}.{entry.strategy_id}",
         )
         for entry in WEIGHTED_VOTING_STRATEGY_CATALOG
     )
 
 
 def weighted_voting_enabled_strategy_catalog() -> tuple[WeightedVotingStrategyCatalogEntry, ...]:
-    return tuple(entry for entry in WEIGHTED_VOTING_STRATEGY_CATALOG if entry.enabled)
+    return tuple(entry for entry in WEIGHTED_VOTING_STRATEGY_CATALOG if entry.executes)
+
+
+def weighted_voting_active_strategy_catalog() -> tuple[WeightedVotingStrategyCatalogEntry, ...]:
+    return tuple(entry for entry in WEIGHTED_VOTING_STRATEGY_CATALOG if entry.contributes_to_vote)
 
 
 def _module_status(item: WeightedVotingDedicatedStrategyInventoryItem) -> WeightedVotingModuleStatus:
-    return WeightedVotingModuleStatus(id=item.strategy_id, status="active" if item.enabled else "disabled")
+    return WeightedVotingModuleStatus(id=item.strategy_id, status=item.lifecycle)
 
 
 def weighted_voting_module_inventory() -> WeightedVotingModuleInventory:
@@ -343,12 +536,18 @@ __all__ = [
     "WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT",
     "WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT",
     "WEIGHTED_VOTING_MODULE_INVENTORY",
+    "WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS",
+    "WEIGHTED_VOTING_PAIRWISE_RETURN_CORRELATION_NAMESPACE",
+    "WEIGHTED_VOTING_PAIRWISE_SIGNAL_CORRELATION_NAMESPACE",
+    "WEIGHTED_VOTING_SHADOW_STRATEGY_IDS",
     "WEIGHTED_VOTING_STRATEGY_CATALOG",
     "WeightedVotingDedicatedStrategyInventoryItem",
     "WeightedVotingModuleInventory",
     "WeightedVotingModuleLifecycleStatus",
     "WeightedVotingModuleStatus",
     "WeightedVotingStrategyCatalogEntry",
+    "WeightedVotingStrategyLifecycleStatus",
+    "weighted_voting_active_strategy_catalog",
     "weighted_voting_dedicated_strategy_inventory",
     "weighted_voting_enabled_strategy_catalog",
     "weighted_voting_module_inventory",
