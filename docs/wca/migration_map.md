@@ -65,7 +65,7 @@ backend/app/algorithms/wca/
     base.py
     moving_average_trend.py
     vwap_position.py
-    trend_pullback.py
+    trend_pullback.py  # deprecated implementation path for first_pullback_after_open
     rsi_mean_reversion.py
     bollinger_band_mean_reversion.py
     opening_range_breakout.py

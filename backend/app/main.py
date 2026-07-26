@@ -31,6 +31,7 @@ from .algorithms.session.api import router as session_router
 from .algorithms.meta_strategy.api import router as meta_strategy_router
 from .algorithms.voting_ensemble.api import router as voting_ensemble_router
 from .algorithms.wca.api import router as wca_router
+from .algorithms.wca.strategy_registry import assert_wca_module_catalog_valid
 from .algorithms.weighted_voting.api import router as weighted_voting_router
 from .algorithms.weighted_voting.runtime_supervisor import get_weighted_voting_runtime_supervisor
 from .api.v2 import router as api_v2_router
@@ -143,6 +144,7 @@ DEFAULT_TRADING_SETTINGS: dict = {
 
 @app.on_event("startup")
 async def start_daily_backtest_refresh_scheduler() -> None:
+    assert_wca_module_catalog_valid()
     asyncio.create_task(end_of_day_backtest_refresh_scheduler())
     asyncio.create_task(market_forecast_ledger_scheduler())
     await get_weighted_voting_runtime_supervisor().start()

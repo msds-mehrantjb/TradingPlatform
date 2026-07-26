@@ -3,7 +3,7 @@ import type { WcaBacktestResult, WcaBacktestTrade } from "./types";
 
 export function renderWcaBacktestPanel(backtest: WcaBacktestResult | null, status = "idle", error: string | null = null): string {
   if (status === "running") {
-    return renderBacktestShell("Backtest status: Running", "Backend-authoritative WCA replay is running.", []);
+    return renderBacktestShell("Backtest status: Queued", "Backend-authoritative WCA research job is queued or running.", []);
   }
   if (status === "waiting") {
     return renderBacktestShell("Backtest status: Waiting", error || "Waiting for a complete backend dataset.", backtest?.trades ?? []);
@@ -12,9 +12,12 @@ export function renderWcaBacktestPanel(backtest: WcaBacktestResult | null, statu
     return renderBacktestShell("Backtest status: Error", error || "Backend WCA backtest failed.", []);
   }
   if (!backtest) {
-    return renderBacktestShell("Backtest status: Scheduled", "No backend-authoritative WCA backtest result is loaded.", []);
+    return renderBacktestShell("Backtest status: Scheduled", "Backtests are enqueued as WCA research jobs; no inline browser result is authoritative.", []);
   }
   const metrics = backtest.metrics ?? {};
+  if (String(backtest.status ?? "").toUpperCase() === "QUEUED") {
+    return renderBacktestShell("Backtest status: Queued", `Research job ${stringValue((metrics as Record<string, unknown>).jobId, "pending")} accepted by backend.`, []);
+  }
   const runConfig = backtest.runConfiguration ?? backtest.run_configuration ?? {};
   const diagnostics = backtest.diagnostics ?? {};
   const summary = `
@@ -88,4 +91,3 @@ function renderTradeRow(trade: WcaBacktestTrade): string {
     </tr>
   `;
 }
-

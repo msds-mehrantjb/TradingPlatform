@@ -4,6 +4,8 @@ Status: NOT COMPLETE
 
 This checklist is the Step 21 completion gate for WCA modernization. WCA must not be declared complete until every required statement below is marked `PASS`.
 
+Step 17 adds an evidence-derived rollout gate. Deployment-sensitive statuses are not marked `PASS` from code existence alone; `final_acceptance.py` derives them from executed test records plus persisted WCA rollout evidence. Real-money execution remains outside this rollout.
+
 ## Architecture
 
 | Statement | Status | Evidence or limitation |
@@ -84,10 +86,30 @@ This checklist is the Step 21 completion gate for WCA modernization. WCA must no
 | Statement | Status | Evidence or limitation |
 | --- | --- | --- |
 | Shadow comparison completed. | PENDING | Rollout support exists, but completed validation evidence has not been recorded. |
-| Critical tests pass. | PASS | Step 19 and Step 21 tests are registered in safety-critical CI coverage. |
+| Critical tests pass. | PENDING | Requires passing safety-critical tests, migration gate, registry parity, architecture-boundary scan, and acceptance evidence checks. |
 | Paper trading is stable. | PENDING | No accepted multi-condition paper-trading stability run has been recorded. |
-| Rollback is tested. | PASS | Step 20 rollout tests cover rollback behavior. |
+| Latency performance is accepted. | PENDING | Requires persisted acceptable event-lag, decision-latency, and broker-latency evidence. |
+| Multi-condition paper evidence is accepted. | PENDING | Requires persisted paper evidence across opening, midday, closing, high-volatility, and economic-event sessions. |
+| Rollback is tested. | PENDING | Requires persisted rollback evidence and proof that rollback restored a safe state. |
 | Real-money execution remains disabled unless explicitly enabled through a separate controlled process. | PASS | WCA rollout flags default paper execution off and do not enable real-money execution. |
+
+## Rollout Stages
+
+WCA paper rollout advances only through persisted evidence:
+
+1. `DISABLED`
+2. `HISTORICAL_REPLAY`
+3. `SHADOW`
+4. `PAPER_RECOMMENDATION`
+5. `MANUAL_PAPER`
+6. `LIMITED_AUTOMATIC_PAPER`
+7. `AUTOMATIC_PAPER`
+
+Promotion evidence must include deterministic replay parity, zero unexplained decision mismatches, zero duplicate broker orders, zero cross-algorithm inventory mutations, restart recovery, reconciliation, no unprotected positions, event lag, decision and broker latency, realised slippage, multiple market conditions, opening/midday/closing coverage, high-volatility and economic-event sessions, minimum paper observation duration, sufficient paper trade count, and tested rollback.
+
+Limited automatic paper mode keeps conservative caps: `SPY` only, max quantity `10`, max daily trades `3`, max daily loss `$100`, session windows `10:00-11:30 America/New_York` and `13:30-15:30 America/New_York`, and allowed strategies `C1`, `C4`, and `C7`.
+
+Any critical failure stops new entries, keeps protective exits available, preserves evidence, opens the circuit breaker, and requires reconciliation plus healthy-state validation before resumption.
 
 ## Blocking Items
 
@@ -100,3 +122,5 @@ WCA modernization remains blocked by these required items:
 - Prove dynamic settings resolver parity between backtesting and paper trading.
 - Record completed shadow comparison evidence.
 - Record stable paper-trading validation evidence across multiple market conditions.
+- Record accepted latency performance evidence.
+- Record tested rollback evidence that restored a safe state.

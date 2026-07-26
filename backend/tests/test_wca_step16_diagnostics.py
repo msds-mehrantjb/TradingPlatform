@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from backend.app.algorithms.wca.backtest.engine import run_wca_backtest
+from backend.app.algorithms.wca.configuration import default_wca_configuration
 from backend.app.algorithms.wca.contracts import WcaBacktestSideMode, WcaSide
 from backend.tests.test_wca_step14_15_backend_backtest import backtest_request, fake_voters, sample_candles
 
@@ -12,7 +13,7 @@ from backend.tests.test_wca_step14_15_backend_backtest import backtest_request, 
 class WcaStep16DiagnosticsTests(unittest.TestCase):
     def test_aggregate_diagnostics_separate_gross_net_costs_and_drawdown(self) -> None:
         with patch("backend.app.algorithms.wca.backtest.engine.WCA_PRIMARY_VOTERS", fake_voters(WcaSide.BUY)):
-            result = run_wca_backtest(backtest_request(side_mode=WcaBacktestSideMode.LONG_AND_SHORT))
+            result = run_wca_backtest(backtest_request(side_mode=WcaBacktestSideMode.LONG_AND_SHORT), configuration=default_wca_configuration())
 
         diagnostics = result.metrics["diagnostics"]
         aggregate = diagnostics["aggregate"]
@@ -32,7 +33,7 @@ class WcaStep16DiagnosticsTests(unittest.TestCase):
 
     def test_diagnostics_include_required_breakdowns_and_lineage(self) -> None:
         with patch("backend.app.algorithms.wca.backtest.engine.WCA_PRIMARY_VOTERS", fake_voters(WcaSide.BUY)):
-            result = run_wca_backtest(backtest_request(side_mode=WcaBacktestSideMode.LONG_AND_SHORT))
+            result = run_wca_backtest(backtest_request(side_mode=WcaBacktestSideMode.LONG_AND_SHORT), configuration=default_wca_configuration())
 
         diagnostics = result.metrics["diagnostics"]
         breakdowns = diagnostics["breakdowns"]
@@ -63,7 +64,7 @@ class WcaStep16DiagnosticsTests(unittest.TestCase):
     def test_local_rejected_signals_have_counterfactuals_without_trades(self) -> None:
         candles = sample_candles(25)
         with patch("backend.app.algorithms.wca.backtest.engine.WCA_PRIMARY_VOTERS", fake_voters(WcaSide.BUY)):
-            result = run_wca_backtest(backtest_request(candles=candles, side_mode=WcaBacktestSideMode.LONG_AND_SHORT))
+            result = run_wca_backtest(backtest_request(candles=candles, side_mode=WcaBacktestSideMode.LONG_AND_SHORT), configuration=default_wca_configuration())
 
         local = result.metrics["diagnostics"]["counterfactuals"]["locallyRejectedSignals"]
         self.assertTrue(local)
@@ -85,7 +86,7 @@ class WcaStep16DiagnosticsTests(unittest.TestCase):
             patch("backend.app.algorithms.wca.backtest.engine.WCA_PRIMARY_VOTERS", fake_voters(WcaSide.BUY)),
             patch("backend.app.algorithms.wca.backtest.engine._simulate_global_gate", reject_all_global_gates),
         ):
-            result = run_wca_backtest(backtest_request(side_mode=WcaBacktestSideMode.LONG_AND_SHORT))
+            result = run_wca_backtest(backtest_request(side_mode=WcaBacktestSideMode.LONG_AND_SHORT), configuration=default_wca_configuration())
 
         diagnostics = result.metrics["diagnostics"]
         self.assertEqual(result.trades, ())

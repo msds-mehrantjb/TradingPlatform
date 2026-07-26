@@ -1,5 +1,5 @@
 import { API_BASE, type ApiClient, defaultApiClient } from "../../api/client";
-import type { WcaBacktestResult, WcaBaselineSettings, WcaConfigurationResponse, WcaStatusResponse } from "./types";
+import type { WcaBacktestResult, WcaBaselineSettings, WcaCommandReceipt, WcaConfigurationResponse, WcaStatusResponse } from "./types";
 
 async function requestJson<T>(
   path: string,
@@ -35,8 +35,8 @@ export function fetchWcaBaselineSettings(client?: ApiClient): Promise<WcaBaselin
 export function updateWcaConfiguration(
   configuration: Partial<WcaConfigurationResponse>,
   client?: ApiClient,
-): Promise<WcaConfigurationResponse> {
-  return requestJson<WcaConfigurationResponse>(
+): Promise<WcaCommandReceipt> {
+  return requestJson<WcaCommandReceipt>(
     "/api/wca/configuration",
     {
       method: "PUT",
@@ -46,8 +46,8 @@ export function updateWcaConfiguration(
   );
 }
 
-export function runWcaBacktest(payload: Record<string, unknown>, client?: ApiClient): Promise<WcaBacktestResult> {
-  return requestJson<WcaBacktestResult>(
+export function runWcaBacktest(payload: Record<string, unknown>, client?: ApiClient): Promise<WcaCommandReceipt> {
+  return requestJson<WcaCommandReceipt>(
     "/api/wca/backtests",
     {
       method: "POST",
@@ -60,4 +60,3 @@ export function runWcaBacktest(payload: Record<string, unknown>, client?: ApiCli
 export function fetchWcaBacktest(runId: string, client?: ApiClient): Promise<WcaBacktestResult> {
   return requestJson<WcaBacktestResult>(`/api/wca/backtests/${encodeURIComponent(runId)}`, {}, client);
 }
-

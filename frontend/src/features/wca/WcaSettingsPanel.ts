@@ -47,7 +47,7 @@ export function renderWcaSettingsPanel(
         <span class="wca-pill">Effective settings are read-only</span>
       </div>
       <div class="wca-note">
-        Editing baseline settings is routed through <code>PUT /api/wca/configuration</code> and creates a backend configuration version.
+        Baseline edits create a backend candidate configuration only. Activation and rollout promotion require explicit user action through backend control endpoints.
       </div>
       ${
         keys.length
@@ -125,7 +125,7 @@ export function renderWcaBaselineEditForm(configuration: WcaConfigurationRespons
   const decisionKeys = ["minimumActiveStrategies", "minimumDirectionalAgreement", "minimumAverageConfidence", "minimumSignalEdge"];
   return `
     <form class="wca-baseline-form" data-wca-baseline-form="true">
-      <strong>Editable baseline settings</strong>
+      <strong>Candidate baseline settings</strong>
       ${tradingKeys
         .map((key) => {
           const value = (trading as Record<string, unknown>)[key] ?? "";
@@ -148,7 +148,7 @@ export function renderWcaBaselineEditForm(configuration: WcaConfigurationRespons
           `;
         })
         .join("")}
-      <button type="submit">Save Baseline Configuration</button>
+      <button type="submit">Create Candidate Configuration</button>
     </form>
   `;
 }

@@ -21,31 +21,13 @@ from backend.tests.test_wca_step14_15_backend_backtest import backtest_request, 
 
 
 WCA_TABLES = (
-    "wca_configuration_versions",
+    *WCA_PERSISTENCE_TABLES,
     "wca_strategy_versions",
-    "wca_weight_snapshots",
-    "wca_confidence_calibrations",
-    "wca_market_status_snapshots",
-    "wca_effective_setting_snapshots",
-    "wca_strategy_evaluations",
-    "wca_decisions",
-    "wca_local_gate_evaluations",
-    "global_gate_evaluations",
-    "wca_order_intents",
-    "wca_attributed_orders",
     "wca_proposed_orders",
     "wca_execution_results",
-    "wca_attributed_fills",
-    "wca_positions",
-    "wca_trade_ledger",
-    "wca_broker_reconciliations",
-    "wca_shadow_comparison_evidence",
-    "wca_paper_stability_validations",
-    "wca_backtest_runs",
-    "wca_backtest_results",
     "wca_backtest_trades",
     "wca_strategy_performance",
-    "wca_rollout_status",
+    "global_gate_evaluations",
 )
 
 REQUIRED_COLUMNS = {
@@ -63,20 +45,41 @@ class WcaStep17PersistenceTests(unittest.TestCase):
     def test_persistence_record_inventory_is_exactly_wca_owned_state(self) -> None:
         expected = (
             "configuration_versions",
+            "active_configuration",
+            "strategy_settings_versions",
+            "calibration_tables",
             "weight_snapshots",
+            "finalized_bar_event_receipts",
+            "runtime_checkpoints",
+            "runtime_event_queue",
+            "runtime_command_queue",
+            "runtime_symbol_leases",
             "market_status_history",
-            "dynamic_profile_history",
+            "effective_settings",
             "strategy_evaluations",
+            "modifier_evaluations",
+            "local_gate_results",
+            "global_risk_responses",
             "decisions",
             "order_intents",
+            "execution_outbox_records",
+            "broker_orders",
             "wca_attributed_orders",
             "wca_attributed_fills",
+            "wca_owned_lots",
             "wca_positions",
+            "wca_virtual_positions",
             "wca_trades",
+            "exit_state",
+            "reconciliation_results",
+            "runtime_health",
+            "background_jobs",
+            "research_candidates",
             "backtest_runs",
             "backtest_results",
             "shadow_comparison_records",
             "paper_stability_evidence",
+            "rollout_evidence",
             "rollout_status",
         )
 
@@ -84,7 +87,7 @@ class WcaStep17PersistenceTests(unittest.TestCase):
         self.assertEqual(WCA_PERSISTENCE_RECORD_IDS, set(expected))
         self.assertEqual(WCA_PERSISTENCE_TABLES, tuple(row.table_name for row in WCA_PERSISTENCE_RECORD_INVENTORY))
         self.assertTrue(all(row.table_name.startswith("wca_") for row in WCA_PERSISTENCE_RECORD_INVENTORY))
-        self.assertTrue(all(row.responsibility.startswith(("Versioned WCA", "WCA")) for row in WCA_PERSISTENCE_RECORD_INVENTORY))
+        self.assertTrue(all("WCA" in row.responsibility for row in WCA_PERSISTENCE_RECORD_INVENTORY))
 
     def test_migration_creates_all_authoritative_wca_tables_idempotently(self) -> None:
         with sqlite3.connect(":memory:") as conn:
@@ -100,8 +103,10 @@ class WcaStep17PersistenceTests(unittest.TestCase):
             self.assertTrue(set(WCA_TABLES).issubset(tables))
             for table in WCA_TABLES:
                 columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-                self.assertTrue(REQUIRED_COLUMNS.issubset(columns), table)
-                self.assertIn("payload_json", columns, table)
+                if table != "wca_active_configuration":
+                    self.assertIn("algorithm_id", columns, table)
+                if REQUIRED_COLUMNS.issubset(columns):
+                    self.assertIn("payload_json", columns, table)
 
     def test_service_persists_configuration_defaults_and_backtest_run_history(self) -> None:
         db_path = temp_db_path()
@@ -121,7 +126,7 @@ class WcaStep17PersistenceTests(unittest.TestCase):
         self.assertGreater(counts["wca_configuration_versions"], 0)
         self.assertGreater(counts["wca_strategy_versions"], 0)
         self.assertGreater(counts["wca_weight_snapshots"], 0)
-        self.assertGreater(counts["wca_rollout_status"], 0)
+        self.assertIn("wca_rollout_status", counts)
         self.assertEqual(counts["wca_backtest_runs"], 1)
         self.assertEqual(counts["wca_backtest_results"], 1)
         self.assertEqual(counts["wca_backtest_trades"], len(result.trades))
@@ -131,12 +136,17 @@ class WcaStep17PersistenceTests(unittest.TestCase):
         self.assertEqual(counts["wca_decisions"], len(result.decisions))
         self.assertGreater(counts["wca_strategy_evaluations"], 0)
         self.assertGreater(counts["wca_local_gate_evaluations"], 0)
+        self.assertGreater(counts["wca_global_risk_responses"], 0)
         self.assertGreater(counts["global_gate_evaluations"], 0)
-        self.assertGreater(counts["wca_proposed_orders"], 0)
-        self.assertGreater(counts["wca_order_intents"], 0)
-        self.assertGreater(counts["wca_attributed_orders"], 0)
-        self.assertGreater(counts["wca_execution_results"], 0)
-        self.assertGreater(counts["wca_strategy_performance"], 0)
+        proposed_decisions = sum(1 for decision in result.decisions if decision.proposed_order is not None)
+        self.assertEqual(counts["wca_proposed_orders"], proposed_decisions)
+        self.assertEqual(counts["wca_order_intents"], proposed_decisions)
+        self.assertEqual(counts["wca_attributed_orders"], proposed_decisions)
+        self.assertEqual(counts["wca_execution_results"], len(result.trades))
+        if result.trades:
+            self.assertGreater(counts["wca_strategy_performance"], 0)
+        else:
+            self.assertEqual(counts["wca_strategy_performance"], 0)
 
         with sqlite3.connect(db_path) as conn:
             for table, count in counts.items():

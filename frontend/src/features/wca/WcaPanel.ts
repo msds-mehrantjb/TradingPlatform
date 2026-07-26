@@ -53,6 +53,7 @@ export function renderWcaPanelHtml(state: WcaPresentationState): string {
             `
         }
       </section>
+      ${renderRuntimeControlSurface(state)}
       ${renderWcaFamilyContributions(decision)}
       ${renderWcaStrategyTable(decision, state.configuration)}
       ${renderWcaSettingsPanel(state.configuration, state.baselineSettings, decision)}
@@ -61,6 +62,38 @@ export function renderWcaPanelHtml(state: WcaPresentationState): string {
       ${renderWcaOrderPanel(decision)}
       ${renderWcaBacktestPanel(state.latestBacktest, backtestStatusFor(state.status), state.error)}
     </div>
+  `;
+}
+
+function renderRuntimeControlSurface(state: WcaPresentationState): string {
+  const status = state.backendStatus;
+  const runtime = (status?.runtimeHealth ?? status?.runtime_health ?? {}) as Record<string, unknown>;
+  const api = (status?.apiHealth ?? status?.api_health ?? {}) as Record<string, unknown>;
+  const versions = (status?.activeVersions ?? status?.active_versions ?? {}) as Record<string, unknown>;
+  const observability = (status?.observability ?? {}) as Record<string, unknown>;
+  const inventory = (status?.virtualInventory ?? status?.virtual_inventory ?? {}) as Record<string, unknown>;
+  const paperOnly = status?.paperOnly ?? status?.paper_only;
+  return `
+    <section class="wca-section">
+      <div class="wca-section-header">
+        <div class="algo-section-title">Runtime Control Surface</div>
+        <span class="wca-pill">${paperOnly ? "PAPER ONLY" : "paper status unavailable"}</span>
+      </div>
+      <div class="wca-status-grid">
+        <div class="wca-status-item"><span>API health</span><strong>${escapeHtml(stringValue(api.status, status?.status, "unknown"))}</strong></div>
+        <div class="wca-status-item"><span>Runtime process</span><strong>${escapeHtml(stringValue(runtime.status, "unknown"))}</strong></div>
+        <div class="wca-status-item"><span>Runtime lag</span><strong>${escapeHtml(formatNumber(observability.eventLagSeconds ?? runtime.lag_seconds ?? runtime.lagSeconds, 1))}s</strong></div>
+        <div class="wca-status-item"><span>Decision latency</span><strong>${escapeHtml(formatNumber(observability.decisionLatencySeconds, 3))}s</strong></div>
+        <div class="wca-status-item"><span>Broker status</span><strong>${escapeHtml(stringValue((observability.brokerStatus as Record<string, unknown> | undefined)?.status, "unavailable"))}</strong></div>
+        <div class="wca-status-item"><span>Reconciliation</span><strong>${escapeHtml(stringValue((observability.reconciliationStatus as Record<string, unknown> | undefined)?.status, "not run"))}</strong></div>
+      </div>
+      <div class="wca-config-meta">
+        <span>Config: ${escapeHtml(stringValue(versions.configuration, status?.configurationVersion, status?.configuration_version, "unavailable"))}</span>
+        <span>Weights: ${escapeHtml(stringValue(versions.weight, "unavailable"))}</span>
+        <span>Calibration: ${escapeHtml(Array.isArray(versions.calibrations) ? versions.calibrations.join(", ") || "none active" : "unavailable")}</span>
+        <span>WCA virtual inventory: ${escapeHtml(stringValue((inventory as Record<string, unknown>).symbol, "SPY"))} isolated</span>
+      </div>
+    </section>
   `;
 }
 

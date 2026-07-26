@@ -25,6 +25,9 @@ class WcaDynamicProfileConfig:
     profile_version: str = "wca_dynamic_profile_v1"
     minimum_profile_hold_seconds: int = 300
     profile_ttl_seconds: int = 900
+    risk_expanding_overlays_enabled: bool = False
+    maximum_defensive_risk_multiplier: float = 1.0
+    maximum_defensive_quantity_multiplier: float = 1.0
     drawdown_reduced_threshold_percent: float = 1.0
     drawdown_defensive_threshold_percent: float = 2.0
     drawdown_stop_threshold_percent: float = 3.0
@@ -105,6 +108,8 @@ def resolve_dynamic_profile(
     )
     if previous_profile is None:
         return proposed
+    if previous_profile.expiration_timestamp <= calculated_at:
+        return proposed.model_copy(update={"reason_codes": (*proposed.reason_codes, "wca.dynamic_profile.previous_expired")})
     if _defensiveness_score(proposed.effective_settings) >= _defensiveness_score(previous_profile.effective_settings):
         return proposed
     previous_age = (calculated_at - previous_profile.calculation_timestamp).total_seconds()
@@ -157,6 +162,8 @@ def _baseline_effective_settings(
         final_entry_cutoff_minutes=baseline.entry_cutoff_minutes,
         final_max_spread_percent=baseline.max_spread_percent,
         final_max_participation_percent=baseline.max_participation_percent,
+        final_minimum_net_edge_per_share=baseline.minimum_net_edge_per_share,
+        final_uncertainty_buffer_per_share=baseline.uncertainty_buffer_per_share,
         final_pyramiding_enabled=baseline.pyramiding_enabled,
         entries_blocked=False,
         reason_codes=("wca.dynamic_profile.baseline",),
@@ -173,6 +180,10 @@ def _effective_from_overlays(
     risk_multiplier = min(overlay.risk_multiplier for overlay in overlays)
     quantity_multiplier = min(overlay.quantity_multiplier for overlay in overlays)
     allocation_multiplier = min(overlay.allocation_multiplier for overlay in overlays)
+    if not config.risk_expanding_overlays_enabled:
+        risk_multiplier = min(risk_multiplier, 1.0, config.maximum_defensive_risk_multiplier)
+        quantity_multiplier = min(quantity_multiplier, 1.0, config.maximum_defensive_quantity_multiplier)
+        allocation_multiplier = min(allocation_multiplier, 1.0)
     threshold_adjustment = max(overlay.threshold_adjustment for overlay in overlays)
     agreement_adjustment = max(overlay.agreement_adjustment for overlay in overlays)
     confidence_adjustment = max(overlay.confidence_adjustment for overlay in overlays)
@@ -214,6 +225,8 @@ def _effective_from_overlays(
         final_entry_cutoff_minutes=baseline.entry_cutoff_minutes,
         final_max_spread_percent=_spread_limit(baseline.max_spread_percent, slippage_multiplier, entries_blocked),
         final_max_participation_percent=_participation_limit(baseline.max_participation_percent, quantity_multiplier, entries_blocked),
+        final_minimum_net_edge_per_share=baseline.minimum_net_edge_per_share,
+        final_uncertainty_buffer_per_share=baseline.uncertainty_buffer_per_share * slippage_multiplier,
         final_pyramiding_enabled=baseline.pyramiding_enabled and False,
         entries_blocked=entries_blocked,
         reason_codes=("wca.dynamic_profile.effective",),

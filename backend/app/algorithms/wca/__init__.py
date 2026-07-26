@@ -3,9 +3,11 @@
 from backend.app.algorithms.wca.contracts import WCA_ALGORITHM_ID, WCA_CONTRACT_VERSION
 from backend.app.algorithms.wca.strategy_registry import (
     WCA_MODULE_INVENTORY,
+    assert_wca_module_catalog_valid,
     WcaModuleInventory,
     WcaModuleLifecycleStatus,
     WcaModuleStatus,
+    validate_wca_module_catalog,
     wca_module_inventory,
 )
 
@@ -19,5 +21,7 @@ __all__ = [
     "WcaModuleInventory",
     "WcaModuleLifecycleStatus",
     "WcaModuleStatus",
+    "assert_wca_module_catalog_valid",
+    "validate_wca_module_catalog",
     "wca_module_inventory",
 ]

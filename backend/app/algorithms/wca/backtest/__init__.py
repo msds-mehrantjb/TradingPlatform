@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from backend.app.algorithms.wca.backtest.engine import WCA_BACKTEST_ENGINE_VERSION, run_wca_backtest, run_wca_backtest_modes
+from backend.app.algorithms.wca.backtest.engine import WCA_BACKTEST_ENGINE_VERSION, prove_wca_production_parity, run_wca_backtest, run_wca_backtest_modes
 from backend.app.algorithms.wca.contracts import BacktestResult, BacktestRunConfiguration, BacktestTrade, WcaBacktestRequest, WcaBacktestSuiteResult
 
 
@@ -56,6 +56,7 @@ __all__ = [
     "WcaBacktestResponsibility",
     "WcaBacktestRequest",
     "WcaBacktestSuiteResult",
+    "prove_wca_production_parity",
     "run_wca_backtest",
     "run_wca_backtest_modes",
 ]

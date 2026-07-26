@@ -11866,6 +11866,24 @@ function wcaBackendEmptyConfidenceResult(reason: string): ConfidenceAggregationR
   };
 }
 
+function wcaBackendQueuedBacktestResult(reason: string): BacktestResult {
+  return {
+    timeframe: "1Min",
+    dateLabel: "Backend WCA",
+    rangeLabel: reason,
+    trades: [],
+    totalTrades: 0,
+    displayedTrades: 0,
+    totalPnl: 0,
+    totalReturnPercent: 0,
+    winners: 0,
+    losers: 0,
+    bars: 0,
+    sessions: 0,
+    strategyDescription: "Backend-authoritative WCA backtest job",
+  };
+}
+
 function wcaBackendStrategyRows(decision: Record<string, unknown>, aggregation: Record<string, unknown> | null): ConfidenceStrategyResult[] {
   const rows =
     arrayFromUnknown(decision.strategyEvaluations ?? decision.strategy_evaluations ?? decision.strategies).filter(isRecord) ??
@@ -17999,13 +18017,20 @@ async function runBackendConfidenceBacktest(preparedOneMinuteCandles: Candle[], 
   if (!response.ok) {
     throw new Error(`Backend WCA backtest failed (${response.status}): ${await response.text()}`);
   }
-  const backend = (await response.json()) as WcaBacktestResult;
-  latestWcaBackendBacktestResult = backend;
+  const receipt = (await response.json()) as { job_id?: string; jobId?: string; status?: string; reason_codes?: string[]; reasonCodes?: string[] };
+  const jobId = receipt.job_id ?? receipt.jobId ?? "";
+  latestWcaBackendBacktestResult = {
+    status: receipt.status ?? "QUEUED",
+    reason_codes: receipt.reason_codes ?? receipt.reasonCodes ?? ["wca.frontend.backtest_job_queued"],
+    metrics: { jobId, queued: true, backendAuthoritative: true },
+    trades: [],
+    decisions: [],
+  };
   wcaPresentationState = withWcaReady(wcaPresentationState, {
-    latestBacktest: backend,
+    latestBacktest: latestWcaBackendBacktestResult,
   });
   renderWcaPresentationMount();
-  return backendWcaBacktestToFrontendResult(backend);
+  return wcaBackendQueuedBacktestResult(jobId ? `Backend WCA backtest queued as ${jobId}. Results load from the WCA job endpoint.` : "Backend WCA backtest queued.");
 }
 
 function backendWcaBacktestToFrontendResult(backend: any): BacktestResult {
@@ -18140,182 +18165,8 @@ function latestRegularSessionDateForConfidenceBacktest(candles: Candle[]) {
 }
 
 function backtestConfidenceAggregation(candles: Candle[]): BacktestResult {
-  const empty: BacktestResult = {
-    timeframe: "1Min",
-    dateLabel: "No candles",
-    trades: [] as BacktestTrade[],
-    totalPnl: 0,
-    totalReturnPercent: 0,
-    winners: 0,
-    strategyDescription: "WCA short-cycle backtest",
-  };
-  const cacheKey = confidenceBacktestCacheKey(candles);
-  if (confidenceBacktestCache?.key === cacheKey) {
-    return confidenceBacktestCache.result;
-  }
-  const regularCandles = candles.filter((candle) => isRegularSession(candle.timestamp));
-  if (!regularCandles.length) {
-    return empty;
-  }
-
-  const sessions = Array.from(
-    regularCandles.reduce((map, candle) => {
-      const day = easternDateString(candle.timestamp);
-      map.set(day, [...(map.get(day) ?? []), candle]);
-      return map;
-    }, new Map<string, Candle[]>()),
-  )
-    .map(([day, dayCandles]) => ({
-      day,
-      candles: dayCandles.slice().sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()),
-    }))
-    .filter((session) => session.candles.length >= 60)
-    .slice(-CONFIDENCE_BACKTEST_MAX_SESSIONS);
-  if (!sessions.length) {
-    const latest = regularCandles.at(-1)!;
-    return { ...empty, dateLabel: formatBacktestDate(latest.timestamp), rangeLabel: "Loaded range needs at least one 60-candle regular session" };
-  }
-
-  const trades: BacktestTrade[] = [];
-  const settings = state.confidenceTradingSettings;
-  const defaults = confidenceDefaultSizingSettings();
-  const startingCapital = settings.startingCapital;
-  let equity = startingCapital;
-  let peakEquity = startingCapital;
-  let maxDrawdown = 0;
-  let maxDrawdownPercent = 0;
-  const allSortedCandles = candles.slice().sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
-  let allCandlesCursor = 0;
-
-  const warmup = 60;
-  for (const session of sessions) {
-    let openTrade:
-      | {
-          side: "Long";
-          entryAt: string;
-          entryPrice: number;
-          shares: number;
-          stopPrice: number;
-          targetPrice: number;
-          riskPerShare: number;
-        }
-      | null = null;
-    let tradesToday = 0;
-    const dayCandles = session.candles;
-
-    for (let index = warmup; index < dayCandles.length; index += 1) {
-      const candle = dayCandles[index];
-      const currentTime = new Date(candle.timestamp).getTime();
-      while (allCandlesCursor < allSortedCandles.length && new Date(allSortedCandles[allCandlesCursor].timestamp).getTime() <= currentTime) {
-        allCandlesCursor += 1;
-      }
-      const allCandlesThroughNow = allSortedCandles.slice(Math.max(0, allCandlesCursor - 2000), allCandlesCursor);
-      const history = dayCandles.slice(0, index + 1);
-      const market = confidenceMarketSnapshotFromCandles(history, allCandlesThroughNow);
-      const currentPositionValue = openTrade ? openTrade.shares * candle.close : 0;
-      void market;
-      void currentPositionValue;
-      const result = wcaBackendEmptyConfidenceResult("Frontend WCA replay disabled; use backend WCA backtest.");
-
-      if (openTrade) {
-        const exit = confidenceBacktestExit(openTrade, candle, history, result);
-        if (exit) {
-          const trade = closeConfidenceBacktestTrade(openTrade, candle.timestamp, exit.price, exit.reason, startingCapital);
-          trades.push(trade);
-          equity = roundNumber(equity + trade.pnl, 2);
-          peakEquity = Math.max(peakEquity, equity);
-          maxDrawdown = Math.max(maxDrawdown, roundNumber(peakEquity - equity, 2));
-          maxDrawdownPercent = peakEquity ? Math.max(maxDrawdownPercent, roundNumber(((peakEquity - equity) / peakEquity) * 100, 2)) : 0;
-          openTrade = null;
-          continue;
-        }
-      }
-
-      if (!openTrade && market && confidenceBacktestCanEnter(result, market, tradesToday, defaults.maxDailyTrades)) {
-        const quantity = result.sizing.finalQuantity;
-        const entryPrice = roundNumber(candle.close + settings.slippagePerShare, 2);
-        const riskPerShare = result.sizing.stopDistance;
-        openTrade = {
-          side: "Long",
-          entryAt: candle.timestamp,
-          entryPrice,
-          shares: quantity,
-          stopPrice: roundNumber(Math.max(0, entryPrice - riskPerShare), 2),
-          targetPrice: roundNumber(entryPrice + targetProfitDistancePerShare(quantity, riskPerShare, settings.takeProfitR), 2),
-          riskPerShare,
-        };
-        tradesToday += 1;
-      }
-    }
-
-    const finalCandle = dayCandles.at(-1)!;
-    if (openTrade) {
-      const exitPrice = roundNumber(Math.max(0, finalCandle.close - settings.slippagePerShare), 2);
-      const trade = closeConfidenceBacktestTrade(openTrade, finalCandle.timestamp, exitPrice, "End of session", startingCapital);
-      trades.push(trade);
-      equity = roundNumber(equity + trade.pnl, 2);
-      peakEquity = Math.max(peakEquity, equity);
-      maxDrawdown = Math.max(maxDrawdown, roundNumber(peakEquity - equity, 2));
-      maxDrawdownPercent = peakEquity ? Math.max(maxDrawdownPercent, roundNumber(((peakEquity - equity) / peakEquity) * 100, 2)) : maxDrawdownPercent;
-    }
-  }
-
-  const firstCandle = sessions[0].candles[0];
-  const finalCandle = sessions.at(-1)!.candles.at(-1)!;
-  const bars = sessions.reduce((sum, session) => sum + session.candles.length, 0);
-
-  const totalPnl = roundNumber(trades.reduce((sum, trade) => sum + trade.pnl, 0), 2);
-  const totalReturnPercent = startingCapital ? roundNumber((totalPnl / startingCapital) * 100, 2) : 0;
-  const winners = trades.filter((trade) => trade.pnl > 0).length;
-  const losers = trades.filter((trade) => trade.pnl <= 0).length;
-  const grossProfit = roundNumber(trades.filter((trade) => trade.pnl > 0).reduce((sum, trade) => sum + trade.pnl, 0), 2);
-  const grossLoss = roundNumber(trades.filter((trade) => trade.pnl < 0).reduce((sum, trade) => sum + trade.pnl, 0), 2);
-  const result: BacktestResult = {
-    timeframe: "1Min",
-    dateLabel: formatBacktestDate(finalCandle.timestamp),
-    rangeLabel:
-      sessions.length === 1
-        ? `${formatBacktestDate(firstCandle.timestamp)} WCA short-cycle replay`
-        : `${formatBacktestDate(firstCandle.timestamp)} to ${formatBacktestDate(finalCandle.timestamp)} WCA short-cycle replay`,
-    trades,
-    totalTrades: trades.length,
-    displayedTrades: trades.length,
-    totalPnl,
-    totalReturnPercent,
-    startingCapital,
-    finalEquity: roundNumber(startingCapital + totalPnl, 2),
-    maxDrawdown,
-    maxDrawdownPercent,
-    grossProfit,
-    grossLoss,
-    profitFactor: grossLoss < 0 ? roundNumber(grossProfit / Math.abs(grossLoss), 2) : grossProfit > 0 ? null : 0,
-    averageWin: winners ? roundNumber(grossProfit / winners, 2) : 0,
-    averageLoss: losers ? roundNumber(grossLoss / losers, 2) : 0,
-    expectancy: trades.length ? roundNumber(totalPnl / trades.length, 2) : 0,
-    winners,
-    losers,
-    bars,
-    sessions: sessions.length,
-    startDate: firstCandle.timestamp,
-    endDate: finalCandle.timestamp,
-    strategyDescription: "WCA short-cycle long entries with automatic sell exits",
-    riskConfig: {
-      startingCapital,
-      riskPerTradePercent: defaults.baseRiskPercent,
-      maxDailyLossPercent: defaults.maxDailyLossPercent,
-      maxTradesPerDay: defaults.maxDailyTrades,
-      sessionStart: "09:30 ET",
-      newTradesUntil: "15:30 ET",
-      forceClose: "15:59 ET",
-      execution: "WCA automatic short-cycle Buy, WCA short-cycle Sell exit",
-      stopLossPercent: defaults.minimumStopDistancePercent,
-      takeProfitR: settings.takeProfitR,
-      slippagePerShare: settings.slippagePerShare,
-      positionSizing: "WCA normalized score ladder with ATR stop distance",
-    },
-  };
-  confidenceBacktestCache = { key: cacheKey, result };
-  return result;
+  void candles;
+  return wcaBackendQueuedBacktestResult("Frontend WCA replay disabled; enqueue backend WCA backtest/research job.");
 }
 
 function confidenceBacktestCacheKey(candles: Candle[]) {

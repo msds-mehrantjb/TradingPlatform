@@ -668,13 +668,13 @@ def _wca_module_payload(entry: Any, collection: str, module_id: str) -> dict[str
     return {
         "id": module_id,
         "name": entry.name,
-        "version": WCA_ENGINE_VERSION,
+        "version": getattr(entry, "strategy_version", WCA_ENGINE_VERSION),
         "family": entry.family,
         "role": _enum_value(entry.role),
         "collection": collection,
-        "status": "active",
-        "enabled": True,
-        "requiredInputs": [],
+        "status": entry.lifecycle,
+        "enabled": entry.lifecycle == "active",
+        "requiredInputs": list(entry.required_market_inputs),
         "aliases": [_alias_metadata(entry.strategy_id, entry.slug)] if collection == "directional" else [],
     }
 

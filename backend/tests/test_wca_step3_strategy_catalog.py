@@ -1,30 +1,39 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from backend.app.algorithms.wca.contracts import WcaCandle, WcaEvaluationStatus, WcaMarketSnapshot, WcaSide
 from backend.app.algorithms.wca.strategies.primary_voters import WCA_PRIMARY_VOTERS
 from backend.app.algorithms.wca.strategy_registry import (
+    WCA_DEPRECATED_ALIASES,
     WCA_HARD_FILTER_REGISTRY,
     WCA_HARD_FILTER_SLUGS,
     WCA_MODIFIER_REGISTRY,
     WCA_MODIFIER_SLUGS,
+    WCA_MODULE_CATALOG,
     WCA_PRIMARY_VOTER_SLUGS,
     WCA_STRATEGY_IDS,
     WCA_STRATEGY_REGISTRY,
     WcaCatalogRole,
+    resolve_wca_module_slug,
+    validate_wca_module_catalog,
 )
+from backend.tests.test_wca_step3_primary_strategy_validation import CASES as FOCUSED_STRATEGY_CASES
 
 
 UTC = timezone.utc
+ROOT = Path(__file__).parents[2]
+WCA_CATALOG_DOC = ROOT / "docs" / "wca" / "authoritative_module_catalog.md"
 
 
 class WcaStep3StrategyCatalogTest(unittest.TestCase):
     def test_catalog_registers_exactly_11_primary_voters(self) -> None:
         expected_inventory = (
             ("C1", "moving_average_trend", "Moving Average Trend", "trend", 0.10),
-            ("C2", "trend_pullback", "Trend Pullback", "trend", 0.09),
+            ("C2", "first_pullback_after_open", "First Pullback After Open", "trend", 0.09),
             ("C3", "vwap_trend_continuation", "VWAP Trend Continuation", "trend", 0.09),
             ("C4", "vwap_mean_reversion", "VWAP Mean Reversion", "mean_reversion", 0.08),
             ("C5", "rsi_mean_reversion", "RSI Mean Reversion", "mean_reversion", 0.08),
@@ -45,6 +54,47 @@ class WcaStep3StrategyCatalogTest(unittest.TestCase):
         self.assertEqual({row.role for row in WCA_STRATEGY_REGISTRY}, {WcaCatalogRole.PRIMARY_VOTER})
         self.assertTrue(all(row.family for row in WCA_STRATEGY_REGISTRY))
         self.assertAlmostEqual(sum(row.base_weight for row in WCA_STRATEGY_REGISTRY), 1.0, places=6)
+
+    def test_catalog_contains_required_operational_metadata(self) -> None:
+        self.assertEqual(len(WCA_MODULE_CATALOG), 29)
+        for entry in WCA_MODULE_CATALOG:
+            with self.subTest(module=entry.slug):
+                self.assertTrue(entry.slug)
+                self.assertTrue(entry.name)
+                self.assertTrue(entry.family)
+                self.assertIn(entry.lifecycle, {"active", "shadow", "disabled", "unavailable", "not_data_ready", "deprecated_alias"})
+                self.assertTrue(entry.implementation_import_path)
+                self.assertTrue(entry.settings_model)
+                self.assertTrue(entry.settings_version)
+                self.assertTrue(entry.strategy_version)
+                self.assertTrue(entry.minimum_history)
+                self.assertTrue(entry.required_market_inputs)
+
+    def test_startup_validation_rejects_catalog_drift(self) -> None:
+        self.assertTrue(validate_wca_module_catalog()["valid"])
+
+        duplicate_id = replace(WCA_STRATEGY_REGISTRY[1], strategy_id="C1")
+        self.assertIn("duplicate_id:C1", validate_wca_module_catalog((WCA_STRATEGY_REGISTRY[0], duplicate_id, *WCA_STRATEGY_REGISTRY[2:]))["errors"])
+
+        bad_weight = replace(WCA_STRATEGY_REGISTRY[0], base_weight=0.11)
+        self.assertTrue(any(error.startswith("primary_baseline_weights_total:") for error in validate_wca_module_catalog((bad_weight, *WCA_STRATEGY_REGISTRY[1:]))["errors"]))
+
+        bad_role = replace(WCA_MODIFIER_REGISTRY[0], role=WcaCatalogRole.PRIMARY_VOTER)
+        self.assertIn("modifier_or_hard_filter_registered_as_primary", validate_wca_module_catalog(WCA_STRATEGY_REGISTRY, (bad_role, *WCA_MODIFIER_REGISTRY[1:]), WCA_HARD_FILTER_REGISTRY)["errors"])
+
+        missing_settings = replace(WCA_STRATEGY_REGISTRY[1], settings_model="")
+        self.assertIn("active_strategy_missing_settings_model:first_pullback_after_open", validate_wca_module_catalog((WCA_STRATEGY_REGISTRY[0], missing_settings, *WCA_STRATEGY_REGISTRY[2:]))["errors"])
+
+    def test_deprecated_trend_pullback_alias_resolves_without_second_voter(self) -> None:
+        self.assertEqual(WCA_DEPRECATED_ALIASES[0].alias_slug, "trend_pullback")
+        self.assertEqual(resolve_wca_module_slug("trend_pullback"), "first_pullback_after_open")
+        self.assertNotIn("trend_pullback", WCA_PRIMARY_VOTER_SLUGS)
+        self.assertEqual([row.strategy_id for row in WCA_STRATEGY_REGISTRY if row.slug == "first_pullback_after_open"], ["C2"])
+
+    def test_documentation_matches_authoritative_catalog(self) -> None:
+        self.assertEqual(_doc_rows("Primary Voters"), _catalog_rows(WCA_STRATEGY_REGISTRY))
+        self.assertEqual(_doc_rows("Contextual Modifiers"), _catalog_rows(WCA_MODIFIER_REGISTRY))
+        self.assertEqual(_doc_rows("Hard Filters"), _catalog_rows(WCA_HARD_FILTER_REGISTRY))
 
     def test_modifiers_and_hard_filters_are_not_primary_votes(self) -> None:
         required_modifiers = {
@@ -292,7 +342,7 @@ STRATEGY_CASES = {
         ("not_applicable", outside_session_snapshot(), WcaEvaluationStatus.NOT_APPLICABLE.value, WcaSide.HOLD.value),
         ("invalid", invalid_snapshot(), WcaEvaluationStatus.INVALID.value, WcaSide.HOLD.value),
     ),
-    "trend_pullback": (
+    "first_pullback_after_open": (
         ("buy", trend_pullback_buy_snapshot(), WcaEvaluationStatus.ACTIVE.value, WcaSide.BUY.value),
         ("sell", trend_pullback_sell_snapshot(), WcaEvaluationStatus.ACTIVE.value, WcaSide.SELL.value),
         ("hold", flat_snapshot(30), WcaEvaluationStatus.ACTIVE.value, WcaSide.HOLD.value),
@@ -363,6 +413,41 @@ STRATEGY_CASES = {
         ("invalid", invalid_snapshot(), WcaEvaluationStatus.INVALID.value, WcaSide.HOLD.value),
     ),
 }
+
+STRATEGY_CASES = {
+    case.slug: (
+        ("buy", case.buy_snapshot(), WcaEvaluationStatus.ACTIVE.value, WcaSide.BUY.value),
+        ("sell", case.sell_snapshot(), WcaEvaluationStatus.ACTIVE.value, WcaSide.SELL.value),
+        ("hold", case.hold_snapshot(), WcaEvaluationStatus.ACTIVE.value, WcaSide.HOLD.value),
+        ("not_applicable", case.not_applicable_snapshot(), WcaEvaluationStatus.NOT_APPLICABLE.value, WcaSide.HOLD.value),
+        ("invalid", invalid_snapshot(), WcaEvaluationStatus.INVALID.value, WcaSide.HOLD.value),
+    )
+    for case in FOCUSED_STRATEGY_CASES
+}
+
+
+def _catalog_rows(entries) -> tuple[tuple[str, str, str, str, str, str], ...]:
+    rows = []
+    for entry in entries:
+        stable_id = entry.strategy_id if hasattr(entry, "strategy_id") else entry.module_id
+        weight = f"{entry.base_weight:.2f}" if hasattr(entry, "base_weight") else ""
+        rows.append((stable_id, entry.slug, entry.name, entry.family, entry.role.value, entry.lifecycle, weight))
+    return tuple(rows)
+
+
+def _doc_rows(section: str) -> tuple[tuple[str, str, str, str, str, str], ...]:
+    lines = WCA_CATALOG_DOC.read_text(encoding="utf-8").splitlines()
+    header = f"## {section}"
+    start = lines.index(header)
+    rows: list[tuple[str, str, str, str, str, str]] = []
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        if not line.startswith("|") or line.startswith("| ID ") or line.startswith("| ---"):
+            continue
+        cells = tuple(cell.strip().strip("`") for cell in line.strip("|").split("|"))
+        rows.append(cells)
+    return tuple(rows)
 
 
 if __name__ == "__main__":

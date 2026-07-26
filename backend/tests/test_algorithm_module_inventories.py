@@ -52,9 +52,9 @@ class AlgorithmModuleInventoriesTest(unittest.TestCase):
     def test_wca_inventory_is_derived_from_strategy_registry(self) -> None:
         self.assertEqual(WCA_MODULE_INVENTORY.algorithm_id, "wca")
         self.assertEqual(wca_module_inventory(), WCA_MODULE_INVENTORY)
-        self.assertEqual(module_pairs(WCA_MODULE_INVENTORY.primary_voters), tuple((entry.slug, "active") for entry in WCA_STRATEGY_REGISTRY))
-        self.assertEqual(module_pairs(WCA_MODULE_INVENTORY.modifiers), tuple((entry.slug, "active") for entry in WCA_MODIFIER_REGISTRY))
-        self.assertEqual(module_pairs(WCA_MODULE_INVENTORY.hard_filters), tuple((entry.slug, "active") for entry in WCA_HARD_FILTER_REGISTRY))
+        self.assertEqual(module_pairs(WCA_MODULE_INVENTORY.primary_voters), tuple((entry.slug, entry.lifecycle) for entry in WCA_STRATEGY_REGISTRY))
+        self.assertEqual(module_pairs(WCA_MODULE_INVENTORY.modifiers), tuple((entry.slug, entry.lifecycle) for entry in WCA_MODIFIER_REGISTRY))
+        self.assertEqual(module_pairs(WCA_MODULE_INVENTORY.hard_filters), tuple((entry.slug, entry.lifecycle) for entry in WCA_HARD_FILTER_REGISTRY))
         assert_unique(
             self,
             (

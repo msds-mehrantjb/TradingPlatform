@@ -34,17 +34,17 @@ EXPECTED_STRATEGY_FILES = {
 }
 
 ISOLATED_STRATEGY_MODULES = (
-    ("moving_average_trend", "MovingAverageTrendStrategy"),
-    ("trend_pullback", "TrendPullbackStrategy"),
-    ("vwap_trend_continuation", "VwapTrendContinuationStrategy"),
-    ("vwap_mean_reversion", "VwapMeanReversionStrategy"),
-    ("rsi_mean_reversion", "RsiMeanReversionStrategy"),
-    ("bollinger_atr_reversion", "BollingerAtrReversionStrategy"),
-    ("opening_range_breakout", "OpeningRangeBreakoutStrategy"),
-    ("intraday_volatility_breakout", "IntradayVolatilityBreakoutStrategy"),
-    ("failed_breakout_reversal", "FailedBreakoutReversalStrategy"),
-    ("liquidity_sweep_reversal", "LiquiditySweepReversalStrategy"),
-    ("gap_continuation_fade", "GapContinuationFadeStrategy"),
+    ("moving_average_trend", "MovingAverageTrendStrategy", "moving_average_trend"),
+    ("trend_pullback", "TrendPullbackStrategy", "first_pullback_after_open"),
+    ("vwap_trend_continuation", "VwapTrendContinuationStrategy", "vwap_trend_continuation"),
+    ("vwap_mean_reversion", "VwapMeanReversionStrategy", "vwap_mean_reversion"),
+    ("rsi_mean_reversion", "RsiMeanReversionStrategy", "rsi_mean_reversion"),
+    ("bollinger_atr_reversion", "BollingerAtrReversionStrategy", "bollinger_atr_reversion"),
+    ("opening_range_breakout", "OpeningRangeBreakoutStrategy", "opening_range_breakout"),
+    ("intraday_volatility_breakout", "IntradayVolatilityBreakoutStrategy", "intraday_volatility_breakout"),
+    ("failed_breakout_reversal", "FailedBreakoutReversalStrategy", "failed_breakout_reversal"),
+    ("liquidity_sweep_reversal", "LiquiditySweepReversalStrategy", "liquidity_sweep_reversal"),
+    ("gap_continuation_fade", "GapContinuationFadeStrategy", "gap_continuation_fade"),
 )
 
 
@@ -55,15 +55,15 @@ class WcaStep4StrategyIsolationTest(unittest.TestCase):
         self.assertEqual(actual, EXPECTED_STRATEGY_FILES)
 
     def test_each_primary_strategy_imports_and_evaluates_independently(self) -> None:
-        for module_name, class_name in ISOLATED_STRATEGY_MODULES:
-            with self.subTest(strategy=module_name):
+        for module_name, class_name, canonical_slug in ISOLATED_STRATEGY_MODULES:
+            with self.subTest(strategy=canonical_slug):
                 module = importlib.import_module(f"{STRATEGY_PACKAGE}.{module_name}")
                 strategy = getattr(module, class_name)()
-                fixture = STRATEGY_CASES[module_name][0][1]
+                fixture = STRATEGY_CASES[canonical_slug][0][1]
 
                 result = strategy.evaluate(fixture, StrategyConfig())
 
-                self.assertEqual(strategy.definition.slug, module_name)
+                self.assertEqual(strategy.definition.slug, canonical_slug)
                 self.assertEqual(result.strategy_id, strategy.strategy_id)
                 self.assertEqual(result.strategy_version, strategy.version)
                 self.assertTrue(strategy.family)
@@ -87,7 +87,7 @@ class WcaStep4StrategyIsolationTest(unittest.TestCase):
 
         from backend.app.algorithms.wca import strategy_registry
 
-        reduced_registry = tuple(row for row in strategy_registry.WCA_STRATEGY_REGISTRY if row.slug != "trend_pullback")
+        reduced_registry = tuple(row for row in strategy_registry.WCA_STRATEGY_REGISTRY if row.slug != "first_pullback_after_open")
         with patch.object(strategy_registry, "WCA_STRATEGY_REGISTRY", reduced_registry):
             after_removal = strategy.evaluate(snapshot, StrategyConfig()).deterministic_json()
 

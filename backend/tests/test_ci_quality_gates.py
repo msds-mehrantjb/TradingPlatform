@@ -39,6 +39,7 @@ class CIQualityGatesTest(unittest.TestCase):
             "deterministic-replay-test",
             "schema-compatibility-test",
             "safety-critical-regression-tests",
+            "wca-safety-critical-tests",
             "regime-final-acceptance",
         ):
             self.assertIn(label, source)
@@ -72,6 +73,10 @@ class CIQualityGatesTest(unittest.TestCase):
             "test_regime_final_acceptance.py",
             "test_regime_phase17_rollout.py",
             "backend/tests/regime",
+            "test_wca_step16_safety_critical_ci.py",
+            "test_wca_step7_background_runtime.py",
+            "test_wca_step10_paper_broker_outbox.py",
+            "test_wca_step15_api_frontend_control_surface.py",
         ):
             self.assertIn(test_file, source)
 

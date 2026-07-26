@@ -34,7 +34,7 @@ Scope: Step 0 baseline only. This document inventories the current Weighted Conf
 | Key | Slug | Name | Family | Base weight |
 | --- | --- | --- | --- | --- |
 | C1 | `moving_average_trend` | Moving Average Trend | Trend | 0.10 |
-| C2 | `trend_pullback` | Trend Pullback | Trend | 0.09 |
+| C2 | `first_pullback_after_open` | First Pullback After Open | Trend | 0.09 |
 | C3 | `vwap_trend_continuation` | VWAP Trend Continuation | Trend | 0.09 |
 | C4 | `vwap_mean_reversion` | VWAP Mean Reversion | Mean reversion | 0.08 |
 | C5 | `rsi_mean_reversion` | RSI Mean Reversion | Mean reversion | 0.08 |

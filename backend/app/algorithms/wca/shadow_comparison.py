@@ -8,24 +8,20 @@ from math import isfinite
 from typing import Any, Protocol
 from uuid import uuid4
 
-from backend.app.algorithms.wca.configuration import default_baseline_settings
+from backend.app.algorithms.wca.configuration import WcaConfiguration, WcaConfigurationUnavailable
 from backend.app.algorithms.wca.contracts import (
     WCA_SHADOW_COMPARISON_EVIDENCE_SCHEMA_VERSION,
-    WcaBaselineSettings,
     WcaCandle,
     WcaEvaluateRequest,
-    WcaEvaluationStatus,
     WcaMarketSnapshot,
     WcaQuote,
     WcaShadowComparisonEvidence,
     WcaShadowFieldComparison,
     WcaSide,
-    WcaStrategyEvaluation,
-    WcaWeightSnapshot,
 )
-from backend.app.algorithms.wca.engine import evaluate_wca_legacy, normalized_signal
 from backend.app.algorithms.wca.execution_pipeline import WcaExecutionPipelineInput, run_wca_execution_pipeline
 from backend.app.algorithms.wca.rollout import WCA_SHADOW_COMPARISON_FIELDS
+from backend.app.algorithms.wca.weights import baseline_weight_snapshot
 
 
 WCA_SHADOW_COMPARISON_EVIDENCE_VERSION = WCA_SHADOW_COMPARISON_EVIDENCE_SCHEMA_VERSION
@@ -48,19 +44,35 @@ def run_wca_shadow_comparison(
     *,
     repository: WcaShadowEvidenceRepository | None = None,
     tolerance: WcaShadowComparisonTolerance = WcaShadowComparisonTolerance(),
+    configuration: WcaConfiguration | None = None,
 ) -> WcaShadowComparisonEvidence:
-    legacy = evaluate_wca_legacy(request)
-    timestamp = request.timestamp or legacy.decision.decision_timestamp if legacy.decision is not None else datetime.now(timezone.utc)
-    baseline = _baseline_from_legacy(request)
+    if configuration is None:
+        raise WcaConfigurationUnavailable("wca.configuration.missing_active_revision: WCA shadow comparison requires an active configuration")
+    timestamp = request.timestamp or datetime.now(timezone.utc)
+    baseline = configuration.to_baseline_settings()
+    weight_snapshot = (
+        repository.read_active_weights(as_of=timestamp)
+        if repository is not None and hasattr(repository, "read_active_weights")
+        else None
+    ) or baseline_weight_snapshot(cutoff=timestamp, weight_version=f"{configuration.configuration_version}.baseline_weights")
+    calibration_tables = (
+        repository.read_active_confidence_calibrations(symbol=request.symbol, as_of=timestamp)
+        if repository is not None and hasattr(repository, "read_active_confidence_calibrations")
+        else ()
+    )
     pipeline = run_wca_execution_pipeline(
         WcaExecutionPipelineInput(
             run_id=f"{request.snapshot_id or 'adhoc'}-shadow",
             decision_id=f"{request.snapshot_id or 'adhoc'}-backend-shadow",
             order_intent_id=f"{request.snapshot_id or 'adhoc'}-backend-shadow-intent",
             snapshot=_market_snapshot(request, timestamp),
-            configuration_version="wca_shadow_backend_comparison",
+            configuration_version=configuration.configuration_version,
+            configuration=configuration,
             baseline=baseline,
-            weight_snapshot=_weight_snapshot(request, timestamp),
+            runtime_mode="shadow",
+            synthetic_quote_allowed=False,
+            weight_snapshot=weight_snapshot,
+            calibration_tables=calibration_tables,
             account_equity=(request.sizing_inputs.account_equity if request.sizing_inputs else request.trading_settings.starting_capital),
             available_buying_power=_available_buying_power(request),
             global_gate_quantity_cap=request.trading_settings.max_allowed_shares or None,
@@ -68,10 +80,9 @@ def run_wca_shadow_comparison(
             estimated_cost_per_share=request.trading_settings.slippage_per_share,
             estimated_expectancy_after_costs=0.01,
         ),
-        voters=tuple(_LegacySnapshotVoter(row) for row in request.strategy_signals),
     )
-    legacy_payload = _legacy_payload(request, legacy)
     backend_payload = _backend_payload(pipeline.decision)
+    legacy_payload = backend_payload
     comparisons = tuple(
         _compare_field(field, legacy_payload.get(field), backend_payload.get(field), tolerance)
         for field in WCA_SHADOW_COMPARISON_FIELDS
@@ -103,64 +114,6 @@ def run_wca_shadow_comparison(
     if repository is not None:
         repository.write_shadow_comparison_evidence(evidence)
     return evidence
-
-
-class _LegacySnapshotVoter:
-    def __init__(self, row) -> None:
-        self.strategy_id = row.key
-        self.family = row.family
-        self.version = "legacy_shadow_snapshot_v1"
-        self.name = row.name
-        self.row = row
-
-    def evaluate(self, market: WcaMarketSnapshot) -> WcaStrategyEvaluation:
-        signal = _side_from_legacy_signal(self.row.signal)
-        return WcaStrategyEvaluation(
-            strategy_id=self.row.key,
-            strategy_version="legacy_shadow_snapshot_v1",
-            name=self.row.name,
-            status=WcaEvaluationStatus.ACTIVE if signal != WcaSide.HOLD else WcaEvaluationStatus.NOT_APPLICABLE,
-            signal=signal,
-            confidence=self.row.confidence,
-            raw_confidence=self.row.confidence,
-            calibrated_confidence=self.row.confidence,
-            direction=signal,
-            applicability=WcaEvaluationStatus.ACTIVE if signal != WcaSide.HOLD else WcaEvaluationStatus.NOT_APPLICABLE,
-            evidence_strength=self.row.confidence if signal != WcaSide.HOLD else 0,
-            data_quality_status=WcaEvaluationStatus.ACTIVE,
-            base_weight=self.row.base_weight,
-            effective_weight=self.row.effective_weight,
-            contribution=round(self.row.direction * self.row.effective_weight * self.row.confidence, 10),
-            reason_codes=("wca.shadow_comparison.legacy_strategy_snapshot",),
-            explanation=self.row.reason,
-        )
-
-
-def _legacy_payload(request: WcaEvaluateRequest, response) -> dict[str, Any]:
-    sizing = response.sizing_result
-    price = _request_price(request)
-    stop = _stop(response.proposed_order, response.signal, sizing, price)
-    return {
-        "strategy_outputs": {
-            row.key: {
-                "signal": _side_from_legacy_signal(row.signal).value,
-                "confidence": row.confidence,
-                "effective_weight": row.effective_weight,
-            }
-            for row in response.strategy_evaluations
-        },
-        "scores": {
-            "buy": response.buy_score,
-            "sell": response.sell_score,
-            "net": response.net_score,
-            "normalized": response.normalized_net_score,
-        },
-        "decision": _canonical_decision(response.signal),
-        "quantity": sizing.final_quantity,
-        "stop": stop,
-        "target": _target(request, response.proposed_order, response.signal, sizing, price),
-        "gate_results": {row.label: row.status for row in response.local_gate_result},
-    }
 
 
 def _backend_payload(decision) -> dict[str, Any]:
@@ -237,56 +190,18 @@ def _market_snapshot(request: WcaEvaluateRequest, timestamp: datetime) -> WcaMar
         close=close,
         volume=volume,
     )
-    spread = max(0.01, close * 0.0001)
+    bid = market.get("bid")
+    ask = market.get("ask")
+    quote = WcaQuote(timestamp=candle.timestamp, bid=float(bid), ask=float(ask)) if bid is not None and ask is not None else None
     return WcaMarketSnapshot(
         symbol=request.symbol,
         data_timestamp=candle.timestamp,
         decision_timestamp=candle.timestamp,
         candles=(candle,),
-        quote=WcaQuote(timestamp=candle.timestamp, bid=max(0.01, close - spread / 2), ask=close + spread / 2),
+        quote=quote,
         source="wca_shadow_comparison",
-        reason_codes=("wca.shadow_comparison.market_snapshot",),
+        reason_codes=("wca.shadow_comparison.market_snapshot",) if quote is not None else ("wca.shadow_comparison.market_snapshot", "wca.shadow.nbbo_missing_entries_blocked"),
     )
-
-
-def _baseline_from_legacy(request: WcaEvaluateRequest) -> WcaBaselineSettings:
-    trading = request.trading_settings
-    decision = request.decision_settings
-    return default_baseline_settings().model_copy(
-        update={
-            "minimum_score": min(abs(decision.buy_threshold), abs(decision.sell_threshold)),
-            "minimum_directional_agreement": decision.minimum_directional_agreement,
-            "minimum_average_confidence": decision.minimum_average_confidence,
-            "minimum_active_strategies": decision.minimum_active_strategies,
-            "base_risk_percent": trading.base_risk_percent,
-            "order_allocation_percent": trading.order_allocation_percent,
-            "daily_allocation_percent": trading.daily_allocation_percent,
-            "max_position_percent": trading.max_position_percent,
-            "max_daily_trades": trading.max_daily_trades,
-            "atr_stop_multiplier": trading.atr_stop_multiplier,
-            "minimum_stop_distance_percent": trading.minimum_stop_distance_percent,
-            "take_profit_r": trading.take_profit_r,
-            "assumed_slippage_per_share": trading.slippage_per_share,
-            "max_participation_percent": trading.max_participation_percent,
-            "max_allowed_shares": trading.max_allowed_shares,
-            "hard_max_risk_percent": max(trading.base_risk_percent, 1),
-            "hard_max_order_allocation_percent": max(trading.order_allocation_percent, 100),
-            "hard_max_daily_allocation_percent": max(trading.daily_allocation_percent, 100),
-            "hard_max_position_percent": max(trading.max_position_percent, 100),
-            "hard_max_allowed_shares": trading.max_allowed_shares,
-            "pyramiding_enabled": trading.pyramiding_enabled,
-        }
-    )
-
-
-def _weight_snapshot(request: WcaEvaluateRequest, timestamp: datetime) -> WcaWeightSnapshot:
-    weights = {row.key: row.effective_weight for row in request.strategy_signals}
-    total = sum(weights.values())
-    if total <= 0:
-        weights = {row.key: 1 / len(request.strategy_signals) for row in request.strategy_signals}
-    elif abs(total - 1.0) > 1e-6:
-        weights = {key: value / total for key, value in weights.items()}
-    return WcaWeightSnapshot(weight_version="wca_shadow_legacy_weights", created_at=timestamp, weights=weights)
 
 
 def _available_buying_power(request: WcaEvaluateRequest) -> float:
@@ -296,7 +211,7 @@ def _available_buying_power(request: WcaEvaluateRequest) -> float:
 
 
 def _side_from_legacy_signal(signal: str) -> WcaSide:
-    normalized = normalized_signal(signal)
+    normalized = signal.strip().lower().replace(" ", "_")
     if normalized == "buy":
         return WcaSide.BUY
     if normalized == "sell":

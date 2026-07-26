@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from backend.app.algorithms.wca.contracts import WcaMarketSnapshot, WcaSide, WcaStrategyEvaluation
+from typing import Any
+
 from backend.app.algorithms.wca.strategy_registry import StrategyConfig, WcaStrategyDefinition
-from backend.app.algorithms.wca.strategies.indicators import active, completed_candles, definition_for, invalid_result, not_applicable, outside_regular_session, sma
+from backend.app.algorithms.wca.strategies.indicators import active, coerce_strategy_settings, completed_candles, definition_for, invalid_result, not_applicable, outside_regular_session, slope_percent, sma
 
 
 class MovingAverageTrendStrategy:
@@ -21,7 +23,10 @@ class MovingAverageTrendStrategy:
     def definition(self) -> WcaStrategyDefinition:
         return definition_for(self)
 
-    def evaluate(self, market: WcaMarketSnapshot, config: StrategyConfig = configuration) -> WcaStrategyEvaluation:
+    def evaluate(self, market: WcaMarketSnapshot, config: Any = None) -> WcaStrategyEvaluation:
+        from backend.app.algorithms.wca.configuration import MovingAverageTrendSettings
+
+        config = coerce_strategy_settings(MovingAverageTrendSettings, config)
         if not config.enabled:
             return not_applicable(self, "wca.config.disabled", "Moving-average trend is disabled.")
         invalid = invalid_result(market, self)
@@ -30,13 +35,40 @@ class MovingAverageTrendStrategy:
         if outside_regular_session(market):
             return not_applicable(self, "wca.session.outside_regular", "Moving-average trend is only evaluated during regular session.")
         candles = completed_candles(market)
-        if len(candles) < 50:
-            return not_applicable(self, "wca.data.insufficient_warmup", "Waiting for 50 completed candles.")
+        warmup = max(config.slow_period, config.fast_period + config.slope_lookback)
+        if len(candles) < warmup:
+            return not_applicable(self, "wca.data.insufficient_warmup", f"Waiting for {warmup} completed candles.")
         close = candles[-1].close
-        sma20 = sma(candles, 20)
-        sma50 = sma(candles, 50)
-        if sma20 > sma50 and close > sma20:
-            return active(self, WcaSide.BUY, min(0.95, 0.45 + abs(sma20 - sma50) / close * 80), "20 SMA is above 50 SMA and price is above 20 SMA.")
-        if sma20 < sma50 and close < sma20:
-            return active(self, WcaSide.SELL, min(0.95, 0.45 + abs(sma20 - sma50) / close * 80), "20 SMA is below 50 SMA and price is below 20 SMA.")
-        return active(self, WcaSide.HOLD, 0.2, "Moving averages are mixed.")
+        fast = sma(candles, config.fast_period)
+        slow = sma(candles, config.slow_period)
+        fast_history = tuple(sma(candles[: index + 1], config.fast_period) for index in range(config.fast_period - 1, len(candles)))
+        slow_history = tuple(sma(candles[: index + 1], config.slow_period) for index in range(config.slow_period - 1, len(candles)))
+        fast_slope = slope_percent(fast_history[-config.slope_lookback:])
+        slow_slope = slope_percent(slow_history[-config.slope_lookback:])
+        separation = abs(fast - slow) / close
+        recent = candles[-config.persistence_bars:]
+        buy_persistent = all(c.close >= fast * (1 - config.price_location_tolerance_percent) for c in recent)
+        sell_persistent = all(c.close <= fast * (1 + config.price_location_tolerance_percent) for c in recent)
+        buy_evidence = (
+            fast > slow,
+            fast_slope >= config.minimum_slope_percent,
+            slow_slope >= 0,
+            separation >= config.minimum_ma_separation_percent,
+            close > fast,
+            buy_persistent,
+        )
+        sell_evidence = (
+            fast < slow,
+            fast_slope <= -config.minimum_slope_percent,
+            slow_slope <= 0,
+            separation >= config.minimum_ma_separation_percent,
+            close < fast,
+            sell_persistent,
+        )
+        if all(buy_evidence):
+            confidence = min(0.90, 0.52 + separation * 45 + max(fast_slope, 0) * 80)
+            return active(self, WcaSide.BUY, confidence, "Moving averages are ordered upward with slope, persistence, and price acceptance.", reason_codes=("wca.c1.trend.buy",))
+        if all(sell_evidence):
+            confidence = min(0.90, 0.52 + separation * 45 + abs(min(fast_slope, 0)) * 80)
+            return active(self, WcaSide.SELL, confidence, "Moving averages are ordered downward with slope, persistence, and price acceptance.", reason_codes=("wca.c1.trend.sell",))
+        return active(self, WcaSide.HOLD, 0.12, "Moving-average trend evidence is flat, mixed, or contradictory.", evidence_strength=0.2, reason_codes=("wca.c1.trend.no_direction",))

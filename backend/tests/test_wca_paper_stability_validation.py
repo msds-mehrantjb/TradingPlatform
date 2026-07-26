@@ -86,14 +86,13 @@ def test_paper_stability_api_records_validation_evidence() -> None:
         json=stable_request().model_dump(mode="json"),
     )
 
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
     body = response.json()
-    assert body["paper_trading_stable"] is True
-    assert body["rollout_phase_passed"] is True
-    assert body["decisions"] == 4
-    assert body["rejected_entries"] == 1
-    assert body["reconciliation_discrepancies"] == 0
-    assert "wca.paper_stability.stable" in body["reason_codes"]
+    assert body["job_type"] == "paper_stability_report"
+    assert body["queued"] is True
+    assert "wca.api.paper_stability.enqueued_research_job" in body["reason_codes"]
+    assert "paper_trading_stable" not in body
+    assert "rollout_phase_passed" not in body
 
 
 def stable_request() -> WcaPaperStabilityValidationRequest:

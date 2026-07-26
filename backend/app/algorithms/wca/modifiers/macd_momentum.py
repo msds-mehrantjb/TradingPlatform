@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from backend.app.algorithms.wca.configuration import MacdMomentumSettings
 from backend.app.algorithms.wca.contracts import WcaMarketSnapshot
 from backend.app.algorithms.wca.modifiers.base import active_modifier, invalid_snapshot_result, not_applicable_modifier
 from backend.app.algorithms.wca.strategies.indicators import completed_candles, sma
@@ -10,17 +11,16 @@ class MacdMomentumModifier:
     name = "MACD Momentum"
     family = "momentum"
 
-    def evaluate(self, snapshot: WcaMarketSnapshot):
+    def evaluate(self, snapshot: WcaMarketSnapshot, settings: MacdMomentumSettings | None = None):
+        settings = settings or MacdMomentumSettings()
         invalid = invalid_snapshot_result(snapshot, self)
         if invalid:
             return invalid
         candles = completed_candles(snapshot)
-        if len(candles) < 26:
-            return not_applicable_modifier(self, "wca.modifier.macd_momentum.insufficient_history", "MACD momentum needs 26 completed candles.")
+        if len(candles) < settings.slow_period:
+            return not_applicable_modifier(self, "wca.modifier.macd_momentum.insufficient_history", "MACD momentum needs completed slow-period history.", settings=settings)
         close = candles[-1].close
-        spread = (sma(candles, 12) - sma(candles, 26)) / max(close, 0.01)
-        if spread > 0.001:
-            return active_modifier(self, 1.04, "wca.modifier.macd_momentum.positive", "Short momentum is above long momentum.")
-        if spread < -0.001:
-            return active_modifier(self, 0.96, "wca.modifier.macd_momentum.negative", "Short momentum is below long momentum.")
-        return active_modifier(self, 1.0, "wca.modifier.macd_momentum.neutral", "Momentum spread is neutral.")
+        spread = (sma(candles, settings.fast_period) - sma(candles, settings.slow_period)) / max(close, 0.01)
+        if abs(spread) > settings.neutral_band_percent:
+            return active_modifier(self, 1.04, "wca.modifier.macd_momentum.expanded", "Short and long momentum windows are separated.", settings=settings, market_status_contributions={"macd_spread_percent": round(spread, 6)})
+        return active_modifier(self, 1.0, "wca.modifier.macd_momentum.neutral", "Momentum spread is neutral.", settings=settings, market_status_contributions={"macd_spread_percent": round(spread, 6)})

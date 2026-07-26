@@ -106,8 +106,11 @@ def _breakdowns(
         "byAgreementBand": _trade_group(executed, lambda _, decision: _band(_winner_agreement(decision), (0.5, 0.6, 0.75, 0.9))),
         "byDynamicProfile": _trade_group(executed, lambda _, decision: decision.effective_settings.profile_id if decision.effective_settings else "missing_settings"),
         "byActiveOverlay": _overlay_breakdown(executed),
+        "byCostBand": _trade_group(executed, lambda _, decision: _band(decision.cost_estimate.conservative_round_trip_cost_per_share if decision.cost_estimate else 0.0, (0.01, 0.03, 0.05, 0.10))),
         "byExitReason": _plain_trade_group(trades, lambda trade: trade.exit_reason or "open"),
         "byEntryRejectionReason": _entry_rejection_breakdown(decisions),
+        "costDiagnostics": _cost_diagnostics(decisions),
+        "transactionCostSensitivity": _transaction_cost_sensitivity(decisions),
     }
 
 
@@ -165,6 +168,33 @@ def _entry_rejection_breakdown(decisions: tuple[WcaDecision, ...]) -> dict[str, 
         for reason in _local_rejection_reasons(decision) + _global_rejection_reasons(decision):
             rows[reason] = rows.get(reason, 0) + 1
     return dict(sorted(rows.items()))
+
+
+def _cost_diagnostics(decisions: tuple[WcaDecision, ...]) -> dict[str, Any]:
+    estimates = [decision.cost_estimate for decision in decisions if decision.cost_estimate is not None]
+    costs = [estimate.conservative_round_trip_cost_per_share for estimate in estimates]
+    net_edges = [estimate.conservative_net_edge_per_share for estimate in estimates]
+    return {
+        "estimateCount": len(estimates),
+        "averageRoundTripCostPerShare": round(mean(costs), 10) if costs else 0.0,
+        "maximumRoundTripCostPerShare": round(max(costs), 10) if costs else 0.0,
+        "averageConservativeNetEdgePerShare": round(mean(net_edges), 10) if net_edges else 0.0,
+        "entriesBlockedByCost": sum(1 for estimate in estimates if not estimate.entry_allowed),
+        "costModelVersions": tuple(sorted({estimate.model_version for estimate in estimates})),
+    }
+
+
+def _transaction_cost_sensitivity(decisions: tuple[WcaDecision, ...]) -> tuple[dict[str, Any], ...]:
+    estimates = [decision.cost_estimate for decision in decisions if decision.cost_estimate is not None]
+    rows = []
+    for multiplier in (0.5, 1.0, 1.5, 2.0):
+        passing = 0
+        for estimate in estimates:
+            adjusted_net = estimate.conservative_gross_edge_per_share - (estimate.conservative_round_trip_cost_per_share * multiplier) - estimate.uncertainty_buffer_per_share
+            if adjusted_net > estimate.minimum_required_net_edge_per_share:
+                passing += 1
+        rows.append({"costMultiplier": multiplier, "entryPassCount": passing, "entryBlockCount": len(estimates) - passing})
+    return tuple(rows)
 
 
 def _counterfactuals(decisions: tuple[WcaDecision, ...], candles: tuple[WcaCandle, ...], horizon: int = 5) -> dict[str, Any]:

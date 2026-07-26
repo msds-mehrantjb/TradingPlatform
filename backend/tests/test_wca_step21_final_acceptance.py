@@ -4,12 +4,16 @@ import unittest
 from pathlib import Path
 
 from backend.app.algorithms.wca.final_acceptance import (
+    WCA_EVIDENCE_DERIVED_ACCEPTANCE_STATEMENTS,
     WCA_FINAL_ACCEPTANCE_ITEMS,
+    WCA_FINAL_ACCEPTANCE_REQUIRED_TESTS,
     WCA_FINAL_ACCEPTANCE_VERSION,
     WcaAcceptanceStatus,
+    WcaFinalAcceptanceEvidence,
     build_wca_final_acceptance_report,
     wca_acceptance_is_complete,
 )
+from backend.app.algorithms.wca.rollout import WCA_REQUIRED_ROLLOUT_EVIDENCE, WcaRolloutEvidence
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -96,6 +100,8 @@ EXPECTED_STEP21_CHECKLIST: tuple[tuple[str, tuple[str, ...]], ...] = (
             "Shadow comparison completed.",
             "Critical tests pass.",
             "Paper trading is stable.",
+            "Latency performance is accepted.",
+            "Multi-condition paper evidence is accepted.",
             "Rollback is tested.",
             "Real-money execution remains disabled unless explicitly enabled through a separate controlled process.",
         ),
@@ -109,8 +115,8 @@ class WcaStep21FinalAcceptanceTests(unittest.TestCase):
 
         self.assertEqual(report["algorithmId"], "wca")
         self.assertEqual(report["version"], WCA_FINAL_ACCEPTANCE_VERSION)
-        self.assertEqual(len(report["items"]), 45)
-        self.assertEqual(len(WCA_FINAL_ACCEPTANCE_ITEMS), 45)
+        self.assertEqual(len(report["items"]), 47)
+        self.assertEqual(len(WCA_FINAL_ACCEPTANCE_ITEMS), 47)
         self.assertEqual(
             {item.category for item in WCA_FINAL_ACCEPTANCE_ITEMS},
             {
@@ -142,13 +148,44 @@ class WcaStep21FinalAcceptanceTests(unittest.TestCase):
 
         self.assertFalse(report["complete"])
         self.assertFalse(wca_acceptance_is_complete())
-        self.assertEqual(report["counts"], {"pass": 38, "pending": 7, "fail": 0})
+        self.assertEqual(report["counts"], {"pass": 36, "pending": 11, "fail": 0})
         self.assertEqual(report["counts"]["fail"], 0)
-        self.assertEqual(report["counts"]["pending"], 7)
-        self.assertEqual(len(report["blockingStatements"]), 7)
+        self.assertEqual(report["counts"]["pending"], 11)
+        self.assertEqual(len(report["blockingStatements"]), 11)
         self.assertNotIn("Frontend is presentation-only.", report["blockingStatements"])
         self.assertIn("Paper trading is stable.", report["blockingStatements"])
         self.assertIn("Shadow comparison completed.", report["blockingStatements"])
+        self.assertIn("Latency performance is accepted.", report["blockingStatements"])
+        self.assertIn("Multi-condition paper evidence is accepted.", report["blockingStatements"])
+
+    def test_evidence_derived_items_require_persisted_rollout_evidence(self) -> None:
+        empty_report = build_wca_final_acceptance_report()
+        empty_items = {item["statement"]: item for item in empty_report["items"]}
+
+        for statement in WCA_EVIDENCE_DERIVED_ACCEPTANCE_STATEMENTS:
+            if statement != "Real-money execution remains disabled unless explicitly enabled through a separate controlled process.":
+                self.assertEqual(empty_items[statement]["status"], WcaAcceptanceStatus.PENDING.value)
+
+        complete_report = build_wca_final_acceptance_report(complete_acceptance_evidence())
+        complete_items = {item["statement"]: item for item in complete_report["items"]}
+
+        for statement in WCA_EVIDENCE_DERIVED_ACCEPTANCE_STATEMENTS:
+            self.assertEqual(complete_items[statement]["status"], WcaAcceptanceStatus.PASS.value)
+        self.assertTrue(wca_acceptance_is_complete(complete_acceptance_evidence()))
+
+    def test_real_money_rollout_evidence_fails_final_acceptance(self) -> None:
+        report = build_wca_final_acceptance_report(
+            complete_acceptance_evidence(rollout_evidence=complete_rollout_evidence(live_trading_enabled=True))
+        )
+        item = next(
+            item
+            for item in report["items"]
+            if item["statement"]
+            == "Real-money execution remains disabled unless explicitly enabled through a separate controlled process."
+        )
+
+        self.assertFalse(report["complete"])
+        self.assertEqual(item["status"], WcaAcceptanceStatus.FAIL.value)
 
     def test_every_acceptance_evidence_path_exists(self) -> None:
         for item in WCA_FINAL_ACCEPTANCE_ITEMS:
@@ -177,6 +214,8 @@ class WcaStep21FinalAcceptanceTests(unittest.TestCase):
         self.assertIn("Frontend is presentation-only.", doc)
         self.assertIn("Shadow comparison completed.", doc)
         self.assertIn("Paper trading is stable.", doc)
+        self.assertIn("Latency performance is accepted.", doc)
+        self.assertIn("Multi-condition paper evidence is accepted.", doc)
         for _category, statements in EXPECTED_STEP21_CHECKLIST:
             for statement in statements:
                 self.assertIn(statement, doc)
@@ -188,6 +227,49 @@ class WcaStep21FinalAcceptanceTests(unittest.TestCase):
         self.assertIn("safety-critical-regression-tests", ci_source)
         self.assertIn("test_wca_step19_comprehensive.py", ci_source)
         self.assertIn("test_wca_step21_final_acceptance.py", ci_source)
+
+def complete_rollout_evidence(**overrides) -> WcaRolloutEvidence:
+    payload = {
+        "persisted_evidence_ids": frozenset(WCA_REQUIRED_ROLLOUT_EVIDENCE),
+        "prior_steps_passed": True,
+        "deterministic_replay_parity": True,
+        "unexplained_decision_mismatches": 0,
+        "duplicate_broker_orders": 0,
+        "cross_algorithm_inventory_mutations": 0,
+        "restart_recovery_passed": True,
+        "reconciliation_passed": True,
+        "unprotected_positions": 0,
+        "max_event_lag_seconds": 1,
+        "max_decision_latency_seconds": 1,
+        "max_broker_latency_seconds": 1,
+        "average_realised_slippage_per_share": 0.01,
+        "market_conditions": ("trend", "range", "volatile"),
+        "session_periods": ("opening", "midday", "closing"),
+        "high_volatility_sessions": 1,
+        "economic_event_sessions": 1,
+        "paper_observation_days": 15,
+        "paper_trade_count": 10,
+        "rollback_tested": True,
+        "rollback_restored_safe_state": True,
+    }
+    payload.update(overrides)
+    return WcaRolloutEvidence(**payload)
+
+
+def complete_acceptance_evidence(**overrides) -> WcaFinalAcceptanceEvidence:
+    payload = {
+        "passing_test_files": frozenset(WCA_FINAL_ACCEPTANCE_REQUIRED_TESTS),
+        "migration_passed": True,
+        "architecture_boundary_passed": True,
+        "registry_parity_passed": True,
+        "acceptance_evidence_present": True,
+        "final_validation_after_override_passed": True,
+        "paper_replay_backtest_parity_passed": True,
+        "dynamic_settings_parity_passed": True,
+        "rollout_evidence": complete_rollout_evidence(),
+    }
+    payload.update(overrides)
+    return WcaFinalAcceptanceEvidence(**payload)
 
 
 if __name__ == "__main__":

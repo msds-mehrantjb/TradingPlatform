@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 import backend.app.algorithms.wca.service as wca_service_module
 from backend.app.algorithms.wca.aggregation import aggregate_wca
+from backend.app.algorithms.wca.configuration import WcaConfiguration, default_wca_configuration
 from backend.app.algorithms.wca.contracts import (
     WcaBaselineSettings,
     WcaCandle,
@@ -23,7 +24,7 @@ from backend.app.algorithms.wca.contracts import (
 )
 from backend.app.algorithms.wca.execution_pipeline import WCA_EXECUTION_PIPELINE_MODULES, WcaExecutionPipelineResult
 from backend.app.algorithms.wca.order_validation import WCA_ORDER_VALIDATION_PASSED, WcaOrderValidationContext, apply_wca_final_order_validation
-from backend.app.algorithms.wca.repository import WcaOrderIntentReservation, WcaPersistenceSummary
+from backend.app.algorithms.wca.repository import WcaOrderIntentReservation, WcaOutboxReservation, WcaPersistenceSummary
 from backend.app.algorithms.wca.service import WcaService
 from backend.app.algorithms.wca.sizing import WcaSizingContext, size_wca_order
 from backend.app.algorithms.wca.weights import baseline_weight_snapshot
@@ -52,17 +53,27 @@ def test_manual_and_automatic_paper_actions_use_shared_execution_pipeline() -> N
 
 def test_wca_execution_pipeline_sequence_is_exact() -> None:
     assert WCA_EXECUTION_PIPELINE_MODULES == (
+        "command_validation",
+        "configuration_revision",
+        "data_freshness",
         "strategy_registry",
+        "contextual_modifiers",
         "confidence_calibration",
         "weight_engine",
+        "reliability_health_family_correlation_controls",
         "market_status",
         "dynamic_profile",
         "aggregation",
+        "hard_filters",
         "local_gates",
+        "expected_edge_after_costs",
         "sizing",
+        "global_risk_approval",
         "order_proposal",
         "order_validation",
         "exits",
+        "decision_persistence",
+        "order_intent_creation",
     )
 
 
@@ -72,12 +83,15 @@ def test_paper_execution_api_routes_to_pipeline() -> None:
         json=WcaPaperExecutionRequest(candles=candles(), runId="paper-api").model_dump(mode="json", by_alias=True),
     )
 
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
     body = response.json()
-    assert body["mode"] == "manual"
-    assert "wca.paper.uses_execution_pipeline" in body["reason_codes"]
-    assert "dynamic_profile" in body["called_production_modules"]
-    assert body["decision"]["effective_settings"]["profile_version"] == "wca_dynamic_profile_v1"
+    assert body["commandType"] == "manual_paper_command"
+    assert body["paperOnly"] is True
+    assert body["accepted"] is True
+    assert "wca.api.paper_command.enqueued" in body["reasonCodes"]
+    assert "wca.api.no_inline_broker_submission" in body["reasonCodes"]
+    assert "decision" not in body
+    assert "submitted" not in body
 
 
 def test_final_order_validation_drops_invalid_order_after_backend_adjustment() -> None:
@@ -140,29 +154,37 @@ def test_paper_order_submission_is_idempotent_by_persisted_intent(monkeypatch) -
     first = service.execute_manual_paper(request)
     second = service.execute_manual_paper(request)
 
-    assert first.submitted is True
-    assert first.action_status == WcaOrderStatus.ACCEPTED_FOR_PAPER.value
+    assert first.submitted is False
+    assert first.action_status == WcaOrderStatus.OUTBOX_RESERVED.value
     assert second.submitted is False
     assert second.action_status == "DUPLICATE_INTENT"
     assert first.idempotency_key == second.idempotency_key
     assert first.proposed_order == second.proposed_order
-    assert "wca.paper.intent_persisted_before_submission" in first.reason_codes
+    assert "wca.paper.outbox_reserved_before_submission" in first.reason_codes
     assert "wca.paper.duplicate_order_intent" in second.reason_codes
     assert len(repository.intents_by_key) == 1
+    assert len(repository.outbox_by_key) == 1
 
 
 class MemoryWcaRepository:
     def __init__(self) -> None:
         self.weights = baseline_weight_snapshot()
+        self.configuration = default_wca_configuration()
         self.decisions = {}
         self.backtests = {}
         self.intents_by_key = {}
+        self.outbox_by_key = {}
 
     def initialize_defaults(self, *, symbol: str, configuration: dict, weight_snapshot: WcaWeightSnapshot, engine_version: str) -> None:
         self.weights = weight_snapshot
+        self.configuration = WcaConfiguration.model_validate(configuration)
 
     def save_configuration(self, payload: dict, *, symbol: str, timestamp: str | None = None, engine_version: str) -> None:
+        self.configuration = WcaConfiguration.model_validate(payload)
         return None
+
+    def read_active_configuration(self) -> WcaConfiguration:
+        return self.configuration
 
     def read_active_weights(self) -> WcaWeightSnapshot | None:
         return self.weights
@@ -178,6 +200,18 @@ class MemoryWcaRepository:
         proposed = decision.proposed_order.model_copy(update={"idempotency_key": idempotency_key, "account_id": account_id})
         self.intents_by_key[idempotency_key] = proposed
         return WcaOrderIntentReservation(True, proposed, idempotency_key)
+
+    def reserve_decision_order_and_outbox(self, decision, *, run_id: str, account_id: str, idempotency_key: str, client_order_id: str, request_payload: dict) -> WcaOutboxReservation:
+        if decision.proposed_order is None:
+            raise AssertionError("missing proposed order")
+        if idempotency_key in self.outbox_by_key:
+            proposed = self.intents_by_key[idempotency_key]
+            return WcaOutboxReservation(False, f"wca-outbox-{proposed.order_intent_id}", proposed, idempotency_key, self.outbox_by_key[idempotency_key]["client_order_id"])
+        proposed = decision.proposed_order.model_copy(update={"idempotency_key": idempotency_key, "account_id": account_id, "status": WcaOrderStatus.OUTBOX_RESERVED})
+        self.decisions[decision.decision_id] = decision.model_copy(update={"proposed_order": proposed})
+        self.intents_by_key[idempotency_key] = proposed
+        self.outbox_by_key[idempotency_key] = {"client_order_id": client_order_id, "request": request_payload}
+        return WcaOutboxReservation(True, f"wca-outbox-{proposed.order_intent_id}", proposed, idempotency_key, client_order_id)
 
     def save_backtest_result(self, result) -> None:
         self.backtests[result.run_configuration.run_id] = result

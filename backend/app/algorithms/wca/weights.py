@@ -198,7 +198,7 @@ def _regime_factor(records: tuple[WcaStrategyPerformanceRecord, ...], regime: st
         return 1.0
     matching = tuple(record.r_multiple for record in records if record.regime == regime)
     if len(matching) < 10:
-        return 0.95
+        return 1.0
     expectancy = sum(matching) / len(matching)
     return max(0.70, min(1.25, 1 + expectancy * 0.10))
 

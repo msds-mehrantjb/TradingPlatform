@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Iterable
 
-from backend.app.algorithms.wca.configuration import default_baseline_settings
+from backend.app.algorithms.wca.configuration import WcaConfiguration, WcaConfigurationUnavailable
 from backend.app.algorithms.wca.contracts import (
     BacktestResult,
     BacktestRunConfiguration,
@@ -21,33 +21,28 @@ from backend.app.algorithms.wca.contracts import (
     WcaCandle,
     WcaDecision,
     WcaEvaluationStatus,
-    WcaGateStatus,
-    GlobalGateResult as WcaGlobalGateResult,
     WcaMarketSnapshot,
     WcaQuote,
     WcaSide,
 )
+from backend.app.algorithms.wca.backtest.execution import WCA_BACKTEST_EXECUTION_SIMULATION_VERSION, simulate_wca_backtest_execution
 from backend.app.algorithms.wca.backtest.metrics import build_wca_backtest_diagnostics
+from backend.app.algorithms.wca.cost_model import WCA_COST_MODEL_ADAPTER_VERSION
 from backend.app.algorithms.wca.exits import WcaBacktestOpenPosition, close_wca_backtest_trade, mark_to_market_pnl
-from backend.app.algorithms.wca.execution_pipeline import WCA_EXECUTION_PIPELINE_MODULES, WcaExecutionPipelineInput, run_wca_execution_pipeline
+from backend.app.algorithms.wca.execution_pipeline import WCA_EXECUTION_PIPELINE_MODULES, WcaExecutionPipelineInput, run_wca_backtest_pipeline_adapter, run_wca_execution_pipeline, run_wca_replay_pipeline_adapter
+from backend.app.algorithms.wca.runtime_events import WcaFinalizedBarEvent
 from backend.app.algorithms.wca.strategies.indicators import eastern_minutes
 from backend.app.algorithms.wca.strategies.primary_voters import WCA_PRIMARY_VOTERS
 from backend.app.algorithms.wca.weights import baseline_weight_snapshot, performance_weight_snapshot
-from backend.app.risk import (
-    GlobalGateAccountState,
-    GlobalGateEngine,
-    GlobalGateInput,
-    GlobalGateMarketState,
-    GlobalGateOrderSide,
-    GlobalGatePolicy,
-    GlobalGateProposedOrder,
-)
 
 WCA_BACKTEST_ENGINE_VERSION = "wca_backend_backtest_v1"
 
 
-def run_wca_backtest(request: WcaBacktestRequest) -> BacktestResult:
-    config = _with_hashes(request.configuration, request.candles)
+def run_wca_backtest(request: WcaBacktestRequest, *, configuration: WcaConfiguration | None = None) -> BacktestResult:
+    if configuration is None:
+        raise WcaConfigurationUnavailable("wca.configuration.missing_active_revision: WCA backtest requires an active configuration")
+    config = _with_hashes(request.configuration, request.candles, configuration)
+    baseline = configuration.to_baseline_settings()
     candles = tuple(sorted(request.candles, key=lambda candle: candle.timestamp))
     quote_by_time = {quote.timestamp: quote for quote in request.quotes}
     decisions: list[WcaDecision] = []
@@ -65,7 +60,7 @@ def run_wca_backtest(request: WcaBacktestRequest) -> BacktestResult:
     risk_improvement_confirmations = 0
     equity_curve: list[dict[str, object]] = []
     weight_records = ()
-    weight_snapshot = baseline_weight_snapshot(cutoff=config.start)
+    weight_snapshot = baseline_weight_snapshot(cutoff=config.start, weight_version=f"{configuration.configuration_version}.baseline_weights")
     dynamic_weight_snapshot = performance_weight_snapshot(records=weight_records, cutoff=config.start)
     _ = dynamic_weight_snapshot
 
@@ -73,7 +68,8 @@ def run_wca_backtest(request: WcaBacktestRequest) -> BacktestResult:
         current = candles[index]
         next_bar = candles[index + 1]
         history = candles[: index + 1]
-        quote = quote_by_time.get(current.timestamp) or _synthetic_quote(current, config)
+        provided_quote = quote_by_time.get(current.timestamp)
+        quote = provided_quote or _synthetic_quote(current, config)
         snapshot = WcaMarketSnapshot(
             symbol=config.symbol,
             data_timestamp=current.timestamp,
@@ -81,17 +77,18 @@ def run_wca_backtest(request: WcaBacktestRequest) -> BacktestResult:
             candles=history,
             quote=quote,
             data_ready=True,
-            reason_codes=("wca.backtest.completed_bar",),
+            reason_codes=("wca.backtest.completed_bar",) if provided_quote is not None else ("wca.backtest.completed_bar", "wca.backtest.synthetic_quote"),
         )
-        baseline = default_baseline_settings()
-        pipeline = run_wca_execution_pipeline(
+        pipeline = run_wca_backtest_pipeline_adapter(
             WcaExecutionPipelineInput(
                 run_id=config.run_id,
                 decision_id=f"{config.run_id}-decision-{index:05d}",
                 order_intent_id=f"{config.run_id}-intent-{index:05d}",
                 snapshot=snapshot,
-                configuration_version=config.configuration_version,
-                baseline=baseline,
+                configuration_version=configuration.configuration_version,
+                configuration=configuration,
+                runtime_mode="backtest",
+                synthetic_quote_allowed=True,
                 weight_snapshot=weight_snapshot,
                 previous_market_status=previous_market_status,
                 previous_dynamic_profile=previous_profile,
@@ -104,8 +101,6 @@ def run_wca_backtest(request: WcaBacktestRequest) -> BacktestResult:
                 remaining_allocated_risk_budget=config.starting_equity * (baseline.base_risk_percent / 100),
                 global_gate_quantity_cap=2_147_483_647,
                 approved_risk_budget=config.starting_equity * (baseline.base_risk_percent / 100),
-                estimated_cost_per_share=config.slippage_per_share + config.fee_per_share,
-                estimated_expectancy_after_costs=_estimated_expectancy_after_costs(current, config),
             ),
             voters=WCA_PRIMARY_VOTERS,
         )
@@ -124,35 +119,46 @@ def run_wca_backtest(request: WcaBacktestRequest) -> BacktestResult:
                     exit_reason=pipeline.exit_evaluation.reason,
                     cost_per_share=config.fee_per_share + config.slippage_per_share,
                 )
+                trade = trade.model_copy(update={"configuration_version": config.configuration_version, "configuration_hash": config.configuration_hash})
                 trades.append(trade)
                 realized_pnl += trade.pnl
                 open_position = None
 
-        global_gate_result = None
+        global_gate_result = decision.global_gate_result
         if open_position is None and decision.proposed_order is not None and _entry_side_allowed(side, config.side_mode):
-            gate_result = _simulate_global_gate(config, current, decision.proposed_order.quantity, decision.proposed_order.side, decision.sizing.stop_risk_dollars)
-            global_gate_result = _wca_global_gate_result(gate_result)
-            if not gate_result.allow_new_entries or gate_result.approved_quantity <= 0:
+            if global_gate_result is not None and global_gate_result.allowed_quantity <= 0:
                 rejected_orders += 1
             else:
-                fill_quantity = _fill_quantity(gate_result.approved_quantity, next_bar, config)
-                if fill_quantity <= 0:
+                approved_quantity = global_gate_result.allowed_quantity if global_gate_result is not None else decision.proposed_order.quantity
+                approved_order = decision.proposed_order.model_copy(update={"quantity": approved_quantity})
+                execution = simulate_wca_backtest_execution(
+                    order=approved_order,
+                    next_bar=next_bar,
+                    config=config,
+                    side_allowed=_entry_side_allowed(side, config.side_mode),
+                )
+                if execution.status in {"UNFILLED", "EXPIRED"}:
                     unfilled_orders += 1
-                else:
-                    if fill_quantity < decision.proposed_order.quantity:
+                elif execution.status == "CANCELLED":
+                    rejected_orders += 1
+                elif execution.status == "REJECTED":
+                    rejected_orders += 1
+                elif execution.filled and execution.fill_price is not None:
+                    if execution.filled_quantity < decision.proposed_order.quantity:
                         partial_fills += 1
-                    entry_price = _entry_price(next_bar.open, side, config)
+                    entry_price = execution.fill_price
                     open_position = WcaBacktestOpenPosition(
                         trade_id=f"{config.run_id}-trade-{len(trades) + 1:05d}",
                         decision_id=decision.decision_id,
                         symbol=config.symbol,
                         side=side,
-                        quantity=fill_quantity,
+                        quantity=execution.filled_quantity,
                         entry_at=next_bar.timestamp,
                         entry_price=entry_price,
                         stop_price=decision.sizing.stop_price or (entry_price - decision.sizing.stop_distance),
                         target_price=decision.sizing.target_price or (entry_price + decision.sizing.stop_distance * 2),
                     )
+                decision = decision.model_copy(update={"reason_codes": (*decision.reason_codes, *execution.reason_codes)})
 
         equity = config.starting_equity + realized_pnl + mark_to_market_pnl(open_position, current.close, config.fee_per_share)
         peak_equity = max(peak_equity, equity)
@@ -176,6 +182,7 @@ def run_wca_backtest(request: WcaBacktestRequest) -> BacktestResult:
             exit_reason="End of data",
             cost_per_share=config.fee_per_share + config.slippage_per_share,
         )
+        trade = trade.model_copy(update={"configuration_version": config.configuration_version, "configuration_hash": config.configuration_hash})
         trades.append(trade)
         realized_pnl += trade.pnl
         open_position = None
@@ -221,14 +228,21 @@ def run_wca_backtest(request: WcaBacktestRequest) -> BacktestResult:
             "openPositionDrawdownIncluded": True,
             "usesBackendEngine": True,
             "calledProductionModules": WCA_EXECUTION_PIPELINE_MODULES,
+            "pinnedVersions": _pinned_versions(config, decisions, weight_snapshot),
+            "executionSimulationVersion": WCA_BACKTEST_EXECUTION_SIMULATION_VERSION,
+            "researchWorkerRequired": True,
+            "operationalSmokeTestOnly": config.mode == WcaBacktestMode.DAILY_SMOKE.value,
+            "trainingCalibrationSeparatedFromEvaluation": config.mode in {WcaBacktestMode.WALK_FORWARD.value, WcaBacktestMode.UNTOUCHED_HOLDOUT.value},
         },
     )
     diagnostics = build_wca_backtest_diagnostics(result, candles, tuple(equity_curve))
     return result.model_copy(update={"metrics": {**result.metrics, "diagnostics": diagnostics}})
 
 
-def run_wca_backtest_modes(request: WcaBacktestRequest) -> WcaBacktestSuiteResult:
-    config = _with_hashes(request.configuration, request.candles)
+def run_wca_backtest_modes(request: WcaBacktestRequest, *, configuration: WcaConfiguration | None = None) -> WcaBacktestSuiteResult:
+    if configuration is None:
+        raise WcaConfigurationUnavailable("wca.configuration.missing_active_revision: WCA backtest requires an active configuration")
+    config = _with_hashes(request.configuration, request.candles, configuration)
     candles = tuple(sorted(request.candles, key=lambda candle: candle.timestamp))
     sessions = _sessions(candles)
     holdout_count = min(config.holdout_sessions, max(1, len(sessions) // 5)) if sessions else 1
@@ -238,7 +252,7 @@ def run_wca_backtest_modes(request: WcaBacktestRequest) -> WcaBacktestSuiteResul
     holdout_candles = _candles_for_sessions(candles, holdout_sessions) or candles[-2:]
     smoke_candles = _candles_for_sessions(candles, sessions[-min(config.smoke_sessions, len(sessions)):]) or candles[-min(len(candles), 120):]
 
-    smoke = _mode_result("Daily smoke test", "Operational and regression validation only; not profitability approval.", False, request, config, smoke_candles, WcaBacktestMode.DAILY_SMOKE)
+    smoke = _mode_result("Daily smoke test", "Operational and regression validation only; not profitability approval.", False, request, config, smoke_candles, WcaBacktestMode.DAILY_SMOKE, configuration)
     rolling_windows = (20, 60, 252)
     rolling = tuple(
         _mode_result(
@@ -249,15 +263,16 @@ def run_wca_backtest_modes(request: WcaBacktestRequest) -> WcaBacktestSuiteResul
             config,
             _candles_for_sessions(candles, optimization_sessions[-window:]) or optimization_candles,
             getattr(WcaBacktestMode, f"ROLLING_{window}"),
+            configuration,
         )
         for window in rolling_windows
     )
     if config.custom_window_sessions:
-        rolling = (*rolling, _mode_result("Custom window", "User-configured rolling window before holdout.", True, request, config, _candles_for_sessions(candles, optimization_sessions[-config.custom_window_sessions:]) or optimization_candles, WcaBacktestMode.CUSTOM_WINDOW))
-    full_history = _mode_result("Full historical replay", "All valid available history using a fixed versioned configuration.", True, request, config, candles, WcaBacktestMode.FULL_HISTORY)
-    walk_forward = _walk_forward_result(request, config, optimization_sessions, candles)
-    holdout = _mode_result("Untouched holdout", "Final historical period reserved from configuration selection and optimization.", False, request, config, holdout_candles, WcaBacktestMode.UNTOUCHED_HOLDOUT)
-    comparisons = _comparisons(config, optimization_candles, request)
+        rolling = (*rolling, _mode_result("Custom window", "User-configured rolling window before holdout.", True, request, config, _candles_for_sessions(candles, optimization_sessions[-config.custom_window_sessions:]) or optimization_candles, WcaBacktestMode.CUSTOM_WINDOW, configuration))
+    full_history = _mode_result("Full historical replay", "All valid available history using a fixed versioned configuration.", True, request, config, candles, WcaBacktestMode.FULL_HISTORY, configuration)
+    walk_forward = _walk_forward_result(request, config, optimization_sessions, candles, configuration)
+    holdout = _mode_result("Untouched holdout", "Final historical period reserved from configuration selection and optimization.", False, request, config, holdout_candles, WcaBacktestMode.UNTOUCHED_HOLDOUT, configuration)
+    comparisons = _comparisons(config, optimization_candles, request, configuration)
     return WcaBacktestSuiteResult(
         suite_id=f"{config.run_id}-suite",
         configuration_hash=config.configuration_hash,
@@ -271,19 +286,79 @@ def run_wca_backtest_modes(request: WcaBacktestRequest) -> WcaBacktestSuiteResul
     )
 
 
-def _mode_result(label: str, purpose: str, production_validation: bool, request: WcaBacktestRequest, config: BacktestRunConfiguration, candles: tuple[WcaCandle, ...], mode: WcaBacktestMode) -> WcaBacktestModeResult:
+def prove_wca_production_parity(
+    events: tuple[WcaFinalizedBarEvent, ...],
+    *,
+    configuration: WcaConfiguration,
+) -> dict[str, object]:
+    """Run identical finalized-bar snapshots through runtime shadow, replay, and backtest adapters."""
+
+    if not events:
+        raise ValueError("WCA parity proof requires finalized-bar events")
+    weight_snapshot = baseline_weight_snapshot(cutoff=events[0].finalized_candle_timestamp, weight_version=f"{configuration.configuration_version}.baseline_weights")
+    rows = []
+    previous_market_status = None
+    previous_profile = None
+    confirmations = 0
+    for index, event in enumerate(events):
+        if event.snapshot is None:
+            raise ValueError("WCA parity proof requires event snapshots")
+        command = WcaExecutionPipelineInput(
+            run_id="wca-parity-proof",
+            decision_id=f"wca-parity-decision-{index:05d}",
+            order_intent_id=f"wca-parity-intent-{index:05d}",
+            snapshot=event.snapshot,
+            configuration_version=configuration.configuration_version,
+            configuration=configuration,
+            weight_snapshot=weight_snapshot,
+            previous_market_status=previous_market_status,
+            previous_dynamic_profile=previous_profile,
+            risk_improvement_confirmations=confirmations,
+            global_gate_quantity_cap=2_147_483_647,
+            approved_risk_budget=configuration.to_baseline_settings().base_risk_percent / 100.0 * 100_000,
+        )
+        runtime_decision = run_wca_execution_pipeline(replace(command, runtime_mode="shadow")).decision
+        replay_result = run_wca_replay_pipeline_adapter(command)
+        backtest_result = run_wca_backtest_pipeline_adapter(command)
+        replay = replay_result.decision
+        backtest = backtest_result.decision
+        _assert_parity(runtime_decision, replay)
+        _assert_parity(runtime_decision, backtest)
+        rows.append(
+            {
+                "eventId": event.event_id,
+                "decisionHash": runtime_decision.decision_hash,
+                "side": _side_value(runtime_decision.aggregation.post_local_gate_decision),
+                "quantity": runtime_decision.proposed_order.quantity if runtime_decision.proposed_order else 0,
+                "effectiveSettingsProfile": runtime_decision.effective_settings.profile_id if runtime_decision.effective_settings else "missing",
+            }
+        )
+        previous_market_status = replay_result.market_status
+        previous_profile = replay_result.dynamic_profile
+        confirmations = replay_result.risk_improvement_confirmations
+    return {
+        "schemaVersion": "wca_production_parity_fixture_v1",
+        "eventCount": len(events),
+        "identical": True,
+        "rows": tuple(rows),
+        "reasonCodes": ("wca.backtest.production_parity.proven",),
+    }
+
+
+def _mode_result(label: str, purpose: str, production_validation: bool, request: WcaBacktestRequest, config: BacktestRunConfiguration, candles: tuple[WcaCandle, ...], mode: WcaBacktestMode, configuration: WcaConfiguration) -> WcaBacktestModeResult:
     result = run_wca_backtest(
         request.model_copy(
             update={
                 "configuration": config.model_copy(update={"mode": mode, "run_id": f"{config.run_id}-{mode.value.lower()}"}),
                 "candles": _ensure_two(candles),
             }
-        )
+        ),
+        configuration=configuration,
     )
     return WcaBacktestModeResult(label=label, purpose=purpose, production_validation=production_validation, result=result)
 
 
-def _walk_forward_result(request: WcaBacktestRequest, config: BacktestRunConfiguration, optimization_sessions: list[str], candles: tuple[WcaCandle, ...]) -> WcaBacktestModeResult:
+def _walk_forward_result(request: WcaBacktestRequest, config: BacktestRunConfiguration, optimization_sessions: list[str], candles: tuple[WcaCandle, ...], configuration: WcaConfiguration) -> WcaBacktestModeResult:
     test_sessions: list[str] = []
     start = config.walk_forward_lookback_sessions
     while start < len(optimization_sessions):
@@ -296,7 +371,8 @@ def _walk_forward_result(request: WcaBacktestRequest, config: BacktestRunConfigu
                 "configuration": config.model_copy(update={"mode": WcaBacktestMode.WALK_FORWARD, "run_id": f"{config.run_id}-walk-forward"}),
                 "candles": _ensure_two(test_candles),
             }
-        )
+        ),
+        configuration=configuration,
     )
     result = result.model_copy(
         update={
@@ -312,7 +388,7 @@ def _walk_forward_result(request: WcaBacktestRequest, config: BacktestRunConfigu
     return WcaBacktestModeResult(label="Walk-forward evaluation", purpose="Chronological out-of-sample windows; weights and calibration use only prior windows.", production_validation=True, result=result)
 
 
-def _comparisons(config: BacktestRunConfiguration, optimization_candles: tuple[WcaCandle, ...], request: WcaBacktestRequest) -> tuple[WcaBacktestComparison, ...]:
+def _comparisons(config: BacktestRunConfiguration, optimization_candles: tuple[WcaCandle, ...], request: WcaBacktestRequest, configuration: WcaConfiguration) -> tuple[WcaBacktestComparison, ...]:
     dataset_hash = _candles_hash(optimization_candles)
     assumptions_hash = _execution_assumptions_hash(config)
     labels = (
@@ -324,7 +400,10 @@ def _comparisons(config: BacktestRunConfiguration, optimization_candles: tuple[W
         "old strategy catalog versus corrected catalog",
         "gross results versus net-after-cost results",
     )
-    baseline = run_wca_backtest(request.model_copy(update={"configuration": config.model_copy(update={"run_id": f"{config.run_id}-comparison-baseline"}), "candles": _ensure_two(optimization_candles)}))
+    baseline = run_wca_backtest(
+        request.model_copy(update={"configuration": config.model_copy(update={"run_id": f"{config.run_id}-comparison-baseline"}), "candles": _ensure_two(optimization_candles)}),
+        configuration=configuration,
+    )
     comparisons: list[WcaBacktestComparison] = []
     for index, label in enumerate(labels, start=1):
         comparisons.append(
@@ -346,11 +425,54 @@ def _comparisons(config: BacktestRunConfiguration, optimization_candles: tuple[W
     return tuple(comparisons)
 
 
-def _with_hashes(config: BacktestRunConfiguration, candles: tuple[WcaCandle, ...]) -> BacktestRunConfiguration:
+def _with_hashes(config: BacktestRunConfiguration, candles: tuple[WcaCandle, ...], configuration: WcaConfiguration) -> BacktestRunConfiguration:
     data_hash = config.data_manifest_hash or _candles_hash(candles)
-    temp = config.model_copy(update={"data_manifest_hash": data_hash})
-    config_hash = config.configuration_hash or hashlib.sha256(temp.model_dump_json(exclude={"configuration_hash"}, by_alias=True).encode("utf-8")).hexdigest()
-    return temp.model_copy(update={"configuration_hash": config_hash})
+    return config.model_copy(
+        update={
+            "data_manifest_hash": data_hash,
+            "configuration_version": configuration.configuration_version,
+            "configuration_hash": configuration.content_hash,
+        }
+    )
+
+
+def _pinned_versions(config: BacktestRunConfiguration, decisions: list[WcaDecision], weight_snapshot) -> dict[str, object]:
+    strategy_versions = {
+        row.strategy_id: row.strategy_version
+        for decision in decisions
+        for row in decision.aggregation.strategy_evaluations
+    }
+    calibration_versions = {
+        row.strategy_id: row.calibration_version
+        for decision in decisions
+        for row in decision.aggregation.strategy_evaluations
+    }
+    return {
+        "configurationVersion": config.configuration_version,
+        "configurationHash": config.configuration_hash,
+        "strategyVersions": dict(sorted(strategy_versions.items())),
+        "calibrationVersions": dict(sorted(calibration_versions.items())),
+        "weightVersion": weight_snapshot.weight_version,
+        "marketDataManifest": config.data_manifest_hash,
+        "costModelVersion": WCA_COST_MODEL_ADAPTER_VERSION,
+        "executionSimulationVersion": WCA_BACKTEST_EXECUTION_SIMULATION_VERSION,
+        "randomSeed": config.random_seed,
+    }
+
+
+def _assert_parity(left: WcaDecision, right: WcaDecision) -> None:
+    comparisons = {
+        "decision_hash": left.decision_hash == right.decision_hash,
+        "effective_settings": left.effective_settings == right.effective_settings,
+        "strategy_evaluations": left.aggregation.strategy_evaluations == right.aggregation.strategy_evaluations,
+        "weights": left.weight_version == right.weight_version and left.aggregation.strategy_contributions == right.aggregation.strategy_contributions,
+        "gates": left.local_gates == right.local_gates,
+        "side": left.aggregation.post_local_gate_decision == right.aggregation.post_local_gate_decision,
+        "quantity": (left.proposed_order.quantity if left.proposed_order else 0) == (right.proposed_order.quantity if right.proposed_order else 0),
+    }
+    failed = tuple(name for name, ok in comparisons.items() if not ok)
+    if failed:
+        raise AssertionError(f"WCA production parity failed: {failed}")
 
 
 def _synthetic_quote(candle: WcaCandle, config: BacktestRunConfiguration) -> WcaQuote:
@@ -487,6 +609,7 @@ __all__ = [
     "WCA_BACKTEST_ENGINE_VERSION",
     "BacktestResult",
     "BacktestRunConfiguration",
+    "prove_wca_production_parity",
     "run_wca_backtest",
     "run_wca_backtest_modes",
 ]

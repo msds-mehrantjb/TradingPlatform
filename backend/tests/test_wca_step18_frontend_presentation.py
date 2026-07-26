@@ -65,7 +65,8 @@ def test_wca_panels_label_readonly_effective_settings_and_gate_boundaries() -> N
     dynamic_source = (WCA_FEATURE_DIR / "WcaDynamicProfilePanel.ts").read_text(encoding="utf-8")
     gate_source = (WCA_FEATURE_DIR / "WcaGatePanel.ts").read_text(encoding="utf-8")
     assert "Effective settings are read-only" in settings_source
-    assert "PUT /api/wca/configuration" in settings_source
+    assert "candidate configuration only" in settings_source
+    assert "Create Candidate Configuration" in settings_source
     assert "Baseline risk:" in dynamic_source
     assert "Effective risk:" in dynamic_source
     assert "WCA-local block" in gate_source
@@ -84,4 +85,3 @@ def test_wca_presentation_panel_is_mounted_from_main_without_replacing_other_tab
     assert "algoWeightedVotingPanel.hidden" in main_source
     assert "algoRegimeSelectionPanel.hidden" in main_source
     assert "algoMetaStrategyPanel.hidden" in main_source
-

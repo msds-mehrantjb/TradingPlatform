@@ -177,10 +177,20 @@ class WcaGateStatus(str, Enum):
 
 class WcaOrderStatus(str, Enum):
     PROPOSED = "PROPOSED"
+    RISK_APPROVED = "RISK_APPROVED"
+    VALIDATED = "VALIDATED"
+    OUTBOX_RESERVED = "OUTBOX_RESERVED"
+    SUBMITTING = "SUBMITTING"
+    BROKER_ACKNOWLEDGED = "BROKER_ACKNOWLEDGED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
     REJECTED = "REJECTED"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+    SUBMISSION_UNKNOWN = "SUBMISSION_UNKNOWN"
+    RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
     ACCEPTED_FOR_PAPER = "ACCEPTED_FOR_PAPER"
     FILLED_PAPER = "FILLED_PAPER"
-    CANCELLED = "CANCELLED"
 
 
 class WcaBacktestMode(str, Enum):
@@ -235,11 +245,16 @@ class WcaQuote(WcaContractModel):
 class WcaMarketSnapshot(WcaContractModel):
     algorithm_id: str = WCA_ALGORITHM_ID
     schema_version: str = WCA_CONTRACT_VERSION
+    configuration_version: str = ""
+    configuration_hash: str = ""
     symbol: str = Field(min_length=1)
     data_timestamp: datetime
     decision_timestamp: datetime
     candles: tuple[WcaCandle, ...] = Field(min_length=1)
     quote: WcaQuote | None = None
+    external_market_data: dict[str, tuple[WcaCandle, ...]] = Field(default_factory=dict)
+    external_input_timestamps: dict[str, datetime] = Field(default_factory=dict)
+    market_breadth_inputs: dict[str, float] = Field(default_factory=dict)
     source: str = "neutral_market_data"
     data_ready: bool = True
     reason_codes: tuple[str, ...] = ()
@@ -248,6 +263,8 @@ class WcaMarketSnapshot(WcaContractModel):
 class WcaStrategyEvaluation(WcaContractModel):
     strategy_id: str = Field(min_length=1)
     strategy_version: str = "wca_strategy_unversioned_v1"
+    configuration_version: str = ""
+    configuration_hash: str = ""
     name: str = Field(min_length=1)
     status: WcaEvaluationStatus = WcaEvaluationStatus.ACTIVE
     signal: WcaSide = WcaSide.HOLD
@@ -299,6 +316,8 @@ class WcaStrategyEvaluation(WcaContractModel):
 class WcaConfidenceCalibrationOutcome(WcaContractModel):
     strategy_id: str = Field(min_length=1)
     strategy_version: str = Field(min_length=1)
+    direction: WcaSide | str = WcaSide.HOLD
+    regime: str = "default"
     raw_confidence: float = Field(ge=0, le=1)
     realized_success: bool
     decision_timestamp: datetime
@@ -326,21 +345,45 @@ class WcaConfidenceCalibrationBin(WcaContractModel):
 class WcaConfidenceCalibrationTable(WcaContractModel):
     strategy_id: str = Field(min_length=1)
     strategy_version: str = Field(min_length=1)
+    direction: WcaSide | str | None = None
+    regime: str | None = None
     calibration_version: str = Field(min_length=1)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     outcome_cutoff_timestamp: datetime
     minimum_samples: int = Field(ge=1)
     prior_success_rate: float = Field(ge=0, le=1)
     prior_strength: float = Field(ge=0)
+    sample_scope: str = "strategy_version"
+    sample_count: int = Field(default=0, ge=0)
     bins: tuple[WcaConfidenceCalibrationBin, ...] = Field(min_length=1)
+    reason_codes: tuple[str, ...] = ()
 
 
 class WcaModifierEvaluation(WcaContractModel):
     modifier_id: str = Field(min_length=1)
     status: WcaEvaluationStatus
     multiplier: float = Field(ge=0)
+    confidence_multiplier: float = Field(default=1.0, ge=0)
+    weight_multiplier: float = Field(default=1.0, ge=0)
+    risk_multiplier: float = Field(default=1.0, ge=0)
+    position_size_multiplier: float = Field(default=1.0, ge=0)
+    entry_requirement_multiplier: float = Field(default=1.0, ge=0)
+    market_status_contributions: dict[str, float | str] = Field(default_factory=dict)
+    primary_vote_contribution: float = Field(default=0.0, ge=0.0, le=0.0)
+    directional_score_contribution: float = Field(default=0.0, ge=0.0, le=0.0)
     reason_codes: tuple[str, ...] = ()
     explanation: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_explicit_multipliers(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        populated = dict(data)
+        multiplier = populated.get("multiplier", 1.0)
+        populated.setdefault("confidence_multiplier", multiplier)
+        populated.setdefault("weight_multiplier", multiplier)
+        return populated
 
 
 class WcaMarketStatus(WcaContractModel):
@@ -387,6 +430,13 @@ class WcaBaselineSettings(WcaContractModel):
     max_spread_percent: float = Field(default=0.10, ge=0)
     max_participation_percent: float = Field(default=1.0, ge=0)
     max_allowed_shares: int = Field(default=0, ge=0)
+    configured_fee_per_share: float = Field(default=0.0, ge=0)
+    market_impact_bps: float = Field(default=1.0, ge=0)
+    adverse_selection_bps: float = Field(default=1.0, ge=0)
+    replacement_cost_bps: float = Field(default=0.5, ge=0)
+    observed_slippage_per_share: float = Field(default=0.0, ge=0)
+    uncertainty_buffer_per_share: float = Field(default=0.01, ge=0)
+    minimum_net_edge_per_share: float = Field(default=0.0, ge=0)
     hard_max_risk_percent: float = Field(default=1.0, ge=0)
     hard_max_order_allocation_percent: float = Field(default=10.0, ge=0)
     hard_max_daily_allocation_percent: float = Field(default=20.0, ge=0)
@@ -428,6 +478,8 @@ class WcaEffectiveSettings(WcaContractModel):
     final_entry_cutoff_minutes: int = Field(default=15 * 60 + 30, ge=0)
     final_max_spread_percent: float = Field(default=0.10, ge=0)
     final_max_participation_percent: float = Field(default=1.0, ge=0)
+    final_minimum_net_edge_per_share: float = Field(default=0.0, ge=0)
+    final_uncertainty_buffer_per_share: float = Field(default=0.01, ge=0)
     final_pyramiding_enabled: bool = False
     entries_blocked: bool = False
     reason_codes: tuple[str, ...] = ()
@@ -557,6 +609,11 @@ class WcaLocalGateResult(WcaContractModel):
     gate_id: str = Field(min_length=1)
     status: WcaGateStatus
     blocks_entry: bool
+    entry_blocked: bool | None = None
+    quantity_multiplier: float = Field(default=1.0, ge=0, le=1)
+    risk_multiplier: float = Field(default=1.0, ge=0, le=1)
+    warning: bool = False
+    exit_allowed: bool = True
     severity: str = "info"
     reason_code: str = ""
     detail: str = ""
@@ -564,6 +621,24 @@ class WcaLocalGateResult(WcaContractModel):
     required_value: float | int | str | bool | None = None
     reason_codes: tuple[str, ...] = ()
     explanation: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_structured_gate_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        populated = dict(data)
+        populated.setdefault("entry_blocked", populated.get("blocks_entry", False))
+        populated.setdefault("warning", populated.get("status") == WcaGateStatus.WARN or populated.get("status") == WcaGateStatus.WARN.value)
+        return populated
+
+    @model_validator(mode="after")
+    def validate_structured_gate_fields(self) -> "WcaLocalGateResult":
+        if self.entry_blocked != self.blocks_entry:
+            raise ValueError("entry_blocked must match blocks_entry for WCA gate compatibility")
+        if self.blocks_entry and not self.exit_allowed:
+            raise ValueError("WCA entry-blocking gates must preserve protective exit permission")
+        return self
 
 
 class WcaSizingResult(WcaContractModel):
@@ -595,6 +670,8 @@ class WcaSizingResult(WcaContractModel):
 class ProposedOrder(WcaContractModel):
     algorithm_id: str = WCA_ALGORITHM_ID
     decision_id: str = Field(min_length=1)
+    configuration_version: str = ""
+    configuration_hash: str = ""
     order_intent_id: str = Field(min_length=1)
     idempotency_key: str | None = Field(default=None, min_length=1)
     account_id: str = Field(default="paper", min_length=1)
@@ -613,6 +690,11 @@ class GlobalGateResult(WcaContractModel):
     status: WcaGateStatus
     proposed_quantity: int = Field(ge=0)
     allowed_quantity: int = Field(ge=0)
+    requested_risk: float = Field(default=0, ge=0)
+    approved_risk: float = Field(default=0, ge=0)
+    entry_permitted: bool = True
+    risk_reducing_exit_permitted: bool = True
+    idempotency_key: str | None = Field(default=None, min_length=1)
     reason_codes: tuple[str, ...] = ()
     explanation: str = ""
 
@@ -620,24 +702,88 @@ class GlobalGateResult(WcaContractModel):
     def cannot_increase_quantity(self) -> "GlobalGateResult":
         if self.allowed_quantity > self.proposed_quantity:
             raise ValueError("global gate cannot increase proposed quantity")
+        if self.approved_risk > self.requested_risk + 1e-9:
+            raise ValueError("global gate cannot increase proposed risk")
         return self
+
+
+class WcaCostEstimate(WcaContractModel):
+    model_version: str = "wca_neutral_cost_model_adapter_v1"
+    symbol: str = Field(min_length=1)
+    side: WcaSide | str
+    entry_price: float = Field(gt=0)
+    spread: float = Field(ge=0)
+    half_spread_entry: float = Field(ge=0)
+    half_spread_exit: float = Field(ge=0)
+    market_impact_per_share: float = Field(ge=0)
+    adverse_selection_per_share: float = Field(ge=0)
+    nonfill_or_replacement_per_share: float = Field(ge=0)
+    fees_per_share: float = Field(ge=0)
+    observed_wca_slippage_per_share: float = Field(ge=0)
+    conservative_round_trip_cost_per_share: float = Field(ge=0)
+    uncertainty_buffer_per_share: float = Field(ge=0)
+    conservative_gross_edge_per_share: float = Field(ge=0)
+    conservative_net_edge_per_share: float
+    minimum_required_net_edge_per_share: float = Field(ge=0)
+    entry_allowed: bool
+    reason_codes: tuple[str, ...] = ()
+
+
+class WcaLatencyTimestamps(WcaContractModel):
+    bar_finalization: datetime | None = None
+    event_publication: datetime | None = None
+    event_receipt: datetime | None = None
+    snapshot_completion: datetime | None = None
+    strategy_completion: datetime | None = None
+    aggregation_completion: datetime | None = None
+    global_risk_response: datetime | None = None
+    outbox_reservation: datetime | None = None
+    broker_request: datetime | None = None
+    broker_acknowledgement: datetime | None = None
+    first_fill: datetime | None = None
+    final_fill: datetime | None = None
+
+
+class WcaLatencyMetrics(WcaContractModel):
+    decision_latency_seconds: float | None = Field(default=None, ge=0)
+    risk_latency_seconds: float | None = Field(default=None, ge=0)
+    broker_latency_seconds: float | None = Field(default=None, ge=0)
+    processing_lag_seconds: float | None = Field(default=None, ge=0)
+    quote_age_seconds: float | None = Field(default=None, ge=0)
+    slippage_per_share: float | None = Field(default=None, ge=0)
+    fill_quality: str | None = None
+    reason_codes: tuple[str, ...] = ()
+
+
+class WcaLatencySnapshot(WcaContractModel):
+    model_version: str = "wca_latency_observability_v1"
+    timestamps: WcaLatencyTimestamps = Field(default_factory=WcaLatencyTimestamps)
+    metrics: WcaLatencyMetrics = Field(default_factory=WcaLatencyMetrics)
 
 
 class WcaDecision(WcaContractModel):
     algorithm_id: str = WCA_ALGORITHM_ID
     decision_id: str = Field(min_length=1)
     configuration_version: str
+    configuration_hash: str = ""
     weight_version: str
     data_timestamp: datetime
     decision_timestamp: datetime
     market_snapshot: WcaMarketSnapshot
     market_status: WcaMarketStatus
     effective_settings: WcaEffectiveSettings | None = None
+    runtime_mode: str = "paper"
+    called_module_versions: dict[str, str] = Field(default_factory=dict)
+    modifier_evaluations: tuple[WcaModifierEvaluation, ...] = ()
+    hard_filter_results: tuple[WcaLocalGateResult, ...] = ()
     aggregation: WcaAggregationResult
     local_gates: tuple[WcaLocalGateResult, ...]
     sizing: WcaSizingResult
+    cost_estimate: WcaCostEstimate | None = None
+    latency: WcaLatencySnapshot | None = None
     proposed_order: ProposedOrder | None = None
     global_gate_result: GlobalGateResult | None = None
+    decision_hash: str = ""
     reason_codes: tuple[str, ...] = ()
 
 
@@ -680,6 +826,8 @@ class BacktestRunConfiguration(WcaContractModel):
     market_impact_bps: float = Field(default=1.0, ge=0)
     max_participation_percent: float = Field(default=10.0, ge=0)
     allow_partial_fills: bool = True
+    execution_simulation_version: str = "wca_backtest_execution_simulator_v1"
+    random_seed: int | None = None
     custom_window_sessions: int | None = Field(default=None, ge=1)
     smoke_sessions: int = Field(default=3, ge=1, le=3)
     walk_forward_lookback_sessions: int = Field(default=60, ge=1)
@@ -691,6 +839,8 @@ class BacktestRunConfiguration(WcaContractModel):
 class BacktestTrade(WcaContractModel):
     trade_id: str = Field(min_length=1)
     decision_id: str = Field(min_length=1)
+    configuration_version: str = ""
+    configuration_hash: str = ""
     symbol: str = Field(min_length=1)
     side: WcaSide
     quantity: int = Field(gt=0)
@@ -770,10 +920,32 @@ class WcaPaperExecutionResult(WcaContractModel):
 class WcaOrderValidationContext:
     evaluation_timestamp: datetime
     paper_only_mode: bool = True
+    account_id: str = "paper"
     current_position_quantity: int = 0
     current_position_side: WcaSide | str | None = None
     allow_position_increase: bool = False
     position_owned_by_wca: bool = True
+    quote_freshness_seconds: int | None = None
+    available_buying_power: float | None = None
+    account_equity: float | None = None
+    max_position_value: float | None = None
+    realized_daily_loss: float | None = None
+    max_daily_loss: float | None = None
+    trades_today: int | None = None
+    max_daily_trades: int | None = None
+    aggregate_global_risk_used: float | None = None
+    aggregate_global_risk_limit: float | None = None
+    max_spread_percent: float | None = None
+    average_one_minute_volume: float | None = None
+    max_participation_percent: float | None = None
+    expected_net_edge: float | None = None
+    minimum_net_edge: float = 0.0
+    idempotency_required: bool = False
+    idempotency_key_seen: bool = False
+    new_entry_permitted: bool = True
+    risk_reducing_exit_permitted: bool = True
+    is_risk_reducing_exit: bool = False
+    cross_algorithm_position_mutation: bool = False
 
 
 @dataclass(frozen=True)
@@ -791,6 +963,8 @@ class WcaBrokerReconciliationDiscrepancy(WcaContractModel):
         "stale_open_order",
         "mismatched_quantity",
         "attribution_missing",
+        "wca_inventory_broker_mismatch",
+        "broker_net_attribution_mismatch",
     ]
     severity: Literal["info", "warning", "hard"] = "warning"
     account_id: str = Field(min_length=1)

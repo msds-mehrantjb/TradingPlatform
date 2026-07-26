@@ -12,17 +12,24 @@ from backend.app.algorithms.wca.backtest import (
     WCA_BACKTEST_INVENTORY,
     WCA_BACKTEST_RESPONSIBILITY_IDS,
 )
-from backend.app.algorithms.wca.backtest.engine import run_wca_backtest, run_wca_backtest_modes
+from backend.app.algorithms.wca.backtest.engine import prove_wca_production_parity, run_wca_backtest, run_wca_backtest_modes
+from backend.app.algorithms.wca.backtest.execution import WCA_BACKTEST_EXECUTION_SIMULATION_VERSION, simulate_wca_backtest_execution
+from backend.app.algorithms.wca.configuration import default_wca_configuration
 from backend.app.algorithms.wca.contracts import (
     BacktestRunConfiguration,
+    ProposedOrder,
     WcaBacktestMode,
     WcaBacktestRequest,
     WcaBacktestSideMode,
     WcaCandle,
     WcaEvaluationStatus,
+    WcaMarketSnapshot,
+    WcaQuote,
     WcaSide,
     WcaStrategyEvaluation,
 )
+from backend.app.algorithms.wca.cost_model import WCA_COST_MODEL_ADAPTER_VERSION
+from backend.app.algorithms.wca.runtime_events import WcaFinalizedBarEvent
 from backend.app.main import app
 
 
@@ -70,8 +77,9 @@ class WcaBacktestInventoryTests(unittest.TestCase):
         self.assertTrue(all(row.owner_file in WCA_BACKTEST_FILE_INVENTORY for row in WCA_BACKTEST_INVENTORY))
 
     def test_backtest_result_evidence_matches_inventory_contract(self) -> None:
-        result = run_wca_backtest(backtest_request(candles=sample_candles(35)))
-        suite = run_wca_backtest_modes(backtest_request(candles=multi_session_candles(28)))
+        configuration = default_wca_configuration()
+        result = run_wca_backtest(backtest_request(candles=sample_candles(35)), configuration=configuration)
+        suite = run_wca_backtest_modes(backtest_request(candles=multi_session_candles(28)), configuration=configuration)
 
         self.assertEqual(result.metrics["engineVersion"], "wca_backend_backtest_v1")
         self.assertEqual(result.metrics["fillRule"], "signal on bar t fills no earlier than bar t+1 open")
@@ -85,10 +93,10 @@ class WcaBacktestInventoryTests(unittest.TestCase):
 
 class WcaStep14BackendBacktestTests(unittest.TestCase):
     def test_backend_backtest_uses_pipeline_and_next_bar_fills(self) -> None:
-        request = backtest_request(side_mode=WcaBacktestSideMode.LONG_AND_SHORT)
+        request = backtest_request(candles=execution_candles(), side_mode=WcaBacktestSideMode.LONG_AND_SHORT)
 
         with patch("backend.app.algorithms.wca.backtest.engine.WCA_PRIMARY_VOTERS", fake_voters(WcaSide.BUY)):
-            result = run_wca_backtest(request)
+            result = run_wca_backtest(request, configuration=default_wca_configuration())
 
         self.assertIn("strategy_registry", result.metrics["calledProductionModules"])
         self.assertIn("confidence_calibration", result.metrics["calledProductionModules"])
@@ -107,13 +115,13 @@ class WcaStep14BackendBacktestTests(unittest.TestCase):
 
     def test_long_only_default_does_not_silently_enable_short_selling(self) -> None:
         with patch("backend.app.algorithms.wca.backtest.engine.WCA_PRIMARY_VOTERS", fake_voters(WcaSide.SELL)):
-            result = run_wca_backtest(backtest_request())
+            result = run_wca_backtest(backtest_request(), configuration=default_wca_configuration())
 
         self.assertEqual(result.run_configuration.side_mode, WcaBacktestSideMode.LONG_ONLY.value)
         self.assertEqual(result.trades, ())
 
     def test_early_session_strategies_are_evaluated_in_valid_window(self) -> None:
-        result = run_wca_backtest(backtest_request(candles=opening_range_candles()))
+        result = run_wca_backtest(backtest_request(candles=opening_range_candles()), configuration=default_wca_configuration())
         opening_decisions = [
             decision
             for decision in result.decisions
@@ -131,27 +139,70 @@ class WcaStep14BackendBacktestTests(unittest.TestCase):
 
     def test_results_are_reproducible_from_run_id_and_configuration_hash(self) -> None:
         request = backtest_request()
+        configuration = default_wca_configuration()
 
         with patch("backend.app.algorithms.wca.backtest.engine.WCA_PRIMARY_VOTERS", fake_voters(WcaSide.BUY)):
-            first = run_wca_backtest(request)
-            second = run_wca_backtest(request)
+            first = run_wca_backtest(request, configuration=configuration)
+            second = run_wca_backtest(request, configuration=configuration)
 
         self.assertEqual(first.run_configuration.configuration_hash, second.run_configuration.configuration_hash)
         self.assertEqual(first.total_pnl, second.total_pnl)
         self.assertEqual(first.metrics["dataManifestHash"], second.metrics["dataManifestHash"])
         self.assertTrue(first.metrics["openPositionDrawdownIncluded"])
 
-    def test_api_submit_status_result_and_report_are_backend_authoritative(self) -> None:
+    def test_backtest_pins_versions_and_cost_diagnostics(self) -> None:
+        request = backtest_request()
+
+        with patch("backend.app.algorithms.wca.backtest.engine.WCA_PRIMARY_VOTERS", fake_voters(WcaSide.BUY)):
+            result = run_wca_backtest(request, configuration=default_wca_configuration())
+
+        pinned = result.metrics["pinnedVersions"]
+        self.assertEqual(pinned["configurationVersion"], result.run_configuration.configuration_version)
+        self.assertEqual(pinned["marketDataManifest"], result.run_configuration.data_manifest_hash)
+        self.assertEqual(pinned["costModelVersion"], WCA_COST_MODEL_ADAPTER_VERSION)
+        self.assertEqual(pinned["executionSimulationVersion"], WCA_BACKTEST_EXECUTION_SIMULATION_VERSION)
+        self.assertIn("C1", pinned["strategyVersions"])
+        diagnostics = result.metrics["diagnostics"]
+        self.assertIn("costDiagnostics", diagnostics["breakdowns"])
+        self.assertIn("transactionCostSensitivity", diagnostics["breakdowns"])
+
+    def test_parity_fixture_matches_runtime_shadow_replay_and_backtest_decisions(self) -> None:
+        configuration = default_wca_configuration()
+        candles = sample_candles(72)
+        events = tuple(parity_event(index, candles[: 70 + index]) for index in range(1, 3))
+
+        proof = prove_wca_production_parity(events, configuration=configuration)
+
+        self.assertTrue(proof["identical"])
+        self.assertEqual(proof["eventCount"], len(events))
+        self.assertTrue(all(row["decisionHash"] for row in proof["rows"]))
+        self.assertIn("wca.backtest.production_parity.proven", proof["reasonCodes"])
+
+    def test_execution_simulator_models_filled_partial_cancelled_and_expired_orders(self) -> None:
+        config = backtest_request().configuration.model_copy(update={"max_participation_percent": 1, "allow_partial_fills": True})
+        bar = WcaCandle(timestamp=datetime(2026, 7, 14, 14, 0, tzinfo=timezone.utc), open=100, high=101, low=99, close=100.5, volume=100)
+        order = ProposedOrder(decision_id="d", order_intent_id="i", symbol="SPY", side=WcaSide.BUY, quantity=200, trigger_price=100, limit_price=100, stop_price=99, target_price=102)
+
+        partial = simulate_wca_backtest_execution(order=order, next_bar=bar, config=config, side_allowed=True)
+        expired = simulate_wca_backtest_execution(order=order.model_copy(update={"limit_price": 90, "trigger_price": 90}), next_bar=bar, config=config, side_allowed=True)
+        cancelled = simulate_wca_backtest_execution(order=order, next_bar=bar, config=config, side_allowed=False)
+        filled = simulate_wca_backtest_execution(order=order.model_copy(update={"quantity": 1}), next_bar=bar, config=config, side_allowed=True)
+
+        self.assertEqual(partial.status, "PARTIALLY_FILLED")
+        self.assertEqual(expired.status, "EXPIRED")
+        self.assertEqual(cancelled.status, "CANCELLED")
+        self.assertEqual(filled.status, "FILLED")
+
+    def test_api_submit_enqueues_backend_research_job(self) -> None:
         client = TestClient(app)
         payload = backtest_request(candles=sample_candles(35)).model_dump(mode="json")
         response = client.post("/api/wca/backtests", json=payload)
 
-        self.assertEqual(response.status_code, 200, response.text)
-        run_id = response.json()["run_configuration"]["run_id"]
-        self.assertTrue(response.json()["metrics"]["usesBackendEngine"])
-        self.assertEqual(client.get(f"/api/wca/backtests/{run_id}/status").json()["status"], "complete")
-        self.assertEqual(client.get(f"/api/wca/backtests/{run_id}").status_code, 200)
-        self.assertTrue(client.get(f"/api/wca/backtests/{run_id}/report").json()["backendAuthoritative"])
+        self.assertEqual(response.status_code, 202, response.text)
+        job_id = response.json()["job_id"]
+        self.assertEqual(response.json()["status"], "QUEUED")
+        self.assertTrue(response.json()["queued"])
+        self.assertEqual(client.get(f"/api/wca/backtests/{job_id}/status").json()["status"], "queued")
 
     def test_frontend_daily_wca_backtest_calls_backend_endpoint(self) -> None:
         frontend = Path(__file__).resolve().parents[2] / "frontend" / "src" / "main.ts"
@@ -165,7 +216,7 @@ class WcaStep14BackendBacktestTests(unittest.TestCase):
 
 class WcaStep15BacktestModesTests(unittest.TestCase):
     def test_backtest_modes_are_labeled_and_smoke_is_not_production_validation(self) -> None:
-        suite = run_wca_backtest_modes(backtest_request(candles=multi_session_candles(28)))
+        suite = run_wca_backtest_modes(backtest_request(candles=multi_session_candles(28)), configuration=default_wca_configuration())
 
         self.assertEqual(suite.smoke.label, "Daily smoke test")
         self.assertFalse(suite.smoke.production_validation)
@@ -176,13 +227,13 @@ class WcaStep15BacktestModesTests(unittest.TestCase):
         self.assertFalse(suite.holdout.production_validation)
 
     def test_holdout_is_excluded_from_comparison_optimization(self) -> None:
-        suite = run_wca_backtest_modes(backtest_request(candles=multi_session_candles(30)))
+        suite = run_wca_backtest_modes(backtest_request(candles=multi_session_candles(30)), configuration=default_wca_configuration())
 
         self.assertIn("wca.backtest.holdout_excluded_from_optimization", suite.reason_codes)
         self.assertTrue(all(comparison.metrics["holdoutExcluded"] for comparison in suite.comparisons))
 
     def test_required_ab_comparisons_use_identical_dataset_and_execution_assumptions(self) -> None:
-        suite = run_wca_backtest_modes(backtest_request(candles=multi_session_candles(30)))
+        suite = run_wca_backtest_modes(backtest_request(candles=multi_session_candles(30)), configuration=default_wca_configuration())
         labels = {comparison.label for comparison in suite.comparisons}
 
         self.assertEqual(
@@ -285,6 +336,27 @@ def sample_candles(count: int) -> tuple[WcaCandle, ...]:
     return tuple(candles)
 
 
+def execution_candles(count: int = 80) -> tuple[WcaCandle, ...]:
+    start = datetime(2026, 7, 14, 13, 30, tzinfo=timezone.utc)
+    price = 100.0
+    candles: list[WcaCandle] = []
+    for index in range(count):
+        open_price = price
+        close = open_price + 0.08
+        candles.append(
+            WcaCandle(
+                timestamp=start + timedelta(minutes=index),
+                open=open_price,
+                high=close + 0.45,
+                low=open_price - 0.45,
+                close=close,
+                volume=200_000,
+            )
+        )
+        price = close
+    return tuple(candles)
+
+
 def opening_range_candles() -> tuple[WcaCandle, ...]:
     rows = list(sample_candles(70))
     adjusted: list[WcaCandle] = []
@@ -294,6 +366,29 @@ def opening_range_candles() -> tuple[WcaCandle, ...]:
         else:
             adjusted.append(candle)
     return tuple(adjusted)
+
+
+def parity_event(index: int, candles: tuple[WcaCandle, ...]) -> WcaFinalizedBarEvent:
+    latest = candles[-1]
+    quote = WcaQuote(timestamp=latest.timestamp, bid=latest.close - 0.01, ask=latest.close + 0.01)
+    snapshot = WcaMarketSnapshot(
+        symbol="SPY",
+        data_timestamp=latest.timestamp,
+        decision_timestamp=latest.timestamp,
+        candles=candles,
+        quote=quote,
+        source="parity_fixture",
+        reason_codes=("test.completed_bar",),
+    )
+    return WcaFinalizedBarEvent(
+        event_id=f"parity-event-{index}",
+        symbol="SPY",
+        finalized_candle_timestamp=latest.timestamp,
+        data_manifest_hash=f"manifest-{index}",
+        publication_timestamp=latest.timestamp + timedelta(seconds=1),
+        source="test",
+        snapshot=snapshot,
+    )
 
 
 def multi_session_candles(session_count: int) -> tuple[WcaCandle, ...]:

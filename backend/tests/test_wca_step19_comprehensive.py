@@ -13,7 +13,7 @@ import pytest
 
 from backend.app.algorithms.wca.aggregation import WcaAggregationConfig, aggregate_wca
 from backend.app.algorithms.wca.confidence import ConfidenceCalibrationConfig, build_calibration_table, calibrate_evaluation
-from backend.app.algorithms.wca.configuration import default_baseline_settings
+from backend.app.algorithms.wca.configuration import default_wca_configuration
 from backend.app.algorithms.wca.contracts import (
     BacktestRunConfiguration,
     WcaBacktestMode,
@@ -281,14 +281,14 @@ class WcaStep19AggregationTests(unittest.TestCase):
 
 class WcaStep19DynamicProfileTests(unittest.TestCase):
     def test_baseline_is_unchanged_and_risk_never_exceeds_baseline(self) -> None:
-        baseline = default_baseline_settings()
+        baseline = default_wca_configuration().to_baseline_settings()
         profile = resolve_dynamic_profile(baseline=baseline, market_status=_market_status(volatility=WcaVolatilityStatus.HIGH))
         self.assertEqual(baseline, profile.effective_settings.baseline)
         self.assertLessEqual(profile.effective_settings.final_risk_percent, baseline.base_risk_percent)
         self.assertIn("volatility.high", profile.active_overlays)
 
     def test_defensive_transition_is_immediate_recovery_requires_hysteresis_and_profile_expires(self) -> None:
-        baseline = default_baseline_settings()
+        baseline = default_wca_configuration().to_baseline_settings()
         now = datetime(2026, 7, 15, 16, 0, tzinfo=UTC)
         defensive = resolve_dynamic_profile(
             baseline=baseline,
@@ -311,7 +311,7 @@ class WcaStep19DynamicProfileTests(unittest.TestCase):
 
     def test_extreme_risk_blocks_entries(self) -> None:
         profile = resolve_dynamic_profile(
-            baseline=default_baseline_settings(),
+            baseline=default_wca_configuration().to_baseline_settings(),
             market_status=_market_status(liquidity=WcaLiquidityStatus.UNSAFE, event_risk=WcaEventRiskStatus.BLOCKED),
         )
         self.assertTrue(profile.effective_settings.entries_blocked)
@@ -349,8 +349,9 @@ class WcaStep19BacktestLeakageTests(unittest.TestCase):
         request_a = _backtest_request(tuple(base), run_id="step19-a")
         request_b = _backtest_request(tuple(altered_future), run_id="step19-b")
 
-        result_a = run_wca_backtest(request_a)
-        result_b = run_wca_backtest(request_b)
+        configuration = default_wca_configuration()
+        result_a = run_wca_backtest(request_a, configuration=configuration)
+        result_b = run_wca_backtest(request_b, configuration=configuration)
 
         comparable = min(len(result_a.decisions), len(result_b.decisions)) - 1
         self.assertGreater(comparable, 0)
@@ -371,19 +372,20 @@ class WcaStep19BacktestLeakageTests(unittest.TestCase):
         self.assertEqual(sum(row.sample_count for row in table.bins), 0)
 
     def test_same_bar_close_fills_are_impossible_and_ordering_must_be_chronological(self) -> None:
-        result = run_wca_backtest(_backtest_request(_chronological_candles(80), run_id="step19-fill"))
+        configuration = default_wca_configuration()
+        result = run_wca_backtest(_backtest_request(_chronological_candles(80), run_id="step19-fill"), configuration=configuration)
         self.assertIn("fill_no_earlier_than_bar_t_plus_1_open", result.metrics["eventOrder"])
         for trade in result.trades:
             decision = next(row for row in result.decisions if row.decision_id == trade.decision_id)
             self.assertGreater(trade.entry_at, decision.decision_timestamp)
 
         unordered = tuple(reversed(_chronological_candles(10)))
-        result_unordered = run_wca_backtest(_backtest_request(unordered, run_id="step19-order"))
+        result_unordered = run_wca_backtest(_backtest_request(unordered, run_id="step19-order"), configuration=configuration)
         timestamps = [decision.decision_timestamp for decision in result_unordered.decisions]
         self.assertEqual(timestamps, sorted(timestamps))
 
     def test_holdout_data_is_inaccessible_to_optimization(self) -> None:
-        result = run_wca_backtest_modes(_backtest_request(_chronological_candles(120), run_id="step19-suite"))
+        result = run_wca_backtest_modes(_backtest_request(_chronological_candles(120), run_id="step19-suite"), configuration=default_wca_configuration())
         self.assertIn("holdout", result.holdout.label.lower())
         self.assertIn("optimization", result.holdout.purpose.lower())
         self.assertIn("optimization", result.holdout.purpose.lower())
@@ -431,7 +433,7 @@ class WcaStep19FailureInjectionTests(unittest.TestCase):
         db_url = (db_dir / "wca.sqlite").as_posix()
         repo = WcaSqliteRepository(f"sqlite:///{db_url}")
         try:
-            result = run_wca_backtest(_backtest_request(_chronological_candles(40), run_id="step19-retry"))
+            result = run_wca_backtest(_backtest_request(_chronological_candles(40), run_id="step19-retry"), configuration=default_wca_configuration())
             repo.save_backtest_result(result)
             repo.save_backtest_result(result)
             self.assertEqual(repo.table_counts().table_counts["wca_backtest_runs"], 1)

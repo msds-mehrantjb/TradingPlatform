@@ -30,7 +30,7 @@ The backend WCA catalog defines 11 primary voting strategies. Modifiers and hard
 | ID | Dedicated WCA strategy | Family | Baseline weight |
 | --- | --- | --- | --- |
 | C1 | Moving Average Trend | Trend | 0.10 |
-| C2 | Trend Pullback | Trend | 0.09 |
+| C2 | First Pullback After Open | Trend | 0.09 |
 | C3 | VWAP Trend Continuation | Trend | 0.09 |
 | C4 | VWAP Mean Reversion | Mean reversion | 0.08 |
 | C5 | RSI Mean Reversion | Mean reversion | 0.08 |
@@ -54,7 +54,7 @@ strategies/
   indicators.py
   primary_voters.py
   moving_average_trend.py
-  trend_pullback.py
+  trend_pullback.py  # legacy file path for canonical first_pullback_after_open
   vwap_trend_continuation.py
   vwap_mean_reversion.py
   rsi_mean_reversion.py
@@ -111,18 +111,29 @@ WCA privately owns these dynamic values: entry-score threshold, minimum confiden
 The dedicated WCA execution pipeline is defined by `WCA_EXECUTION_PIPELINE_MODULES` in `backend/app/algorithms/wca/execution_pipeline.py`.
 
 ```text
-strategy_registry
-  -> confidence_calibration
-  -> weight_engine
-  -> market_status
-  -> dynamic_profile
-  -> aggregation
-  -> local_gates
-  -> sizing
-  -> order_proposal
-  -> order_validation
-  -> exits
+validate_command_and_snapshot
+  -> load_exact_configuration_revision
+  -> validate_data_completeness_and_freshness
+  -> resolve_market_status
+  -> resolve_bounded_dynamic_effective_settings
+  -> evaluate_active_primary_strategies
+  -> evaluate_contextual_modifiers
+  -> calibrate_strategy_confidence
+  -> load_immutable_weight_snapshot
+  -> apply_reliability_health_family_and_correlation_controls
+  -> aggregate_weighted_confidence
+  -> apply_wca_local_gates
+  -> evaluate_existing_position_exits
+  -> compute_expected_edge_after_costs
+  -> size_proposed_order
+  -> request_shared_global_risk_approval
+  -> apply_approved_quantity_and_risk_cap
+  -> run_final_order_validation
+  -> persist_complete_decision
+  -> create_durable_order_intent_when_permitted
 ```
+
+`run_wca_execution_pipeline` is the single WCA production decision pipeline for manual paper, automatic paper, shadow, historical replay, and backtest adapters. Legacy-shaped API requests are translated into canonical WCA commands; externally supplied strategy votes are compatibility inputs only and are not authoritative WCA votes. Paper execution requires a real NBBO quote, while synthetic quotes are allowed only in explicitly labelled backtest or test-simulation contexts.
 
 Related dedicated files:
 
@@ -277,6 +288,9 @@ modifiers/
 ## Hard-Filter And Local-Gate Inventory
 
 The WCA registry defines seven hard-filter categories. These are filters, not primary voting strategies.
+Modifiers and hard filters are WCA-owned contextual controls. Modifiers may only report applicability, bounded confidence/weight multipliers, bounded risk/quantity multipliers, market-status contributions, or tighter entry requirements. They do not emit BUY/SELL/HOLD votes and their contract records zero primary-vote and directional-score contribution.
+
+Hard filters return structured gate outcomes with separate entry blocking, quantity/risk reduction, warning status, reason codes, and exit permission. Entry blockers preserve protective and risk-reducing exits. Relative Strength vs QQQ/IWM requires timestamp-aligned QQQ and IWM data, while Market Breadth requires configured breadth inputs; missing or stale external context returns NOT_APPLICABLE instead of substituting another algorithm or market-direction signal.
 
 | Hard filter |
 | --- |

@@ -103,8 +103,37 @@ class ApiV2EndpointsTest(unittest.TestCase):
         wca_body = self.client.get("/api/v2/algorithms/wca/inventory").json()
         wca_directional = wca_body["modules"]["directional"]
         self.assertNotIn("alias:C1", {module["id"] for module in wca_directional})
-        self.assertNotIn("moving_average_trend", {module["id"] for module in wca_directional})
-        self.assertEqual({module["id"] for module in wca_body["modules"]["context"]}, {"relative_strength_vs_qqq_iwm", "market_breadth"})
+        self.assertEqual(
+            {module["id"] for module in wca_directional},
+            {
+                "moving_average_trend",
+                "first_pullback_after_open",
+                "vwap_trend_continuation",
+                "vwap_mean_reversion",
+                "rsi_mean_reversion",
+                "bollinger_atr_reversion",
+                "opening_range_breakout",
+                "intraday_volatility_breakout",
+                "failed_breakout_reversal",
+                "liquidity_sweep_reversal",
+                "gap_continuation_fade",
+            },
+        )
+        self.assertNotIn("trend_pullback", {module["id"] for module in wca_directional})
+        self.assertEqual(
+            {module["id"] for module in wca_body["modules"]["context"]},
+            {
+                "vwap_position",
+                "volume_confirmation",
+                "macd_momentum",
+                "market_structure",
+                "multi_timeframe_trend_alignment",
+                "relative_strength_vs_qqq_iwm",
+                "market_breadth",
+                "session_phase",
+                "spread_liquidity",
+            },
+        )
         self.assertEqual({module["id"] for module in wca_body["modules"]["regime"]}, {"adx_trend_strength", "atr_volatility_regime"})
 
         expected_modules = {
@@ -130,10 +159,40 @@ class ApiV2EndpointsTest(unittest.TestCase):
                 "aggregator": [],
             },
             "wca": {
-                "directional": ["trend_pullback", "bollinger_atr_reversion", "failed_breakout_reversal", "liquidity_sweep_reversal"],
-                "context": ["relative_strength_vs_qqq_iwm", "market_breadth"],
+                "directional": [
+                    "moving_average_trend",
+                    "first_pullback_after_open",
+                    "vwap_trend_continuation",
+                    "vwap_mean_reversion",
+                    "rsi_mean_reversion",
+                    "bollinger_atr_reversion",
+                    "opening_range_breakout",
+                    "intraday_volatility_breakout",
+                    "failed_breakout_reversal",
+                    "liquidity_sweep_reversal",
+                    "gap_continuation_fade",
+                ],
+                "context": [
+                    "vwap_position",
+                    "volume_confirmation",
+                    "macd_momentum",
+                    "market_structure",
+                    "multi_timeframe_trend_alignment",
+                    "relative_strength_vs_qqq_iwm",
+                    "market_breadth",
+                    "session_phase",
+                    "spread_liquidity",
+                ],
                 "regime": ["adx_trend_strength", "atr_volatility_regime"],
-                "safety": ["cash_avoid_trading"],
+                "safety": [
+                    "cash_avoid_trading",
+                    "economic_event_risk",
+                    "invalid_or_stale_data",
+                    "unsafe_spread",
+                    "unsafe_liquidity",
+                    "extreme_volatility",
+                    "session_entry_block",
+                ],
                 "aggregator": [],
             },
             "weighted-voting": {

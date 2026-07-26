@@ -273,6 +273,20 @@ export type WcaBacktestResult = WcaReasonedRecord & {
   run_configuration?: Record<string, unknown>;
 };
 
+export type WcaCommandReceipt = WcaReasonedRecord & {
+  commandId?: string;
+  command_id?: string;
+  commandType?: string;
+  command_type?: string;
+  job_id?: string;
+  jobId?: string;
+  status?: string;
+  accepted?: boolean;
+  queued?: boolean;
+  paperOnly?: boolean;
+  paper_only?: boolean;
+};
+
 export type WcaConfigurationResponse = {
   algorithmId?: string;
   algorithm_id?: string;
@@ -290,6 +304,8 @@ export type WcaConfigurationResponse = {
   strategy_count?: number;
   paperOnly?: boolean;
   paper_only?: boolean;
+  activeVersions?: Record<string, unknown>;
+  active_versions?: Record<string, unknown>;
 };
 
 export type WcaStatusResponse = {
@@ -308,6 +324,15 @@ export type WcaStatusResponse = {
   paperOnly?: boolean;
   paper_only?: boolean;
   persistence?: Record<string, unknown>;
+  runtimeHealth?: Record<string, unknown>;
+  runtime_health?: Record<string, unknown>;
+  apiHealth?: Record<string, unknown>;
+  api_health?: Record<string, unknown>;
+  activeVersions?: Record<string, unknown>;
+  active_versions?: Record<string, unknown>;
+  observability?: Record<string, unknown>;
+  virtualInventory?: Record<string, unknown>;
+  virtual_inventory?: Record<string, unknown>;
   reasonCodes?: string[];
   reason_codes?: string[];
 };

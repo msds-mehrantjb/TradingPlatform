@@ -39,6 +39,9 @@ class WcaBrokerReconciliationRepository(Protocol):
     def write_broker_reconciliation(self, result: WcaBrokerReconciliationResult) -> None:
         ...
 
+    def open_wca_position_quantity(self, *, account_id: str, symbol: str) -> int:
+        ...
+
 
 def reconcile_wca_broker(
     *,
@@ -47,6 +50,7 @@ def reconcile_wca_broker(
     account_id: str | None = None,
     evaluated_at: datetime | None = None,
     stale_after_seconds: int = 300,
+    shared_global_attribution_ledger: dict[str, dict[str, int]] | None = None,
 ) -> WcaBrokerReconciliationResult:
     evaluated = (evaluated_at or datetime.now(UTC)).astimezone(UTC)
     snapshot = broker.refresh_account_snapshot()
@@ -115,6 +119,35 @@ def reconcile_wca_broker(
             discrepancies.append(_orphan_position(account, position, "wca.broker_reconciliation.orphan_position"))
         if not position.orderIntentId or not position.decisionId:
             discrepancies.append(_orphan_position(account, position, "wca.broker_reconciliation.attribution_missing", discrepancy_type="attribution_missing"))
+
+    for symbol in sorted({position.symbol for position in broker_positions}):
+        broker_wca_quantity = sum(_signed_quantity(position.side, position.quantity) for position in broker_positions if position.symbol == symbol)
+        backend_wca_quantity = repository.open_wca_position_quantity(account_id=account, symbol=symbol) if hasattr(repository, "open_wca_position_quantity") else broker_wca_quantity
+        if broker_wca_quantity != backend_wca_quantity:
+            discrepancies.append(
+                _inventory_mismatch(
+                    account,
+                    symbol,
+                    broker_quantity=broker_wca_quantity,
+                    backend_quantity=backend_wca_quantity,
+                    reason="wca.broker_reconciliation.wca_inventory_broker_mismatch",
+                )
+            )
+
+    if shared_global_attribution_ledger is not None:
+        for symbol in sorted({position.symbol for position in snapshot.positions} | set(shared_global_attribution_ledger)):
+            broker_net_quantity = sum(_signed_quantity(position.side, position.quantity) for position in snapshot.positions if position.symbol == symbol)
+            ledger_net_quantity = sum(int(quantity) for quantity in shared_global_attribution_ledger.get(symbol, {}).values())
+            if broker_net_quantity != ledger_net_quantity:
+                discrepancies.append(
+                    _net_attribution_mismatch(
+                        account,
+                        symbol,
+                        broker_quantity=broker_net_quantity,
+                        ledger_quantity=ledger_net_quantity,
+                        ledger=shared_global_attribution_ledger.get(symbol, {}),
+                    )
+                )
 
     reason_codes = ("wca.broker_reconciliation.clean",) if not discrepancies else tuple(sorted({code for row in discrepancies for code in row.reason_codes}))
     result = WcaBrokerReconciliationResult(
@@ -211,6 +244,47 @@ def _orphan_position(
     )
 
 
+def _inventory_mismatch(account_id: str, symbol: str, *, broker_quantity: int, backend_quantity: int, reason: str) -> WcaBrokerReconciliationDiscrepancy:
+    side = WcaSide.BUY if broker_quantity >= 0 else WcaSide.SELL
+    return WcaBrokerReconciliationDiscrepancy(
+        discrepancy_type="wca_inventory_broker_mismatch",
+        severity="hard",
+        account_id=account_id,
+        symbol=symbol,
+        side=side,
+        broker_quantity=abs(broker_quantity),
+        backend_quantity=abs(backend_quantity),
+        attribution={
+            "algorithmId": WCA_ALGORITHM_ID,
+            "brokerSignedQuantity": str(broker_quantity),
+            "backendSignedQuantity": str(backend_quantity),
+        },
+        reason_codes=(reason,),
+        explanation="WCA-owned inventory does not match WCA-attributed broker position; new WCA entries must remain blocked.",
+    )
+
+
+def _net_attribution_mismatch(account_id: str, symbol: str, *, broker_quantity: int, ledger_quantity: int, ledger: dict[str, int]) -> WcaBrokerReconciliationDiscrepancy:
+    side = WcaSide.BUY if broker_quantity >= 0 else WcaSide.SELL
+    return WcaBrokerReconciliationDiscrepancy(
+        discrepancy_type="broker_net_attribution_mismatch",
+        severity="hard",
+        account_id=account_id,
+        symbol=symbol,
+        side=side,
+        broker_quantity=abs(broker_quantity),
+        backend_quantity=abs(ledger_quantity),
+        preserves_wca_attribution=True,
+        attribution={
+            "brokerSignedQuantity": str(broker_quantity),
+            "ledgerSignedQuantity": str(ledger_quantity),
+            **{f"ledger.{algorithm_id}": str(quantity) for algorithm_id, quantity in ledger.items()},
+        },
+        reason_codes=("wca.broker_reconciliation.broker_net_attribution_mismatch",),
+        explanation="Broker net position differs from the sum of attributed algorithm inventories; WCA will not absorb another algorithm's quantity.",
+    )
+
+
 def _attribution(intent: ProposedOrder) -> dict[str, str | None]:
     return {
         "algorithmId": intent.algorithm_id,
@@ -223,6 +297,14 @@ def _attribution(intent: ProposedOrder) -> dict[str, str | None]:
 
 def _is_wca(value: BrokerOrderState | BrokerPositionState) -> bool:
     return getattr(value, "algorithmId", None) == WCA_ALGORITHM_ID
+
+
+def _signed_quantity(side: WcaSide | str, quantity: int) -> int:
+    return int(quantity) if _side_value(side) == WcaSide.BUY.value else -int(quantity)
+
+
+def _side_value(side: WcaSide | str) -> str:
+    return side.value if isinstance(side, WcaSide) else str(side)
 
 
 __all__ = [

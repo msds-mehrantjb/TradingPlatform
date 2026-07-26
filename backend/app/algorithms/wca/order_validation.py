@@ -34,12 +34,16 @@ def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationC
 
     if order.algorithm_id != WCA_ALGORITHM_ID or decision.algorithm_id != WCA_ALGORITHM_ID or snapshot.algorithm_id != WCA_ALGORITHM_ID:
         reasons.append("wca.order_validation.ownership_algorithm_mismatch")
+    if order.account_id != context.account_id:
+        reasons.append("wca.order_validation.account_mismatch")
     if order.decision_id != decision.decision_id:
         reasons.append("wca.order_validation.ownership_decision_mismatch")
     if order.symbol != snapshot.symbol:
         reasons.append("wca.order_validation.ownership_symbol_mismatch")
     if not context.position_owned_by_wca and context.current_position_quantity > 0:
         reasons.append("wca.order_validation.ownership_position_mismatch")
+    if context.cross_algorithm_position_mutation:
+        reasons.append("wca.order_validation.cross_algorithm_position_mutation")
 
     if side not in (WcaSide.BUY.value, WcaSide.SELL.value):
         reasons.append("wca.order_validation.invalid_side")
@@ -50,6 +54,10 @@ def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationC
         reasons.append("wca.order_validation.zero_quantity")
     if order.quantity != sizing.final_quantity:
         reasons.append("wca.order_validation.quantity_sizing_mismatch")
+    if context.idempotency_required and not order.idempotency_key:
+        reasons.append("wca.order_validation.missing_idempotency_key")
+    if order.idempotency_key and context.idempotency_key_seen:
+        reasons.append("wca.order_validation.duplicate_idempotency_key")
 
     if not all(_positive_number(price) for price in prices):
         reasons.append("wca.order_validation.invalid_prices")
@@ -58,15 +66,23 @@ def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationC
 
     if not context.paper_only_mode:
         reasons.append("wca.order_validation.paper_only_required")
-    if _status_value(order.status) not in (WcaOrderStatus.PROPOSED.value, WcaOrderStatus.ACCEPTED_FOR_PAPER.value):
+    if _status_value(order.status) not in (
+        WcaOrderStatus.PROPOSED.value,
+        WcaOrderStatus.RISK_APPROVED.value,
+        WcaOrderStatus.VALIDATED.value,
+        WcaOrderStatus.OUTBOX_RESERVED.value,
+        WcaOrderStatus.ACCEPTED_FOR_PAPER.value,
+    ):
         reasons.append("wca.order_validation.invalid_paper_status")
 
     if settings is None:
         reasons.append("wca.order_validation.missing_effective_settings")
     else:
-        if settings.entries_blocked or settings.final_risk_percent <= 0:
+        if settings.entries_blocked and not context.is_risk_reducing_exit:
             reasons.append("wca.order_validation.risk_entries_blocked")
-        if eastern_minutes(context.evaluation_timestamp) > settings.final_entry_cutoff_minutes:
+        if settings.final_risk_percent <= 0 and not context.is_risk_reducing_exit:
+            reasons.append("wca.order_validation.risk_entries_blocked")
+        if eastern_minutes(context.evaluation_timestamp) > settings.final_entry_cutoff_minutes and not context.is_risk_reducing_exit:
             reasons.append("wca.order_validation.session_closed")
         if settings.final_max_allowed_shares and order.quantity > settings.final_max_allowed_shares:
             reasons.append("wca.order_validation.quantity_exceeds_max_allowed")
@@ -87,6 +103,44 @@ def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationC
         order_risk = abs(float(order.trigger_price) - float(order.stop_price)) * order.quantity
         if sizing.approved_risk_budget is not None and order_risk > sizing.approved_risk_budget + 1e-6:
             reasons.append("wca.order_validation.order_risk_budget_exceeded")
+
+    if not context.new_entry_permitted and not context.is_risk_reducing_exit:
+        reasons.append("wca.order_validation.new_entry_not_permitted")
+    if context.is_risk_reducing_exit and not context.risk_reducing_exit_permitted:
+        reasons.append("wca.order_validation.risk_reducing_exit_not_permitted")
+    if context.quote_freshness_seconds is not None and snapshot.quote is None:
+        reasons.append("wca.order_validation.missing_fresh_quote")
+    elif context.quote_freshness_seconds is not None:
+        age = abs((context.evaluation_timestamp - snapshot.quote.timestamp).total_seconds())
+        if age > context.quote_freshness_seconds:
+            reasons.append("wca.order_validation.stale_quote")
+    if context.available_buying_power is not None and order.limit_price is not None:
+        if order.quantity * float(order.limit_price) > context.available_buying_power + 1e-6:
+            reasons.append("wca.order_validation.buying_power_exceeded")
+    if context.max_position_value is not None and order.limit_price is not None:
+        existing_value = max(0, context.current_position_quantity) * float(order.limit_price)
+        proposed_value = order.quantity * float(order.limit_price)
+        if existing_value + proposed_value > context.max_position_value + 1e-6:
+            reasons.append("wca.order_validation.max_position_exceeded")
+    if context.realized_daily_loss is not None and context.max_daily_loss is not None:
+        if context.realized_daily_loss >= context.max_daily_loss - 1e-9 and not context.is_risk_reducing_exit:
+            reasons.append("wca.order_validation.max_daily_loss_exceeded")
+    if context.trades_today is not None and context.max_daily_trades is not None:
+        if context.trades_today >= context.max_daily_trades and not context.is_risk_reducing_exit:
+            reasons.append("wca.order_validation.max_daily_trades_exceeded")
+    if context.aggregate_global_risk_used is not None and context.aggregate_global_risk_limit is not None:
+        if context.aggregate_global_risk_used > context.aggregate_global_risk_limit + 1e-6:
+            reasons.append("wca.order_validation.aggregate_global_risk_exceeded")
+    if context.max_spread_percent is not None and _positive_number(sizing.entry_price):
+        spread_percent = (sizing.spread / sizing.entry_price) * 100.0
+        if spread_percent > context.max_spread_percent + 1e-9:
+            reasons.append("wca.order_validation.spread_limit_exceeded")
+    if context.average_one_minute_volume is not None and context.max_participation_percent is not None:
+        max_quantity = context.average_one_minute_volume * (context.max_participation_percent / 100.0)
+        if order.quantity > max_quantity + 1e-9:
+            reasons.append("wca.order_validation.participation_limit_exceeded")
+    if context.expected_net_edge is not None and context.expected_net_edge <= context.minimum_net_edge and not context.is_risk_reducing_exit:
+        reasons.append("wca.order_validation.expected_net_edge_not_met")
 
     if len(reasons) == 1:
         reasons.append(WCA_ORDER_VALIDATION_PASSED)

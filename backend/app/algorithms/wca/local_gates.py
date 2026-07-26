@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
-from backend.app.algorithms.wca.contracts import WcaAggregationResult, WcaEffectiveSettings, WcaGateStatus, WcaLocalGateResult, WcaSide
-from backend.app.algorithms.wca.strategies.indicators import eastern_minutes
+from backend.app.algorithms.wca.configuration import (
+    CashAvoidTradingSettings,
+    EconomicEventRiskSettings,
+    ExtremeVolatilitySettings,
+    InvalidOrStaleDataSettings,
+    SessionEntryBlockSettings,
+    UnsafeLiquiditySettings,
+    UnsafeSpreadSettings,
+    WcaHardFilterSettings,
+)
+from backend.app.algorithms.wca.contracts import WcaAggregationResult, WcaEffectiveSettings, WcaGateStatus, WcaLocalGateResult, WcaMarketSnapshot, WcaSide
+from backend.app.algorithms.wca.strategies.indicators import atr, average_volume, completed_candles, eastern_minutes
 
 
 @dataclass(frozen=True)
@@ -55,6 +65,36 @@ WCA_LOCAL_GATE_INVENTORY: tuple[WcaLocalGateDefinition, ...] = (
 )
 
 WCA_LOCAL_GATE_IDS = frozenset(gate.gate_id for gate in WCA_LOCAL_GATE_INVENTORY)
+
+WCA_HARD_FILTER_IDS = frozenset(
+    {
+        "cash_avoid_trading",
+        "economic_event_risk",
+        "invalid_or_stale_data",
+        "unsafe_spread",
+        "unsafe_liquidity",
+        "extreme_volatility",
+        "session_entry_block",
+    }
+)
+
+
+def evaluate_wca_hard_filters(
+    *,
+    snapshot: WcaMarketSnapshot,
+    context: WcaLocalGateContext,
+    settings: WcaHardFilterSettings | None = None,
+) -> tuple[WcaLocalGateResult, ...]:
+    settings = settings or WcaHardFilterSettings()
+    return (
+        _cash_avoid_filter(context, settings.cash_avoid_trading),
+        _economic_event_filter(snapshot, settings.economic_event_risk),
+        _invalid_or_stale_data_filter(snapshot, settings.invalid_or_stale_data),
+        _unsafe_spread_filter(snapshot, settings.unsafe_spread),
+        _unsafe_liquidity_filter(snapshot, settings.unsafe_liquidity),
+        _extreme_volatility_filter(snapshot, settings.extreme_volatility),
+        _session_entry_block_filter(snapshot, settings.session_entry_block),
+    )
 
 
 def evaluate_wca_local_gates(
@@ -167,6 +207,79 @@ def _dynamic_profile_gate(settings: WcaEffectiveSettings) -> WcaLocalGateResult:
     return _gate("dynamic_profile_restrictions", WcaGateStatus.FAIL if blocked else WcaGateStatus.PASS, blocked, "wca.local_gate.dynamic_profile_restrictions", "WCA dynamic profile must allow new entries.", settings.entries_blocked, False)
 
 
+def _cash_avoid_filter(context: WcaLocalGateContext, settings: CashAvoidTradingSettings) -> WcaLocalGateResult:
+    if not settings.enabled:
+        return _gate("cash_avoid_trading", WcaGateStatus.NOT_APPLICABLE, False, "wca.hard_filter.cash_avoid_trading.disabled", "Cash/avoid-trading filter is disabled in the active WCA configuration.", context.remaining_allocated_risk_budget, settings.minimum_remaining_risk_budget, "info")
+    blocked = context.remaining_allocated_risk_budget <= settings.minimum_remaining_risk_budget
+    return _gate("cash_avoid_trading", WcaGateStatus.FAIL if blocked else WcaGateStatus.PASS, blocked, "wca.hard_filter.cash_avoid_trading", "Remaining WCA risk budget must permit a new entry.", context.remaining_allocated_risk_budget, settings.minimum_remaining_risk_budget)
+
+
+def _economic_event_filter(snapshot: WcaMarketSnapshot, settings: EconomicEventRiskSettings) -> WcaLocalGateResult:
+    if not settings.enabled:
+        return _gate("economic_event_risk", WcaGateStatus.NOT_APPLICABLE, False, "wca.hard_filter.economic_event_risk.disabled", "Economic-event filter is disabled in the active WCA configuration.", False, True, "info")
+    matching = tuple(code for code in snapshot.reason_codes if code in settings.blocking_reason_codes)
+    blocked = bool(matching)
+    return _gate("economic_event_risk", WcaGateStatus.FAIL if blocked else WcaGateStatus.PASS, blocked, "wca.hard_filter.economic_event_risk", "Configured economic-event risk reason codes block new WCA entries.", ",".join(matching) if matching else "none", "none")
+
+
+def _invalid_or_stale_data_filter(snapshot: WcaMarketSnapshot, settings: InvalidOrStaleDataSettings) -> WcaLocalGateResult:
+    if not settings.enabled:
+        return _gate("invalid_or_stale_data", WcaGateStatus.NOT_APPLICABLE, False, "wca.hard_filter.invalid_or_stale_data.disabled", "Invalid/stale-data filter is disabled in the active WCA configuration.", snapshot.data_ready, True, "info")
+    age = (snapshot.decision_timestamp.astimezone(timezone.utc) - snapshot.data_timestamp.astimezone(timezone.utc)).total_seconds()
+    candles = completed_candles(snapshot)
+    blocked = not snapshot.data_ready or not candles or age > settings.stale_after_seconds
+    reason = "wca.hard_filter.invalid_or_stale_data.stale" if age > settings.stale_after_seconds else "wca.hard_filter.invalid_or_stale_data"
+    return _gate("invalid_or_stale_data", WcaGateStatus.FAIL if blocked else WcaGateStatus.PASS, blocked, reason, "WCA entries require data-ready, non-stale completed one-minute bars.", round(age, 4), settings.stale_after_seconds)
+
+
+def _unsafe_spread_filter(snapshot: WcaMarketSnapshot, settings: UnsafeSpreadSettings) -> WcaLocalGateResult:
+    if not settings.enabled:
+        return _gate("unsafe_spread", WcaGateStatus.NOT_APPLICABLE, False, "wca.hard_filter.unsafe_spread.disabled", "Unsafe-spread filter is disabled in the active WCA configuration.", 0, settings.maximum_spread_percent, "info")
+    if snapshot.quote is None:
+        return _gate("unsafe_spread", WcaGateStatus.FAIL, True, "wca.hard_filter.unsafe_spread.missing_quote", "Missing quote blocks new WCA entries while preserving exits.", None, settings.maximum_spread_percent)
+    midpoint = max((snapshot.quote.bid + snapshot.quote.ask) / 2.0, 0.01)
+    spread_percent = (snapshot.quote.ask - snapshot.quote.bid) / midpoint
+    if spread_percent >= settings.maximum_spread_percent:
+        return _gate("unsafe_spread", WcaGateStatus.FAIL, True, "wca.hard_filter.unsafe_spread", "Spread exceeds the configured WCA hard ceiling.", round(spread_percent, 6), settings.maximum_spread_percent)
+    if spread_percent >= settings.reduction_spread_percent:
+        return _gate("unsafe_spread", WcaGateStatus.WARN, False, "wca.hard_filter.unsafe_spread.reduced", "Spread is elevated; WCA risk and quantity are reduced.", round(spread_percent, 6), settings.reduction_spread_percent, "warn", quantity_multiplier=settings.reduction_multiplier, risk_multiplier=settings.reduction_multiplier)
+    return _gate("unsafe_spread", WcaGateStatus.PASS, False, "wca.hard_filter.unsafe_spread.pass", "Spread is within WCA limits.", round(spread_percent, 6), settings.maximum_spread_percent)
+
+
+def _unsafe_liquidity_filter(snapshot: WcaMarketSnapshot, settings: UnsafeLiquiditySettings) -> WcaLocalGateResult:
+    if not settings.enabled:
+        return _gate("unsafe_liquidity", WcaGateStatus.NOT_APPLICABLE, False, "wca.hard_filter.unsafe_liquidity.disabled", "Unsafe-liquidity filter is disabled in the active WCA configuration.", 0, settings.minimum_average_volume, "info")
+    candles = completed_candles(snapshot)
+    avg_volume = average_volume(candles, min(20, len(candles))) if candles else 0
+    if avg_volume < settings.minimum_average_volume:
+        return _gate("unsafe_liquidity", WcaGateStatus.FAIL, True, "wca.hard_filter.unsafe_liquidity", "Average one-minute volume is below the WCA hard floor.", round(avg_volume, 4), settings.minimum_average_volume)
+    if avg_volume < settings.reduction_average_volume:
+        return _gate("unsafe_liquidity", WcaGateStatus.WARN, False, "wca.hard_filter.unsafe_liquidity.reduced", "Average one-minute volume is thin; WCA risk and quantity are reduced.", round(avg_volume, 4), settings.reduction_average_volume, "warn", quantity_multiplier=settings.reduction_multiplier, risk_multiplier=settings.reduction_multiplier)
+    return _gate("unsafe_liquidity", WcaGateStatus.PASS, False, "wca.hard_filter.unsafe_liquidity.pass", "Average one-minute volume is within WCA limits.", round(avg_volume, 4), settings.minimum_average_volume)
+
+
+def _extreme_volatility_filter(snapshot: WcaMarketSnapshot, settings: ExtremeVolatilitySettings) -> WcaLocalGateResult:
+    if not settings.enabled:
+        return _gate("extreme_volatility", WcaGateStatus.NOT_APPLICABLE, False, "wca.hard_filter.extreme_volatility.disabled", "Extreme-volatility filter is disabled in the active WCA configuration.", 0, settings.maximum_atr_percent, "info")
+    candles = completed_candles(snapshot)
+    if len(candles) < settings.atr_period + 1:
+        return _gate("extreme_volatility", WcaGateStatus.FAIL, True, "wca.hard_filter.extreme_volatility.insufficient_history", "ATR volatility gate requires completed ATR history.", len(candles), settings.atr_period + 1)
+    atr_percent = atr(candles, settings.atr_period) / max(candles[-1].close, 0.01)
+    if atr_percent >= settings.maximum_atr_percent:
+        return _gate("extreme_volatility", WcaGateStatus.FAIL, True, "wca.hard_filter.extreme_volatility", "ATR volatility exceeds the configured WCA hard ceiling.", round(atr_percent, 6), settings.maximum_atr_percent)
+    if atr_percent >= settings.reduction_atr_percent:
+        return _gate("extreme_volatility", WcaGateStatus.WARN, False, "wca.hard_filter.extreme_volatility.reduced", "ATR volatility is elevated; WCA risk and quantity are reduced.", round(atr_percent, 6), settings.reduction_atr_percent, "warn", quantity_multiplier=settings.reduction_multiplier, risk_multiplier=settings.reduction_multiplier)
+    return _gate("extreme_volatility", WcaGateStatus.PASS, False, "wca.hard_filter.extreme_volatility.pass", "ATR volatility is within WCA limits.", round(atr_percent, 6), settings.maximum_atr_percent)
+
+
+def _session_entry_block_filter(snapshot: WcaMarketSnapshot, settings: SessionEntryBlockSettings) -> WcaLocalGateResult:
+    if not settings.enabled:
+        return _gate("session_entry_block", WcaGateStatus.NOT_APPLICABLE, False, "wca.hard_filter.session_entry_block.disabled", "Session-entry filter is disabled in the active WCA configuration.", 0, settings.entry_cutoff_minutes, "info")
+    minutes = eastern_minutes(snapshot.data_timestamp)
+    blocked = minutes < settings.entry_start_minutes or minutes > settings.entry_cutoff_minutes
+    return _gate("session_entry_block", WcaGateStatus.FAIL if blocked else WcaGateStatus.PASS, blocked, "wca.hard_filter.session_entry_block", "WCA entries must be inside the configured entry session.", minutes, settings.entry_cutoff_minutes)
+
+
 def _gate(
     gate_id: str,
     status: WcaGateStatus,
@@ -176,11 +289,20 @@ def _gate(
     evaluated_value: float | int | str | bool | None,
     required_value: float | int | str | bool | None,
     severity: str = "error",
+    *,
+    quantity_multiplier: float = 1.0,
+    risk_multiplier: float = 1.0,
+    exit_allowed: bool = True,
 ) -> WcaLocalGateResult:
     return WcaLocalGateResult(
         gate_id=gate_id,
         status=status,
         blocks_entry=blocks_entry,
+        entry_blocked=blocks_entry,
+        quantity_multiplier=quantity_multiplier,
+        risk_multiplier=risk_multiplier,
+        warning=status == WcaGateStatus.WARN,
+        exit_allowed=exit_allowed,
         severity=severity if status != WcaGateStatus.PASS else "info",
         reason_code=reason_code,
         detail=detail,
@@ -191,6 +313,7 @@ def _gate(
     )
 
 __all__ = (
+    "WCA_HARD_FILTER_IDS",
     "WCA_LOCAL_GATE_IDS",
     "WCA_LOCAL_GATE_INVENTORY",
     "WcaLocalGateConfig",
@@ -198,5 +321,6 @@ __all__ = (
     "WcaLocalGateDefinition",
     "WcaLocalGateResult",
     "apply_local_gates_to_decision",
+    "evaluate_wca_hard_filters",
     "evaluate_wca_local_gates",
 )
