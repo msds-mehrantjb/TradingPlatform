@@ -9,10 +9,7 @@ from backend.app.algorithms.meta_strategy.strategies.directional.common import D
 class OpeningRangeBreakoutStrategy(DirectionalSnapshotStrategy):
     strategy_id = "opening_range_breakout"
     family = "BREAKOUT"
-    minimum_warmup = 30
     required_inputs = ("candles", "atr", "relative_volume", "spread", "liquidity", "openingRangeHigh", "openingRangeLow")
-    buy_threshold = 0.65
-    sell_threshold = 0.65
 
     def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
         high = float(snapshot.features.get("openingRangeHigh") or 0.0)

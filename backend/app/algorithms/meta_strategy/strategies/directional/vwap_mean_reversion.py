@@ -9,10 +9,7 @@ from backend.app.algorithms.meta_strategy.strategies.directional.common import D
 class VwapMeanReversionStrategy(DirectionalSnapshotStrategy):
     strategy_id = "vwap_mean_reversion"
     family = "MEAN_REVERSION"
-    minimum_warmup = 40
-    required_inputs = ("candles", "vwap", "adx", "rsi", "volume")
-    buy_threshold = 0.58
-    sell_threshold = 0.58
+    required_inputs = ("candles", "vwap", "atr", "adx", "rsi", "volume", "vwap_relationship", "reclaimDistanceAtr")
 
     def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
         atr = float(snapshot.atr.get("1m") or 0.0)

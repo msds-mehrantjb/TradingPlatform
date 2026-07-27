@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
+from backend.app.algorithms.meta_strategy.session import MetaStrategySession, canonical_session
+
 
 ExecutionMode = Literal["PAPER", "LIVE"]
 
@@ -32,7 +34,13 @@ class MetaStrategyLocalGateConfig:
     maximum_daily_loss: float = 1_000.0
     maximum_daily_trades: int = 5
     cooldown_seconds: int = 300
-    allowed_session_phases: tuple[str, ...] = ("regular", "open", "midday", "power_hour")
+    allowed_session_phases: tuple[str, ...] = (
+        MetaStrategySession.OPENING.value,
+        MetaStrategySession.MORNING.value,
+        MetaStrategySession.MIDDAY.value,
+        MetaStrategySession.AFTERNOON.value,
+        MetaStrategySession.CLOSING.value,
+    )
     paper_trading_allowed: bool = True
     live_trading_allowed: bool = False
     configuration_hash: str = "meta_strategy_local_gates_v1"
@@ -209,8 +217,8 @@ def _boolean_clear(gate_id: str, value: bool, *, reason_suffix: str) -> MetaStra
 
 
 def _session_restriction(session_phase: str, allowed: tuple[str, ...]) -> MetaStrategyLocalGateResult:
-    normalized = str(session_phase).lower()
-    allowed_normalized = tuple(str(item).lower() for item in allowed)
+    normalized = canonical_session(session_phase).value
+    allowed_normalized = tuple(canonical_session(item).value for item in allowed)
     return MetaStrategyLocalGateResult(
         gate_id="session_restriction",
         passed=normalized in allowed_normalized,

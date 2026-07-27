@@ -61,8 +61,16 @@
           "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/bollinger_atr_reversion.py"
         },
         {
-          "component_id": "gap_continuation_gap_fade",
-          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/gap_continuation_gap_fade.py"
+          "component_id": "gap_continuation",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/gap_continuation.py"
+        },
+        {
+          "component_id": "gap_fade",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/gap_fade.py"
+        },
+        {
+          "component_id": "economic_event_reaction",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/directional/economic_event_reaction.py"
         }
       ]
     },
@@ -93,7 +101,7 @@
           "implementation_path": "backend/app/algorithms/meta_strategy/strategies/context/market_structure_context.py"
         },
         {
-          "component_id": "volume_confirmation",
+          "component_id": "volume_confirmation_context",
           "implementation_path": "backend/app/algorithms/meta_strategy/strategies/context/volume_confirmation.py"
         },
         {
@@ -113,12 +121,8 @@
       "isolation_case": "MetaStrategyStep11RegimeModulesTest::test_regime_sources_do_not_encode_directional_votes",
       "components": [
         {
-          "component_id": "adx_trend_strength_regime",
-          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/regime/adx_trend_strength.py"
-        },
-        {
-          "component_id": "atr_volatility_regime",
-          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/regime/atr_volatility_regime.py"
+          "component_id": "adx_atr_regime_classifier",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/regime/adx_atr_regime_classifier.py"
         }
       ]
     },
@@ -171,6 +175,26 @@
         {
           "component_id": "operational_health_filter",
           "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/operational_health.py"
+        },
+        {
+          "component_id": "daily_loss_limit_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/local_risk_controls.py"
+        },
+        {
+          "component_id": "trade_count_limit_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/local_risk_controls.py"
+        },
+        {
+          "component_id": "duplicate_order_protection_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/local_risk_controls.py"
+        },
+        {
+          "component_id": "existing_position_policy_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/local_risk_controls.py"
+        },
+        {
+          "component_id": "local_risk_budget_filter",
+          "implementation_path": "backend/app/algorithms/meta_strategy/strategies/safety/local_risk_controls.py"
         }
       ]
     },

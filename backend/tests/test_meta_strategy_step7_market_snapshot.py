@@ -65,7 +65,7 @@ class MetaStrategyStep7MarketSnapshotTest(unittest.TestCase):
         self.assertGreater(snapshot.volume, 0)
         self.assertIn("basisPoints", snapshot.spread)
         self.assertIn("level", snapshot.liquidity)
-        self.assertIn(snapshot.session_phase, {"outside_session", "opening", "morning", "midday", "afternoon", "closing"})
+        self.assertIn(snapshot.session_phase, {"PREMARKET", "OPENING", "MORNING", "MIDDAY", "AFTERNOON", "CLOSING", "AFTER_HOURS", "CLOSED"})
         self.assertIn("state", snapshot.gap_state)
         self.assertIn("spyVsQqq", snapshot.qqq_iwm_context)
         self.assertIn("spyVsIwm", snapshot.qqq_iwm_context)

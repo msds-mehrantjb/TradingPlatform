@@ -37,10 +37,11 @@ from backend.app.domain.models import (
 )
 from backend.app.algorithms.meta_strategy.versions import meta_strategy_version_identifiers
 from backend.app.ensemble.family_aware import FamilyAwareDeterministicEnsemble
+from backend.app.algorithms.meta_strategy.feature_schema import meta_strategy_feature_schema, meta_strategy_feature_schema_hash
 from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceConfig, apply_safe_ml_inference
 from backend.app.algorithms.meta_strategy.labeling.candidate_meta_labeling import MetaLabelExecutionConfig, create_candidate_meta_label
-from backend.app.algorithms.meta_strategy.ml_features import MLFeatureSet, build_candidate_meta_features, candidate_meta_feature_schema_hash
-from backend.app.strategies.registry import directional_strategy_input_ids, resolve_strategy
+from backend.app.algorithms.meta_strategy.ml_features import MLFeatureSet, build_candidate_meta_features, candidate_meta_feature_schema_hash, directional_strategy_input_ids
+from backend.app.strategies.registry import resolve_strategy
 
 
 META_STRATEGY_CHARACTERIZATION_SCHEMA_VERSION = "meta_strategy_current_behavior_characterization_v1"
@@ -130,7 +131,7 @@ def build_current_behavior_characterization() -> dict[str, Any]:
             "containsPrivateAccountInformation": False,
             "requiresLiveFeed": False,
         },
-        "featureSchemaHash": candidate_meta_feature_schema_hash(),
+        "featureSchemaHash": meta_strategy_feature_schema_hash(),
         "fixtures": fixtures,
     }
     return payload
@@ -187,7 +188,7 @@ def _characterize_case(spec: CaseSpec) -> dict[str, Any]:
         "deterministicCandidate": _deterministic_summary(deterministic),
         "candidateGeometry": _candidate_geometry(order),
         "featureVector": _feature_summary(features),
-        "featureSchemaHash": features.schemaHash,
+        "featureSchemaHash": meta_strategy_feature_schema_hash(),
         "label": _label_summary(label),
         "modelProbabilities": _probabilities(spec),
         "mlDecision": _ml_decision_summary(ml_decision),
@@ -930,8 +931,8 @@ def _feature_summary(features: MLFeatureSet) -> dict[str, Any]:
     )
     return {
         "schemaVersion": features.schemaVersion,
-        "schemaHash": features.schemaHash,
-        "featureCount": len(features.featureValues),
+        "schemaHash": meta_strategy_feature_schema_hash(),
+        "featureCount": len(meta_strategy_feature_schema()) * 2,
         "missingFeatureCount": sum(1 for value in features.missingIndicators.values() if value),
         "completeFeatureVectorHash": _hash(features.featureValues),
         "selectedValues": {key: features.featureValues.get(key) for key in selected_keys},

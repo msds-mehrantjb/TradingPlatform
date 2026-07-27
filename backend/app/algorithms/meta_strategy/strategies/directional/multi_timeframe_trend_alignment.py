@@ -9,10 +9,7 @@ from backend.app.algorithms.meta_strategy.strategies.directional.common import D
 class MultiTimeframeTrendAlignmentStrategy(DirectionalSnapshotStrategy):
     strategy_id = "multi_timeframe_trend_alignment"
     family = "TREND"
-    minimum_warmup = 50
-    required_inputs = ("candles", "moving_averages", "vwap", "adx")
-    buy_threshold = 0.60
-    sell_threshold = 0.60
+    required_inputs = ("candles", "moving_averages", "vwap", "atr", "adx")
 
     def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
         ema20_1m = _ma(snapshot, "1m", "ema20")

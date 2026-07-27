@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from backend.app.algorithms.meta_strategy.contracts import MetaStrategyMarketSnapshot
+from backend.app.algorithms.meta_strategy.evaluation_context import MetaStrategyEvaluationContext, context_market_snapshot
 from backend.app.algorithms.meta_strategy.strategies.safety.common import SafetySnapshotStrategy, block_evidence, missing_required_evidence, pass_evidence
 
 
@@ -12,7 +13,8 @@ class HaltLuldFilterStrategy(SafetySnapshotStrategy):
     strategy_id = "halt_luld_filter"
     required_inputs = ("halt_luld_state",)
 
-    def safety_evidence(self, snapshot: MetaStrategyMarketSnapshot, required_status: dict[str, bool]) -> dict[str, Any]:
+    def safety_evidence(self, value: MetaStrategyMarketSnapshot | MetaStrategyEvaluationContext, required_status: dict[str, bool]) -> dict[str, Any]:
+        snapshot = context_market_snapshot(value)
         if not all(required_status.values()):
             return missing_required_evidence(self.strategy_id, required_status)
         state = str(snapshot.features.get("haltLuldState") or "clear").lower()

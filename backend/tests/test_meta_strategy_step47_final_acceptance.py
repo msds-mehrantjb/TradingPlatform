@@ -5,8 +5,9 @@ from pathlib import Path
 
 from backend.app.algorithms.meta_strategy import (
     ALGORITHM_ID,
-    META_STRATEGY_FINAL_ACCEPTANCE_ITEMS,
+    META_STRATEGY_FINAL_DOD_IDS,
     META_STRATEGY_FINAL_ACCEPTANCE_VERSION,
+    META_STRATEGY_RECOVERY_TEST_IDS,
     build_meta_strategy_final_acceptance_report,
     meta_strategy_acceptance_is_complete,
 )
@@ -15,72 +16,39 @@ from backend.app.algorithms.meta_strategy.service import MetaStrategyApplication
 
 ROOT = Path(__file__).resolve().parents[2]
 
-MANDATORY_ACCEPTANCE_STATEMENTS = (
-    "Dedicated package exists.",
-    "Backend is authoritative.",
-    "Strategies are dedicated.",
-    "Candidate generation is dedicated.",
-    "Features and labels are dedicated.",
-    "Training is dedicated.",
-    "Artifacts are dedicated.",
-    "Inference is candidate-conditional.",
-    "ML cannot create or reverse trades.",
-    "ML cannot increase risk.",
-    "Dynamic settings are dedicated.",
-    "Position sizing is dedicated.",
-    "Trade management is dedicated.",
-    "Persistence is dedicated.",
-    "Backtesting is dedicated.",
-    "Runtime and backtest use one pipeline.",
-    "Promotion requires walk-forward, holdout and paper stability.",
-    "Shared services preserve algorithm attribution.",
-    "Cross-algorithm state access is prohibited.",
-    "Legacy authority has been deleted.",
-    "Dedicated tests pass.",
-    "Runtime-parity tests pass.",
-    "No mandatory tests are skipped.",
-    "Live execution remains disabled until separately approved.",
-)
-
-
 class MetaStrategyStep47FinalAcceptanceTest(unittest.TestCase):
     maxDiff = None
 
-    def test_final_acceptance_module_exists_and_covers_every_mandatory_item(self) -> None:
+    def test_final_acceptance_module_exists_and_declares_evidence_requirements(self) -> None:
         self.assertTrue((ROOT / "backend/app/algorithms/meta_strategy/final_acceptance.py").is_file())
-        self.assertEqual(len(META_STRATEGY_FINAL_ACCEPTANCE_ITEMS), 24)
-        self.assertEqual(
-            tuple(item.statement for item in META_STRATEGY_FINAL_ACCEPTANCE_ITEMS),
-            MANDATORY_ACCEPTANCE_STATEMENTS,
-        )
+        self.assertEqual(len(META_STRATEGY_RECOVERY_TEST_IDS), 13)
+        self.assertEqual(len(META_STRATEGY_FINAL_DOD_IDS), 18)
+        self.assertIn("live_execution_disabled", META_STRATEGY_FINAL_DOD_IDS)
 
-    def test_every_mandatory_acceptance_item_reports_passed(self) -> None:
+    def test_acceptance_is_blocked_without_required_evidence(self) -> None:
         report = build_meta_strategy_final_acceptance_report()
 
         self.assertEqual(report["algorithmId"], ALGORITHM_ID)
         self.assertEqual(report["version"], META_STRATEGY_FINAL_ACCEPTANCE_VERSION)
-        self.assertTrue(report["complete"])
-        self.assertEqual(report["counts"], {"PASSED": 24, "FAILED": 0})
-        self.assertEqual(report["blockingStatements"], [])
+        self.assertFalse(report["complete"])
+        self.assertGreater(report["counts"]["FAILED"], 0)
+        self.assertTrue(report["blockingStatements"])
+        self.assertIn("failedControls", report)
         for item in report["items"]:
-            with self.subTest(item=item["itemId"]):
-                self.assertTrue(item["requiredForCompletion"])
-                self.assertEqual(item["status"], "PASSED")
+            self.assertTrue(item["requiredForCompletion"])
 
-        self.assertTrue(meta_strategy_acceptance_is_complete())
+        self.assertFalse(meta_strategy_acceptance_is_complete())
 
-    def test_every_acceptance_evidence_path_exists(self) -> None:
-        missing: list[str] = []
-        for item in META_STRATEGY_FINAL_ACCEPTANCE_ITEMS:
-            for evidence in item.evidence:
-                if not (ROOT / evidence).exists():
-                    missing.append(f"{item.item_id}: {evidence}")
-
-        self.assertEqual(missing, [])
+    def test_acceptance_reports_evidence_categories(self) -> None:
+        report = build_meta_strategy_final_acceptance_report()
+        categories = {item["category"] for item in report["items"]}
+        self.assertIn("Recovery", categories)
+        self.assertIn("Definition of done", categories)
+        self.assertIn("Operational evidence", categories)
 
     def test_live_execution_remains_disabled_until_separately_approved(self) -> None:
         report = build_meta_strategy_final_acceptance_report()
-        live_item = next(item for item in report["items"] if item["itemId"] == "live_execution_disabled_until_separately_approved")
+        live_item = next(item for item in report["items"] if item["itemId"] == "live_disabled")
 
         self.assertFalse(report["liveExecutionEnabled"])
         self.assertTrue(report["liveExecutionApprovalRequired"])
@@ -91,9 +59,9 @@ class MetaStrategyStep47FinalAcceptanceTest(unittest.TestCase):
 
         self.assertEqual(response["algorithmId"], ALGORITHM_ID)
         self.assertEqual(response["operation"], "final_acceptance")
-        self.assertEqual(response["status"], "OK")
-        self.assertTrue(response["payload"]["complete"])
-        self.assertEqual(response["payload"]["counts"]["PASSED"], 24)
+        self.assertEqual(response["status"], "REJECTED")
+        self.assertFalse(response["payload"]["complete"])
+        self.assertIn("failedControls", response["payload"])
 
 
 if __name__ == "__main__":

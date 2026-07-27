@@ -9,10 +9,7 @@ from backend.app.algorithms.meta_strategy.strategies.directional.common import D
 class VwapTrendContinuationStrategy(DirectionalSnapshotStrategy):
     strategy_id = "vwap_trend_continuation"
     family = "TREND"
-    minimum_warmup = 30
-    required_inputs = ("candles", "vwap", "moving_averages", "relative_volume")
-    buy_threshold = 0.50
-    sell_threshold = 0.50
+    required_inputs = ("candles", "vwap", "moving_averages", "relative_volume", "vwap_relationship", "vwap_slope")
 
     def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
         ema20 = float((snapshot.moving_averages.get("1m") or {}).get("ema20") or 0.0)

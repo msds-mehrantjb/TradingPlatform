@@ -9,10 +9,7 @@ from backend.app.algorithms.meta_strategy.strategies.directional.common import D
 class FailedBreakoutReversalStrategy(DirectionalSnapshotStrategy):
     strategy_id = "failed_breakout_reversal"
     family = "REVERSAL"
-    minimum_warmup = 40
     required_inputs = ("candles", "atr", "spread", "liquidity", "failedBreakoutSide")
-    buy_threshold = 0.60
-    sell_threshold = 0.60
 
     def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
         side = str(snapshot.features.get("failedBreakoutSide") or "none")

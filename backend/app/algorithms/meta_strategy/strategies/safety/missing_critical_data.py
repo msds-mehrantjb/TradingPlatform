@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from backend.app.algorithms.meta_strategy.contracts import MetaStrategyMarketSnapshot
+from backend.app.algorithms.meta_strategy.evaluation_context import MetaStrategyEvaluationContext, context_market_snapshot
 from backend.app.algorithms.meta_strategy.strategies.safety.common import SafetySnapshotStrategy, block_evidence, critical_data_ready, pass_evidence
 
 
@@ -12,7 +13,8 @@ class MissingCriticalDataFilterStrategy(SafetySnapshotStrategy):
     strategy_id = "missing_critical_data_filter"
     required_inputs = ("critical_data",)
 
-    def safety_evidence(self, snapshot: MetaStrategyMarketSnapshot, required_status: dict[str, bool]) -> dict[str, Any]:
+    def safety_evidence(self, value: MetaStrategyMarketSnapshot | MetaStrategyEvaluationContext, required_status: dict[str, bool]) -> dict[str, Any]:
+        snapshot = context_market_snapshot(value)
         observed = {
             "pointInTime": snapshot.point_in_time,
             "hasCutoff": snapshot.source_cutoff_timestamp is not None,

@@ -28,6 +28,7 @@ ALLOWED_SHARED_INFRASTRUCTURE_IMPORT_PREFIXES = (
     "backend.app.risk",
     "backend.app.broker",
     "backend.app.brokers",
+    "backend.app.execution",
     "backend.app.logging",
     "backend.app.observability",
     "backend.app.database",

@@ -3,22 +3,24 @@ from __future__ import annotations
 from typing import Any
 
 from backend.app.algorithms.meta_strategy.contracts import MetaStrategyMarketSnapshot
+from backend.app.algorithms.meta_strategy.session import MetaStrategySession, canonical_session
 from backend.app.algorithms.meta_strategy.strategies.directional.common import DirectionalSnapshotStrategy, pct_distance
 
 
 class FirstPullbackAfterOpenStrategy(DirectionalSnapshotStrategy):
     strategy_id = "first_pullback_after_open"
     family = "TREND"
-    minimum_warmup = 30
-    required_inputs = ("candles", "session_phase", "vwap", "relative_volume")
-    buy_threshold = 0.55
-    sell_threshold = 0.55
+    required_inputs = ("candles", "session_phase", "vwap", "relative_volume", "pullbackDepthAtr")
 
     def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
         relvol = float(snapshot.relative_volume.get("1m") or 0.0)
         pullback_depth = float(snapshot.features.get("pullbackDepthAtr") or 0.0)
         continuation_bias = pct_distance(snapshot.last_price, snapshot.vwap)
-        in_session = snapshot.session_phase in {"opening", "morning"}
+        try:
+            session = canonical_session(snapshot.session_phase)
+        except ValueError:
+            session = MetaStrategySession.CLOSED
+        in_session = session in {MetaStrategySession.OPENING, MetaStrategySession.MORNING}
         buy_score = (0.35 if continuation_bias >= 0.001 else 0.0) + (0.25 if 0.25 <= pullback_depth <= 1.25 else 0.0) + min(0.4, relvol / 3.0)
         sell_score = (0.35 if continuation_bias <= -0.001 else 0.0) + (0.25 if 0.25 <= pullback_depth <= 1.25 else 0.0) + min(0.4, relvol / 3.0)
         return {
@@ -32,4 +34,8 @@ class FirstPullbackAfterOpenStrategy(DirectionalSnapshotStrategy):
         }
 
     def regime_allows(self, snapshot: MetaStrategyMarketSnapshot, evidence: dict[str, Any]) -> bool:
-        return super().regime_allows(snapshot, evidence) and snapshot.session_phase in {"opening", "morning"}
+        try:
+            session = canonical_session(snapshot.session_phase)
+        except ValueError:
+            return False
+        return super().regime_allows(snapshot, evidence) and session in {MetaStrategySession.OPENING, MetaStrategySession.MORNING}

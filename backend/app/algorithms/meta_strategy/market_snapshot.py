@@ -25,13 +25,13 @@ from backend.app.algorithms.meta_strategy.indicators import (
     relative_strength_context,
     relative_volume,
     rsi,
-    session_phase,
     sma,
     spread_bps,
     spread_dollars,
     timestamp_value,
     vwap,
 )
+from backend.app.algorithms.meta_strategy.session import meta_strategy_session_at
 from backend.app.algorithms.meta_strategy.versions import (
     META_STRATEGY_ALGORITHM_VERSION,
     META_STRATEGY_CONFIGURATION_VERSION,
@@ -171,6 +171,15 @@ def build_meta_strategy_market_snapshot(request: MetaStrategyMarketSnapshotReque
         "quoteTimestamp": timestamp_value(quote, "timestamp").isoformat() if quote is not None else None,
     }
     liquidity = liquidity_state(one_minute, quote, relative_volume_value=relative_volume_values["1m"])
+    vwap_value = vwap(one_minute)
+    derived_features = _derived_market_features(
+        one_minute=one_minute,
+        decision_timestamp=request.decision_timestamp,
+        last_price=anchor.close,
+        atr_value=atr_values["1m"],
+        vwap_value=vwap_value,
+        bollinger_bands_value=bollinger_bands(close_values(one_minute), 20, 2.0),
+    )
 
     return MetaStrategyMarketSnapshot(
         algorithm_id=ALGORITHM_ID,
@@ -194,7 +203,7 @@ def build_meta_strategy_market_snapshot(request: MetaStrategyMarketSnapshotReque
             "15m": _dump_candles(fifteen_minute),
         },
         quote=quote.model_dump(mode="json") if quote is not None else None,
-        vwap=vwap(one_minute),
+        vwap=vwap_value,
         moving_averages=moving_averages,
         atr=atr_values,
         adx={label: adx(candles, 14) for label, candles in candle_sets.items()},
@@ -204,7 +213,7 @@ def build_meta_strategy_market_snapshot(request: MetaStrategyMarketSnapshotReque
         relative_volume=relative_volume_values,
         spread=quote_spread,
         liquidity=liquidity,
-        session_phase=session_phase(request.decision_timestamp),
+        session_phase=meta_strategy_session_at(request.decision_timestamp).value,
         gap_state=gap_state(one_minute, request.prior_close),
         qqq_iwm_context=relative_strength_context(anchor, qqq, iwm),
         breadth=breadth_state(breadth),
@@ -213,6 +222,7 @@ def build_meta_strategy_market_snapshot(request: MetaStrategyMarketSnapshotReque
             "snapshotVersion": META_STRATEGY_MARKET_SNAPSHOT_VERSION,
             "pointInTimeCutoff": request.decision_timestamp.isoformat(),
             "finalizationLagSeconds": request.finalization_lag_seconds,
+            **derived_features,
         },
     )
 
@@ -243,6 +253,114 @@ def _latest_completed(
 
 def _dump_candles(candles: tuple[MetaStrategySnapshotCandle, ...]) -> tuple[dict[str, Any], ...]:
     return tuple(candle.model_dump(mode="json") for candle in candles)
+
+
+def _derived_market_features(
+    *,
+    one_minute: tuple[MetaStrategySnapshotCandle, ...],
+    decision_timestamp: datetime,
+    last_price: float,
+    atr_value: float | None,
+    vwap_value: float | None,
+    bollinger_bands_value: dict[str, float] | None,
+) -> dict[str, Any]:
+    atr_safe = float(atr_value or 0.0)
+    opening = _opening_range(one_minute, decision_timestamp)
+    latest = one_minute[-1]
+    previous = one_minute[-2] if len(one_minute) >= 2 else latest
+    recent = one_minute[-20:]
+    recent_high = max(candle.high for candle in recent)
+    recent_low = min(candle.low for candle in recent)
+    reclaim_distance = _atr_distance(last_price, previous.close, atr_safe)
+    failed_side = "none"
+    if previous.high >= recent_high and latest.close < previous.high:
+        failed_side = "upside"
+    elif previous.low <= recent_low and latest.close > previous.low:
+        failed_side = "downside"
+    sweep_side = "none"
+    if latest.high >= recent_high and latest.close < latest.open:
+        sweep_side = "buy_side"
+    elif latest.low <= recent_low and latest.close > latest.open:
+        sweep_side = "sell_side"
+    body = max(abs(latest.close - latest.open), 0.000001)
+    upper_wick = max(0.0, latest.high - max(latest.open, latest.close))
+    lower_wick = max(0.0, min(latest.open, latest.close) - latest.low)
+    rejection_wick_ratio = max(upper_wick, lower_wick) / body
+    pullback_depth = _pullback_depth_atr(one_minute, atr_safe, vwap_value)
+    vwap_relationship = "unknown"
+    if vwap_value is not None:
+        vwap_relationship = "above" if last_price > vwap_value else "below" if last_price < vwap_value else "at"
+    vwap_slope = _vwap_slope(one_minute)
+    width_percentile = _bollinger_width_percentile(bollinger_bands_value, one_minute)
+    return {
+        "pullbackDepthAtr": round(pullback_depth, 6),
+        "failedBreakoutSide": failed_side,
+        "reclaimDistanceAtr": round(abs(reclaim_distance), 6),
+        "sweepSide": sweep_side,
+        "rejectionWickRatio": round(rejection_wick_ratio, 6),
+        "openingRangeHigh": opening["high"],
+        "openingRangeLow": opening["low"],
+        "vwapRelationship": vwap_relationship,
+        "vwapSlope": round(vwap_slope, 8),
+        "bollingerWidthPercentile": round(width_percentile, 6),
+        "gapTradeType": "continuation",
+        "haltLuldState": "clear",
+    }
+
+
+def _opening_range(candles: tuple[MetaStrategySnapshotCandle, ...], decision_timestamp: datetime) -> dict[str, float | None]:
+    local_date = decision_timestamp.astimezone(candles[-1].timestamp.tzinfo).date()
+    opening_rows = [
+        candle
+        for candle in candles
+        if candle.timestamp.date() == local_date and 14 <= candle.timestamp.hour <= 15
+    ][:30]
+    source = opening_rows or candles[: min(30, len(candles))]
+    return {
+        "high": max((candle.high for candle in source), default=None),
+        "low": min((candle.low for candle in source), default=None),
+    }
+
+
+def _atr_distance(left: float, right: float, atr_value: float) -> float:
+    return (left - right) / atr_value if atr_value > 0 else 0.0
+
+
+def _pullback_depth_atr(candles: tuple[MetaStrategySnapshotCandle, ...], atr_value: float, vwap_value: float | None) -> float:
+    if atr_value <= 0 or vwap_value is None:
+        return 0.0
+    recent = candles[-10:]
+    if not recent:
+        return 0.0
+    latest_close = recent[-1].close
+    if latest_close >= vwap_value:
+        return max(0.0, (max(candle.high for candle in recent) - latest_close) / atr_value)
+    return max(0.0, (latest_close - min(candle.low for candle in recent)) / atr_value)
+
+
+def _vwap_slope(candles: tuple[MetaStrategySnapshotCandle, ...]) -> float:
+    if len(candles) < 10:
+        return 0.0
+    first = vwap(candles[-10:-5])
+    second = vwap(candles[-5:])
+    if first is None or second is None or first == 0:
+        return 0.0
+    return (second - first) / first
+
+
+def _bollinger_width_percentile(bands: dict[str, float] | None, candles: tuple[MetaStrategySnapshotCandle, ...]) -> float:
+    if not bands or not bands.get("middle"):
+        return 0.0
+    current = (float(bands["upper"]) - float(bands["lower"])) / float(bands["middle"])
+    closes = close_values(candles)
+    widths = []
+    for end in range(20, len(closes) + 1):
+        sample = bollinger_bands(closes[:end], 20, 2.0)
+        if sample and sample.get("middle"):
+            widths.append((float(sample["upper"]) - float(sample["lower"])) / float(sample["middle"]))
+    if not widths:
+        return 0.0
+    return sum(1 for width in widths if width <= current) / len(widths)
 
 
 __all__ = [

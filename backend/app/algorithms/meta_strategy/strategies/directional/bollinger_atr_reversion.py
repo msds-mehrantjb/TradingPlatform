@@ -9,10 +9,7 @@ from backend.app.algorithms.meta_strategy.strategies.directional.common import D
 class BollingerAtrReversionStrategy(DirectionalSnapshotStrategy):
     strategy_id = "bollinger_atr_reversion"
     family = "MEAN_REVERSION"
-    minimum_warmup = 50
-    required_inputs = ("candles", "bollinger_bands", "atr", "adx", "rsi")
-    buy_threshold = 0.60
-    sell_threshold = 0.60
+    required_inputs = ("candles", "bollinger_bands", "atr", "adx", "rsi", "rejectionWickRatio")
 
     def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
         bands = snapshot.bollinger_bands.get("1m") or {}

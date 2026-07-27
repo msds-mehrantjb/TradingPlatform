@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from backend.app.algorithms.meta_strategy.contracts import MetaStrategyMarketSnapshot
+from backend.app.algorithms.meta_strategy.evaluation_context import MetaStrategyEvaluationContext, context_market_snapshot
+from backend.app.algorithms.meta_strategy.feature_contracts import has_required_input, required_input_status
+from backend.app.algorithms.meta_strategy.settings import MetaStrategyContextSettings
 from backend.app.algorithms.meta_strategy.strategies.base import SnapshotEvaluationResult, hold_result
 
 
@@ -22,13 +25,27 @@ class ContextSnapshotStrategy:
     family = "MARKET_CONTEXT"
     required_inputs: tuple[str, ...] = ()
 
-    def evaluate(self, snapshot: MetaStrategyMarketSnapshot) -> SnapshotEvaluationResult:
+    def __init__(
+        self,
+        settings: MetaStrategyContextSettings | None = None,
+        *,
+        settings_version: str = "meta_strategy_settings_v1",
+        effective_settings_hash: str = "meta_strategy_settings_unresolved",
+    ) -> None:
+        self.context_settings = settings or MetaStrategyContextSettings()
+        self.settings_version = settings_version
+        self.effective_settings_hash = effective_settings_hash
+
+    def evaluate(self, value: MetaStrategyMarketSnapshot | MetaStrategyEvaluationContext) -> SnapshotEvaluationResult:
+        snapshot = context_market_snapshot(value)
         required_status = self.required_input_status(snapshot)
         if not snapshot.point_in_time:
             return hold_result(
                 self.strategy_id,
                 "meta_strategy.context.snapshot_not_point_in_time",
                 family=self.family,
+                settings_version=snapshot.settings_version,
+                effective_settings_hash=snapshot.effective_settings_hash,
                 evidence=clamp_adjustments(neutral_adjustments()),
                 required_input_status=required_status,
             )
@@ -37,6 +54,8 @@ class ContextSnapshotStrategy:
                 self.strategy_id,
                 "meta_strategy.context.missing_required_inputs",
                 family=self.family,
+                settings_version=snapshot.settings_version,
+                effective_settings_hash=snapshot.effective_settings_hash,
                 evidence=_safe_missing_evidence({}),
                 required_input_status=required_status,
             )
@@ -48,6 +67,8 @@ class ContextSnapshotStrategy:
             signal="HOLD",
             confidence=round(min(1.0, confidence), 6),
             eligible=True,
+            settings_version=snapshot.settings_version,
+            effective_settings_hash=snapshot.effective_settings_hash,
             family=self.family,
             evidence=bounded,
             required_input_status=required_status,
@@ -55,32 +76,10 @@ class ContextSnapshotStrategy:
         )
 
     def required_input_status(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, bool]:
-        return {name: self.has_input(snapshot, name) for name in self.required_inputs}
+        return required_input_status(snapshot, self.required_inputs)
 
     def has_input(self, snapshot: MetaStrategyMarketSnapshot, name: str) -> bool:
-        if name == "qqq_iwm_context":
-            return bool(snapshot.qqq_iwm_context)
-        if name == "breadth":
-            return bool(snapshot.breadth)
-        if name == "economic_event_state":
-            return bool(snapshot.economic_event_state)
-        if name == "session_phase":
-            return bool(snapshot.session_phase)
-        if name == "spread":
-            return bool(snapshot.spread)
-        if name == "candles":
-            return bool(snapshot.candles.get("1m"))
-        if name == "moving_averages":
-            return bool(snapshot.moving_averages.get("1m"))
-        if name == "atr":
-            return snapshot.atr.get("1m") is not None
-        if name == "volume":
-            return snapshot.volume > 0
-        if name == "relative_volume":
-            return snapshot.relative_volume.get("1m") is not None
-        if name == "vwap":
-            return snapshot.vwap is not None
-        return snapshot.features.get(name) is not None
+        return has_required_input(snapshot, name)
 
     def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
         return {"limits": ADJUSTMENT_LIMITS}

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from typing import Any, Callable, Literal, Protocol
 
@@ -37,6 +37,7 @@ from backend.app.algorithms.meta_strategy.sizing import (
     calculate_meta_strategy_position_size,
 )
 from backend.app.algorithms.meta_strategy.reconciliation import MetaStrategyReconciliationRecord, reconcile_meta_strategy_broker_fill
+from backend.app.algorithms.meta_strategy.settings import MetaStrategySettings, build_meta_strategy_settings
 
 
 MetaStrategyPipelineMode = Literal["EVALUATION", "SHADOW", "PAPER", "BACKTEST", "DAILY_REPLAY", "DIAGNOSTICS", "LIVE"]
@@ -72,6 +73,7 @@ class MetaStrategyPersistenceAdapter(Protocol):
 
 @dataclass(frozen=True)
 class MetaStrategyExecutionPipelineConfig:
+    settings: MetaStrategySettings = field(default_factory=lambda: build_meta_strategy_settings(status="ACTIVE"))
     inference_config: MetaStrategyInferenceConfig = field(default_factory=lambda: MetaStrategyInferenceConfig(mode="FILTER", fallbackBehavior="NO_TRADE"))
     baseline_settings: MetaStrategyBaselineSettings = field(default_factory=meta_strategy_baseline_settings)
     live_trading_enabled: bool = False
@@ -81,6 +83,7 @@ class MetaStrategyExecutionPipelineConfig:
     default_global_available_risk: float = 1_000.0
     default_global_quantity_cap: int = 10_000
     configuration_hash: str = "meta_strategy_execution_pipeline_v1"
+    submit_to_broker: bool = True
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,8 @@ class MetaStrategyExecutionPipelineResult:
     persistence_result: dict[str, Any]
     reconciliation: MetaStrategyReconciliationRecord | None
     final_valid: bool
+    settings_version: str
+    effective_settings_hash: str
     reason_codes: tuple[str, ...]
 
 
@@ -161,6 +166,8 @@ class InMemoryMetaStrategyPersistenceAdapter:
             "status": "PERSISTED",
             "recordId": f"meta_strategy.pipeline.{payload.get('decisionId', 'unknown')}",
             "stageCount": len(payload.get("stageSequence") or ()),
+            "settingsVersion": payload.get("settingsVersion"),
+            "effectiveSettingsHash": payload.get("effectiveSettingsHash"),
             "reasonCodes": ("meta_strategy.pipeline.persisted",),
         }
 
@@ -172,10 +179,18 @@ def run_meta_strategy_execution_pipeline(
     broker_adapter: MetaStrategyBrokerAdapter | None = None,
     persistence_adapter: MetaStrategyPersistenceAdapter | None = None,
     global_risk_adapter: MetaStrategyGlobalRiskAdapter | None = None,
+    config_settings: MetaStrategySettings | None = None,
 ) -> MetaStrategyExecutionPipelineResult:
+    active_config = config or MetaStrategyExecutionPipelineConfig()
+    if config_settings is not None:
+        active_config = replace(
+            active_config,
+            settings=config_settings,
+            baseline_settings=config_settings.to_baseline_settings(),
+        )
     state = _PipelineState(
         request=request,
-        config=config or MetaStrategyExecutionPipelineConfig(),
+        config=active_config,
         broker=broker_adapter or NoopMetaStrategyBrokerAdapter(),
         persistence=persistence_adapter or InMemoryMetaStrategyPersistenceAdapter(),
         global_risk_adapter=global_risk_adapter or ReadOnlyMetaStrategyGlobalRiskAdapter(),
@@ -193,7 +208,13 @@ def pipeline_modes_using_authoritative_sequence() -> dict[str, tuple[str, ...]]:
 
 
 def _stage_market_snapshot(state: _PipelineState) -> None:
-    state.snapshot = build_meta_strategy_market_snapshot(state.request.snapshot_request)
+    snapshot = build_meta_strategy_market_snapshot(state.request.snapshot_request)
+    state.snapshot = snapshot.model_copy(
+        update={
+            "settings_version": state.config.settings.settings_version,
+            "effective_settings_hash": state.config.settings.effective_settings_hash,
+        }
+    )
     _record(state, "market_snapshot", {"snapshotId": state.snapshot.snapshot_id, "symbol": state.snapshot.symbol})
 
 
@@ -205,7 +226,7 @@ def _stage_passive(name: str, payload: dict[str, Any] | None = None) -> Callable
 
 
 def _stage_deterministic_candidate(state: _PipelineState) -> None:
-    state.deterministic_candidate = generate_deterministic_candidate(_require(state.snapshot, "snapshot"))
+    state.deterministic_candidate = generate_deterministic_candidate(_require(state.snapshot, "snapshot"), settings=state.config.settings)
     state.reason_codes.extend(state.deterministic_candidate.reason_codes)
     _record(
         state,
@@ -460,6 +481,16 @@ def _stage_global_risk(state: _PipelineState) -> None:
 
 
 def _stage_broker_adapter(state: _PipelineState) -> None:
+    if not state.config.submit_to_broker:
+        state.broker_result = {
+            "status": "SKIPPED",
+            "submitted": False,
+            "filledQuantity": 0,
+            "reasonCodes": ("meta_strategy.pipeline.broker_skipped_in_decision_worker",),
+        }
+        state.reason_codes.extend(tuple(state.broker_result["reasonCodes"]))
+        _record(state, "broker_adapter", state.broker_result)
+        return
     state.broker_result = state.broker.submit(state.order_intent, mode=state.request.mode)
     state.reason_codes.extend(tuple(state.broker_result.get("reasonCodes") or ()))
     _record(state, "broker_adapter", state.broker_result)
@@ -471,6 +502,8 @@ def _stage_persistence(state: _PipelineState) -> None:
         {
             "algorithmId": "meta_strategy",
             "decisionId": snapshot.decision_id,
+            "settingsVersion": state.config.settings.settings_version,
+            "effectiveSettingsHash": state.config.settings.effective_settings_hash,
             "mode": state.request.mode,
             "stageSequence": META_STRATEGY_EXECUTION_PIPELINE_STAGES,
             "stageResults": state.stage_results,
@@ -524,12 +557,18 @@ def _build_result(state: _PipelineState) -> MetaStrategyExecutionPipelineResult:
         persistence_result=state.persistence_result or {},
         reconciliation=state.reconciliation,
         final_valid=state.final_valid,
+        settings_version=state.config.settings.settings_version,
+        effective_settings_hash=state.config.settings.effective_settings_hash,
         reason_codes=tuple(dict.fromkeys(state.reason_codes)),
     )
 
 
 def _record(state: _PipelineState, stage: str, payload: dict[str, Any]) -> None:
-    state.stage_results[stage] = payload
+    state.stage_results[stage] = {
+        **payload,
+        "settingsVersion": state.config.settings.settings_version,
+        "effectiveSettingsHash": state.config.settings.effective_settings_hash,
+    }
 
 
 def _require(value: Any, name: str) -> Any:

@@ -26,15 +26,11 @@ class MetaStrategyStep40ApplicationServiceTest(unittest.TestCase):
         calls = called_names(tree)
 
         self.assertIn("backend.app.algorithms.meta_strategy.execution_pipeline", imports)
-        self.assertIn("backend.app.algorithms.meta_strategy.backtest", imports)
         self.assertIn("backend.app.algorithms.meta_strategy.models", imports)
-        self.assertIn("backend.app.algorithms.meta_strategy.promotion", imports)
-        self.assertIn("backend.app.algorithms.meta_strategy.training", imports)
+        self.assertIn("backend.app.algorithms.meta_strategy.jobs", imports)
         self.assertIn("run_meta_strategy_execution_pipeline", calls)
-        self.assertIn("run_meta_strategy_backtest", calls)
         self.assertIn("load_runtime_model_artifact_data", calls)
-        self.assertIn("train_and_validate_meta_model_v2", calls)
-        self.assertIn("evaluate_meta_strategy_promotion_policy", calls)
+        self.assertIn("enqueue_job", calls)
 
     def test_service_does_not_import_formula_or_legacy_api_modules(self) -> None:
         tree = ast.parse((META_STRATEGY_DIR / "service.py").read_text(encoding="utf-8"))
@@ -53,17 +49,16 @@ class MetaStrategyStep40ApplicationServiceTest(unittest.TestCase):
         }
         self.assertFalse(forbidden & imports)
 
-    def test_service_evaluation_calls_pipeline_and_returns_summary(self) -> None:
+    def test_service_evaluation_enqueues_command_without_inline_pipeline(self) -> None:
         service = MetaStrategyApplicationService()
 
         response = service.evaluate({"snapshotRequest": request_with().model_dump(mode="python")})
 
         self.assertEqual(response["algorithmId"], ALGORITHM_ID)
-        self.assertEqual(response["operation"], "evaluation")
+        self.assertEqual(response["operation"], "evaluation_command")
         self.assertEqual(response["status"], "OK")
-        self.assertEqual(response["payload"]["mode"], "EVALUATION")
-        self.assertEqual(response["payload"]["decisionId"], "decision-1")
-        self.assertIn("stageSequence", response["payload"])
+        self.assertEqual(response["payload"]["job"]["queueName"], "finalised_bar_decisions")
+        self.assertTrue(response["payload"]["backgroundWorkerRequired"])
 
     def test_service_requires_inputs_for_non_runnable_operations(self) -> None:
         service = MetaStrategyApplicationService()

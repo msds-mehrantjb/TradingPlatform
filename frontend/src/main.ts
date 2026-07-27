@@ -10561,7 +10561,7 @@ async function loadMetaStrategyTrainingStatus() {
   state.metaTrainingWarning = "";
   renderMetaMlReadiness();
   try {
-    const response = await fetch(`${API_BASE}/api/meta-strategy/status`, { method: "GET" });
+    const response = await fetch(`${API_BASE}/api/meta-strategy/models/active`, { method: "GET" });
     if (!response.ok) {
       if (response.status === 404) {
         state.metaTrainingResult = {
@@ -10577,14 +10577,14 @@ async function loadMetaStrategyTrainingStatus() {
     }
     const envelope = (await response.json()) as {
       status?: string;
-      payload?: { modelStatus?: { status?: string; mode?: string; reasonCodes?: string[] } };
+      payload?: { activeModel?: { modelArtifactId?: string | null; promotionJobId?: string | null }; mlShadowOnly?: boolean };
       reasonCodes?: string[];
     };
-    const modelStatus = envelope.payload?.modelStatus ?? {};
+    const activeModel = envelope.payload?.activeModel ?? {};
     state.metaTrainingResult = {
-      status: modelStatus.status ?? envelope.status ?? "unknown",
+      status: activeModel.modelArtifactId ?? envelope.status ?? "unknown",
       trusted: false,
-      message: [...(modelStatus.reasonCodes ?? []), ...(envelope.reasonCodes ?? [])].join("; ") || `Mode ${modelStatus.mode ?? "unknown"}`,
+      message: [...(envelope.reasonCodes ?? [])].join("; ") || `Promotion job ${activeModel.promotionJobId ?? "none"}; shadow-only ${String(envelope.payload?.mlShadowOnly ?? true)}`,
     };
     state.metaTrainingStatus = "ready";
   } catch (error) {

@@ -44,6 +44,8 @@ def build_meta_strategy_order_intent(
         algorithm_version=META_STRATEGY_ALGORITHM_VERSION,
         configuration_version=META_STRATEGY_CONFIGURATION_VERSION,
         strategy_catalog_version=META_STRATEGY_STRATEGY_CATALOG_VERSION,
+        settings_version=snapshot.settings_version,
+        effective_settings_hash=snapshot.effective_settings_hash,
         decision_id=snapshot.decision_id,
         snapshot_id=snapshot.snapshot_id,
         timestamp=snapshot.timestamp,

@@ -42,9 +42,14 @@ class MetaStrategyStep12SafetyInventoryTest(unittest.TestCase):
             "unsupported_session_filter",
             "halt_luld_filter",
             "operational_health_filter",
+            "daily_loss_limit_filter",
+            "trade_count_limit_filter",
+            "duplicate_order_protection_filter",
+            "existing_position_policy_filter",
+            "local_risk_budget_filter",
         }
         self.assertEqual({entry.strategy_id for entry in SAFETY_STRATEGIES}, expected)
-        self.assertEqual(len(SAFETY_STRATEGIES), 10)
+        self.assertEqual(len(SAFETY_STRATEGIES), 15)
 
     def test_each_safety_module_has_required_behavior_coverage(self) -> None:
         for entry in SAFETY_STRATEGIES:
@@ -138,6 +143,13 @@ def snapshot_fixture(**overrides: Any) -> MetaStrategyMarketSnapshot:
         "avoidTrading": False,
         "haltLuldState": "clear",
         "operationalHealth": {"status": "ok", "brokerConnected": True, "dataConnected": True},
+        "marketDailyPnl": 0.0,
+        "dailyLossLimit": -1_000.0,
+        "tradeCount": 0,
+        "tradeCountLimit": 5,
+        "duplicateOrderState": {"duplicate": False},
+        "existingPositionState": {"policyAllowsEntry": True},
+        "localRiskBudget": {"remainingRiskDollars": 1_000.0},
     }
     features.update(overrides.get("features", {}))
     for key in overrides.get("remove_features", ()):
@@ -295,6 +307,57 @@ def safety_cases() -> dict[str, SafetyCase]:
             pass_reason="meta_strategy.safety.operational_health.pass",
             missing_reason="meta_strategy.safety.operational_health_filter.missing_data",
             existing_position_action="MONITOR",
+        ),
+        "daily_loss_limit_filter": SafetyCase(
+            trigger={"features": {"marketDailyPnl": -1_000.01}},
+            non_trigger={},
+            boundary={"features": {"marketDailyPnl": -1_000.0}},
+            missing={"remove_features": ("marketDailyPnl",)},
+            trigger_reason="meta_strategy.safety.daily_loss_limit_filter.block",
+            pass_reason="meta_strategy.safety.daily_loss_limit_filter.pass",
+            missing_reason="meta_strategy.safety.daily_loss_limit_filter.missing_data",
+            existing_position_action="REDUCE_ONLY",
+            boundary_blocks=True,
+        ),
+        "trade_count_limit_filter": SafetyCase(
+            trigger={"features": {"tradeCount": 5}},
+            non_trigger={},
+            boundary={"features": {"tradeCount": 4}},
+            missing={"remove_features": ("tradeCount",)},
+            trigger_reason="meta_strategy.safety.trade_count_limit_filter.block",
+            pass_reason="meta_strategy.safety.trade_count_limit_filter.pass",
+            missing_reason="meta_strategy.safety.trade_count_limit_filter.missing_data",
+            existing_position_action="ALLOW_MANAGE",
+        ),
+        "duplicate_order_protection_filter": SafetyCase(
+            trigger={"features": {"duplicateOrderState": {"duplicate": True}}},
+            non_trigger={},
+            boundary={"features": {"duplicateOrderState": {"duplicate": False}}},
+            missing={"remove_features": ("duplicateOrderState",)},
+            trigger_reason="meta_strategy.safety.duplicate_order_protection_filter.block",
+            pass_reason="meta_strategy.safety.duplicate_order_protection_filter.pass",
+            missing_reason="meta_strategy.safety.duplicate_order_protection_filter.missing_data",
+            existing_position_action="ALLOW_MANAGE",
+        ),
+        "existing_position_policy_filter": SafetyCase(
+            trigger={"features": {"existingPositionState": {"policyAllowsEntry": False}}},
+            non_trigger={},
+            boundary={"features": {"existingPositionState": {"policyAllowsEntry": True}}},
+            missing={"remove_features": ("existingPositionState",)},
+            trigger_reason="meta_strategy.safety.existing_position_policy_filter.block",
+            pass_reason="meta_strategy.safety.existing_position_policy_filter.pass",
+            missing_reason="meta_strategy.safety.existing_position_policy_filter.missing_data",
+            existing_position_action="MANAGE_EXISTING_ONLY",
+        ),
+        "local_risk_budget_filter": SafetyCase(
+            trigger={"features": {"localRiskBudget": {"remainingRiskDollars": 0.0}}},
+            non_trigger={},
+            boundary={"features": {"localRiskBudget": {"remainingRiskDollars": 0.01}}},
+            missing={"remove_features": ("localRiskBudget",)},
+            trigger_reason="meta_strategy.safety.local_risk_budget_filter.block",
+            pass_reason="meta_strategy.safety.local_risk_budget_filter.pass",
+            missing_reason="meta_strategy.safety.local_risk_budget_filter.missing_data",
+            existing_position_action="REDUCE_ONLY",
         ),
     }
 

@@ -8,9 +8,12 @@ from pathlib import Path
 
 from backend.app.algorithms.meta_strategy import (
     ALL_META_STRATEGY_STRATEGIES,
+    CONTEXT_STRATEGIES,
     DIRECTIONAL_STRATEGIES,
     META_STRATEGY_STRATEGY_PACKAGE,
     MetaStrategyMarketSnapshot,
+    REGIME_STRATEGIES,
+    SAFETY_STRATEGIES,
     directional_strategy_input_ids,
     influence_strategy_ids,
     meta_strategy_strategy_catalog,
@@ -61,7 +64,7 @@ class MetaStrategyStep8StrategyRegistryTest(unittest.TestCase):
 
         self.assertEqual(catalog, ALL_META_STRATEGY_STRATEGIES)
         self.assertTrue(validation["valid"])
-        self.assertEqual(len(catalog), 13)
+        self.assertEqual(len(catalog), len(DIRECTIONAL_STRATEGIES) + len(CONTEXT_STRATEGIES) + len(REGIME_STRATEGIES) + len(SAFETY_STRATEGIES))
         self.assertEqual(len(directional_strategy_input_ids()), len(DIRECTIONAL_STRATEGIES))
         for entry in catalog:
             with self.subTest(strategy=entry.strategy_id):

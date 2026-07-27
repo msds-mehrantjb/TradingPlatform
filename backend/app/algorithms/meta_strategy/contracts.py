@@ -101,6 +101,8 @@ class MetaStrategyDecisionContract(MetaStrategyContractModel):
     algorithm_version: Literal["meta_strategy_algorithm_v1"]
     configuration_version: Literal["meta_strategy_config_v1"]
     strategy_catalog_version: Literal["meta_strategy_strategy_catalog_v1"]
+    settings_version: str = "meta_strategy_settings_v1"
+    effective_settings_hash: str = "meta_strategy_settings_unresolved"
     decision_id: str = Field(min_length=1)
     snapshot_id: str = Field(min_length=1)
     timestamp: datetime

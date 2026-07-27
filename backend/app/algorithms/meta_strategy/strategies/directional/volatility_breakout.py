@@ -9,10 +9,7 @@ from backend.app.algorithms.meta_strategy.strategies.directional.common import D
 class VolatilityBreakoutStrategy(DirectionalSnapshotStrategy):
     strategy_id = "volatility_breakout"
     family = "BREAKOUT"
-    minimum_warmup = 50
-    required_inputs = ("candles", "atr", "bollinger_bands", "relative_volume", "spread")
-    buy_threshold = 0.70
-    sell_threshold = 0.70
+    required_inputs = ("candles", "atr", "bollinger_bands", "bollingerWidthPercentile", "relative_volume", "spread")
 
     def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
         bands = snapshot.bollinger_bands.get("1m") or {}

@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from backend.app.algorithms.meta_strategy import DIRECTIONAL_STRATEGIES, MetaStrategyMarketSnapshot
+from backend.app.algorithms.meta_strategy.settings import build_meta_strategy_settings
 
 
 NOW = datetime(2026, 1, 5, 15, 45, tzinfo=UTC)
@@ -17,7 +18,7 @@ class MetaStrategyStep9DirectionalStrategiesTest(unittest.TestCase):
     maxDiff = None
 
     def test_every_directional_strategy_has_focused_behavior_coverage(self) -> None:
-        self.assertEqual(len(DIRECTIONAL_STRATEGIES), 10)
+        self.assertEqual(len(DIRECTIONAL_STRATEGIES), 12)
         for entry in DIRECTIONAL_STRATEGIES:
             strategy = strategy_for(entry.strategy_id)
             cases = strategy_cases(entry.strategy_id)
@@ -77,8 +78,10 @@ class MetaStrategyStep9DirectionalStrategiesTest(unittest.TestCase):
 
 def strategy_for(strategy_id: str):
     entry = next(item for item in DIRECTIONAL_STRATEGIES if item.strategy_id == strategy_id)
+    settings = build_meta_strategy_settings(directional_strategies={strategy_id: {"enabled": True}})
+    strategy_settings = settings.directional_strategies[strategy_id]
     module = importlib.import_module(entry.implementation_module)
-    return getattr(module, entry.implementation_class)()
+    return getattr(module, entry.implementation_class)(strategy_settings)
 
 
 def strategy_cases(strategy_id: str) -> dict[str, dict[str, Any]]:
@@ -163,13 +166,29 @@ def strategy_cases(strategy_id: str) -> dict[str, dict[str, Any]]:
             "threshold_at": {"price": 99.8, "lowerBand": 100.0, "upperBand": 101.0, "atr": 1.0, "rsi": 35.0, "adx": 28.0},
             "threshold_below": {"price": 99.81, "lowerBand": 100.0, "upperBand": 101.0, "atr": 1.0, "rsi": 35.0, "adx": 28.0},
         },
-        "gap_continuation_gap_fade": {
+        "gap_continuation": {
             "buy": {"gapState": "gap_up", "gapPercent": 0.75, "gapTradeType": "continuation", "spyVsQqq": 1.01},
             "sell": {"gapState": "gap_down", "gapPercent": -0.75, "gapTradeType": "continuation", "spyVsQqq": 0.99},
             "hold": {"gapState": "flat_open", "gapPercent": 0.0, "gapTradeType": "continuation"},
             "missing": {"gap_state": {}},
             "threshold_at": {"gapState": "gap_up", "gapPercent": 0.75, "gapTradeType": "continuation", "spyVsQqq": 1.0},
             "threshold_below": {"gapState": "gap_up", "gapPercent": 0.74, "gapTradeType": "continuation", "spyVsQqq": 1.0},
+        },
+        "gap_fade": {
+            "buy": {"gapState": "gap_down", "gapPercent": -0.75, "gapTradeType": "fade", "spyVsQqq": 1.01},
+            "sell": {"gapState": "gap_up", "gapPercent": 0.75, "gapTradeType": "fade", "spyVsQqq": 0.99},
+            "hold": {"gapState": "flat_open", "gapPercent": 0.0, "gapTradeType": "fade"},
+            "missing": {"gap_state": {}},
+            "threshold_at": {"gapState": "gap_down", "gapPercent": -0.75, "gapTradeType": "fade", "spyVsQqq": 1.0},
+            "threshold_below": {"gapState": "gap_down", "gapPercent": -0.74, "gapTradeType": "fade", "spyVsQqq": 1.0},
+        },
+        "economic_event_reaction": {
+            "buy": {"economic_event_state": {"state": "released", "active": True, "directionalBias": "bullish"}, "relative_volume": 2.5},
+            "sell": {"economic_event_state": {"state": "released", "active": True, "directionalBias": "bearish"}, "relative_volume": 2.5},
+            "hold": {"economic_event_state": {"state": "none", "active": False, "directionalBias": "none"}, "relative_volume": 1.0},
+            "missing": {"economic_event_state": {}},
+            "threshold_at": {"economic_event_state": {"state": "released", "active": True, "directionalBias": "bullish"}, "relative_volume": 2.25},
+            "threshold_below": {"economic_event_state": {"state": "released", "active": True, "directionalBias": "bullish"}, "relative_volume": 2.24},
         },
     }
     return {key: {**base[key], **overrides[strategy_id][key]} for key in base}

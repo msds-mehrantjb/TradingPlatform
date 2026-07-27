@@ -37,6 +37,7 @@ class StrategyContribution:
     weight: float = 1.0
     canonical_influence_id: str | None = None
     correlation_key: str | None = None
+    orderable: bool = True
 
 
 @dataclass(frozen=True)
@@ -72,12 +73,16 @@ class FamilyAggregationResult:
         decision_id: str,
         snapshot_id: str,
         timestamp: datetime,
+        settings_version: str = "meta_strategy_settings_v1",
+        effective_settings_hash: str = "meta_strategy_settings_unresolved",
     ) -> DeterministicCandidate:
         return DeterministicCandidate(
             algorithm_id=ALGORITHM_ID,
             algorithm_version=algorithm_version,
             configuration_version=configuration_version,
             strategy_catalog_version=strategy_catalog_version,
+            settings_version=settings_version,
+            effective_settings_hash=effective_settings_hash,
             decision_id=decision_id,
             snapshot_id=snapshot_id,
             timestamp=timestamp,
@@ -90,6 +95,8 @@ class FamilyAggregationResult:
                     algorithm_version=algorithm_version,
                     configuration_version=configuration_version,
                     strategy_catalog_version=strategy_catalog_version,
+                    settings_version=settings_version,
+                    effective_settings_hash=effective_settings_hash,
                     decision_id=decision_id,
                     snapshot_id=snapshot_id,
                     timestamp=timestamp,
@@ -129,6 +136,16 @@ def aggregate_family_scores(
 
     if active_count == 0:
         return _hold_result("meta_strategy.aggregation.no_active_directional_strategies", total_count=total_count, abstention_rate=1.0, extra_reasons=tuple(reason_codes))
+    if not any(item.orderable and item.family != "MARKET_CONTEXT" for item in active):
+        return _hold_result(
+            "meta_strategy.aggregation.context_only_not_orderable",
+            total_count=total_count,
+            active_count=active_count,
+            active_family_count=len(active_families),
+            abstention_rate=abstention_rate,
+            family_scores=_family_scores(active, settings),
+            extra_reasons=tuple(reason_codes),
+        )
     if active_count < settings.minimum_active_strategies:
         return _hold_result(
             "meta_strategy.aggregation.minimum_active_strategies",
@@ -230,8 +247,9 @@ def _as_contribution(
         confidence=float(item.confidence),
         eligible=bool(item.eligible),
         weight=float(evidence.get("weight", 1.0)),
-        canonical_influence_id=str(evidence.get("canonicalInfluenceId") or entry.canonical_influence_id if entry else item.strategy_id),
-        correlation_key=str(evidence.get("correlationKey") or family),
+        canonical_influence_id=str(evidence.get("canonicalInfluenceId") or (entry.canonical_influence_id if entry else item.strategy_id)),
+        correlation_key=str(evidence.get("correlationKey") or (entry.correlation_group if entry else family)),
+        orderable=True if entry is None else bool(str(entry.role) == "DIRECTIONAL" and entry.enabled),
     )
 
 
@@ -255,11 +273,11 @@ def _family_scores(active: tuple[StrategyContribution, ...], settings: FamilyAgg
     results: list[FamilyContribution] = []
     for family in families:
         family_items = tuple(item for item in active if item.family == family)
-        grouped = _correlation_capped_contributions(family_items, settings)
+        grouped, group_capped = _correlation_capped_contributions(family_items, settings)
         buy = sum(value for item, value in grouped if item.signal == "BUY")
         sell = sum(value for item, value in grouped if item.signal == "SELL")
         total = buy + sell
-        capped = False
+        capped = group_capped
         if total > settings.family_contribution_cap:
             scale = settings.family_contribution_cap / total
             buy *= scale
@@ -281,17 +299,19 @@ def _family_scores(active: tuple[StrategyContribution, ...], settings: FamilyAgg
 def _correlation_capped_contributions(
     family_items: tuple[StrategyContribution, ...],
     settings: FamilyAggregationConfig,
-) -> tuple[tuple[StrategyContribution, float], ...]:
+) -> tuple[tuple[tuple[StrategyContribution, float], ...], bool]:
     raw_items = tuple((item, min(settings.strategy_contribution_cap, _raw_contribution(item))) for item in family_items)
     by_group: dict[str, list[tuple[StrategyContribution, float]]] = {}
     for item, value in raw_items:
         by_group.setdefault(item.correlation_key or item.family, []).append((item, value))
     capped: list[tuple[StrategyContribution, float]] = []
+    group_capped = False
     for group_items in by_group.values():
         group_total = sum(value for _, value in group_items)
         scale = settings.correlation_group_cap / group_total if group_total > settings.correlation_group_cap else 1.0
+        group_capped = group_capped or scale < 1.0
         capped.extend((item, value * scale) for item, value in group_items)
-    return tuple(capped)
+    return tuple(capped), group_capped
 
 
 def _raw_contribution(item: StrategyContribution) -> float:

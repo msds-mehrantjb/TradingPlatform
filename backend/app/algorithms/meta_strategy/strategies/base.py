@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from backend.app.algorithms.meta_strategy.contracts import MetaStrategyMarketSnapshot
+from backend.app.algorithms.meta_strategy.evaluation_context import MetaStrategyEvaluationContext
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,8 @@ class SnapshotEvaluationResult:
     signal: str
     confidence: float
     eligible: bool
+    settings_version: str = "meta_strategy_settings_v1"
+    effective_settings_hash: str = "meta_strategy_settings_unresolved"
     family: str = "UNKNOWN"
     evidence: dict[str, object] | None = None
     required_input_status: dict[str, bool] | None = None
@@ -23,7 +26,7 @@ class SnapshotEvaluationResult:
 class MetaStrategySnapshotOnlyStrategy(Protocol):
     strategy_id: str
 
-    def evaluate(self, snapshot: MetaStrategyMarketSnapshot) -> SnapshotEvaluationResult:
+    def evaluate(self, snapshot: MetaStrategyMarketSnapshot | MetaStrategyEvaluationContext) -> SnapshotEvaluationResult:
         ...
 
 
@@ -32,6 +35,8 @@ def hold_result(
     reason_code: str,
     *,
     family: str = "UNKNOWN",
+    settings_version: str = "meta_strategy_settings_v1",
+    effective_settings_hash: str = "meta_strategy_settings_unresolved",
     evidence: dict[str, object] | None = None,
     required_input_status: dict[str, bool] | None = None,
 ) -> SnapshotEvaluationResult:
@@ -40,6 +45,8 @@ def hold_result(
         signal="HOLD",
         confidence=0.0,
         eligible=False,
+        settings_version=settings_version,
+        effective_settings_hash=effective_settings_hash,
         family=family,
         evidence=evidence or {},
         required_input_status=required_input_status or {},

@@ -5,15 +5,16 @@ from __future__ import annotations
 from typing import Any
 
 from backend.app.algorithms.meta_strategy.contracts import MetaStrategyMarketSnapshot
+from backend.app.algorithms.meta_strategy.evaluation_context import MetaStrategyEvaluationContext, context_market_snapshot
 from backend.app.algorithms.meta_strategy.strategies.safety.common import SafetySnapshotStrategy, block_evidence, missing_required_evidence, pass_evidence
 
 
 class StaleMarketDataFilterStrategy(SafetySnapshotStrategy):
     strategy_id = "stale_market_data_filter"
     required_inputs = ("source_cutoff_timestamp",)
-    max_age_seconds = 90.0
 
-    def safety_evidence(self, snapshot: MetaStrategyMarketSnapshot, required_status: dict[str, bool]) -> dict[str, Any]:
+    def safety_evidence(self, value: MetaStrategyMarketSnapshot | MetaStrategyEvaluationContext, required_status: dict[str, bool]) -> dict[str, Any]:
+        snapshot = context_market_snapshot(value)
         if not all(required_status.values()):
             return missing_required_evidence(self.strategy_id, required_status)
         age_seconds = (snapshot.timestamp - snapshot.source_cutoff_timestamp).total_seconds()

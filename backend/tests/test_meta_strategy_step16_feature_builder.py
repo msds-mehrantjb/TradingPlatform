@@ -23,10 +23,10 @@ class MetaStrategyStep16FeatureBuilderTest(unittest.TestCase):
     def test_feature_schema_hash_is_deterministic_and_matches_characterization(self) -> None:
         payload = fixture_payload()
 
-        self.assertEqual(meta_strategy_feature_schema_hash(), "988c0cfe6ab86361")
+        self.assertEqual(meta_strategy_feature_schema_hash(), "04c43017715a2e83")
         self.assertEqual(meta_strategy_feature_schema_hash(), meta_strategy_feature_schema_hash())
         self.assertEqual(meta_strategy_feature_schema_hash(), payload["featureSchemaHash"])
-        self.assertEqual(len(meta_strategy_feature_schema()), 133)
+        self.assertEqual(len(meta_strategy_feature_schema()), 149)
 
     def test_feature_vectors_match_characterization_fixtures(self) -> None:
         for fixture in fixture_payload()["fixtures"]:

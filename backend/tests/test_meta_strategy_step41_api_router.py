@@ -79,9 +79,9 @@ class MetaStrategyStep41ApiRouterTest(unittest.TestCase):
     def test_prediction_route_fails_closed_and_does_not_submit_orders(self) -> None:
         response = self.client.post("/api/meta-strategy/prediction/evaluate", json={})
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 202)
         body = response.json()
-        self.assertEqual(body["operation"], "prediction")
+        self.assertEqual(body["operation"], "prediction_command")
         self.assertEqual(body["status"], "REQUIRES_INPUT")
         self.assertFalse(body["payload"]["orderSubmissionAllowed"])
         self.assertTrue(body["payload"]["approvedSubmissionEndpointRequired"])
@@ -106,8 +106,9 @@ class MetaStrategyStep41ApiRouterTest(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["algorithmId"], ALGORITHM_ID)
         self.assertEqual(body["operation"], "final_acceptance")
-        self.assertTrue(body["payload"]["complete"])
-        self.assertEqual(body["payload"]["counts"]["PASSED"], 24)
+        self.assertFalse(body["payload"]["complete"])
+        self.assertGreater(body["payload"]["counts"]["FAILED"], 0)
+        self.assertIn("failedControls", body["payload"])
         self.assertFalse(body["payload"]["liveExecutionEnabled"])
 
 

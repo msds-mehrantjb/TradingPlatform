@@ -28,7 +28,7 @@ class MetaStrategyStep11RegimeModulesTest(unittest.TestCase):
     maxDiff = None
 
     def test_regime_modules_describe_environment_without_casting_votes(self) -> None:
-        self.assertEqual(len(REGIME_STRATEGIES), 2)
+        self.assertEqual(len(REGIME_STRATEGIES), 1)
         for entry in REGIME_STRATEGIES:
             strategy = strategy_for(entry.strategy_id)
             with self.subTest(strategy=entry.strategy_id):
@@ -80,10 +80,10 @@ class MetaStrategyStep11RegimeModulesTest(unittest.TestCase):
                 self.assertNotIn("persistedResult", result.evidence)
 
     def test_regime_outputs_have_expected_environment_labels(self) -> None:
-        adx_result = strategy_for("adx_trend_strength_regime").evaluate(snapshot_fixture(adx={"1m": 38.0}, moving_averages={"1m": {"ema20": 102.0, "ema50": 100.0}}))
-        atr_result = strategy_for("atr_volatility_regime").evaluate(snapshot_fixture(atr={"1m": 5.0}, relative_volume={"1m": 3.0}, economic_event_state={"state": "blocked", "active": True}))
+        adx_result = strategy_for("adx_atr_regime_classifier").evaluate(snapshot_fixture(adx={"1m": 38.0}, moving_averages={"1m": {"ema20": 102.0, "ema50": 100.0}}))
+        atr_result = strategy_for("adx_atr_regime_classifier").evaluate(snapshot_fixture(atr={"1m": 5.0}, relative_volume={"1m": 3.0}, economic_event_state={"state": "blocked", "active": True}))
 
-        self.assertEqual(adx_result.evidence["regimeLabel"], "strong_trend")
+        self.assertTrue(adx_result.evidence["regimeLabel"].startswith("strong_trend."))
         self.assertEqual(adx_result.evidence["direction"], 1)
         self.assertGreater(adx_result.evidence["strategyFit"]["TREND"], adx_result.evidence["strategyFit"]["MEAN_REVERSION"])
         self.assertEqual(atr_result.evidence["volatility"], "EXTREME")
@@ -91,8 +91,7 @@ class MetaStrategyStep11RegimeModulesTest(unittest.TestCase):
 
     def test_regime_registry_uses_dedicated_modules(self) -> None:
         expected_modules = {
-            "adx_trend_strength_regime": "regime.adx_trend_strength",
-            "atr_volatility_regime": "regime.atr_volatility_regime",
+            "adx_atr_regime_classifier": "regime.adx_atr_regime_classifier",
         }
         for entry in REGIME_STRATEGIES:
             with self.subTest(strategy=entry.strategy_id):
@@ -173,15 +172,13 @@ def candles(count: int, close: float) -> tuple[dict[str, Any], ...]:
 
 def valid_overrides(strategy_id: str) -> dict[str, Any]:
     return {
-        "adx_trend_strength_regime": {"adx": {"1m": 28.0}, "atr": {"1m": 1.2}, "moving_averages": {"1m": {"ema20": 102.0, "ema50": 100.0}}},
-        "atr_volatility_regime": {"atr": {"1m": 2.8}, "relative_volume": {"1m": 2.1}, "economic_event_state": {"state": "none", "active": False}},
+        "adx_atr_regime_classifier": {"adx": {"1m": 28.0}, "atr": {"1m": 1.2}, "moving_averages": {"1m": {"ema20": 102.0, "ema50": 100.0}}, "relative_volume": {"1m": 1.5}, "economic_event_state": {"state": "none", "active": False}},
     }[strategy_id]
 
 
 def missing_overrides(strategy_id: str) -> dict[str, Any]:
     return {
-        "adx_trend_strength_regime": {"adx": {}, "atr": {}, "moving_averages": {}},
-        "atr_volatility_regime": {"atr": {}, "relative_volume": {}, "economic_event_state": {}},
+        "adx_atr_regime_classifier": {"adx": {}, "atr": {}, "moving_averages": {}, "relative_volume": {}, "economic_event_state": {}},
     }[strategy_id]
 
 

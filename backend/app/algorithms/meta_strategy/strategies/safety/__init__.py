@@ -9,6 +9,13 @@ from backend.app.algorithms.meta_strategy.strategies.safety.excessive_spread imp
 from backend.app.algorithms.meta_strategy.strategies.safety.extreme_volatility import ExtremeVolatilityFilterStrategy
 from backend.app.algorithms.meta_strategy.strategies.safety.halt_luld import HaltLuldFilterStrategy
 from backend.app.algorithms.meta_strategy.strategies.safety.insufficient_liquidity import InsufficientLiquidityFilterStrategy
+from backend.app.algorithms.meta_strategy.strategies.safety.local_risk_controls import (
+    DailyLossLimitFilterStrategy,
+    DuplicateOrderProtectionFilterStrategy,
+    ExistingPositionPolicyFilterStrategy,
+    LocalRiskBudgetFilterStrategy,
+    TradeCountLimitFilterStrategy,
+)
 from backend.app.algorithms.meta_strategy.strategies.safety.missing_critical_data import MissingCriticalDataFilterStrategy
 from backend.app.algorithms.meta_strategy.strategies.safety.operational_health import OperationalHealthFilterStrategy
 from backend.app.algorithms.meta_strategy.strategies.safety.stale_market_data import StaleMarketDataFilterStrategy
@@ -17,14 +24,19 @@ from backend.app.algorithms.meta_strategy.strategies.safety.unsupported_session 
 
 __all__ = [
     "CashAvoidTradingFilterStrategy",
+    "DailyLossLimitFilterStrategy",
+    "DuplicateOrderProtectionFilterStrategy",
     "EconomicEventBlackoutFilterStrategy",
     "ExcessiveSpreadFilterStrategy",
+    "ExistingPositionPolicyFilterStrategy",
     "ExtremeVolatilityFilterStrategy",
     "HaltLuldFilterStrategy",
     "InsufficientLiquidityFilterStrategy",
+    "LocalRiskBudgetFilterStrategy",
     "MissingCriticalDataFilterStrategy",
     "OperationalHealthFilterStrategy",
     "SafetySnapshotStrategy",
     "StaleMarketDataFilterStrategy",
+    "TradeCountLimitFilterStrategy",
     "UnsupportedSessionFilterStrategy",
 ]

@@ -13,7 +13,9 @@ from backend.app.algorithms.meta_strategy.family_aggregation import (
     StrategyContribution,
     aggregate_family_scores,
 )
+from backend.app.algorithms.meta_strategy.settings import MetaStrategySettings, build_meta_strategy_settings
 from backend.app.algorithms.meta_strategy.strategy_registry import (
+    ACTIVE_DIRECTIONAL_STRATEGIES,
     CONTEXT_STRATEGIES,
     DIRECTIONAL_STRATEGIES,
     REGIME_STRATEGIES,
@@ -60,23 +62,28 @@ def generate_deterministic_candidate(
     snapshot: MetaStrategyMarketSnapshot,
     *,
     config: CandidateGenerationConfig | None = None,
+    settings: MetaStrategySettings | None = None,
 ) -> GeneratedDeterministicCandidate:
-    settings = config or CandidateGenerationConfig()
-    directional_outputs = evaluate_registry_group(snapshot, DIRECTIONAL_STRATEGIES)
-    context_outputs = evaluate_registry_group(snapshot, CONTEXT_STRATEGIES)
+    active_settings = settings or build_meta_strategy_settings(
+        settings_version=snapshot.settings_version,
+        status="ACTIVE",
+    )
+    generation_config = config or _candidate_generation_config(active_settings)
+    directional_outputs = evaluate_registry_group(snapshot, DIRECTIONAL_STRATEGIES, settings=active_settings)
+    context_outputs = evaluate_registry_group(snapshot, CONTEXT_STRATEGIES, settings=active_settings)
     active_context_outputs = tuple(
         output
         for output, entry in zip(context_outputs, CONTEXT_STRATEGIES, strict=True)
         if entry.enabled
     )
-    regime_outputs = evaluate_registry_group(snapshot, REGIME_STRATEGIES)
-    safety_outputs = evaluate_registry_group(snapshot, SAFETY_STRATEGIES)
+    regime_outputs = evaluate_registry_group(snapshot, REGIME_STRATEGIES, settings=active_settings)
+    safety_outputs = evaluate_registry_group(snapshot, SAFETY_STRATEGIES, settings=active_settings)
     safety_blockers = tuple(output for output in safety_outputs if bool((output.evidence or {}).get("blocksNewEntries")))
     aggregation = aggregate_family_scores(
         _directional_contributions(directional_outputs, DIRECTIONAL_STRATEGIES, active_context_outputs, regime_outputs),
-        config=settings.aggregation,
+        config=generation_config.aggregation,
     )
-    safety_blocks = settings.block_new_entries_on_safety_failure and bool(safety_blockers)
+    safety_blocks = generation_config.block_new_entries_on_safety_failure and bool(safety_blockers)
     direction: Direction = "HOLD" if safety_blocks else aggregation.signal
     eligible = aggregation.eligible and not safety_blocks
     reason_codes = tuple(
@@ -98,6 +105,8 @@ def generate_deterministic_candidate(
         algorithm_version=snapshot.algorithm_version,
         configuration_version=snapshot.configuration_version,
         strategy_catalog_version=snapshot.strategy_catalog_version,
+        settings_version=snapshot.settings_version,
+        effective_settings_hash=snapshot.effective_settings_hash,
         decision_id=snapshot.decision_id,
         snapshot_id=snapshot.snapshot_id,
         timestamp=snapshot.timestamp,
@@ -111,6 +120,8 @@ def generate_deterministic_candidate(
             decision_id=snapshot.decision_id,
             snapshot_id=snapshot.snapshot_id,
             timestamp=snapshot.timestamp,
+            settings_version=snapshot.settings_version,
+            effective_settings_hash=snapshot.effective_settings_hash,
         ).family_scores,
         reason_codes=reason_codes,
     )
@@ -148,13 +159,54 @@ def generate_deterministic_candidate(
 def evaluate_registry_group(
     snapshot: MetaStrategyMarketSnapshot,
     entries: tuple[MetaStrategyRegistryEntry, ...],
+    *,
+    settings: MetaStrategySettings | None = None,
 ) -> tuple[SnapshotEvaluationResult, ...]:
-    return tuple(_instantiate(entry).evaluate(snapshot) for entry in entries)
+    active_settings = settings or build_meta_strategy_settings(
+        settings_version=snapshot.settings_version,
+        status="ACTIVE",
+    )
+    return tuple(instantiate_meta_strategy(entry, active_settings).evaluate(snapshot) for entry in entries)
+
+
+def instantiate_meta_strategy(entry: MetaStrategyRegistryEntry, settings: MetaStrategySettings | None = None):
+    active_settings = settings or build_meta_strategy_settings(status="ACTIVE")
+    module = importlib.import_module(entry.implementation_module)
+    strategy_class = getattr(module, entry.implementation_class)
+    if str(entry.role) == "DIRECTIONAL":
+        strategy_settings = active_settings.directional_strategies[entry.strategy_id]
+    elif str(entry.role) == "CONTEXT":
+        strategy_settings = active_settings.context_strategies[entry.strategy_id]
+    elif str(entry.role) == "REGIME":
+        strategy_settings = active_settings.regime_classification[entry.strategy_id]
+    else:
+        strategy_settings = active_settings.safety_gates[entry.strategy_id]
+    return strategy_class(
+        strategy_settings,
+        settings_version=active_settings.settings_version,
+        effective_settings_hash=active_settings.effective_settings_hash,
+    )
 
 
 def _instantiate(entry: MetaStrategyRegistryEntry):
-    module = importlib.import_module(entry.implementation_module)
-    return getattr(module, entry.implementation_class)()
+    return instantiate_meta_strategy(entry)
+
+
+def _candidate_generation_config(settings: MetaStrategySettings) -> CandidateGenerationConfig:
+    aggregation = settings.candidate_aggregation
+    correlation = settings.correlation_controls
+    return CandidateGenerationConfig(
+        aggregation=FamilyAggregationConfig(
+            strategy_contribution_cap=correlation.strategy_contribution_cap,
+            family_contribution_cap=correlation.family_contribution_cap,
+            correlation_group_cap=correlation.correlation_group_cap,
+            minimum_active_strategies=aggregation.minimum_active_strategies,
+            minimum_independent_families=aggregation.minimum_independent_families,
+            maximum_abstention_rate=aggregation.maximum_abstention_rate,
+            minimum_conflict_edge=aggregation.minimum_conflict_edge,
+        ),
+        block_new_entries_on_safety_failure=aggregation.block_new_entries_on_safety_failure,
+    )
 
 
 def _directional_contributions(
@@ -169,6 +221,8 @@ def _directional_contributions(
     contributions: list[StrategyContribution] = []
     for output in outputs:
         entry = by_id[output.strategy_id]
+        if entry not in ACTIVE_DIRECTIONAL_STRATEGIES:
+            continue
         family = str(entry.family)
         weight = round(context_multiplier * regime_fit.get(family, 1.0), 6)
         contributions.append(
@@ -181,6 +235,7 @@ def _directional_contributions(
                 weight=weight,
                 canonical_influence_id=entry.canonical_influence_id,
                 correlation_key=_correlation_key(entry),
+                orderable=True,
             )
         )
     return tuple(contributions)
@@ -207,7 +262,7 @@ def _regime_family_fit(outputs: tuple[SnapshotEvaluationResult, ...]) -> dict[st
 
 
 def _correlation_key(entry: MetaStrategyRegistryEntry) -> str:
-    return f"{entry.family}:{entry.strategy_id}"
+    return entry.correlation_group
 
 
 def _family_alignment(aggregation: FamilyAggregationResult) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -276,4 +331,5 @@ __all__ = [
     "GeneratedDeterministicCandidate",
     "evaluate_registry_group",
     "generate_deterministic_candidate",
+    "instantiate_meta_strategy",
 ]

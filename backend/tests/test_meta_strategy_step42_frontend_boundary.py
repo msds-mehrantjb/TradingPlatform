@@ -37,6 +37,7 @@ ALLOWED_META_STRATEGY_PRESENTATION_ROUTES = {
     "/api/meta-strategy/paper/evaluate",
     "/api/meta-strategy/artifacts/status",
     "/api/meta-strategy/backtests/run",
+    "/api/meta-strategy/models/active",
     "/api/meta-strategy/diagnostics",
     "/api/meta-strategy/final-acceptance",
 }
@@ -59,7 +60,7 @@ class MetaStrategyStep42FrontendBoundaryTest(unittest.TestCase):
         source = FRONTEND_MAIN.read_text(encoding="utf-8")
 
         self.assertIn("state.currentMetaTargetOrder = null", source)
-        self.assertIn("/api/meta-strategy/status", source)
+        self.assertIn("/api/meta-strategy/models/active", source)
         self.assertIn("Backend Meta-Strategy service is authoritative", source)
 
     def test_frontend_meta_strategy_api_usage_is_presentation_only(self) -> None:

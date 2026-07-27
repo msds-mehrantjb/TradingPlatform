@@ -7,7 +7,7 @@
     "marketDataFeed": "deterministic_synthetic",
     "requiresLiveFeed": false
   },
-  "featureSchemaHash": "988c0cfe6ab86361",
+  "featureSchemaHash": "04c43017715a2e83",
   "fixtures": [
     {
       "candidateGeometry": {
@@ -202,12 +202,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "798a2803bb64234d",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 16,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "BUY",
@@ -477,12 +477,12 @@
           "sellScore": 0.6192
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "2466c1efde96ef64",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 18,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "SELL",
@@ -751,12 +751,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "ca610c534fc239b2",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 22,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "HOLD",
@@ -1020,12 +1020,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "5266e9f49f3b1c1e",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 23,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "HOLD",
@@ -1297,12 +1297,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "376881f996d2d4ae",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 18,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "BUY",
@@ -1572,12 +1572,12 @@
           "sellScore": 0.49
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "c464690b8f413c1d",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 18,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "SELL",
@@ -1847,12 +1847,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "4c8756649f9debbd",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 18,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "BUY",
@@ -2122,12 +2122,12 @@
           "sellScore": 0.704
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "603722d7e1197594",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 18,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "SELL",
@@ -2396,12 +2396,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "28ed58c940a66ac8",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 22,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "HOLD",
@@ -2673,12 +2673,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "920456b72d5061c4",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 22,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "HOLD",
@@ -2951,12 +2951,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "05b89e03cddfee8c",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 18,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "BUY",
@@ -3226,12 +3226,12 @@
           "sellScore": 0.6232
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "6dd96ca3dd1b6ce9",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 18,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "SELL",
@@ -3485,12 +3485,12 @@
           "sellScore": 0.39
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "2d850c25ab30fdc9",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 24,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "HOLD",
@@ -3748,12 +3748,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "6aeaf625a1184446",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 20,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "BUY",
@@ -4009,12 +4009,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "6aeaf625a1184446",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 20,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "BUY",
@@ -4271,12 +4271,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "e260d2862305be90",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 27,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "BUY",
@@ -4525,12 +4525,12 @@
           "sellScore": 0.0
         }
       ],
-      "featureSchemaHash": "988c0cfe6ab86361",
+      "featureSchemaHash": "04c43017715a2e83",
       "featureVector": {
         "completeFeatureVectorHash": "6aeaf625a1184446",
-        "featureCount": 266,
+        "featureCount": 298,
         "missingFeatureCount": 20,
-        "schemaHash": "988c0cfe6ab86361",
+        "schemaHash": "04c43017715a2e83",
         "schemaVersion": "candidate_meta_feature_schema_v1",
         "selectedValues": {
           "candidate_side": "BUY",

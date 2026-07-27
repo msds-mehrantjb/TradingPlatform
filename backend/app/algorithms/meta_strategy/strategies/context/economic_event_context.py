@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from backend.app.algorithms.meta_strategy.contracts import MetaStrategyMarketSnapshot
+from backend.app.algorithms.meta_strategy.evaluation_context import MetaStrategyEvaluationContext, context_market_snapshot
 from backend.app.algorithms.meta_strategy.strategies.context.common import ContextSnapshotStrategy
 
 
@@ -12,12 +13,19 @@ class EconomicEventContextStrategy(ContextSnapshotStrategy):
     strategy_id = "economic_event_context"
     required_inputs = ("economic_event_state", "session_phase", "spread")
 
-    def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
-        state = str(snapshot.economic_event_state.get("state") or "none").lower()
-        severity = str(snapshot.economic_event_state.get("severity") or "none").lower()
-        minutes_to_event = snapshot.economic_event_state.get("minutesToEvent")
+    def evidence(self, value: MetaStrategyMarketSnapshot | MetaStrategyEvaluationContext) -> dict[str, Any]:
+        snapshot = context_market_snapshot(value)
+        if isinstance(value, MetaStrategyEvaluationContext):
+            state = value.economic_event_snapshot.state.lower()
+            severity = value.economic_event_snapshot.severity.lower()
+            minutes_to_event = value.economic_event_snapshot.minutes_to_event
+            active = value.economic_event_snapshot.active
+        else:
+            state = str(snapshot.economic_event_state.get("state") or "none").lower()
+            severity = str(snapshot.economic_event_state.get("severity") or "none").lower()
+            minutes_to_event = snapshot.economic_event_state.get("minutesToEvent")
+            active = bool(snapshot.economic_event_state.get("active") or state in {"active", "blocked", "halt"})
         spread_bps = float(snapshot.spread.get("basisPoints") or snapshot.spread_bps or 0.0)
-        active = bool(snapshot.economic_event_state.get("active") or state in {"active", "blocked", "halt"})
         return {
             "eventState": state,
             "eventSeverity": severity,

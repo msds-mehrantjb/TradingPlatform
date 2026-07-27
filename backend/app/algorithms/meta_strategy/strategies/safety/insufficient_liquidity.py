@@ -5,15 +5,16 @@ from __future__ import annotations
 from typing import Any
 
 from backend.app.algorithms.meta_strategy.contracts import MetaStrategyMarketSnapshot
+from backend.app.algorithms.meta_strategy.evaluation_context import MetaStrategyEvaluationContext, context_market_snapshot
 from backend.app.algorithms.meta_strategy.strategies.safety.common import SafetySnapshotStrategy, block_evidence, liquidity_score, missing_required_evidence, pass_evidence
 
 
 class InsufficientLiquidityFilterStrategy(SafetySnapshotStrategy):
     strategy_id = "insufficient_liquidity_filter"
     required_inputs = ("liquidity",)
-    min_liquidity_score = 0.35
 
-    def safety_evidence(self, snapshot: MetaStrategyMarketSnapshot, required_status: dict[str, bool]) -> dict[str, Any]:
+    def safety_evidence(self, value: MetaStrategyMarketSnapshot | MetaStrategyEvaluationContext, required_status: dict[str, bool]) -> dict[str, Any]:
+        snapshot = context_market_snapshot(value)
         if not all(required_status.values()):
             return missing_required_evidence(self.strategy_id, required_status)
         score = float(liquidity_score(snapshot) or 0.0)
