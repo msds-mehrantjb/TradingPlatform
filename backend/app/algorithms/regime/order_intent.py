@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 
-from backend.app.algorithms.regime.contracts import REGIME_ALGORITHM_ID, REGIME_ALGORITHM_VERSION, REGIME_SETTINGS_VERSION, RegimeDecision, RegimeOrderIntent, RegimeSizingResult
+from backend.app.algorithms.regime.contracts import REGIME_ALGORITHM_ID, REGIME_ALGORITHM_VERSION, RegimeDecision, RegimeOrderIntent, RegimeSizingResult
 
 
 def build_regime_order_intent(decision: RegimeDecision, sizing: RegimeSizingResult) -> RegimeOrderIntent | None:
@@ -16,7 +16,7 @@ def build_regime_order_intent(decision: RegimeDecision, sizing: RegimeSizingResu
     return RegimeOrderIntent(
         algorithm_id=REGIME_ALGORITHM_ID,
         algorithm_version=REGIME_ALGORITHM_VERSION,
-        settings_version=REGIME_SETTINGS_VERSION,
+        settings_version=decision.settings_version,
         decision_id=decision.decision_id,
         order_intent_id="regime-intent-" + sha256(key.encode("utf-8")).hexdigest()[:16],
         symbol=decision.symbol,
@@ -30,4 +30,3 @@ def build_regime_order_intent(decision: RegimeDecision, sizing: RegimeSizingResu
         regime=decision.confirmed_state.confirmed_regime,
         confidence=decision.confidence,
     )
-

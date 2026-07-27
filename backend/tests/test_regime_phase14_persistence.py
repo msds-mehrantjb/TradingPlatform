@@ -20,33 +20,60 @@ from backend.app.main import app
 
 REQUIRED_COLUMNS = {
     "algorithm_id",
+    "algorithm_instance_id",
+    "account_id",
+    "runtime_mode",
     "algorithm_version",
     "settings_version",
     "strategy_version",
     "profile_version",
     "model_version",
     "timestamp",
+    "event_timestamp",
     "symbol",
     "data_timestamp",
     "decision_id",
     "order_id",
     "order_intent_id",
+    "broker_order_id",
     "position_id",
     "trade_id",
+    "processing_status",
+    "sequence_version",
 }
 
 EXPECTED_REGIME_OWNED_TABLES = (
+    "regime_settings_versions",
+    "regime_active_settings",
+    "regime_strategy_settings",
+    "regime_runtime_instances",
+    "regime_runtime_commands",
+    "regime_runtime_events",
+    "regime_runtime_checkpoints",
+    "regime_hysteresis_state",
+    "regime_daily_counters",
+    "regime_strategy_performance",
     "regime_decisions",
     "regime_classifications",
     "regime_transitions",
     "regime_strategy_outputs",
     "regime_context_outputs",
+    "regime_confirmation_outputs",
     "regime_safety_results",
     "regime_family_scores",
     "regime_effective_profiles",
+    "regime_local_risk_results",
     "regime_order_intents",
+    "regime_execution_outbox",
+    "regime_orders",
+    "regime_fills",
+    "regime_positions",
+    "regime_trades",
+    "regime_reconciliation_events",
+    "regime_backtest_jobs",
     "regime_backtest_runs",
     "regime_backtest_trades",
+    "regime_rollout_evidence",
     "regime_ml_predictions",
     "regime_ml_artifacts",
 )
@@ -70,7 +97,7 @@ class RegimePhase14PersistenceTest(unittest.TestCase):
 
         with sqlite3.connect(path) as conn:
             versions = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
-        self.assertIn("regime_persistence_phase14_002", versions)
+        self.assertIn("regime_persistence_step2_003", versions)
 
     def test_inventory_separates_regime_owned_tables_from_shared_attributed_tables(self) -> None:
         path = temp_db_path()
@@ -84,8 +111,13 @@ class RegimePhase14PersistenceTest(unittest.TestCase):
             REGIME_SHARED_ATTRIBUTION_COLUMNS,
             (
                 "algorithm_id",
+                "algorithm_instance_id",
+                "account_id",
+                "runtime_mode",
+                "symbol",
                 "decision_id",
                 "order_intent_id",
+                "broker_order_id",
                 "position_id",
                 "trade_id",
                 "settings_version",
@@ -120,7 +152,9 @@ class RegimePhase14PersistenceTest(unittest.TestCase):
         self.assertEqual(counts["regime_safety_results"], 1)
         self.assertEqual(counts["regime_family_scores"], 1)
         self.assertEqual(counts["regime_effective_profiles"], 1)
+        self.assertEqual(counts["regime_local_risk_results"], 1)
         self.assertEqual(counts["regime_order_intents"], 1)
+        self.assertEqual(counts["regime_execution_outbox"], 1)
         self.assertEqual(counts["regime_ml_predictions"], 1)
 
         with sqlite3.connect(path) as conn:
@@ -138,6 +172,7 @@ class RegimePhase14PersistenceTest(unittest.TestCase):
         self.assertTrue(result["recorded"])
         self.assertEqual(result["tradeCount"], 1)
         counts = repository.table_counts()
+        self.assertEqual(counts["regime_backtest_jobs"], 1)
         self.assertEqual(counts["regime_backtest_runs"], 1)
         self.assertEqual(counts["regime_backtest_trades"], 1)
 
@@ -161,6 +196,9 @@ def sample_snapshot() -> dict:
         "apiSecret": "top-secret",
         "regime": {
             "algorithmId": "regime",
+            "algorithmInstanceId": "regime-default",
+            "accountId": "paper-account",
+            "runtimeMode": "paper",
             "algorithmVersion": "regime_algorithm_v2",
             "settingsVersion": "regime_base_settings_v1",
             "strategyVersion": "regime_strategy_catalog_v2",
@@ -182,6 +220,7 @@ def sample_snapshot() -> dict:
             "safetyResults": [{"strategyId": "stale_data", "passed": True}],
             "familyAggregation": [{"family": "trend", "buyScore": 0.2}],
             "effectiveSettings": {"profileId": "strong_uptrend:regime_profile_matrix_v1"},
+            "localRiskResult": {"localRiskResultId": "regime-local-risk-1", "passed": True, "reasonCodes": []},
             "ml": {"prediction": {"probabilityVector": {"strong_uptrend": 0.72}}},
             "orderIntent": {
                 "decisionId": "regime:SPY:2026-01-05T15:30:00.000Z",

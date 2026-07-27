@@ -46,11 +46,22 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
             "local_gates.py",
             "dynamic_profile.py",
             "sizing.py",
+            "position_manager.py",
             "trade_management.py",
             "exits.py",
             "order_intent.py",
             "order_validation.py",
+            "execution_gateway.py",
+            "runtime_state.py",
+            "stateful_core.py",
             "execution_pipeline.py",
+            "runtime.py",
+            "runtime_supervisor.py",
+            "runtime_events.py",
+            "runtime_idempotency.py",
+            "runtime_workers.py",
+            "runtime_commands.py",
+            "runtime_health.py",
             "service.py",
             "repository.py",
             "global_risk_adapter.py",
@@ -66,9 +77,16 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
         self.assertEqual(inventory["files"], expected)
         self.assertEqual(inventory["authoritativeRuntime"], "backend.app.algorithms.regime.execution_pipeline")
         self.assertEqual(inventory["authoritativeBacktestEngine"], "backend.app.algorithms.regime.backtest.engine")
-        self.assertEqual(inventory["frontendRole"], "API client and presentation only")
+        self.assertEqual(inventory["frontendRole"], "API client, settings editor, status display, diagnostics display, and backtest-job display")
+        self.assertEqual(inventory["productionDecisionCore"], "backend.app.algorithms.regime.execution_pipeline.execute_regime_pipeline")
+        self.assertEqual(inventory["productionStateTransitionCore"], "backend.app.algorithms.regime.stateful_core.process_completed_bar")
+        self.assertEqual(inventory["productionBacktestCore"], "backend.app.algorithms.regime.backtest.engine.run_regime_backtest")
+        self.assertEqual(inventory["backgroundRuntime"], "backend.app.algorithms.regime.runtime_supervisor.RegimeRuntimeSupervisor")
+        self.assertEqual(inventory["legacyJobManager"], "backend.app.algorithms.regime.runtime.RegimeBackgroundJobManager")
+        self.assertFalse(inventory["apiHandlersExecuteHeavyWorkInline"])
         self.assertIn("classifier", inventory["pipeline"])
         self.assertTrue(inventory["apiTransportOnly"])
+        self.assertEqual(inventory["apiResponsibilities"], ("transport", "control", "status", "job_management"))
         for file_name in expected:
             self.assertTrue((ROOT / "backend" / "app" / "algorithms" / "regime" / file_name).exists(), file_name)
 

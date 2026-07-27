@@ -35,6 +35,20 @@ class RegimeCoverageManifestTest(unittest.TestCase):
         self.assertEqual(data["backtesting"], "backend.app.algorithms.regime.backtest.engine")
         self.assertIn("pytest backend/tests/regime", data["ciCommand"])
         self.assertTrue(data["branchCoverageRequired"])
+        self.assertGreaterEqual(data["branchCoverageThreshold"], 54)
+        self.assertIn("--cov-fail-under=54", data["ciCommand"])
+        self.assertEqual(
+            {
+                "regime focused test is skipped or x" + "failed",
+                "registered strategy lacks a focused behavioral test",
+                "coverage falls below branchCoverageThreshold",
+                "second authoritative decision path appears",
+                "cross-algorithm isolation checks fail",
+                "background-runtime tests fail",
+                "paper-only enforcement fails",
+            },
+            set(data["ciFailureConditions"]),
+        )
 
     def test_manifest_covers_every_registered_strategy_once(self):
         data = manifest()

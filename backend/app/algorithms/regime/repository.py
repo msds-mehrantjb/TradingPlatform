@@ -32,6 +32,15 @@ def regime_repository_inventory() -> dict[str, Any]:
         "sharedAttributedTables": REGIME_SHARED_ATTRIBUTED_TABLES,
         "allTables": REGIME_PERSISTENCE_TABLES,
         "sharedTablesAreInfrastructureOnly": True,
+        "sharedInfrastructureIsAttributionOnly": True,
+        "authoritativeOrderFillPositionTradeInventory": (
+            "regime_orders",
+            "regime_fills",
+            "regime_positions",
+            "regime_trades",
+        ),
+        "ownershipKey": ("algorithm_id", "algorithm_instance_id", "account_id", "runtime_mode", "symbol"),
+        "optimisticLockingColumn": "sequence_version",
     }
 
 

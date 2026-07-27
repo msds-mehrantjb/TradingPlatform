@@ -45,7 +45,9 @@ class ClassificationConfidenceTest(unittest.TestCase):
         self.assertIn("volatilityConfidence", confidence)
         self.assertIn("structureConfidence", confidence)
         self.assertIn("liquidityConfidence", confidence)
+        self.assertIn("sessionConfidence", confidence)
         self.assertIn("eventConfidence", confidence)
+        self.assertIn("dataQualityConfidence", confidence)
         self.assertIn("compositeConfidence", confidence)
         self.assertEqual(classification.confidence, confidence["compositeConfidence"])
         self.assertEqual(classification.features["compositeConfidence"], confidence["compositeConfidence"])
@@ -66,7 +68,8 @@ class ClassificationConfidenceTest(unittest.TestCase):
 
         self.assertEqual(classification.raw_regime, "liquidity_stress")
         self.assertEqual(confidence["liquidityConfidence"], 0.25)
-        self.assertEqual(confidence["compositeConfidence"], 0.25)
+        self.assertEqual(confidence["dataQualityConfidence"], 0.10)
+        self.assertEqual(confidence["compositeConfidence"], 0.10)
         self.assertGreater(confidence["safetyBlockConfidence"], confidence["compositeConfidence"])
         self.assertIn("regime.safety.liquidity_fail_closed", classification.no_trade_reasons)
 

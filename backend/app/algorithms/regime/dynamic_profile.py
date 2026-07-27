@@ -6,6 +6,7 @@ from copy import deepcopy
 
 
 PROFILE_VERSION = "regime_profile_matrix_v3_backend"
+PROFILE_FAMILY_SET = ("trend", "momentum", "breakout", "mean_reversion", "vwap", "reversal", "structure", "event")
 
 
 NO_ENTRY_PROFILE = {
@@ -26,6 +27,13 @@ NO_ENTRY_PROFILE = {
     "baseRiskPercent": 0.0,
     "maxPositionPercent": 0.0,
     "maxParticipationPercent": 0.0,
+    "riskMultiplier": 0.0,
+    "maximumPositionMultiplier": 0.0,
+    "maximumHoldingBars": 0,
+    "cooldownBars": 999,
+    "slippageAllowanceBps": 0.0,
+    "minimumEdge": 1.0,
+    "minimumSignalScore": 1.0,
 }
 
 
@@ -39,6 +47,16 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "stopGeometry": "atr_trailing_or_structure_swing",
         "targetGeometry": "runner_with_trailing_exit",
         "maximumHoldingMinutes": 45,
+        "maximumHoldingBars": 45,
+        "riskMultiplier": 1.0,
+        "maximumPositionMultiplier": 1.0,
+        "minimumSignalScore": 0.60,
+        "minimumEdge": 0.20,
+        "stopMultiplier": 2.0,
+        "targetMultiple": 1.5,
+        "cooldownBars": 5,
+        "entryWindowEt": ("09:35", "15:30"),
+        "slippageAllowanceBps": 8.0,
         "trailingExitsEnabled": True,
         "pyramidingEnabled": True,
         "profileReason": "regime.profile.strong_trend_pullback_continuation",
@@ -52,6 +70,16 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "stopGeometry": "atr_trailing_or_structure_swing",
         "targetGeometry": "runner_with_trailing_exit",
         "maximumHoldingMinutes": 45,
+        "maximumHoldingBars": 45,
+        "riskMultiplier": 1.0,
+        "maximumPositionMultiplier": 1.0,
+        "minimumSignalScore": 0.60,
+        "minimumEdge": 0.20,
+        "stopMultiplier": 2.0,
+        "targetMultiple": 1.5,
+        "cooldownBars": 5,
+        "entryWindowEt": ("09:35", "15:30"),
+        "slippageAllowanceBps": 8.0,
         "trailingExitsEnabled": True,
         "pyramidingEnabled": True,
         "profileReason": "regime.profile.strong_trend_pullback_continuation",
@@ -69,6 +97,16 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "stopGeometry": "structure_or_atr",
         "targetGeometry": "measured_move",
         "maximumHoldingMinutes": 25,
+        "maximumHoldingBars": 25,
+        "riskMultiplier": 0.75,
+        "maximumPositionMultiplier": 0.75,
+        "minimumSignalScore": 0.70,
+        "minimumEdge": 0.24,
+        "stopMultiplier": 2.0,
+        "targetMultiple": 1.35,
+        "cooldownBars": 6,
+        "entryWindowEt": ("09:45", "15:15"),
+        "slippageAllowanceBps": 6.0,
         "pyramidingEnabled": False,
         "profileReason": "regime.profile.weak_trend_stricter_confirmation",
     },
@@ -85,6 +123,16 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "stopGeometry": "structure_or_atr",
         "targetGeometry": "measured_move",
         "maximumHoldingMinutes": 25,
+        "maximumHoldingBars": 25,
+        "riskMultiplier": 0.75,
+        "maximumPositionMultiplier": 0.75,
+        "minimumSignalScore": 0.70,
+        "minimumEdge": 0.24,
+        "stopMultiplier": 2.0,
+        "targetMultiple": 1.35,
+        "cooldownBars": 6,
+        "entryWindowEt": ("09:45", "15:15"),
+        "slippageAllowanceBps": 6.0,
         "pyramidingEnabled": False,
         "profileReason": "regime.profile.weak_trend_stricter_confirmation",
     },
@@ -102,6 +150,16 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "targetGeometry": "opposite_range_or_vwap",
         "takeProfitRCap": 1.10,
         "maximumHoldingMinutes": 18,
+        "maximumHoldingBars": 18,
+        "riskMultiplier": 0.65,
+        "maximumPositionMultiplier": 0.65,
+        "minimumSignalScore": 0.68,
+        "minimumEdge": 0.22,
+        "stopMultiplier": 1.7,
+        "targetMultiple": 1.10,
+        "cooldownBars": 7,
+        "entryWindowEt": ("10:00", "15:00"),
+        "slippageAllowanceBps": 5.0,
         "pyramidingEnabled": False,
         "profileReason": "regime.profile.range_mean_reversion_no_breakout_chasing",
     },
@@ -112,7 +170,7 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "preferredStrategyFamilies": ("breakout", "momentum", "structure"),
         "allowedStrategyFamilies": ("breakout", "momentum", "trend", "vwap", "structure"),
         "minimumWinningScore": 0.72,
-        "minimumIndependentFamilies": 3,
+        "minimumIndependentFamilies": 2,
         "minimumNetExpectedEdge": 0.32,
         "maxSpreadPercentCap": 0.0015,
         "maximumSlippageBps": 8.0,
@@ -122,6 +180,16 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "stopGeometry": "opening_range_retest_failure",
         "targetGeometry": "opening_range_measured_move",
         "maximumHoldingMinutes": 12,
+        "maximumHoldingBars": 12,
+        "riskMultiplier": 0.70,
+        "maximumPositionMultiplier": 0.70,
+        "minimumSignalScore": 0.72,
+        "minimumEdge": 0.28,
+        "stopMultiplier": 2.2,
+        "targetMultiple": 1.4,
+        "cooldownBars": 8,
+        "entryWindowEt": ("09:31", "10:15"),
+        "slippageAllowanceBps": 8.0,
         "pyramidingEnabled": False,
         "profileReason": "regime.profile.opening_breakout_short_validity_strict_execution",
     },
@@ -139,6 +207,16 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "stopGeometry": "wide_atr_with_structure_anchor",
         "targetGeometry": "expansion_continuation",
         "maximumHoldingMinutes": 25,
+        "maximumHoldingBars": 25,
+        "riskMultiplier": 0.65,
+        "maximumPositionMultiplier": 0.70,
+        "minimumSignalScore": 0.72,
+        "minimumEdge": 0.30,
+        "stopMultiplier": 2.5,
+        "targetMultiple": 1.45,
+        "cooldownBars": 8,
+        "entryWindowEt": ("10:00", "15:15"),
+        "slippageAllowanceBps": 8.0,
         "pyramidingEnabled": False,
         "profileReason": "regime.profile.intraday_expansion_reduced_size_higher_edge",
     },
@@ -155,6 +233,16 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "stopGeometry": "wide_atr_trailing",
         "targetGeometry": "trend_runner",
         "maximumHoldingMinutes": 30,
+        "maximumHoldingBars": 30,
+        "riskMultiplier": 0.60,
+        "maximumPositionMultiplier": 0.65,
+        "minimumSignalScore": 0.70,
+        "minimumEdge": 0.28,
+        "stopMultiplier": 2.5,
+        "targetMultiple": 1.35,
+        "cooldownBars": 10,
+        "entryWindowEt": ("09:45", "15:00"),
+        "slippageAllowanceBps": 8.0,
         "pyramidingEnabled": False,
         "profileReason": "regime.profile.high_volatility_defensive_reduction",
     },
@@ -190,6 +278,16 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "targetGeometry": "small_mean_reversion",
         "takeProfitRCap": 1.15,
         "maximumHoldingMinutes": 15,
+        "maximumHoldingBars": 15,
+        "riskMultiplier": 0.50,
+        "maximumPositionMultiplier": 0.55,
+        "minimumSignalScore": 0.70,
+        "minimumEdge": 0.30,
+        "stopMultiplier": 1.6,
+        "targetMultiple": 1.15,
+        "cooldownBars": 9,
+        "entryWindowEt": ("10:00", "14:45"),
+        "slippageAllowanceBps": 4.0,
         "pyramidingEnabled": False,
         "profileReason": "regime.profile.quiet_market_cost_edge_filter",
     },
@@ -205,6 +303,16 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "stopGeometry": "failed_acceptance_reference_level",
         "targetGeometry": "return_to_value_or_opposite_level",
         "maximumHoldingMinutes": 20,
+        "maximumHoldingBars": 20,
+        "riskMultiplier": 0.55,
+        "maximumPositionMultiplier": 0.60,
+        "minimumSignalScore": 0.72,
+        "minimumEdge": 0.28,
+        "stopMultiplier": 1.9,
+        "targetMultiple": 1.25,
+        "cooldownBars": 8,
+        "entryWindowEt": ("10:00", "15:00"),
+        "slippageAllowanceBps": 6.0,
         "pyramidingEnabled": False,
         "profileReason": "regime.profile.failed_breakout_reversal_confirmation",
     },
@@ -220,6 +328,16 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         "stopGeometry": "gap_extreme_invalidated",
         "targetGeometry": "gap_continuation_or_fade",
         "maximumHoldingMinutes": 18,
+        "maximumHoldingBars": 18,
+        "riskMultiplier": 0.50,
+        "maximumPositionMultiplier": 0.55,
+        "minimumSignalScore": 0.72,
+        "minimumEdge": 0.30,
+        "stopMultiplier": 2.0,
+        "targetMultiple": 1.20,
+        "cooldownBars": 10,
+        "entryWindowEt": ("09:35", "10:30"),
+        "slippageAllowanceBps": 6.0,
         "pyramidingEnabled": False,
         "profileReason": "regime.profile.gap_session_strict_confirmation",
     },
@@ -232,8 +350,15 @@ def resolve_effective_regime_profile(settings: dict, confirmed_regime: str) -> d
     reasons = [str(policy.get("profileReason") or "regime.profile.default")]
     _apply_profile_policy(effective, settings, policy)
     effective["profileId"] = f"{confirmed_regime}:{PROFILE_VERSION}"
+    effective["baselineSettingsVersion"] = str(settings.get("settingsVersion") or "regime_base_settings")
+    effective["baselineProfileVersion"] = str(settings.get("profileVersion") or PROFILE_VERSION)
+    effective["profileVersion"] = PROFILE_VERSION
     effective["profileReasons"] = reasons
+    effective["overlayReasons"] = tuple(reasons)
     effective["profilePolicy"] = _public_policy(policy)
+    effective["finalValues"] = _final_values(effective)
+    effective["riskOffPositionManagementAllowed"] = True
+    _assert_profile_bounds(settings, effective)
     return effective
 
 
@@ -242,12 +367,22 @@ def _policy_for_regime(regime: str) -> dict:
     if policy is None:
         return {
             "preferredStrategyFamilies": (),
-            "allowedStrategyFamilies": (),
+            "allowedStrategyFamilies": PROFILE_FAMILY_SET,
             "orderType": "limit",
             "entryTimeoutSeconds": 45,
             "stopGeometry": "default_atr",
             "targetGeometry": "default_reward_risk",
             "maximumHoldingMinutes": 20,
+            "maximumHoldingBars": 20,
+            "riskMultiplier": 1.0,
+            "maximumPositionMultiplier": 1.0,
+            "minimumSignalScore": 0.60,
+            "minimumEdge": 0.20,
+            "stopMultiplier": 2.0,
+            "targetMultiple": 1.5,
+            "cooldownBars": 5,
+            "entryWindowEt": ("09:35", "15:30"),
+            "slippageAllowanceBps": 8.0,
             "profileReason": "regime.profile.default_bounded",
         }
     alias = policy.get("aliasOf")
@@ -257,16 +392,22 @@ def _policy_for_regime(regime: str) -> dict:
 
 
 def _apply_profile_policy(effective: dict, settings: dict, policy: dict) -> None:
+    risk_multiplier = max(0.0, min(1.0, float(policy.get("riskMultiplier", 1.0))))
+    position_multiplier = max(0.0, min(1.0, float(policy.get("maximumPositionMultiplier", 1.0))))
     if policy.get("noNewEntries"):
         effective["baseRiskPercent"] = 0.0
         effective["maxPositionPercent"] = 0.0
         effective["maxParticipationPercent"] = 0.0
     else:
+        effective["baseRiskPercent"] = min(float(effective["baseRiskPercent"]), float(settings["baseRiskPercent"]) * risk_multiplier)
+        effective["maxPositionPercent"] = min(float(effective["maxPositionPercent"]), float(settings["maxPositionPercent"]) * position_multiplier)
         _cap_float(effective, settings, "baseRiskPercent", policy.get("baseRiskPercentCap"))
         _cap_float(effective, settings, "maxPositionPercent", policy.get("maxPositionPercentCap"))
         _cap_float(effective, settings, "maxParticipationPercent", policy.get("maxParticipationPercentCap"))
-    _floor_float(effective, settings, "minimumWinningScore", policy.get("minimumWinningScore"))
-    _floor_float(effective, settings, "minimumSignalEdge", policy.get("minimumSignalEdge"))
+    effective["riskMultiplier"] = risk_multiplier
+    effective["maximumPositionMultiplier"] = position_multiplier
+    _floor_float(effective, settings, "minimumWinningScore", policy.get("minimumSignalScore", policy.get("minimumWinningScore")))
+    _floor_float(effective, settings, "minimumSignalEdge", policy.get("minimumEdge", policy.get("minimumSignalEdge")))
     effective["minimumNetExpectedEdge"] = max(
         float(settings.get("minimumNetExpectedEdge", settings.get("minimumSignalEdge", 0.0))),
         float(policy.get("minimumNetExpectedEdge", settings.get("minimumSignalEdge", 0.0))),
@@ -274,8 +415,8 @@ def _apply_profile_policy(effective: dict, settings: dict, policy: dict) -> None
     if policy.get("minimumIndependentFamilies") is not None:
         effective["minimumIndependentFamilies"] = max(int(settings["minimumIndependentFamilies"]), int(policy["minimumIndependentFamilies"]))
     _cap_float(effective, settings, "maxSpreadPercent", policy.get("maxSpreadPercentCap"))
-    _floor_float(effective, settings, "atrStopMultiplier", policy.get("atrStopMultiplierMin"))
-    _cap_float(effective, settings, "takeProfitR", policy.get("takeProfitRCap"))
+    _floor_float(effective, settings, "atrStopMultiplier", policy.get("stopMultiplier", policy.get("atrStopMultiplierMin")))
+    _cap_float(effective, settings, "takeProfitR", policy.get("targetMultiple", policy.get("takeProfitRCap")))
     effective["noNewEntries"] = bool(policy.get("noNewEntries", False))
     effective["preferredStrategyFamilies"] = tuple(policy.get("preferredStrategyFamilies", ()))
     effective["allowedStrategyFamilies"] = tuple(policy.get("allowedStrategyFamilies", ()))
@@ -285,11 +426,16 @@ def _apply_profile_policy(effective: dict, settings: dict, policy: dict) -> None
     effective["entryTimeoutSeconds"] = max(0, int(policy.get("entryTimeoutSeconds", 45)))
     effective["validityWindowSeconds"] = max(0, int(policy.get("validityWindowSeconds", 0)))
     effective["maximumHoldingMinutes"] = max(0, int(policy.get("maximumHoldingMinutes", 20)))
+    effective["maximumHoldingBars"] = max(0, int(policy.get("maximumHoldingBars", effective.get("maxHoldingBars", 20))))
+    effective["maxHoldingBars"] = min(int(settings.get("maxHoldingBars", effective["maximumHoldingBars"])), effective["maximumHoldingBars"]) if effective["maximumHoldingBars"] else 0
+    effective["cooldownBars"] = max(int(settings.get("cooldownBars", 0)), int(policy.get("cooldownBars", settings.get("cooldownBars", 0))))
+    effective["entryWindowEt"] = tuple(policy.get("entryWindowEt", ("09:35", settings.get("entryCutoffTimeEt", "15:30"))))
     effective["stopGeometry"] = str(policy.get("stopGeometry") or "default_atr")
     effective["targetGeometry"] = str(policy.get("targetGeometry") or "default_reward_risk")
     effective["trailingExitsEnabled"] = bool(policy.get("trailingExitsEnabled", False))
     effective["pyramidingEnabled"] = bool(effective.get("pyramidingEnabled", False) and policy.get("pyramidingEnabled", effective.get("pyramidingEnabled", False)))
-    effective["maximumSlippageBps"] = float(policy.get("maximumSlippageBps", effective.get("maximumSlippageBps", 12.0)))
+    effective["maximumSlippageBps"] = min(float(settings.get("maximumSlippageBps", 0.0)), float(policy.get("slippageAllowanceBps", policy.get("maximumSlippageBps", settings.get("maximumSlippageBps", 0.0)))))
+    effective["slippageAllowanceBps"] = effective["maximumSlippageBps"]
     effective["maxExecutionCostToEdgeRatio"] = float(policy.get("maxExecutionCostToEdgeRatio", effective.get("maxExecutionCostToEdgeRatio", 0.35)))
     if policy.get("eventBlackoutBeforeMinutes") is not None:
         effective["eventBlackoutBeforeMinutes"] = int(policy["eventBlackoutBeforeMinutes"])
@@ -316,3 +462,35 @@ def _public_policy(policy: dict) -> dict:
         if key not in {"profileReason", "aliasOf"}
     }
     return deepcopy(public)
+
+
+def _final_values(effective: dict) -> dict:
+    keys = (
+        "noNewEntries",
+        "allowedStrategyFamilies",
+        "preferredStrategyFamilies",
+        "disabledStrategyFamilies",
+        "riskMultiplier",
+        "maximumPositionMultiplier",
+        "baseRiskPercent",
+        "maxPositionPercent",
+        "maxParticipationPercent",
+        "minimumWinningScore",
+        "minimumSignalEdge",
+        "minimumNetExpectedEdge",
+        "atrStopMultiplier",
+        "takeProfitR",
+        "maximumHoldingBars",
+        "cooldownBars",
+        "entryWindowEt",
+        "maximumSlippageBps",
+    )
+    return {key: deepcopy(effective.get(key)) for key in keys}
+
+
+def _assert_profile_bounds(settings: dict, effective: dict) -> None:
+    for key in ("baseRiskPercent", "maxPositionPercent", "maxParticipationPercent", "maximumSlippageBps"):
+        if float(effective.get(key, 0.0)) > float(settings.get(key, 0.0)):
+            raise ValueError(f"Regime dynamic profile exceeded baseline {key}")
+    if bool(effective.get("pyramidingEnabled")) and not bool(settings.get("pyramidingEnabled")):
+        raise ValueError("Regime dynamic profile cannot enable pyramiding beyond baseline")

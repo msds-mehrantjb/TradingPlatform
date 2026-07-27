@@ -88,6 +88,7 @@ def build_regime_context_feeds(raw: dict[str, Any] | None) -> dict[str, Any]:
             or source.get("structure_levels")
             or source.get("levels")
         ),
+        "previousRegularClose": _number(_first(source, "previousRegularClose", "previous_regular_close", "previousClose", "previous_close")),
         "intradayVolatilityBaseline": adapt_intraday_volatility_baseline(
             source.get("intradayVolatilityBaseline")
             or source.get("intraday_volatility_baseline")

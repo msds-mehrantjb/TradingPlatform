@@ -19,8 +19,13 @@ class RegimePhase13BacktestApiTest(unittest.TestCase):
         self.assertEqual(payload["status"], "backend_runtime_available")
         self.assertEqual(payload["authoritativeRuntime"], "backend.app.algorithms.regime.execution_pipeline")
         self.assertEqual(payload["authoritativeEngine"], "backend.app.algorithms.regime.backtest.engine")
+        self.assertEqual(payload["productionDecisionCore"], "backend.app.algorithms.regime.execution_pipeline.execute_regime_pipeline")
+        self.assertEqual(payload["productionBacktestCore"], "backend.app.algorithms.regime.backtest.engine.run_regime_backtest")
+        self.assertEqual(payload["backgroundRuntime"], "backend.app.algorithms.regime.runtime_supervisor.RegimeRuntimeSupervisor")
+        self.assertEqual(payload["legacyJobManager"], "backend.app.algorithms.regime.runtime.RegimeBackgroundJobManager")
+        self.assertFalse(payload["apiHandlersExecuteHeavyWorkInline"])
         self.assertEqual(payload["runtimeLocation"], "backend/app/algorithms/regime")
-        self.assertEqual(payload["frontendRole"], "API client and presentation only")
+        self.assertEqual(payload["frontendRole"], "API client, settings editor, status display, diagnostics display, and backtest-job display")
         self.assertEqual(
             payload["fileInventory"],
             [
@@ -68,6 +73,8 @@ class RegimePhase13BacktestApiTest(unittest.TestCase):
         self.assertIn("/api/regime/backtests/status", paths)
         self.assertIn("/api/regime/evaluate", paths)
         self.assertIn("/api/regime/backtests/run", paths)
+        self.assertIn("/api/regime/jobs/{job_id}", paths)
+        self.assertIn("/api/regime/runtime/status", paths)
         self.assertTrue(all("/api/wca/" not in path for path in paths))
 
 

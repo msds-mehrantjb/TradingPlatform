@@ -16,7 +16,7 @@ def candles(count: int = 70, *, trend: str = "up", start: float = 100.0, volume:
         minute = index % 60
         rows.append(
             {
-                "timestamp": f"2026-07-18T{hour:02d}:{minute:02d}:00Z",
+                "timestamp": f"2026-07-23T{hour:02d}:{minute:02d}:00Z",
                 "open": price - 0.05,
                 "high": price + 0.10,
                 "low": price - 0.10,
@@ -25,4 +25,3 @@ def candles(count: int = 70, *, trend: str = "up", start: float = 100.0, volume:
             }
         )
     return rows
-

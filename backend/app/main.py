@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .alpaca import AlpacaClient, demo_bars, local_market_status
 from .algorithms.regime.api import router as regime_router
 from .algorithms.regime.api import REGIME_REPOSITORY
+from .algorithms.regime.runtime_supervisor import get_regime_runtime_supervisor
 from .algorithms.session.api import router as session_router
 from .algorithms.meta_strategy.api import router as meta_strategy_router
 from .algorithms.voting_ensemble.api import router as voting_ensemble_router
@@ -148,10 +149,12 @@ async def start_daily_backtest_refresh_scheduler() -> None:
     asyncio.create_task(end_of_day_backtest_refresh_scheduler())
     asyncio.create_task(market_forecast_ledger_scheduler())
     await get_weighted_voting_runtime_supervisor().start()
+    await get_regime_runtime_supervisor().start()
 
 
 @app.on_event("shutdown")
 async def stop_weighted_voting_runtime_supervisor() -> None:
+    await get_regime_runtime_supervisor().shutdown()
     await get_weighted_voting_runtime_supervisor().shutdown()
 
 

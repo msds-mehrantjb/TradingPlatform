@@ -60,6 +60,7 @@ QUALITY_GATES = (
             "-q",
             "--cov=backend/app/algorithms/regime",
             "--cov-branch",
+            "--cov-fail-under=54",
         ],
     ),
     QualityGate(
@@ -232,6 +233,7 @@ QUALITY_GATES = (
             "backend/tests/test_regime_phase13_backtest_api.py",
             "backend/tests/test_regime_phase14_persistence.py",
             "backend/tests/test_regime_phase17_rollout.py",
+            "backend/tests/regime/test_step10_paper_readiness_rollout.py",
             "backend/tests/test_global_account_risk_state.py",
             "backend/tests/test_global_portfolio_risk_manager_phase12.py",
             "-q",

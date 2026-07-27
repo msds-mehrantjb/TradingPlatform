@@ -6,8 +6,6 @@ from backend.app.algorithms.regime.contracts import RegimeDecision, RegimeMarket
 
 
 def calculate_regime_position_size(decision: RegimeDecision, snapshot: RegimeMarketSnapshot, account: dict | None = None) -> RegimeSizingResult:
-    if decision.signal == "Hold" or not decision.trade_allowed:
-        return RegimeSizingResult(0, 0.0, 0.0, None, None, "blocked", (), tuple(decision.trade_blockers))
     profile = decision.effective_settings
     latest_price = snapshot.latest.close
     account_snapshot = account or {}
@@ -25,6 +23,8 @@ def calculate_regime_position_size(decision: RegimeDecision, snapshot: RegimeMar
     allocation_quantity = int((buying_power * float(profile["maxPositionPercent"]) / 100) / max(latest_price, 0.01))
     liquidity_quantity = int(max(0, snapshot.latest.volume) * float(profile["maxParticipationPercent"]))
     share_limit = int(profile.get("maxAllowedShares") or 0)
+    notional_limit = float(profile.get("maxNotionalDollars") or 0)
+    notional_quantity = int(notional_limit / max(latest_price, 0.01)) if notional_limit > 0 else 0
     caps = [
         {"label": "risk", "quantity": risk_quantity},
         {"label": "allocation", "quantity": allocation_quantity},
@@ -32,8 +32,12 @@ def calculate_regime_position_size(decision: RegimeDecision, snapshot: RegimeMar
     ]
     if share_limit > 0:
         caps.append({"label": "share_limit", "quantity": share_limit})
+    if notional_quantity > 0:
+        caps.append({"label": "notional_limit", "quantity": notional_quantity})
     final = max(0, min(cap["quantity"] for cap in caps))
     limiting = min(caps, key=lambda cap: cap["quantity"])["label"]
+    if decision.signal == "Hold" or not decision.trade_allowed:
+        return RegimeSizingResult(0, 0.0, stop_distance, None, None, "blocked", tuple(caps), tuple(decision.trade_blockers))
     if decision.signal == "Buy":
         stop_price = latest_price - stop_distance
         target_price = latest_price + (stop_distance * float(profile["takeProfitR"]))

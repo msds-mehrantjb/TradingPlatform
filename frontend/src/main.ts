@@ -9018,44 +9018,7 @@ function maybeAutoSubmitConfidenceTargetOrder() {
 }
 
 function maybeAutoSubmitRegimeTargetOrder() {
-  if (automaticSubmitInFlight) {
-    return;
-  }
-  const latest = latestExecutionCandleForMode("regime");
-  const order = state.currentRegimeTargetOrder;
-  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitTrades()) {
-    return;
-  }
-  if (order.side !== "Buy") {
-    return;
-  }
-  if (automaticTradeAlreadySubmittedForCandle("regime", latest)) {
-    return;
-  }
-  const executionPrice = targetOrderExecutionPrice(order, latest.close);
-  const position = summarizePositionFromTradeHistory(latest.close, latest.close, "regime");
-  const quantity = automaticOrderQuantity(order, position, "regime");
-  const rejection = automaticOrderRejectionReason(order, position, quantity, executionPrice, "regime");
-  if (rejection) {
-    return;
-  }
-  const key = automaticOrderKeyForMode("regime", order, quantity, executionPrice);
-  if (state.autoSubmittedOrderKeys.includes(key)) {
-    return;
-  }
-
-  automaticSubmitInFlight = true;
-  try {
-    appendTradeHistory("Buy", quantity, executionPrice, undefined, "regime", {
-      submitMode: "Automatic",
-      trigger: "Regime target order",
-    });
-    rememberAutoSubmittedOrderKey(key);
-    updateRegimeSelectionPanel();
-    updateQuoteCard(latest);
-  } finally {
-    automaticSubmitInFlight = false;
-  }
+  return;
 }
 
 function maybeAutoSubmitAllAlgorithms() {
@@ -10949,10 +10912,6 @@ function calculateRegimeSelection(): RegimeSelectionResult {
 }
 
 function backendRegimeEvaluationPayload(market: RegimeFrontendMarketContext) {
-  const settings = state.regimeTradingSettings as typeof state.regimeTradingSettings & {
-    mlMode?: "off" | "shadow" | "confirm_only" | "active";
-    shortEntriesEnabled?: boolean;
-  };
   return {
     marketData: {
       symbol: state.symbol,
@@ -10960,18 +10919,6 @@ function backendRegimeEvaluationPayload(market: RegimeFrontendMarketContext) {
       candles: market.candles,
       oneMinuteCandles: market.oneMinuteCandles,
       fiveMinuteCandles: market.fiveMinuteCandles,
-    },
-    settings: {
-      ...settings,
-      minimumWinningScore: settings.minimumBuyScore,
-      minimumRegimeConfidence: 0,
-      shortEntriesEnabled: false,
-      mlMode: settings.mlMode ?? "shadow",
-    },
-    account: {
-      availableBuyingPower: targetBuyingPowerAvailable(settings) ? settings.startingCapital : 0,
-      remainingAlgorithmRiskDollars: settings.startingCapital,
-      globalRiskCapacityQuantity: 1000000,
     },
   };
 }
@@ -10985,8 +10932,6 @@ function backendRegimeEvaluationKey(payload: ReturnType<typeof backendRegimeEval
     candleCount: candles.length,
     latestTimestamp: latest?.timestamp ?? "none",
     latestClose: latest?.close ?? null,
-    settings: payload.settings,
-    account: payload.account,
   });
 }
 
@@ -13248,10 +13193,13 @@ function buildBackendRegimeOrderRecommendation(result: RegimeSelectionResult): M
   const latest = market?.latest ?? latestExecutionCandleForMode("regime");
   const sizing = result.backendSizing ?? emptyRegimeSizingForUi(state.regimeTradingSettings, result.tradeBlockers[0] ?? "Waiting for backend Regime sizing");
   const intent = result.backendOrderIntent ?? null;
-  const failedGates = regimeTargetOrderFailedGates(result, sizing, intent);
-  const eligible = Boolean(intent && result.tradeAllowed && sizing.finalQuantity > 0 && failedGates.length === 0);
-  const side = eligible ? intent!.side : "Hold";
-  const quantity = eligible ? intent!.quantity : 0;
+  const failedGates = uniqueStrings([
+    ...regimeTargetOrderFailedGates(result, sizing, intent),
+    "Regime UI is display-only; backend workers own order intents and paper execution.",
+  ]);
+  const eligible = false;
+  const side = "Hold";
+  const quantity = 0;
   const entryPrice = intent?.entry_price ?? latest?.close ?? null;
   const order: ManualOrderRecommendation = {
     eligible,
@@ -13262,7 +13210,7 @@ function buildBackendRegimeOrderRecommendation(result: RegimeSelectionResult): M
     effectiveProfileId: stringFromUnknown(result.effectiveSettings?.profileId, null as unknown as string) || null,
     currentPosition: latest ? regimeCurrentPositionSnapshot(latest.close).shares : 0,
     requestedResultingPosition: intent ? intent.quantity : 0,
-    orderType: eligible ? "Backend proposed order" : "No order",
+    orderType: intent ? "Backend intent display only" : "No order",
     symbol: intent?.symbol ?? state.symbol,
     quantity,
     triggerPrice: entryPrice,
@@ -13288,7 +13236,9 @@ function buildBackendRegimeOrderRecommendation(result: RegimeSelectionResult): M
       openingLow: market?.openingRange?.low ?? null,
       lastTime: latest?.timestamp ?? null,
     },
-    summary: eligible ? `Backend Regime order intent ${intent!.order_intent_id}` : `No order: ${uniqueStrings(failedGates).join(", ") || "backend Regime did not create an order intent"}.`,
+    summary: intent
+      ? `Backend Regime order intent ${intent.order_intent_id} is displayed for diagnostics only.`
+      : `No order: ${uniqueStrings(failedGates).join(", ") || "backend Regime did not create an order intent"}.`,
     regimeSizing: sizing,
   };
   return applyConfidenceTargetOrderOverrides(order, "regime");
@@ -17926,26 +17876,14 @@ async function runRegimeDailyBacktestFromPreparedCandles(preparedOneMinuteCandle
   renderRegimeBacktestState();
   await wait(0);
   try {
-    const regimeSettings = state.regimeTradingSettings as typeof state.regimeTradingSettings & {
-      mlMode?: "off" | "shadow" | "confirm_only" | "active";
-      shortEntriesEnabled?: boolean;
-    };
     const result = await runRegimeBacktestOnBackend<RegimeBacktestResult>({
       symbol: state.symbol,
       candles: sorted,
-      settings: regimeSettings,
-      startingCapital: regimeSettings.startingCapital,
-      account: {
-        availableBuyingPower: state.regimeTradingSettings.startingCapital,
-        remainingAlgorithmRiskDollars: state.regimeTradingSettings.startingCapital,
-        globalRiskCapacityQuantity: 1000000,
-      },
     });
     regimeBacktestResult = result;
     regimeBacktestCache = { key: cacheKey, result };
     regimeBacktestStatus = "ready";
     saveStoredRegimeBacktest(cacheKey, result, latestSessionDate);
-    void recordRegimeBacktestResult(result);
   } catch (error) {
     regimeBacktestStatus = "error";
     regimeBacktestError = error instanceof Error ? error.message : "Unable to run Regime backtest";
@@ -17957,18 +17895,6 @@ function backendRegimeBacktestCacheKey(symbol: string, candles: Candle[]): strin
   const first = candles[0]?.timestamp ?? "na";
   const last = candles[candles.length - 1]?.timestamp ?? "na";
   return `${symbol.toUpperCase()}:${first}:${last}:${candles.length}`;
-}
-
-async function recordRegimeBacktestResult(result: RegimeBacktestResult) {
-  try {
-    await fetchWithTimeout(`${API_BASE}/api/regime/backtests/record`, 10000, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ result }),
-    });
-  } catch {
-    // Regime backtest persistence is best-effort; the local result remains available.
-  }
 }
 
 async function runBackendConfidenceBacktest(preparedOneMinuteCandles: Candle[], latestSessionDate: string): Promise<BacktestResult> {

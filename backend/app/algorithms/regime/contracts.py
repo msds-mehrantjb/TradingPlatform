@@ -7,6 +7,7 @@ source of truth for Regime classification, decisions, orders, and backtests.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, field
+from enum import Enum
 from typing import Any, Literal
 
 
@@ -15,6 +16,27 @@ REGIME_ALGORITHM_VERSION = "regime_algorithm_v3_backend_authoritative"
 REGIME_SETTINGS_VERSION = "regime_base_settings_v2"
 REGIME_STRATEGY_CATALOG_VERSION = "regime_strategy_catalog_v3_backend"
 REGIME_PROFILE_VERSION = "regime_profile_matrix_v3_backend"
+
+
+class RegimeRuntimeMode(str, Enum):
+    SHADOW = "shadow"
+    PAPER = "paper"
+    BACKTEST = "backtest"
+    REPLAY = "replay"
+
+
+REGIME_ALLOWED_RUNTIME_MODE_VALUES: tuple[str, ...] = tuple(mode.value for mode in RegimeRuntimeMode)
+
+
+def normalize_regime_runtime_mode(value: Any | None, *, default: RegimeRuntimeMode = RegimeRuntimeMode.SHADOW) -> RegimeRuntimeMode:
+    raw = str(value if value not in {None, ""} else default.value).strip().lower()
+    if raw == "live":
+        raise ValueError("Regime live runtime mode is disabled and must fail closed")
+    try:
+        return RegimeRuntimeMode(raw)
+    except ValueError as exc:
+        allowed = ", ".join(REGIME_ALLOWED_RUNTIME_MODE_VALUES)
+        raise ValueError(f"Unsupported Regime runtime mode '{raw}'. Allowed modes: {allowed}") from exc
 
 RegimeSignal = Literal["Buy", "Sell", "Hold"]
 StrategyRole = Literal["directional", "confirmation", "regime_context", "safety_gate"]

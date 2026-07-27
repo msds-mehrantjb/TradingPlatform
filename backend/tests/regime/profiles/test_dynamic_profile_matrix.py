@@ -36,7 +36,7 @@ class DynamicProfileMatrixTest(unittest.TestCase):
         self.assertEqual(profile["entryStyle"], "pullback_continuation")
         self.assertIn("trend", profile["preferredStrategyFamilies"])
         self.assertTrue(profile["trailingExitsEnabled"])
-        self.assertTrue(profile["pyramidingEnabled"])
+        self.assertFalse(profile["pyramidingEnabled"])
         self.assertGreaterEqual(profile["maximumHoldingMinutes"], 45)
 
     def test_weak_trend_reduces_size_and_requires_stricter_confirmation(self):

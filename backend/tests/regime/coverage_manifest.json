@@ -2,9 +2,19 @@
   "algorithmId": "regime",
   "runtime": "backend.app.algorithms.regime.execution_pipeline",
   "backtesting": "backend.app.algorithms.regime.backtest.engine",
-  "ciCommand": "python -m pytest backend/tests/regime -q --cov=backend/app/algorithms/regime --cov-branch",
+  "ciCommand": "python -m pytest backend/tests/regime -q --cov=backend/app/algorithms/regime --cov-branch --cov-fail-under=54",
   "branchCoverageRequired": true,
+  "branchCoverageThreshold": 54,
   "skipPolicy": "no skips or xfails in focused Regime suite",
+  "ciFailureConditions": [
+    "regime focused test is skipped or xfailed",
+    "registered strategy lacks a focused behavioral test",
+    "coverage falls below branchCoverageThreshold",
+    "second authoritative decision path appears",
+    "cross-algorithm isolation checks fail",
+    "background-runtime tests fail",
+    "paper-only enforcement fails"
+  ],
   "components": [
     {"component_id": "moving_average_trend", "component_type": "directional_strategy", "implementation_path": "backend/app/algorithms/regime/strategies/directional/moving_average_trend.py", "focused_test_path": "backend/tests/regime/strategies/directional/test_moving_average_trend.py", "buy_case": true, "sell_case": true, "hold_case": true, "boundary_case": true, "missing_input_case": true, "determinism_case": true, "isolation_case": true},
     {"component_id": "trend_pullback", "component_type": "directional_strategy", "implementation_path": "backend/app/algorithms/regime/strategies/directional/trend_pullback.py", "focused_test_path": "backend/tests/regime/strategies/directional/test_trend_pullback.py", "buy_case": true, "sell_case": true, "hold_case": true, "boundary_case": true, "missing_input_case": true, "determinism_case": true, "isolation_case": true},

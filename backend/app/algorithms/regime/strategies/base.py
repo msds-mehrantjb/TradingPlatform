@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 from backend.app.algorithms.regime.contracts import RegimeClassification, RegimeMarketSnapshot, RegimeStrategyEvaluation, StrategyRole
 
@@ -22,7 +22,26 @@ class RegimeStrategyDefinition:
     evaluator: StrategyEvaluator
 
 
-def evaluate_definition(definition: RegimeStrategyDefinition, snapshot: RegimeMarketSnapshot, classification: RegimeClassification) -> RegimeStrategyEvaluation:
+def evaluate_definition(
+    definition: RegimeStrategyDefinition,
+    snapshot: RegimeMarketSnapshot,
+    classification: RegimeClassification,
+    strategy_settings: dict[str, Any] | None = None,
+) -> RegimeStrategyEvaluation:
+    lifecycle = _strategy_lifecycle(strategy_settings)
+    if lifecycle == "disabled":
+        return RegimeStrategyEvaluation(
+            strategy_id=definition.strategy_id,
+            name=definition.name,
+            family=definition.family,
+            role=definition.role,
+            signal="Hold",
+            confidence=0.0,
+            weight=definition.base_weight,
+            eligible=False,
+            reason="regime.strategy.lifecycle_disabled",
+            evidence={"lifecycle": lifecycle, "settingsType": (strategy_settings or {}).get("settingsType")},
+        )
     if len(snapshot.candles) < definition.minimum_bars:
         return RegimeStrategyEvaluation(
             strategy_id=definition.strategy_id,
@@ -34,38 +53,47 @@ def evaluate_definition(definition: RegimeStrategyDefinition, snapshot: RegimeMa
             weight=definition.base_weight,
             eligible=False,
             reason="regime.strategy.minimum_bars_not_met",
-            evidence={"minimumBars": definition.minimum_bars, "actualBars": len(snapshot.candles)},
+            evidence={"minimumBars": definition.minimum_bars, "actualBars": len(snapshot.candles), "lifecycle": lifecycle},
         )
     signal, confidence, reason, evidence = definition.evaluator(snapshot, classification)
     if definition.role != "directional":
         signal = "Hold"
+    signal = signal if signal in {"Buy", "Sell", "Hold"} else "Hold"
+    confidence = max(0.0, min(1.0, float(confidence)))
+    eligible = True
+    if lifecycle == "shadow":
+        evidence = {
+            "lifecycle": lifecycle,
+            "shadowSignal": signal,
+            "shadowConfidence": confidence,
+            "shadowReason": reason,
+            "evaluatorEvidence": evidence,
+        }
+        signal = "Hold"
+        eligible = False
+        reason = "regime.strategy.lifecycle_shadow_only"
+    else:
+        evidence = {**evidence, "lifecycle": lifecycle}
     return RegimeStrategyEvaluation(
         strategy_id=definition.strategy_id,
         name=definition.name,
         family=definition.family,
         role=definition.role,
-        signal=signal if signal in {"Buy", "Sell", "Hold"} else "Hold",
-        confidence=max(0.0, min(1.0, float(confidence))),
+        signal=signal,
+        confidence=confidence,
         weight=definition.base_weight,
-        eligible=True,
+        eligible=eligible,
         reason=reason,
         evidence=evidence,
     )
 
 
-def directional_by_scores(snapshot: RegimeMarketSnapshot, classification: RegimeClassification, *, trend: bool = False, reversal: bool = False) -> tuple[str, float, str, dict]:
-    bull = int(classification.features.get("bullScore") or 0)
-    bear = int(classification.features.get("bearScore") or 0)
-    rsi = classification.features.get("rsi")
-    edge = bull - bear
-    if reversal and rsi is not None:
-        if rsi <= 32:
-            return "Buy", 0.66, "regime.strategy.oversold_reversal", {"rsi": rsi}
-        if rsi >= 68:
-            return "Sell", 0.66, "regime.strategy.overbought_reversal", {"rsi": rsi}
-    if edge >= (2 if trend else 3):
-        return "Buy", min(0.90, 0.55 + abs(edge) * 0.08), "regime.strategy.bullish_alignment", {"bullScore": bull, "bearScore": bear}
-    if edge <= (-2 if trend else -3):
-        return "Sell", min(0.90, 0.55 + abs(edge) * 0.08), "regime.strategy.bearish_alignment", {"bullScore": bull, "bearScore": bear}
-    return "Hold", 0.45, "regime.strategy.no_edge", {"bullScore": bull, "bearScore": bear}
-
+def _strategy_lifecycle(settings: dict[str, Any] | None) -> str:
+    if not settings:
+        return "active"
+    lifecycle = str(settings.get("lifecycle") or settings.get("status") or "").lower()
+    if settings.get("enabled") is False:
+        lifecycle = "disabled"
+    if lifecycle not in {"active", "shadow", "disabled"}:
+        lifecycle = "active"
+    return lifecycle

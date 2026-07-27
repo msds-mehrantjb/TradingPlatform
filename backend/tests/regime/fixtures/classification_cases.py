@@ -35,6 +35,5 @@ def classification(
         evidence={"close": 101.0},
         missing_inputs=missing_inputs,
         no_trade_reasons=no_trade_reasons,
-        timestamp="2026-07-18T15:30:00Z",
+        timestamp="2026-07-23T15:30:00Z",
     )
-

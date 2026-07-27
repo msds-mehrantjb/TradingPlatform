@@ -75,6 +75,7 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
     candles = snapshot.candles
     closes = [c.close for c in candles]
     latest = snapshot.latest
+    session_evidence = exchange_session(latest.timestamp)
     computed_vwap = vwap(candles)
     ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
@@ -113,8 +114,10 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
         efficiency=efficiency,
         direction_evidence=direction_evidence,
         volatility_evidence=volatility_evidence,
+        liquidity_evidence=liquidity_evidence,
+        session_evidence=session_evidence,
     )
-    no_trade = _no_trade_reasons(snapshot, volatility_evidence, liquidity_evidence)
+    no_trade = _no_trade_reasons(snapshot, volatility_evidence, liquidity_evidence, session_evidence=session_evidence)
     structure_evidence = _structure_evidence(
         snapshot,
         bull_score,
@@ -127,7 +130,6 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
     event_evidence = _event_evidence(snapshot)
     event_axis = _event_axis(event_evidence)
     cross_market_evidence = _cross_market_context_evidence(snapshot, direction_axis, structure_axis, event_axis)
-    session_evidence = exchange_session(latest.timestamp)
     axes = RegimeAxes(
         direction=direction_axis,
         volatility=_volatility_axis(volatility_evidence),
@@ -144,6 +146,7 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
         volatility_evidence=volatility_evidence,
         structure_evidence=structure_evidence,
         liquidity_evidence=liquidity_evidence,
+        session_evidence=session_evidence,
         event_state=event_evidence,
         missing_inputs=missing,
         no_trade=no_trade,
@@ -177,7 +180,9 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
         "volatilityConfidence": confidence_evidence["volatilityConfidence"],
         "structureConfidence": confidence_evidence["structureConfidence"],
         "liquidityConfidence": confidence_evidence["liquidityConfidence"],
+        "sessionConfidence": confidence_evidence["sessionConfidence"],
         "eventConfidence": confidence_evidence["eventConfidence"],
+        "dataQualityConfidence": confidence_evidence["dataQualityConfidence"],
         "compositeConfidence": confidence_evidence["compositeConfidence"],
         "safetyBlockConfidence": confidence_evidence["safetyBlockConfidence"],
         "bullScore": bull_score,
@@ -530,6 +535,8 @@ def _missing_indicator_inputs(
     efficiency: float | None,
     direction_evidence: dict,
     volatility_evidence: dict,
+    liquidity_evidence: dict | None = None,
+    session_evidence=None,
 ) -> tuple[str, ...]:
     missing: list[str] = []
     checks = {
@@ -547,6 +554,19 @@ def _missing_indicator_inputs(
     for name, value in checks.items():
         if value is None:
             missing.append(name)
+    if not _valid_completed_primary_candle(snapshot.latest):
+        missing.append("completedPrimaryCandle")
+    if len(snapshot.candles) < INDICATOR_WARMUP_REQUIREMENTS["marketStructure"]:
+        missing.append("usableRecentHistory")
+    if session_evidence is None or getattr(session_evidence, "reason", "") == "invalid_timestamp":
+        missing.append("validTimestamp")
+    if session_evidence is None or getattr(session_evidence, "status", None) not in {"opening", "midday", "afternoon", "closing"}:
+        missing.append("sessionStatus")
+    if liquidity_evidence:
+        if liquidity_evidence.get("status") != "fresh":
+            missing.append("freshQuote")
+        for field in liquidity_evidence.get("missingCriticalFields") or []:
+            missing.append(str(field))
     return tuple(dict.fromkeys(missing))
 
 
@@ -639,6 +659,7 @@ def _volatility_evidence(
     status = str(baseline.get("calibrationStatus") or same_minute.get("calibrationStatus") or "").lower()
     if not status:
         status = "ready" if atr_percentile is not None or rv_percentile is not None else "missing_or_insufficient_same_minute_history"
+    reason_codes = _volatility_reason_codes(baseline, same_minute, status, atr_percentile, rv_percentile, range_vs_expected)
     evidence = {
         "policy": VOLATILITY_PERCENTILE_POLICY,
         "calibrationStatus": status,
@@ -665,6 +686,15 @@ def _volatility_evidence(
             and (atr_percentile is not None or rv_percentile is not None or range_vs_expected is not None)
         ),
         "source": "context_feed" if baseline.get("calibrationStatus") not in {None, "missing"} else same_minute.get("source", "unavailable"),
+        "reasonCodes": reason_codes,
+        "unitConvention": {
+            "atrPercent": "decimal_ratio",
+            "realizedVolatility": "decimal_ratio",
+            "atrPercentile": "percentile_decimal_0_to_1",
+            "realizedVolatilityPercentile": "percentile_decimal_0_to_1",
+            "currentRangeVsExpected": "ratio",
+            "currentVolumeVsExpected": "ratio",
+        },
     }
     decision = _volatility_decision(evidence)
     return {
@@ -1221,6 +1251,8 @@ def _no_trade_reasons(
     snapshot: RegimeMarketSnapshot,
     volatility_evidence: dict | float | None,
     liquidity_evidence_or_rel_volume: dict | float,
+    *,
+    session_evidence=None,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
     liquidity_evidence = (
@@ -1248,6 +1280,17 @@ def _no_trade_reasons(
         reasons.append("regime.safety.extreme_volatility")
     if liquidity_evidence.get("axis") == "poor":
         reasons.append("regime.safety.insufficient_liquidity")
+    session = session_evidence or exchange_session(snapshot.latest.timestamp)
+    if session.reason == "invalid_timestamp":
+        reasons.append("regime.safety.invalid_timestamp")
+    elif session.reason == "holiday_or_weekend":
+        reasons.append("regime.safety.market_holiday_or_weekend")
+    elif session.status == "outside_regular":
+        reasons.append("regime.safety.outside_regular_session")
+    if not _valid_completed_primary_candle(snapshot.latest):
+        reasons.append("regime.safety.invalid_completed_primary_candle")
+    if len(snapshot.candles) < INDICATOR_WARMUP_REQUIREMENTS["marketStructure"]:
+        reasons.append("regime.safety.insufficient_recent_history")
     return tuple(dict.fromkeys(reasons))
 
 
@@ -1282,6 +1325,7 @@ def _confidence_evidence(
     volatility_evidence: dict,
     structure_evidence: dict,
     liquidity_evidence: dict,
+    session_evidence,
     event_state: str | None,
     missing_inputs: tuple[str, ...],
     no_trade: tuple[str, ...],
@@ -1291,14 +1335,18 @@ def _confidence_evidence(
     volatility_confidence = _volatility_confidence(volatility_evidence)
     structure_confidence = _structure_confidence(structure_evidence)
     liquidity_confidence = _liquidity_confidence(liquidity_evidence)
+    session_confidence = _session_confidence(session_evidence)
     event_confidence = _event_confidence(event_state)
+    data_quality_confidence = _data_quality_confidence(missing_inputs, no_trade)
     required_axes = _required_confidence_axes(raw_regime, axes)
     axis_values = {
         "direction": direction_confidence,
         "volatility": volatility_confidence,
         "structure": structure_confidence,
         "liquidity": liquidity_confidence,
+        "session": session_confidence,
         "event": event_confidence,
+        "dataQuality": data_quality_confidence,
     }
     required_values = [axis_values[name] for name in required_axes]
     composite = min(required_values) if required_values else min(axis_values.values())
@@ -1313,13 +1361,15 @@ def _confidence_evidence(
         "volatilityConfidence": volatility_confidence,
         "structureConfidence": structure_confidence,
         "liquidityConfidence": liquidity_confidence,
+        "sessionConfidence": session_confidence,
         "eventConfidence": event_confidence,
+        "dataQualityConfidence": data_quality_confidence,
         "compositeConfidence": round(composite, 4),
         "classificationConfidence": round(composite, 4),
         "safetyBlockConfidence": safety_block_confidence,
         "requiredAxes": required_axes,
         "rawRegime": raw_regime,
-        "rule": "Composite market-regime confidence is the minimum required axis confidence; safety-block certainty is tracked separately.",
+        "rule": "Composite market-regime confidence is the minimum required axis confidence plus data-quality confidence; safety-block certainty is tracked separately.",
     }
 
 
@@ -1384,6 +1434,20 @@ def _liquidity_confidence(liquidity_evidence: dict) -> float:
     return round(_clamp(confidence, 0.05, 1.0), 4)
 
 
+def _session_confidence(session_evidence) -> float:
+    if session_evidence is None:
+        return 0.05
+    reason = getattr(session_evidence, "reason", "")
+    status = getattr(session_evidence, "status", "")
+    if reason == "invalid_timestamp":
+        return 0.05
+    if status == "outside_regular":
+        return 0.95
+    if status in {"opening", "midday", "afternoon", "closing"}:
+        return 0.95
+    return 0.25
+
+
 def _event_confidence(event_state: str | dict | None) -> float:
     if isinstance(event_state, dict):
         if event_state.get("newEntriesBlocked"):
@@ -1398,18 +1462,38 @@ def _event_confidence(event_state: str | dict | None) -> float:
     return 0.55
 
 
+def _data_quality_confidence(missing_inputs: tuple[str, ...], no_trade: tuple[str, ...]) -> float:
+    critical = {
+        "completedPrimaryCandle",
+        "usableRecentHistory",
+        "validTimestamp",
+        "freshQuote",
+        "bid",
+        "ask",
+        "quoteAgeMs",
+        "spreadBps",
+        "sessionStatus",
+    }
+    missing_critical = critical.intersection(missing_inputs)
+    if missing_critical:
+        return 0.10
+    if no_trade:
+        return 0.45
+    return 0.95
+
+
 def _required_confidence_axes(raw_regime: str, axes: RegimeAxes) -> tuple[str, ...]:
     if raw_regime in {"event_risk"}:
-        return ("event", "liquidity")
+        return ("event", "liquidity", "session", "dataQuality")
     if raw_regime in {"liquidity_stress"}:
-        return ("liquidity", "event")
+        return ("liquidity", "event", "session", "dataQuality")
     if raw_regime in {"extreme_volatility_no_trade", "high_volatility_trend", "low_volatility_quiet"}:
-        return ("volatility", "liquidity", "event")
+        return ("volatility", "liquidity", "event", "session", "dataQuality")
     if raw_regime in {"opening_breakout", "intraday_expansion", "failed_breakout_reversal"}:
-        return ("structure", "volatility", "liquidity", "event")
+        return ("structure", "volatility", "liquidity", "event", "session", "dataQuality")
     if axes.structure in {"range", "mixed"} or raw_regime in {"range_bound", "choppy_mixed"}:
-        return ("structure", "volatility", "liquidity", "event")
-    return ("direction", "structure", "volatility", "liquidity", "event")
+        return ("structure", "volatility", "liquidity", "event", "session", "dataQuality")
+    return ("direction", "structure", "volatility", "liquidity", "event", "session", "dataQuality")
 
 
 def _safety_block_confidence(
@@ -1554,6 +1638,39 @@ def _minute_key(timestamp: str) -> str | None:
 
 def _minute_of_session(timestamp: str) -> int | None:
     return exchange_session(timestamp).minutes_from_open
+
+
+def _volatility_reason_codes(baseline: dict, same_minute: dict, status: str, atr_percentile, rv_percentile, range_vs_expected) -> list[str]:
+    reasons: list[str] = []
+    baseline_status = str(baseline.get("calibrationStatus") or "missing").lower()
+    same_minute_status = str(same_minute.get("calibrationStatus") or "missing").lower()
+    if baseline_status != "ready":
+        reasons.append(f"regime.volatility.calibration_unavailable:{baseline_status}")
+    if baseline_status != "ready" and same_minute_status == "ready":
+        reasons.append("regime.volatility.fallback.same_minute_history")
+    elif baseline_status != "ready":
+        reasons.append(f"regime.volatility.fallback.conservative:{same_minute_status}")
+    if atr_percentile is None:
+        reasons.append("regime.volatility.missing_atr_percentile")
+    if rv_percentile is None:
+        reasons.append("regime.volatility.missing_realized_volatility_percentile")
+    if range_vs_expected is None:
+        reasons.append("regime.volatility.missing_current_range_vs_expected")
+    if status in {"inactive_until_live_paper_trading", "missing", "missing_minute", "outside_regular_session", "unknown", "insufficient_history"}:
+        reasons.append(f"regime.volatility.status.{status}")
+    return list(dict.fromkeys(reasons))
+
+
+def _valid_completed_primary_candle(candle: RegimeCandle) -> bool:
+    if parse_exchange_timestamp(candle.timestamp) is None:
+        return False
+    if candle.high < candle.low:
+        return False
+    if not (candle.low <= candle.open <= candle.high and candle.low <= candle.close <= candle.high):
+        return False
+    if candle.volume < 0:
+        return False
+    return True
 
 
 def _first_present(*values):

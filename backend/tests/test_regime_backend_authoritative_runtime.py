@@ -54,11 +54,9 @@ class RegimeBackendAuthoritativeRuntimeTest(unittest.TestCase):
         self.assertEqual(result["decision"]["algorithm_id"], "regime")
         self.assertEqual(result["decision"]["raw_classification"]["raw_regime"] in result["decision"]["confirmed_state"]["confirmed_regime"], True)
         self.assertIsInstance(result["decision"]["strategy_outputs"], list)
-        self.assertGreaterEqual(len(result["decision"]["strategy_outputs"]), 2)
-        self.assertEqual(
-            {item["strategy_id"] for item in result["decision"]["strategy_outputs"]},
-            {"adx_atr_regime_classifier", "cash_avoid_filter"},
-        )
+        self.assertGreaterEqual(len(result["decision"]["strategy_outputs"]), 14)
+        self.assertIn("volume_confirmation", {item["strategy_id"] for item in result["decision"]["strategy_outputs"]})
+        self.assertIn("cash_avoid_filter", {item["strategy_id"] for item in result["decision"]["strategy_outputs"]})
         self.assertIn(result["decision"]["signal"], {"Buy", "Sell", "Hold"})
         self.assertIn("valid", result["orderValidation"])
 
@@ -75,14 +73,15 @@ class RegimeBackendAuthoritativeRuntimeTest(unittest.TestCase):
     def test_backend_strategy_catalog_has_dedicated_role_inventory(self) -> None:
         inventory = regime_strategy_inventory()
 
-        self.assertEqual(inventory["strategyCount"], 2)
-        self.assertEqual(inventory["directionalCount"], 0)
-        self.assertEqual(inventory["confirmationCount"], 0)
-        self.assertEqual(inventory["contextCount"], 1)
-        self.assertEqual(inventory["safetyCount"], 1)
-        self.assertEqual(inventory["moduleInventory"]["regime"][0]["id"], "adx_atr_regime_classifier")
+        self.assertEqual(inventory["strategyCount"], 28)
+        self.assertEqual(inventory["directionalCount"], 14)
+        self.assertEqual(inventory["confirmationCount"], 2)
+        self.assertEqual(inventory["contextCount"], 2)
+        self.assertEqual(inventory["safetyCount"], 10)
+        self.assertEqual(inventory["moduleInventory"]["context"][0]["id"], "volume_confirmation")
+        self.assertEqual(inventory["moduleInventory"]["regime"][0]["id"], "vwap_position")
         self.assertEqual(inventory["moduleInventory"]["safety"][0]["id"], "cash_avoid_filter")
-        self.assertEqual(inventory["aliases"]["adx_trend_strength_regime"], "adx_atr_regime_classifier")
+        self.assertEqual(inventory["aliases"]["adx_trend_strength_regime"], "adx_trend_strength")
 
     def test_backend_regime_package_does_not_import_frontend_runtime(self) -> None:
         backend_files = list((ROOT / "backend" / "app" / "algorithms" / "regime").rglob("*.py"))
