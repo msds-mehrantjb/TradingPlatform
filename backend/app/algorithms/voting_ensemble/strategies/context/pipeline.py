@@ -117,6 +117,13 @@ class MarketBreadthMomentumSnapshotContext:
     def evaluate(self, snapshot: VotingEnsembleEvaluationSnapshot, *, active: bool) -> VotingStrategyVote:
         feed = snapshot.breadth.externalFeed or {}
         advancing = _number(feed.get("percentageAdvancing"))
+        source_label = "external breadth feed"
+        data_coverage = _number(feed.get("dataCoverage")) or 0.0
+        if advancing is None:
+            proxy = _breadth_proxy_from_components(snapshot)
+            advancing = proxy.get("percentageAdvancing")
+            data_coverage = proxy.get("dataCoverage", 0.0)
+            source_label = "ETF breadth proxy"
         if advancing is None:
             return _vote(
                 self,
@@ -145,7 +152,7 @@ class MarketBreadthMomentumSnapshotContext:
             reason,
             (code,),
             snapshot,
-            {"percentageAdvancing": round(advancing, 4), "breadthCoverage": round(_number(feed.get("dataCoverage")) or 0.0, 4)},
+            {"percentageAdvancing": round(advancing, 4), "breadthCoverage": round(data_coverage, 4), "breadthSource": source_label},
             source_timestamps=_source_timestamps(snapshot, breadth=snapshot.breadth.timestamp),
         )
 
@@ -355,6 +362,21 @@ def _number(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _breadth_proxy_from_components(snapshot: VotingEnsembleEvaluationSnapshot) -> dict[str, float]:
+    components = []
+    for data in snapshot.breadth.components.values():
+        if len(data.candles) < 2:
+            continue
+        previous = data.candles[-2].candle.close
+        latest = data.candles[-1].candle.close
+        components.append(_return(previous, latest))
+    if not components:
+        return {}
+    advancing = sum(1 for value in components if value > 0) / len(components)
+    coverage = len(components) / max(1, len(snapshot.breadth.components))
+    return {"percentageAdvancing": advancing, "dataCoverage": coverage}
 
 
 def _event_blackout_active(event: dict[str, Any]) -> bool:

@@ -57,12 +57,24 @@ from backend.app.algorithms.regime.strategy_registry import REGIME_STRATEGY_ALIA
 from backend.app.algorithms.voting_ensemble.strategies.registry import (
     STRATEGY_ALIAS_MAP as VOTING_ENSEMBLE_ALIAS_MAP,
     StrategyRegistryEntry as VotingEnsembleStrategyRegistryEntry,
+    VOTING_ENSEMBLE_BACKTEST_REPLAY_ADAPTERS,
+    VOTING_ENSEMBLE_BACKGROUND_WORKERS,
     VOTING_ENSEMBLE_AGGREGATOR_STRATEGIES,
     VOTING_ENSEMBLE_CONTEXT_STRATEGIES,
     VOTING_ENSEMBLE_DIRECTIONAL_STRATEGIES,
+    VOTING_ENSEMBLE_EXECUTION_ADAPTERS,
+    VOTING_ENSEMBLE_MODULE_INVENTORY,
+    VOTING_ENSEMBLE_ORDER_PLANNER_MODULES,
     VOTING_ENSEMBLE_REGIME_STRATEGIES,
+    VOTING_ENSEMBLE_RISK_BUDGET_MODULES,
     VOTING_ENSEMBLE_SAFETY_STRATEGIES,
+    VOTING_ENSEMBLE_STRATEGIES,
+    VOTING_ENSEMBLE_TRADING_SETTINGS_RESOLVERS,
     resolve_strategy as resolve_voting_ensemble_strategy,
+)
+from backend.app.algorithms.voting_ensemble.trading_settings.models import (
+    VOTING_ENSEMBLE_ONE_MINUTE_PROFILE_VERSION,
+    VOTING_ENSEMBLE_ONE_MINUTE_SETTINGS_VERSION,
 )
 from backend.app.algorithms.wca.engine import WCA_ENGINE_VERSION
 from backend.app.algorithms.wca.strategy_registry import WCA_HARD_FILTER_REGISTRY, WCA_MODIFIER_REGISTRY, WCA_STRATEGY_REGISTRY
@@ -194,15 +206,54 @@ def strategy_fit_inventory() -> dict[str, Any]:
 
 
 def _voting_ensemble_inventory_payload() -> dict[str, Any]:
+    background_runtime = _voting_ensemble_background_runtime_health()
+    execution_readiness = _voting_ensemble_execution_readiness(background_runtime)
+    paper_readiness = _voting_ensemble_paper_trading_readiness(background_runtime, execution_readiness)
     return {
         "algorithmId": "voting_ensemble",
         "engineVersion": "voting_ensemble_v2",
+        "contractVersion": "voting_ensemble_isolated_inventory_contract_v2",
+        "displayName": "Voting Ensemble",
+        "isolatedInventory": {
+            "inventoryVersion": VOTING_ENSEMBLE_MODULE_INVENTORY.inventoryVersion,
+            "algorithmOwnsInventory": True,
+            "settingsNamespace": "voting_ensemble.settings",
+            "stateNamespace": "voting_ensemble.state",
+            "persistenceNamespace": "voting_ensemble.persistence",
+        },
+        "tradingDecisionPolicy": {
+            "decisionInputCadence": "finalized_1m_market_data_events",
+            "tradeCadence": "opportunity_only_not_every_minute",
+            "tradeTrigger": "profitable_intraday_setup_after_strategy_family_agreement_cost_risk_latency_and_operational_gates",
+            "oneMinuteDataPurpose": "collect market data every minute so the algorithm can detect short-lived profitable intraday opportunities",
+            "settingsPurpose": "risk_execution_cost_latency_and_operational_constraints_not_a_signal_to_trade_every_minute",
+            "automaticPaperTradingControl": "global_paper_trade_switch_controls_submission_only",
+            "manualTradingPolicy": "manual_orders_remain_separate_from_automatic_paper_submission",
+        },
+        "paperTradingReadiness": paper_readiness,
+        "backgroundRuntimeHealth": background_runtime,
+        "tradingSettingsContract": {
+            "settingsVersion": VOTING_ENSEMBLE_ONE_MINUTE_SETTINGS_VERSION,
+            "profileVersion": VOTING_ENSEMBLE_ONE_MINUTE_PROFILE_VERSION,
+            "scope": "event_driven_intraday_trading_from_finalized_one_minute_data",
+            "paperOnly": True,
+            "liveTradingEnabled": False,
+            "purpose": "controls sizing, risk, session windows, spread/slippage/cost limits, latency deadlines, and paper execution mode",
+        },
+        "executionReadiness": execution_readiness,
+        "strategyCounts": _voting_ensemble_strategy_counts(),
         "modules": {
             "directional": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_DIRECTIONAL_STRATEGIES if entry.enabled],
             "context": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_CONTEXT_STRATEGIES],
             "regime": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_REGIME_STRATEGIES],
             "safety": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_SAFETY_STRATEGIES],
             "aggregator": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_AGGREGATOR_STRATEGIES],
+            "tradingSettings": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_TRADING_SETTINGS_RESOLVERS],
+            "riskBudget": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_RISK_BUDGET_MODULES],
+            "orderPlanner": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_ORDER_PLANNER_MODULES],
+            "executionAdapter": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_EXECUTION_ADAPTERS],
+            "backtestReplay": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_BACKTEST_REPLAY_ADAPTERS],
+            "backgroundWorker": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_BACKGROUND_WORKERS],
         },
     }
 
@@ -741,6 +792,147 @@ def envelope(*, endpoint_version: str, payload: dict[str, Any], configuration_ha
         payload=payload,
         explanation=explanation,
     )
+
+
+def _voting_ensemble_background_runtime_health() -> dict[str, Any]:
+    try:
+        from backend.app.algorithms.voting_ensemble.runtime.orchestrator import VOTING_ENSEMBLE_RUNTIME
+
+        runtime = VOTING_ENSEMBLE_RUNTIME.summary()
+    except Exception as exc:  # pragma: no cover - defensive inventory endpoint
+        return {
+            "status": "unavailable",
+            "ready": False,
+            "reasonCodes": ["voting_ensemble.runtime.summary_unavailable"],
+            "message": str(exc) or type(exc).__name__,
+        }
+
+    queue = runtime.get("queue") if isinstance(runtime.get("queue"), dict) else {}
+    status_store = runtime.get("statusStore") if isinstance(runtime.get("statusStore"), dict) else {}
+    jobs = status_store.get("jobs") if isinstance(status_store.get("jobs"), dict) else {}
+    high_depth = int(queue.get("highPriorityDepth") or 0)
+    low_depth = int(queue.get("lowPriorityDepth") or 0)
+    high_capacity = max(1, int(queue.get("highPriorityCapacity") or 1))
+    running = int(jobs.get("running") or 0)
+    queued_jobs = int(jobs.get("queued") or 0)
+    failed = int(jobs.get("failed") or 0)
+    blocked = int(jobs.get("blocked") or 0)
+    reason_codes = list(runtime.get("reasonCodes") or [])
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if runtime.get("workerAlive") is False:
+        blockers.append("voting_ensemble.runtime.worker_not_alive")
+    if bool(runtime.get("heavyProcessingInRequestPath")):
+        blockers.append("voting_ensemble.runtime.heavy_processing_in_request_path")
+    if high_depth >= high_capacity:
+        blockers.append("voting_ensemble.runtime.high_priority_queue_full")
+    if failed or blocked:
+        blockers.append("voting_ensemble.runtime.failed_or_blocked_jobs_present")
+    if high_depth and running == 0:
+        warnings.append("voting_ensemble.runtime.queued_jobs_not_currently_running")
+    if queued_jobs and high_depth == 0 and low_depth == 0 and running == 0:
+        warnings.append("voting_ensemble.runtime.persisted_queued_jobs_need_recovery_or_reconciliation")
+    if low_depth:
+        warnings.append("voting_ensemble.runtime.low_priority_backlog_present")
+    ready = not blockers
+    status = "ready" if ready and not warnings else "warning" if ready else "not_ready"
+    return {
+        "status": status,
+        "ready": ready,
+        "runtimeVersion": runtime.get("runtimeVersion"),
+        "workerMode": runtime.get("workerMode"),
+        "workerAlive": runtime.get("workerAlive"),
+        "workerThread": runtime.get("workerThread"),
+        "heavyProcessingInRequestPath": bool(runtime.get("heavyProcessingInRequestPath")),
+        "singleLogicalWriter": runtime.get("singleLogicalWriter"),
+        "queue": queue,
+        "jobs": jobs,
+        "blockers": blockers,
+        "warnings": warnings,
+        "reasonCodes": reason_codes or ["voting_ensemble.runtime.status_reported"],
+    }
+
+
+def _voting_ensemble_execution_readiness(background_runtime: dict[str, Any]) -> dict[str, Any]:
+    active_execution_adapter = any(entry.enabled for entry in VOTING_ENSEMBLE_EXECUTION_ADAPTERS)
+    active_order_planner = any(entry.enabled for entry in VOTING_ENSEMBLE_ORDER_PLANNER_MODULES)
+    active_risk_budget = any(entry.enabled for entry in VOTING_ENSEMBLE_RISK_BUDGET_MODULES)
+    active_settings = any(entry.enabled for entry in VOTING_ENSEMBLE_TRADING_SETTINGS_RESOLVERS)
+    blockers: list[str] = []
+    if not active_settings:
+        blockers.append("voting_ensemble.execution.settings_resolver_missing")
+    if not active_risk_budget:
+        blockers.append("voting_ensemble.execution.risk_budget_missing")
+    if not active_order_planner:
+        blockers.append("voting_ensemble.execution.order_planner_missing")
+    if not active_execution_adapter:
+        blockers.append("voting_ensemble.execution.execution_adapter_missing")
+    if not background_runtime.get("ready"):
+        blockers.append("voting_ensemble.execution.background_runtime_not_ready")
+    return {
+        "status": "ready" if not blockers else "not_ready",
+        "ready": not blockers,
+        "submissionMode": "paper_order_plan_ready_automatic_submission_requires_global_paper_switch",
+        "serviceBehavior": "evaluate_creates_gated_order_plan; execution submission is separate and idempotent",
+        "paperOnly": True,
+        "liveTradingEnabled": False,
+        "orderPlannerActive": active_order_planner,
+        "riskBudgetActive": active_risk_budget,
+        "executionAdapterActive": active_execution_adapter,
+        "tradingSettingsResolverActive": active_settings,
+        "blockers": blockers,
+    }
+
+
+def _voting_ensemble_paper_trading_readiness(background_runtime: dict[str, Any], execution_readiness: dict[str, Any]) -> dict[str, Any]:
+    active_directional = [entry for entry in VOTING_ENSEMBLE_DIRECTIONAL_STRATEGIES if entry.enabled]
+    active_safety = [entry for entry in VOTING_ENSEMBLE_SAFETY_STRATEGIES if entry.enabled]
+    active_aggregator = [entry for entry in VOTING_ENSEMBLE_AGGREGATOR_STRATEGIES if entry.enabled]
+    blockers: list[str] = []
+    warnings: list[str] = list(background_runtime.get("warnings") or [])
+    if not active_directional:
+        blockers.append("voting_ensemble.paper.no_active_directional_strategies")
+    if not active_safety:
+        blockers.append("voting_ensemble.paper.no_active_safety_modules")
+    if not active_aggregator:
+        blockers.append("voting_ensemble.paper.no_active_aggregator")
+    blockers.extend(background_runtime.get("blockers") or [])
+    blockers.extend(execution_readiness.get("blockers") or [])
+    return {
+        "ready": not blockers,
+        "status": "ready" if not blockers and not warnings else "conditional" if not blockers else "not_ready",
+        "scope": "automatic_paper_trade_submission",
+        "decisionCadence": "event_driven_on_finalized_one_minute_market_data",
+        "tradeCadence": "only_when_profitability_risk_cost_latency_and_operational_gates_pass",
+        "notEveryMinute": True,
+        "manualTradingUnaffected": True,
+        "blockers": list(dict.fromkeys(blockers)),
+        "warnings": list(dict.fromkeys(warnings)),
+        "reasonCodes": [
+            "voting_ensemble.paper.uses_finalized_1m_data_events",
+            "voting_ensemble.paper.trade_requires_profitable_gated_intraday_opportunity",
+        ],
+    }
+
+
+def _voting_ensemble_strategy_counts() -> dict[str, Any]:
+    active = [entry for entry in VOTING_ENSEMBLE_STRATEGIES if entry.enabled]
+    shadow = [entry for entry in VOTING_ENSEMBLE_STRATEGIES if entry.lifecycleStatus == "shadow"]
+    counts_by_collection: dict[str, dict[str, int]] = {}
+    for entry in VOTING_ENSEMBLE_STRATEGIES:
+        key = _enum_value(entry.collection).lower()
+        row = counts_by_collection.setdefault(key, {"total": 0, "active": 0, "shadow": 0})
+        row["total"] += 1
+        if entry.enabled:
+            row["active"] += 1
+        if entry.lifecycleStatus == "shadow":
+            row["shadow"] += 1
+    return {
+        "total": len(VOTING_ENSEMBLE_STRATEGIES),
+        "active": len(active),
+        "shadow": len(shadow),
+        "byCollection": counts_by_collection,
+    }
 
 
 def _voting_ensemble_module_payload(entry: VotingEnsembleStrategyRegistryEntry) -> dict[str, Any]:

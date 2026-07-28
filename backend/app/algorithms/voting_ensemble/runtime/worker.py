@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from threading import Event, Thread
+from time import sleep
 from typing import TYPE_CHECKING, Any, Protocol
 
+from backend.app.alpaca import AlpacaClient
+from backend.app.config import get_settings
 from backend.app.algorithms.voting_ensemble.runtime.commands import VotingEnsembleRuntimeCommand
 from backend.app.algorithms.voting_ensemble.runtime.queue import VotingEnsemblePriorityQueue
 from backend.app.algorithms.voting_ensemble.runtime.status_store import VotingEnsembleStatusStore
 from backend.app.algorithms.voting_ensemble.pipeline import VotingEnsemblePipeline
+from backend.app.tick_data import parse_timestamp
 
 
 if TYPE_CHECKING:
@@ -37,6 +41,7 @@ class VotingEnsembleWorker:
         self.status_store = status_store
         self.service = service or VotingEnsemblePipeline()
         self.backtesting_adapter = backtesting_adapter or _default_backtesting_adapter()
+        self.quote_client = AlpacaClient(get_settings())
 
     def process_once(self, *, timeout: float | None = 0.0) -> dict[str, Any] | None:
         command = self.queue.pop(timeout=timeout)
@@ -53,7 +58,8 @@ class VotingEnsembleWorker:
 
     def _execute(self, command: VotingEnsembleRuntimeCommand) -> dict[str, Any]:
         if command.commandKind in {"manual_evaluation", "finalized_bar_evaluation"}:
-            result = self.service.evaluate(command.payload)
+            payload = self._payload_with_fresh_nbbo(command.payload)
+            result = self.service.evaluate(payload)
             return {
                 "algorithmId": "voting_ensemble",
                 "commandKind": command.commandKind,
@@ -76,7 +82,8 @@ class VotingEnsembleWorker:
                 "reasonCodes": ["voting_ensemble.runtime.backtest.completed"],
             }
         if command.commandKind == "replay":
-            result = self.service.evaluate(command.payload) if command.payload.get("data_timestamp") or command.payload.get("candles") else None
+            payload = self._payload_with_fresh_nbbo(command.payload)
+            result = self.service.evaluate(payload) if payload.get("data_timestamp") or payload.get("candles") else None
             return {
                 "algorithmId": "voting_ensemble",
                 "commandKind": command.commandKind,
@@ -105,6 +112,32 @@ class VotingEnsembleWorker:
             }
         raise ValueError(f"Unsupported Voting Ensemble command kind: {command.commandKind}")
 
+    def _payload_with_fresh_nbbo(self, payload: dict[str, Any]) -> dict[str, Any]:
+        symbol = str(payload.get("symbol") or "SPY").upper()
+        feed = str(payload.get("feed") or payload.get("marketDataFeed") or "iex").lower()
+        try:
+            quote = self.quote_client.get_latest_quote_sync(symbol=symbol, feed=feed)
+        except Exception:
+            return payload
+        if not quote:
+            return payload
+        enriched = dict(payload)
+        enriched["nbbo"] = quote
+        timestamps = [
+            parse_timestamp(enriched.get("data_timestamp")),
+            parse_timestamp(quote.get("quoteTimestamp")),
+            parse_timestamp(quote.get("lastTradeTimestamp")),
+            parse_timestamp(quote.get("marketDataReceiptTimestamp")),
+        ]
+        latest = max((timestamp for timestamp in timestamps if timestamp is not None), default=None)
+        if latest is not None:
+            enriched["data_timestamp"] = latest.isoformat().replace("+00:00", "Z")
+        context = dict(enriched.get("market_context") or {})
+        context["nbbo"] = quote
+        context["nbboSource"] = "worker_hydrated_alpaca_latest_quote"
+        enriched["market_context"] = context
+        return enriched
+
 
 class InProcessVotingEnsembleWorkerAdapter:
     """Test adapter that runs the production worker loop in-process."""
@@ -129,17 +162,37 @@ class VotingEnsembleWorkerThread:
         self.worker = worker
         self._stop = Event()
         self._thread = Thread(target=self._run, name="voting-ensemble-runtime-worker", daemon=True)
+        self.startedAt: str | None = None
+        self.lastError: str | None = None
+        self.lastErrorAt: str | None = None
 
     def start(self) -> None:
         if not self._thread.is_alive():
+            self.startedAt = datetime.now(UTC).isoformat()
             self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
 
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "alive": self.is_alive(),
+            "startedAt": self.startedAt,
+            "lastError": self.lastError,
+            "lastErrorAt": self.lastErrorAt,
+        }
+
     def _run(self) -> None:
         while not self._stop.is_set():
-            self.worker.process_once(timeout=0.25)
+            try:
+                self.worker.process_once(timeout=0.25)
+            except Exception as exc:  # pragma: no cover - defensive worker liveness guard
+                self.lastError = str(exc) or type(exc).__name__
+                self.lastErrorAt = datetime.now(UTC).isoformat()
+                sleep(0.25)
 
 
 def _is_stale(command: VotingEnsembleRuntimeCommand) -> bool:

@@ -1828,6 +1828,39 @@ def ingest_quote_trade_ticks_endpoint(payload: dict = Body(...)) -> dict:
     return append_quote_trade_ticks(symbol=symbol, feed=feed, quotes=quotes, trades=trades)
 
 
+@app.get("/api/market-data/quotes/latest")
+async def latest_market_data_quote(symbol: str = Query("SPY"), feed: str = Query("iex")) -> dict:
+    normalized_symbol = symbol.upper().strip() or "SPY"
+    normalized_feed = feed.lower().strip() or "iex"
+    if not settings.has_alpaca_credentials:
+        return {
+            "status": "unavailable",
+            "symbol": normalized_symbol,
+            "feed": normalized_feed,
+            "quote": None,
+            "reasonCodes": ["market_data.nbbo.alpaca_credentials_missing"],
+        }
+    try:
+        quote = await alpaca.get_latest_quote(symbol=normalized_symbol, feed=normalized_feed)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Latest quote feed unavailable: {exc}") from exc
+    if quote is None:
+        return {
+            "status": "unavailable",
+            "symbol": normalized_symbol,
+            "feed": normalized_feed,
+            "quote": None,
+            "reasonCodes": ["market_data.nbbo.latest_quote_missing"],
+        }
+    return {
+        "status": "ready",
+        "symbol": normalized_symbol,
+        "feed": normalized_feed,
+        "quote": quote,
+        "reasonCodes": ["market_data.nbbo.latest_quote_ready"],
+    }
+
+
 @app.post("/api/execution-cost-model/train")
 def train_execution_cost_candidate_endpoint(payload: dict = Body(...)) -> dict:
     symbol = str(payload.get("symbol") or "SPY").upper()

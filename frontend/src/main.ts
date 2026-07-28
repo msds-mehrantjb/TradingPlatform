@@ -453,6 +453,14 @@ type AlgoVote = {
   score?: number;
 };
 
+type VotingBacktestQuality = {
+  paperReady: boolean;
+  statusCap: StrategyFit["status"];
+  scoreCap: number;
+  label: string;
+  reason: string;
+};
+
 type VotingEnsembleBackendVote = {
   strategy: string;
   role: "directional" | "context";
@@ -497,6 +505,20 @@ type VotingEnsembleBackendResult = {
   safety_gate_failed?: boolean;
   removed_voters: string[];
   reason_codes: string[];
+};
+
+type VotingEnsembleNbboSnapshot = {
+  provider?: string;
+  feed?: string;
+  symbol?: string;
+  bid: number;
+  ask: number;
+  bidSize: number;
+  askSize: number;
+  quoteTimestamp: string;
+  lastTradeTimestamp: string;
+  marketDataReceiptTimestamp: string;
+  source?: string;
 };
 
 type VotingEnsembleEvaluationJob = {
@@ -3010,6 +3032,10 @@ const state = {
   votingEnsembleBackendStatus: "idle" as "idle" | "loading" | "ready" | "error",
   votingEnsembleBackendWarning: "",
   votingEnsembleBackendKey: "",
+  votingEnsembleNbbo: null as VotingEnsembleNbboSnapshot | null,
+  votingEnsembleNbboStatus: "idle" as "idle" | "loading" | "ready" | "unavailable" | "error",
+  votingEnsembleNbboWarning: "",
+  votingEnsembleNbboKey: "",
   votingEnsembleInventory: emptyVotingEnsembleInventory(),
   votingEnsembleInventoryStatus: "idle" as "idle" | "loading" | "ready" | "error",
   votingEnsembleInventoryWarning: "",
@@ -5886,7 +5912,7 @@ function compactMarketContext(context: MarketContext | null) {
   return {
     regime: compactLayer(context.regime),
     session: compactLayer(context.session),
-    event: compactLayer(context.event),
+    event: compactTimestampedEventLayer(context),
     strategies: context.strategies.map((strategy) => ({
       name: strategy.name,
       status: strategy.status,
@@ -5895,6 +5921,24 @@ function compactMarketContext(context: MarketContext | null) {
       risks: strategy.risks,
     })),
   };
+}
+
+function compactTimestampedEventLayer(context: MarketContext) {
+  const eventLayer = context.event as MarketLayer & Record<string, unknown>;
+  const providerTimestamp = stringField(eventLayer.providerTimestamp) ?? stringField(eventLayer.sourceTimestamp) ?? stringField(eventLayer.timestamp);
+  const receiptTimestamp = stringField(eventLayer.receiptTimestamp) ?? stringField(eventLayer.receivedAt);
+  if (!providerTimestamp && !receiptTimestamp) {
+    return undefined;
+  }
+  return {
+    ...compactLayer(context.event),
+    ...(providerTimestamp ? { providerTimestamp } : {}),
+    ...(receiptTimestamp ? { receiptTimestamp } : {}),
+  };
+}
+
+function stringField(value: unknown) {
+  return typeof value === "string" && value.trim() ? value : null;
 }
 
 function compactLayer(layer: MarketLayer) {
@@ -8047,6 +8091,10 @@ function canSubmitAutomaticTrades() {
   return globalPaperTradingEnabled() && isMarketOpenForOrders();
 }
 
+function canSubmitVotingEnsembleAutomaticPaperTrades() {
+  return canSubmitAutomaticTrades();
+}
+
 function tradeSubmissionBlockedTitle(submitMode: SubmitOrderMode | "Manual" | "Automatic" = "Manual") {
   if (!isMarketOpenForOrders()) {
     return "Market is closed";
@@ -8060,8 +8108,8 @@ function updateTradeToggleButton() {
   tradeToggleButton.setAttribute("aria-pressed", String(enabled));
   tradeToggleButton.dataset.enabled = String(enabled);
   tradeToggleButton.title = enabled
-    ? "Automatic paper trading enabled for all dashboard algorithms"
-    : "Automatic paper trading disabled for all dashboard algorithms; manual orders remain available while the market is open";
+    ? "Automatic paper trading enabled for Voting Ensemble and other dashboard algorithms"
+    : "Automatic paper trading disabled for Voting Ensemble and other dashboard algorithms; manual orders remain available while the market is open";
 }
 
 function updateOrderButtonStates(position: PositionSummary) {
@@ -9029,7 +9077,8 @@ function maybeAutoSubmitTargetOrder() {
   }
   const latest = latestExecutionCandleForMode("ensemble");
   const order = state.currentTargetOrder;
-  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitAutomaticTrades()) {
+  const backtestQuality = currentVotingBacktestQuality();
+  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitVotingEnsembleAutomaticPaperTrades() || backtestQuality?.paperReady !== true) {
     return;
   }
   if (order.side === "Sell") {
@@ -9507,7 +9556,11 @@ function maybeAutoSubmitOpenOrderControls() {
   if (automaticSubmitInFlight || !canSubmitAutomaticTrades()) {
     return;
   }
+  const ensembleBacktestQuality = currentVotingBacktestQuality();
   for (const mode of ["ensemble", "weighted", "confidence", "regime", "meta"] as TradingWindowMode[]) {
+    if (mode === "ensemble" && (!canSubmitVotingEnsembleAutomaticPaperTrades() || ensembleBacktestQuality?.paperReady !== true)) {
+      continue;
+    }
     const latest = latestExecutionCandleForMode(mode);
     if (!latest) {
       continue;
@@ -9562,6 +9615,9 @@ function submitSelectedOpenOrderSell(mode: TradingWindowMode = activeTradingMode
 function submitOpenOrderLot(lotId: string, automatic: boolean, mode: TradingWindowMode = state.tradingWindowMode) {
   const latest = latestExecutionCandleForMode(mode);
   if (!latest || !(automatic ? canSubmitAutomaticTrades() : canSubmitManualTrades())) {
+    return;
+  }
+  if (automatic && mode === "ensemble" && !canSubmitVotingEnsembleAutomaticPaperTrades()) {
     return;
   }
   const lot = openOrderLots(mode).find((item) => item.id === lotId);
@@ -10428,6 +10484,19 @@ function updateAlgorithmPanel(_candles: Candle[]) {
   const sellVotes = state.votingEnsembleBackend?.eligible_counts.Sell ?? eligibleVotes.filter((vote) => vote.signal === "Sell").length;
   const holdVotes = state.votingEnsembleBackend?.eligible_counts.Hold ?? eligibleVotes.filter((vote) => vote.signal === "Hold").length;
   const finalSignal = activeVotingEnsembleSignal(state.votingEnsembleBackend?.final_signal ?? "Hold");
+  const backtestCandles =
+    state.algoBacktestCandles.length || state.algoBacktestTimeframe !== state.timeframe
+      ? state.algoBacktestCandles
+      : state.candles;
+  const backtest =
+    state.algoBacktestTimeframe === "Trading"
+      ? null
+      : compactVotingBacktestForDisplay(
+          state.algoBacktestResult ?? backtestVotingEnsembleLastDay(backtestCandles, state.algoBacktestTimeframe),
+          { preserveTrades: state.algoBacktestTimeframe === "1Min" || state.algoBacktestTimeframe === "5Min" },
+        );
+  const backtestQuality = backtest ? votingBacktestQuality(backtest) : null;
+  const displayVotes = backtestQuality ? applyBacktestQualityToVotes(votes, backtestQuality) : votes;
 
   updateAlgoBacktestControls();
   algoFinalSignal.textContent = finalSignal;
@@ -10451,7 +10520,7 @@ function updateAlgorithmPanel(_candles: Candle[]) {
       `,
     )
     .join("");
-  algoVoteList.innerHTML = votes.map(renderAlgoVoteRow).join("");
+  algoVoteList.innerHTML = displayVotes.map(renderAlgoVoteRow).join("");
   algoVotesToggleMeta.textContent =
     state.votingEnsembleBackendStatus === "ready"
       ? `${directionalBuyVotes}B/${directionalSellVotes}S/${directionalHoldVotes}H total - actionable ${buyVotes}B/${sellVotes}S/${holdVotes}H - ${excludedVotes} watch/avoid`
@@ -10481,18 +10550,13 @@ function updateAlgorithmPanel(_candles: Candle[]) {
   updateTradingSettingsMount(manualOrder ?? undefined, {
     preserveExisting: state.tradingRagStatus === "loading",
   });
-  const backtestCandles =
-    state.algoBacktestCandles.length || state.algoBacktestTimeframe !== state.timeframe
-      ? state.algoBacktestCandles
-      : state.candles;
-  const backtest = compactVotingBacktestForDisplay(
-    state.algoBacktestResult ?? backtestVotingEnsembleLastDay(backtestCandles, state.algoBacktestTimeframe),
-    { preserveTrades: state.algoBacktestTimeframe === "1Min" || state.algoBacktestTimeframe === "5Min" },
-  );
+  if (!backtest || !backtestQuality) {
+    return;
+  }
   algoTableWrap.hidden = true;
-  setAlgoTradePlanContent(renderAlgoTradePlan(finalSignal, votes, backtest));
+  setAlgoTradePlanContent(renderAlgoTradePlan(finalSignal, displayVotes, backtest, backtestQuality));
   renderAlgoIntradayTrades(backtest);
-  algoResultsBody.innerHTML = renderAlgoResults(finalSignal, buyVotes, sellVotes, holdVotes, votes, backtest);
+  algoResultsBody.innerHTML = renderAlgoResults(finalSignal, buyVotes, sellVotes, holdVotes, displayVotes, backtest, backtestQuality);
   maybeAutoSubmitTargetOrder();
   maybeAutoSubmitOpenOrderControls();
   void maybeSaveDecisionSnapshot("algorithm-panel");
@@ -14269,12 +14333,15 @@ let weightedVotingBackendRequestInFlight = false;
 let votingEnsembleBackendRequestInFlight = false;
 
 async function ensureVotingEnsembleBackendDecision(options: { force?: boolean } = {}) {
+  await refreshVotingEnsembleNbbo({ force: true });
+  await ensureVotingEnsembleAuxiliaryCandles({ refresh: options.force ?? false });
   const payload = votingEnsembleEvaluatePayload();
   const requestKey = JSON.stringify({
     symbol: state.symbol,
     latest: payload?.data_timestamp ?? "no-candles",
     count: payload?.candles.length ?? 0,
     contextUpdatedAt: state.marketContext?.updatedAt ?? "",
+    nbbo: payload?.nbbo?.quoteTimestamp ?? "missing-nbbo",
   });
   if (
     votingEnsembleBackendRequestInFlight ||
@@ -14285,9 +14352,14 @@ async function ensureVotingEnsembleBackendDecision(options: { force?: boolean } 
     return;
   }
   if (!payload) {
-    state.votingEnsembleBackend = null;
-    state.votingEnsembleBackendStatus = "idle";
-    state.votingEnsembleBackendWarning = "Waiting for candles before requesting backend Voting Ensemble.";
+    if (state.votingEnsembleBackend) {
+      state.votingEnsembleBackendStatus = "ready";
+      state.votingEnsembleBackendWarning = "";
+    } else {
+      state.votingEnsembleBackend = null;
+      state.votingEnsembleBackendStatus = "idle";
+      state.votingEnsembleBackendWarning = "Waiting for candles before requesting backend Voting Ensemble.";
+    }
     state.votingEnsembleBackendKey = requestKey;
     return;
   }
@@ -14343,6 +14415,114 @@ async function fetchVotingEnsembleDecision(payload: ReturnType<typeof votingEnse
     }
   }
   throw new Error(lastMessage);
+}
+
+async function ensureVotingEnsembleAuxiliaryCandles(options: { refresh?: boolean } = {}) {
+  const source = latestRegularSessionCandles().length ? latestRegularSessionCandles() : state.candles;
+  const latest = source.at(-1);
+  const evaluationTimestamp = latest ? votingEnsembleEvaluationTimestamp(latest) : "";
+  const needsRefresh = options.refresh || !votingEnsembleAuxiliaryCandlesReady(evaluationTimestamp);
+  if (!needsRefresh) {
+    return;
+  }
+  await loadWeightedMarketData({ refresh: true });
+  for (let attempt = 0; attempt < 20 && weightedMarketDataInFlight; attempt += 1) {
+    await wait(100);
+  }
+}
+
+function votingEnsembleAuxiliaryCandlesReady(evaluationTimestamp: string) {
+  const evaluationTime = new Date(evaluationTimestamp).getTime();
+  if (!Number.isFinite(evaluationTime)) {
+    return false;
+  }
+  return weightedRelativeStrengthSymbols.every((symbol) => {
+    const latest = state.weightedMarketData.candlesBySymbol[symbol]?.at(-1);
+    if (!latest) {
+      return false;
+    }
+    const latestEnd = new Date(votingEnsembleEvaluationTimestamp(latest)).getTime();
+    return Number.isFinite(latestEnd) && evaluationTime - latestEnd <= 5 * 60_000;
+  });
+}
+
+async function refreshVotingEnsembleNbbo(options: { force?: boolean } = {}) {
+  const latest = latestRegularSessionCandles().at(-1) ?? state.candles.at(-1);
+  const evaluationTimestamp = latest ? votingEnsembleEvaluationTimestamp(latest) : "";
+  const requestKey = JSON.stringify({ symbol: state.symbol, feed: state.feed, evaluationTimestamp });
+  if (!options.force && state.votingEnsembleNbboKey === requestKey && state.votingEnsembleNbboStatus === "loading") {
+    return;
+  }
+  state.votingEnsembleNbboKey = requestKey;
+  state.votingEnsembleNbboStatus = state.votingEnsembleNbboStatus === "ready" ? "ready" : "loading";
+  state.votingEnsembleNbboWarning = "";
+  let lastMessage = "Latest NBBO quote route unavailable";
+  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+    try {
+      const params = new URLSearchParams({ symbol: state.symbol, feed: state.feed });
+      const response = await fetchWithTimeout(`${baseUrl}/api/market-data/quotes/latest?${params.toString()}`, 5000);
+      if (response.ok) {
+        const body = await response.json();
+        const quote = normalizeVotingEnsembleNbbo(body);
+        if (quote) {
+          state.votingEnsembleNbbo = quote;
+          state.votingEnsembleNbboStatus = "ready";
+          state.votingEnsembleNbboWarning = "";
+          return;
+        }
+        state.votingEnsembleNbbo = null;
+        state.votingEnsembleNbboStatus = "unavailable";
+        state.votingEnsembleNbboWarning = nbboUnavailableMessage(body);
+        return;
+      }
+      lastMessage = response.status === 404 ? `Latest NBBO quote route not loaded on ${baseUrl}` : await readableResponseError(response);
+      if (response.status !== 404) {
+        throw new Error(lastMessage);
+      }
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : lastMessage;
+    }
+  }
+  state.votingEnsembleNbbo = null;
+  state.votingEnsembleNbboStatus = "error";
+  state.votingEnsembleNbboWarning = lastMessage;
+}
+
+function normalizeVotingEnsembleNbbo(raw: unknown): VotingEnsembleNbboSnapshot | null {
+  const record = isRecord(raw) ? raw : {};
+  if (record.status && record.status !== "ready") {
+    return null;
+  }
+  const quote = childRecord(record, "quote") ?? record;
+  const bid = numberFromUnknown(quote.bid, 0);
+  const ask = numberFromUnknown(quote.ask, 0);
+  const bidSize = numberFromUnknown(quote.bidSize ?? quote.bid_size, 0);
+  const askSize = numberFromUnknown(quote.askSize ?? quote.ask_size, 0);
+  const quoteTimestamp = stringFromUnknown(quote.quoteTimestamp ?? quote.timestamp, "");
+  const lastTradeTimestamp = stringFromUnknown(quote.lastTradeTimestamp ?? quoteTimestamp, "");
+  const marketDataReceiptTimestamp = stringFromUnknown(quote.marketDataReceiptTimestamp ?? quote.receiptTimestamp ?? quote.receivedAt, "");
+  if (!bid || !ask || ask < bid || !bidSize || !askSize || !quoteTimestamp || !lastTradeTimestamp || !marketDataReceiptTimestamp) {
+    return null;
+  }
+  return {
+    provider: stringFromUnknown(quote.provider, ""),
+    feed: stringFromUnknown(quote.feed, ""),
+    symbol: stringFromUnknown(quote.symbol, state.symbol),
+    bid,
+    ask,
+    bidSize,
+    askSize,
+    quoteTimestamp,
+    lastTradeTimestamp,
+    marketDataReceiptTimestamp,
+    source: stringFromUnknown(quote.source, "latest_nbbo_quote"),
+  };
+}
+
+function nbboUnavailableMessage(raw: unknown) {
+  const record = isRecord(raw) ? raw : {};
+  const codes = arrayFromUnknown(record.reasonCodes).map((value) => String(value));
+  return codes.length ? codes.join(", ") : "Latest NBBO quote unavailable";
 }
 
 async function pollVotingEnsembleEvaluationJob(baseUrl: string, job: VotingEnsembleEvaluationJob) {
@@ -14614,13 +14794,19 @@ function votingEnsembleEvaluatePayload() {
   if (!latest) {
     return null;
   }
+  const dataTimestamp = votingEnsembleDecisionTimestamp(latest, state.votingEnsembleNbbo);
+  const nbbo = votingEnsembleNbboForEvaluation(dataTimestamp);
   return {
     symbol: state.symbol,
-    data_timestamp: latest.timestamp,
+    data_timestamp: dataTimestamp,
     candles: candles.map(votingCandlePayload),
+    spy_5m_candles: aggregateCandlesToFiveMinute(candles).map(votingCandlePayload),
+    spy_15m_candles: aggregateCandlesToMinutes(candles, 15, "15Min").map(votingCandlePayload),
+    ...(nbbo ? { nbbo } : {}),
     market_context: {
       ...(state.marketContext ? compactMarketContext(state.marketContext) : {}),
       ...votingEnsembleLevelContext(candles, state.candles),
+      ...votingEnsemblePermissionContext(dataTimestamp),
     },
     external_breadth_feed: votingEnsembleExternalBreadthFeed(),
     qqq_candles: (state.weightedMarketData.candlesBySymbol.QQQ ?? []).slice(-240).map(votingCandlePayload),
@@ -14629,6 +14815,124 @@ function votingEnsembleEvaluatePayload() {
       weightedBreadthProxySymbols.map((symbol) => [symbol, (state.weightedMarketData.candlesBySymbol[symbol] ?? []).slice(-240).map(votingCandlePayload)]),
     ),
   };
+}
+
+function votingEnsemblePermissionContext(dataTimestamp: string) {
+  const automaticPaperEnabled = canSubmitVotingEnsembleAutomaticPaperTrades();
+  const marketOpen = isMarketOpenForOrders();
+  const latest = latestRegularSessionCandles().at(-1) ?? currentCandle();
+  const sessionPhase = latest && isRegularSession(latest.timestamp) ? "regular" : marketOpen ? "regular" : "closed";
+  const globalGateDecision = votingEnsembleGlobalGateDecision(dataTimestamp, automaticPaperEnabled, marketOpen);
+  return {
+    sessionState: {
+      phase: sessionPhase,
+      marketClosed: !marketOpen,
+      marketStatus: state.marketStatus,
+    },
+    operationalHealthSnapshot: {
+      status: "ready",
+      tradingEnabled: automaticPaperEnabled,
+      automaticPaperTradingEnabled: globalPaperTradingEnabled(),
+      paperTradingMode: true,
+      liveTradingEnabled: false,
+      marketOpen,
+      entryWindowOpen: marketOpen,
+      validSession: marketOpen && sessionPhase !== "closed",
+      feedDegraded: false,
+      clockDisagreement: false,
+      executionFailureCooldownActive: false,
+      globalGateDecision,
+      upstreamGlobalGateDecision: globalGateDecision,
+      permissionContractVersion: "voting_ensemble_dashboard_permission_contract_v1",
+    },
+  };
+}
+
+function votingEnsembleGlobalGateDecision(dataTimestamp: string, automaticPaperEnabled: boolean, marketOpen: boolean) {
+  const eligible = automaticPaperEnabled && marketOpen;
+  return {
+    status: eligible ? "PASS" : "FAIL",
+    eligible,
+    dataReady: true,
+    gateResults: [],
+    reasonCodes: eligible
+      ? ["dashboard.global_gate.automatic_paper_trading_allowed"]
+      : [
+          !globalPaperTradingEnabled() ? "dashboard.global_gate.automatic_paper_trading_disabled" : "",
+          !marketOpen ? "dashboard.global_gate.market_closed" : "",
+        ].filter(Boolean),
+    explanation: eligible
+      ? "Dashboard upstream global gate allows automatic paper evaluation for Voting Ensemble."
+      : "Dashboard upstream global gate blocks automatic paper entries.",
+    checkedAt: dataTimestamp,
+    sessionDate: easternDateString(dataTimestamp),
+    configurationHash: `dashboard-global-gate:${eligible ? "pass" : "fail"}:${state.marketStatus}:${globalPaperTradingEnabled() ? "paper-on" : "paper-off"}`,
+  };
+}
+
+function votingEnsembleEvaluationTimestamp(candle: Candle) {
+  const timestamp = new Date(candle.timestamp);
+  if (Number.isNaN(timestamp.getTime())) {
+    return candle.timestamp;
+  }
+  timestamp.setUTCMinutes(timestamp.getUTCMinutes() + timeframeMinutes(candle.timeframe));
+  return timestamp.toISOString();
+}
+
+function votingEnsembleDecisionTimestamp(candle: Candle, nbbo: VotingEnsembleNbboSnapshot | null) {
+  const candleEnd = new Date(votingEnsembleEvaluationTimestamp(candle)).getTime();
+  const quoteTime = nbbo ? new Date(nbbo.quoteTimestamp).getTime() : Number.NaN;
+  const tradeTime = nbbo ? new Date(nbbo.lastTradeTimestamp).getTime() : Number.NaN;
+  const receiptTime = nbbo ? new Date(nbbo.marketDataReceiptTimestamp).getTime() : Number.NaN;
+  const decisionTime = Math.max(
+    Number.isNaN(candleEnd) ? 0 : candleEnd,
+    Number.isNaN(quoteTime) ? 0 : quoteTime,
+    Number.isNaN(tradeTime) ? 0 : tradeTime,
+    Number.isNaN(receiptTime) ? 0 : receiptTime,
+  );
+  return decisionTime > 0 ? new Date(decisionTime).toISOString() : candle.timestamp;
+}
+
+function timeframeMinutes(timeframe: Timeframe) {
+  if (timeframe === "3Min") {
+    return 3;
+  }
+  if (timeframe === "5Min") {
+    return 5;
+  }
+  if (timeframe === "15Min") {
+    return 15;
+  }
+  if (timeframe === "1Hour") {
+    return 60;
+  }
+  if (timeframe === "1Day") {
+    return 390;
+  }
+  return 1;
+}
+
+function votingEnsembleNbboForEvaluation(evaluationTimestamp: string) {
+  const nbbo = state.votingEnsembleNbbo;
+  if (!nbbo) {
+    return null;
+  }
+  const quoteTime = new Date(nbbo.quoteTimestamp).getTime();
+  const tradeTime = new Date(nbbo.lastTradeTimestamp).getTime();
+  const receiptTime = new Date(nbbo.marketDataReceiptTimestamp).getTime();
+  const evaluationTime = new Date(evaluationTimestamp).getTime();
+  if (
+    Number.isNaN(quoteTime) ||
+    Number.isNaN(tradeTime) ||
+    Number.isNaN(receiptTime) ||
+    Number.isNaN(evaluationTime) ||
+    quoteTime > evaluationTime ||
+    tradeTime > evaluationTime ||
+    receiptTime > evaluationTime
+  ) {
+    return null;
+  }
+  return nbbo;
 }
 
 function votingEnsembleExternalBreadthFeed() {
@@ -16629,7 +16933,12 @@ function votingEnsembleBuyQuantitySizing(
   };
 }
 
-function renderAlgoTradePlan(finalSignal: AlgoSignal, votes: AlgoVote[], backtest: ReturnType<typeof backtestVotingEnsembleLastDay>) {
+function renderAlgoTradePlan(
+  finalSignal: AlgoSignal,
+  votes: AlgoVote[],
+  backtest: ReturnType<typeof backtestVotingEnsembleLastDay>,
+  backtestQuality?: VotingBacktestQuality,
+) {
   const latest = currentCandle();
   const evaluatedAt = formatTimeWithSeconds(new Date().toISOString());
   const latestCandleAt = latest ? formatTimeWithSeconds(latest.timestamp) : "No candle";
@@ -16660,6 +16969,7 @@ function renderAlgoTradePlan(finalSignal: AlgoSignal, votes: AlgoVote[], backtes
   const gateResult = tradingDecisionGateResult(finalSignal);
   const mlResult = tradingDecisionMlResult(finalSignal, backtest.timeframe);
   const finalDecision = tradingDecisionFinalResult(finalSignal, gateResult, mlResult);
+  const backtestQualityEvidence = backtestQuality && !backtestQuality.paperReady ? ` Backtest readiness: ${backtestQuality.reason}` : "";
 
   return `
     <div class="trading-decision-flow" aria-label="Normalized trading decision architecture">
@@ -16678,7 +16988,7 @@ function renderAlgoTradePlan(finalSignal: AlgoSignal, votes: AlgoVote[], backtes
         finalSignal,
         `${directionalCounts.Buy} Buy / ${directionalCounts.Sell} Sell / ${directionalCounts.Hold} Hold`,
         `Actionable subset: ${eligibleCounts.Buy}B / ${eligibleCounts.Sell}S / ${eligibleCounts.Hold}H; ${eligibleVotes.length} eligible of ${votes.length}; ${votes.length - eligibleVotes.length} watch/avoid.`,
-        `${strategyDescription}; independent strategy outputs only.`,
+        `${strategyDescription}; independent strategy outputs only.${backtestQualityEvidence}`,
         finalSignal === "Hold" ? "hold" : "pass",
       )}
       ${renderTradingDecisionStage(
@@ -16758,7 +17068,7 @@ function tradingDecisionContextResult(finalSignal: AlgoSignal): {
               ? "No trade candidate"
               : "Mixed context",
       result: backendConfirmation.detail,
-      evidence: backendConfirmation.evidence.length ? backendConfirmation.evidence.join(" | ") : "No context confirmation signals available.",
+      evidence: backendConfirmation.evidence.length ? summarizeVotingEnsembleGateEvidence(backendConfirmation.evidence) : "No context confirmation signals available.",
       status:
         backendConfirmation.outcome === "confirms"
           ? "pass"
@@ -16802,6 +17112,43 @@ function tradingDecisionContextResult(finalSignal: AlgoSignal): {
     evidence: directionalLayers.join(" | "),
     status: conflicts ? "caution" : confirms ? "pass" : "info",
   };
+}
+
+function summarizeVotingEnsembleGateEvidence(evidence: string[]) {
+  const labels = evidence
+    .filter((code) => !looksLikeHash(code))
+    .map(votingEnsembleGateLabel);
+  return Array.from(new Set(labels)).join(" | ");
+}
+
+function votingEnsembleGateLabel(code: string) {
+  const normalized = code.toLowerCase();
+  if (normalized.includes("global_hard_gate_block")) {
+    return "Upstream global gate blocked automatic paper entry";
+  }
+  if (normalized.includes("trading_disabled")) {
+    return "Automatic paper trading is off";
+  }
+  if (normalized.includes("global_upstream_not_provided")) {
+    return "Upstream global gate contract missing";
+  }
+  if (normalized.includes("global_upstream_allows")) {
+    return "Upstream global gate allows evaluation";
+  }
+  if (normalized.includes("stale_or_missing_quote:passed")) {
+    return "NBBO quote fresh";
+  }
+  if (normalized.includes("invalid_bid_ask:passed")) {
+    return "Bid/ask valid";
+  }
+  if (normalized.includes(":passed")) {
+    return code.replace(/^voting_ensemble\.local_gate\./, "").replaceAll("_", " ");
+  }
+  return code;
+}
+
+function looksLikeHash(value: string) {
+  return value.length >= 8 && /^[0-9a-f]+$/i.test(value);
 }
 
 function tradingDecisionGateResult(finalSignal: AlgoSignal): {
@@ -16918,6 +17265,7 @@ function renderAlgoResults(
   holdVotes: number,
   votes: AlgoVote[],
   backtest: BacktestResult,
+  backtestQuality?: VotingBacktestQuality,
 ) {
   const strongest = [...votes].sort((a, b) => (b.score ?? -1) - (a.score ?? -1))[0];
   const strongestLabel =
@@ -16932,6 +17280,7 @@ function renderAlgoResults(
     <span>Actionable Buy ${buyVotes} / Sell ${sellVotes} / Hold ${holdVotes}</span>
     <span>Highest-ranked strategy: ${escapeHtml(strongestLabel)}</span>
     <span>Backtest status: <strong class="algo-backtest-status" data-status="${algoBacktestStatusKind()}">${escapeHtml(algoBacktestStatusLabel())}</strong></span>
+    <span>Paper readiness: ${escapeHtml(backtestQuality?.label ?? "Unknown")}</span>
     <span>ML artifact: ${escapeHtml(compactMlArtifactLabel(backtest.timeframe))}</span>
     <span>Backtest timeframe: ${algoBacktestTimeframeLabel(backtest.timeframe)}</span>
     <span>Backtest range: ${escapeHtml(rangeLabel)}</span>
@@ -20537,6 +20886,84 @@ function renderAuthoritativeSessionLayer(
     <span class="signal-chip" data-status="${["unknown", "stale", "incomplete", "invalid"].includes(readinessRaw) ? "unknown" : "ok"}"><span>Readiness</span><strong>${escapeHtml(readiness)}</strong></span>
     ${unknownOrStale ? `<span class="signal-chip" data-status="unknown"><span>Evidence</span><strong>Unknown / stale</strong></span>` : ""}
   `;
+}
+
+function votingBacktestQuality(backtest: BacktestResult): VotingBacktestQuality {
+  const totalTrades = backtest.totalTrades ?? backtest.trades.length;
+  const winRate = totalTrades ? backtest.winners / totalTrades : 0;
+  const profitFactor = typeof backtest.profitFactor === "number" ? backtest.profitFactor : null;
+  const issues: string[] = [];
+  let statusCap: StrategyFit["status"] = "Strong Fit";
+  let scoreCap = 100;
+  if (totalTrades < 30) {
+    issues.push(`sample ${totalTrades}/30 trades`);
+    statusCap = "Watch";
+    scoreCap = Math.min(scoreCap, 61);
+  }
+  if (backtest.totalPnl <= 0) {
+    issues.push(`net P/L ${signedCurrency(backtest.totalPnl)}`);
+    statusCap = "Avoid";
+    scoreCap = Math.min(scoreCap, 44);
+  }
+  if (profitFactor === null || profitFactor < 1.1) {
+    issues.push(`PF ${profitFactor ?? "NA"}/1.10`);
+    statusCap = "Avoid";
+    scoreCap = Math.min(scoreCap, 44);
+  }
+  if (winRate < 0.4) {
+    issues.push(`win rate ${Math.round(winRate * 100)}%/40%`);
+    statusCap = statusCap === "Avoid" ? "Avoid" : "Watch";
+    scoreCap = Math.min(scoreCap, statusCap === "Avoid" ? 44 : 61);
+  }
+  const paperReady = issues.length === 0;
+  return {
+    paperReady,
+    statusCap,
+    scoreCap,
+    label: paperReady ? "Ready by backtest economics" : `Blocked by backtest economics - ${issues.join(", ")}`,
+    reason: paperReady ? "backtest economics pass paper-readiness thresholds." : issues.join(", "),
+  };
+}
+
+function currentVotingBacktestQuality(): VotingBacktestQuality | null {
+  if (state.algoBacktestTimeframe === "Trading") {
+    return null;
+  }
+  const backtestCandles =
+    state.algoBacktestCandles.length || state.algoBacktestTimeframe !== state.timeframe
+      ? state.algoBacktestCandles
+      : state.candles;
+  const backtest = compactVotingBacktestForDisplay(
+    state.algoBacktestResult ?? backtestVotingEnsembleLastDay(backtestCandles, state.algoBacktestTimeframe),
+    { preserveTrades: state.algoBacktestTimeframe === "1Min" || state.algoBacktestTimeframe === "5Min" },
+  );
+  return votingBacktestQuality(backtest);
+}
+
+function applyBacktestQualityToVotes(votes: AlgoVote[], quality: VotingBacktestQuality): AlgoVote[] {
+  if (quality.paperReady) {
+    return votes;
+  }
+  return votes.map((vote) => {
+    if (vote.signal === "Hold" || typeof vote.score !== "number") {
+      return vote;
+    }
+    const cappedScore = Math.min(vote.score, quality.scoreCap);
+    const cappedStatus = capStrategyFitStatus(vote.status, quality.statusCap);
+    return {
+      ...vote,
+      score: cappedScore,
+      status: cappedStatus,
+      detail: `${vote.detail} Backtest economics block paper readiness: ${quality.reason}.`,
+    };
+  });
+}
+
+function capStrategyFitStatus(status: StrategyFit["status"] | undefined, cap: StrategyFit["status"]): StrategyFit["status"] {
+  const order: StrategyFit["status"][] = ["Avoid", "Watch", "Allowed", "Strong Fit"];
+  const statusIndex = status ? order.indexOf(status) : order.indexOf("Watch");
+  const capIndex = order.indexOf(cap);
+  return order[Math.min(statusIndex < 0 ? order.indexOf("Watch") : statusIndex, capIndex)];
 }
 
 function sessionClassificationPayload(session: SessionAuthoritativePayload): Record<string, unknown> {

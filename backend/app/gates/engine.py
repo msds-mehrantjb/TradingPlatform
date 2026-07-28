@@ -14,7 +14,7 @@ from backend.app.gates.models import (
 )
 
 
-NON_ENTRY_INTENTS = {"protective_exit", "risk_reducing", "end_of_day_liquidation", "reconciliation"}
+NON_ENTRY_INTENTS = {"strategy_evaluation", "protective_exit", "risk_reducing", "end_of_day_liquidation", "reconciliation"}
 
 
 class GlobalGateEngine:

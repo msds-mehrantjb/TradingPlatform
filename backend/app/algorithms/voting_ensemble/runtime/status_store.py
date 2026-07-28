@@ -9,7 +9,10 @@ from threading import Lock
 from typing import Any, Literal
 
 from backend.app.algorithms.voting_ensemble.intelligence_capture import VotingEnsembleCaptureWriter, capture_operational_event
-from backend.app.algorithms.voting_ensemble.runtime.commands import VotingEnsembleRuntimeCommand
+from backend.app.algorithms.voting_ensemble.runtime.commands import (
+    VOTING_ENSEMBLE_EVALUATION_RESULT_CONTRACT_VERSION,
+    VotingEnsembleRuntimeCommand,
+)
 
 
 VOTING_ENSEMBLE_STATUS_NAMESPACE = "voting_ensemble.runtime.status"
@@ -38,7 +41,7 @@ class VotingEnsembleStatusStore:
         self._lock = Lock()
         self._jobs: dict[str, dict[str, Any]] = {}
         self._idempotency_index: dict[str, str] = {}
-        self._evaluation_index: dict[tuple[str, str, str], str] = {}
+        self._evaluation_index: dict[tuple[str, str, str, str], str] = {}
         self.writerNamespace = VOTING_ENSEMBLE_STATUS_NAMESPACE
         self.persistencePath = Path(persistence_path).resolve() if persistence_path is not None else None
         self.captureWriter = capture_writer
@@ -56,6 +59,7 @@ class VotingEnsembleStatusStore:
                 "algorithmId": "voting_ensemble",
                 "statusNamespace": VOTING_ENSEMBLE_STATUS_NAMESPACE,
                 "statusStoreVersion": VOTING_ENSEMBLE_STATUS_STORE_VERSION,
+                "evaluationResultContractVersion": command.evaluationResultContractVersion,
                 "jobId": command.jobId,
                 "jobType": "evaluate" if command.commandKind in {"manual_evaluation", "finalized_bar_evaluation"} else command.commandKind,
                 "commandId": command.commandId,
@@ -261,7 +265,7 @@ class VotingEnsembleStatusStore:
             bar_end = record.get("barEndTimestamp")
             settings_hash = record.get("settingsHash")
             if isinstance(symbol, str) and isinstance(bar_end, str) and isinstance(settings_hash, str):
-                self._evaluation_index[(symbol.upper(), bar_end, settings_hash)] = job_id
+                self._evaluation_index[(symbol.upper(), bar_end, settings_hash, _evaluation_result_contract(record))] = job_id
 
     def _capture_worker_job_status_locked(self, record: dict[str, Any]) -> None:
         if self.captureWriter is None:
@@ -307,6 +311,21 @@ def _iso(value: datetime | None) -> str | None:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
     return value.astimezone(UTC).isoformat()
+
+
+def _evaluation_result_contract(record: dict[str, Any]) -> str:
+    command = record.get("command")
+    if isinstance(command, dict):
+        version = command.get("evaluationResultContractVersion") or command.get("resultContractVersion")
+        if isinstance(version, str) and version:
+            return version
+    version = record.get("evaluationResultContractVersion") or record.get("resultContractVersion")
+    if isinstance(version, str) and version:
+        return version
+    command_schema = record.get("command", {}).get("commandSchemaVersion") if isinstance(record.get("command"), dict) else None
+    if command_schema == "voting_ensemble_runtime_command_v2":
+        return VOTING_ENSEMBLE_EVALUATION_RESULT_CONTRACT_VERSION
+    return "legacy_evaluation_result_contract"
 
 
 def default_status_store_path() -> Path:

@@ -11,7 +11,8 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 
-VOTING_ENSEMBLE_COMMAND_SCHEMA_VERSION = "voting_ensemble_runtime_command_v1"
+VOTING_ENSEMBLE_COMMAND_SCHEMA_VERSION = "voting_ensemble_runtime_command_v2"
+VOTING_ENSEMBLE_EVALUATION_RESULT_CONTRACT_VERSION = "voting_ensemble_evaluation_result_contract_v2"
 VotingEnsembleCommandKind = Literal[
     "finalized_bar_evaluation",
     "manual_evaluation",
@@ -27,6 +28,7 @@ class VotingEnsembleRuntimeCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     commandSchemaVersion: str = VOTING_ENSEMBLE_COMMAND_SCHEMA_VERSION
+    evaluationResultContractVersion: str = VOTING_ENSEMBLE_EVALUATION_RESULT_CONTRACT_VERSION
     jobId: str = Field(min_length=1)
     commandId: str = Field(min_length=1)
     commandKind: VotingEnsembleCommandKind
@@ -42,10 +44,15 @@ class VotingEnsembleRuntimeCommand(BaseModel):
     source: str = Field(default="api", min_length=1)
 
     @property
-    def evaluation_key(self) -> tuple[str, str, str] | None:
-        if self.commandKind not in {"finalized_bar_evaluation", "manual_evaluation"} or self.barEndTimestamp is None:
+    def evaluation_key(self) -> tuple[str, str, str, str] | None:
+        if self.commandKind != "finalized_bar_evaluation" or self.barEndTimestamp is None:
             return None
-        return (self.symbol.upper(), _iso(self.barEndTimestamp), self.settingsHash)
+        return (
+            self.symbol.upper(),
+            _iso(self.barEndTimestamp),
+            self.settingsHash,
+            VOTING_ENSEMBLE_EVALUATION_RESULT_CONTRACT_VERSION,
+        )
 
 
 def manual_evaluation_command(
@@ -215,12 +222,20 @@ def _idempotency_key(
     settings_hash: str,
     payload: dict[str, Any],
 ) -> str:
-    if command_kind in {"finalized_bar_evaluation", "manual_evaluation"} and bar_end_timestamp is not None:
+    if command_kind == "finalized_bar_evaluation" and bar_end_timestamp is not None:
         base = {
             "kind": command_kind,
             "symbol": symbol.upper(),
             "barEndTimestamp": _iso(bar_end_timestamp),
             "settingsHash": settings_hash,
+            "resultContractVersion": VOTING_ENSEMBLE_EVALUATION_RESULT_CONTRACT_VERSION,
+        }
+    elif command_kind == "manual_evaluation":
+        base = {
+            "kind": command_kind,
+            "symbol": symbol.upper(),
+            "settingsHash": settings_hash,
+            "requestNonce": uuid4().hex,
         }
     else:
         base = {

@@ -35,7 +35,36 @@ class ApiV2EndpointsTest(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["algorithmId"], "voting_ensemble")
         self.assertEqual(body["engineVersion"], "voting_ensemble_v2")
-        self.assertEqual(set(body["modules"]), {"directional", "context", "regime", "safety", "aggregator"})
+        self.assertEqual(body["contractVersion"], "voting_ensemble_isolated_inventory_contract_v2")
+        self.assertEqual(body["displayName"], "Voting Ensemble")
+        self.assertTrue(body["isolatedInventory"]["algorithmOwnsInventory"])
+        self.assertEqual(body["tradingDecisionPolicy"]["decisionInputCadence"], "finalized_1m_market_data_events")
+        self.assertEqual(body["tradingDecisionPolicy"]["tradeCadence"], "opportunity_only_not_every_minute")
+        self.assertTrue(body["paperTradingReadiness"]["notEveryMinute"])
+        self.assertIn(body["paperTradingReadiness"]["status"], {"ready", "conditional", "not_ready"})
+        self.assertIn("backgroundRuntimeHealth", body)
+        self.assertIn("tradingSettingsContract", body)
+        self.assertEqual(body["tradingSettingsContract"]["scope"], "event_driven_intraday_trading_from_finalized_one_minute_data")
+        self.assertTrue(body["tradingSettingsContract"]["paperOnly"])
+        self.assertFalse(body["tradingSettingsContract"]["liveTradingEnabled"])
+        self.assertIn("executionReadiness", body)
+        self.assertIn("strategyCounts", body)
+        self.assertEqual(
+            set(body["modules"]),
+            {
+                "directional",
+                "context",
+                "regime",
+                "safety",
+                "aggregator",
+                "tradingSettings",
+                "riskBudget",
+                "orderPlanner",
+                "executionAdapter",
+                "backtestReplay",
+                "backgroundWorker",
+            },
+        )
         directional = body["modules"]["directional"]
         context = body["modules"]["context"]
         regime = body["modules"]["regime"]
@@ -75,6 +104,11 @@ class ApiV2EndpointsTest(unittest.TestCase):
         self.assertEqual(regime[0]["evidence"], ["Trend strength", "Volatility level", "Structure", "Liquidity", "Session", "Event risk"])
         self.assertEqual([module["id"] for module in safety], ["cash_avoid_trading_filter"])
         self.assertEqual([module["id"] for module in aggregator], ["ensemble_strategy_voting"])
+        self.assertEqual([module["id"] for module in body["modules"]["tradingSettings"]], ["trading_settings_resolver"])
+        self.assertEqual([module["id"] for module in body["modules"]["riskBudget"]], ["risk_budget"])
+        self.assertEqual([module["id"] for module in body["modules"]["orderPlanner"]], ["order_planner"])
+        self.assertEqual([module["id"] for module in body["modules"]["executionAdapter"]], ["execution_adapter"])
+        self.assertEqual([module["id"] for module in body["modules"]["backgroundWorker"]], ["background_worker"])
         non_aggregators = directional + context + regime + safety
         self.assertNotIn("ensemble_strategy_voting", {module["id"] for module in non_aggregators})
 

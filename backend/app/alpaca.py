@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from random import Random
 
@@ -180,6 +181,62 @@ class AlpacaClient:
             result["warning"] = calendar_warning
         return result
 
+    async def get_latest_quote(self, *, symbol: str, feed: str) -> dict | None:
+        if not self.settings.has_alpaca_credentials:
+            return None
+
+        params: dict[str, str] = {"feed": feed}
+        url = f"{self.settings.alpaca_data_base_url}/stocks/{symbol}/quotes/latest"
+        headers = {
+            "APCA-API-KEY-ID": self.settings.alpaca_key_id,
+            "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+        }
+        received_at = datetime.now(UTC)
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(4.0, connect=3.0), trust_env=False) as client:
+            response = await client.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+
+        quote = payload.get("quote") if isinstance(payload, dict) else None
+        if not isinstance(quote, dict):
+            return None
+        return normalize_quote(
+            provider="alpaca",
+            feed=feed,
+            symbol=symbol,
+            quote=quote,
+            received_at=received_at,
+        )
+
+    def get_latest_quote_sync(self, *, symbol: str, feed: str) -> dict | None:
+        if not self.settings.has_alpaca_credentials:
+            return None
+
+        params: dict[str, str] = {"feed": feed}
+        url = f"{self.settings.alpaca_data_base_url}/stocks/{symbol}/quotes/latest"
+        headers = {
+            "APCA-API-KEY-ID": self.settings.alpaca_key_id,
+            "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+        }
+        received_at = datetime.now(UTC)
+
+        with httpx.Client(timeout=httpx.Timeout(4.0, connect=3.0), trust_env=False) as client:
+            response = client.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+
+        quote = payload.get("quote") if isinstance(payload, dict) else None
+        if not isinstance(quote, dict):
+            return None
+        return normalize_quote(
+            provider="alpaca",
+            feed=feed,
+            symbol=symbol,
+            quote=quote,
+            received_at=received_at,
+        )
+
 
 def normalize_bar(
     *,
@@ -203,6 +260,50 @@ def normalize_bar(
         "trade_count": bar.get("n"),
         "vwap": bar.get("vw"),
     }
+
+
+def normalize_quote(
+    *,
+    provider: str,
+    feed: str,
+    symbol: str,
+    quote: dict,
+    received_at: datetime,
+) -> dict:
+    quote_timestamp = normalized_utc_timestamp(quote.get("t") or quote.get("timestamp"), received_at)
+    bid = float(quote.get("bp") or quote.get("bid_price") or quote.get("bidPrice") or quote.get("bid") or 0)
+    ask = float(quote.get("ap") or quote.get("ask_price") or quote.get("askPrice") or quote.get("ask") or 0)
+    bid_size = float(quote.get("bs") or quote.get("bid_size") or quote.get("bidSize") or 0)
+    ask_size = float(quote.get("as") or quote.get("ask_size") or quote.get("askSize") or 0)
+    return {
+        "provider": provider,
+        "feed": feed,
+        "symbol": symbol,
+        "bid": bid,
+        "ask": ask,
+        "bidSize": bid_size,
+        "askSize": ask_size,
+        "quoteTimestamp": quote_timestamp,
+        "lastTradeTimestamp": quote_timestamp,
+        "marketDataReceiptTimestamp": normalized_utc_timestamp(received_at, received_at),
+        "source": "alpaca_latest_quote",
+        "raw": quote,
+    }
+
+
+def normalized_utc_timestamp(value: object, fallback: datetime) -> str:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "")
+        if not text:
+            parsed = fallback
+        else:
+            text = re.sub(r"(\.\d{6})\d+(Z|[+-]\d\d:\d\d)$", r"\1\2", text)
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def demo_bars(*, symbol: str, timeframe: str, feed: str, limit: int) -> list[dict]:

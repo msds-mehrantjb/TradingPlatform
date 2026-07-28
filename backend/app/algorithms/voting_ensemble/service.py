@@ -75,14 +75,16 @@ def _fail_closed_response(snapshot: VotingEnsembleEvaluationSnapshot, service_ve
         *snapshot.dataReadiness.staleInputs,
         *snapshot.dataReadiness.malformedInputs,
     )
+    votes = _fail_closed_votes(StrategyCollection.DIRECTIONAL, reason_codes)
+    context_signals = _fail_closed_votes(StrategyCollection.CONTEXT, reason_codes)
     response = VotingEnsembleEvaluateResponse(
         service_version=service_version,
         symbol=snapshot.symbol,
         evaluated_at=snapshot.evaluationTimestamp,
         data_timestamp=snapshot.evaluationTimestamp,
         final_signal="Hold",
-        votes=(),
-        context_signals=(),
+        votes=votes,
+        context_signals=context_signals,
         context_confirmation=VotingContextConfirmation(
             outcome="not_applicable",
             detail="Voting Ensemble failed closed because mandatory point-in-time market data was missing, stale, malformed, or future-dated.",
@@ -90,7 +92,7 @@ def _fail_closed_response(snapshot: VotingEnsembleEvaluationSnapshot, service_ve
             confirmations=0,
             conflicts=0,
         ),
-        counts={"Buy": 0, "Sell": 0, "Hold": 0},
+        counts=_counts(votes),
         eligible_counts={"Buy": 0, "Sell": 0, "Hold": 0},
         family_scores={},
         base_score=0.0,
@@ -111,6 +113,75 @@ def _fail_closed_response(snapshot: VotingEnsembleEvaluationSnapshot, service_ve
         reason_codes=reason_codes,
     )
     return response.model_dump(mode="json")
+
+
+def _fail_closed_votes(collection: StrategyCollection, reason_codes: tuple[str, ...]) -> tuple[VotingStrategyVote, ...]:
+    blockers = ", ".join(_readiness_blocker_codes(reason_codes))
+    return _inventory_blocker_votes(
+        collection,
+        reason=f"Snapshot data-readiness failed closed before strategy evaluation: {blockers}.",
+        reason_code="voting_ensemble.strategy.fail_closed_data_readiness",
+        reason_codes=reason_codes,
+    )
+
+
+def _inventory_blocker_votes(
+    collection: StrategyCollection,
+    *,
+    reason: str,
+    reason_code: str,
+    reason_codes: tuple[str, ...],
+) -> tuple[VotingStrategyVote, ...]:
+    modules_by_id = {module.strategyId: module for module in VOTING_ENSEMBLE_MODULE_INVENTORY.modules}
+    votes: list[VotingStrategyVote] = []
+    for module_id in active_module_ids(collection):
+        module = modules_by_id[module_id]
+        role = "context" if collection == StrategyCollection.CONTEXT else "directional"
+        votes.append(
+            VotingStrategyVote(
+                strategy=module.strategyName,
+                family=_vote_family_from_inventory(module.family),
+                role=role,
+                signal="Hold",
+                direction=0,
+                confidence=0.0,
+                active=True,
+                eligible=False,
+                dataReady=False,
+                regimeFit=0.0,
+                reliability=0.0,
+                reason=reason,
+                features={
+                    "strategyId": module.strategyId,
+                    "strategyVersion": module.strategyVersion,
+                    "reasonCode": reason_code,
+                    "reasonCodes": ",".join(reason_codes),
+                    "inventoryCollection": collection.value,
+                    "lifecycleStatus": module.lifecycleStatus,
+                },
+            )
+        )
+    return tuple(votes)
+
+
+def _vote_family_from_inventory(family: str) -> str:
+    normalized = str(family).lower()
+    if normalized == "market_context":
+        return "event"
+    return normalized
+
+
+def _readiness_blocker_codes(reason_codes: tuple[str, ...]) -> tuple[str, ...]:
+    blockers = [
+        code
+        for code in reason_codes
+        if code != "voting_ensemble.evaluate.fail_closed_data_readiness" and not _looks_like_snapshot_hash(code)
+    ]
+    return tuple(blockers or ("unknown_data_readiness_blocker",))
+
+
+def _looks_like_snapshot_hash(value: str) -> bool:
+    return len(value) >= 8 and all(character in "0123456789abcdef" for character in value.lower())
 
 
 class VotingEnsembleService:
@@ -143,6 +214,7 @@ class VotingEnsembleService:
                 snapshot=snapshot,
                 settings_hash=settings.configurationHash,
                 settings=settings,
+                order_intent="strategy_evaluation",
                 upstream_global_gate=upstream_global_gate,
                 regime_state=regime_state,
                 ensemble_decision=None,
@@ -355,14 +427,16 @@ def _safety_blocked_response(
     trace: tuple[dict[str, Any], ...],
 ) -> dict[str, Any]:
     blocked_gate_ids = _blocked_gate_ids(local_gate)
+    votes = _safety_blocked_votes(StrategyCollection.DIRECTIONAL, tuple(local_gate.reasonCodes))
+    context_signals = _safety_blocked_votes(StrategyCollection.CONTEXT, tuple(local_gate.reasonCodes))
     response = VotingEnsembleEvaluateResponse(
         service_version=service_version,
         symbol=snapshot.symbol,
         evaluated_at=datetime.now(timezone.utc),
         data_timestamp=snapshot.evaluationTimestamp,
         final_signal="Hold",
-        votes=(),
-        context_signals=(),
+        votes=votes,
+        context_signals=context_signals,
         context_confirmation=VotingContextConfirmation(
             outcome="not_applicable",
             detail="Voting Ensemble failed closed before directional evaluation because mandatory local safety gates blocked automatic entries.",
@@ -370,7 +444,7 @@ def _safety_blocked_response(
             confirmations=0,
             conflicts=0,
         ),
-        counts={"Buy": 0, "Sell": 0, "Hold": 0},
+        counts=_counts(votes),
         eligible_counts={"Buy": 0, "Sell": 0, "Hold": 0},
         family_scores={},
         base_score=0.0,
@@ -394,6 +468,16 @@ def _safety_blocked_response(
         ),
     )
     return response.model_dump(mode="json")
+
+
+def _safety_blocked_votes(collection: StrategyCollection, reason_codes: tuple[str, ...]) -> tuple[VotingStrategyVote, ...]:
+    blockers = ", ".join(reason_codes or ("local_safety_gate_blocked",))
+    return _inventory_blocker_votes(
+        collection,
+        reason="Voting Ensemble local safety gates blocked automatic entry before strategy evaluation: " + blockers + ".",
+        reason_code="voting_ensemble.strategy.blocked_by_local_safety",
+        reason_codes=reason_codes,
+    )
 
 
 def evaluate_multi_timeframe_trend(request: VotingEnsembleEvaluateRequest) -> VotingStrategyVote:
@@ -680,6 +764,7 @@ def _local_gate_input(
     snapshot: VotingEnsembleEvaluationSnapshot,
     settings_hash: str,
     settings: Any | None,
+    order_intent: str = "new_entry",
     upstream_global_gate: GlobalGateDecision | None,
     regime_state: RegimeState,
     ensemble_decision: EnsembleDecision | None,
@@ -704,7 +789,7 @@ def _local_gate_input(
         execution.update(_execution_state_from_economics(execution_economics))
     risk = _risk_state(snapshot)
     return GlobalGateInput(
-        orderIntent="new_entry",
+        orderIntent=order_intent,
         evaluatedAt=evaluated_at,
         sessionDate=session_date,
         symbol=snapshot.symbol,

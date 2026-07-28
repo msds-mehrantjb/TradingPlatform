@@ -26,7 +26,7 @@ from backend.app.domain.models import (
 
 GLOBAL_GATE_ENGINE_VERSION = "global_gate_engine_v1"
 
-GateOrderIntent = Literal["new_entry", "protective_exit", "risk_reducing", "end_of_day_liquidation", "reconciliation"]
+GateOrderIntent = Literal["strategy_evaluation", "new_entry", "protective_exit", "risk_reducing", "end_of_day_liquidation", "reconciliation"]
 GateSeverity = Literal["hard", "caution", "info"]
 ConditionalGateAction = Literal["hard_block", "caution", "info"]
 

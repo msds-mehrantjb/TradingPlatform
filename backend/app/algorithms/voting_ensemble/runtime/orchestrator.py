@@ -54,11 +54,13 @@ class VotingEnsembleRuntimeOrchestrator:
         self.in_process_adapter = InProcessVotingEnsembleWorkerAdapter(self.worker)
         self._thread: VotingEnsembleWorkerThread | None = None
         self.workerMode = "separable_worker_process_contract"
+        self.autoManageWorker = auto_start
         if auto_start:
+            self.recover_incomplete_jobs()
             self.start()
 
     def start(self) -> None:
-        if self._thread is None:
+        if self._thread is None or not self._thread.is_alive():
             self._thread = VotingEnsembleWorkerThread(self.worker)
             self._thread.start()
 
@@ -67,7 +69,24 @@ class VotingEnsembleRuntimeOrchestrator:
             self._thread.stop()
             self._thread = None
 
+    def ensure_worker_running(self) -> dict[str, Any]:
+        was_alive = bool(self._thread and self._thread.is_alive())
+        if self.autoManageWorker and not was_alive:
+            self.start()
+        return {
+            "workerAliveBefore": was_alive,
+            "workerAliveAfter": bool(self._thread and self._thread.is_alive()),
+            "reasonCodes": [
+                "voting_ensemble.runtime.worker_running"
+                if was_alive
+                else "voting_ensemble.runtime.worker_restarted"
+                if self.autoManageWorker
+                else "voting_ensemble.runtime.worker_manual_mode_not_started"
+            ],
+        }
+
     def enqueue_command(self, command: VotingEnsembleRuntimeCommand) -> dict[str, Any]:
+        self.ensure_worker_running()
         record, accepted = self.status_store.persist_queued(command)
         if not accepted:
             return {
@@ -155,10 +174,14 @@ class VotingEnsembleRuntimeOrchestrator:
         return self.in_process_adapter.drain(max_commands=max_commands)
 
     def summary(self) -> dict[str, Any]:
+        self.ensure_worker_running()
+        worker_thread = self._thread.snapshot() if self._thread is not None else {"alive": False}
         return {
             "runtimeVersion": VOTING_ENSEMBLE_RUNTIME_VERSION,
             "statusNamespace": VOTING_ENSEMBLE_STATUS_NAMESPACE,
             "workerMode": self.workerMode,
+            "workerAlive": bool(worker_thread.get("alive")),
+            "workerThread": worker_thread,
             "heavyProcessingInRequestPath": False,
             "singleLogicalWriter": self.status_store.writerNamespace,
             "queue": self.queue.snapshot(),

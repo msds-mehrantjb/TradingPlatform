@@ -61,6 +61,23 @@ class VotingEnsembleContextPipelineTest(unittest.TestCase):
         self.assertEqual(persisted[0]["snapshotHash"], snapshot.snapshotHash)
         self.assertEqual(len(persisted[0]["outputs"]), len(result.shadow))
 
+    def test_market_breadth_uses_component_proxy_without_external_feed(self) -> None:
+        payload = snapshot_payload(candles(30))
+        payload.pop("external_breadth_feed", None)
+        snapshot = build_live_paper_snapshot(payload)
+
+        result = VotingEnsembleContextPipeline().evaluate(
+            snapshot,
+            active_module_ids=active_module_ids(StrategyCollection.CONTEXT),
+            shadow_module_ids=(),
+        )
+
+        breadth = next(vote for vote in result.active if vote.features["strategyId"] == "market_breadth_momentum")
+        self.assertTrue(breadth.dataReady)
+        self.assertNotIn("missing_inputs", breadth.features["reasonCode"])
+        self.assertEqual(breadth.features["breadthSource"], "ETF breadth proxy")
+        self.assertGreater(float(breadth.features["breadthCoverage"]), 0)
+
     def test_context_cannot_create_candidate_without_directional_evidence(self) -> None:
         context = context_signal("relative_strength_qqq_iwm", "confirm_long", confidence=1.0, max_adjustment=0.08)
 

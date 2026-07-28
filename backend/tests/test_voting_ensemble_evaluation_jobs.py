@@ -14,6 +14,7 @@ from backend.app.algorithms.voting_ensemble.runtime.commands import manual_evalu
 from backend.app.algorithms.voting_ensemble.runtime.events import FinalizedOneMinuteBarEvent
 from backend.app.algorithms.voting_ensemble.runtime.orchestrator import VotingEnsembleRuntimeOrchestrator
 from backend.app.algorithms.voting_ensemble.runtime.status_store import VotingEnsembleStatusStore
+from backend.app.algorithms.voting_ensemble.service import VotingEnsembleService
 from backend.app.main import app
 
 
@@ -201,8 +202,73 @@ class VotingEnsembleEvaluationJobsTest(unittest.TestCase):
         self.assertEqual(runtime["runtimeVersion"], "voting_ensemble_background_runtime_v1")
         self.assertEqual(runtime["statusNamespace"], "voting_ensemble.runtime.status")
         self.assertEqual(runtime["workerMode"], "separable_worker_process_contract")
+        self.assertTrue(runtime["workerAlive"])
+        self.assertTrue(runtime["workerThread"]["alive"])
         self.assertFalse(runtime["heavyProcessingInRequestPath"])
         self.assertEqual(runtime["singleLogicalWriter"], "voting_ensemble.runtime.status")
+
+    def test_runtime_summary_restarts_dead_worker_thread(self) -> None:
+        runtime = VotingEnsembleRuntimeOrchestrator(
+            service=CountingService(),
+            status_store=VotingEnsembleStatusStore(),
+            auto_start=True,
+        )
+
+        first = runtime.summary()
+        runtime.stop()
+        restarted = runtime.summary()
+
+        self.assertTrue(first["workerAlive"])
+        self.assertTrue(restarted["workerAlive"])
+        runtime.stop()
+
+    def test_fail_closed_evaluation_returns_strategy_blocker_votes(self) -> None:
+        result = VotingEnsembleService().evaluate(evaluate_payload(candles(45)))
+
+        self.assertEqual(result["final_signal"], "Hold")
+        self.assertIn("missing_spy_nbbo", result["reason_codes"])
+        self.assertGreater(len(result["votes"]), 0)
+        first_vote = result["votes"][0]
+        self.assertEqual(first_vote["signal"], "Hold")
+        self.assertFalse(first_vote["eligible"])
+        self.assertFalse(first_vote["dataReady"])
+        self.assertIn("missing_spy_nbbo", first_vote["reason"])
+        self.assertEqual(result["counts"]["Hold"], len(result["votes"]))
+        self.assertEqual(result["eligible_counts"], {"Buy": 0, "Sell": 0, "Hold": 0})
+
+    def test_automatic_paper_disabled_does_not_block_strategy_evaluation(self) -> None:
+        payload = evaluate_payload(candles(45))
+        payload["nbbo"] = nbbo(payload["data_timestamp"])
+        payload["market_context"] = {
+            "sessionState": {"phase": "regular", "marketClosed": False, "marketStatus": "open"},
+            "operationalHealthSnapshot": operational_permission_contract(payload["data_timestamp"], enabled=False),
+        }
+
+        result = VotingEnsembleService().evaluate(payload)
+
+        self.assertEqual(result["final_signal"], "Hold")
+        self.assertNotIn("voting_ensemble.evaluate.blocked_by_local_safety", result["reason_codes"])
+        self.assertIn("voting_ensemble.local_gate.trading_disabled", result["reason_codes"])
+        self.assertIn("voting_ensemble.local_gate.global_hard_gate_block", result["reason_codes"])
+        self.assertGreater(len(result["votes"]), 0)
+        self.assertFalse(any("local safety gates blocked" in vote["reason"] for vote in result["votes"]))
+        self.assertEqual(sum(result["counts"].values()), len(result["votes"]))
+        self.assertEqual(result["local_gate_decision"]["eligible"], False)
+
+    def test_dashboard_permission_contract_clears_upstream_and_trading_switch_blockers(self) -> None:
+        payload = evaluate_payload(candles(45))
+        payload["nbbo"] = nbbo(payload["data_timestamp"])
+        payload["market_context"] = {
+            "sessionState": {"phase": "regular", "marketClosed": False, "marketStatus": "open"},
+            "operationalHealthSnapshot": operational_permission_contract(payload["data_timestamp"], enabled=True),
+        }
+
+        result = VotingEnsembleService().evaluate(payload)
+        reason_codes = set(result["reason_codes"])
+
+        self.assertNotIn("voting_ensemble.local_gate.trading_disabled", reason_codes)
+        self.assertNotIn("voting_ensemble.local_gate.global_upstream_not_provided", reason_codes)
+        self.assertIn("voting_ensemble.local_gate.global_upstream_allows", reason_codes)
 
 
 class BlockingService:
@@ -299,6 +365,45 @@ def candles(count: int, *, minutes: int = 1, symbol: str = "SPY") -> list[dict[s
         )
         price = close
     return rows
+
+
+def nbbo(timestamp: str) -> dict[str, Any]:
+    return {
+        "bid": 100.01,
+        "ask": 100.03,
+        "bidSize": 500,
+        "askSize": 500,
+        "quoteTimestamp": timestamp,
+        "lastTradeTimestamp": timestamp,
+        "marketDataReceiptTimestamp": timestamp,
+    }
+
+
+def operational_permission_contract(timestamp: str, *, enabled: bool) -> dict[str, Any]:
+    return {
+        "status": "ready",
+        "tradingEnabled": enabled,
+        "automaticPaperTradingEnabled": enabled,
+        "paperTradingMode": True,
+        "liveTradingEnabled": False,
+        "marketOpen": True,
+        "entryWindowOpen": True,
+        "validSession": True,
+        "feedDegraded": False,
+        "clockDisagreement": False,
+        "executionFailureCooldownActive": False,
+        "globalGateDecision": {
+            "status": "PASS" if enabled else "FAIL",
+            "eligible": enabled,
+            "dataReady": True,
+            "gateResults": [],
+            "reasonCodes": ["test.dashboard_global_gate_allowed" if enabled else "test.dashboard_global_gate_blocked"],
+            "explanation": "test dashboard global gate",
+            "checkedAt": timestamp,
+            "sessionDate": timestamp[:10],
+            "configurationHash": f"test-dashboard-global-gate-{enabled}",
+        },
+    }
 
 
 if __name__ == "__main__":
