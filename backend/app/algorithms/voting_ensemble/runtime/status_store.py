@@ -17,6 +17,8 @@ from backend.app.algorithms.voting_ensemble.runtime.commands import (
 
 VOTING_ENSEMBLE_STATUS_NAMESPACE = "voting_ensemble.runtime.status"
 VOTING_ENSEMBLE_STATUS_STORE_VERSION = "voting_ensemble_status_store_v1"
+MAX_PERSISTED_TERMINAL_JOBS = 120
+MAX_PERSISTED_COMPLETED_RESULTS = 40
 VotingEnsembleJobStatus = Literal["queued", "running", "completed", "blocked", "expired", "failed"]
 TERMINAL_STATUSES = {"completed", "blocked", "expired", "failed"}
 ACTIVE_STATUSES = {"queued", "running"}
@@ -44,6 +46,8 @@ class VotingEnsembleStatusStore:
         self._evaluation_index: dict[tuple[str, str, str, str], str] = {}
         self.writerNamespace = VOTING_ENSEMBLE_STATUS_NAMESPACE
         self.persistencePath = Path(persistence_path).resolve() if persistence_path is not None else None
+        self.lastPersistenceError: str | None = None
+        self.lastPersistenceErrorAt: str | None = None
         self.captureWriter = capture_writer
         self._load()
 
@@ -169,11 +173,25 @@ class VotingEnsembleStatusStore:
 
     def summary(self) -> dict[str, Any]:
         jobs = self.list_jobs()
+        persisted_size_bytes = None
+        if self.persistencePath is not None and self.persistencePath.exists():
+            try:
+                persisted_size_bytes = self.persistencePath.stat().st_size
+            except OSError:
+                persisted_size_bytes = None
         return {
             "statusNamespace": VOTING_ENSEMBLE_STATUS_NAMESPACE,
             "statusStoreVersion": VOTING_ENSEMBLE_STATUS_STORE_VERSION,
             "logicalWriter": self.writerNamespace,
             "persistencePath": str(self.persistencePath) if self.persistencePath is not None else None,
+            "persistenceSizeBytes": persisted_size_bytes,
+            "lastPersistenceError": self.lastPersistenceError,
+            "lastPersistenceErrorAt": self.lastPersistenceErrorAt,
+            "persistencePolicy": {
+                "activeJobsRecoverable": True,
+                "maxPersistedTerminalJobs": MAX_PERSISTED_TERMINAL_JOBS,
+                "maxPersistedCompletedResults": MAX_PERSISTED_COMPLETED_RESULTS,
+            },
             "jobs": {status: sum(1 for job in jobs if job["status"] == status) for status in ("queued", "running", "completed", "blocked", "expired", "failed")},
             "reasonCodes": ["voting_ensemble.runtime.status_store.ready"],
         }
@@ -235,24 +253,79 @@ class VotingEnsembleStatusStore:
     def _persist_locked(self) -> None:
         if self.persistencePath is None:
             return
+        self._prune_terminal_jobs_locked()
         payload = {
             "statusNamespace": VOTING_ENSEMBLE_STATUS_NAMESPACE,
             "statusStoreVersion": VOTING_ENSEMBLE_STATUS_STORE_VERSION,
             "updatedAt": _now(),
-            "jobs": self._jobs,
+            "jobs": self._persistable_jobs_locked(),
         }
         self.persistencePath.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.persistencePath.with_suffix(f"{self.persistencePath.suffix}.tmp")
         encoded = json.dumps(payload, sort_keys=True, indent=2)
-        temporary.write_text(encoded, encoding="utf-8")
         try:
+            if temporary.exists():
+                temporary.unlink()
+        except OSError:
+            pass
+        try:
+            temporary.write_text(encoded, encoding="utf-8")
             temporary.replace(self.persistencePath)
         except PermissionError:
-            self.persistencePath.write_text(encoded, encoding="utf-8")
             try:
-                temporary.unlink()
+                self.persistencePath.write_text(encoded, encoding="utf-8")
+            except OSError as exc:
+                self._record_persistence_error_locked(exc)
+                return
+            try:
+                temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+        except OSError as exc:
+            self._record_persistence_error_locked(exc)
+            return
+        self.lastPersistenceError = None
+        self.lastPersistenceErrorAt = None
+
+    def _record_persistence_error_locked(self, exc: OSError) -> None:
+        self.lastPersistenceError = str(exc) or type(exc).__name__
+        self.lastPersistenceErrorAt = _now()
+
+    def _prune_terminal_jobs_locked(self) -> None:
+        terminal = [record for record in self._jobs.values() if record.get("status") in TERMINAL_STATUSES]
+        if len(terminal) <= MAX_PERSISTED_TERMINAL_JOBS:
+            return
+        keep_terminal_ids = {
+            str(record.get("jobId"))
+            for record in sorted(terminal, key=_record_sort_timestamp, reverse=True)[:MAX_PERSISTED_TERMINAL_JOBS]
+            if record.get("jobId")
+        }
+        self._jobs = {
+            job_id: record
+            for job_id, record in self._jobs.items()
+            if record.get("status") in ACTIVE_STATUSES or job_id in keep_terminal_ids
+        }
+        self._rebuild_indexes_locked()
+
+    def _persistable_jobs_locked(self) -> dict[str, dict[str, Any]]:
+        completed_with_result_ids = {
+            str(record.get("jobId"))
+            for record in sorted(
+                [record for record in self._jobs.values() if record.get("status") == "completed" and record.get("result") is not None],
+                key=_record_sort_timestamp,
+                reverse=True,
+            )[:MAX_PERSISTED_COMPLETED_RESULTS]
+            if record.get("jobId")
+        }
+        jobs: dict[str, dict[str, Any]] = {}
+        for job_id, record in self._jobs.items():
+            persisted = dict(record)
+            if persisted.get("status") in TERMINAL_STATUSES:
+                persisted.pop("command", None)
+                if job_id not in completed_with_result_ids:
+                    persisted.pop("result", None)
+            jobs[job_id] = persisted
+        return jobs
 
     def _rebuild_indexes_locked(self) -> None:
         self._idempotency_index = {}
@@ -288,6 +361,11 @@ def _public_record(record: dict[str, Any]) -> dict[str, Any]:
     if public.get("status") != "completed":
         public.pop("result", None)
     return public
+
+
+def _record_sort_timestamp(record: dict[str, Any]) -> str:
+    value = record.get("updatedAt") or record.get("completedAt") or record.get("createdAt")
+    return str(value or "")
 
 
 def _now() -> str:

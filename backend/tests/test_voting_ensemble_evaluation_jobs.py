@@ -13,7 +13,7 @@ import backend.app.algorithms.voting_ensemble.api as voting_ensemble_api
 from backend.app.algorithms.voting_ensemble.runtime.commands import manual_evaluation_command
 from backend.app.algorithms.voting_ensemble.runtime.events import FinalizedOneMinuteBarEvent
 from backend.app.algorithms.voting_ensemble.runtime.orchestrator import VotingEnsembleRuntimeOrchestrator
-from backend.app.algorithms.voting_ensemble.runtime.status_store import VotingEnsembleStatusStore
+from backend.app.algorithms.voting_ensemble.runtime.status_store import MAX_PERSISTED_TERMINAL_JOBS, VotingEnsembleStatusStore
 from backend.app.algorithms.voting_ensemble.service import VotingEnsembleService
 from backend.app.main import app
 
@@ -192,6 +192,29 @@ class VotingEnsembleEvaluationJobsTest(unittest.TestCase):
 
         final_store = VotingEnsembleStatusStore(persistence_path=store_path)
         self.assertEqual(final_store.get_job(job["jobId"])["status"], "completed")
+        store_path.unlink()
+
+    def test_status_store_prunes_old_terminal_commands_from_persistence(self) -> None:
+        store_path = Path("backend/tests/.tmp_voting_ensemble_runtime/status_store_pruned.json")
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        if store_path.exists():
+            store_path.unlink()
+        status_store = VotingEnsembleStatusStore(persistence_path=store_path)
+        runtime = VotingEnsembleRuntimeOrchestrator(service=CountingService(), status_store=status_store, auto_start=False)
+        large_payload = evaluate_payload(candles(500))
+
+        for index in range(MAX_PERSISTED_TERMINAL_JOBS + 8):
+            payload = dict(large_payload)
+            payload["data_timestamp"] = (START + timedelta(minutes=45 + index)).isoformat().replace("+00:00", "Z")
+            runtime.enqueue_manual_evaluation(payload)
+            runtime.drain_in_process(max_commands=1)
+
+        persisted = store_path.read_text(encoding="utf-8")
+        final_store = VotingEnsembleStatusStore(persistence_path=store_path)
+
+        self.assertLess(store_path.stat().st_size, 1_000_000)
+        self.assertNotIn('"command"', persisted)
+        self.assertLessEqual(final_store.summary()["jobs"]["completed"], MAX_PERSISTED_TERMINAL_JOBS)
         store_path.unlink()
 
     def test_status_reports_dedicated_runtime_contract(self) -> None:

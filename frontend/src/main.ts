@@ -3041,7 +3041,8 @@ const state = {
   votingEnsembleInventoryWarning: "",
   algoIntradayTradesExpanded:
     persistedUiState.algoIntradayTradesExpanded ?? ["1Min", "5Min"].includes(visibleAlgoBacktestTimeframe(persistedUiState.algoBacktestTimeframe)),
-  algoVotesExpanded: persistedUiState.algoVotesExpanded ?? false,
+  algoVotesExpanded: false,
+  algoTradeDecisionExpanded: false,
   weightedVotingExpanded: persistedUiState.weightedVotingExpanded ?? true,
   weightedDataExpanded: persistedUiState.weightedDataExpanded ?? false,
   weightedGatesExpanded: persistedUiState.weightedGatesExpanded ?? false,
@@ -3092,7 +3093,7 @@ const state = {
   tradingRagStatus: "idle" as "idle" | "loading" | "ready" | "error",
   tradingRagWarning: "",
   tradingSettings: loadTradingSettings(),
-  tradingSettingsExpanded: persistedUiState.tradingSettingsExpanded ?? false,
+  tradingSettingsExpanded: true,
   votingDefaultSizingExpanded: persistedUiState.votingDefaultSizingExpanded ?? false,
   weightedTradingSettings: loadWeightedTradingSettings(),
   weightedTradingSettingsExpanded: persistedUiState.weightedTradingSettingsExpanded ?? false,
@@ -3516,9 +3517,13 @@ leftRail.innerHTML = `
           <div id="algoFinalSignal" class="algo-final hold">Hold</div>
         </div>
         <div id="algoVoteCounts" class="algo-vote-grid"></div>
-        <div id="algoResultsBody" class="algo-rule-list"></div>
-        <div id="algoTradePlanTitle" class="algo-section-title">Trading Decision</div>
-        <div id="algoTradePlan" class="algo-rule-list"></div>
+        <div id="algoResultsBody" class="algo-rule-list" hidden></div>
+        <button id="algoTradePlanToggle" class="algo-expand-toggle algo-trade-decision-toggle" type="button" aria-expanded="false" aria-controls="algoTradePlan">
+          <span>Trading Decision</span>
+          <strong id="algoTradePlanToggleMeta">Closed</strong>
+          <b id="algoTradePlanToggleIcon">+</b>
+        </button>
+        <div id="algoTradePlan" class="algo-rule-list" hidden></div>
         <div class="algo-table-wrap">
           <table class="algo-trade-table">
             <thead>
@@ -4088,7 +4093,9 @@ const algoIntradayTradesTable = document.querySelector<HTMLTableSectionElement>(
 const algoBacktest1mButton = document.querySelector<HTMLButtonElement>("#algoBacktest1mButton")!;
 const algoBacktest5mButton = document.querySelector<HTMLButtonElement>("#algoBacktest5mButton")!;
 const algoBacktestTradingButton = document.querySelector<HTMLButtonElement>("#algoBacktestTradingButton")!;
-const algoTradePlanTitle = document.querySelector<HTMLDivElement>("#algoTradePlanTitle")!;
+const algoTradePlanToggle = document.querySelector<HTMLButtonElement>("#algoTradePlanToggle")!;
+const algoTradePlanToggleMeta = document.querySelector<HTMLElement>("#algoTradePlanToggleMeta")!;
+const algoTradePlanToggleIcon = document.querySelector<HTMLElement>("#algoTradePlanToggleIcon")!;
 const algoTradePlan = document.querySelector<HTMLDivElement>("#algoTradePlan")!;
 const algoTableWrap = document.querySelector<HTMLDivElement>(".algo-table-wrap")!;
 const algoTradesTable = document.querySelector<HTMLTableSectionElement>("#algoTradesTable")!;
@@ -4637,6 +4644,11 @@ algoVotesToggle.addEventListener("click", () => {
   saveUiState();
   renderAlgoVotesExpandedState();
   updateWeightedVotingPanel();
+});
+
+algoTradePlanToggle.addEventListener("click", () => {
+  state.algoTradeDecisionExpanded = !state.algoTradeDecisionExpanded;
+  renderAlgoTradeDecisionExpandedState();
 });
 
 regimeStrategiesToggle.addEventListener("click", () => {
@@ -10535,7 +10547,8 @@ function updateAlgorithmPanel(_candles: Candle[]) {
     updateTradingSettingsMount(state.currentTargetOrder ?? undefined, {
       preserveExisting: state.tradingRagStatus === "loading",
     });
-    algoResultsBody.innerHTML = tradingResults;
+    algoResultsBody.innerHTML = "";
+    setAlgoTradePlanContent(tradingResults, "Trading RAG");
     updateQuoteCard(currentCandle());
     maybeAutoSubmitTargetOrder();
     maybeAutoSubmitOpenOrderControls();
@@ -10554,9 +10567,11 @@ function updateAlgorithmPanel(_candles: Candle[]) {
     return;
   }
   algoTableWrap.hidden = true;
-  setAlgoTradePlanContent(renderAlgoTradePlan(finalSignal, displayVotes, backtest, backtestQuality));
+  const decisionSummary = renderAlgoResults(finalSignal, buyVotes, sellVotes, holdVotes, displayVotes, backtest, backtestQuality);
+  const decisionFlow = renderAlgoTradePlan(finalSignal, displayVotes, backtest, backtestQuality);
+  setAlgoTradePlanContent(`${decisionSummary}${decisionFlow}`, `${finalSignal} / ${buyVotes}B ${sellVotes}S ${holdVotes}H`);
   renderAlgoIntradayTrades(backtest);
-  algoResultsBody.innerHTML = renderAlgoResults(finalSignal, buyVotes, sellVotes, holdVotes, displayVotes, backtest, backtestQuality);
+  algoResultsBody.innerHTML = "";
   maybeAutoSubmitTargetOrder();
   maybeAutoSubmitOpenOrderControls();
   void maybeSaveDecisionSnapshot("algorithm-panel");
@@ -10588,11 +10603,20 @@ function renderAlgoIntradayTrades(backtest: BacktestResult) {
   algoIntradayTradesTable.innerHTML = renderBacktestTrades(backtest.trades);
 }
 
-function setAlgoTradePlanContent(html: string) {
+function setAlgoTradePlanContent(html: string, meta = "Decision details") {
   const hasContent = html.trim().length > 0;
-  algoTradePlanTitle.hidden = !hasContent;
-  algoTradePlan.hidden = !hasContent;
+  algoTradePlanToggle.hidden = !hasContent;
+  algoTradePlanToggleMeta.textContent = hasContent ? meta : "Closed";
   algoTradePlan.innerHTML = html;
+  renderAlgoTradeDecisionExpandedState();
+}
+
+function renderAlgoTradeDecisionExpandedState() {
+  const hasContent = algoTradePlan.innerHTML.trim().length > 0;
+  algoTradePlanToggle.setAttribute("aria-expanded", String(hasContent && state.algoTradeDecisionExpanded));
+  algoTradePlan.hidden = !hasContent || !state.algoTradeDecisionExpanded;
+  algoTradePlan.classList.toggle("expanded", hasContent && state.algoTradeDecisionExpanded);
+  algoTradePlanToggleIcon.textContent = hasContent && state.algoTradeDecisionExpanded ? "-" : "+";
 }
 
 function renderAlgoVotesExpandedState() {

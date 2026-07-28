@@ -1055,6 +1055,21 @@ select {
   background: #eff6ff;
 }
 
+.algo-trade-decision-toggle {
+  border-color: #7dd3fc;
+  background: #e0f7fa;
+  color: #073b4c;
+}
+
+.algo-trade-decision-toggle[aria-expanded="true"] {
+  border-color: #0ea5e9;
+  background: #cffafe;
+}
+
+.algo-trade-decision-toggle strong {
+  color: #075985;
+}
+
 .algo-expand-toggle span,
 .algo-expand-toggle strong,
 .algo-expand-toggle b {
