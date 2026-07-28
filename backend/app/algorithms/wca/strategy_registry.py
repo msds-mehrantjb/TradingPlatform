@@ -285,6 +285,10 @@ def _duplicate_errors(label: str, values: tuple[str, ...]) -> list[str]:
 def _load_symbol(import_path: str) -> Any | None:
     if not import_path:
         return None
+    try:
+        return import_module(import_path)
+    except ImportError:
+        pass
     module_name, separator, symbol_name = import_path.rpartition(".")
     try:
         if not separator:

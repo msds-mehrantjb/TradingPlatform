@@ -6,6 +6,7 @@ import traceback
 from datetime import UTC, datetime
 
 from .main import artifact_job_path, write_artifact_job_status
+from .market_forecast import promote_market_forecast_candidate
 from .train_market_forecast import (
     DEFAULT_ATR_LOOKBACK_MINUTES,
     DEFAULT_EMBARGO_MINUTES,
@@ -18,7 +19,7 @@ from .train_market_forecast import (
     DEFAULT_TARGET_ATR_MULTIPLIER,
     DEFAULT_TRAINING_COST,
     DEFAULT_WALK_FORWARD_FOLDS,
-    train_market_forecast_model,
+    train_market_forecast_multi_horizon_model,
 )
 
 
@@ -30,13 +31,14 @@ def load_job(job_id: str) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Train the isolated 5-minute future market forecast model.")
+    parser = argparse.ArgumentParser(description="Train the isolated multi-horizon future market forecast model.")
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--feed", default="iex")
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--model-kind", choices=["xgboost", "logistic"], default="xgboost")
+    parser.add_argument("--auto-promote", action="store_true")
     args = parser.parse_args()
 
     write_artifact_job_status(
@@ -51,7 +53,7 @@ def main() -> int:
     )
 
     try:
-        summary = train_market_forecast_model(
+        summary = train_market_forecast_multi_horizon_model(
             symbol=args.symbol.upper(),
             feed=args.feed,
             start_date=args.start_date,
@@ -69,18 +71,40 @@ def main() -> int:
             max_rows=DEFAULT_MAX_ROWS,
             model_kind=args.model_kind,
         )
+        promotion_result = None
+        promotion_required = True
+        status = "ready"
+        message = "Future market forecast candidate trained; explicit promotion is required before activation."
+        promotion_error = None
+        if args.auto_promote:
+            try:
+                promotion_result = promote_market_forecast_candidate(
+                    str(summary["artifactId"]),
+                    symbol=args.symbol.upper(),
+                    promoted_by="end_of_day_market_forecast_worker",
+                    reason=f"End-of-day retrain through {args.end_date}; activate for next market session after all multi-horizon gates passed.",
+                )
+                promotion_required = False
+                message = "Future market forecast retrained and promoted for the next market session."
+            except Exception as exc:
+                status = "validation_failed"
+                promotion_error = str(exc)
+                message = f"Future market forecast candidate trained but was not promoted: {exc}"
+
         write_artifact_job_status(
             args.job_id,
             {
                 **load_job(args.job_id),
-                "status": "ready",
+                "status": status,
                 "completedAt": datetime.now(UTC).isoformat(),
                 "artifactPath": summary.get("candidateArtifactPath") or summary.get("artifact"),
                 "candidateArtifactPath": summary.get("candidateArtifactPath") or summary.get("artifact"),
-                "activeArtifactPath": summary.get("activeArtifactPath"),
-                "promotionRequired": True,
+                "activeArtifactPath": (promotion_result or {}).get("activePath") or summary.get("activeArtifactPath"),
+                "promotionRequired": promotion_required,
+                "promotionResult": promotion_result,
+                "promotionError": promotion_error,
                 "summary": summary,
-                "message": "Future market forecast candidate trained; explicit promotion is required before activation.",
+                "message": message,
                 "error": None,
             },
         )

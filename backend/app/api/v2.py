@@ -79,6 +79,13 @@ from backend.app.algorithms.voting_ensemble.strategies.directional import (
     MultiTimeframeTrendAlignmentStrategy,
 )
 from backend.app.algorithms.voting_ensemble.strategies.regime import AdxAtrRegimeClassifier
+from backend.app.market_forecast import (
+    FUTURE_MARKET_PREDICTION_LEDGER_CONTRACT_VERSION,
+    MARKET_FORECAST_POSITION_HORIZONS_MINUTES,
+    MARKET_FORECAST_SERVICE,
+    MODEL_VERSION as MARKET_FORECAST_MODEL_VERSION,
+    market_forecast_out_of_sample_execution_value_proof,
+)
 from backend.app.trading_policy import DynamicPolicyInputs, DynamicTradingPolicyEngine
 
 
@@ -168,6 +175,25 @@ class PaperShadowEvaluateRequest(ReplayDecisionEvaluateRequest):
 
 @router.get("/algorithms/voting-ensemble/inventory")
 def voting_ensemble_inventory() -> dict[str, Any]:
+    return _voting_ensemble_inventory_payload()
+
+
+@router.get("/algorithms/strategy-fit/inventory")
+def strategy_fit_inventory() -> dict[str, Any]:
+    source = _voting_ensemble_inventory_payload()
+    return {
+        "algorithmId": "strategy_fit",
+        "engineVersion": "strategy_fit_inventory_v1",
+        "contractVersion": "strategy_fit_inventory_contract_v1",
+        "displayName": "Strategy Fit",
+        "sourceAlgorithmId": source["algorithmId"],
+        "sourceEngineVersion": source["engineVersion"],
+        "sourceEndpoint": "/api/v2/algorithms/voting-ensemble/inventory",
+        "modules": source["modules"],
+    }
+
+
+def _voting_ensemble_inventory_payload() -> dict[str, Any]:
     return {
         "algorithmId": "voting_ensemble",
         "engineVersion": "voting_ensemble_v2",
@@ -177,6 +203,117 @@ def voting_ensemble_inventory() -> dict[str, Any]:
             "regime": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_REGIME_STRATEGIES],
             "safety": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_SAFETY_STRATEGIES],
             "aggregator": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_AGGREGATOR_STRATEGIES],
+        },
+    }
+
+
+@router.get("/algorithms/market-forecast/inventory")
+def market_forecast_inventory() -> dict[str, Any]:
+    runtime_status = MARKET_FORECAST_SERVICE.runtime_status("SPY")
+    artifact = MARKET_FORECAST_SERVICE.approved_model("SPY")
+    horizon_statuses = _market_forecast_horizon_inventory(artifact)
+    horizons_ready = all(row["ready"] for row in horizon_statuses)
+    model_ready = runtime_status.get("status") == "ready" and horizons_ready
+    model_status = "active" if model_ready else "unavailable"
+    reason_codes = []
+    if runtime_status.get("status") != "ready":
+        reason_codes.append("market_forecast.model.not_approved_for_order_authorization")
+    if not horizons_ready:
+        reason_codes.append("market_forecast.multi_horizon.required_models_not_ready")
+    return {
+        "algorithmId": "market_forecast",
+        "engineVersion": MARKET_FORECAST_MODEL_VERSION,
+        "contractVersion": "market_forecast_inventory_contract_v1",
+        "displayName": "Market Forecast",
+        "runtimeStatus": runtime_status,
+        "horizonReadiness": horizon_statuses,
+        "liveDataPolicy": {
+            "source": "future_market_prediction_ledger",
+            "contractVersion": FUTURE_MARKET_PREDICTION_LEDGER_CONTRACT_VERSION,
+            "barInterval": "1Min",
+            "usage": "append finalized ML forecasts and resolve 5m/10m/15m outcomes from real market candles for monitoring and later retraining",
+        },
+        "paperTradingReadiness": {
+            "ready": model_ready,
+            "status": "ready" if model_ready else "not_ready",
+            "reasonCodes": reason_codes,
+        },
+        "modules": {
+            "directional": [
+                _market_forecast_module_payload(
+                    _market_forecast_horizon_module_id(int(row["horizonMinutes"])),
+                    f"{row['horizonMinutes']}-Minute Directional Forecast",
+                    "directional",
+                    status="active" if row["ready"] else "unavailable",
+                    enabled=row["ready"],
+                    required_inputs=["spy_1m_candles", "approved_market_forecast_artifact", "execution_cost_model"],
+                    evidence=[
+                        f"{row['horizonMinutes']}-minute buy/sell/timeout probabilities",
+                        "Buy/sell/timeout probabilities",
+                        "Expected value after execution costs",
+                        "Approved model artifact required for order authorization",
+                    ],
+                )
+                for row in horizon_statuses
+            ],
+            "context": [
+                _market_forecast_module_payload(
+                    "forecast_feature_extractor",
+                    "Forecast Feature Extractor",
+                    "context",
+                    required_inputs=["spy_1m_candles", "strategy_signal_contracts", "microstructure_rows"],
+                    evidence=["Trend, mean reversion, volatility, volume, microstructure, time, regime, and algorithm features"],
+                ),
+                _market_forecast_module_payload(
+                    "future_prediction_ledger",
+                    "Future ML Prediction Performance Ledger",
+                    "context",
+                    required_inputs=["finalized_1m_bars", "market_clock"],
+                    evidence=[
+                        "Records every finalized one-minute ML forecast invocation while market is open",
+                        "Stores 5m/10m/15m probabilities, artifacts, expected move, and advice",
+                        "Resolves real future market candles into accuracy, error, and value metrics for model improvement",
+                    ],
+                ),
+            ],
+            "regime": [
+                _market_forecast_module_payload(
+                    "forecast_regime_gate",
+                    "Forecast Regime Gate",
+                    "regime",
+                    required_inputs=["market_regime", "volatility_state", "session_state"],
+                    evidence=["Blocks weak forecast edge when regime compatibility is insufficient"],
+                )
+            ],
+            "safety": [
+                _market_forecast_module_payload(
+                    "approved_model_authorization_gate",
+                    "Approved Model Authorization Gate",
+                    "safety",
+                    status="active",
+                    enabled=True,
+                    required_inputs=["model_lifecycle_state", "promotion_validation_gates"],
+                    evidence=["Forecast output cannot affect orders without an explicitly approved artifact"],
+                ),
+                _market_forecast_module_payload(
+                    "execution_cost_latency_gate",
+                    "Execution Cost / Latency Gate",
+                    "safety",
+                    required_inputs=["spread", "slippage", "fees", "decision_to_submission_latency"],
+                    evidence=["Controls expected value after transaction costs and opportunity decay"],
+                ),
+            ],
+            "aggregator": [
+                _market_forecast_module_payload(
+                    "multi_horizon_forecast_aggregator",
+                    "Multi-Horizon Forecast Aggregator",
+                    "aggregator",
+                    status=model_status,
+                    enabled=model_ready,
+                    required_inputs=["5m_forecast", "10m_forecast", "15m_forecast"],
+                    evidence=["Advisory multi-horizon position forecast until live paper validation passes"],
+                )
+            ],
         },
     }
 
@@ -630,6 +767,66 @@ def _voting_ensemble_alias_metadata(target_id: str) -> list[dict[str, Any]]:
             continue
         aliases.append(_alias_metadata(alias, entry.strategyId))
     return aliases
+
+
+def _market_forecast_module_payload(
+    module_id: str,
+    name: str,
+    collection: str,
+    *,
+    status: str = "active",
+    enabled: bool = True,
+    required_inputs: list[str] | None = None,
+    evidence: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": module_id,
+        "name": name,
+        "version": MARKET_FORECAST_MODEL_VERSION,
+        "family": "MARKET_FORECAST",
+        "role": collection.upper(),
+        "collection": collection,
+        "status": status,
+        "enabled": enabled,
+        "requiredInputs": required_inputs or [],
+        "evidence": evidence or [],
+        "aliases": [],
+    }
+
+
+def _market_forecast_horizon_inventory(artifact: dict[str, Any] | None) -> list[dict[str, Any]]:
+    horizon_models = artifact.get("horizonModels") if isinstance(artifact, dict) and isinstance(artifact.get("horizonModels"), dict) else {}
+    rows: list[dict[str, Any]] = []
+    for horizon in MARKET_FORECAST_POSITION_HORIZONS_MINUTES:
+        payload = None
+        if isinstance(horizon_models, dict):
+            payload = horizon_models.get(str(horizon)) or horizon_models.get(horizon) or horizon_models.get(f"{horizon}m")
+        if payload is None and horizon == 5:
+            payload = artifact
+        proof = market_forecast_out_of_sample_execution_value_proof(payload or {}) if isinstance(payload, dict) else {}
+        ready = (
+            isinstance(payload, dict)
+            and payload.get("approved") is True
+            and str(payload.get("lifecycleState") or "") == "ACTIVE"
+            and proof.get("passed") is True
+        )
+        rows.append(
+            {
+                "horizonMinutes": horizon,
+                "ready": ready,
+                "status": "ready" if ready else "unavailable",
+                "artifactId": payload.get("artifactId") if isinstance(payload, dict) else None,
+                "threshold": payload.get("threshold") if isinstance(payload, dict) else None,
+                "oosExecutionValueProof": proof,
+            }
+        )
+    return rows
+
+
+def _market_forecast_horizon_module_id(horizon_minutes: int) -> str:
+    labels = {5: "five", 10: "ten", 15: "fifteen"}
+    prefix = labels.get(horizon_minutes, str(horizon_minutes))
+    return f"{prefix}_minute_directional_forecast"
 
 
 def _meta_strategy_module_payload(entry: MetaStrategyRegistryEntry) -> dict[str, Any]:

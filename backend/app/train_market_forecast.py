@@ -18,6 +18,7 @@ from .market_forecast import (
     DEFAULT_STOP_ATR_MULTIPLIER,
     DEFAULT_TARGET_ATR_MULTIPLIER,
     FORECAST_HORIZON_MINUTES,
+    MARKET_FORECAST_POSITION_HORIZONS_MINUTES,
     MICROSTRUCTURE_DIR,
     MODEL_VERSION,
     OUTCOME_LABELS,
@@ -41,12 +42,13 @@ from .tick_data import first_barrier_hit_from_ticks, load_quote_trade_ticks, par
 
 BACKTEST_EXPORT_DIR = Path(__file__).resolve().parents[1] / "data" / "backtests"
 DEFAULT_SYMBOL = "SPY"
-DEFAULT_PROFIT_TARGET = DEFAULT_PROFIT_TARGET_DOLLARS
+DEFAULT_PROFIT_TARGET = 0.25
 DEFAULT_STOP_LOSS = 0.25
 DEFAULT_MAX_ROWS = 120_000
 DEFAULT_ATR_LOOKBACK_MINUTES = 5
 DEFAULT_WALK_FORWARD_FOLDS = 4
 DEFAULT_EMBARGO_MINUTES = FORECAST_HORIZON_MINUTES
+DEFAULT_FORECAST_HORIZONS = MARKET_FORECAST_POSITION_HORIZONS_MINUTES
 DEFAULT_TRAINING_COST = 0.03
 DEFAULT_EXECUTION_LATENCY_CANDLES = 1
 AMBIGUOUS_LABEL_POLICY = "resolve_with_quote_trade_ticks_else_exclude_from_training"
@@ -54,7 +56,7 @@ ENTRY_PRICE_POLICY = "first_executable_price_after_decision_latency_order_valida
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train the isolated 5-minute market forecast model.")
+    parser = argparse.ArgumentParser(description="Train the isolated multi-horizon market forecast model.")
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
     parser.add_argument("--feed", default="iex")
     parser.add_argument("--start-date", default=None)
@@ -71,9 +73,10 @@ def main() -> None:
     parser.add_argument("--training-cost", type=float, default=DEFAULT_TRAINING_COST)
     parser.add_argument("--max-rows", type=int, default=DEFAULT_MAX_ROWS)
     parser.add_argument("--model-kind", choices=["xgboost", "logistic"], default="xgboost")
+    parser.add_argument("--horizons", default=",".join(str(horizon) for horizon in DEFAULT_FORECAST_HORIZONS))
     args = parser.parse_args()
 
-    summary = train_market_forecast_model(
+    summary = train_market_forecast_multi_horizon_model(
         symbol=args.symbol.upper(),
         feed=args.feed,
         start_date=args.start_date,
@@ -90,8 +93,101 @@ def main() -> None:
         training_cost=args.training_cost,
         max_rows=args.max_rows,
         model_kind=args.model_kind,
+        horizons=parse_horizons(args.horizons),
     )
     print(json.dumps(summary, indent=2))
+
+
+def parse_horizons(value: str) -> tuple[int, ...]:
+    horizons = []
+    for raw in str(value or "").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        horizon = int(raw)
+        if horizon <= 0:
+            raise ValueError("Forecast horizons must be positive minute counts")
+        if horizon not in horizons:
+            horizons.append(horizon)
+    return tuple(horizons or DEFAULT_FORECAST_HORIZONS)
+
+
+def train_market_forecast_multi_horizon_model(
+    *,
+    symbol: str,
+    feed: str,
+    start_date: str | None,
+    end_date: str | None,
+    profit_target: float,
+    stop_loss: float,
+    min_target_pct: float,
+    min_stop_pct: float,
+    target_atr_multiplier: float,
+    stop_atr_multiplier: float,
+    atr_lookback_minutes: int,
+    walk_forward_folds: int,
+    embargo_minutes: int,
+    training_cost: float,
+    max_rows: int,
+    model_kind: str,
+    horizons: tuple[int, ...] = DEFAULT_FORECAST_HORIZONS,
+) -> dict[str, Any]:
+    ordered_horizons = tuple(horizon for horizon in MARKET_FORECAST_POSITION_HORIZONS_MINUTES if horizon in set(horizons))
+    ordered_horizons = ordered_horizons + tuple(horizon for horizon in horizons if horizon not in set(ordered_horizons))
+    if not ordered_horizons:
+        ordered_horizons = DEFAULT_FORECAST_HORIZONS
+    primary_horizon = FORECAST_HORIZON_MINUTES if FORECAST_HORIZON_MINUTES in ordered_horizons else ordered_horizons[0]
+    horizon_summaries: dict[str, dict[str, Any]] = {}
+    horizon_artifacts: dict[str, dict[str, Any]] = {}
+
+    for horizon in ordered_horizons:
+        summary = train_market_forecast_model(
+            symbol=symbol,
+            feed=feed,
+            start_date=start_date,
+            end_date=end_date,
+            profit_target=profit_target,
+            stop_loss=stop_loss,
+            min_target_pct=min_target_pct,
+            min_stop_pct=min_stop_pct,
+            target_atr_multiplier=target_atr_multiplier,
+            stop_atr_multiplier=stop_atr_multiplier,
+            atr_lookback_minutes=atr_lookback_minutes,
+            walk_forward_folds=walk_forward_folds,
+            embargo_minutes=max(embargo_minutes, horizon),
+            training_cost=training_cost,
+            max_rows=max_rows,
+            model_kind=model_kind,
+            horizon_minutes=horizon,
+        )
+        horizon_summaries[str(horizon)] = summary
+        artifact_path = Path(str(summary["candidateArtifactPath"]))
+        horizon_artifacts[str(horizon)] = json.loads(artifact_path.read_text(encoding="utf-8"))
+
+    primary = dict(horizon_artifacts[str(primary_horizon)])
+    primary["horizonModels"] = {
+        str(horizon): horizon_artifacts[str(horizon)]
+        for horizon in ordered_horizons
+    }
+    primary["multiHorizonPolicy"] = {
+        "requiredHorizonMinutes": list(ordered_horizons),
+        "primaryHorizonMinutes": primary_horizon,
+        "usage": "position_timing_and_position_management_advice",
+        "entryAuthorization": "advisory_until_execution_risk_and_paper_gates_allow_order",
+        "liveDataIngestion": "finalized_one_minute_predictions_are_recorded_to_the_future_market_prediction_ledger_for_later_retraining",
+    }
+    primary["promotionValidationGates"] = market_forecast_promotion_validation_gates(primary)
+    path = market_forecast_candidate_artifact_path(str(primary["artifactId"]))
+    path.write_text(json.dumps(primary, indent=2), encoding="utf-8")
+
+    return {
+        **horizon_summaries[str(primary_horizon)],
+        "candidateArtifactPath": str(path),
+        "artifact": str(path),
+        "horizons": list(ordered_horizons),
+        "horizonTrainingResults": horizon_summaries,
+        "promotionValidationGates": primary["promotionValidationGates"],
+    }
 
 
 def train_market_forecast_model(
@@ -112,6 +208,7 @@ def train_market_forecast_model(
     training_cost: float,
     max_rows: int,
     model_kind: str,
+    horizon_minutes: int = FORECAST_HORIZON_MINUTES,
 ) -> dict[str, Any]:
     trained_at = datetime.now(UTC).isoformat()
     artifact_id = market_forecast_candidate_artifact_id(symbol=symbol, trained_at=trained_at, model_kind=model_kind)
@@ -137,6 +234,7 @@ def train_market_forecast_model(
         require_microstructure=model_kind == "xgboost",
         symbol=symbol,
         feed=feed,
+        horizon_minutes=horizon_minutes,
     )
     if len(rows) < 1_000:
         raise ValueError(f"Need at least 1,000 labeled rows; found {len(rows)}")
@@ -225,7 +323,7 @@ def train_market_forecast_model(
     calibrated_train_metrics = evaluate_outcome_probabilities(zip(calibrated_train_probabilities, labels(train_rows), row_economics(train_rows)))
     calibrated_calibration_metrics = evaluate_outcome_probabilities(zip(calibrated_calibration_probabilities, labels(calibration_rows), row_economics(calibration_rows)))
     threshold_selection_metrics = evaluate_outcome_probabilities(zip(ensemble_threshold_probabilities, labels(threshold_rows), row_economics(threshold_rows)))
-    optimized_probability_threshold = max(DEFAULT_SUCCESS_THRESHOLD, float(threshold_selection_metrics.get("evOptimizedThreshold") or DEFAULT_SUCCESS_THRESHOLD))
+    optimized_probability_threshold = float(threshold_selection_metrics.get("evOptimizedThreshold") or DEFAULT_SUCCESS_THRESHOLD)
     final_holdout_metrics = evaluate_outcome_probabilities(
         zip(ensemble_final_holdout_probabilities, labels(final_holdout_rows), row_economics(final_holdout_rows)),
         threshold=optimized_probability_threshold,
@@ -250,9 +348,9 @@ def train_market_forecast_model(
         "sourceCandles": str(candle_path),
         "sourceMicrostructure": str(MICROSTRUCTURE_DIR / symbol.upper() / feed),
         "dateRange": {"startDate": start_date, "endDate": end_date},
-        "horizonMinutes": FORECAST_HORIZON_MINUTES,
+        "horizonMinutes": horizon_minutes,
         "label": {
-            "name": "trade_decision_triple_barrier_5m",
+            "name": f"trade_decision_triple_barrier_{horizon_minutes}m",
             "profitTargetDollars": profit_target,
             "stopLossDollars": stop_loss,
             "minTargetPct": min_target_pct,
@@ -284,7 +382,7 @@ def train_market_forecast_model(
             "thresholdPolicy": "expected_value_optimized_threshold",
             "thresholdPolicySource": "threshold_selection_partition",
             "barrierDefinitions": {
-                "name": "trade_decision_triple_barrier_5m",
+                "name": f"trade_decision_triple_barrier_{horizon_minutes}m",
                 "profitTargetDollars": profit_target,
                 "stopLossDollars": stop_loss,
                 "minTargetPct": min_target_pct,
@@ -337,7 +435,7 @@ def train_market_forecast_model(
             "method": "walk_forward_purged_embargo",
             "requestedFolds": walk_forward_folds,
             "embargoMinutes": embargo_minutes,
-            "labelHorizonMinutes": FORECAST_HORIZON_MINUTES,
+            "labelHorizonMinutes": horizon_minutes,
             "sourceRows": "training_calibration_threshold_selection_only",
             "note": "Each validation fold is later in time than its training fold; training observations whose label interval overlaps or falls inside the embargo window are removed. Final untouched test rows are excluded from walk-forward validation and all tuning.",
         },
@@ -404,6 +502,7 @@ def train_market_forecast_model(
             "thresholdSource": "threshold_selection_ev_optimized_threshold",
             "finalHoldoutRole": "report_only_never_tuning",
             "defaultMinimumProbability": DEFAULT_SUCCESS_THRESHOLD,
+            "artifactThresholdPolicy": "use_threshold_selection_ev_optimized_threshold_when_present",
         },
         "uncertaintyPolicy": {
             "method": "primary_model_plus_calibrated_logistic_ensemble",
@@ -773,9 +872,10 @@ def build_training_rows(
     symbol: str = DEFAULT_SYMBOL,
     feed: str = "iex",
     use_quote_trade_ticks: bool = True,
+    horizon_minutes: int = FORECAST_HORIZON_MINUTES,
 ) -> list[dict[str, Any]]:
     start_index = 60
-    end_index = len(candles) - FORECAST_HORIZON_MINUTES - 1
+    end_index = len(candles) - horizon_minutes - 1
     if end_index <= start_index:
         return []
     stride = max(1, math.ceil((end_index - start_index) / max(1, max_rows)))
@@ -813,6 +913,7 @@ def build_training_rows(
             symbol=symbol,
             feed=feed,
             use_quote_trade_ticks=use_quote_trade_ticks,
+            horizon_minutes=horizon_minutes,
         )
         if label is None:
             continue
@@ -823,7 +924,8 @@ def build_training_rows(
                 "timestamp": candles[index]["timestamp"],
                 "decisionTimestamp": candles[index]["timestamp"],
                 "labelStart": executable_entry["entryTimestamp"],
-                "labelEnd": candles[min(len(candles) - 1, int(executable_entry["entryIndex"]) + FORECAST_HORIZON_MINUTES - 1)]["timestamp"],
+                "labelEnd": candles[min(len(candles) - 1, int(executable_entry["entryIndex"]) + horizon_minutes - 1)]["timestamp"],
+                "horizonMinutes": horizon_minutes,
                 "entryTimestamp": executable_entry["entryTimestamp"],
                 "entryPrice": executable_entry["entryPrice"],
                 "entryPricePolicy": ENTRY_PRICE_POLICY,
@@ -865,6 +967,7 @@ def future_trade_outcome_label(
     symbol: str = DEFAULT_SYMBOL,
     feed: str = "iex",
     use_quote_trade_ticks: bool = True,
+    horizon_minutes: int = FORECAST_HORIZON_MINUTES,
 ) -> int | None:
     executable_entry = first_executable_entry(candles, index)
     if executable_entry is None:
@@ -885,7 +988,7 @@ def future_trade_outcome_label(
     )
     target = entry + barriers["targetDistance"]
     stop = entry - barriers["stopDistance"]
-    for future in candles[entry_index : entry_index + FORECAST_HORIZON_MINUTES]:
+    for future in candles[entry_index : entry_index + horizon_minutes]:
         hit_target = float(future["high"]) >= target
         hit_stop = float(future["low"]) <= stop
         if hit_target and hit_stop:

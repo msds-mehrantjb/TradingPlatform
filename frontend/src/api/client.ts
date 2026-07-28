@@ -5,6 +5,8 @@ export const BACKTEST_API_CANDIDATES = ["http://127.0.0.1:8020", API_BASE].filte
 );
 
 export const TRADING_ALGORITHM_INVENTORY_ENDPOINTS = {
+  strategyFit: "/api/v2/algorithms/strategy-fit/inventory",
+  marketForecast: "/api/v2/algorithms/market-forecast/inventory",
   votingEnsemble: "/api/v2/algorithms/voting-ensemble/inventory",
   metaStrategy: "/api/v2/algorithms/meta-strategy/inventory",
   regime: "/api/v2/algorithms/regime/inventory",

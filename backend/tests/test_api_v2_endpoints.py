@@ -78,9 +78,51 @@ class ApiV2EndpointsTest(unittest.TestCase):
         non_aggregators = directional + context + regime + safety
         self.assertNotIn("ensemble_strategy_voting", {module["id"] for module in non_aggregators})
 
+    def test_strategy_fit_inventory_endpoint_has_named_dashboard_contract(self) -> None:
+        response = self.client.get("/api/v2/algorithms/strategy-fit/inventory")
+        source_response = self.client.get("/api/v2/algorithms/voting-ensemble/inventory")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(source_response.status_code, 200, source_response.text)
+        body = response.json()
+        source = source_response.json()
+        self.assertEqual(body["algorithmId"], "strategy_fit")
+        self.assertEqual(body["engineVersion"], "strategy_fit_inventory_v1")
+        self.assertEqual(body["contractVersion"], "strategy_fit_inventory_contract_v1")
+        self.assertEqual(body["displayName"], "Strategy Fit")
+        self.assertEqual(body["sourceAlgorithmId"], "voting_ensemble")
+        self.assertEqual(body["sourceEngineVersion"], "voting_ensemble_v2")
+        self.assertEqual(body["sourceEndpoint"], "/api/v2/algorithms/voting-ensemble/inventory")
+        self.assertEqual(body["modules"], source["modules"])
+
+    def test_market_forecast_inventory_endpoint_has_named_dashboard_contract(self) -> None:
+        response = self.client.get("/api/v2/algorithms/market-forecast/inventory")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["algorithmId"], "market_forecast")
+        self.assertEqual(body["engineVersion"], "market_forecast_v11")
+        self.assertEqual(body["contractVersion"], "market_forecast_inventory_contract_v1")
+        self.assertEqual(body["displayName"], "Market Forecast")
+        self.assertEqual(set(body["modules"]), {"directional", "context", "regime", "safety", "aggregator"})
+        self.assertEqual(
+            [module["id"] for module in body["modules"]["directional"]],
+            ["five_minute_directional_forecast", "ten_minute_directional_forecast", "fifteen_minute_directional_forecast"],
+        )
+        self.assertIn("forecast_feature_extractor", {module["id"] for module in body["modules"]["context"]})
+        self.assertIn("approved_model_authorization_gate", {module["id"] for module in body["modules"]["safety"]})
+        self.assertEqual([module["id"] for module in body["modules"]["aggregator"]], ["multi_horizon_forecast_aggregator"])
+        self.assertEqual([row["horizonMinutes"] for row in body["horizonReadiness"]], [5, 10, 15])
+        model_ready = body["runtimeStatus"]["status"] == "ready" and all(row["ready"] for row in body["horizonReadiness"])
+        self.assertEqual(body["paperTradingReadiness"]["ready"], model_ready)
+        self.assertEqual(body["modules"]["aggregator"][0]["enabled"], model_ready)
+        self.assertEqual(body["modules"]["aggregator"][0]["status"], "active" if model_ready else "unavailable")
+
     def test_algorithm_inventory_endpoints_share_v2_module_shape(self) -> None:
         allowed_statuses = {"active", "shadow", "disabled", "unavailable", "not_data_ready", "deprecated_alias"}
         expected = {
+            "strategy-fit": ("strategy_fit", "directional"),
+            "market-forecast": ("market_forecast", "context"),
             "meta-strategy": ("meta_strategy", "directional"),
             "regime": ("regime", "safety"),
             "wca": ("wca", "context"),

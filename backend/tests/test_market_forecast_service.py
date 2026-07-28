@@ -73,6 +73,67 @@ def promotion_gate_metadata(*, average_ev: float = 0.04, total_ev: float = 0.48,
     }
 
 
+def test_market_forecast_serving_uses_artifact_ev_optimized_threshold() -> None:
+    assert market_forecast.forecast_probability_threshold(None) == market_forecast.DEFAULT_SUCCESS_THRESHOLD
+    assert market_forecast.forecast_probability_threshold({"threshold": 0.45}) == 0.45
+
+
+def test_market_forecast_multi_horizon_promotion_requires_all_horizon_models() -> None:
+    candidate = {
+        "lifecycleState": MODEL_STATE_TRAINED_CANDIDATE,
+        "multiHorizonPolicy": {"requiredHorizonMinutes": [5, 10, 15]},
+        **promotion_gate_metadata(),
+        "horizonModels": {
+            "5": {"approved": False, "lifecycleState": MODEL_STATE_TRAINED_CANDIDATE, **promotion_gate_metadata()},
+            "10": {"approved": False, "lifecycleState": MODEL_STATE_TRAINED_CANDIDATE, **promotion_gate_metadata()},
+        },
+    }
+
+    gates = market_forecast.market_forecast_promotion_validation_gates(candidate)
+
+    assert gates["passed"] is False
+    assert "market_forecast.multi_horizon.required_models_ready" in gates["failedGateIds"]
+
+
+def test_market_forecast_artifact_ready_requires_training_date_and_all_horizons() -> None:
+    horizon_payload = {
+        "approved": True,
+        "lifecycleState": MODEL_STATE_ACTIVE,
+        **promotion_gate_metadata(),
+    }
+    artifact = {
+        "version": market_forecast.MODEL_VERSION,
+        "artifactId": "active-multi-horizon",
+        "modelKind": "logistic",
+        "lifecycleState": MODEL_STATE_ACTIVE,
+        "promotionStatus": MODEL_STATE_ACTIVE,
+        "approved": True,
+        **promotion_gate_metadata(),
+        "horizonModels": {
+            "5": horizon_payload,
+            "10": horizon_payload,
+            "15": horizon_payload,
+        },
+    }
+
+    with patch("backend.app.market_forecast.load_market_forecast_artifact", return_value=artifact):
+        ready, message, _ = MarketForecastService().artifact_ready("SPY", "2026-07-27")
+    assert ready is False
+    assert "no training end date" in message
+
+    dated = {**artifact, "dateRange": {"endDate": "2026-07-27"}}
+    missing_15 = {**dated, "horizonModels": {"5": horizon_payload, "10": horizon_payload}}
+    with patch("backend.app.market_forecast.load_market_forecast_artifact", return_value=missing_15):
+        ready, message, _ = MarketForecastService().artifact_ready("SPY", "2026-07-27")
+    assert ready is False
+    assert "15" in message
+
+    with patch("backend.app.market_forecast.load_market_forecast_artifact", return_value=dated):
+        ready, message, _ = MarketForecastService().artifact_ready("SPY", "2026-07-27")
+    assert ready is True
+    assert "ready" in message
+
+
 def test_service_never_applies_heuristic_when_approved_model_is_missing() -> None:
     with (
         patch("backend.app.market_forecast.load_market_forecast_artifact", return_value=None),
@@ -308,12 +369,44 @@ def test_authoritative_ledger_records_every_one_minute_forecast_invocation(monke
             "artifactId",
             "featureSchemaHash",
             "predictionProbabilities",
+            "predictionHorizons",
+            "actualHorizonPerformance",
             "uncertainty",
             "expectedCosts",
         ):
             assert field in record
+        assert {row["horizonMinutes"] for row in record["predictionHorizons"]} == {5, 10, 15}
         assert record["actual"]["actualFill"]["status"] == "pending"
         assert record["actual"]["realizedOutcome"] is None
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_prediction_ledger_resolves_ml_horizons_against_real_market_data(monkeypatch) -> None:
+    scratch = Path("tmp") / f"market_forecast_horizon_ledger_{uuid.uuid4().hex}"
+    shutil.rmtree(scratch, ignore_errors=True)
+    monkeypatch.setattr(market_forecast, "PREDICTION_LOG_DIR", scratch / "event_ledger")
+    monkeypatch.setattr(market_forecast, "LEGACY_PREDICTION_LOG_DIR", scratch / "legacy")
+
+    try:
+        rows = candles(30)
+        forecast = MarketForecastService().predict(rows[:2])
+        saved = record_market_forecast_prediction("SPY", "iex", "1Min", rows[:2], forecast)
+        assert saved["saved"] is True
+
+        resolved = market_forecast.resolve_market_forecast_prediction_day("SPY", "2026-07-23", rows)
+        ledger = read_market_forecast_prediction_log("SPY", date="2026-07-23", limit=10)
+        record = ledger["records"][0]
+
+        assert resolved["resolved"] >= 1
+        assert record["actualHorizonPerformance"]["status"] == "resolved"
+        assert {row["horizonMinutes"] for row in record["predictionHorizons"]} == {5, 10, 15}
+        assert all((row["actual"] or {})["status"] == "resolved" for row in record["predictionHorizons"])
+        assert set(ledger["summary"]["horizonPerformance"]) == {"5m", "10m", "15m"}
+        assert all(
+            "meanAbsolutePredictionErrorDollars" in summary
+            for summary in ledger["summary"]["horizonPerformance"].values()
+        )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 

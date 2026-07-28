@@ -1935,6 +1935,7 @@ type AlgoTab = "voting" | "weighted" | "confidence" | "regime" | "meta";
 type PersistedUiState = {
   algoTab?: AlgoTab;
   tradingWindowMode?: TradingWindowMode;
+  globalPaperTradingEnabled?: boolean;
   tradingEnabled?: boolean;
   selectedSellSetupByMode?: Record<TradingWindowMode, string>;
   sellSetupSelectionLockedByMode?: Record<TradingWindowMode, boolean>;
@@ -1995,7 +1996,8 @@ function saveUiState() {
   const payload: PersistedUiState = {
     algoTab: state.algoTab,
     tradingWindowMode: state.tradingWindowMode,
-    tradingEnabled: state.tradingEnabled,
+    globalPaperTradingEnabled: state.globalPaperTradingEnabled,
+    tradingEnabled: state.globalPaperTradingEnabled,
     selectedSellSetupByMode: state.selectedSellSetupByMode,
     sellSetupSelectionLockedByMode: state.sellSetupSelectionLockedByMode,
     feed: state.feed,
@@ -2491,6 +2493,11 @@ function buildDecisionRecorderSnapshot(reason: string) {
     timeframe: state.timeframe,
     marketStatus: state.marketStatus,
     source: state.source,
+    globalPaperTrading: {
+      enabled: globalPaperTradingEnabled(),
+      liveTradingEnabled: false,
+      scope: ["ensemble", "weighted", "confidence", "regime", "meta"],
+    },
     candles: candlePayload,
     indicators: compactIndicatorsFromMarket(market),
     marketContext: state.marketContext,
@@ -3073,7 +3080,8 @@ const state = {
   currentRegimeTargetOrder: null as ManualOrderRecommendation | null,
   currentMetaTargetOrder: null as ManualOrderRecommendation | null,
   autoSubmittedOrderKeys: loadAutoSubmittedOrderKeys(),
-  tradingEnabled: persistedUiState.tradingEnabled ?? false,
+  globalPaperTradingEnabled: persistedUiState.globalPaperTradingEnabled ?? persistedUiState.tradingEnabled ?? false,
+  tradingEnabled: persistedUiState.globalPaperTradingEnabled ?? persistedUiState.tradingEnabled ?? false,
   tradingWindowMode: persistedUiState.tradingWindowMode ?? "ensemble" as TradingWindowMode,
   selectedSellSetupByMode: {
     ensemble: persistedUiState.selectedSellSetupByMode?.ensemble ?? "",
@@ -3161,9 +3169,11 @@ const state = {
 let refreshTimer: number | undefined;
 let nextChartRefreshAt = 0;
 let contextTimer: number | undefined;
+let strategyFitRefreshInFlight = false;
 let tradingRagRefreshInFlight = false;
 let automaticSubmitInFlight = false;
 let marketForecastRequestKey = "";
+let lastStrategyFitCandleTimestamp = "";
 let lastTradingRagCandleTimestamp = "";
 let chartDrawFrame: number | undefined;
 let pendingRegimeSelectionUpdateFrame: number | undefined;
@@ -3354,7 +3364,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <div class="quote-header">
             <span>SPDR S&P 500 ETF TRUST</span>
             <div class="quote-header-actions">
-              <button id="tradeToggleButton" class="trade-toggle-button" type="button" aria-pressed="false">Trade Off</button>
+              <button id="tradeToggleButton" class="trade-toggle-button" type="button" aria-pressed="false">Paper Off</button>
               <strong id="quoteSymbol">SPY</strong>
             </div>
           </div>
@@ -4371,11 +4381,11 @@ document.querySelector("#latestButton")!.addEventListener("click", () => {
 });
 
 tradeToggleButton.addEventListener("click", () => {
-  state.tradingEnabled = !state.tradingEnabled;
+  setGlobalPaperTradingEnabled(!globalPaperTradingEnabled());
   saveUiState();
   updateTradeToggleButton();
   updateQuoteCard(currentCandle());
-  if (state.tradingEnabled) {
+  if (globalPaperTradingEnabled()) {
     maybeAutoSubmitAllAlgorithms();
   }
 });
@@ -4464,7 +4474,7 @@ openOrderControls.addEventListener("click", (event) => {
 closePositionButton.addEventListener("click", () => {
   const mode = state.tradingWindowMode;
   const latest = latestExecutionCandleForMode(mode);
-  if (!latest || !canSubmitTrades()) {
+  if (!latest || !canSubmitManualTrades()) {
     return;
   }
   const lots = openOrderLots(mode);
@@ -5354,8 +5364,12 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
     state.error = payload.warning ?? "";
     markRefresh(latestChanged ? "updated" : "checked");
     updateLastCandleStatus(nextLatest);
-    if (latestChanged && nextLatest && shouldRefreshVotingTradingRag()) {
-      void refreshVotingEnsembleTradingOnNewCandle(nextLatest.timestamp);
+    if (latestChanged && nextLatest && marketAllowsTradingRefresh()) {
+      if (shouldRefreshVotingTradingRag()) {
+        void refreshVotingEnsembleTradingOnNewCandle(nextLatest.timestamp);
+      } else {
+        void refreshStrategyFitOnNewCandle(nextLatest.timestamp);
+      }
     }
   } catch (error) {
     if (showLoading) {
@@ -5604,6 +5618,25 @@ async function loadTradingRag() {
   updateAlgorithmPanel(visibleCandles());
 }
 
+async function refreshStrategyFitOnNewCandle(timestamp: string) {
+  if (strategyFitRefreshInFlight || lastStrategyFitCandleTimestamp === timestamp) {
+    return;
+  }
+  strategyFitRefreshInFlight = true;
+  if (contextTimer) {
+    window.clearTimeout(contextTimer);
+    contextTimer = undefined;
+  }
+  try {
+    await loadVotingEnsembleInventory();
+    await loadMarketContext({ showLoading: false, refresh: true, asOf: timestamp });
+    await ensureVotingEnsembleBackendDecision({ force: true });
+    lastStrategyFitCandleTimestamp = timestamp;
+  } finally {
+    strategyFitRefreshInFlight = false;
+  }
+}
+
 async function refreshVotingEnsembleTradingOnNewCandle(timestamp: string) {
   if (!shouldRefreshVotingTradingRag() || tradingRagRefreshInFlight || lastTradingRagCandleTimestamp === timestamp) {
     return;
@@ -5615,7 +5648,7 @@ async function refreshVotingEnsembleTradingOnNewCandle(timestamp: string) {
     contextTimer = undefined;
   }
   try {
-    await loadMarketContext({ showLoading: false, refresh: true, asOf: timestamp });
+    await refreshStrategyFitOnNewCandle(timestamp);
     await loadTradingRag();
   } finally {
     tradingRagRefreshInFlight = false;
@@ -7997,19 +8030,38 @@ function isMarketOpenForOrders() {
   return state.marketStatus === "open";
 }
 
-function canSubmitTrades() {
-  return state.tradingEnabled && isMarketOpenForOrders();
+function globalPaperTradingEnabled() {
+  return Boolean(state.globalPaperTradingEnabled);
 }
 
-function tradeSubmissionBlockedTitle() {
-  return state.tradingEnabled ? "Market is closed" : "Trade is off";
+function setGlobalPaperTradingEnabled(enabled: boolean) {
+  state.globalPaperTradingEnabled = enabled;
+  state.tradingEnabled = enabled;
+}
+
+function canSubmitManualTrades() {
+  return isMarketOpenForOrders();
+}
+
+function canSubmitAutomaticTrades() {
+  return globalPaperTradingEnabled() && isMarketOpenForOrders();
+}
+
+function tradeSubmissionBlockedTitle(submitMode: SubmitOrderMode | "Manual" | "Automatic" = "Manual") {
+  if (!isMarketOpenForOrders()) {
+    return "Market is closed";
+  }
+  return submitMode === "Automatic" && !globalPaperTradingEnabled() ? "Global automatic paper trading is off" : "";
 }
 
 function updateTradeToggleButton() {
-  tradeToggleButton.textContent = state.tradingEnabled ? "Trade On" : "Trade Off";
-  tradeToggleButton.setAttribute("aria-pressed", String(state.tradingEnabled));
-  tradeToggleButton.dataset.enabled = String(state.tradingEnabled);
-  tradeToggleButton.title = state.tradingEnabled ? "Trading enabled for all algorithms" : "Trading disabled for all algorithms";
+  const enabled = globalPaperTradingEnabled();
+  tradeToggleButton.textContent = enabled ? "Paper On" : "Paper Off";
+  tradeToggleButton.setAttribute("aria-pressed", String(enabled));
+  tradeToggleButton.dataset.enabled = String(enabled);
+  tradeToggleButton.title = enabled
+    ? "Automatic paper trading enabled for all dashboard algorithms"
+    : "Automatic paper trading disabled for all dashboard algorithms; manual orders remain available while the market is open";
 }
 
 function updateOrderButtonStates(position: PositionSummary) {
@@ -8018,7 +8070,7 @@ function updateOrderButtonStates(position: PositionSummary) {
   const targetSide = order?.side ?? "Hold";
   const latest = latestExecutionCandleForMode(mode);
   const sellableLot = latest ? selectedSellableOpenOrderLot(mode, latest.close) : null;
-  if (!canSubmitTrades()) {
+  if (!canSubmitManualTrades()) {
     buyOrderButton.disabled = true;
     sellOrderButton.disabled = true;
     buyOrderButton.title = tradeSubmissionBlockedTitle();
@@ -8520,10 +8572,10 @@ function updateQuoteCard(latest: Candle | null) {
     ["Realized P&L", money(position.realizedPnl)],
   ]);
   closePositionButton.hidden = position.shares === 0;
-  closePositionButton.disabled = position.shares === 0 || !canSubmitTrades();
+  closePositionButton.disabled = position.shares === 0 || !canSubmitManualTrades();
   closePositionButton.title = position.shares === 0
     ? "No open position"
-    : canSubmitTrades()
+    : canSubmitManualTrades()
       ? "Close the full open position"
       : tradeSubmissionBlockedTitle();
   updateOrderButtonStates(position);
@@ -8539,7 +8591,7 @@ function recordTradeHistory(side: TradeHistoryRow["side"], mode: TradingWindowMo
   if (!latest) {
     return;
   }
-  if (!canSubmitTrades()) {
+  if (!canSubmitManualTrades()) {
     updateQuoteCard(latest);
     return;
   }
@@ -8977,7 +9029,7 @@ function maybeAutoSubmitTargetOrder() {
   }
   const latest = latestExecutionCandleForMode("ensemble");
   const order = state.currentTargetOrder;
-  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitTrades()) {
+  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitAutomaticTrades()) {
     return;
   }
   if (order.side === "Sell") {
@@ -9022,7 +9074,7 @@ function maybeAutoSubmitRegimeTargetOrder() {
 }
 
 function maybeAutoSubmitAllAlgorithms() {
-  if (!canSubmitTrades()) {
+  if (!canSubmitAutomaticTrades()) {
     return;
   }
   maybeAutoSubmitTargetOrder();
@@ -9311,7 +9363,7 @@ function renderOpenOrderControl(
   const canManualSell = lot.id === selectedLotId;
   const selectedAutoSellReady = selectedProfitableAutomaticSellReady(lot, template, mode, selectedLotId);
   const displayAction = template.action === "Sell" || selectedAutoSellReady ? "Sell" : template.action;
-  const canSell = canSubmitTrades() && !template.forecastSafetyNote && template.quantity > 0 && (template.action === "Sell" || canManualSell || selectedAutoSellReady);
+  const canSell = canSubmitManualTrades() && !template.forecastSafetyNote && template.quantity > 0 && (template.action === "Sell" || canManualSell || selectedAutoSellReady);
   const statusText = openOrderControlStatusText({
     lot,
     template,
@@ -9360,7 +9412,7 @@ function openOrderControlStatusText(input: {
   selectedAutoSellReady: boolean;
   canSell: boolean;
 }) {
-  if (!canSubmitTrades()) {
+  if (!canSubmitManualTrades()) {
     return tradeSubmissionBlockedTitle();
   }
   if (input.template.forecastSafetyNote) {
@@ -9452,7 +9504,7 @@ function isEditableLotOrderKey(key: string): key is keyof LotOrderOverride {
 }
 
 function maybeAutoSubmitOpenOrderControls() {
-  if (automaticSubmitInFlight || !canSubmitTrades()) {
+  if (automaticSubmitInFlight || !canSubmitAutomaticTrades()) {
     return;
   }
   for (const mode of ["ensemble", "weighted", "confidence", "regime", "meta"] as TradingWindowMode[]) {
@@ -9495,7 +9547,7 @@ function submitSelectedOpenOrderSell(mode: TradingWindowMode = activeTradingMode
     setTradingWindowMode(mode);
   }
   const latest = latestExecutionCandleForMode(mode);
-  if (!latest || !canSubmitTrades()) {
+  if (!latest || !canSubmitManualTrades()) {
     updateQuoteCard(latest);
     return;
   }
@@ -9509,7 +9561,7 @@ function submitSelectedOpenOrderSell(mode: TradingWindowMode = activeTradingMode
 
 function submitOpenOrderLot(lotId: string, automatic: boolean, mode: TradingWindowMode = state.tradingWindowMode) {
   const latest = latestExecutionCandleForMode(mode);
-  if (!latest || !canSubmitTrades()) {
+  if (!latest || !(automatic ? canSubmitAutomaticTrades() : canSubmitManualTrades())) {
     return;
   }
   const lot = openOrderLots(mode).find((item) => item.id === lotId);
@@ -10101,7 +10153,7 @@ function appendTradeHistory(
   mode: TradingWindowMode = state.tradingWindowMode,
   options: { submitMode?: OrderEvidenceSnapshot["submitMode"]; trigger?: string } = {},
 ) {
-  if (!canSubmitTrades()) {
+  if (options.submitMode === "Automatic" ? !canSubmitAutomaticTrades() : !canSubmitManualTrades()) {
     return;
   }
   const executionPrice = Number.isFinite(tradePrice) && tradePrice > 0 ? tradePrice : 0;
@@ -14371,10 +14423,10 @@ function isVotingEnsembleBackendResult(value: unknown): value is VotingEnsembleB
 async function loadVotingEnsembleInventory() {
   state.votingEnsembleInventoryStatus = state.votingEnsembleInventoryStatus === "ready" ? "ready" : "loading";
   state.votingEnsembleInventoryWarning = "";
-  let lastMessage = "Voting Ensemble inventory route unavailable";
+  let lastMessage = "Strategy Fit inventory route unavailable";
   for (const baseUrl of BACKTEST_API_CANDIDATES) {
     try {
-      const response = await fetchWithTimeout(`${baseUrl}${TRADING_ALGORITHM_INVENTORY_ENDPOINTS.votingEnsemble}`, 10000);
+      const response = await fetchWithTimeout(`${baseUrl}${TRADING_ALGORITHM_INVENTORY_ENDPOINTS.strategyFit}`, 10000);
       if (response.ok) {
         state.votingEnsembleInventory = normalizeVotingEnsembleInventory(await response.json());
         state.votingEnsembleInventoryStatus = "ready";
@@ -14385,7 +14437,7 @@ async function loadVotingEnsembleInventory() {
       }
       lastMessage =
         response.status === 404
-          ? `Voting Ensemble inventory route not loaded on ${baseUrl}; restart the FastAPI backend.`
+          ? `Strategy Fit inventory route not loaded on ${baseUrl}; restart the FastAPI backend.`
           : await readableResponseError(response);
       if (response.status !== 404) {
         throw new Error(lastMessage);
@@ -20401,7 +20453,7 @@ function updateMarketContext() {
   }
 
   renderLayer(regimeLayer, context.regime);
-  renderAuthoritativeSessionLayer(sessionLayer, state.sessionCurrent ?? context.sessionAuthoritative ?? null, context.session);
+  renderLayer(sessionLayer, context.session);
   renderLayer(eventLayer, context.event);
   renderStrategies(context);
   renderDecision(context);
@@ -20639,7 +20691,7 @@ function renderStrategyInventoryPending() {
     contextUpdatedAt.textContent = "updated --";
     strategyList.innerHTML = strategyInventoryMessageCard(
       "Inventory unavailable",
-      state.votingEnsembleInventoryWarning || "Backend strategy inventory endpoint did not return live modules.",
+      state.votingEnsembleInventoryWarning || "Backend Strategy Fit inventory endpoint did not return live modules.",
       "unavailable",
     );
     return;

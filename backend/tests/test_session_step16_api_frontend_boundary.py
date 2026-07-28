@@ -7,7 +7,9 @@ import uuid
 
 from fastapi.testclient import TestClient
 
+from backend.app import main as app_main
 from backend.app.main import app
+from backend.app.market_context import compute_market_context
 from backend.app.algorithms.session import (
     DataQualityState,
     EventRiskState,
@@ -103,8 +105,26 @@ def test_session_step16_market_context_includes_authoritative_session_bridge() -
     assert session["classification"]["feature_schema_version"]
     assert session["display"]["phase"]
     assert session["display"]["behavior"]
+    assert session["transitionState"]["transitionReason"] == "SESSION_TRANSITION_INITIALIZED"
     assert session["routePermissions"]["readOnly"] is True
     assert session["orderAffectingStatus"]["enabled"] is False
+
+
+def test_session_step16_market_context_session_bridge_persists_shadow_record(monkeypatch) -> None:
+    scratch = _scratch_path()
+    store = SessionDecisionJsonlStore(root=scratch / "session")
+    monkeypatch.setattr(app_main, "session_decision_store", store)
+    daily = [_candle(NOW - timedelta(days=80 - index), 400 + index * 0.2) for index in range(80)]
+    intraday = [_candle(NOW + timedelta(minutes=index), 420 + index * 0.03) for index in range(15)]
+
+    app_main.persist_session_context_decision(compute_market_context("SPY", daily, intraday))
+
+    records = store.read_records(symbol="SPY", session_date="2026-07-23")
+    assert len(records) == 1
+    assert records[0].outputMode == "shadow"
+    assert records[0].transitionState["transitionReason"] == "SESSION_TRANSITION_INITIALIZED"
+    assert records[0].strategyPermissions["readOnly"] is True
+    shutil.rmtree(scratch, ignore_errors=True)
 
 
 def test_session_step16_frontend_fetches_backend_session_and_does_not_define_classification_constants() -> None:

@@ -17,7 +17,6 @@ from backend.app.execution.cost_model import EXECUTION_COST_MODEL_SERVICE
 FORECAST_HORIZON_MINUTES = 5
 MARKET_FORECAST_POSITION_HORIZONS_MINUTES = (5, 10, 15)
 MULTI_HORIZON_POSITION_FORECAST_POLICY = "advisory_only_until_live_paper_validation"
-PREDICTION_LOG_INTERVAL_MINUTES = 5
 LEDGER_NUMBER_DECIMAL_PLACES = 2
 MIN_FEATURE_FORECAST_CANDLES = 2
 DEFAULT_SUCCESS_THRESHOLD = 0.6
@@ -47,6 +46,7 @@ FORECAST_ACTIVE_HISTORY_DIR = FORECAST_ARTIFACT_ROOT / "active_history"
 FORECAST_REJECTED_ARTIFACT_DIR = FORECAST_ARTIFACT_ROOT / "rejected"
 FUTURE_MARKET_PREDICTION_LEDGER_NAME = "future_market_prediction_ledger"
 FUTURE_MARKET_PREDICTION_LEDGER_TITLE = "Future Market Prediction Ledger"
+FUTURE_MARKET_PREDICTION_LEDGER_CONTRACT_VERSION = "market_forecast_prediction_performance_ledger_v1"
 FUTURE_MARKET_PREDICTION_LEDGER_RULE = (
     "futurePredictionPrice is a real 5-minute expected future close estimate derived from "
     "buy/sell/timeout probabilities, trend indicators, VWAP/RSI/Bollinger mean-reversion "
@@ -156,8 +156,17 @@ class MarketForecastService:
         if not artifact:
             return False, f"{MODEL_VERSION} approved forecast model is unavailable.", load_market_forecast_artifact(symbol)
         artifact_end = str(((artifact.get("dateRange") or {}).get("endDate")) or "")[:10]
-        if artifact_end and artifact_end < end_date:
+        if not artifact_end:
+            return False, "Approved forecast artifact has no training end date; daily retraining is required.", artifact
+        if artifact_end < end_date:
             return False, f"Approved forecast artifact ends at {artifact_end}; needs {end_date}.", artifact
+        missing_horizons = [
+            horizon
+            for horizon in MARKET_FORECAST_POSITION_HORIZONS_MINUTES
+            if not market_forecast_horizon_model_ready(artifact, horizon)
+        ]
+        if missing_horizons:
+            return False, f"Approved forecast artifact is missing ready horizons: {', '.join(str(horizon) for horizon in missing_horizons)}.", artifact
         return True, "Approved future market forecast model is ready.", artifact
 
 
@@ -652,6 +661,17 @@ def horizon_forecast_row(
         "minimumEdgeGap": round(minimum_edge_gap, 4),
         "buyExpectedValue": buy_ev,
         "sellExpectedValue": sell_ev,
+        "barriers": {
+            "targetDistance": round(float(barriers["targetDistance"]), 4),
+            "stopDistance": round(float(barriers["stopDistance"]), 4),
+            "atr5m": round(float(barriers["atr5m"]), 4),
+            "minTargetPct": barriers["minTargetPct"],
+            "minStopPct": barriers["minStopPct"],
+            "targetAtrMultiplier": barriers["targetAtrMultiplier"],
+            "stopAtrMultiplier": barriers["stopAtrMultiplier"],
+            "fixedTargetDollars": barriers["fixedTargetDollars"],
+            "fixedStopDollars": barriers["fixedStopDollars"],
+        },
         "futurePricePrediction": future_price_prediction,
         "predictedDirection": future_price_prediction["direction"],
         "predictedPrice": future_price_prediction["predictedPrice"],
@@ -1142,6 +1162,7 @@ def read_market_forecast_prediction_log(
     return {
         "ledgerName": FUTURE_MARKET_PREDICTION_LEDGER_NAME,
         "ledgerTitle": FUTURE_MARKET_PREDICTION_LEDGER_TITLE,
+        "ledgerContractVersion": FUTURE_MARKET_PREDICTION_LEDGER_CONTRACT_VERSION,
         "ledgerRule": FUTURE_MARKET_PREDICTION_LEDGER_RULE,
         "symbol": symbol,
         "date": date,
@@ -1160,7 +1181,7 @@ def resolve_market_forecast_prediction_day(symbol: str, day: str, candles: list[
     resolved = 0
     pending = 0
     for index, record in enumerate(records):
-        if (record.get("actual") or {}).get("status") == "resolved":
+        if (record.get("actual") or {}).get("status") == "resolved" and prediction_horizons_resolved(record):
             continue
         resolution = resolve_market_forecast_record(record, candles)
         records[index] = resolution["record"]
@@ -1205,6 +1226,7 @@ def build_market_forecast_prediction_record(
         numeric(barriers.get("stopDistance")),
         future_price_prediction=future_price_prediction,
     )
+    prediction_horizons = build_prediction_horizon_records(latest, forecast)
     return json_safe(
         {
             "id": f"{symbol.upper()}|{feed}|{timeframe}|{timestamp}|{MODEL_VERSION}|{safe_artifact_id(invocation_id)}",
@@ -1214,6 +1236,7 @@ def build_market_forecast_prediction_record(
             "timeframe": timeframe,
             "ledgerName": FUTURE_MARKET_PREDICTION_LEDGER_NAME,
             "ledgerTitle": FUTURE_MARKET_PREDICTION_LEDGER_TITLE,
+            "ledgerContractVersion": FUTURE_MARKET_PREDICTION_LEDGER_CONTRACT_VERSION,
             "ledgerRule": FUTURE_MARKET_PREDICTION_LEDGER_RULE,
             "recordingPolicy": "every_forecast_invocation_from_finalized_one_minute_events",
             "modelVersion": MODEL_VERSION,
@@ -1264,6 +1287,7 @@ def build_market_forecast_prediction_record(
             "predictedFutureMarket": predicted_future,
             "futurePricePrediction": future_price_prediction,
             "multiHorizonForecast": forecast.get("multiHorizonForecast") or {},
+            "predictionHorizons": prediction_horizons,
             "priceComparison": price_comparison_snapshot(latest, predicted_future),
             "expectedCosts": {
                 "costs": numeric(forecast.get("costs")),
@@ -1295,8 +1319,103 @@ def build_market_forecast_prediction_record(
                 "actualFutureMarket": None,
                 "reason": "Waiting for future candles inside the prediction horizon",
             },
+            "actualHorizonPerformance": {
+                "status": "pending",
+                "resolvedHorizons": 0,
+                "pendingHorizons": len(prediction_horizons),
+                "horizons": [],
+            },
         }
     )
+
+
+def build_prediction_horizon_records(latest: dict[str, Any], forecast: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = (forecast.get("multiHorizonForecast") or {}).get("horizons") or []
+    if not isinstance(rows, list):
+        rows = []
+    fallback_barriers = forecast.get("barriers") or {}
+    fallback_future_price_prediction = forecast.get("futurePricePrediction") or {}
+    entry = numeric(latest.get("close"))
+    horizons: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        horizon_minutes = max(1, int(row.get("horizonMinutes") or FORECAST_HORIZON_MINUTES))
+        barriers = row.get("barriers") if isinstance(row.get("barriers"), dict) else fallback_barriers
+        probabilities = {
+            "probabilityBuySuccess": row.get("probabilityBuySuccess") if row.get("probabilityBuySuccess") is not None else row.get("probabilityUp"),
+            "probabilitySellSuccess": row.get("probabilitySellSuccess") if row.get("probabilitySellSuccess") is not None else row.get("probabilityDown"),
+            "probabilityTimeout": row.get("probabilityTimeout") if row.get("probabilityTimeout") is not None else row.get("probabilityFlatOrNoEdge"),
+        }
+        future_price_prediction = row.get("futurePricePrediction") if isinstance(row.get("futurePricePrediction"), dict) else fallback_future_price_prediction
+        predicted_direction = str(row.get("predictedDirection") or future_price_prediction.get("direction") or "flat").lower()
+        predicted_action = DECISION_BUY if predicted_direction == "up" else DECISION_SELL if predicted_direction == "down" else DECISION_NO_TRADE
+        predicted_future = predicted_future_market_snapshot(
+            latest,
+            predicted_action,
+            horizon_minutes,
+            numeric(barriers.get("targetDistance")),
+            numeric(barriers.get("stopDistance")),
+            future_price_prediction=future_price_prediction,
+        )
+        horizons.append(
+            {
+                "horizonMinutes": horizon_minutes,
+                "status": row.get("status"),
+                "forecastStatus": row.get("forecastStatus") or row.get("status"),
+                "modelApplied": bool(row.get("modelApplied")),
+                "modelKind": row.get("modelKind"),
+                "artifactId": row.get("artifactId") or forecast.get("artifactId"),
+                "featureSchemaHash": row.get("featureSchemaHash") or forecast.get("featureSchemaHash"),
+                "predictionTimestamp": str(latest.get("timestamp") or ""),
+                "expectedAt": add_minutes_iso(str(latest.get("timestamp") or ""), horizon_minutes),
+                "entryPrice": round(entry, 4),
+                "predictedClass": predicted_probability_class(probabilities),
+                "predictedDirection": predicted_direction,
+                "predictedAction": predicted_action,
+                "probabilities": probabilities,
+                "threshold": row.get("threshold"),
+                "edgeGap": row.get("edgeGap"),
+                "minimumEdgeGap": row.get("minimumEdgeGap"),
+                "buyExpectedValue": row.get("buyExpectedValue"),
+                "sellExpectedValue": row.get("sellExpectedValue"),
+                "predictedFutureMarket": predicted_future,
+                "futurePricePrediction": future_price_prediction,
+                "barriers": {
+                    "targetDistance": numeric(barriers.get("targetDistance")),
+                    "stopDistance": numeric(barriers.get("stopDistance")),
+                    "atr5m": barriers.get("atr5m"),
+                    "minTargetPct": barriers.get("minTargetPct"),
+                    "minStopPct": barriers.get("minStopPct"),
+                    "targetAtrMultiplier": barriers.get("targetAtrMultiplier"),
+                    "stopAtrMultiplier": barriers.get("stopAtrMultiplier"),
+                },
+                "expectedExecutionCost": row.get("expectedExecutionCost"),
+                "executionQuality": row.get("executionQuality") or {},
+                "advice": row.get("advice") or {},
+                "actual": {
+                    "status": "pending",
+                    "actualClass": None,
+                    "actualDirection": None,
+                    "actualFutureMarket": None,
+                    "resolvedAt": None,
+                    "reason": "Waiting for future candles inside this ML horizon",
+                },
+            }
+        )
+    return sorted(horizons, key=lambda item: int(item.get("horizonMinutes") or 0))
+
+
+def predicted_probability_class(probabilities: dict[str, Any]) -> str | None:
+    scored = {
+        "buy_success": probabilities.get("probabilityBuySuccess"),
+        "sell_success": probabilities.get("probabilitySellSuccess"),
+        "timeout_no_edge": probabilities.get("probabilityTimeout"),
+    }
+    numeric_scores = {key: numeric(value) for key, value in scored.items() if value is not None}
+    if not numeric_scores:
+        return None
+    return max(numeric_scores, key=numeric_scores.get)
 
 
 def resolve_market_forecast_record(record: dict[str, Any], candles: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1307,17 +1426,21 @@ def resolve_market_forecast_record(record: dict[str, Any], candles: list[dict[st
     if index is None:
         return {"record": record, "updated": False, "resolved": False}
 
+    record = dict(record)
+    horizon_resolution = resolve_prediction_horizon_records(record, candles, index)
+    record = horizon_resolution["record"]
+    horizon_updated = bool(horizon_resolution["updated"])
     horizon = max(1, int(record.get("horizonMinutes") or FORECAST_HORIZON_MINUTES))
     future = candles[index + 1 : index + 1 + horizon]
     if not future:
-        return {"record": record, "updated": False, "resolved": False}
+        return {"record": record, "updated": horizon_updated, "resolved": False}
 
     entry = float(record.get("entryPrice") or candles[index]["close"])
     barriers = record.get("barriers") or {}
     target_distance = numeric(barriers.get("targetDistance"))
     stop_distance = numeric(barriers.get("stopDistance"))
     if target_distance <= 0 or stop_distance <= 0:
-        return {"record": record, "updated": False, "resolved": False}
+        return {"record": record, "updated": horizon_updated, "resolved": False}
 
     buy_target_price = entry + target_distance
     buy_stop_price = entry - stop_distance
@@ -1345,7 +1468,6 @@ def resolve_market_forecast_record(record: dict[str, Any], candles: list[dict[st
         target_distance=target_distance,
         stop_distance=stop_distance,
     )
-    record = dict(record)
     action = ((record.get("prediction") or {}).get("decisionAction") or DECISION_NO_TRADE)
     candidate_action = ((record.get("prediction") or {}).get("candidateAction") or DECISION_NO_TRADE)
     candidate_resolution = (
@@ -1449,6 +1571,165 @@ def resolve_market_forecast_record(record: dict[str, Any], candles: list[dict[st
     record["actual"] = json_safe(actual)
     record["priceComparison"] = json_safe(price_comparison)
     return {"record": record, "updated": True, "resolved": True}
+
+
+def prediction_horizons_resolved(record: dict[str, Any]) -> bool:
+    horizons = record.get("predictionHorizons")
+    if not isinstance(horizons, list) or not horizons:
+        return True
+    return all((row.get("actual") or {}).get("status") == "resolved" for row in horizons if isinstance(row, dict))
+
+
+def resolve_prediction_horizon_records(record: dict[str, Any], candles: list[dict[str, Any]], prediction_index: int) -> dict[str, Any]:
+    horizons = record.get("predictionHorizons")
+    if not isinstance(horizons, list) or not horizons:
+        latest = record.get("predictionMarket") or candles[prediction_index]
+        if isinstance(record.get("multiHorizonForecast"), dict):
+            rebuilt = build_prediction_horizon_records(
+                {
+                    "timestamp": record.get("predictionTimestamp") or candles[prediction_index].get("timestamp"),
+                    "open": latest.get("open") or record.get("entryPrice"),
+                    "high": latest.get("high") or record.get("entryPrice"),
+                    "low": latest.get("low") or record.get("entryPrice"),
+                    "close": latest.get("close") or record.get("entryPrice"),
+                    "volume": latest.get("volume") or 0,
+                    "vwap": latest.get("vwap"),
+                },
+                {"multiHorizonForecast": record.get("multiHorizonForecast"), "artifactId": record.get("artifactId")},
+            )
+            horizons = rebuilt
+        else:
+            horizons = []
+    updated = False
+    resolved_rows: list[dict[str, Any]] = []
+    for row in horizons:
+        if not isinstance(row, dict):
+            continue
+        if (row.get("actual") or {}).get("status") == "resolved":
+            resolved_rows.append(row)
+            continue
+        resolution = resolve_prediction_horizon_record(row, record, candles, prediction_index)
+        resolved_rows.append(resolution["row"])
+        updated = updated or bool(resolution["updated"])
+
+    if resolved_rows:
+        record["predictionHorizons"] = resolved_rows
+        resolved_count = sum(1 for row in resolved_rows if (row.get("actual") or {}).get("status") == "resolved")
+        pending_count = len(resolved_rows) - resolved_count
+        record["actualHorizonPerformance"] = {
+            "status": "resolved" if pending_count == 0 else "pending",
+            "resolvedHorizons": resolved_count,
+            "pendingHorizons": pending_count,
+            "horizons": [
+                {
+                    "horizonMinutes": row.get("horizonMinutes"),
+                    "predictedClass": row.get("predictedClass"),
+                    "actualClass": (row.get("actual") or {}).get("actualClass"),
+                    "classCorrect": (row.get("actual") or {}).get("classCorrect"),
+                    "predictedDirection": row.get("predictedDirection"),
+                    "actualDirection": (row.get("actual") or {}).get("actualDirection"),
+                    "directionCorrect": (row.get("actual") or {}).get("directionCorrect"),
+                    "predictionErrorDollars": (row.get("actual") or {}).get("predictionErrorDollars"),
+                }
+                for row in resolved_rows
+            ],
+        }
+    return {"record": record, "updated": updated}
+
+
+def resolve_prediction_horizon_record(
+    row: dict[str, Any],
+    record: dict[str, Any],
+    candles: list[dict[str, Any]],
+    prediction_index: int,
+) -> dict[str, Any]:
+    horizon = max(1, int(row.get("horizonMinutes") or FORECAST_HORIZON_MINUTES))
+    future = candles[prediction_index + 1 : prediction_index + 1 + horizon]
+    if not future:
+        return {"row": row, "updated": False}
+
+    timestamp = str(record.get("predictionTimestamp") or candles[prediction_index].get("timestamp") or "")
+    latest_timestamp = parse_timestamp(str(candles[-1].get("timestamp") or ""))
+    prediction_timestamp = parse_timestamp(timestamp)
+    horizon_elapsed = bool(
+        latest_timestamp
+        and prediction_timestamp
+        and latest_timestamp >= prediction_timestamp + timedelta(minutes=horizon)
+    )
+    if len(future) < horizon and not horizon_elapsed:
+        return {"row": row, "updated": False}
+
+    entry = float(row.get("entryPrice") or record.get("entryPrice") or candles[prediction_index]["close"])
+    barriers = row.get("barriers") or record.get("barriers") or {}
+    target_distance = numeric(barriers.get("targetDistance"))
+    stop_distance = numeric(barriers.get("stopDistance"))
+    if target_distance <= 0 or stop_distance <= 0:
+        return {"row": row, "updated": False}
+
+    buy_resolution = directional_trade_resolution(
+        future,
+        entry=entry,
+        side=DECISION_BUY,
+        target_distance=target_distance,
+        stop_distance=stop_distance,
+    )
+    sell_resolution = directional_trade_resolution(
+        future,
+        entry=entry,
+        side=DECISION_SELL,
+        target_distance=target_distance,
+        stop_distance=stop_distance,
+    )
+    market_resolution = first_directional_market_resolution(buy_resolution, sell_resolution)
+    outcome = market_outcome_from_directional_resolution(market_resolution)
+    resolved_candle = market_resolution["resolvedCandle"] if outcome != OUTCOME_TIMEOUT else future[-1]
+    horizon_candle = future[horizon - 1] if len(future) >= horizon else future[-1]
+    horizon_close = float(horizon_candle["close"])
+    actual_change = horizon_close - entry
+    predicted_future = row.get("predictedFutureMarket") or {}
+    predicted_price = predicted_future.get("predictedPrice")
+    if predicted_price is None:
+        predicted_price = (row.get("futurePricePrediction") or {}).get("predictedPrice")
+    predicted_class = row.get("predictedClass") or predicted_probability_class(row.get("probabilities") or {})
+    actual_class = actual_class_name(outcome)
+    predicted_direction = str(row.get("predictedDirection") or "").lower()
+    actual_direction = price_direction(actual_change)
+    buy_value = directional_resolution_value(buy_resolution, entry, horizon_close, target_distance, stop_distance)
+    sell_value = directional_resolution_value(sell_resolution, entry, horizon_close, target_distance, stop_distance)
+    actual = {
+        "status": "resolved",
+        "resolvedAt": market_resolution["hitAt"] if outcome != OUTCOME_TIMEOUT else horizon_candle["timestamp"],
+        "expectedAt": add_minutes_iso(timestamp, horizon),
+        "barsHeld": int(market_resolution["barsHeld"] if outcome != OUTCOME_TIMEOUT else len(future)),
+        "entryPrice": round(entry, 4),
+        "actualClass": actual_class,
+        "actualOutcome": outcome,
+        "actualDirection": actual_direction,
+        "actualFutureMarket": candle_market_snapshot(horizon_candle),
+        "actualMarketAtResolution": candle_market_snapshot(resolved_candle),
+        "actualFutureClose": round(horizon_close, 4),
+        "actualFutureChangeDollars": round(actual_change, 4),
+        "actualFutureReturnPct": round(safe_return(horizon_close, entry), 6),
+        "maxHighDuringHorizon": round(max(float(candle["high"]) for candle in future), 4),
+        "minLowDuringHorizon": round(min(float(candle["low"]) for candle in future), 4),
+        "buyValueDollars": round(buy_value, 4),
+        "sellValueDollars": round(sell_value, 4),
+        "predictedClass": predicted_class,
+        "classCorrect": bool(predicted_class == actual_class) if predicted_class else None,
+        "predictedDirection": predicted_direction or None,
+        "directionCorrect": bool(predicted_direction == actual_direction) if predicted_direction and actual_direction else None,
+        "predictionErrorDollars": (
+            round(horizon_close - numeric(predicted_price), 4) if predicted_price is not None else None
+        ),
+        "absolutePredictionErrorDollars": (
+            round(abs(horizon_close - numeric(predicted_price)), 4) if predicted_price is not None else None
+        ),
+        "reason": "Resolved against real one-minute market candles for this ML horizon",
+    }
+    updated = dict(row)
+    updated["predictedClass"] = predicted_class
+    updated["actual"] = json_safe(actual)
+    return {"row": updated, "updated": True}
 
 
 def directional_trade_resolution(
@@ -1807,7 +2088,66 @@ def summarize_prediction_log(records: list[dict[str, Any]]) -> dict[str, Any]:
         "cumulativeRealizedDecisionValueDollars": round(sum(realized_values), 4) if realized_values else 0.0,
         "actions": count_prediction_values(records, "decisionAction"),
         "actualOutcomes": count_actual_outcomes(resolved),
+        "horizonPerformance": summarize_horizon_prediction_performance(records),
     }
+
+
+def summarize_horizon_prediction_performance(records: list[dict[str, Any]]) -> dict[str, Any]:
+    buckets: dict[int, list[dict[str, Any]]] = {}
+    for record in records:
+        horizons = record.get("predictionHorizons")
+        if not isinstance(horizons, list):
+            continue
+        for row in horizons:
+            if not isinstance(row, dict):
+                continue
+            actual = row.get("actual") or {}
+            if actual.get("status") != "resolved":
+                continue
+            horizon = int(row.get("horizonMinutes") or 0)
+            if horizon <= 0:
+                continue
+            buckets.setdefault(horizon, []).append(row)
+    summary: dict[str, Any] = {}
+    for horizon, rows in sorted(buckets.items()):
+        class_scored = [row for row in rows if (row.get("actual") or {}).get("classCorrect") is not None]
+        class_hits = [row for row in class_scored if (row.get("actual") or {}).get("classCorrect") is True]
+        direction_scored = [row for row in rows if (row.get("actual") or {}).get("directionCorrect") is not None]
+        direction_hits = [row for row in direction_scored if (row.get("actual") or {}).get("directionCorrect") is True]
+        errors = [
+            numeric((row.get("actual") or {}).get("absolutePredictionErrorDollars"))
+            for row in rows
+            if (row.get("actual") or {}).get("absolutePredictionErrorDollars") is not None
+        ]
+        buy_values = [numeric((row.get("actual") or {}).get("buyValueDollars")) for row in rows]
+        sell_values = [numeric((row.get("actual") or {}).get("sellValueDollars")) for row in rows]
+        summary[f"{horizon}m"] = {
+            "resolved": len(rows),
+            "classAccuracy": round(len(class_hits) / len(class_scored), 4) if class_scored else None,
+            "directionAccuracy": round(len(direction_hits) / len(direction_scored), 4) if direction_scored else None,
+            "meanAbsolutePredictionErrorDollars": round(mean(errors), 4) if errors else None,
+            "averageBuyValueDollars": round(mean(buy_values), 4) if buy_values else None,
+            "averageSellValueDollars": round(mean(sell_values), 4) if sell_values else None,
+            "predictedClasses": count_horizon_values(rows, "predictedClass"),
+            "actualClasses": count_horizon_actual_values(rows, "actualClass"),
+        }
+    return summary
+
+
+def count_horizon_values(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = str(row.get(key) or "unknown")
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def count_horizon_actual_values(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = str((row.get("actual") or {}).get(key) or "unknown")
+        counts[value] = counts.get(value, 0) + 1
+    return counts
 
 
 def count_prediction_values(records: list[dict[str, Any]], key: str) -> dict[str, int]:
@@ -1858,30 +2198,6 @@ def prediction_log_day(timestamp: str) -> str:
     return str(timestamp)[:10] or datetime.utcnow().date().isoformat()
 
 
-def is_prediction_log_cadence(timestamp: str) -> bool:
-    parsed = parse_timestamp(str(timestamp))
-    if not parsed:
-        return False
-    local = eastern_wall_clock(parsed)
-    return (
-        local.minute % PREDICTION_LOG_INTERVAL_MINUTES == 0
-        and local.second == 0
-        and local.microsecond == 0
-    )
-
-
-def next_prediction_log_boundary(timestamp: str) -> str | None:
-    parsed = parse_timestamp(str(timestamp))
-    if not parsed:
-        return None
-    local = eastern_wall_clock(parsed).replace(second=0, microsecond=0)
-    minutes_until = PREDICTION_LOG_INTERVAL_MINUTES - (local.minute % PREDICTION_LOG_INTERVAL_MINUTES)
-    if minutes_until == PREDICTION_LOG_INTERVAL_MINUTES:
-        minutes_until = 0
-    boundary = local + timedelta(minutes=minutes_until)
-    return boundary.isoformat()
-
-
 def read_prediction_log_document(symbol: str, day: str) -> dict[str, Any]:
     path = existing_prediction_log_path(symbol, day)
     if not path.exists():
@@ -1901,11 +2217,12 @@ def write_prediction_log_document(symbol: str, day: str, records: list[dict[str,
         "version": 2,
         "ledgerName": FUTURE_MARKET_PREDICTION_LEDGER_NAME,
         "ledgerTitle": FUTURE_MARKET_PREDICTION_LEDGER_TITLE,
+        "ledgerContractVersion": FUTURE_MARKET_PREDICTION_LEDGER_CONTRACT_VERSION,
         "ledgerRule": FUTURE_MARKET_PREDICTION_LEDGER_RULE,
         "modelVersion": MODEL_VERSION,
         "symbol": symbol.upper(),
         "date": day,
-        "horizonMinutes": FORECAST_HORIZON_MINUTES,
+        "horizonMinutes": list(MARKET_FORECAST_POSITION_HORIZONS_MINUTES),
         "intervalMinutes": 1,
         "recordingPolicy": "every_forecast_invocation_from_finalized_one_minute_events",
         "dashboardAggregationPolicy": "five_minute_rows_are_derived_after_authoritative_event_logging",
@@ -3050,7 +3367,7 @@ def forecast_probability_threshold(artifact: dict[str, Any] | None) -> float:
     if not artifact:
         return DEFAULT_SUCCESS_THRESHOLD
     try:
-        return max(DEFAULT_SUCCESS_THRESHOLD, float(artifact.get("threshold") or DEFAULT_SUCCESS_THRESHOLD))
+        return clamp(float(artifact.get("threshold") or DEFAULT_SUCCESS_THRESHOLD), 0.0, 1.0)
     except (TypeError, ValueError):
         return DEFAULT_SUCCESS_THRESHOLD
 
@@ -3350,6 +3667,7 @@ def promote_market_forecast_candidate(
         "lifecycleState": MODEL_STATE_ACTIVE,
         "promotionStatus": MODEL_STATE_ACTIVE,
         "approved": True,
+        "horizonModels": activate_market_forecast_horizon_models(candidate),
         "activeSymbol": normalized_symbol,
         "promotedAt": promoted_at,
         "promotedBy": promoted_by,
@@ -3369,7 +3687,22 @@ def promote_market_forecast_candidate(
         "reversible": rollback_path is not None,
         "outOfSampleExecutionValueProof": oos_proof,
         "promotionValidationGates": gate_report,
-    }
+}
+
+
+def activate_market_forecast_horizon_models(candidate: dict[str, Any]) -> dict[str, Any]:
+    horizon_models = candidate.get("horizonModels") if isinstance(candidate.get("horizonModels"), dict) else {}
+    activated: dict[str, Any] = {}
+    for key, payload in horizon_models.items():
+        if not isinstance(payload, dict):
+            continue
+        activated[str(key)] = {
+            **payload,
+            "lifecycleState": MODEL_STATE_ACTIVE,
+            "promotionStatus": MODEL_STATE_ACTIVE,
+            "approved": True,
+        }
+    return activated
 
 
 def market_forecast_promotion_validation_gates(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -3382,6 +3715,7 @@ def market_forecast_promotion_validation_gates(candidate: dict[str, Any]) -> dic
     walk_forward = candidate.get("walkForwardValidation") or {}
     calibration = candidate.get("calibration") or {}
     feature_names = candidate.get("featureNames") or []
+    multi_horizon_gate = market_forecast_multi_horizon_validation_gate(candidate)
     gates = [
         promotion_validation_gate(
             "market_forecast.lifecycle.promotable_state",
@@ -3424,6 +3758,8 @@ def market_forecast_promotion_validation_gates(candidate: dict[str, Any]) -> dic
             "Feature schema identity must be present.",
         ),
     ]
+    if multi_horizon_gate is not None:
+        gates.append(multi_horizon_gate)
     passed = all(gate["passed"] for gate in gates)
     return {
         "passed": passed,
@@ -3438,6 +3774,53 @@ def market_forecast_promotion_validation_gates(candidate: dict[str, Any]) -> dic
 
 def promotion_validation_gate(gate_id: str, passed: bool, detail: str) -> dict[str, Any]:
     return {"id": gate_id, "passed": bool(passed), "detail": detail}
+
+
+def market_forecast_multi_horizon_validation_gate(candidate: dict[str, Any]) -> dict[str, Any] | None:
+    policy = candidate.get("multiHorizonPolicy") or {}
+    required = [int(horizon) for horizon in policy.get("requiredHorizonMinutes") or []]
+    if not required:
+        return None
+    horizon_models = candidate.get("horizonModels") if isinstance(candidate.get("horizonModels"), dict) else {}
+    missing: list[str] = []
+    failed: list[str] = []
+    for horizon in required:
+        payload = horizon_models.get(str(horizon)) or horizon_models.get(horizon) or horizon_models.get(f"{horizon}m")
+        if not isinstance(payload, dict):
+            if horizon == FORECAST_HORIZON_MINUTES:
+                payload = candidate
+            else:
+                missing.append(str(horizon))
+                continue
+        proof = market_forecast_out_of_sample_execution_value_proof(payload)
+        if proof.get("passed") is not True:
+            failed.append(f"{horizon}m:{proof.get('status')}")
+    detail_parts = []
+    if missing:
+        detail_parts.append(f"missing horizon models {', '.join(missing)}")
+    if failed:
+        detail_parts.append(f"failed horizon OOS proofs {', '.join(failed)}")
+    detail = "; ".join(detail_parts) if detail_parts else f"Required horizons available: {', '.join(str(horizon) for horizon in required)}."
+    return promotion_validation_gate(
+        "market_forecast.multi_horizon.required_models_ready",
+        not missing and not failed,
+        detail,
+    )
+
+
+def market_forecast_horizon_model_ready(artifact: dict[str, Any], horizon_minutes: int) -> bool:
+    horizon_models = artifact.get("horizonModels") if isinstance(artifact.get("horizonModels"), dict) else {}
+    payload = horizon_models.get(str(horizon_minutes)) or horizon_models.get(horizon_minutes) or horizon_models.get(f"{horizon_minutes}m")
+    if payload is None and horizon_minutes == FORECAST_HORIZON_MINUTES:
+        payload = artifact
+    if not isinstance(payload, dict):
+        return False
+    proof = market_forecast_out_of_sample_execution_value_proof(payload)
+    return (
+        payload.get("approved") is True
+        and str(payload.get("lifecycleState") or "") == MODEL_STATE_ACTIVE
+        and proof.get("passed") is True
+    )
 
 
 def market_forecast_out_of_sample_execution_value_proof(artifact: dict[str, Any]) -> dict[str, Any]:

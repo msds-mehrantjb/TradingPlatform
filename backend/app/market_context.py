@@ -16,6 +16,7 @@ from backend.app.algorithms.session import (
     session_classification_to_layer_result,
     session_route_permissions,
 )
+from backend.app.algorithms.session.transition import SessionTransitionManager
 
 
 LayerName = Literal["regime", "session", "event"]
@@ -300,9 +301,11 @@ def _compute_session(symbol: str, candles: list[dict], daily: list[dict]) -> Lay
 
 def _session_authoritative_payload(classification: Any) -> dict[str, Any]:
     profile = resolve_session_profile(classification)
+    transition_state = SessionTransitionManager().process(classification)
     return {
         "classification": classification.model_dump(mode="json"),
         "profile": profile.as_dict(),
+        "transitionState": transition_state.as_dict(),
         "routePermissions": session_route_permissions(classification),
         "orderAffectingStatus": {
             "enabled": False,

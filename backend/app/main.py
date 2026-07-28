@@ -29,6 +29,10 @@ from .algorithms.regime.api import router as regime_router
 from .algorithms.regime.api import REGIME_REPOSITORY
 from .algorithms.regime.runtime_supervisor import get_regime_runtime_supervisor
 from .algorithms.session.api import router as session_router
+from .algorithms.session.models import SessionClassification
+from .algorithms.session.persistence import SESSION_PERSISTENCE_ROOT, SessionDecisionJsonlStore, build_session_decision_record
+from .algorithms.session.router import resolve_session_profile
+from .algorithms.session.transition import SessionTransitionManager
 from .algorithms.meta_strategy.api import router as meta_strategy_router
 from .algorithms.voting_ensemble.api import router as voting_ensemble_router
 from .algorithms.wca.api import router as wca_router
@@ -75,6 +79,7 @@ from .tick_data import append_quote_trade_ticks
 settings = get_settings()
 store = CandleStore(settings)
 alpaca = AlpacaClient(settings)
+session_decision_store = SessionDecisionJsonlStore(root=SESSION_PERSISTENCE_ROOT)
 
 app = FastAPI(title="Trading Dashboard API", version="0.1.0")
 app.add_middleware(
@@ -2545,14 +2550,17 @@ async def end_of_day_backtest_refresh_scheduler() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - defensive scheduler guard
+            now = datetime.now(UTC)
+            wait_seconds = 5 * 60
             DAILY_BACKTEST_REFRESH_STATUS.update(
                 {
                     "status": "error",
-                    "lastRunAt": datetime.now(UTC).isoformat(),
-                    "message": f"End-of-day refresh scheduler failed: {exc}",
+                    "lastRunAt": now.isoformat(),
+                    "nextRunAt": (now + timedelta(seconds=wait_seconds)).isoformat(),
+                    "message": f"End-of-day refresh scheduler failed: {exc or type(exc).__name__}",
                 }
             )
-            await asyncio.sleep(5 * 60)
+            await asyncio.sleep(wait_seconds)
 
 
 async def market_forecast_ledger_scheduler() -> None:
@@ -2711,7 +2719,7 @@ async def maybe_run_end_of_day_backtest_refresh() -> None:
         return
     now = datetime.now(UTC)
     eastern_now = now.astimezone(eastern_tz_for_date(now.year, now.month, now.day))
-    market_status = await alpaca.get_market_status()
+    market_status = await safe_market_status()
     target_date = end_of_day_refresh_target_date(market_status, eastern_now)
     if not target_date:
         DAILY_BACKTEST_REFRESH_STATUS.update(
@@ -2741,7 +2749,7 @@ async def maybe_run_end_of_day_backtest_refresh() -> None:
 
 async def next_end_of_day_refresh_schedule() -> tuple[float, str, datetime, dict]:
     now = datetime.now(UTC)
-    market_status = await alpaca.get_market_status()
+    market_status = await safe_market_status()
     eastern_now = now.astimezone(eastern_tz_for_date(now.year, now.month, now.day))
     completed_target = str(DAILY_BACKTEST_REFRESH_STATUS.get("lastTargetDate") or "")
     target_date = end_of_day_refresh_target_date(market_status, eastern_now)
@@ -2877,6 +2885,7 @@ async def run_daily_backtest_refresh(
             end_date=latest_end,
             reason="daily_refresh_up_to_date",
         )
+        forecast_ledger_resolution = resolve_market_forecast_ledger_from_store(normalized_symbol, feed=feed)
         forecast_job = ensure_daily_market_forecast_training_job(
             symbol=normalized_symbol,
             feed=feed,
@@ -2894,6 +2903,7 @@ async def run_daily_backtest_refresh(
             "artifactJob": artifact_job,
             "dynamicArtifactStatus": dynamic_job.get("status"),
             "dynamicArtifactJob": dynamic_job,
+            "forecastLedgerResolution": forecast_ledger_resolution,
             "forecastTrainingStatus": forecast_job.get("status"),
             "forecastTrainingJob": forecast_job,
         }
@@ -2906,6 +2916,7 @@ async def run_daily_backtest_refresh(
                 "artifactJob": artifact_job,
                 "dynamicArtifactStatus": dynamic_job.get("status"),
                 "dynamicArtifactJob": dynamic_job,
+                "forecastLedgerResolution": forecast_ledger_resolution,
                 "forecastTrainingStatus": forecast_job.get("status"),
                 "forecastTrainingJob": forecast_job,
                 "message": result["message"],
@@ -2981,6 +2992,7 @@ async def run_daily_backtest_refresh(
         end_date=target_date,
         reason="daily_refresh",
     )
+    forecast_ledger_resolution = resolve_market_forecast_ledger_from_store(normalized_symbol, feed=feed)
     forecast_training_job = ensure_daily_market_forecast_training_job(
         symbol=normalized_symbol,
         feed=feed,
@@ -2998,6 +3010,7 @@ async def run_daily_backtest_refresh(
         "artifactJob": artifact_job,
         "dynamicArtifactStatus": dynamic_artifact_job.get("status"),
         "dynamicArtifactJob": dynamic_artifact_job,
+        "forecastLedgerResolution": forecast_ledger_resolution,
         "forecastTrainingStatus": forecast_training_job.get("status"),
         "forecastTrainingJob": forecast_training_job,
         "warnings": warnings,
@@ -3011,6 +3024,7 @@ async def run_daily_backtest_refresh(
             "artifactJob": artifact_job,
             "dynamicArtifactStatus": dynamic_artifact_job.get("status"),
             "dynamicArtifactJob": dynamic_artifact_job,
+            "forecastLedgerResolution": forecast_ledger_resolution,
             "forecastTrainingStatus": forecast_training_job.get("status"),
             "forecastTrainingJob": forecast_training_job,
             "message": result["message"],
@@ -3509,6 +3523,28 @@ def market_forecast_artifact_ready(*, symbol: str, end_date: str) -> tuple[bool,
     return MARKET_FORECAST_SERVICE.artifact_ready(symbol, end_date)
 
 
+def resolve_market_forecast_ledger_from_store(symbol: str, *, feed: str) -> dict:
+    normalized_symbol = symbol.upper()
+    candles = store.latest(
+        symbol=normalized_symbol,
+        timeframe=MARKET_FORECAST_LEDGER_TIMEFRAME,
+        feed=feed,
+        limit=MARKET_FORECAST_LEDGER_LIMIT,
+    )
+    if not candles:
+        return {
+            "status": "skipped",
+            "symbol": normalized_symbol,
+            "reason": "market_forecast_ledger.no_stored_one_minute_candles",
+        }
+    return {
+        "status": "resolved",
+        "symbol": normalized_symbol,
+        "feed": feed,
+        **resolve_market_forecast_ledger_pending(normalized_symbol, candles),
+    }
+
+
 def required_daily_ml_artifact_paths(*, manifest: dict, symbol: str, start_date: str, end_date: str) -> list[Path]:
     cache_dir = backtest_cache_dir(manifest)
     normalized_symbol = symbol.upper()
@@ -3628,7 +3664,10 @@ def ensure_daily_market_forecast_training_job(
             "message": message,
         }
     latest_job = latest_market_forecast_training_job_status(symbol=normalized_symbol, start_date=start_date, end_date=end_date)
-    if latest_job and str(latest_job.get("status") or "").lower() in {"queued", "running", "ready"}:
+    latest_status = str((latest_job or {}).get("status") or "").lower()
+    if latest_job and latest_status in {"queued", "running"}:
+        return latest_job
+    if latest_job and latest_status == "ready" and latest_job.get("promotionRequired") is False:
         return latest_job
     return start_market_forecast_training_job(
         symbol=normalized_symbol,
@@ -3834,12 +3873,13 @@ def start_market_forecast_training_job(
             "candidateArtifactPath": None,
             "activeArtifactPath": str(market_forecast_artifact_path(symbol)),
             "promotionRequired": True,
+            "autoPromotion": True,
             "logPath": str(ARTIFACT_JOB_DIR / f"{job_id}.log"),
             "createdAt": created_at,
             "startedAt": None,
             "completedAt": None,
             "pid": None,
-            "message": "Future market forecast candidate training queued; explicit promotion is required before activation.",
+            "message": "Future market forecast multi-horizon retraining queued; candidate will auto-promote only if validation gates pass.",
             "summary": None,
             "error": None,
         },
@@ -3858,6 +3898,7 @@ def start_market_forecast_training_job(
         start_date,
         "--end-date",
         end_date,
+        "--auto-promote",
     ]
     creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
     log_path = ARTIFACT_JOB_DIR / f"{job_id}.log"
@@ -3893,7 +3934,7 @@ def start_market_forecast_training_job(
             "status": "running",
             "startedAt": datetime.now(UTC).isoformat(),
             "pid": process.pid,
-            "message": "Future market forecast retraining worker started.",
+            "message": "Future market forecast retraining worker started; activation is gated by multi-horizon validation.",
         },
     )
 
@@ -8940,7 +8981,35 @@ async def market_context(
         refresh=should_refresh,
         as_of=as_of,
     )
-    return compute_market_context(normalized_symbol, daily, intraday)
+    context = compute_market_context(normalized_symbol, daily, intraday)
+    persist_session_context_decision(context)
+    return context
+
+
+def persist_session_context_decision(context: dict) -> None:
+    session_payload = context.get("sessionAuthoritative")
+    if not isinstance(session_payload, dict):
+        return
+    classification_payload = session_payload.get("classification")
+    if not isinstance(classification_payload, dict):
+        return
+    try:
+        classification = SessionClassification.model_validate(classification_payload)
+        profile = resolve_session_profile(classification)
+        transition_state = session_payload.get("transitionState")
+        if not isinstance(transition_state, dict) or not transition_state:
+            transition_state = SessionTransitionManager().process(classification)
+        record = build_session_decision_record(
+            classification=classification,
+            output_mode="shadow",
+            profile=profile,
+            transition_state=transition_state,
+            persisted_at=classification.decision_time,
+        )
+        session_decision_store.write_record(record)
+    except Exception:
+        # Diagnostic persistence must never block market-context display or trading safeguards.
+        return
 
 
 async def _context_bars(
