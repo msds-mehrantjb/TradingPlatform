@@ -11,7 +11,6 @@ from backend.app.algorithms.weighted_voting.catalog import (
     WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT,
     WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT,
     WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS,
-    WEIGHTED_VOTING_SHADOW_STRATEGY_IDS,
     WEIGHTED_VOTING_STRATEGY_CATALOG,
     weighted_voting_active_strategy_catalog,
     weighted_voting_dedicated_strategy_inventory,
@@ -22,43 +21,34 @@ from backend.app.algorithms.weighted_voting.strategies.base import WeightedVotin
 
 
 EXPECTED_STRATEGIES = (
-    ("S1", "Opening Range Breakout", WeightedStrategyFamily.BREAKOUT, "opening_range_breakout"),
     ("S2", "First Pullback After Open", WeightedStrategyFamily.TREND, "first_pullback_after_open"),
-    ("S3", "VWAP Trend Continuation", WeightedStrategyFamily.TREND, "vwap_trend_continuation"),
-    ("S4", "VWAP Mean Reversion", WeightedStrategyFamily.MEAN_REVERSION, "vwap_mean_reversion"),
     ("S5", "Failed Breakout Reversal", WeightedStrategyFamily.REVERSAL, "failed_breakout_reversal"),
     ("S6", "Liquidity Sweep Reversal", WeightedStrategyFamily.REVERSAL, "liquidity_sweep_reversal"),
     ("S7", "Bollinger/ATR Reversion", WeightedStrategyFamily.MEAN_REVERSION, "bollinger_atr_reversion"),
-    ("S8", "Volatility Breakout", WeightedStrategyFamily.BREAKOUT, "volatility_breakout"),
 )
 EXPECTED_LIFECYCLES = {
-    "S1": "shadow",
     "S2": "active",
-    "S3": "shadow",
-    "S4": "shadow",
     "S5": "active",
     "S6": "active",
     "S7": "active",
-    "S8": "shadow",
 }
 
 
 class WeightedVotingStrategyCatalogTest(unittest.TestCase):
-    def test_catalog_contains_exactly_the_authoritative_eight_strategies(self) -> None:
+    def test_catalog_contains_exactly_the_authoritative_four_strategies(self) -> None:
         actual = tuple((entry.strategy_id, entry.name, entry.family, entry.module_name) for entry in WEIGHTED_VOTING_STRATEGY_CATALOG)
 
         self.assertEqual(actual, EXPECTED_STRATEGIES)
         self.assertEqual(WEIGHTED_VOTING_CATALOG_VERSION, "weighted_voting_catalog_v2")
 
-    def test_families_are_balanced_two_per_family(self) -> None:
+    def test_families_match_weighted_voting_mission(self) -> None:
         counts = Counter(entry.family for entry in WEIGHTED_VOTING_STRATEGY_CATALOG)
 
         self.assertEqual(
             counts,
             {
-                WeightedStrategyFamily.BREAKOUT: 2,
-                WeightedStrategyFamily.TREND: 2,
-                WeightedStrategyFamily.MEAN_REVERSION: 2,
+                WeightedStrategyFamily.TREND: 1,
+                WeightedStrategyFamily.MEAN_REVERSION: 1,
                 WeightedStrategyFamily.REVERSAL: 2,
             },
         )
@@ -87,7 +77,7 @@ class WeightedVotingStrategyCatalogTest(unittest.TestCase):
                 self.assertTrue(entry.enabled)
                 self.assertTrue(entry.executes)
                 self.assertEqual(entry.contributes_to_vote, entry.strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS)
-                self.assertEqual(entry.shadow_records_only, entry.strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS)
+                self.assertFalse(entry.shadow_records_only)
                 self.assertEqual(entry.display_name, entry.name)
                 self.assertEqual(entry.baseline_weight, WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT)
                 self.assertEqual(entry.minimum_weight, WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT)
@@ -105,11 +95,11 @@ class WeightedVotingStrategyCatalogTest(unittest.TestCase):
 
         self.assertEqual(enabled, WEIGHTED_VOTING_STRATEGY_CATALOG)
         self.assertEqual(tuple(entry.strategy_id for entry in active), WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS)
-        self.assertEqual(tuple(entry.strategy_id for entry in enabled if entry.shadow_records_only), WEIGHTED_VOTING_SHADOW_STRATEGY_IDS)
+        self.assertEqual(tuple(entry.strategy_id for entry in enabled if entry.shadow_records_only), ())
         self.assertEqual({entry.minimum_weight for entry in enabled}, {WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT})
         self.assertEqual({entry.maximum_weight for entry in enabled}, {WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT})
-        self.assertEqual(len({entry.strategy_id for entry in enabled}), 8)
-        self.assertEqual(len({entry.display_name for entry in enabled}), 8)
+        self.assertEqual(len({entry.strategy_id for entry in enabled}), 4)
+        self.assertEqual(len({entry.display_name for entry in enabled}), 4)
         self.assertAlmostEqual(sum(entry.baseline_weight for entry in WEIGHTED_VOTING_STRATEGY_CATALOG), 1.0, places=10)
 
     def test_strategy_modules_match_catalog_without_aliasing_other_algorithms(self) -> None:
@@ -136,8 +126,8 @@ class WeightedVotingStrategyCatalogTest(unittest.TestCase):
             tuple((item.strategy_id, item.name, item.family, item.module_name) for item in inventory),
             EXPECTED_STRATEGIES,
         )
-        self.assertEqual(len({item.implementation_path for item in inventory}), 8)
-        self.assertEqual(len({item.implementation_module for item in inventory}), 8)
+        self.assertEqual(len({item.implementation_path for item in inventory}), 4)
+        self.assertEqual(len({item.implementation_module for item in inventory}), 4)
 
         for item in inventory:
             with self.subTest(strategy_id=item.strategy_id):
@@ -192,7 +182,7 @@ class WeightedVotingStrategyCatalogTest(unittest.TestCase):
                 self.assertTrue(item.enabled)
                 self.assertTrue(item.executes)
                 self.assertEqual(item.lifecycle, EXPECTED_LIFECYCLES[item.strategy_id])
-                self.assertEqual(item.voting_influence, WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT if item.strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS else 0.0)
+                self.assertEqual(item.voting_influence, WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT)
                 self.assertEqual(item.display_name, item.name)
                 self.assertEqual(item.baseline_weight, WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT)
                 self.assertEqual(item.minimum_weight, WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT)

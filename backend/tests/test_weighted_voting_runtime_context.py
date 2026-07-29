@@ -122,6 +122,21 @@ class WeightedVotingRuntimeContextTest(unittest.TestCase):
         self.assertEqual(conflicting["decision"]["signal"], "Hold")
         self.assertIn("weighted_voting.runtime_context.conflicting_inventory_symbol", conflicting["runtimeContext"]["failureReasonCodes"])
 
+    def test_market_snapshot_rejects_explicit_incomplete_one_minute_bar(self) -> None:
+        payload = evaluate_payload(include_session=True)
+        payload["candles"][-1]["finalized"] = False
+
+        with self.assertRaisesRegex(ValueError, "completed bars"):
+            build_weighted_voting_market_snapshot(payload)
+
+    def test_market_snapshot_accepts_explicit_completed_one_minute_bar(self) -> None:
+        payload = evaluate_payload(include_session=True)
+        payload["candles"][-1]["finalized"] = True
+
+        snapshot = build_weighted_voting_market_snapshot(payload)
+
+        self.assertTrue(snapshot.one_minute_candles[-1].finalized)
+
 
 def valid_fixture_context(*, inventory_symbol: str = "SPY"):
     store = MemoryStore()

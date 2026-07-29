@@ -16,7 +16,7 @@ from backend.app.algorithms.weighted_voting.broker_reconciliation import (
     reconcile_weighted_voting_broker_observations,
 )
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedVotingGatePipelineResult
-from backend.app.algorithms.weighted_voting.dynamic_settings import DynamicSettingsResolver
+from backend.app.algorithms.weighted_voting.dynamic_settings import resolve_effective_settings
 from backend.app.algorithms.weighted_voting.execution_gateway import (
     WEIGHTED_VOTING_EXECUTION_NAMESPACE,
     WeightedVotingExecutionQueueItem,
@@ -27,10 +27,26 @@ from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ALGO
 from backend.app.algorithms.weighted_voting.inventory import CURRENT_SNAPSHOT_KEY, WeightedVotingInventoryRepository
 from backend.app.algorithms.weighted_voting.market_condition import classify_market_condition
 from backend.app.algorithms.weighted_voting.market_snapshot import build_weighted_voting_market_snapshot
-from backend.app.algorithms.weighted_voting.models import WeightedEffectiveSettings, WeightedWeightState
-from backend.app.algorithms.weighted_voting.persistence import WEIGHTED_VOTING_SETTINGS_KEY, WeightedVotingFilesystemStateStore, WeightedVotingStateStore
+from backend.app.algorithms.weighted_voting.models import WeightedEffectiveSettings, WeightedMarketSnapshot, WeightedWeightState
+from backend.app.algorithms.weighted_voting.persistence import (
+    WEIGHTED_VOTING_SETTINGS_KEY,
+    WeightedVotingFilesystemStateStore,
+    WeightedVotingStateStore,
+    load_effective_settings,
+    persist_effective_settings,
+)
 from backend.app.algorithms.weighted_voting.position_manager import WeightedVotingPositionManagerService
 from backend.app.algorithms.weighted_voting.rollout import WeightedVotingRolloutFlags, WeightedVotingRolloutValidation, automatic_submission_allowed
+from backend.app.algorithms.weighted_voting.runtime_context import (
+    WeightedVotingAccountObservationPort,
+    WeightedVotingExecutionCostEstimate,
+    WeightedVotingGlobalRiskPort,
+    WeightedVotingRuntimeContext,
+    WeightedVotingRuntimeContextBuilder,
+    WeightedVotingStaticMarketDataPort,
+    WeightedVotingUnavailableAccountPort,
+    WeightedVotingUnavailableGlobalRiskPort,
+)
 from backend.app.algorithms.weighted_voting.scheduler import ACTIVE_WEIGHT_STATE_KEY
 from backend.app.algorithms.weighted_voting.service import WeightedVotingService
 from backend.app.algorithms.weighted_voting.strategy_lifecycle import WEIGHTED_VOTING_STRATEGY_LIFECYCLE_LATEST_KEY
@@ -267,6 +283,8 @@ class WeightedVotingRuntimeSupervisor:
         calendar: WeightedVotingMarketCalendar | None = None,
         paper_gateway: PaperOrderGateway | None = None,
         inventory_repository: WeightedVotingInventoryRepository | None = None,
+        account_port: WeightedVotingAccountObservationPort | None = None,
+        global_risk_port: WeightedVotingGlobalRiskPort | None = None,
         rollout_flags: WeightedVotingRolloutFlags | None = None,
         rollout_validation: WeightedVotingRolloutValidation | None = None,
         position_manager: WeightedVotingPositionManagerService | None = None,
@@ -280,6 +298,8 @@ class WeightedVotingRuntimeSupervisor:
         self.calendar = calendar or WeightedVotingMarketCalendar()
         self.paper_gateway = paper_gateway
         self.inventory_repository = inventory_repository or WeightedVotingInventoryRepository(self.store, allocated_capital=0.0)
+        self.account_port = account_port or WeightedVotingUnavailableAccountPort()
+        self.global_risk_port = global_risk_port or WeightedVotingUnavailableGlobalRiskPort()
         self.rollout_flags = rollout_flags
         self.rollout_validation = rollout_validation
         self.position_manager = position_manager or WeightedVotingPositionManagerService(store=self.store, inventory_repository=self.inventory_repository)
@@ -850,7 +870,7 @@ class WeightedVotingRuntimeSupervisor:
             return self._write_event_record(event, "rejected_out_of_order", None, ("weighted_voting.runtime.out_of_order_event_rejected",))
         weight_state = self.service.active_weight_state()
         condition = classify_market_condition(snapshot, config=self.weighted_config)
-        effective = DynamicSettingsResolver(baseline_config=self.weighted_config).resolve(condition, timestamp=snapshot.data_timestamp)
+        effective = self._active_effective_settings()
         idempotency_key = weighted_voting_bar_event_idempotency_key(
             symbol=event.symbol,
             finalised_candle_timestamp=snapshot.data_timestamp,
@@ -871,7 +891,15 @@ class WeightedVotingRuntimeSupervisor:
             self._write_checkpoint(event, idempotency_key, decision_id=None, status="stale_no_order")
             return record
         decision_started = _now()
-        result = self.service.evaluate(event.market_payload)
+        context = self.build_runtime_context_from_finalised_bar(
+            snapshot=snapshot,
+            active_weight_state=weight_state,
+            effective_settings=effective,
+            market_condition=condition,
+            observed_at=snapshot.data_timestamp,
+            event_payload=event.market_payload,
+        )
+        result = self.service.evaluate_context(context)
         self.metrics.decision_latency_ms = round((_now() - decision_started).total_seconds() * 1000, 3)
         self._capture_decision_observability_metrics(result)
         decision_id = str(result["decision"]["decision_id"])
@@ -883,6 +911,79 @@ class WeightedVotingRuntimeSupervisor:
         record = self._write_event_record(event, "decision_persisted", idempotency_key, ("weighted_voting.runtime.decision_persisted",), decision_id=decision_id)
         self._write_checkpoint(event, idempotency_key, decision_id=decision_id, status="decision_persisted")
         return record
+
+    def _active_effective_settings(self) -> WeightedEffectiveSettings:
+        try:
+            return load_effective_settings(self.store)
+        except KeyError:
+            effective = resolve_effective_settings(
+                baseline_config=self.weighted_config,
+                source_evidence=("weighted_voting.runtime.stable_bootstrap_settings",),
+            )
+            persist_effective_settings(self.store, effective)
+            return effective
+
+    def build_runtime_context_from_finalised_bar(
+        self,
+        *,
+        snapshot: WeightedMarketSnapshot,
+        active_weight_state: WeightedWeightState,
+        effective_settings: WeightedEffectiveSettings,
+        market_condition: Any,
+        observed_at: datetime,
+        event_payload: dict[str, Any],
+    ) -> WeightedVotingRuntimeContext:
+        context = WeightedVotingRuntimeContextBuilder(
+            market_data_port=WeightedVotingStaticMarketDataPort(snapshot),
+            inventory_repository=self.inventory_repository,
+            account_port=self.account_port,
+            global_risk_port=self.global_risk_port,
+            effective_settings=effective_settings,
+            active_weight_state=active_weight_state,
+            observed_at=observed_at,
+            mode="production",
+            cost_estimate=_runtime_cost_estimate(
+                event_payload,
+                effective_settings=effective_settings,
+                weighted_config=self.weighted_config,
+                observed_at=observed_at,
+            ),
+            market_condition=market_condition,
+        ).build()
+        self.store.write_snapshot(
+            f"weighted_voting.runtime.contexts.{context.finalised_one_minute_market_snapshot.symbol.upper()}.{context.finalised_one_minute_market_snapshot.data_timestamp.isoformat()}",
+            {
+                "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+                "runtime_version": WEIGHTED_VOTING_RUNTIME_SUPERVISOR_VERSION,
+                "context_version": context.context_version,
+                "manifest_hash": context.manifest_hash,
+                "symbol": context.finalised_one_minute_market_snapshot.symbol.upper(),
+                "data_timestamp": context.finalised_one_minute_market_snapshot.data_timestamp.isoformat(),
+                "one_minute_candle_count": len(context.finalised_one_minute_market_snapshot.one_minute_candles),
+                "five_minute_candle_count": len(context.five_minute_candles),
+                "five_minute_alignment": _enum_value(context.five_minute_alignment),
+                "settings_version": context.effective_settings.settings_version,
+                "weight_version": context.active_weight_state.weight_version,
+                "inventory_snapshot_version": context.inventory_snapshot.snapshot_version,
+                "inventory_available": context.inventory_available,
+                "current_position_quantity": context.current_position.quantity if context.current_position else 0,
+                "pending_order_count": len(context.pending_orders),
+                "algorithm_daily_pnl": context.algorithm_daily_pnl,
+                "algorithm_daily_trade_count": context.algorithm_daily_trade_count,
+                "remaining_algorithm_daily_risk": context.remaining_algorithm_daily_risk,
+                "remaining_algorithm_capital_partition": context.remaining_algorithm_capital_partition,
+                "read_only_account_equity_available": context.read_only_account_equity is not None,
+                "read_only_broker_buying_power_available": context.read_only_broker_buying_power is not None,
+                "current_spread": context.current_spread,
+                "estimated_slippage": context.estimated_slippage,
+                "estimated_fees": context.estimated_fees,
+                "global_risk_service_available": context.global_risk_state.service_available,
+                "global_available_risk": context.global_risk_state.global_available_risk,
+                "global_max_shares": context.global_risk_state.global_max_shares,
+                "reason_codes": ("weighted_voting.runtime.full_context_built_from_finalised_bar",),
+            },
+        )
+        return context
 
     def process_execution_queue_item(self, item: WeightedVotingExecutionQueueItem) -> dict[str, Any]:
         self.metrics.execution_queue_depth = self.execution_queue.qsize()
@@ -1118,6 +1219,22 @@ class WeightedVotingRuntimeSupervisor:
                         "risk_reducing_exits_allowed": self.metrics.risk_reducing_exits_allowed,
                         "recorded_at": _now().isoformat(),
                         "reason_codes": ("weighted_voting.runtime.reconciliation_blocks_new_entries",),
+                    },
+                )
+                return
+            if self.metrics.automatic_order_creation_paused and proposal.intent == "new_entry":
+                self.metrics.rejected_execution_events += 1
+                self.store.write_snapshot(
+                    f"{RUNTIME_EXECUTION_PREFIX}blocked.{proposal.orderIntentId}",
+                    {
+                        "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+                        "runtime_version": WEIGHTED_VOTING_RUNTIME_SUPERVISOR_VERSION,
+                        "decision_id": proposal.decisionId,
+                        "order_intent_id": proposal.orderIntentId,
+                        "status": "automatic_order_creation_paused",
+                        "risk_reducing_exits_allowed": self.metrics.risk_reducing_exits_allowed,
+                        "recorded_at": _now().isoformat(),
+                        "reason_codes": ("weighted_voting.runtime.automatic_entries_paused",),
                     },
                 )
                 return
@@ -1547,6 +1664,36 @@ def _safe_float(value: Any) -> float:
         return float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _runtime_cost_estimate(
+    payload: dict[str, Any],
+    *,
+    effective_settings: WeightedEffectiveSettings,
+    weighted_config: WeightedVotingConfig,
+    observed_at: datetime,
+) -> WeightedVotingExecutionCostEstimate:
+    return WeightedVotingExecutionCostEstimate(
+        slippage_per_share=effective_settings.slippage_allowance_per_share,
+        fee_per_share=weighted_config.fee_per_share,
+        observed_at=observed_at,
+        source_id="weighted_voting.runtime.cost_estimate_from_stable_settings",
+        available=True,
+        reason_codes=("weighted_voting.runtime.cost_estimate_ignores_bar_payload_settings",),
+    )
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value))
 
 
 def _hash_payload(value: Any) -> str:

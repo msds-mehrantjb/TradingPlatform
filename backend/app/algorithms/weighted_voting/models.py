@@ -155,6 +155,7 @@ class WeightedCandle(WeightedContractModel):
     low: float = Field(gt=0)
     close: float = Field(gt=0)
     volume: float = Field(ge=0)
+    finalized: bool = True
 
     @model_validator(mode="after")
     def validate_ohlc_geometry(self) -> WeightedCandle:

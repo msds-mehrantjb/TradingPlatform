@@ -202,6 +202,7 @@ class WeightedVotingControlledRolloutEvidence:
     position_pnl_attribution_accurate: bool = False
     protective_order_reliability_ok: bool = False
     explicit_configuration_approval: bool = False
+    automated_paper_readiness_detected: bool = False
     evidence_id: str = ""
     evidence_version: str = "weighted_voting_rollout_evidence_v1"
 
@@ -326,7 +327,12 @@ def evaluate_controlled_rollout_promotion(
         raise ValueError(f"unknown target Weighted Voting rollout stage: {target_stage}")
     if evidence.algorithm_id != "weighted_voting":
         raise ValueError("Weighted Voting rollout promotion evidence must be attributed to weighted_voting")
-    if CONTROLLED_ROLLOUT_STAGES.index(target_stage) > CONTROLLED_ROLLOUT_STAGES.index(current_stage) + 1:
+    allowed_shadow_to_auto_small = (
+        current_stage == "shadow_decisions"
+        and target_stage == "automatic_paper_small_allocation"
+        and evidence.automated_paper_readiness_detected
+    )
+    if CONTROLLED_ROLLOUT_STAGES.index(target_stage) > CONTROLLED_ROLLOUT_STAGES.index(current_stage) + 1 and not allowed_shadow_to_auto_small:
         return False, ("weighted_voting.rollout.promotion_must_be_sequential",)
     blockers = list(_controlled_stage_blockers(target_stage, evidence))
     return not blockers, tuple(blockers)
@@ -387,6 +393,85 @@ def promote_controlled_rollout_stage(
         }
         store.write_snapshot(ROLLOUT_STATE_KEY, new_state)
     return promotion
+
+
+def controlled_rollout_evidence_from_shadow_report(
+    report: Mapping[str, Any],
+    *,
+    explicit_configuration_approval: bool = False,
+    manual_paper_sample_count: int = 0,
+    restart_recovery_successful: bool = False,
+    protective_order_reliability_ok: bool = False,
+) -> WeightedVotingControlledRolloutEvidence:
+    """Convert a Weighted Voting shadow evidence report into rollout evidence.
+
+    Shadow evidence can prove runtime safety properties, but it cannot by
+    itself grant explicit configuration approval or replace manual paper
+    samples for automatic allocation promotion.
+    """
+
+    if str(report.get("algorithmId") or report.get("algorithm_id")) != "weighted_voting":
+        raise ValueError("Weighted Voting rollout evidence must come from a weighted_voting shadow report")
+    if bool(report.get("liveOrdersSubmitted")):
+        raise ValueError("Weighted Voting shadow evidence cannot include live order submission")
+
+    decisions = _nested_int(report, "decisions", "count")
+    accepted = _nested_int(report, "acceptedProposals", "count")
+    latency = _nested_mapping(report, "latency")
+    latency_max_ms = _float_value(latency.get("maxLatencyMs", latency.get("maxMs")))
+    reconciliation = _nested_mapping(report, "reconciliationHealth")
+    runtime_health = _nested_mapping(reconciliation, "runtimeHealth")
+    restart_recovery = _nested_mapping(report, "restartRecovery")
+    protective_order_behavior = _nested_mapping(report, "protectiveOrderBehavior")
+    duplicate_prevented = bool(_nested_value(report, "duplicatePrevention", "duplicateEventPrevented"))
+    discrepancy_count = _int_value(reconciliation.get("discrepancyCount"))
+    entries_paused = bool(reconciliation.get("entriesPaused"))
+    inventory_reconciled = bool(reconciliation.get("inventoryReconciled")) and not entries_paused and discrepancy_count == 0
+    recovery_required = bool(runtime_health.get("recoveryRequired"))
+    restart_ok = bool(restart_recovery.get("passed")) or bool(restart_recovery_successful)
+    protective_ok = bool(protective_order_behavior.get("passed")) or bool(protective_order_reliability_ok)
+    latency_ok = latency_max_ms is not None and latency_max_ms <= 250.0
+    transaction_cost_ok = _nested_value(report, "pnl", "netUnrealizedAfterFees") is not None
+    drawdown_ok = _nested_float(report, "pnl", "netUnrealizedAfterFees", default=0.0) >= 0.0
+    data_ok = _all_runtime_contexts_have_fresh_data(report)
+    global_ok = accepted > 0 and _nested_int(report, "globalGateApplications", "count") >= decisions
+    automated_ready = all(
+        (
+            decisions >= 50,
+            not recovery_required,
+            inventory_reconciled,
+            duplicate_prevented,
+            latency_ok,
+            accepted > 0,
+            data_ok,
+            global_ok,
+            restart_ok,
+            protective_ok,
+            transaction_cost_ok,
+            drawdown_ok,
+        )
+    )
+
+    return WeightedVotingControlledRolloutEvidence(
+        no_unresolved_isolation_failures=not recovery_required and not bool(report.get("liveOrdersSubmitted")),
+        inventory_reconciled=inventory_reconciled,
+        no_duplicate_order_incidents=duplicate_prevented,
+        worker_reliability_ok=not recovery_required and decisions > 0,
+        decision_latency_ok=latency_ok,
+        broker_latency_ok=accepted > 0 and report.get("simulatedFills") is not None,
+        data_freshness_stable=data_ok,
+        global_risk_fail_closed_tests_passing=global_ok,
+        restart_recovery_successful=restart_ok,
+        shadow_opportunity_count=decisions,
+        manual_paper_sample_count=manual_paper_sample_count,
+        transaction_cost_adjusted_paper_stability_ok=transaction_cost_ok,
+        drawdown_within_limit=drawdown_ok,
+        position_pnl_attribution_accurate=transaction_cost_ok,
+        protective_order_reliability_ok=protective_ok,
+        explicit_configuration_approval=explicit_configuration_approval,
+        automated_paper_readiness_detected=automated_ready,
+        evidence_id=str(report.get("runId") or report.get("run_id") or ""),
+    )
 
 
 def rollback_controlled_rollout_stage(
@@ -675,18 +760,24 @@ def _controlled_stage_blockers(stage: WeightedVotingControlledRolloutStage, evid
                 (evidence.decision_latency_ok, "weighted_voting.rollout.decision_latency_unacceptable"),
                 (evidence.broker_latency_ok, "weighted_voting.rollout.broker_latency_unacceptable"),
                 (evidence.data_freshness_stable, "weighted_voting.rollout.data_freshness_unstable"),
-                (evidence.restart_recovery_successful, "weighted_voting.rollout.restart_recovery_missing"),
                 (evidence.position_pnl_attribution_accurate, "weighted_voting.rollout.position_pnl_attribution_unverified"),
-                (evidence.protective_order_reliability_ok, "weighted_voting.rollout.protective_order_reliability_unverified"),
-                (evidence.explicit_configuration_approval, "weighted_voting.rollout.explicit_configuration_approval_missing"),
             )
         )
     if stage in {"automatic_paper_small_allocation", "automatic_paper_approved_allocation"}:
         checks.extend(
             (
-                (evidence.manual_paper_sample_count >= 20, "weighted_voting.rollout.manual_paper_sample_minimum_not_met"),
+                (evidence.automated_paper_readiness_detected, "weighted_voting.rollout.automated_paper_readiness_not_detected"),
+                (evidence.restart_recovery_successful, "weighted_voting.rollout.restart_recovery_missing"),
+                (evidence.protective_order_reliability_ok, "weighted_voting.rollout.protective_order_reliability_unverified"),
                 (evidence.transaction_cost_adjusted_paper_stability_ok, "weighted_voting.rollout.paper_stability_unacceptable"),
                 (evidence.drawdown_within_limit, "weighted_voting.rollout.drawdown_limit_exceeded"),
+            )
+        )
+    if stage == "automatic_paper_approved_allocation":
+        checks.extend(
+            (
+                (evidence.manual_paper_sample_count >= 20, "weighted_voting.rollout.manual_paper_sample_minimum_not_met"),
+                (evidence.explicit_configuration_approval, "weighted_voting.rollout.explicit_configuration_approval_missing"),
             )
         )
     return tuple(reason for passed, reason in checks if not passed)
@@ -711,6 +802,56 @@ def _read_optional(store: WeightedVotingRolloutStore, key: str) -> dict | None:
         return None
 
 
+def _nested_mapping(source: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = source.get(key)
+    return value if isinstance(value, Mapping) else {}
+
+
+def _nested_value(source: Mapping[str, Any], first: str, second: str) -> Any:
+    return _nested_mapping(source, first).get(second)
+
+
+def _nested_int(source: Mapping[str, Any], first: str, second: str) -> int:
+    return _int_value(_nested_value(source, first, second))
+
+
+def _nested_float(source: Mapping[str, Any], first: str, second: str, default: float | None = None) -> float | None:
+    value = _nested_value(source, first, second)
+    return _float_value(value, default=default)
+
+
+def _float_value(value: Any, default: float | None = None) -> float | None:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _all_runtime_contexts_have_fresh_data(report: Mapping[str, Any]) -> bool:
+    contexts = _nested_mapping(report, "runtimeContexts").get("items") or ()
+    if not contexts:
+        return False
+    for context in contexts:
+        if not isinstance(context, Mapping):
+            return False
+        if context.get("read_only_account_equity_available") is not True:
+            return False
+        if context.get("read_only_broker_buying_power_available") is not True:
+            return False
+        if context.get("global_risk_service_available") is not True:
+            return False
+    return True
+
+
 __all__ = [
     "CONTROLLED_ROLLOUT_STAGES",
     "ROLLOUT_AUDIT_PREFIX",
@@ -726,6 +867,7 @@ __all__ = [
     "WeightedVotingSmallAllocationGuardrails",
     "automatic_submission_allowed",
     "controlled_rollout_status",
+    "controlled_rollout_evidence_from_shadow_report",
     "default_controlled_rollout_state",
     "evaluate_controlled_rollout_promotion",
     "evaluate_rollout_stage",

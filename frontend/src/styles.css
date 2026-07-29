@@ -1424,6 +1424,24 @@ select {
   box-shadow: none;
 }
 
+.weighted-loading-note {
+  display: grid;
+  gap: 6px;
+  border: 1px solid #dbeafe;
+  border-radius: 6px;
+  background: #eff6ff;
+  padding: 10px;
+  color: #334155;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.3;
+}
+
+.weighted-loading-note strong {
+  color: #06162f;
+  font-size: 12px;
+}
+
 .weighted-strategy-table {
   width: 100%;
   border-collapse: separate;
@@ -2914,6 +2932,33 @@ select {
   font-weight: 900;
 }
 
+.target-settings-grid span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  color: #1e3a8a;
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.target-settings-grid small {
+  min-width: 0;
+  display: block;
+  color: inherit;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.target-settings-grid b {
+  min-width: 0;
+  display: block;
+  color: #06162f;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
 .target-settings-grid label.wide {
   grid-column: 1 / -1;
 }
@@ -2927,6 +2972,14 @@ select {
 }
 
 .target-settings-panel[data-side="hold"] .target-settings-grid label {
+  color: #9a3412;
+}
+
+.target-settings-panel[data-side="sell"] .target-settings-grid span {
+  color: #9f1239;
+}
+
+.target-settings-panel[data-side="hold"] .target-settings-grid span {
   color: #9a3412;
 }
 

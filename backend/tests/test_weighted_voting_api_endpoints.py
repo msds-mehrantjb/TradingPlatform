@@ -83,7 +83,7 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertEqual(status.json()["serviceBoundary"]["reason_code_namespace"], "weighted_voting.")
         self.assertIn("WeightedVotingEvaluateRequest", status.json()["serviceBoundary"]["input_models"])
         self.assertIn("WeightedVotingDecision", status.json()["serviceBoundary"]["output_models"])
-        self.assertEqual([item["strategy_id"] for item in status.json()["strategyInventory"]], ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"])
+        self.assertEqual([item["strategy_id"] for item in status.json()["strategyInventory"]], ["S2", "S5", "S6", "S7"])
         self.assertTrue(all(item["implementation_path"].startswith("backend/app/algorithms/weighted_voting/strategies/") for item in status.json()["strategyInventory"]))
         self.assertTrue(all(item["required_indicators"] for item in status.json()["strategyInventory"]))
         self.assertTrue(all(item["state_namespace"].startswith("weighted_voting.strategies.") for item in status.json()["strategyInventory"]))
@@ -91,7 +91,7 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertTrue(all(item["enabled"] for item in status.json()["strategyInventory"]))
         self.assertEqual(sum(item["baseline_weight"] for item in status.json()["strategyInventory"]), 1.0)
         self.assertTrue(all(item["minimum_weight"] == 0.02 for item in status.json()["strategyInventory"]))
-        self.assertTrue(all(item["maximum_weight"] == 0.25 for item in status.json()["strategyInventory"]))
+        self.assertTrue(all(item["maximum_weight"] == 0.35 for item in status.json()["strategyInventory"]))
         self.assertTrue(all(item["long_allowed"] and item["short_allowed"] for item in status.json()["strategyInventory"]))
         self.assertTrue(all(item["dedicated_file"].startswith("backend/app/algorithms/weighted_voting/strategies/") for item in status.json()["strategyInventory"]))
         self.assertTrue(status.json()["finalAcceptance"]["complete"])
@@ -127,7 +127,7 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertEqual(decision.status_code, 200)
         self.assertEqual(decision.json()["decision"]["decision_id"], decision_id)
         self.assertEqual(signals.status_code, 200)
-        self.assertEqual(len(signals.json()["signals"]), 8)
+        self.assertEqual(len(signals.json()["signals"]), 4)
         self.assertEqual(observability.status_code, 200)
         self.assertEqual(observability.json()["observability"]["decisionId"], decision_id)
         self.assertEqual(evaluation.json()["globalGateApplication"]["proposedQuantity"], evaluation.json()["globalOrderProposal"]["quantity"])
@@ -158,6 +158,29 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertEqual(positions.json()["positions"], [])
         self.assertEqual(trades.json()["trades"], [])
         self.assertTrue(all(key.startswith("weighted_voting.") for key in self.store.snapshots))
+
+    def test_backtest_seed_can_use_stored_backtest_outcomes(self) -> None:
+        self.store.write_snapshot(
+            "weighted_voting.backtests.seed-run",
+            {"historicalOutcomes": seed_outcomes()},
+        )
+
+        response = self.client.post(
+            "/api/weighted-voting/weights/recalculate",
+            json={
+                "mode": "backtest_seed",
+                "backtest_run_id": "seed-run",
+                "session_date": "2026-07-14",
+                "update_timestamp": "2026-07-14T21:10:00+00:00",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        weights = response.json()["weightState"]["strategy_weights"]
+        self.assertEqual(response.json()["weightState"]["state_status"], "BACKTEST_SEEDED")
+        self.assertGreater(weights["S2"], 0.25)
+        self.assertLess(weights["S6"], 0.25)
+        self.assertTrue(all(abs(weight - 0.25) <= 0.10 + 0.0000001 for weight in weights.values()))
 
     def test_backtest_endpoints_store_and_return_run_collections(self) -> None:
         response = self.client.post("/api/weighted-voting/backtests", json=backtest_payload("api-run-1"))
@@ -256,6 +279,47 @@ def candle_rows(count: int = 390) -> list[dict]:
             }
         )
     return rows
+
+
+def seed_outcomes() -> list[dict]:
+    returns = {"S2": [0.030] * 60, "S5": [0.022] * 60, "S6": [-0.010] * 60, "S7": [0.004] * 60}
+    rows: list[dict] = []
+    index = 0
+    for strategy_id, values in returns.items():
+        for value in values:
+            rows.append(seed_outcome(strategy_id, index, value))
+            index += 1
+    return rows
+
+
+def seed_outcome(strategy_id: str, index: int, value: float) -> dict:
+    entry_price = 100.0
+    return {
+        "outcome_id": f"outcome-{strategy_id}-{index}",
+        "trade_id": f"trade-{strategy_id}-{index}",
+        "strategy_id": strategy_id,
+        "side": "Buy",
+        "entry_timestamp": (SESSION_OPEN + timedelta(minutes=index)).isoformat(),
+        "exit_timestamp": (SESSION_OPEN + timedelta(minutes=index + 1)).isoformat(),
+        "entry_price": entry_price,
+        "exit_price": entry_price * (1.0 + value),
+        "is_closed": True,
+        "fully_reconciled": True,
+        "gross_return": value + 0.0003,
+        "outcome_return": value,
+        "spread_cost_return": 0.0001,
+        "slippage_cost_return": 0.0001,
+        "fee_cost_return": 0.0001,
+        "total_cost_return": 0.0003,
+        "maximum_favorable_excursion_return": max(0.001, value + 0.002),
+        "maximum_adverse_excursion_return": min(-0.001, value - 0.003),
+        "opportunity_count": 1,
+        "execution_quality": 0.92,
+        "regime_label": "trend",
+        "session_label": "morning",
+        "reason_codes": ["weighted_voting.backtest.synthetic_closed_reconciled"],
+        "explanation": "Synthetic Weighted-owned completed outcome.",
+    }
 
 
 if __name__ == "__main__":

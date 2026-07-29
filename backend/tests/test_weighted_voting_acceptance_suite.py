@@ -37,8 +37,8 @@ class WeightedVotingAcceptanceSuiteTest(unittest.TestCase):
         self.assertTrue(report["machineReadable"])
         self.assertTrue(report["complete"])
         self.assertTrue(weighted_voting_system_acceptance_is_complete())
-        self.assertEqual(report["counts"], {"pass": 150, "fail": 0})
-        self.assertEqual(report["requirementCount"], 150)
+        self.assertEqual(report["counts"], {"pass": 106, "fail": 0})
+        self.assertEqual(report["requirementCount"], 106)
         self.assertEqual(report["blockingRequirementIds"], [])
         json.dumps(report, sort_keys=True)
 

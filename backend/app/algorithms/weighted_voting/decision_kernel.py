@@ -107,13 +107,14 @@ class WeightedVotingDecisionKernel:
                 }
             )
         alignment = _five_minute_alignment(context, decision.proposed_side)
+        expected_value_after_costs = _expected_value_after_costs(signals, decision, snapshot, context)
         gate_result = evaluate_local_decision_gates(
             WeightedVotingLocalGateInputs(
                 decision=decision,
                 signals=signals,
                 market_snapshot=snapshot,
                 five_minute_alignment=alignment if decision.signal in (WeightedSide.BUY.value, WeightedSide.SELL.value) else WeightedFiveMinuteAlignment.UNAVAILABLE,
-                expected_value_after_costs=_expected_value_after_costs(signals, decision, snapshot, context),
+                expected_value_after_costs=expected_value_after_costs,
                 spread_cost=_spread(snapshot),
                 slippage_cost=_normalized_slippage_cost(snapshot, context),
                 fee_cost=_normalized_fee_cost(snapshot, context),
@@ -149,6 +150,18 @@ class WeightedVotingDecisionKernel:
             )
         )
         decision = decision.model_copy(update={"proposed_quantity": sizing.quantity, "gate_results": gate_result.gate_results})
+        final_blocking_reasons = _final_trade_blocking_reason_codes(
+            context=context,
+            effective=effective,
+            expected_value_after_costs=expected_value_after_costs,
+            context_failure_reasons=context_failure_reasons,
+            gate_result=gate_result,
+            sizing=sizing,
+            decision=decision,
+        )
+        if final_blocking_reasons:
+            decision = _hold_decision(decision, final_blocking_reasons)
+            sizing = _zero_sizing_from(sizing, final_blocking_reasons)
         trigger_price = _proposal_entry_price(snapshot, decision.proposed_side)
         stop_price = _proposal_stop_price(trigger_price, sizing.stop_distance, decision.proposed_side)
         target_price = _proposal_target_price(trigger_price, sizing.stop_distance, effective.target_r, decision.proposed_side)
@@ -238,6 +251,7 @@ def decision_kernel_status() -> dict[str, Any]:
             "estimate_transaction_costs_and_expected_value",
             "run_local_algorithm_gates",
             "calculate_position_size_from_algorithm_risk_and_capital",
+            "enforce_final_trade_eligibility_after_cost_latency_gate_and_position_limits",
             "create_order_proposal_or_hold",
             "produce_immutable_observability_record",
         ),
@@ -385,6 +399,96 @@ def _structural_invalidation(signals: tuple[WeightedVotingSignal, ...], side: We
     if not levels:
         return None
     return max(levels) if side_value == WeightedSide.BUY.value else min(levels)
+
+
+def _final_trade_blocking_reason_codes(
+    *,
+    context: WeightedVotingRuntimeContext,
+    effective: WeightedEffectiveSettings,
+    expected_value_after_costs: float,
+    context_failure_reasons: tuple[str, ...],
+    gate_result: Any,
+    sizing: WeightedVotingSizingResult,
+    decision: WeightedDecision,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    side = _side_value(decision.proposed_side)
+    if side not in (WeightedSide.BUY.value, WeightedSide.SELL.value) or not decision.eligible:
+        reasons.append("weighted_voting.decision_kernel.no_directional_trade")
+    if context_failure_reasons:
+        reasons.append("weighted_voting.decision_kernel.latency_or_runtime_context_blocks_trade")
+    if expected_value_after_costs <= 0:
+        reasons.append("weighted_voting.decision_kernel.expected_edge_does_not_survive_costs")
+    if gate_result.permission_granted is not True:
+        reasons.append("weighted_voting.decision_kernel.local_gates_block_trade")
+    if context.global_risk_state.service_available is not True:
+        reasons.append("weighted_voting.decision_kernel.global_gate_unavailable_blocks_trade")
+    if context.global_risk_state.global_available_risk is None or context.global_risk_state.global_available_risk <= 0:
+        reasons.append("weighted_voting.decision_kernel.global_risk_capacity_blocks_trade")
+    if context.global_risk_state.global_max_shares is None or context.global_risk_state.global_max_shares <= 0:
+        reasons.append("weighted_voting.decision_kernel.global_share_capacity_blocks_trade")
+    response = context.global_risk_state.gate_response
+    if response is not None and (
+        response.action not in {"ALLOW", "REDUCE_QUANTITY"}
+        or response.maximumAllowedQuantity <= 0
+        or response.maximumAdditionalRiskDollars <= 0
+    ):
+        reasons.append("weighted_voting.decision_kernel.global_gate_response_blocks_trade")
+    if sizing.quantity <= 0:
+        reasons.append("weighted_voting.decision_kernel.position_sizing_blocks_trade")
+    if _cap_quantity(sizing, "maximum_position") <= 0 or effective.maximum_position_percent <= 0:
+        reasons.append("weighted_voting.decision_kernel.position_limit_blocks_trade")
+    if sizing.buying_power_quantity <= 0 or sizing.capital_partition_quantity <= 0 or sizing.algorithm_maximum_quantity <= 0:
+        reasons.append("weighted_voting.decision_kernel.capital_or_algorithm_position_limit_blocks_trade")
+    return tuple(dict.fromkeys(reasons))
+
+
+def _hold_decision(decision: WeightedDecision, reason_codes: tuple[str, ...]) -> WeightedDecision:
+    return decision.model_copy(
+        update={
+            "signal": WeightedSide.HOLD.value,
+            "proposed_side": WeightedSide.HOLD.value,
+            "raw_winner": WeightedSide.HOLD.value,
+            "eligible": False,
+            "proposed_quantity": 0,
+            "reason_codes": tuple(
+                dict.fromkeys(
+                    (
+                        *decision.reason_codes,
+                        *reason_codes,
+                        "weighted_voting.decision_kernel.final_trade_eligibility_failed",
+                    )
+                )
+            ),
+            "explanation": "Weighted Voting held because the final trade eligibility barrier rejected the trade after costs, latency, gates, and position limits.",
+        }
+    )
+
+
+def _zero_sizing_from(sizing: WeightedVotingSizingResult, reason_codes: tuple[str, ...]) -> WeightedVotingSizingResult:
+    return replace(
+        sizing,
+        quantity=0,
+        requested_quantity=0,
+        approved_local_quantity=0,
+        reason_codes=tuple(
+            dict.fromkeys(
+                (
+                    *sizing.reason_codes,
+                    *reason_codes,
+                    "weighted_voting.sizing.final_trade_eligibility_zeroed",
+                )
+            )
+        ),
+        explanation="Final Weighted Voting quantity is zero because the final trade eligibility barrier failed.",
+    )
+
+
+def _cap_quantity(sizing: WeightedVotingSizingResult, cap_id: str) -> int:
+    for cap in sizing.caps:
+        if cap.cap_id == cap_id:
+            return cap.quantity
+    return 0
 
 
 def _proposal_entry_price(snapshot: WeightedMarketSnapshot, side: WeightedSide | str) -> float | None:

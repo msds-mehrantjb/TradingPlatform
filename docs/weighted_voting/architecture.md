@@ -213,6 +213,13 @@ Mutable persistence keys use `weighted_voting.*`. Filesystem artifacts use
 `data/algorithms/weighted_voting`. Every write validates or stamps
 `algorithm_id == "weighted_voting"`; foreign algorithm writes are rejected.
 
+The authoritative Weighted Voting strategy inventory is intentionally limited to
+four active strategy IDs: `S2` First Pullback After Open, `S5` Failed Breakout
+Reversal, `S6` Liquidity Sweep Reversal, and `S7` Bollinger/ATR Reversion.
+Similarly named strategies in WCA, Regime, Meta-Strategy, or Voting Ensemble are
+separate modules in those algorithms' own inventories and do not register as
+Weighted Voting voters.
+
 Weighted Voting owns one isolated virtual inventory and the
 `weighted_voting.paper.default` capital partition. The broker account is a shared
 external resource, not the algorithm inventory. Shared services may provide

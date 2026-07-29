@@ -48,7 +48,7 @@ class WeightedVotingSettingsTest(unittest.TestCase):
         self.assertEqual(baseline["configurationNamespace"], WEIGHTED_VOTING_CONFIGURATION_NAMESPACE)
         self.assertEqual(baseline["configurationKey"], WEIGHTED_VOTING_BASELINE_CONFIGURATION_KEY)
         self.assertEqual(baseline["configVersion"], config.config_version)
-        self.assertEqual(len(baseline["strategyEnablement"]), 8)
+        self.assertEqual(len(baseline["strategyEnablement"]), 4)
         self.assertEqual(set(baseline["strategyEnablement"]), set(baseline["strategyBaselineWeights"]))
         self.assertAlmostEqual(sum(baseline["strategyBaselineWeights"].values()), 1.0)
         self.assertEqual(baseline["decisionThresholds"]["minimumWinningScore"], config.minimum_score)
@@ -71,10 +71,10 @@ class WeightedVotingSettingsTest(unittest.TestCase):
 
     def test_baseline_configuration_hash_changes_with_baseline_policy(self) -> None:
         config = WeightedVotingConfig()
-        disabled_s1 = dict(config.strategy_enablement)
-        disabled_s1["S1"] = False
+        disabled_s2 = dict(config.strategy_enablement)
+        disabled_s2["S2"] = False
 
-        updated = WeightedVotingConfig(strategy_enablement=disabled_s1)
+        updated = WeightedVotingConfig(strategy_enablement=disabled_s2)
 
         self.assertNotEqual(config.configuration_hash, updated.configuration_hash)
 
@@ -90,7 +90,7 @@ class WeightedVotingSettingsTest(unittest.TestCase):
 
     def test_dynamic_settings_begin_from_weighted_voting_baseline(self) -> None:
         disabled = dict(WeightedVotingConfig().strategy_enablement)
-        disabled["S1"] = False
+        disabled["S2"] = False
         config = WeightedVotingConfig(
             risk_per_trade_baseline_percent=0.75,
             order_allocation_percent=12.5,
@@ -106,19 +106,19 @@ class WeightedVotingSettingsTest(unittest.TestCase):
         self.assertEqual(defaults.order_allocation_percent, config.order_allocation_percent)
         self.assertEqual(defaults.maximum_trades, config.maximum_weighted_daily_trades)
         self.assertEqual(defaults.slippage_allowance_per_share, config.entry_slippage_per_share)
-        self.assertFalse(defaults.strategy_eligibility["S1"])
+        self.assertFalse(defaults.strategy_eligibility["S2"])
         self.assertEqual(effective.baseline_configuration_version, config.config_version)
         self.assertEqual(effective.dynamic_profile_version, WEIGHTED_VOTING_DYNAMIC_PROFILE_VERSION)
         self.assertEqual(effective.hard_limit_version, effective.hard_limits.limits_version)
         self.assertEqual(effective.expiration_timestamp, TS + timedelta(seconds=WEIGHTED_VOTING_DYNAMIC_SETTINGS_TTL_SECONDS))
-        self.assertEqual(effective.strategy_eligibility["S1"], defaults.strategy_eligibility["S1"])
+        self.assertEqual(effective.strategy_eligibility["S2"], defaults.strategy_eligibility["S2"])
 
     def test_step6_dedicated_settings_surface_is_weighted_voting_owned(self) -> None:
         config = WeightedVotingConfig()
         defaults = default_weighted_settings(timestamp=TS, baseline_config=config)
 
-        self.assertEqual(defaults.strategy_states["S1"], "shadow")
         self.assertEqual(defaults.strategy_states["S2"], "active")
+        self.assertEqual(set(defaults.strategy_states), {"S2", "S5", "S6", "S7"})
         self.assertEqual(defaults.strategy_eligibility, config.strategy_enablement)
         self.assertEqual(defaults.baseline_strategy_weights, config.strategy_baseline_weights)
         self.assertEqual(defaults.minimum_strategy_weights, config.strategy_minimum_weights)
@@ -172,7 +172,7 @@ class WeightedVotingSettingsTest(unittest.TestCase):
                 "maximum_participation_rate": 0.02,
                 "slippage_allowance_per_share": 0.03,
                 "cooldown_seconds": 420,
-                "strategy_eligibility": {"S1": False},
+                "strategy_eligibility": {"S2": False},
                 "strategy_risk_multipliers": {"S2": 1.4},
             },
             baseline_config=config,
@@ -185,7 +185,7 @@ class WeightedVotingSettingsTest(unittest.TestCase):
         self.assertEqual(effective.maximum_trades, 12)
         self.assertEqual(effective.slippage_allowance_per_share, 0.03)
         self.assertEqual(effective.cooldown_seconds, 420)
-        self.assertFalse(effective.strategy_eligibility["S1"])
+        self.assertFalse(effective.strategy_eligibility["S2"])
         self.assertEqual(effective.strategy_risk_multipliers["S2"], 1.4)
         self.assertEqual(effective.source_evidence, ("weighted_voting.market_condition.clean",))
         self.assertEqual(effective.market_condition_input, {"market_quality": "clean"})

@@ -21,6 +21,7 @@ from backend.app.algorithms.weighted_voting.rollout import (
     WeightedVotingControlledRolloutEvidence,
     automatic_submission_allowed,
     controlled_rollout_status,
+    controlled_rollout_evidence_from_shadow_report,
     evaluate_controlled_rollout_promotion,
     evaluate_rollout_stage,
     evaluate_weighted_voting_rollout_control,
@@ -290,6 +291,53 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertTrue(status["small_allocation_guardrails"]["stop_entries_after_reconciliation_discrepancy"])
         self.assertEqual(tuple(status["small_allocation_guardrails"]["approved_active_strategy_ids"]), ("S2", "S5", "S6", "S7"))
 
+    def test_shadow_report_evidence_does_not_skip_to_small_automatic_allocation(self) -> None:
+        report = shadow_report(decisions=12)
+        evidence = controlled_rollout_evidence_from_shadow_report(report)
+
+        promoted, blockers = evaluate_controlled_rollout_promotion(
+            current_stage="manual_paper_submission",
+            target_stage="automatic_paper_small_allocation",
+            evidence=evidence,
+        )
+
+        self.assertFalse(promoted)
+        self.assertEqual(evidence.shadow_opportunity_count, 12)
+        self.assertEqual(evidence.manual_paper_sample_count, 0)
+        self.assertFalse(evidence.automated_paper_readiness_detected)
+        self.assertIn("weighted_voting.rollout.shadow_opportunity_minimum_not_met", blockers)
+        self.assertIn("weighted_voting.rollout.automated_paper_readiness_not_detected", blockers)
+
+    def test_shadow_report_with_automated_readiness_can_promote_small_allocation_without_manual_paper(self) -> None:
+        store = MemoryStore()
+        store.write_snapshot(
+            ROLLOUT_STATE_KEY,
+            {
+                "algorithm_id": "weighted_voting",
+                "rollout_version": "weighted_voting_rollout_v2",
+                "stage": "shadow_decisions",
+                "status": "valid",
+                "automatic_paper_submission_allowed": False,
+            },
+        )
+        evidence = controlled_rollout_evidence_from_shadow_report(
+            shadow_report(decisions=55),
+        )
+
+        promotion = promote_controlled_rollout_stage(
+            store,
+            target_stage="automatic_paper_small_allocation",
+            evidence=evidence,
+            actor="ops-user",
+            promoted_at=NOW,
+        )
+
+        self.assertTrue(promotion.promoted)
+        self.assertEqual(evidence.manual_paper_sample_count, 0)
+        self.assertTrue(evidence.automated_paper_readiness_detected)
+        self.assertTrue(store.snapshots[ROLLOUT_STATE_KEY]["automatic_paper_submission_allowed"])
+        self.assertEqual(store.snapshots[ROLLOUT_STATE_KEY]["small_allocation_guardrails"]["cap_quantity"], 10)
+
     def test_controlled_rollback_is_immediate_and_safe(self) -> None:
         store = MemoryStore()
         store.write_snapshot(
@@ -370,8 +418,48 @@ def passing_evidence(*, shadow_opportunity_count: int = 100, manual_paper_sample
         position_pnl_attribution_accurate=True,
         protective_order_reliability_ok=True,
         explicit_configuration_approval=True,
+        automated_paper_readiness_detected=True,
         evidence_id="weighted_voting.rollout.evidence.test",
     )
+
+
+def shadow_report(*, decisions: int) -> dict:
+    return {
+        "algorithmId": "weighted_voting",
+        "runId": "weighted-voting-shadow-test",
+        "liveOrdersSubmitted": False,
+        "decisions": {"count": decisions},
+        "acceptedProposals": {"count": 1},
+        "latency": {"maxLatencyMs": 20.0},
+        "simulatedFills": {"observedSlippagePerShare": 0.01},
+        "pnl": {"netUnrealizedAfterFees": 10.0},
+        "duplicatePrevention": {"duplicateEventPrevented": True},
+        "reconciliationHealth": {
+            "inventoryReconciled": True,
+            "entriesPaused": False,
+            "discrepancyCount": 0,
+            "runtimeHealth": {
+                "recoveryRequired": False,
+            },
+        },
+        "restartRecovery": {
+            "passed": True,
+        },
+        "protectiveOrderBehavior": {
+            "passed": True,
+        },
+        "runtimeContexts": {
+            "items": [
+                {
+                    "read_only_account_equity_available": True,
+                    "read_only_broker_buying_power_available": True,
+                    "global_risk_service_available": True,
+                }
+                for _ in range(decisions)
+            ],
+        },
+        "globalGateApplications": {"count": decisions},
+    }
 
 
 if __name__ == "__main__":

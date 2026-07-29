@@ -81,7 +81,7 @@ Evidence:
 
 Validated conditions:
 
-- Exactly eight strategies exist.
+- Exactly four active Weighted Voting strategies exist: `S2`, `S5`, `S6`, and `S7`.
 - Strategy families are balanced and differentiated.
 - Family caps and correlation controls are tested.
 - Confidence/probability outputs are deterministic and normalized.

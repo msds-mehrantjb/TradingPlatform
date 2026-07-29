@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Body, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field
@@ -134,9 +134,11 @@ class WeightedVotingDailyUpdateRequest(BaseModel):
 class WeightedVotingWeightRecalculateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    mode: Literal["performance_update", "backtest_seed"] = "performance_update"
     session_date: str | None = Field(default=None)
     update_timestamp: datetime | None = None
     regime_label: str | None = None
+    backtest_run_id: str | None = Field(default=None)
     outcomes: tuple[dict[str, Any], ...] = ()
 
 

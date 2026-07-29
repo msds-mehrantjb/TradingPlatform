@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 import hashlib
 import json
@@ -35,7 +35,7 @@ WEIGHTED_VOTING_WEIGHT_HISTORY_KEY = "weighted_voting.weights.history"
 WEIGHTED_VOTING_WEIGHT_UPDATE_RULES = (
     "use_only_weighted_voting_attributed_strategy_outcomes",
     "use_only_closed_and_fully_reconciled_weighted_voting_trades",
-    "shadow_strategies_retain_zero_voting_weight",
+    "only_catalog_active_strategies_receive_voting_weight",
     "deterministic_input_and_output_hashes",
     "score_out_of_sample_expectancy_after_costs",
     "score_profit_factor_and_win_rate",
@@ -53,6 +53,7 @@ WEIGHTED_VOTING_WEIGHT_UPDATE_RULES = (
     "smooth_across_evaluation_windows",
     "enforce_minimum_and_maximum_strategy_weights",
     "limit_maximum_daily_weight_change",
+    "limit_initial_backtest_seed_deviation",
     "preserve_previous_weights_on_validation_failure",
 )
 FORBIDDEN_WEIGHT_INPUT_MARKERS = (
@@ -109,7 +110,52 @@ def create_unseeded_equal_weight_state(
         input_data_hash=_hash_payload({"source": "unseeded_equal", "strategy_ids": strategy_ids}),
         output_hash=_hash_payload({"strategy_weights": _baseline_weights(strategy_ids), "status": "UNSEEDED_EQUAL_WEIGHTS"}),
         reason_codes=("weighted_voting.weights.unseeded_equal",),
-        explanation="Initial deterministic equal active-strategy weights before qualified Weighted Voting outcomes are available; shadow strategies carry zero voting weight.",
+        explanation="Initial deterministic equal active-strategy weights before qualified Weighted Voting outcomes are available; non-active strategies carry zero voting weight.",
+    )
+
+
+def create_backtest_seeded_weight_state(
+    outcomes: tuple[WeightedStrategyOutcome, ...],
+    *,
+    timestamp: datetime,
+    data_timestamp: datetime | None = None,
+    session_date: date | str | None = None,
+    config: WeightedVotingConfig | None = None,
+    regime_label: str | None = None,
+) -> WeightedWeightState:
+    active_config = config or WeightedVotingConfig()
+    seed_config = replace(
+        active_config,
+        weight_smoothing_previous=0.50,
+        weight_smoothing_candidate=0.50,
+        maximum_daily_weight_change=active_config.maximum_backtest_seed_deviation,
+    )
+    initial_state = create_unseeded_equal_weight_state(timestamp=timestamp, data_timestamp=data_timestamp or timestamp)
+    seeded = update_performance_weight_state(
+        initial_state,
+        outcomes,
+        update_timestamp=timestamp,
+        data_timestamp=data_timestamp or timestamp,
+        session_date=session_date,
+        config=seed_config,
+        regime_label=regime_label,
+    )
+    if seeded.state_status != WeightedWeightStateStatus.BACKTEST_SEEDED.value:
+        return seeded
+    return seeded.model_copy(
+        update={
+            "reason_codes": tuple(
+                dict.fromkeys(
+                    (
+                        *seeded.reason_codes,
+                        "weighted_voting.weights.backtest_seeded_initial",
+                        "weighted_voting.weights.walk_forward_or_backtest_only",
+                        "weighted_voting.weights.conservative_seed_shrink_to_equal",
+                    )
+                )
+            ),
+            "explanation": "Initial Weighted Voting weights seeded from closed, reconciled walk-forward/backtest outcomes with transaction costs, drawdown/stability penalties, shrinkage toward equal weights, and capped initial deviation.",
+        }
     )
 
 
@@ -244,7 +290,7 @@ def update_performance_weight_state(
         limited_weights = _apply_daily_weight_change_limit(previous_weights, smoothed_weights, active_config.maximum_daily_weight_change)
         final_weights = _normalize_state_weights_with_caps(limited_weights, active_config, strategy_ids)
         final_weights = _apply_daily_weight_change_limit(previous_weights, final_weights, active_config.maximum_daily_weight_change)
-        final_weights = _zero_shadow_and_normalize(final_weights, strategy_ids)
+        final_weights = _zero_non_active_and_normalize(final_weights, strategy_ids)
         final_weights = _round_weight_dict(final_weights)
 
         status = (
@@ -407,7 +453,7 @@ def _complete_weights(weights: dict[str, float], strategy_ids: tuple[str, ...]) 
     normalized = normalize_weights(completed)
     if sum(normalized.values()) <= 0:
         return _baseline_weights(strategy_ids)
-    return _zero_shadow_and_normalize(normalized, strategy_ids)
+    return _zero_non_active_and_normalize(normalized, strategy_ids)
 
 
 def _qualified_outcomes(outcomes: tuple[WeightedStrategyOutcome, ...], strategy_ids: tuple[str, ...]) -> tuple[WeightedStrategyOutcome, ...]:
@@ -510,7 +556,7 @@ def _performance_metrics(
         reason_codes = []
         if strategy_id not in WEIGHTED_VOTING_ACTIVE_VOTER_IDS:
             raw_score = 0.0
-            reason_codes.append("weighted_voting.weights.shadow_zero_weight")
+            reason_codes.append("weighted_voting.weights.non_active_zero_weight")
         if sample_size < config.minimum_qualified_outcomes_for_adaptation:
             reason_codes.append("weighted_voting.weights.small_sample_shrinkage")
         if not strategy_outcomes:
@@ -746,7 +792,7 @@ def _normalize_state_weights_with_caps(
     return _normalize_with_strategy_and_family_caps(weights, signals, config, set(_active_strategy_ids(strategy_ids)))
 
 
-def _zero_shadow_and_normalize(weights: dict[str, float], strategy_ids: tuple[str, ...]) -> dict[str, float]:
+def _zero_non_active_and_normalize(weights: dict[str, float], strategy_ids: tuple[str, ...]) -> dict[str, float]:
     zeroed = {strategy_id: weights.get(strategy_id, 0.0) if strategy_id in WEIGHTED_VOTING_ACTIVE_VOTER_IDS else 0.0 for strategy_id in strategy_ids}
     normalized = normalize_weights(zeroed)
     if sum(normalized.values()) <= 0:

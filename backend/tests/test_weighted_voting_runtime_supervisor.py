@@ -3,6 +3,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
+from backend.app.algorithms.weighted_voting.dynamic_settings import DynamicSettingsResolver, resolve_effective_settings
+from backend.app.algorithms.weighted_voting.market_condition import classify_market_condition
 from backend.app.algorithms.weighted_voting.market_snapshot import build_weighted_voting_market_snapshot
 from backend.app.algorithms.weighted_voting.inventory import WeightedVotingInventoryEventType, WeightedVotingInventoryRepository
 from backend.app.algorithms.weighted_voting.rollout import WeightedVotingRolloutFlags, WeightedVotingRolloutValidation
@@ -14,6 +17,8 @@ from backend.app.algorithms.weighted_voting.runtime_supervisor import (
     runtime_supervisor_status,
     weighted_voting_bar_event_idempotency_key,
 )
+from backend.app.algorithms.weighted_voting.runtime_context import WeightedVotingStaticAccountPort, WeightedVotingStaticGlobalRiskPort
+from backend.app.algorithms.weighted_voting.persistence import WEIGHTED_VOTING_SETTINGS_KEY, persist_effective_settings
 from backend.app.algorithms.weighted_voting.service import WeightedVotingService
 from backend.app.domain.models import Signal
 from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill, PaperOrderGateway
@@ -45,6 +50,119 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(len([key for key in store.snapshots if key.startswith("weighted_voting.decisions.")]), 1)
         self.assertTrue(any(key.startswith("weighted_voting.runtime.checkpoints.SPY") for key in store.snapshots))
         self.assertEqual(supervisor.health()["persistedDecisions"], 1)
+
+    def test_runtime_builds_full_context_from_completed_bar_event(self) -> None:
+        store = MemoryStore()
+        inventory = seeded_inventory(store)
+        payload = evaluate_payload()
+        payload["five_minute_candles"] = [
+            {
+                "timestamp": payload["candles"][index]["timestamp"],
+                "open": payload["candles"][index - 4]["open"],
+                "high": max(row["high"] for row in payload["candles"][index - 4 : index + 1]),
+                "low": min(row["low"] for row in payload["candles"][index - 4 : index + 1]),
+                "close": payload["candles"][index]["close"],
+                "volume": sum(row["volume"] for row in payload["candles"][index - 4 : index + 1]),
+                "finalized": True,
+            }
+            for index in range(4, len(payload["candles"]), 5)
+        ]
+        snapshot = build_weighted_voting_market_snapshot(payload)
+        service = WeightedVotingService(store=store)
+        weight_state = service.active_weight_state()
+        condition = classify_market_condition(snapshot)
+        effective = DynamicSettingsResolver().resolve(condition, timestamp=snapshot.data_timestamp)
+        supervisor = WeightedVotingRuntimeSupervisor(
+            service=service,
+            store=store,
+            inventory_repository=inventory,
+            account_port=WeightedVotingStaticAccountPort(account_equity=100000.0, broker_buying_power=75000.0, source_id="weighted_voting.test.account_port"),
+            global_risk_port=WeightedVotingStaticGlobalRiskPort(global_available_risk=1000.0, global_max_shares=100, gate_response=None, source_id="weighted_voting.test.global_risk_port"),
+            config=WeightedVotingRuntimeConfig(heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
+            event_bus=WeightedVotingEventBus(maxsize=8),
+        )
+
+        context = supervisor.build_runtime_context_from_finalised_bar(
+            snapshot=snapshot,
+            active_weight_state=weight_state,
+            effective_settings=effective,
+            market_condition=condition,
+            observed_at=snapshot.data_timestamp,
+            event_payload=payload,
+        )
+
+        self.assertEqual(context.mode, "production")
+        self.assertEqual(len(context.finalised_one_minute_market_snapshot.one_minute_candles), len(payload["candles"]))
+        self.assertGreaterEqual(len(context.five_minute_candles), 1)
+        self.assertEqual(context.inventory_snapshot.algorithm_id, "weighted_voting")
+        self.assertEqual(context.read_only_account_equity, 100000.0)
+        self.assertEqual(context.read_only_broker_buying_power, 75000.0)
+        self.assertEqual(context.global_risk_state.global_available_risk, 1000.0)
+        self.assertEqual(context.global_risk_state.global_max_shares, 100)
+        self.assertEqual(context.algorithm_daily_pnl, 0.0)
+        self.assertEqual(context.effective_settings.settings_version, effective.settings_version)
+        self.assertTrue(any(key.startswith("weighted_voting.runtime.contexts.") for key in store.snapshots))
+
+    def test_finalised_bar_event_uses_stable_settings_not_one_minute_payload_settings(self) -> None:
+        store = MemoryStore()
+        stable_settings = resolve_effective_settings(
+            dynamic_values={"slippage_allowance_per_share": 0.02, "maximum_shares": 7},
+            baseline_config=WeightedVotingConfig(),
+            source_evidence=("weighted_voting.test.stable_settings_version",),
+        )
+        persist_effective_settings(store, stable_settings)
+        supervisor = supervisor_for(store)
+        first_payload = evaluate_payload()
+        first_payload["settingsVersion"] = "one-minute-settings-should-be-ignored"
+        first_payload["effective_settings"] = {"settings_version": "bar-derived-settings", "maximum_shares": 999999}
+        first_payload["slippage_per_share"] = 12.34
+        first_payload["fee_per_share"] = 56.78
+        second_payload = evaluate_payload(offset_minutes=5)
+        second_payload["settingsVersion"] = "different-one-minute-settings-should-still-be-ignored"
+        second_payload["effective_settings"] = {"settings_version": "second-bar-derived-settings", "maximum_shares": 1}
+        second_payload["slippage_per_share"] = 87.65
+        second_payload["fee_per_share"] = 43.21
+
+        first = asyncio.run(supervisor.process_finalised_bar_event(event_from_payload(first_payload)))
+        second = asyncio.run(supervisor.process_finalised_bar_event(event_from_payload(second_payload)))
+
+        self.assertEqual(first["status"], "decision_persisted")
+        self.assertEqual(second["status"], "decision_persisted")
+        self.assertEqual(store.read_snapshot(WEIGHTED_VOTING_SETTINGS_KEY)["settings_version"], stable_settings.settings_version)
+        context_records = [
+            snapshot
+            for key, snapshot in store.snapshots.items()
+            if key.startswith("weighted_voting.runtime.contexts.")
+        ]
+        self.assertEqual(len(context_records), 2)
+        self.assertEqual({record["settings_version"] for record in context_records}, {stable_settings.settings_version})
+        self.assertEqual({record["estimated_slippage"] for record in context_records}, {stable_settings.slippage_allowance_per_share})
+        self.assertEqual({record["estimated_fees"] for record in context_records}, {WeightedVotingConfig().fee_per_share})
+        proposal_records = [
+            snapshot
+            for key, snapshot in store.snapshots.items()
+            if key.startswith("weighted_voting.order_proposals.")
+        ]
+        self.assertEqual(len(proposal_records), 2)
+        self.assertEqual({record["settings_version"] for record in proposal_records}, {stable_settings.settings_version})
+
+    def test_missing_effective_settings_are_bootstrapped_once_and_reused_across_bar_events(self) -> None:
+        store = MemoryStore()
+        supervisor = supervisor_for(store)
+
+        first = asyncio.run(supervisor.process_finalised_bar_event(event_from_payload(evaluate_payload())))
+        bootstrapped_version = store.read_snapshot(WEIGHTED_VOTING_SETTINGS_KEY)["settings_version"]
+        second = asyncio.run(supervisor.process_finalised_bar_event(event_from_payload(evaluate_payload(offset_minutes=5))))
+
+        self.assertEqual(first["status"], "decision_persisted")
+        self.assertEqual(second["status"], "decision_persisted")
+        self.assertEqual(store.read_snapshot(WEIGHTED_VOTING_SETTINGS_KEY)["settings_version"], bootstrapped_version)
+        context_versions = {
+            snapshot["settings_version"]
+            for key, snapshot in store.snapshots.items()
+            if key.startswith("weighted_voting.runtime.contexts.")
+        }
+        self.assertEqual(context_versions, {bootstrapped_version})
 
     def test_duplicate_bar_events_produce_only_one_decision(self) -> None:
         store = MemoryStore()
@@ -94,6 +212,28 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(len([key for key in store.snapshots if key.startswith("weighted_voting.order_proposals.")]), 0)
         self.assertTrue(supervisor.health()["automaticOrderCreationPaused"])
 
+    def test_incomplete_one_minute_bar_event_cannot_create_decision(self) -> None:
+        store = MemoryStore()
+        supervisor = supervisor_for(store)
+        payload = evaluate_payload()
+        payload["candles"][-1]["finalized"] = False
+        event = WeightedVotingFinalisedBarEvent(
+            algorithm_id="weighted_voting",
+            symbol="SPY",
+            finalised_candle_timestamp=datetime.fromisoformat(payload["data_timestamp"]),
+            data_manifest_hash="incomplete-candle-manifest",
+            market_payload=payload,
+            published_at=datetime.now(timezone.utc),
+        )
+
+        record = asyncio.run(supervisor.process_finalised_bar_event(event))
+
+        self.assertEqual(record["status"], "runtime_exception_safe_degradation")
+        self.assertEqual(len([key for key in store.snapshots if key.startswith("weighted_voting.decisions.")]), 0)
+        self.assertTrue(supervisor.health()["automaticOrderCreationPaused"])
+        self.assertTrue(supervisor.health()["recoveryRequired"])
+        self.assertIn("completed bars", record["error"])
+
     def test_bounded_queue_applies_backpressure(self) -> None:
         store = MemoryStore()
         supervisor = supervisor_for(store, queue_maxsize=1)
@@ -133,6 +273,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             rollout_flags=validated_rollout_flags(),
             rollout_validation=validated_rollout_validation(),
         )
+        enable_automatic_entries(supervisor)
 
         record = asyncio.run(supervisor.process_finalised_bar_event(event_from_payload(evaluate_payload())))
         item = supervisor.execution_queue.get_nowait()
@@ -212,6 +353,25 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
         self.assertTrue(health["riskReducingExitsAllowed"])
         self.assertEqual(health["operationalStatus"]["pauseReason"], "weighted_voting.test.pause_entries")
         self.assertTrue(any(key.startswith("weighted_voting.runtime.admin_audit.") for key in store.snapshots))
+
+    def test_automatic_entry_pause_blocks_execution_queue_but_keeps_shadow_decision(self) -> None:
+        store = MemoryStore()
+        supervisor = WeightedVotingRuntimeSupervisor(
+            service=AcceptedExecutionService(store=store),
+            store=store,
+            config=WeightedVotingRuntimeConfig(heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
+            event_bus=WeightedVotingEventBus(maxsize=8),
+        )
+        supervisor.pause_new_entries(actor="dashboard", reason="weighted_voting.test.global_paper_off")
+
+        record = asyncio.run(supervisor.process_finalised_bar_event(event_from_payload(evaluate_payload(offset_minutes=20))))
+
+        self.assertEqual(record["status"], "decision_persisted")
+        self.assertEqual(supervisor.execution_queue.qsize(), 0)
+        self.assertEqual(supervisor.health()["rejectedExecutionEvents"], 1)
+        blocked = [value for key, value in store.snapshots.items() if key.startswith("weighted_voting.runtime.executions.blocked.")]
+        self.assertEqual(blocked[0]["status"], "automatic_order_creation_paused")
+        self.assertIn("weighted_voting.runtime.automatic_entries_paused", blocked[0]["reason_codes"])
 
     def test_all_admin_state_changes_capture_actor_prior_and_new_state(self) -> None:
         store = MemoryStore()
@@ -430,6 +590,14 @@ def evaluate_payload(*, offset_minutes: int = 0) -> dict:
 
 def global_proposal_for_snapshot(payload: dict) -> GlobalOrderProposal:
     snapshot = build_weighted_voting_market_snapshot(payload)
+    return global_proposal_for_market_snapshot(snapshot)
+
+
+def global_proposal_for_context(context) -> GlobalOrderProposal:
+    return global_proposal_for_market_snapshot(context.finalised_one_minute_market_snapshot)
+
+
+def global_proposal_for_market_snapshot(snapshot) -> GlobalOrderProposal:
     close = snapshot.one_minute_candles[-1].close
     return GlobalOrderProposal(
         algorithmId="weighted_voting",
@@ -482,6 +650,16 @@ def validated_rollout_validation() -> WeightedVotingRolloutValidation:
     )
 
 
+def enable_automatic_entries(supervisor: WeightedVotingRuntimeSupervisor) -> None:
+    supervisor.metrics.inventory_reconciled = True
+    supervisor.resume_new_entries(
+        actor="weighted_voting.test",
+        reason="weighted_voting.test.enable_automatic_entries",
+        validation_passed=True,
+    )
+    assert not supervisor.health()["automaticOrderCreationPaused"]
+
+
 def seeded_inventory(store: "MemoryStore") -> WeightedVotingInventoryRepository:
     inventory = WeightedVotingInventoryRepository(store, symbol="SPY", allocated_capital=25_000.0)
     inventory.initialize_session(
@@ -517,6 +695,7 @@ def seed_queued_order_without_submission(store: "MemoryStore"):
         rollout_flags=validated_rollout_flags(),
         rollout_validation=validated_rollout_validation(),
     )
+    enable_automatic_entries(supervisor)
     asyncio.run(supervisor.process_finalised_bar_event(event_from_payload(evaluate_payload(offset_minutes=20))))
     return supervisor.execution_queue.get_nowait()
 
@@ -611,8 +790,8 @@ def seed_unprotected_position(store: "MemoryStore"):
 
 
 class AcceptedExecutionService(WeightedVotingService):
-    def evaluate(self, payload: dict) -> dict:
-        proposal = global_proposal_for_snapshot(payload)
+    def evaluate_context(self, context, **_kwargs) -> dict:
+        proposal = global_proposal_for_context(context)
         response = GlobalGateResponse(
             action="ALLOW",
             maximumAllowedQuantity=proposal.quantity,
@@ -640,8 +819,8 @@ class AcceptedExecutionService(WeightedVotingService):
 
 
 class GlobalRiskOutageService(WeightedVotingService):
-    def evaluate(self, payload: dict) -> dict:
-        proposal = global_proposal_for_snapshot(payload)
+    def evaluate_context(self, context, **_kwargs) -> dict:
+        proposal = global_proposal_for_context(context)
         return {
             "decision": {"decision_id": proposal.decisionId},
             "gateResult": {

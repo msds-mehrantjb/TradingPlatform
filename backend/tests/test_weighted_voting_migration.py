@@ -4,7 +4,7 @@ import json
 import unittest
 from datetime import datetime, timezone
 
-from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS, WEIGHTED_VOTING_SHADOW_STRATEGY_IDS
+from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS
 from backend.app.algorithms.weighted_voting.migration import (
     LEGACY_STRATEGY_PERFORMANCE_KEY,
     LEGACY_UI_STATE_KEY,
@@ -25,6 +25,7 @@ from backend.app.algorithms.weighted_voting.persistence import WEIGHTED_VOTING_S
 
 
 MIGRATED_AT = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+LEGACY_RETIRED_STRATEGY_IDS = ("S1", "S3", "S4", "S8")
 
 
 class WeightedVotingMigrationTest(unittest.TestCase):
@@ -52,8 +53,9 @@ class WeightedVotingMigrationTest(unittest.TestCase):
         active_weights = store.snapshots[WEIGHTED_VOTING_ACTIVE_WEIGHT_STATE_KEY]
         self.assertEqual(active_weights["state_status"], "UNSEEDED_EQUAL_WEIGHTS")
         self.assertEqual(active_weights["reason_codes"], ["weighted_voting.weights.unseeded_equal"])
+        self.assertEqual(set(active_weights["strategy_weights"]), set(WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS))
         self.assertTrue(all(active_weights["strategy_weights"][strategy_id] == 0.25 for strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS))
-        self.assertTrue(all(active_weights["strategy_weights"][strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
+        self.assertTrue(all(strategy_id not in active_weights["strategy_weights"] for strategy_id in LEGACY_RETIRED_STRATEGY_IDS))
 
         archive_keys = [key for key in store.snapshots if key.startswith("weighted_voting.migration.archive.weight_history.")]
         self.assertEqual(len(archive_keys), 1)
@@ -164,8 +166,9 @@ class WeightedVotingMigrationTest(unittest.TestCase):
         self.assertIn("weighted_voting.weights.history.trusted-wf-v1", store.snapshots)
         self.assertEqual(store.snapshots[WEIGHTED_VOTING_ACTIVE_WEIGHT_STATE_KEY]["state_status"], "UNSEEDED_EQUAL_WEIGHTS")
         active = store.snapshots[WEIGHTED_VOTING_ACTIVE_WEIGHT_STATE_KEY]["strategy_weights"]
+        self.assertEqual(set(active), set(WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS))
         self.assertTrue(all(active[strategy_id] == 0.25 for strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS))
-        self.assertTrue(all(active[strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
+        self.assertTrue(all(strategy_id not in active for strategy_id in LEGACY_RETIRED_STRATEGY_IDS))
 
 
 class MemoryStore:

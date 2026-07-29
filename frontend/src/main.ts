@@ -1590,6 +1590,7 @@ const OPENING_GRACE_EMERGENCY_RISK_MULTIPLE = 1.5;
 const FORECAST_SAFETY_LOG_STORAGE_KEY = "market-forecast-safety-decision-log-v1";
 
 const weightedTradingSettingsStorageKey = "weighted-voting-trading-settings-v1";
+const weightedTargetOrderOverridesStorageKey = "weighted-voting-target-order-overrides-v1";
 const confidenceDecisionSettingsStorageKey = "weighted-confidence-decision-settings-v1";
 const confidenceTradingSettingsStorageKey = "weighted-confidence-trading-settings-v1";
 const confidenceTargetOrderOverridesStorageKey = "weighted-confidence-target-order-overrides-v1";
@@ -1600,6 +1601,7 @@ const metaTargetOrderOverridesStorageKey = "meta-strategy-target-order-overrides
 const tradingSettingsStorageKey = "voting-ensemble-trading-settings-v1";
 const targetOrderOverridesStorageKey = "voting-ensemble-target-order-overrides-v1";
 const uiStateStorageKey = "trading-dashboard-ui-state-v1";
+const weightedVotingExpandableDefaultsVersion = 2;
 const autoSubmittedOrderKeysStorageKey = "trading-dashboard.auto-submitted-order-keys.v1";
 
 function sanitizeTradingSettings(input: Partial<TradingSettings>, maxOrderAllocationPercent = MAX_ORDER_ALLOCATION_PERCENT): TradingSettings {
@@ -1807,6 +1809,19 @@ function saveConfidenceTargetOrderOverrides(overrides: Partial<TargetOrderSettin
   window.localStorage.setItem(confidenceTargetOrderOverridesStorageKey, JSON.stringify(overrides));
 }
 
+function loadWeightedTargetOrderOverrides(): Partial<TargetOrderSettings> {
+  try {
+    const raw = window.localStorage.getItem(weightedTargetOrderOverridesStorageKey);
+    return raw ? (JSON.parse(raw) as Partial<TargetOrderSettings>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveWeightedTargetOrderOverrides(overrides: Partial<TargetOrderSettings>) {
+  window.localStorage.setItem(weightedTargetOrderOverridesStorageKey, JSON.stringify(overrides));
+}
+
 function loadRegimeTargetOrderOverrides(): Partial<TargetOrderSettings> {
   try {
     const raw = window.localStorage.getItem(regimeTargetOrderOverridesStorageKey);
@@ -1992,6 +2007,8 @@ type PersistedUiState = {
   tradingSettingsExpanded?: boolean;
   votingDefaultSizingExpanded?: boolean;
   weightedTradingSettingsExpanded?: boolean;
+  weightedDefaultSettingsExpanded?: boolean;
+  weightedVotingExpandableDefaultsVersion?: number;
   macroExpanded?: boolean;
   fedExpanded?: boolean;
   tradingAlertsExpanded?: boolean;
@@ -2008,7 +2025,22 @@ function loadUiState(): PersistedUiState {
       return {};
     }
     const parsed = JSON.parse(raw) as PersistedUiState;
-    return parsed && typeof parsed === "object" ? parsed : {};
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+    if (parsed.weightedVotingExpandableDefaultsVersion !== weightedVotingExpandableDefaultsVersion) {
+      return {
+        ...parsed,
+        weightedVotingExpanded: false,
+        weightedDataExpanded: false,
+        weightedGatesExpanded: false,
+        weightedControlsExpanded: false,
+        weightedTradingSettingsExpanded: true,
+        weightedDefaultSettingsExpanded: false,
+        weightedVotingExpandableDefaultsVersion,
+      };
+    }
+    return parsed;
   } catch {
     return {};
   }
@@ -2053,6 +2085,8 @@ function saveUiState() {
     tradingSettingsExpanded: state.tradingSettingsExpanded,
     votingDefaultSizingExpanded: state.votingDefaultSizingExpanded,
     weightedTradingSettingsExpanded: state.weightedTradingSettingsExpanded,
+    weightedDefaultSettingsExpanded: state.weightedDefaultSettingsExpanded,
+    weightedVotingExpandableDefaultsVersion,
     macroExpanded: state.macroExpanded,
     fedExpanded: state.fedExpanded,
     tradingAlertsExpanded: state.tradingAlertsExpanded,
@@ -2323,6 +2357,8 @@ const BROWSER_STORAGE_SNAPSHOT_INTERVAL_MS = 5 * 60_000;
 const AUTO_DAILY_ALGORITHM_BACKTESTS = false;
 const WAKE_CHECK_INTERVAL_MS = 15_000;
 const WAKE_GAP_THRESHOLD_MS = 90_000;
+const MARKET_FORECAST_TIMEOUT_MS = 20_000;
+const STRATEGY_INVENTORY_TIMEOUT_MS = 30_000;
 const DECISION_SNAPSHOT_MAX_CANDLES = 500;
 let browserStorageSnapshotTimer: number | null = null;
 let browserStorageSnapshotInFlight = false;
@@ -3043,7 +3079,7 @@ const state = {
     persistedUiState.algoIntradayTradesExpanded ?? ["1Min", "5Min"].includes(visibleAlgoBacktestTimeframe(persistedUiState.algoBacktestTimeframe)),
   algoVotesExpanded: false,
   algoTradeDecisionExpanded: false,
-  weightedVotingExpanded: persistedUiState.weightedVotingExpanded ?? true,
+  weightedVotingExpanded: persistedUiState.weightedVotingExpanded ?? false,
   weightedDataExpanded: persistedUiState.weightedDataExpanded ?? false,
   weightedGatesExpanded: persistedUiState.weightedGatesExpanded ?? false,
   weightedControlsExpanded: persistedUiState.weightedControlsExpanded ?? false,
@@ -3096,7 +3132,9 @@ const state = {
   tradingSettingsExpanded: true,
   votingDefaultSizingExpanded: persistedUiState.votingDefaultSizingExpanded ?? false,
   weightedTradingSettings: loadWeightedTradingSettings(),
-  weightedTradingSettingsExpanded: persistedUiState.weightedTradingSettingsExpanded ?? false,
+  weightedTradingSettingsExpanded: persistedUiState.weightedTradingSettingsExpanded ?? true,
+  weightedDefaultSettingsExpanded: persistedUiState.weightedDefaultSettingsExpanded ?? false,
+  weightedTargetOrderOverrides: loadWeightedTargetOrderOverrides(),
   confidenceTargetOrderOverrides: loadConfidenceTargetOrderOverrides(),
   regimeTargetOrderOverrides: loadRegimeTargetOrderOverrides(),
   metaTargetOrderOverrides: loadMetaTargetOrderOverrides(),
@@ -3196,10 +3234,14 @@ const state = {
 let refreshTimer: number | undefined;
 let nextChartRefreshAt = 0;
 let contextTimer: number | undefined;
+let candleStartupTimer: number | undefined;
+let contextStartupTimer: number | undefined;
 let strategyFitRefreshInFlight = false;
 let tradingRagRefreshInFlight = false;
 let automaticSubmitInFlight = false;
 let marketForecastRequestKey = "";
+let marketForecastLoadId = 0;
+let votingEnsembleInventoryLoadId = 0;
 let lastStrategyFitCandleTimestamp = "";
 let lastTradingRagCandleTimestamp = "";
 let chartDrawFrame: number | undefined;
@@ -3576,15 +3618,32 @@ leftRail.innerHTML = `
         <div class="algo-header">
           <div id="weightedFinalSignal" class="algo-final hold">Hold</div>
         </div>
-        <div id="weightedScoreGrid" class="weighted-score-grid"></div>
-        <div id="weightedSummary" class="algo-rule-list weighted-summary"></div>
+        <div id="weightedScoreGrid" class="weighted-score-grid">
+          <div class="weighted-score-card hold">
+            <span>Runtime</span>
+            <strong>Loading</strong>
+          </div>
+          <div class="weighted-score-card hold">
+            <span>Data</span>
+            <strong>Waiting</strong>
+          </div>
+          <div class="weighted-score-card hold">
+            <span>Mode</span>
+            <strong>Shadow</strong>
+          </div>
+        </div>
         <div id="weightedTradingSettingsMount" class="algo-stable-settings"></div>
-        <button id="weightedStrategiesToggle" class="algo-expand-toggle" type="button" aria-expanded="true" aria-controls="weightedStrategiesList">
+        <button id="weightedStrategiesToggle" class="algo-expand-toggle" type="button" aria-expanded="false" aria-controls="weightedStrategiesList">
           <span>Weighted Strategies</span>
           <strong id="weightedStrategiesToggleMeta">8 alpha models</strong>
-          <b id="weightedStrategiesToggleIcon">-</b>
+          <b id="weightedStrategiesToggleIcon">+</b>
         </button>
-        <div id="weightedStrategiesList" class="weighted-strategy-list"></div>
+        <div id="weightedStrategiesList" class="weighted-strategy-list" hidden>
+          <div class="weighted-loading-note">
+            <strong>Loading Weighted Voting strategy evidence</strong>
+            <span>Backend strategy rows will appear after candles, market context, settings, and inventory load.</span>
+          </div>
+        </div>
         <button id="weightedDataToggle" class="algo-expand-toggle" type="button" aria-expanded="false" aria-controls="weightedDataGrid">
           <span>Data & Conditions</span>
           <strong id="weightedDataToggleMeta">Market inputs</strong>
@@ -4103,7 +4162,6 @@ const tradingSettingsMount = document.querySelector<HTMLDivElement>("#tradingSet
 const algoResultsBody = document.querySelector<HTMLDivElement>("#algoResultsBody")!;
 const weightedFinalSignal = document.querySelector<HTMLDivElement>("#weightedFinalSignal")!;
 const weightedScoreGrid = document.querySelector<HTMLDivElement>("#weightedScoreGrid")!;
-const weightedSummary = document.querySelector<HTMLDivElement>("#weightedSummary")!;
 const weightedTradingSettingsMount = document.querySelector<HTMLDivElement>("#weightedTradingSettingsMount")!;
 const weightedStrategiesToggle = document.querySelector<HTMLButtonElement>("#weightedStrategiesToggle")!;
 const weightedStrategiesToggleMeta = document.querySelector<HTMLElement>("#weightedStrategiesToggleMeta")!;
@@ -4207,7 +4265,8 @@ updateCandleSettingsControls();
 updateOverlayToggleControls();
 updateZoomLevel();
 updateTradeToggleButton();
-setAlgoTab(state.algoTab);
+const initialAlgoTab = state.algoTab;
+queueMicrotask(() => setAlgoTab(initialAlgoTab));
 
 function makeTimeframeButtons(container: Element, compact = false) {
   const items = compact ? timeframeItems.filter((item) => item.value === "1Min" || item.value === "5Min") : timeframeItems;
@@ -4418,6 +4477,7 @@ tradeToggleButton.addEventListener("click", () => {
   saveUiState();
   updateTradeToggleButton();
   updateQuoteCard(currentCandle());
+  void syncWeightedVotingAutomaticPaperControl(globalPaperTradingEnabled());
   if (globalPaperTradingEnabled()) {
     maybeAutoSubmitAllAlgorithms();
   }
@@ -4907,6 +4967,41 @@ function handleRegimeTradingSettingChange(event: Event) {
 document.addEventListener("input", handleRegimeTradingSettingChange);
 document.addEventListener("change", handleRegimeTradingSettingChange);
 
+function handleWeightedTradingSettingChange(event: Event) {
+  const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-weighted-trading-setting]");
+  if (!input) {
+    return;
+  }
+  const key = input.dataset.weightedTradingSetting as keyof TradingSettings | undefined;
+  if (!key || key === "positionSizingMode") {
+    return;
+  }
+  const shouldRerender = event.type !== "input" || input.type === "checkbox";
+  if (key === "useDefaultSizingSettings" || key === "pyramidingEnabled") {
+    state.weightedTradingSettings = sanitizeTradingSettings({ ...state.weightedTradingSettings, [key]: input.checked }, VOTING_MAX_ORDER_ALLOCATION_PERCENT);
+    saveWeightedTradingSettings(state.weightedTradingSettings);
+    if (shouldRerender) {
+      updateWeightedVotingPanel();
+    }
+    return;
+  }
+  if (input.value.trim() === "") {
+    return;
+  }
+  const value = Number(input.value);
+  if (!Number.isFinite(value)) {
+    return;
+  }
+  state.weightedTradingSettings = sanitizeTradingSettings({ ...state.weightedTradingSettings, [key]: value }, VOTING_MAX_ORDER_ALLOCATION_PERCENT);
+  saveWeightedTradingSettings(state.weightedTradingSettings);
+  if (shouldRerender) {
+    updateWeightedVotingPanel();
+  }
+}
+
+document.addEventListener("input", handleWeightedTradingSettingChange);
+document.addEventListener("change", handleWeightedTradingSettingChange);
+
 document.addEventListener("click", (event) => {
   const tradingSettingsToggle = (event.target as HTMLElement).closest<HTMLButtonElement>("#confidenceTradingSettingsToggle");
   if (tradingSettingsToggle) {
@@ -5088,6 +5183,67 @@ function handleConfidenceTargetSettingInput(event: Event) {
 document.addEventListener("input", handleConfidenceTargetSettingInput);
 document.addEventListener("change", handleConfidenceTargetSettingInput);
 
+function handleWeightedTargetSettingInput(event: Event) {
+  const input = (event.target as HTMLElement).closest<HTMLInputElement | HTMLSelectElement>("[data-weighted-target-setting]");
+  if (!input) {
+    return;
+  }
+  const key = input.dataset.weightedTargetSetting as keyof TargetOrderSettings | undefined;
+  if (!key) {
+    return;
+  }
+  if (key === "quantity") {
+    updateWeightedVotingPanel();
+    return;
+  }
+  const generatedKeys = new Set<keyof TargetOrderSettings>([
+    "symbol",
+    "side",
+    "orderType",
+    "triggerPrice",
+    "limitPrice",
+    "stopPrice",
+    "targetPrice",
+    "accountBalance",
+    "orderLimitDollars",
+    "dailyLimitDollars",
+    "riskDollars",
+    "orderNotional",
+    "plannedStopRiskDollars",
+    "estimatedSlippage",
+    "timeInForce",
+    "cutoff",
+  ]);
+  if (state.weightedTradingSettings.useDefaultSizingSettings && generatedKeys.has(key)) {
+    updateWeightedVotingPanel();
+    return;
+  }
+  const numericKeys = new Set<keyof TargetOrderSettings>([
+    "quantity",
+    "triggerPrice",
+    "limitPrice",
+    "stopPrice",
+    "targetPrice",
+    "accountBalance",
+    "orderLimitDollars",
+    "dailyLimitDollars",
+    "riskDollars",
+    "orderNotional",
+    "plannedStopRiskDollars",
+    "estimatedSlippage",
+  ]);
+  const nextValue = numericKeys.has(key) ? Number(input.value) : input.value;
+  if (numericKeys.has(key) && !Number.isFinite(nextValue as number)) {
+    return;
+  }
+  state.weightedTargetOrderOverrides = { ...state.weightedTargetOrderOverrides, [key]: nextValue };
+  saveWeightedTargetOrderOverrides(state.weightedTargetOrderOverrides);
+  updateWeightedVotingPanel();
+}
+
+document.addEventListener("input", handleWeightedTargetSettingInput);
+document.addEventListener("change", handleWeightedTargetSettingInput);
+
 function handleRegimeTargetSettingInput(event: Event) {
   const input = (event.target as HTMLElement).closest<HTMLInputElement | HTMLSelectElement>("[data-regime-target-setting]");
   if (!input) {
@@ -5258,6 +5414,16 @@ document.addEventListener("click", (event) => {
   updateWeightedVotingPanel();
 });
 
+document.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("#weightedDefaultSettingsToggle");
+  if (!button) {
+    return;
+  }
+  state.weightedDefaultSettingsExpanded = !state.weightedDefaultSettingsExpanded;
+  saveUiState();
+  updateWeightedVotingPanel();
+});
+
 canvas.addEventListener("mousemove", (event) => {
   if (isDragging) {
     return;
@@ -5358,12 +5524,6 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
   const shouldRefresh = options.refresh ?? state.candles.length > 0;
   state.error = "";
   state.historyEndReached = false;
-  if (showLoading) {
-    state.source = "loading";
-    emptyState.textContent = "Loading candles...";
-    emptyState.hidden = false;
-    updateMeta();
-  }
 
   const item = timeframeItems.find((candidate) => candidate.value === state.timeframe)!;
   const params = new URLSearchParams({
@@ -5381,9 +5541,28 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
   if (end) {
     params.set("end", end);
   }
+  const candlesPath = `/api/candles?${params.toString()}`;
+  let candlesUrl = `${API_BASE}${candlesPath}`;
+
+  if (showLoading) {
+    state.source = "loading";
+    emptyState.textContent = `Loading candles from ${API_BASE}...`;
+    emptyState.hidden = false;
+    if (candleStartupTimer) {
+      window.clearTimeout(candleStartupTimer);
+    }
+    candleStartupTimer = window.setTimeout(() => {
+      if (state.source === "loading" && !state.candles.length) {
+        emptyState.textContent = `Still waiting for candles from ${API_BASE}. Backend should be running on port 8020.`;
+      }
+    }, 5000);
+    updateMeta();
+  }
 
   try {
-    const response = await fetch(`${API_BASE}/api/candles?${params.toString()}`);
+    const result = await fetchFromBackendCandidates(candlesPath, 15000);
+    const response = result.response;
+    candlesUrl = result.url;
     if (!response.ok) {
       throw new Error(await response.text());
     }
@@ -5402,7 +5581,7 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
     state.error = payload.warning ?? "";
     markRefresh(latestChanged ? "updated" : "checked");
     updateLastCandleStatus(nextLatest);
-    if (latestChanged && nextLatest && marketAllowsTradingRefresh()) {
+    if (latestChanged && nextLatest && marketAllowsTradingRefresh() && shouldRefreshVotingEnsembleBackend()) {
       if (shouldRefreshVotingTradingRag()) {
         void refreshVotingEnsembleTradingOnNewCandle(nextLatest.timestamp);
       } else {
@@ -5413,11 +5592,17 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
     if (showLoading) {
       state.candles = [];
     }
-    state.error = error instanceof Error ? error.message : "Unable to load candles";
+    const message = error instanceof Error ? error.message : "Unable to load candles";
+    state.error = `${message}. Tried ${candlesUrl}`;
     if (!state.candles.length) {
       state.source = "error";
     }
     markRefresh("failed");
+  } finally {
+    if (candleStartupTimer) {
+      window.clearTimeout(candleStartupTimer);
+      candleStartupTimer = undefined;
+    }
   }
 
   emptyState.hidden = state.candles.length > 0;
@@ -5657,6 +5842,9 @@ async function loadTradingRag() {
 }
 
 async function refreshStrategyFitOnNewCandle(timestamp: string) {
+  if (!shouldRefreshVotingEnsembleBackend()) {
+    return;
+  }
   if (strategyFitRefreshInFlight || lastStrategyFitCandleTimestamp === timestamp) {
     return;
   }
@@ -6087,6 +6275,24 @@ async function fetchWithTimeout(url: string, timeoutMs: number, init: RequestIni
   } finally {
     window.clearTimeout(timeoutId);
   }
+}
+
+async function fetchFromBackendCandidates(path: string, timeoutMs: number, init: RequestInit = {}) {
+  let lastMessage = "Backend route unavailable";
+  let lastUrl = `${API_BASE}${path}`;
+  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+    lastUrl = `${baseUrl}${path}`;
+    try {
+      const response = await fetchWithTimeout(lastUrl, timeoutMs, init);
+      if (response.ok || response.status !== 404) {
+        return { response, url: lastUrl };
+      }
+      lastMessage = `Backend route not loaded on ${baseUrl}`;
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : lastMessage;
+    }
+  }
+  throw new Error(`${lastMessage}. Tried ${lastUrl}`);
 }
 
 async function fetchMlComparison() {
@@ -6680,6 +6886,7 @@ async function loadMarketForecast(options: { refresh?: boolean } = {}) {
   if (marketForecastRequestKey === requestKey) {
     return;
   }
+  const loadId = ++marketForecastLoadId;
   marketForecastRequestKey = requestKey;
   state.marketForecastStatus = state.marketForecast ? state.marketForecastStatus : "loading";
   renderMarketForecastPanel();
@@ -6691,7 +6898,10 @@ async function loadMarketForecast(options: { refresh?: boolean } = {}) {
       limit: "240",
       refresh: String(options.refresh ?? false),
     });
-    const response = await fetchWithTimeout(`${API_BASE}/api/market-forecast/prediction?${params.toString()}`, 4000);
+    const response = await fetchWithTimeout(`${API_BASE}/api/market-forecast/prediction?${params.toString()}`, MARKET_FORECAST_TIMEOUT_MS);
+    if (loadId !== marketForecastLoadId) {
+      return;
+    }
     if (!response.ok) {
       throw new Error(await response.text());
     }
@@ -6699,6 +6909,9 @@ async function loadMarketForecast(options: { refresh?: boolean } = {}) {
     state.marketForecastStatus = state.marketForecast.status === "ready" ? "ready" : "fallback";
     state.marketForecastError = "";
   } catch (error) {
+    if (loadId !== marketForecastLoadId) {
+      return;
+    }
     state.marketForecastStatus = state.marketForecast ? "fallback" : "error";
     state.marketForecastError = error instanceof Error ? error.message : "Market forecast unavailable";
   } finally {
@@ -6974,6 +7187,15 @@ async function loadMarketContext(options: { showLoading?: boolean; refresh?: boo
   if (showLoading) {
     state.contextStatus = "loading";
     state.contextError = "";
+    if (contextStartupTimer) {
+      window.clearTimeout(contextStartupTimer);
+    }
+    contextStartupTimer = window.setTimeout(() => {
+      if (state.contextStatus === "loading" && !state.marketContext) {
+        state.contextError = `Still waiting for market context from ${API_BASE}.`;
+        updateMarketContext();
+      }
+    }, 5000);
     updateMarketContext();
   }
 
@@ -6985,9 +7207,13 @@ async function loadMarketContext(options: { showLoading?: boolean; refresh?: boo
   if (asOf) {
     params.set("as_of", asOf);
   }
+  const contextPath = `/api/market-context?${params.toString()}`;
+  let contextUrl = `${API_BASE}${contextPath}`;
 
   try {
-    const response = await fetch(`${API_BASE}/api/market-context?${params.toString()}`);
+    const result = await fetchFromBackendCandidates(contextPath, 15000);
+    const response = result.response;
+    contextUrl = result.url;
     if (!response.ok) {
       throw new Error(await response.text());
     }
@@ -7003,12 +7229,20 @@ async function loadMarketContext(options: { showLoading?: boolean; refresh?: boo
     state.contextAsOf = asOf;
   } catch (error) {
     state.contextStatus = "error";
-    state.contextError = error instanceof Error ? error.message : "Unable to load market context";
+    const message = error instanceof Error ? error.message : "Unable to load market context";
+    state.contextError = `${message}. Tried ${contextUrl}`;
+  } finally {
+    if (contextStartupTimer) {
+      window.clearTimeout(contextStartupTimer);
+      contextStartupTimer = undefined;
+    }
   }
 
   updateMarketContext();
   void fetchSessionCurrent({ showLoading: false });
-  void ensureVotingEnsembleBackendDecision({ force: true });
+  if (shouldRefreshVotingEnsembleBackend()) {
+    void ensureVotingEnsembleBackendDecision({ force: true });
+  }
 }
 
 async function fetchSessionCurrent(options: { showLoading?: boolean; sessionDate?: string } = {}) {
@@ -10484,8 +10718,14 @@ function setAlgoTab(tab: AlgoTab) {
   }
 }
 
+function shouldRefreshVotingEnsembleBackend() {
+  return state.algoTab === "voting" || state.tradingWindowMode === "ensemble";
+}
+
 function updateAlgorithmPanel(_candles: Candle[]) {
-  void ensureVotingEnsembleBackendDecision();
+  if (shouldRefreshVotingEnsembleBackend()) {
+    void ensureVotingEnsembleBackendDecision();
+  }
   const localVotes = strategyEnsembleSignals(state.marketContext);
   const votes = activeVotingEnsembleVotes(localVotes);
   const eligibleVotes = votes.filter(isEligibleStrategyVote);
@@ -13825,7 +14065,9 @@ function applyConfidenceTargetOrderOverrides(order: ManualOrderRecommendation, m
       ? state.regimeTargetOrderOverrides
       : mode === "meta"
         ? state.metaTargetOrderOverrides
-        : state.confidenceTargetOrderOverrides;
+        : mode === "weighted"
+          ? state.weightedTargetOrderOverrides
+          : state.confidenceTargetOrderOverrides;
   const settings = tradingSettingsForMode(mode);
   const useDefaults = settings.useDefaultSizingSettings;
   const quantity = order.quantity;
@@ -13855,7 +14097,7 @@ function applyConfidenceTargetOrderOverrides(order: ManualOrderRecommendation, m
       ? Number(overrides.estimatedSlippage)
       : roundNumber(quantity * settings.slippagePerShare * 2, 2);
   const submitMode = (overrides.submitMode as SubmitOrderMode | undefined) ?? order.submitMode;
-  const side = mode !== "regime" && submitMode === "Automatic" ? "Buy" : useDefaults ? order.side : (overrides.side as AlgoSignal | undefined) ?? order.side;
+  const side = mode === "confidence" && submitMode === "Automatic" ? "Buy" : useDefaults ? order.side : (overrides.side as AlgoSignal | undefined) ?? order.side;
   return {
     ...order,
     side,
@@ -13881,7 +14123,15 @@ function applyConfidenceTargetOrderOverrides(order: ManualOrderRecommendation, m
 
 function renderConfidenceTargetOrderSettings(order: ManualOrderRecommendation, sourceLabel = "WCA", mode: TradingWindowMode = "confidence") {
   const defaultsOn = tradingSettingsForMode(mode).useDefaultSizingSettings;
-  const targetDataset = mode === "regime" ? "regime-target-setting" : mode === "meta" ? "meta-target-setting" : "confidence-target-setting";
+  const showSummary = order.eligible || !order.failedGates.length;
+  const targetDataset =
+    mode === "regime"
+      ? "regime-target-setting"
+      : mode === "meta"
+        ? "meta-target-setting"
+        : mode === "weighted"
+          ? "weighted-target-setting"
+          : "confidence-target-setting";
   return `
     <div class="target-settings-panel weighted-target-settings-panel" data-side="${escapeHtml(order.side.toLowerCase())}">
       <strong>Target Order</strong>
@@ -13907,7 +14157,7 @@ function renderConfidenceTargetOrderSettings(order: ManualOrderRecommendation, s
         ${renderConfidenceTargetSettingInput("cutoff", "Cutoff", order.cutoff, "text", undefined, "half", defaultsOn, targetDataset)}
         ${renderConfidenceTargetSettingSelect("submitMode", "Submit order", order.submitMode, ["Manual", "Automatic"], "half", false, targetDataset)}
       </div>
-      <span class="trading-settings-warning">${escapeHtml(order.summary)}</span>
+      ${showSummary ? `<span class="trading-settings-warning">${escapeHtml(order.summary)}</span>` : ""}
     </div>
   `;
 }
@@ -14004,6 +14254,35 @@ function renderRegimeTradingSettingToggle(
     <label class="trading-default-toggle">
       <span>${escapeHtml(label)}</span>
       <input data-regime-trading-setting="${escapeHtml(name)}" type="checkbox" ${checked ? "checked" : ""} />
+    </label>
+  `;
+}
+
+function renderWeightedTradingSettingInput(
+  name: keyof TradingSettings,
+  label: string,
+  value: number,
+  min: number,
+  max: number,
+  step: number,
+) {
+  return `
+    <label>
+      <span>${escapeHtml(label)}</span>
+      <input data-weighted-trading-setting="${escapeHtml(name)}" type="number" min="${min}" max="${max}" step="${step}" value="${value}" />
+    </label>
+  `;
+}
+
+function renderWeightedTradingSettingToggle(
+  name: keyof TradingSettings,
+  label: string,
+  checked: boolean,
+) {
+  return `
+    <label class="trading-default-toggle">
+      <span>${escapeHtml(label)}</span>
+      <input data-weighted-trading-setting="${escapeHtml(name)}" type="checkbox" ${checked ? "checked" : ""} />
     </label>
   `;
 }
@@ -14357,7 +14636,7 @@ let weightedVotingBackendRequestInFlight = false;
 let votingEnsembleBackendRequestInFlight = false;
 
 async function ensureVotingEnsembleBackendDecision(options: { force?: boolean } = {}) {
-  await refreshVotingEnsembleNbbo({ force: true });
+  await refreshVotingEnsembleNbbo({ force: options.force ?? false });
   await ensureVotingEnsembleAuxiliaryCandles({ refresh: options.force ?? false });
   const payload = votingEnsembleEvaluatePayload();
   const requestKey = JSON.stringify({
@@ -14474,7 +14753,14 @@ async function refreshVotingEnsembleNbbo(options: { force?: boolean } = {}) {
   const latest = latestRegularSessionCandles().at(-1) ?? state.candles.at(-1);
   const evaluationTimestamp = latest ? votingEnsembleEvaluationTimestamp(latest) : "";
   const requestKey = JSON.stringify({ symbol: state.symbol, feed: state.feed, evaluationTimestamp });
-  if (!options.force && state.votingEnsembleNbboKey === requestKey && state.votingEnsembleNbboStatus === "loading") {
+  if (
+    !options.force &&
+    state.votingEnsembleNbboKey === requestKey &&
+    (state.votingEnsembleNbboStatus === "loading" ||
+      state.votingEnsembleNbboStatus === "ready" ||
+      state.votingEnsembleNbboStatus === "unavailable" ||
+      state.votingEnsembleNbboStatus === "error")
+  ) {
     return;
   }
   state.votingEnsembleNbboKey = requestKey;
@@ -14625,12 +14911,16 @@ function isVotingEnsembleBackendResult(value: unknown): value is VotingEnsembleB
 }
 
 async function loadVotingEnsembleInventory() {
+  const loadId = ++votingEnsembleInventoryLoadId;
   state.votingEnsembleInventoryStatus = state.votingEnsembleInventoryStatus === "ready" ? "ready" : "loading";
   state.votingEnsembleInventoryWarning = "";
   let lastMessage = "Strategy Fit inventory route unavailable";
   for (const baseUrl of BACKTEST_API_CANDIDATES) {
     try {
-      const response = await fetchWithTimeout(`${baseUrl}${TRADING_ALGORITHM_INVENTORY_ENDPOINTS.strategyFit}`, 10000);
+      const response = await fetchWithTimeout(`${baseUrl}${TRADING_ALGORITHM_INVENTORY_ENDPOINTS.strategyFit}`, STRATEGY_INVENTORY_TIMEOUT_MS);
+      if (loadId !== votingEnsembleInventoryLoadId) {
+        return;
+      }
       if (response.ok) {
         state.votingEnsembleInventory = normalizeVotingEnsembleInventory(await response.json());
         state.votingEnsembleInventoryStatus = "ready";
@@ -14647,6 +14937,9 @@ async function loadVotingEnsembleInventory() {
         throw new Error(lastMessage);
       }
     } catch (error) {
+      if (loadId !== votingEnsembleInventoryLoadId) {
+        return;
+      }
       lastMessage = error instanceof Error ? error.message : lastMessage;
     }
   }
@@ -15046,7 +15339,12 @@ async function refreshWeightedVotingBackendClient(options: { force?: boolean } =
     latest: payload?.data_timestamp ?? "no-candles",
     count: payload?.candles.length ?? 0,
   });
-  if (weightedVotingBackendRequestInFlight || (!options.force && weightedVotingBackendState.requestKey === requestKey && weightedVotingBackendState.status === "ready")) {
+  if (
+    weightedVotingBackendRequestInFlight ||
+    (!options.force &&
+      weightedVotingBackendState.requestKey === requestKey &&
+      (weightedVotingBackendState.status === "ready" || weightedVotingBackendState.status === "error"))
+  ) {
     return;
   }
   weightedVotingBackendRequestInFlight = true;
@@ -15074,22 +15372,97 @@ async function refreshWeightedVotingBackendClient(options: { force?: boolean } =
     weightedVotingBackendState.warning = error instanceof Error ? error.message : "Weighted Voting API request failed";
   } finally {
     weightedVotingBackendRequestInFlight = false;
-    updateWeightedVotingPanel();
+    updateWeightedVotingPanel({ refresh: false });
   }
 }
 
 async function fetchWeightedVotingJson(path: string, init: RequestInit = {}) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/weighted-voting${path}`, 15000, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init.headers ?? {}),
-    },
-  });
-  if (!response.ok) {
-    throw new Error(await response.text());
+  let lastMessage = "Weighted Voting API route unavailable";
+  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+    try {
+      const response = await fetchWithTimeout(`${baseUrl}/api/weighted-voting${path}`, 15000, {
+        ...init,
+        headers: {
+          "Content-Type": "application/json",
+          ...(init.headers ?? {}),
+        },
+      });
+      if (response.ok) {
+        return (await response.json()) as Record<string, unknown>;
+      }
+      lastMessage =
+        response.status === 404
+          ? `Weighted Voting API route not loaded on ${baseUrl}; restart the FastAPI backend.`
+          : await readableResponseError(response);
+      if (response.status !== 404) {
+        throw new Error(lastMessage);
+      }
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : lastMessage;
+    }
   }
-  return (await response.json()) as Record<string, unknown>;
+  throw new Error(lastMessage);
+}
+
+async function syncWeightedVotingAutomaticPaperControl(enabled: boolean) {
+  try {
+    let validationPassed = false;
+    if (enabled) {
+      const runtime = await fetchWeightedVotingJson("/runtime/status");
+      validationPassed = weightedVotingRuntimeAllowsAutomaticPaper(runtime);
+    }
+    const endpoint = enabled ? "/runtime/resume-new-entries" : "/runtime/pause-new-entries";
+    const reason = enabled
+      ? "weighted_voting.runtime.dashboard.global_paper_toggle_on"
+      : "weighted_voting.runtime.dashboard.global_paper_toggle_off";
+    const result = await fetchWeightedVotingJson(endpoint, {
+      method: "POST",
+      body: JSON.stringify({
+        actor: "dashboard.global_paper_toggle",
+        reason,
+        ...(enabled ? { validation_passed: validationPassed } : {}),
+      }),
+    });
+    const health = childRecord(result, "health");
+    const paused = weightedTruthFromUnknown(health?.automaticOrderCreationPaused ?? health?.automatic_order_creation_paused, true);
+    weightedVotingBackendState.warning = enabled && paused
+      ? "Global paper is on; Weighted Voting automatic entries remain paused until rollout, reconciliation, and risk validation pass."
+      : !enabled
+        ? "Global paper is off; Weighted Voting automatic entries are paused."
+        : weightedVotingBackendState.warning;
+    updateWeightedVotingPanel({ refresh: false });
+  } catch (error) {
+    weightedVotingBackendState.warning = error instanceof Error ? error.message : "Weighted Voting automatic paper control sync failed";
+    updateWeightedVotingPanel({ refresh: false });
+  }
+}
+
+function weightedVotingRuntimeAllowsAutomaticPaper(runtime: Record<string, unknown>) {
+  const health = childRecord(runtime, "health");
+  const operational = childRecord(health, "operationalStatus");
+  const rollout = childRecord(operational, "automaticSubmissionRolloutState");
+  const automaticEnabled = weightedTruthFromUnknown(rollout?.automaticSubmissionEnabled ?? rollout?.automatic_submission_enabled, false);
+  const validationPassed = weightedTruthFromUnknown(rollout?.validationPassed ?? rollout?.validation_passed, false);
+  return automaticEnabled && validationPassed;
+}
+
+function weightedTruthFromUnknown(value: unknown, fallback = false) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "y", "enabled", "pass", "passed"].includes(normalized)) {
+      return true;
+    }
+    if (["false", "0", "no", "n", "disabled", "fail", "failed"].includes(normalized)) {
+      return false;
+    }
+  }
+  return fallback;
 }
 
 function weightedVotingEvaluatePayload() {
@@ -15137,22 +15510,6 @@ function renderWeightedBackendScoreGrid(summary: WeightedVotingBackendSummary) {
     .join("");
 }
 
-function renderWeightedBackendSummary(summary: WeightedVotingBackendSummary) {
-  const status = stringFromUnknown(weightedVotingBackendState.serviceStatus?.status, weightedVotingBackendState.status);
-  const version = stringFromUnknown(weightedVotingBackendState.serviceStatus?.serviceVersion, "backend");
-  const config = childRecord(weightedVotingBackendState.config, "configuration");
-  const settingsVersion = stringFromUnknown(config?.settings_version ?? config?.settingsVersion, "unversioned");
-  const decision = childRecord(weightedVotingBackendState.evaluation, "decision");
-  const decisionId = stringFromUnknown(decision?.decision_id ?? decision?.decisionId, "waiting");
-  return `
-    <span>Backend status: ${escapeHtml(status)} (${escapeHtml(version)}).</span>
-    <span>Decision: ${escapeHtml(decisionId)}; raw winner ${summary.rawWinner}; final signal ${summary.signal}.</span>
-    <span>Scores: B ${formatProbability(summary.buyScore)} / S ${formatProbability(summary.sellScore)} / H ${formatProbability(summary.holdScore)}; edge ${formatProbability(summary.edge)}.</span>
-    <span>Settings version: ${escapeHtml(settingsVersion)}.</span>
-    ${weightedVotingBackendState.warning ? `<span>${escapeHtml(weightedVotingBackendState.warning)}</span>` : ""}
-  `;
-}
-
 function renderWeightedBackendStrategies() {
   const signalsById = new Map(weightedVotingSignalRows().map((signal) => [stringFromUnknown(signal.strategy_id ?? signal.strategyId, ""), signal]));
   const weightRows = weightedVotingWeightRows();
@@ -15198,16 +15555,16 @@ function renderWeightedBackendDataGrid() {
   const globalApplication = childRecord(weightedVotingBackendState.evaluation, "globalGateApplication");
   const rows = [
     ["Internal condition", weightedVotingMarketConditionLabel()],
-    ["Trend", stringFromUnknown(condition?.trend, "NA")],
-    ["Volatility", stringFromUnknown(condition?.volatility, "NA")],
-    ["Liquidity", stringFromUnknown(condition?.liquidity, "NA")],
-    ["Session", stringFromUnknown(condition?.session, "NA")],
-    ["Market quality", stringFromUnknown(condition?.market_quality ?? condition?.marketQuality, "NA")],
-    ["Dynamic multipliers", compactJsonLabel(config?.multipliers ?? effectiveSettings?.multipliers)],
-    ["Effective settings", compactJsonLabel(effectiveSettings)],
-    ["Sizing caps", compactJsonLabel(sizing?.caps ?? sizing?.cap_breakdown ?? sizing?.capBreakdown)],
+    ["Trend", weightedRecordString(condition, "NA", "trend_direction", "trendDirection", "trend")],
+    ["Volatility", weightedRecordString(condition, "NA", "volatility_level", "volatilityLevel", "volatility")],
+    ["Liquidity", weightedRecordString(condition, "NA", "liquidity_level", "liquidityLevel", "liquidity")],
+    ["Session", weightedRecordString(condition, "NA", "session_label", "sessionLabel", "session_phase", "sessionPhase", "session")],
+    ["Market quality", weightedRecordString(condition, "NA", "market_quality", "marketQuality")],
+    ["Dynamic multipliers", weightedVotingMultipliersLabel(condition, config, effectiveSettings)],
+    ["Effective settings", weightedVotingEffectiveSettingsLabel(effectiveSettings)],
+    ["Sizing caps", weightedVotingSizingLabel(sizing)],
     ["Limiting factor", stringFromUnknown(sizing?.limiting_cap ?? sizing?.limitingCap ?? sizing?.limiting_factor ?? sizing?.limitingFactor, "NA")],
-    ["Global adjustment", compactJsonLabel(globalApplication)],
+    ["Global adjustment", weightedVotingGlobalAdjustmentLabel(globalApplication)],
   ];
   return rows
     .map(
@@ -15232,7 +15589,7 @@ function renderWeightedBackendGates() {
   const globalGate = renderWeightedGate({
     label: "Global adjustment",
     status: stringFromUnknown(globalResponse?.status, "ALLOW").toLowerCase().includes("reject") ? "fail" : "info",
-    detail: compactJsonLabel(globalApplication ?? globalResponse),
+    detail: weightedVotingGlobalAdjustmentLabel(globalApplication ?? globalResponse),
   });
   return [...localGates, globalGate].join("");
 }
@@ -15243,11 +15600,24 @@ function renderWeightedBackendControlRules() {
   return `
     <span>Authoritative calculations are served by /api/weighted-voting/evaluate.</span>
     <span>Config edits are persisted through /api/weighted-voting/config; browser storage is display-only.</span>
-    <span>Active weights: ${escapeHtml(compactJsonLabel(activeWeights))}</span>
+    <span>Active weights: ${escapeHtml(weightedVotingActiveWeightsLabel(activeWeights))}</span>
     <span>Weight history rows: ${weightedVotingBackendState.weightHistory.length}</span>
     <span>Daily update: ${escapeHtml(compactJsonLabel(dailyUpdate))}</span>
     <span>Paper orders, positions, trades, and backtests are backend-owned artifacts.</span>
   `;
+}
+
+function weightedVotingActiveWeightsLabel(weightState: Record<string, unknown> | null) {
+  if (!weightState) {
+    return "NA";
+  }
+  const weights = childRecord(weightState, "strategy_weights") ?? childRecord(weightState, "strategyWeights");
+  const entries = weights
+    ? Object.entries(weights).map(([strategyId, value]) => `${strategyId} ${formatProbability(numberFromUnknown(value, 0))}`)
+    : [];
+  const status = weightedRecordString(weightState, "unknown", "state_status", "stateStatus");
+  const version = weightedRecordString(weightState, "unversioned", "weight_version", "weightVersion");
+  return `${entries.join(" / ") || "no active weights"}; ${status}; ${version}`;
 }
 
 function weightedVotingSignalRows() {
@@ -15274,10 +15644,93 @@ function weightedVotingMarketConditionLabel() {
   if (!condition) {
     return weightedVotingBackendState.status === "ready" ? "Backend ready / waiting for evaluation" : "Loading backend";
   }
-  const trend = stringFromUnknown(condition.trend, "trend NA");
-  const volatility = stringFromUnknown(condition.volatility, "vol NA");
-  const liquidity = stringFromUnknown(condition.liquidity, "liquidity NA");
+  const trend = weightedRecordString(condition, "trend NA", "trend_direction", "trendDirection", "trend");
+  const volatility = weightedRecordString(condition, "vol NA", "volatility_level", "volatilityLevel", "volatility");
+  const liquidity = weightedRecordString(condition, "liquidity NA", "liquidity_level", "liquidityLevel", "liquidity");
   return `${trend} / ${volatility} / ${liquidity}`;
+}
+
+function weightedRecordValue(record: Record<string, unknown> | null | undefined, ...keys: string[]) {
+  for (const key of keys) {
+    if (record && record[key] !== undefined && record[key] !== null) {
+      return record[key];
+    }
+  }
+  return undefined;
+}
+
+function weightedRecordString(record: Record<string, unknown> | null | undefined, fallback: string, ...keys: string[]) {
+  return stringFromUnknown(weightedRecordValue(record, ...keys), fallback);
+}
+
+function weightedVotingMultipliersLabel(...records: Array<Record<string, unknown> | null | undefined>) {
+  const multipliers = records
+    .map((record) => weightedRecordValue(record, "regime_fit_multipliers", "regimeFitMultipliers", "multipliers"))
+    .find(isRecord);
+  if (!multipliers) {
+    return "NA";
+  }
+  return [
+    ["trend", weightedRecordValue(multipliers, "trend")],
+    ["breakout", weightedRecordValue(multipliers, "breakout")],
+    ["reversal", weightedRecordValue(multipliers, "reversal")],
+    ["mean rev", weightedRecordValue(multipliers, "mean_reversion", "meanReversion")],
+  ]
+    .filter(([, value]) => Number.isFinite(Number(value)))
+    .map(([label, value]) => `${label} ${roundNumber(Number(value), 2)}x`)
+    .join(" / ") || "NA";
+}
+
+function weightedVotingEffectiveSettingsLabel(settings: Record<string, unknown> | null | undefined) {
+  if (!settings) {
+    return "NA";
+  }
+  const version = weightedRecordString(settings, "unversioned", "settings_version", "settingsVersion", "configuration_version", "configurationVersion");
+  const minimumScore = numberFromUnknown(weightedRecordValue(settings, "minimum_score", "minimumScore"), NaN);
+  const minimumEdge = numberFromUnknown(weightedRecordValue(settings, "minimum_edge", "minimumEdge"), NaN);
+  const orderAllocation = numberFromUnknown(weightedRecordValue(settings, "order_allocation_percent", "orderAllocationPercent"), NaN);
+  const maximumTrades = numberFromUnknown(weightedRecordValue(settings, "maximum_trades", "maximumTrades", "maximum_weighted_daily_trades", "maximumWeightedDailyTrades"), NaN);
+  const parts = [`version ${version}`];
+  if (Number.isFinite(minimumScore)) {
+    parts.push(`min score ${formatProbability(minimumScore)}`);
+  }
+  if (Number.isFinite(minimumEdge)) {
+    parts.push(`edge ${formatProbability(minimumEdge)}`);
+  }
+  if (Number.isFinite(orderAllocation)) {
+    parts.push(`order ${roundNumber(orderAllocation, 1)}%`);
+  }
+  if (Number.isFinite(maximumTrades)) {
+    parts.push(`max trades ${maximumTrades}`);
+  }
+  return parts.join(" / ");
+}
+
+function weightedVotingSizingLabel(sizing: Record<string, unknown> | null) {
+  if (!sizing) {
+    return "NA";
+  }
+  const quantity = numberFromUnknown(weightedRecordValue(sizing, "quantity", "approved_local_quantity", "approvedLocalQuantity"), 0);
+  const limiting = weightedRecordString(sizing, "NA", "limiting_cap", "limitingCap", "limiting_factor", "limitingFactor");
+  const caps = arrayFromUnknown(weightedRecordValue(sizing, "caps", "cap_breakdown", "capBreakdown")).filter(isRecord);
+  const capLabel = caps
+    .slice(0, 2)
+    .map((cap) => `${weightedRecordString(cap, "cap", "cap_id", "capId", "field_name", "fieldName")}=${numberFromUnknown(weightedRecordValue(cap, "quantity", "allowedQuantity"), 0)}`)
+    .join(" / ");
+  return [`qty ${quantity}`, `limit ${limiting}`, capLabel].filter(Boolean).join(" / ");
+}
+
+function weightedVotingGlobalAdjustmentLabel(application: Record<string, unknown> | null) {
+  if (!application) {
+    return "NA";
+  }
+  const action = weightedRecordString(application, "UNKNOWN", "action", "status");
+  const side = weightedRecordString(application, "HOLD", "side");
+  const proposed = numberFromUnknown(weightedRecordValue(application, "proposedQuantity", "proposed_quantity"), 0);
+  const allowed = numberFromUnknown(weightedRecordValue(application, "globallyAllowedQuantity", "globally_allowed_quantity", "maximumAllowedQuantity", "maximum_allowed_quantity"), proposed);
+  const reduced = stringFromUnknown(weightedRecordValue(application, "quantityReduced", "quantity_reduced"), "false");
+  const blockers = arrayFromUnknown(weightedRecordValue(application, "rejectionReasons", "rejection_reasons"));
+  return `${action}; ${side}; qty ${proposed} -> ${allowed}; reduced ${reduced}; blockers ${blockers.length}`;
 }
 
 function childRecord(source: Record<string, unknown> | null | undefined, key: string): Record<string, unknown> | null {
@@ -15338,12 +15791,11 @@ function compactJsonLabel(value: unknown) {
   }
 }
 
-function updateWeightedVotingPanel() {
+function updateWeightedVotingPanel(options: { refresh?: boolean } = {}) {
   const summary = weightedVotingBackendSummary();
   weightedFinalSignal.textContent = summary.signal;
   weightedFinalSignal.className = `algo-final ${summary.signal.toLowerCase()}`;
   weightedScoreGrid.innerHTML = renderWeightedBackendScoreGrid(summary);
-  weightedSummary.innerHTML = renderWeightedBackendSummary(summary);
   updateWeightedTradingSettingsMount();
   weightedStrategiesToggleMeta.textContent = `${summary.activeStrategyCount} active / ${weightedAlphaStrategies.length} strategies`;
   weightedStrategiesList.innerHTML = renderWeightedBackendStrategies();
@@ -15356,7 +15808,9 @@ function updateWeightedVotingPanel() {
   renderWeightedDataExpandedState();
   renderWeightedGatesExpandedState();
   renderWeightedControlsExpandedState();
-  void refreshWeightedVotingBackendClient();
+  if (options.refresh ?? true) {
+    void refreshWeightedVotingBackendClient();
+  }
 }
 
 function latestWeightedCalculationCandles() {
@@ -15929,6 +16383,9 @@ function updateWeightedTradingSettingsMount() {
   state.currentWeightedTargetOrder = weightedBackendOrderRecommendation();
   const key = JSON.stringify({
     expanded: state.weightedTradingSettingsExpanded,
+    defaultSettingsExpanded: state.weightedDefaultSettingsExpanded,
+    settings: state.weightedTradingSettings,
+    targetOverrides: state.weightedTargetOrderOverrides,
     config: weightedVotingBackendState.config,
     evaluation: weightedVotingBackendState.evaluation,
     order: state.currentWeightedTargetOrder,
@@ -15945,6 +16402,7 @@ function updateWeightedTradingSettingsMount() {
 
 function renderWeightedTradingSettingsPanel() {
   const expanded = state.weightedTradingSettingsExpanded;
+  const settings = state.weightedTradingSettings;
   const config = childRecord(weightedVotingBackendState.config, "configuration");
   const order = state.currentWeightedTargetOrder;
   return `
@@ -15957,8 +16415,19 @@ function renderWeightedTradingSettingsPanel() {
         <span class="trading-settings-summary">${escapeHtml(weightedBackendSettingsSummary(config))}</span>
       </button>
       <div id="weightedTradingSettingsBody" class="trading-settings-body" ${expanded ? "" : "hidden"}>
-        ${renderWeightedBackendConfigEditor(config)}
-        ${order ? renderWeightedBackendOrderProposal(order) : ""}
+        <div class="trading-settings-grid">
+          ${renderWeightedTradingSettingInput("startingCapital", "Total balance", settings.startingCapital, 1000, 10000000, 100)}
+          ${renderWeightedTradingSettingInput("orderAllocationPercent", "Order limit %", settings.orderAllocationPercent, 0.1, VOTING_MAX_ORDER_ALLOCATION_PERCENT, 0.1)}
+          ${renderWeightedTradingSettingInput("dailyAllocationPercent", "Daily max %", settings.dailyAllocationPercent, 0.1, 100, 0.1)}
+          ${renderWeightedTradingSettingInput("riskBudgetPercentOfOrder", "Risk budget %", settings.riskBudgetPercentOfOrder, 0.1, 100, 0.1)}
+          ${renderWeightedTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 1, 50, 1)}
+          ${renderWeightedTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
+          ${renderWeightedTradingSettingInput("stopLossPercent", "Stop %", settings.stopLossPercent, 0.01, 20, 0.01)}
+          ${renderWeightedTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
+          ${renderWeightedTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
+        </div>
+        ${order ? renderConfidenceTargetOrderSettings(order, "Weighted Voting", "weighted") : ""}
+        ${renderWeightedDefaultSettingsSection()}
       </div>
     </div>
   `;
@@ -16013,34 +16482,51 @@ function weightedBackendOrderRecommendation(): ManualOrderRecommendation | null 
   if (!proposal) {
     return null;
   }
-  return {
-    eligible: quantity > 0 && side !== "Hold",
+  const settings = state.weightedTradingSettings;
+  const accountBalance = settings.startingCapital;
+  const orderLimitDollars = accountBalance * (settings.orderAllocationPercent / 100);
+  const dailyLimitDollars = accountBalance * (settings.dailyAllocationPercent / 100);
+  const riskDollars = settings.useDefaultSizingSettings
+    ? accountBalance * (settings.baseRiskPercent / 100)
+    : orderLimitDollars * (settings.riskBudgetPercentOfOrder / 100);
+  const triggerPrice = nullableBackendNumber(proposal.trigger_price ?? proposal.triggerPrice);
+  const orderNotional = triggerPrice !== null && quantity > 0
+    ? roundNumber(quantity * triggerPrice, 2)
+    : numberFromUnknown(proposal.notional_dollars ?? proposal.notionalDollars, 0);
+  const failedGates = weightedVotingGateRows().filter((gate) => gate.status === "fail").map((gate) => `${gate.label}: ${gate.detail}`);
+  const eligible = quantity > 0 && side !== "Hold" && failedGates.length === 0;
+  const summary = eligible
+    ? `Weighted Voting backend proposal is eligible for manual review. Auto paper still follows runtime rollout and global paper gates.`
+    : `No order: ${failedGates.length ? uniqueStrings(failedGates).join(", ") : "Weighted Voting backend did not approve a directional proposal"}.`;
+  return applyConfidenceTargetOrderOverrides({
+    eligible,
     side,
-    orderType: side === "Hold" ? "No order" : `${side} backend proposal`,
+    orderType: eligible ? `${side} stop-limit` : "No order",
     symbol: stringFromUnknown(proposal.symbol, state.symbol),
     quantity,
-    triggerPrice: nullableBackendNumber(proposal.trigger_price ?? proposal.triggerPrice),
+    triggerPrice,
     limitPrice: nullableBackendNumber(proposal.limit_price ?? proposal.limitPrice),
     stopPrice: nullableBackendNumber(proposal.stop_price ?? proposal.stopPrice),
     targetPrice: nullableBackendNumber(proposal.target_price ?? proposal.targetPrice),
-    accountBalance: state.weightedTradingSettings.startingCapital,
-    orderLimitDollars: numberFromUnknown(proposal.notional_dollars ?? proposal.notionalDollars, 0),
-    dailyLimitDollars: numberFromUnknown(proposal.maximum_daily_risk ?? proposal.maximumDailyRisk, 0),
-    riskDollars: numberFromUnknown(proposal.planned_risk ?? proposal.plannedRisk, 0),
-    orderNotional: numberFromUnknown(proposal.notional_dollars ?? proposal.notionalDollars, 0),
+    accountBalance,
+    orderLimitDollars,
+    dailyLimitDollars,
+    riskDollars,
+    orderNotional,
     plannedStopRiskDollars: numberFromUnknown(proposal.planned_risk ?? proposal.plannedRisk, 0),
     estimatedSlippage: numberFromUnknown(proposal.estimated_slippage ?? proposal.estimatedSlippage, 0),
     timeInForce: "Day",
     cutoff: "Backend session policy",
     submitMode: "Manual",
-    failedGates: weightedVotingGateRows().filter((gate) => gate.status === "fail").map((gate) => `${gate.label}: ${gate.detail}`),
+    failedGates,
     gates: weightedVotingGateRows().map((gate) => ({ layer: gate.label, status: gate.status, signal: side, detail: gate.detail })),
     levels: { last: null, vwap: null, openingHigh: null, openingLow: null, lastTime: weightedVotingBackendState.updatedAt || null },
-    summary: compactJsonLabel(application ?? proposal),
-  };
+    summary,
+  }, "weighted");
 }
 
 function renderWeightedBackendOrderProposal(order: ManualOrderRecommendation) {
+  const globalRows = weightedBackendOrderGlobalRows(order);
   return `
     <div class="target-settings-panel weighted-target-settings-panel" data-side="${escapeHtml(order.side.toLowerCase())}">
       <strong>Backend Order Proposal</strong>
@@ -16053,9 +16539,33 @@ function renderWeightedBackendOrderProposal(order: ManualOrderRecommendation) {
         <span><small>Stop</small><b>${order.stopPrice === null ? "NA" : price(order.stopPrice)}</b></span>
         <span><small>Target</small><b>${order.targetPrice === null ? "NA" : price(order.targetPrice)}</b></span>
         <span><small>Planned risk</small><b>${currency(order.plannedStopRiskDollars)}</b></span>
-        <span><small>Global result</small><b>${escapeHtml(order.summary)}</b></span>
+        ${globalRows}
       </div>
     </div>
+  `;
+}
+
+function weightedBackendOrderGlobalRows(order: ManualOrderRecommendation) {
+  const application = childRecord(weightedVotingBackendState.evaluation, "globalGateApplication");
+  const proposal = childRecord(weightedVotingBackendState.evaluation, "globalOrderProposal");
+  const action = weightedRecordString(application ?? proposal, "BLOCKED", "action", "status");
+  const side = weightedRecordString(application ?? proposal, order.side, "side", "proposed_side", "proposedSide");
+  const proposed = numberFromUnknown(
+    weightedRecordValue(application ?? proposal, "proposedQuantity", "proposed_quantity", "quantity"),
+    order.quantity,
+  );
+  const allowed = numberFromUnknown(
+    weightedRecordValue(application ?? proposal, "globallyAllowedQuantity", "globally_allowed_quantity", "allowedQuantity", "allowed_quantity", "maximumAllowedQuantity", "maximum_allowed_quantity"),
+    order.quantity,
+  );
+  const reduced = stringFromUnknown(weightedRecordValue(application, "quantityReduced", "quantity_reduced"), proposed !== allowed ? "true" : "false");
+  const blockers = arrayFromUnknown(weightedRecordValue(application, "rejectionReasons", "rejection_reasons"));
+  return `
+    <span><small>Global action</small><b>${escapeHtml(action)}</b></span>
+    <span><small>Global side</small><b>${escapeHtml(side)}</b></span>
+    <span><small>Allowed qty</small><b>${roundNumber(proposed, 4)} -> ${roundNumber(allowed, 4)}</b></span>
+    <span><small>Reduced</small><b>${escapeHtml(reduced)}</b></span>
+    <span><small>Blockers</small><b>${blockers.length || order.failedGates.length}</b></span>
   `;
 }
 
@@ -20797,7 +21307,7 @@ function updateMarketContext() {
     [regimeLayer, sessionLayer, eventLayer].forEach((element) => {
       element.classList.add("loading");
     });
-    strategySummary.textContent = "Loading market context";
+    strategySummary.textContent = state.contextError || "Loading market context";
     contextUpdatedAt.textContent = "--";
     strategyList.innerHTML = skeletonStrategies();
     renderDecisionLoading();
@@ -20909,6 +21419,37 @@ function renderAuthoritativeSessionLayer(
     <span class="signal-chip" data-status="${["unknown", "stale"].includes(liquidityRaw) ? "unknown" : "ok"}"><span>Liquidity</span><strong>${escapeHtml(liquidity)}</strong></span>
     <span class="signal-chip" data-status="${["unknown", "stale", "incomplete", "invalid"].includes(readinessRaw) ? "unknown" : "ok"}"><span>Readiness</span><strong>${escapeHtml(readiness)}</strong></span>
     ${unknownOrStale ? `<span class="signal-chip" data-status="unknown"><span>Evidence</span><strong>Unknown / stale</strong></span>` : ""}
+  `;
+}
+
+function renderWeightedDefaultSettingsSection() {
+  const expanded = state.weightedDefaultSettingsExpanded;
+  const settings = state.weightedTradingSettings;
+  return `
+    <div class="trading-default-section weighted-default-section" data-expanded="${String(expanded)}">
+      <div class="trading-default-head">
+        <button id="weightedDefaultSettingsToggle" class="trading-default-expand" type="button" aria-expanded="${String(expanded)}" aria-controls="weightedDefaultSettingsBody">
+          <b>${expanded ? "-" : "+"}</b>
+          <strong>Default Settings</strong>
+        </button>
+        ${renderWeightedTradingSettingToggle("useDefaultSizingSettings", "On / Off", settings.useDefaultSizingSettings)}
+      </div>
+      <div id="weightedDefaultSettingsBody" class="trading-default-body" ${expanded ? "" : "hidden"}>
+        <div class="trading-settings-grid trading-default-grid">
+          ${renderWeightedTradingSettingInput("minimumBuyScore", "Minimum buy score", settings.minimumBuyScore, 0, 1, 0.01)}
+          ${renderWeightedTradingSettingInput("minimumSignalEdge", "Minimum signal edge", settings.minimumSignalEdge, 0, 1, 0.01)}
+          ${renderWeightedTradingSettingInput("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0.01, 10, 0.01)}
+          ${renderWeightedTradingSettingInput("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0.1, 100, 0.1)}
+          ${renderWeightedTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
+          ${renderWeightedTradingSettingInput("atrStopMultiplier", "ATR stop multiplier", settings.atrStopMultiplier, 0.1, 10, 0.1)}
+          ${renderWeightedTradingSettingInput("minimumStopDistancePercent", "Min stop distance %", settings.minimumStopDistancePercent, 0.001, 5, 0.001)}
+          ${renderWeightedTradingSettingInput("maxParticipationPercent", "Max participation %", settings.maxParticipationPercent, 0.001, 10, 0.001)}
+          ${renderWeightedTradingSettingInput("maxAllowedShares", "Max shares (0 auto)", settings.maxAllowedShares, 0, 1000000, 1)}
+          ${renderWeightedTradingSettingInput("maxDailyLossPercent", "Max daily loss %", settings.maxDailyLossPercent, 0.1, 10, 0.1)}
+          ${renderWeightedTradingSettingToggle("pyramidingEnabled", "Pyramiding", settings.pyramidingEnabled)}
+        </div>
+      </div>
+    </div>
   `;
 }
 

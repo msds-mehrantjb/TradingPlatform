@@ -16,5 +16,5 @@ if (-not (Test-Path (Join-Path $dist "index.html"))) {
   }
 }
 
-Set-Location $dist
-& python -m http.server 5173 --bind 127.0.0.1 1> $log 2> $err
+Set-Location $root
+& python (Join-Path $frontend "scripts\no_cache_static.py") --directory $dist --host 127.0.0.1 --port 5173 1> $log 2> $err

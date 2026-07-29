@@ -8,24 +8,20 @@ Current backend references are reporting, reconstruction, account-risk labeling,
 
 ## Strategy Catalog
 
-`weightedAlphaStrategies` defines eight Weighted Voting strategies:
+The authoritative backend Weighted Voting catalog defines four active strategies:
 
 | Key | Name | Family |
 | --- | --- | --- |
-| `S1` | Opening Range Breakout | `breakout` |
 | `S2` | First Pullback After Open | `trend` |
-| `S3` | VWAP Trend Continuation | `trend` |
-| `S4` | VWAP Mean Reversion | `reversion` |
 | `S5` | Failed Breakout Reversal | `reversion` |
 | `S6` | Liquidity Sweep Reversal | `reversion` |
 | `S7` | Bollinger/ATR Reversion | `reversion` |
-| `S8` | Volatility Breakout | `volatility` |
 
 Related type and state objects:
 
 | Symbol | Purpose |
 | --- | --- |
-| `WeightedAlphaKey` | Strategy key union `S1` through `S8`. |
+| `WeightedAlphaKey` | Historical frontend strategy key union; backend authority now uses `S2`, `S5`, `S6`, and `S7`. |
 | `WeightedAlphaStrategy` | Static strategy catalog row. |
 | `WeightedAlphaResult` | Per-strategy probabilities, weights, performance, multipliers, and explanation. |
 | `WeightedVotingWeightState` | Stored active weights plus update metadata. |
@@ -84,7 +80,7 @@ Constants:
 
 - `WEIGHTED_BROWSER_BACKTEST_BOOTSTRAP_ENABLED = false`
 - `weightedMinimumTradesForFullWeight = 40`
-- `weightedVotingDefaultWeights = 0.125` for every strategy
+- backend equal seed weights are `0.25` for each active Weighted Voting strategy
 - `weightedRelativeStrengthSymbols = ["QQQ", "IWM"]`
 - `weightedSectorEtfSymbols = []`
 - `weightedSpyBasketSampleSymbols = []`

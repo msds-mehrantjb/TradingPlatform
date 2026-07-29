@@ -91,14 +91,15 @@ class WeightedVotingConfig:
     maximum_weighted_daily_trades: int = 10
     minimum_capital_available: float = 1.0
     allow_weighted_pyramiding: bool = False
-    maximum_strategy_weight: float = 0.25
+    maximum_strategy_weight: float = 0.35
     maximum_family_weight: float = 0.50
     minimum_enabled_strategy_weight: float = 0.02
-    equal_seed_weight: float = 0.125
+    equal_seed_weight: float = 0.25
     minimum_qualified_outcomes_for_adaptation: int = 40
     weight_smoothing_previous: float = 0.70
     weight_smoothing_candidate: float = 0.30
     maximum_daily_weight_change: float = 0.025
+    maximum_backtest_seed_deviation: float = 0.10
     expectancy_score_weight: float = 0.35
     profit_factor_score_weight: float = 0.20
     win_loss_score_weight: float = 0.15
@@ -358,6 +359,7 @@ class WeightedVotingConfig:
             "weightSmoothingPrevious": self.weight_smoothing_previous,
             "weightSmoothingCandidate": self.weight_smoothing_candidate,
             "maximumDailyWeightChange": self.maximum_daily_weight_change,
+            "maximumBacktestSeedDeviation": self.maximum_backtest_seed_deviation,
             "expectancyScoreWeight": self.expectancy_score_weight,
             "profitFactorScoreWeight": self.profit_factor_score_weight,
             "winLossScoreWeight": self.win_loss_score_weight,

@@ -25,13 +25,9 @@ from backend.app.algorithms.weighted_voting.scheduler import (
 SESSION_DATE = date(2026, 7, 14)
 SESSION_OPEN = datetime(2026, 7, 14, 13, 30, tzinfo=timezone.utc)
 AFTER_MARKET = datetime(2026, 7, 14, 21, 10, tzinfo=timezone.utc)
-STRATEGY_IDS = ("S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8")
+STRATEGY_IDS = ("S2", "S5", "S6", "S7")
 FAMILY_BY_STRATEGY = {
-    "S1": WeightedStrategyFamily.BREAKOUT,
-    "S8": WeightedStrategyFamily.BREAKOUT,
     "S2": WeightedStrategyFamily.TREND,
-    "S3": WeightedStrategyFamily.TREND,
-    "S4": WeightedStrategyFamily.MEAN_REVERSION,
     "S7": WeightedStrategyFamily.MEAN_REVERSION,
     "S5": WeightedStrategyFamily.REVERSAL,
     "S6": WeightedStrategyFamily.REVERSAL,
@@ -224,7 +220,7 @@ def synthetic_signals(snapshot: WeightedVotingMarketSnapshot, _config=None) -> t
                 expected_return=0.02,
                 expected_return_after_costs=0.018,
                 strength=confidence,
-                final_weight=0.125,
+                final_weight=0.25,
                 eligible=True,
                 data_ready=True,
                 required_data_freshness_seconds=300,

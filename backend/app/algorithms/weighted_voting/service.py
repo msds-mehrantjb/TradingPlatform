@@ -13,11 +13,11 @@ from backend.app.algorithms.weighted_voting.architecture import weighted_voting_
 from backend.app.algorithms.weighted_voting.backtest.engine import WeightedBacktestEngineConfig, WeightedBacktestResult, backtest_engine_status, run_weighted_voting_backtest
 from backend.app.algorithms.weighted_voting.backtest.execution_simulator import simulator_status
 from backend.app.algorithms.weighted_voting.backtest.walk_forward import walk_forward_status
-from backend.app.algorithms.weighted_voting.catalog import weighted_voting_dedicated_strategy_inventory
+from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS, weighted_voting_dedicated_strategy_inventory
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedFiveMinuteAlignment, WeightedVotingLocalGateInputs, evaluate_local_decision_gates
 from backend.app.algorithms.weighted_voting.decision_kernel import WeightedVotingDecisionKernel, decision_kernel_status
-from backend.app.algorithms.weighted_voting.dynamic_settings import DynamicSettingsResolver, default_dynamic_envelope, default_hard_limits, default_weighted_settings, resolve_effective_settings
+from backend.app.algorithms.weighted_voting.dynamic_settings import default_dynamic_envelope, default_hard_limits, default_weighted_settings, resolve_effective_settings
 from backend.app.algorithms.weighted_voting.final_acceptance import build_weighted_voting_final_acceptance_report
 from backend.app.algorithms.weighted_voting.global_interface import (
     WeightedVotingCentralGlobalRiskService,
@@ -71,7 +71,7 @@ from backend.app.algorithms.weighted_voting.scheduler import ACTIVE_WEIGHT_STATE
 from backend.app.algorithms.weighted_voting.signal_engine import evaluate_signals
 from backend.app.algorithms.weighted_voting.strategy_lifecycle import strategy_lifecycle_status
 from backend.app.algorithms.weighted_voting.strategies.common import average_true_range, average_volume
-from backend.app.algorithms.weighted_voting.weight_engine import append_weight_history, create_unseeded_equal_weight_state, rollback_weight_state, update_performance_weight_state, weight_engine_status
+from backend.app.algorithms.weighted_voting.weight_engine import append_weight_history, create_backtest_seeded_weight_state, create_unseeded_equal_weight_state, rollback_weight_state, update_performance_weight_state, weight_engine_status
 
 
 class WeightedVotingService:
@@ -173,7 +173,9 @@ class WeightedVotingService:
     def active_weight_state(self) -> WeightedWeightState:
         snapshot = _read_optional(self.store, ACTIVE_WEIGHT_STATE_KEY)
         if snapshot:
-            return WeightedWeightState.model_validate(snapshot)
+            state = WeightedWeightState.model_validate(snapshot)
+            if _active_weight_state_matches_catalog(state):
+                return state
         state = create_unseeded_equal_weight_state(timestamp=_now())
         self.store.write_snapshot(ACTIVE_WEIGHT_STATE_KEY, state.model_dump(mode="json"))
         return state
@@ -195,17 +197,32 @@ class WeightedVotingService:
     def weights_recalculate(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
         current = self.active_weight_state()
-        outcomes = tuple(WeightedStrategyOutcome.model_validate(row) for row in payload.get("outcomes", ()))
+        outcome_rows = payload.get("outcomes", ())
+        backtest_run_id = payload.get("backtest_run_id") or payload.get("backtestRunId")
+        if not outcome_rows and backtest_run_id:
+            outcome_rows = self._read_backtest_payload(str(backtest_run_id)).get("historicalOutcomes", ())
+        outcomes = tuple(WeightedStrategyOutcome.model_validate(row) for row in outcome_rows)
         timestamp = _parse_datetime(payload.get("update_timestamp") or payload.get("updateTimestamp") or _now().isoformat())
-        state = update_performance_weight_state(
-            current,
-            outcomes,
-            update_timestamp=timestamp,
-            data_timestamp=timestamp,
-            session_date=payload.get("session_date") or payload.get("sessionDate"),
-            config=self.config,
-            regime_label=payload.get("regime_label") or payload.get("regimeLabel"),
-        )
+        mode = str(payload.get("mode") or "performance_update")
+        if mode == "backtest_seed":
+            state = create_backtest_seeded_weight_state(
+                outcomes,
+                timestamp=timestamp,
+                data_timestamp=timestamp,
+                session_date=payload.get("session_date") or payload.get("sessionDate"),
+                config=self.config,
+                regime_label=payload.get("regime_label") or payload.get("regimeLabel"),
+            )
+        else:
+            state = update_performance_weight_state(
+                current,
+                outcomes,
+                update_timestamp=timestamp,
+                data_timestamp=timestamp,
+                session_date=payload.get("session_date") or payload.get("sessionDate"),
+                config=self.config,
+                regime_label=payload.get("regime_label") or payload.get("regimeLabel"),
+            )
         history = tuple(WeightedWeightState.model_validate(row) for row in self.weights_history()["history"])
         updated_history = append_weight_history(history, state)
         self.store.write_snapshot(ACTIVE_WEIGHT_STATE_KEY, state.model_dump(mode="json"))
@@ -306,16 +323,7 @@ class WeightedVotingService:
         *,
         central_risk_service: WeightedVotingCentralGlobalRiskService | None = None,
     ) -> dict[str, Any]:
-        kernel_result = WeightedVotingDecisionKernel.evaluate(
-            context,
-            config=self.config,
-            settings_resolver=DynamicSettingsResolver(
-                default_settings=context.effective_settings.default_settings,
-                dynamic_envelope=context.effective_settings.dynamic_envelope,
-                hard_limits=context.effective_settings.hard_limits,
-                baseline_config=self.config,
-            ),
-        )
+        kernel_result = WeightedVotingDecisionKernel.evaluate(context, config=self.config)
         snapshot = kernel_result.market_snapshot
         active_weight_state = context.active_weight_state
         condition = kernel_result.market_condition
@@ -747,6 +755,7 @@ def _backtest_payload(result: WeightedBacktestResult) -> dict[str, Any]:
         "trades": [_json_ready(trade) for trade in result.trades],
         "decisions": [_json_ready(decision) for decision in result.decisions],
         "strategyPerformance": {key: _json_ready(value) for key, value in result.strategy_results.items()},
+        "historicalOutcomes": [_json_ready(outcome) for outcome in result.historical_outcomes],
     }
 
 
@@ -775,3 +784,7 @@ def _json_ready(value):
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _active_weight_state_matches_catalog(state: WeightedWeightState) -> bool:
+    return set(state.strategy_weights) == set(WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS)

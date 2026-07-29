@@ -24,7 +24,7 @@ WEIGHTED_VOTING_STRATEGY_LIFECYCLE_LATEST_KEY = "weighted_voting.strategy_lifecy
 WEIGHTED_VOTING_STRATEGY_LIFECYCLE_SNAPSHOT_PREFIX = "weighted_voting.strategy_lifecycle.snapshot."
 WEIGHTED_VOTING_STRATEGY_LIFECYCLE_AUDIT_PREFIX = "weighted_voting.strategy_lifecycle.audit."
 WEIGHTED_VOTING_LIFECYCLE_AFTER_MARKET_WORKFLOW = "after_market_admin"
-WEIGHTED_VOTING_PROMOTION_PRIORITY_CANDIDATES = ("S1", "S3")
+WEIGHTED_VOTING_PROMOTION_PRIORITY_CANDIDATES: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -322,10 +322,6 @@ def _promotion_gates(
         _gate("incremental_portfolio_value", evidence.incremental_portfolio_value > requirements.minimum_incremental_portfolio_value, evidence.incremental_portfolio_value, requirements.minimum_incremental_portfolio_value, "weighted_voting.strategy_lifecycle.no_incremental_value", "Promotion requires demonstrated incremental portfolio value."),
         _gate("data_quality_stability", evidence.data_quality_stability >= requirements.minimum_data_quality_stability, evidence.data_quality_stability, requirements.minimum_data_quality_stability, "weighted_voting.strategy_lifecycle.data_quality_unstable", "Promotion requires data-quality stability."),
     ]
-    if evidence.strategy_id == "S4" and evidence.duplicate_of_strategy_id == "S7":
-        gates.append(_gate("vwap_reversion_incremental_to_s7", (evidence.duplicate_correlation or 0.0) <= requirements.maximum_correlation_with_active, evidence.duplicate_correlation, requirements.maximum_correlation_with_active, "weighted_voting.strategy_lifecycle.vwap_reversion_duplicates_s7", "VWAP Mean Reversion remains shadow when it duplicates S7."))
-    if evidence.strategy_id == "S8":
-        gates.append(_gate("volatility_breakout_independent_from_opening_range", (evidence.breakout_family_correlation or evidence.correlation_with_active_strategies) <= requirements.maximum_correlation_with_active, evidence.breakout_family_correlation, requirements.maximum_correlation_with_active, "weighted_voting.strategy_lifecycle.volatility_breakout_correlation_high", "Volatility Breakout remains shadow until breakout-family correlation is acceptable."))
     return tuple(gates)
 
 
@@ -406,7 +402,7 @@ def _reject_without_evidence(
     evaluated_at = snapshot.created_at
     evidence = WeightedVotingStrategyLifecycleEvidence(
         algorithm_id=WEIGHTED_VOTING_ALGORITHM_ID,
-        strategy_id="S1",
+        strategy_id="S2",
         evidence_id="missing",
         evaluated_at=evaluated_at,
         workflow="missing",

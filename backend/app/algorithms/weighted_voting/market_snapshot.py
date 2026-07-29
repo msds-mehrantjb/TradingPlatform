@@ -53,10 +53,18 @@ def build_weighted_voting_market_snapshot(payload: dict[str, Any]) -> WeightedVo
     present in the same shared payload.
     """
 
-    candles = _candles_from_rows(payload.get("candles") or payload.get("one_minute_candles") or payload.get("oneMinuteCandles") or ())
+    candles = _candles_from_rows(
+        payload.get("candles") or payload.get("one_minute_candles") or payload.get("oneMinuteCandles") or (),
+        collection_name="one_minute_candles",
+    )
     if not candles:
         raise ValueError("candles are required")
-    five_minute_candles = _candles_from_rows(payload.get("five_minute_candles") or payload.get("fiveMinuteCandles") or ())
+    if not candles[-1].finalized:
+        raise ValueError("Weighted Voting requires a completed one-minute bar event; the latest one-minute candle is incomplete")
+    five_minute_candles = _candles_from_rows(
+        payload.get("five_minute_candles") or payload.get("fiveMinuteCandles") or (),
+        collection_name="five_minute_candles",
+    )
     timestamp = _parse_datetime(payload.get("data_timestamp") or payload.get("dataTimestamp") or payload.get("decision_timestamp") or payload.get("decisionTimestamp") or candles[-1].timestamp)
     bid = _optional_float(payload.get("bid"))
     ask = _optional_float(payload.get("ask"))
@@ -96,20 +104,71 @@ def payload_contains_foreign_algorithm_fields(payload: dict[str, Any]) -> bool:
     return any(field in payload for field in FORBIDDEN_FOREIGN_ALGORITHM_FIELDS)
 
 
-def _candles_from_rows(rows: Any) -> tuple[WeightedCandle, ...]:
+def _candles_from_rows(rows: Any, *, collection_name: str) -> tuple[WeightedCandle, ...]:
     if not rows:
         return ()
-    return tuple(
-        WeightedCandle(
-            timestamp=_parse_datetime(row["timestamp"]),
-            open=float(row["open"]),
-            high=float(row["high"]),
-            low=float(row["low"]),
-            close=float(row["close"]),
-            volume=float(row["volume"]),
+    candles: list[WeightedCandle] = []
+    for row in rows:
+        finalized = _candle_finalized(row)
+        if not finalized:
+            raise ValueError(f"Weighted Voting requires completed bars; {collection_name} contains an incomplete candle")
+        candles.append(
+            WeightedCandle(
+                timestamp=_parse_datetime(row["timestamp"]),
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=float(row["volume"]),
+                finalized=finalized,
+            )
         )
-        for row in rows
+    return tuple(candles)
+
+
+def _candle_finalized(row: Any) -> bool:
+    if not isinstance(row, dict):
+        raise ValueError("candle rows must be objects")
+    explicit = (
+        row.get("finalized")
+        if "finalized" in row
+        else row.get("finalised")
+        if "finalised" in row
+        else row.get("completed")
+        if "completed" in row
+        else row.get("complete")
+        if "complete" in row
+        else row.get("isComplete")
+        if "isComplete" in row
+        else row.get("isFinal")
+        if "isFinal" in row
+        else row.get("isClosed")
+        if "isClosed" in row
+        else None
     )
+    if explicit is not None:
+        return _truthy_finalized(explicit)
+    status = row.get("barStatus") or row.get("bar_status") or row.get("status")
+    if status is not None:
+        normalized = str(status).strip().lower()
+        if normalized in {"partial", "incomplete", "forming", "current", "open", "unconfirmed"}:
+            return False
+        if normalized in {"complete", "completed", "closed", "final", "finalized", "finalised"}:
+            return True
+    return True
+
+
+def _truthy_finalized(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"false", "0", "no", "n", "incomplete", "partial", "forming", "current", "open"}:
+        return False
+    if normalized in {"true", "1", "yes", "y", "complete", "completed", "closed", "final", "finalized", "finalised"}:
+        return True
+    raise ValueError(f"unknown candle completion value: {value}")
 
 
 def _reference_levels(value: Any) -> WeightedReferenceLevels | None:
@@ -175,10 +234,10 @@ def _object_value(value: Any) -> dict[str, Any]:
 
 def _parse_datetime(value: str | datetime) -> datetime:
     if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc) if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     normalized = str(value).replace("Z", "+00:00")
     parsed = datetime.fromisoformat(normalized)
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def _manifest_hash(snapshot_values: dict[str, Any]) -> str:
