@@ -18,12 +18,13 @@ from backend.app.algorithms.wca.contracts import (
     WcaMarketStatus,
     WcaOrderStatus,
     WcaPaperExecutionRequest,
+    WcaQuote,
     WcaSide,
     WcaStrategyEvaluation,
     WcaWeightSnapshot,
 )
 from backend.app.algorithms.wca.execution_pipeline import WCA_EXECUTION_PIPELINE_MODULES, WcaExecutionPipelineResult
-from backend.app.algorithms.wca.order_validation import WCA_ORDER_VALIDATION_PASSED, WcaOrderValidationContext, apply_wca_final_order_validation
+from backend.app.algorithms.wca.order_validation import WCA_ORDER_VALIDATION_PASSED, WcaOrderValidationContext, apply_wca_final_order_validation, assert_wca_final_pre_outbox_validation
 from backend.app.algorithms.wca.repository import WcaOrderIntentReservation, WcaOutboxReservation, WcaPersistenceSummary
 from backend.app.algorithms.wca.service import WcaService
 from backend.app.algorithms.wca.sizing import WcaSizingContext, size_wca_order
@@ -145,9 +146,12 @@ def test_paper_service_revalidates_after_pipeline_and_status_adjustment(monkeypa
 def test_paper_order_submission_is_idempotent_by_persisted_intent(monkeypatch) -> None:
     repository = MemoryWcaRepository()
     service = WcaService(repository=repository)
+    rows = candles()
+    quote = WcaQuote(timestamp=rows[-1].timestamp, bid=99.95, ask=100.05)
     decision = decision_with_order()
+    decision = decision.model_copy(update={"market_snapshot": decision.market_snapshot.model_copy(update={"quote": quote})})
     pipeline = pipeline_result(decision)
-    request = WcaPaperExecutionRequest(candles=candles(), runId="paper-idempotent", accountId="paper-account-1")
+    request = WcaPaperExecutionRequest(candles=rows, quotes=(quote,), runId="paper-idempotent", accountId="paper-account-1")
 
     monkeypatch.setattr(wca_service_module, "run_wca_execution_pipeline", lambda *args, **kwargs: pipeline)
 
@@ -201,14 +205,17 @@ class MemoryWcaRepository:
         self.intents_by_key[idempotency_key] = proposed
         return WcaOrderIntentReservation(True, proposed, idempotency_key)
 
-    def reserve_decision_order_and_outbox(self, decision, *, run_id: str, account_id: str, idempotency_key: str, client_order_id: str, request_payload: dict) -> WcaOutboxReservation:
+    def reserve_decision_order_and_outbox(self, decision, *, run_id: str, account_id: str, idempotency_key: str, client_order_id: str, request_payload: dict, final_validation_context: WcaOrderValidationContext) -> WcaOutboxReservation:
         if decision.proposed_order is None:
             raise AssertionError("missing proposed order")
         if idempotency_key in self.outbox_by_key:
             proposed = self.intents_by_key[idempotency_key]
             return WcaOutboxReservation(False, f"wca-outbox-{proposed.order_intent_id}", proposed, idempotency_key, self.outbox_by_key[idempotency_key]["client_order_id"])
         proposed = decision.proposed_order.model_copy(update={"idempotency_key": idempotency_key, "account_id": account_id, "status": WcaOrderStatus.OUTBOX_RESERVED})
-        self.decisions[decision.decision_id] = decision.model_copy(update={"proposed_order": proposed})
+        decision = assert_wca_final_pre_outbox_validation(decision.model_copy(update={"proposed_order": proposed}), final_validation_context)
+        proposed = decision.proposed_order
+        assert proposed is not None
+        self.decisions[decision.decision_id] = decision
         self.intents_by_key[idempotency_key] = proposed
         self.outbox_by_key[idempotency_key] = {"client_order_id": client_order_id, "request": request_payload}
         return WcaOutboxReservation(True, f"wca-outbox-{proposed.order_intent_id}", proposed, idempotency_key, client_order_id)

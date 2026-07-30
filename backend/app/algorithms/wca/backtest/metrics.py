@@ -206,9 +206,10 @@ def _counterfactuals(decisions: tuple[WcaDecision, ...], candles: tuple[WcaCandl
         post_gate = _side_value(decision.aggregation.post_local_gate_decision)
         if pre_gate in {WcaSide.BUY.value, WcaSide.SELL.value} and post_gate == WcaSide.HOLD.value:
             local.append(_counterfactual_row(decision, pre_gate, _local_rejection_reasons(decision), candle_by_timestamp, candles, horizon))
-        if decision.global_gate_result is not None and decision.global_gate_result.status == "FAIL" and decision.proposed_order is not None:
-            side = _side_value(decision.proposed_order.side)
-            global_rejected.append(_counterfactual_row(decision, side, _global_rejection_reasons(decision), candle_by_timestamp, candles, horizon))
+        if decision.global_gate_result is not None and decision.global_gate_result.status == "FAIL":
+            side = _side_value(decision.proposed_order.side) if decision.proposed_order is not None else post_gate
+            if side in {WcaSide.BUY.value, WcaSide.SELL.value}:
+                global_rejected.append(_counterfactual_row(decision, side, _global_rejection_reasons(decision), candle_by_timestamp, candles, horizon))
     return {
         "locallyRejectedSignals": tuple(row for row in local if row is not None),
         "globallyRejectedOrders": tuple(row for row in global_rejected if row is not None),

@@ -57,24 +57,38 @@ WCA_ROLLOUT_STAGE_ALIASES = {
 WCA_REQUIRED_ROLLOUT_EVIDENCE = frozenset(
     {
         "deterministic_replay_parity",
-        "no_unexplained_decision_mismatches",
-        "no_duplicate_broker_orders",
-        "no_cross_algorithm_inventory_mutations",
+        "zero_unexplained_decision_mismatches",
+        "zero_duplicate_broker_orders",
+        "zero_cross_algorithm_inventory_mutations",
         "successful_restart_recovery",
-        "successful_reconciliation",
-        "no_unprotected_positions",
-        "acceptable_event_lag",
-        "acceptable_decision_latency",
-        "acceptable_broker_latency",
-        "acceptable_realised_slippage",
-        "multiple_market_conditions",
-        "opening_midday_closing_periods",
-        "high_volatility_and_economic_event_sessions",
+        "accepted_reconciliation",
+        "zero_unprotected_positions",
+        "accepted_event_latency",
+        "accepted_decision_latency",
+        "accepted_broker_latency",
+        "recorded_slippage",
+        "opening_session_evidence",
+        "midday_evidence",
+        "closing_session_evidence",
+        "high_volatility_evidence",
+        "economic_event_session_evidence",
         "minimum_paper_observation_duration",
         "sufficient_paper_trade_count",
         "tested_rollback",
     }
 )
+
+WCA_ROLLOUT_EVIDENCE_ALIASES = {
+    "no_unexplained_decision_mismatches": "zero_unexplained_decision_mismatches",
+    "no_duplicate_broker_orders": "zero_duplicate_broker_orders",
+    "no_cross_algorithm_inventory_mutations": "zero_cross_algorithm_inventory_mutations",
+    "successful_reconciliation": "accepted_reconciliation",
+    "no_unprotected_positions": "zero_unprotected_positions",
+    "acceptable_event_lag": "accepted_event_latency",
+    "acceptable_decision_latency": "accepted_decision_latency",
+    "acceptable_broker_latency": "accepted_broker_latency",
+    "acceptable_realised_slippage": "recorded_slippage",
+}
 
 WCA_SHADOW_COMPARISON_FIELDS = (
     "strategy_outputs",
@@ -184,32 +198,47 @@ class WcaRolloutEvidence:
     healthy_state_validation_passed: bool = False
     live_trading_enabled: bool = False
 
+    def __post_init__(self) -> None:
+        normalized = set(self.persisted_evidence_ids)
+        normalized.update(
+            WCA_ROLLOUT_EVIDENCE_ALIASES[evidence_id]
+            for evidence_id in tuple(normalized)
+            if evidence_id in WCA_ROLLOUT_EVIDENCE_ALIASES
+        )
+        if "opening_midday_closing_periods" in normalized:
+            normalized.update({"opening_session_evidence", "midday_evidence", "closing_session_evidence"})
+        if "high_volatility_and_economic_event_sessions" in normalized:
+            normalized.update({"high_volatility_evidence", "economic_event_session_evidence"})
+        object.__setattr__(self, "persisted_evidence_ids", frozenset(normalized))
+
     @classmethod
     def from_validation(cls, validation: WcaRolloutValidation) -> "WcaRolloutEvidence":
         persisted = set()
         if validation.full_history_backtest_passed and validation.walk_forward_passed and validation.untouched_holdout_passed:
             persisted.add("deterministic_replay_parity")
         if validation.corrected_catalog_shadow_passed:
-            persisted.add("no_unexplained_decision_mismatches")
+            persisted.add("zero_unexplained_decision_mismatches")
         if validation.paper_execution_passed:
             persisted.update(
                 {
-                    "no_duplicate_broker_orders",
-                    "no_cross_algorithm_inventory_mutations",
-                    "successful_reconciliation",
-                    "no_unprotected_positions",
-                    "acceptable_event_lag",
-                    "acceptable_decision_latency",
-                    "acceptable_broker_latency",
-                    "acceptable_realised_slippage",
+                    "zero_duplicate_broker_orders",
+                    "zero_cross_algorithm_inventory_mutations",
+                    "accepted_reconciliation",
+                    "zero_unprotected_positions",
+                    "accepted_event_latency",
+                    "accepted_decision_latency",
+                    "accepted_broker_latency",
+                    "recorded_slippage",
                 }
             )
         if validation.paper_trading_stable:
             persisted.update(
                 {
-                    "multiple_market_conditions",
-                    "opening_midday_closing_periods",
-                    "high_volatility_and_economic_event_sessions",
+                    "opening_session_evidence",
+                    "midday_evidence",
+                    "closing_session_evidence",
+                    "high_volatility_evidence",
+                    "economic_event_session_evidence",
                     "minimum_paper_observation_duration",
                     "sufficient_paper_trade_count",
                 }
@@ -304,6 +333,25 @@ class WcaCriticalFailureAction:
     require_reconciliation_before_resumption: bool = True
     require_healthy_state_validation_before_resumption: bool = True
     reason_codes: tuple[str, ...] = ("wca.rollout.critical_failure.circuit_breaker_open",)
+
+    def model_dump(self) -> dict[str, object]:
+        return self.__dict__.copy()
+
+
+@dataclass(frozen=True)
+class WcaRollbackResult:
+    source_stage: WcaRolloutStage
+    target_stage: Literal["SHADOW", "DISABLED"]
+    new_entries_stopped: bool
+    wca_entry_orders_cancelled: bool
+    protective_exits_preserved: bool
+    reconciliation_requested: bool
+    broker_local_state_reconciled: bool
+    wca_inventory_preserved: bool
+    evidence_preserved: bool
+    safe_state_verified: bool
+    explicit_repromotion_required: bool
+    reason_codes: tuple[str, ...]
 
     def model_dump(self) -> dict[str, object]:
         return self.__dict__.copy()
@@ -507,12 +555,70 @@ def rollback_configuration() -> dict[str, object]:
         "dynamic_profile": "disabled",
         "automated_paper_submission": False,
         "new_entries_stopped": True,
+        "cancel_wca_entry_orders": True,
         "protective_exits_continue": True,
+        "reconcile_broker_and_local_state": True,
+        "preserve_wca_inventory": True,
+        "preserve_rollout_evidence": True,
+        "verify_safe_state": True,
+        "explicit_repromotion_required": True,
         "circuit_breaker_open": True,
         "requires_reconciliation_before_resumption": True,
         "requires_healthy_state_validation_before_resumption": True,
         "delete_historical_records": False,
     }
+
+
+def rollback_wca_automatic_paper_stage(
+    *,
+    source_stage: WcaRolloutStage | str,
+    target_stage: Literal["SHADOW", "DISABLED"],
+    entry_orders_cancelled: bool,
+    broker_local_state_reconciled: bool,
+    safe_state_verified: bool,
+) -> WcaRollbackResult:
+    source = _canonical_stage(source_stage)
+    if source not in {"MANUAL_PAPER", "LIMITED_AUTOMATIC_PAPER", "AUTOMATIC_PAPER"}:
+        raise ValueError("WCA rollback source must be a paper stage")
+    if target_stage not in {"SHADOW", "DISABLED"}:
+        raise ValueError("WCA rollback target must be SHADOW or DISABLED")
+    reasons = [
+        "wca.rollout.rollback.requested",
+        "wca.rollout.rollback.new_entries_stopped",
+        "wca.rollout.rollback.protective_exits_preserved",
+        "wca.rollout.rollback.inventory_preserved",
+        "wca.rollout.rollback.evidence_preserved",
+        "wca.rollout.rollback.explicit_repromotion_required",
+    ]
+    reasons.append(
+        "wca.rollout.rollback.entry_orders_cancelled"
+        if entry_orders_cancelled
+        else "wca.rollout.rollback.entry_order_cancellation_required"
+    )
+    reasons.append(
+        "wca.rollout.rollback.reconciliation_accepted"
+        if broker_local_state_reconciled
+        else "wca.rollout.rollback.reconciliation_required"
+    )
+    reasons.append(
+        "wca.rollout.rollback.safe_state_verified"
+        if safe_state_verified
+        else "wca.rollout.rollback.safe_state_verification_required"
+    )
+    return WcaRollbackResult(
+        source_stage=source,
+        target_stage=target_stage,
+        new_entries_stopped=True,
+        wca_entry_orders_cancelled=entry_orders_cancelled,
+        protective_exits_preserved=True,
+        reconciliation_requested=True,
+        broker_local_state_reconciled=broker_local_state_reconciled,
+        wca_inventory_preserved=True,
+        evidence_preserved=True,
+        safe_state_verified=safe_state_verified,
+        explicit_repromotion_required=True,
+        reason_codes=tuple(reasons),
+    )
 
 
 def record_valid_wca_rollout_state(
@@ -537,7 +643,15 @@ def record_valid_wca_rollout_state(
     return state
 
 
-def rollback_wca_rollout(store: WcaRolloutStore, *, rolled_back_at: datetime | None = None) -> dict:
+def rollback_wca_rollout(
+    store: WcaRolloutStore,
+    *,
+    rolled_back_at: datetime | None = None,
+    target_stage: Literal["SHADOW", "DISABLED"] = "SHADOW",
+    entry_orders_cancelled: bool = True,
+    broker_local_state_reconciled: bool = True,
+    safe_state_verified: bool = True,
+) -> dict:
     previous = _read_optional(store, WCA_ROLLBACK_STATE_KEY)
     if not previous:
         previous = {
@@ -547,12 +661,28 @@ def rollback_wca_rollout(store: WcaRolloutStore, *, rolled_back_at: datetime | N
             "rollback_configuration": rollback_configuration(),
             "reason_codes": ("wca.rollout.rollback_baseline_restored",),
         }
+    current = _read_optional(store, WCA_ROLLOUT_STATE_KEY) or {}
+    source_stage = str(current.get("phase") or previous.get("phase") or "MANUAL_PAPER")
+    rollback = rollback_wca_automatic_paper_stage(
+        source_stage=source_stage,
+        target_stage=target_stage,
+        entry_orders_cancelled=entry_orders_cancelled,
+        broker_local_state_reconciled=broker_local_state_reconciled,
+        safe_state_verified=safe_state_verified,
+    )
     restored = {
         **previous,
+        "phase": target_stage,
+        "status": "rollback_safe_state_verified" if safe_state_verified else "rollback_pending_safe_state",
         "restored_at": (rolled_back_at or datetime.now(timezone.utc)).isoformat(),
         "rollback_configuration": rollback_configuration(),
+        "rollback_result": rollback.model_dump(),
         "historical_records_deleted": False,
-        "reason_codes": tuple(dict.fromkeys([*(previous.get("reason_codes") or ()), "wca.rollout.rollback_restored_safe_state"])),
+        "reason_codes": tuple(
+            dict.fromkeys(
+                [*(previous.get("reason_codes") or ()), *rollback.reason_codes, "wca.rollout.rollback_restored_safe_state"]
+            )
+        ),
     }
     store.write_snapshot(WCA_ROLLOUT_STATE_KEY, restored)
     return restored
@@ -604,34 +734,34 @@ def _evidence_blockers(
         "SHADOW": (
             "deterministic_replay_parity",
             "successful_restart_recovery",
-            "no_unexplained_decision_mismatches",
-            "acceptable_event_lag",
-            "acceptable_decision_latency",
+            "zero_unexplained_decision_mismatches",
+            "accepted_event_latency",
+            "accepted_decision_latency",
         ),
         "PAPER_RECOMMENDATION": (
             "deterministic_replay_parity",
             "successful_restart_recovery",
-            "no_unexplained_decision_mismatches",
-            "no_duplicate_broker_orders",
-            "no_cross_algorithm_inventory_mutations",
-            "successful_reconciliation",
-            "no_unprotected_positions",
-            "acceptable_event_lag",
-            "acceptable_decision_latency",
-            "acceptable_broker_latency",
+            "zero_unexplained_decision_mismatches",
+            "zero_duplicate_broker_orders",
+            "zero_cross_algorithm_inventory_mutations",
+            "accepted_reconciliation",
+            "zero_unprotected_positions",
+            "accepted_event_latency",
+            "accepted_decision_latency",
+            "accepted_broker_latency",
         ),
         "MANUAL_PAPER": (
             "deterministic_replay_parity",
             "successful_restart_recovery",
-            "no_unexplained_decision_mismatches",
-            "no_duplicate_broker_orders",
-            "no_cross_algorithm_inventory_mutations",
-            "successful_reconciliation",
-            "no_unprotected_positions",
-            "acceptable_event_lag",
-            "acceptable_decision_latency",
-            "acceptable_broker_latency",
-            "acceptable_realised_slippage",
+            "zero_unexplained_decision_mismatches",
+            "zero_duplicate_broker_orders",
+            "zero_cross_algorithm_inventory_mutations",
+            "accepted_reconciliation",
+            "zero_unprotected_positions",
+            "accepted_event_latency",
+            "accepted_decision_latency",
+            "accepted_broker_latency",
+            "recorded_slippage",
         ),
         "LIMITED_AUTOMATIC_PAPER": tuple(sorted(WCA_REQUIRED_ROLLOUT_EVIDENCE)),
         "AUTOMATIC_PAPER": tuple(sorted(WCA_REQUIRED_ROLLOUT_EVIDENCE)),
@@ -737,6 +867,7 @@ __all__ = [
     "WCA_ROLLOUT_STAGES",
     "WCA_ROLLOUT_STATE_KEY",
     "WCA_ROLLOUT_VERSION",
+    "WCA_ROLLOUT_EVIDENCE_ALIASES",
     "WCA_REQUIRED_ROLLOUT_EVIDENCE",
     "WCA_SHADOW_COMPARISON_FIELDS",
     "WcaCriticalFailureAction",
@@ -748,6 +879,7 @@ __all__ = [
     "WcaRolloutPhaseStatus",
     "WcaRolloutStage",
     "WcaRolloutValidation",
+    "WcaRollbackResult",
     "WcaShadowComparisonResult",
     "compare_shadow_results",
     "critical_failure_action",
@@ -760,6 +892,7 @@ __all__ = [
     "paper_recommendation_allowed",
     "record_valid_wca_rollout_state",
     "rollback_configuration",
+    "rollback_wca_automatic_paper_stage",
     "rollback_wca_rollout",
     "wca_rollout_feature_flags",
     "wca_rollout_status",

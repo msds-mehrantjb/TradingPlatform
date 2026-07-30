@@ -37,4 +37,14 @@ Cancellation requires a new cancellation idempotency key. Replacement requires a
 
 ## Paper Only
 
-The WCA paper broker adapter exposes no real-money endpoint or credential path. The default transport is a deterministic paper simulator; production may inject a paper broker transport that satisfies the same WCA contract.
+The WCA paper broker adapter exposes no real-money endpoint or credential path. The default transport is a deterministic paper simulator for tests and local dry runs.
+
+Automatic runtime submission must also pass the dedicated WCA Alpaca paper-account guard before any broker transport is called. The guard requires:
+
+- `WCA_AUTOMATIC_PAPER_ENABLED=true`
+- `WCA_ALPACA_PAPER_API_KEY_ID`
+- `WCA_ALPACA_PAPER_API_SECRET_KEY`
+- `WCA_ALPACA_PAPER_ACCOUNT_ID` matching the runtime command account
+- `WCA_ALPACA_PAPER_BASE_URL=https://paper-api.alpaca.markets`
+
+Generic `APCA_*` credentials are not used as a fallback for WCA automatic paper trading. A missing, live-looking, mismatched, or shared credential configuration leaves the outbox reservation persisted but disables broker submission.

@@ -11,6 +11,8 @@ from backend.app.algorithms.wca.configuration import default_wca_configuration
 from backend.app.algorithms.wca.contracts import (
     ProposedOrder,
     WcaBrokerReconciliationResult,
+    WcaOrderValidationContext,
+    WcaRuntimeMode,
     WcaSide,
 )
 from backend.app.algorithms.wca.execution_pipeline import WcaExecutionPipelineInput, run_wca_paper_pipeline_adapter
@@ -18,6 +20,7 @@ from backend.app.algorithms.wca.repository import (
     WCA_PERSISTENCE_RECORD_INVENTORY,
     WCA_PERSISTENCE_TABLES,
     WCA_PERSISTENCE_MIGRATION_VERSION,
+    WcaInventoryLedgerEvent,
     WcaSqliteRepository,
     apply_wca_persistence_migrations,
     classify_wca_local_storage_key,
@@ -42,14 +45,18 @@ class WcaStep6InventoryPersistenceTests(unittest.TestCase):
 
             self.assertEqual(migration_count, 1)
             self.assertTrue(set(WCA_PERSISTENCE_TABLES).issubset(tables))
-            self.assertEqual(len(WCA_PERSISTENCE_RECORD_INVENTORY), 37)
+            self.assertEqual(len(WCA_PERSISTENCE_RECORD_INVENTORY), 43)
             self.assert_primary_key(conn, "wca_finalized_bar_event_receipts", "event_id")
             self.assert_primary_key(conn, "wca_decisions", "decision_id")
             self.assert_primary_key(conn, "wca_broker_orders", "broker_order_id")
             self.assert_primary_key(conn, "wca_attributed_fills", "fill_id")
+            self.assert_primary_key(conn, "wca_inventory_ledger", "inventory_event_id")
+            self.assert_primary_key(conn, "wca_broker_account_snapshots", "broker_snapshot_id")
             self.assert_index_exists(conn, "wca_order_intents", "idx_wca_order_intents_idempotency")
             self.assert_index_exists(conn, "wca_execution_outbox", "idx_wca_execution_outbox_idempotency")
             self.assert_index_exists(conn, "wca_broker_orders", "idx_wca_broker_orders_idempotency")
+            self.assert_index_exists(conn, "wca_inventory_ledger", "idx_wca_inventory_ledger_fill_id")
+            self.assert_index_exists(conn, "wca_inventory_ledger", "idx_wca_inventory_ledger_client_order_submission")
 
     def test_event_claim_and_runtime_checkpoint_are_atomic_and_idempotent(self) -> None:
         repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")
@@ -91,8 +98,8 @@ class WcaStep6InventoryPersistenceTests(unittest.TestCase):
         self.assertGreater(counts["wca_modifier_evaluations"], 0)
         self.assertGreater(counts["wca_global_risk_responses"], 0)
         self.assertGreater(counts["wca_order_intents"], 0)
-        self.assertTrue(repository.create_execution_outbox_record(decision, account_id="paper", idempotency_key="outbox-key"))
-        self.assertFalse(repository.create_execution_outbox_record(decision, account_id="paper", idempotency_key="outbox-key"))
+        self.assertTrue(repository.create_execution_outbox_record(decision, account_id="paper", idempotency_key="outbox-key", final_validation_context=validation_context(decision)))
+        self.assertFalse(repository.create_execution_outbox_record(decision, account_id="paper", idempotency_key="outbox-key", final_validation_context=validation_context(decision)))
         self.assertTrue(repository.record_broker_order(decision, broker_order_id="broker-order-1", account_id="paper", idempotency_key="broker-key", status="accepted"))
         self.assertFalse(repository.record_broker_order(decision, broker_order_id="broker-order-1", account_id="paper", idempotency_key="broker-key", status="accepted"))
         self.assertTrue(repository.apply_fill_and_update_position(decision, fill_id="fill-1", account_id="paper", quantity=5, broker_order_id="broker-order-1"))
@@ -102,10 +109,285 @@ class WcaStep6InventoryPersistenceTests(unittest.TestCase):
             conn.row_factory = sqlite3.Row
             lot = conn.execute("SELECT * FROM wca_owned_lots WHERE lot_id = ?", ("wca-lot-fill-1",)).fetchone()
             fill_count = conn.execute("SELECT COUNT(*) FROM wca_attributed_fills WHERE fill_id = ?", ("fill-1",)).fetchone()[0]
+            inventory_event_count = conn.execute("SELECT COUNT(*) FROM wca_inventory_ledger WHERE fill_id = ?", ("fill-1",)).fetchone()[0]
             self.assertEqual(fill_count, 1)
+            self.assertEqual(inventory_event_count, 1)
             self.assertEqual(lot["algorithm_id"], "wca")
             self.assertEqual(lot["account_id"], "paper")
             self.assertEqual(lot["symbol"], "SPY")
+
+    def test_inventory_ledger_events_are_idempotent_and_projection_rebuild_is_deterministic(self) -> None:
+        repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")
+        self.assertTrue(
+            repository.record_inventory_event(
+                WcaInventoryLedgerEvent(
+                    inventory_event_id="ledger-order-1",
+                    event_type="ORDER_INTENT_RESERVED",
+                    broker_account_id="paper-ledger",
+                    symbol="SPY",
+                    event_timestamp="2026-01-06T14:30:00+00:00",
+                    trade_date="2026-01-06",
+                    order_intent_id="intent-ledger-1",
+                    side="BUY",
+                    quantity=5,
+                    remaining_quantity=5,
+                    configuration_version="cfg-ledger",
+                    decision_id="decision-ledger",
+                    run_id="run-ledger",
+                )
+            )
+        )
+        self.assertFalse(
+            repository.record_inventory_event(
+                WcaInventoryLedgerEvent(
+                    inventory_event_id="ledger-order-1",
+                    event_type="ORDER_INTENT_RESERVED",
+                    broker_account_id="paper-ledger",
+                    symbol="SPY",
+                    event_timestamp="2026-01-06T14:30:00+00:00",
+                    trade_date="2026-01-06",
+                )
+            )
+        )
+        repository.record_inventory_event(
+            WcaInventoryLedgerEvent(
+                inventory_event_id="ledger-risk-1",
+                event_type="RISK_RESERVED",
+                broker_account_id="paper-ledger",
+                symbol="SPY",
+                event_timestamp="2026-01-06T14:30:01+00:00",
+                trade_date="2026-01-06",
+                reserved_risk=25.0,
+            )
+        )
+        repository.record_inventory_event(
+            WcaInventoryLedgerEvent(
+                inventory_event_id="ledger-fill-buy",
+                event_type="FILL_RECEIVED",
+                broker_account_id="paper-ledger",
+                symbol="SPY",
+                event_timestamp="2026-01-06T14:31:00+00:00",
+                trade_date="2026-01-06",
+                fill_id="ledger-fill-buy",
+                side="BUY",
+                quantity=5,
+                filled_quantity=5,
+                fill_price=100.0,
+            )
+        )
+        repository.record_inventory_event(
+            WcaInventoryLedgerEvent(
+                inventory_event_id="ledger-fill-sell",
+                event_type="FILL_RECEIVED",
+                broker_account_id="paper-ledger",
+                symbol="SPY",
+                event_timestamp="2026-01-06T15:00:00+00:00",
+                trade_date="2026-01-06",
+                fill_id="ledger-fill-sell",
+                side="SELL",
+                quantity=2,
+                filled_quantity=2,
+                fill_price=104.0,
+                reserved_risk=10.0,
+            )
+        )
+
+        before = repository.read_inventory_projection(algorithm_id="wca", broker_account_id="paper-ledger", symbol="SPY")
+        daily_before = repository.read_daily_state_projection(algorithm_id="wca", broker_account_id="paper-ledger", symbol="SPY", session_date="2026-01-06")
+
+        with sqlite3.connect(repository.path) as conn:
+            conn.execute("DELETE FROM wca_inventory_projection")
+            conn.execute("DELETE FROM wca_daily_state")
+        repository.rebuild_inventory_projections(algorithm_id="wca", broker_account_id="paper-ledger", symbol="SPY")
+
+        after = repository.read_inventory_projection(algorithm_id="wca", broker_account_id="paper-ledger", symbol="SPY")
+        daily_after = repository.read_daily_state_projection(algorithm_id="wca", broker_account_id="paper-ledger", symbol="SPY", session_date="2026-01-06")
+
+        self.assertEqual(before, after)
+        self.assertEqual(daily_before, daily_after)
+        self.assertEqual(after.open_quantity, 3)
+        self.assertEqual(after.average_entry_price, 100.0)
+        self.assertEqual(after.realized_pnl, 8.0)
+        self.assertEqual(after.reserved_risk, 25.0)
+        self.assertEqual(daily_after.entries_attempted_today, 1)
+        self.assertEqual(daily_after.realized_pnl_today, 8.0)
+        self.assertEqual(daily_after.maximum_intraday_exposure, 500.0)
+
+    def test_inventory_ledger_rejects_cross_algorithm_writes_and_scopes_reads_by_account(self) -> None:
+        repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")
+        repository.record_inventory_event(
+            WcaInventoryLedgerEvent(
+                inventory_event_id="account-a-fill",
+                event_type="FILL_RECEIVED",
+                broker_account_id="paper-a",
+                symbol="SPY",
+                event_timestamp="2026-01-06T14:31:00+00:00",
+                trade_date="2026-01-06",
+                fill_id="account-a-fill",
+                side="BUY",
+                quantity=5,
+                filled_quantity=5,
+                fill_price=100.0,
+            )
+        )
+        repository.record_inventory_event(
+            WcaInventoryLedgerEvent(
+                inventory_event_id="account-b-fill",
+                event_type="FILL_RECEIVED",
+                broker_account_id="paper-b",
+                symbol="SPY",
+                event_timestamp="2026-01-06T14:31:00+00:00",
+                trade_date="2026-01-06",
+                fill_id="account-b-fill",
+                side="BUY",
+                quantity=7,
+                filled_quantity=7,
+                fill_price=100.0,
+            )
+        )
+
+        account_a = repository.read_inventory_projection(algorithm_id="wca", broker_account_id="paper-a", symbol="SPY")
+        account_b = repository.read_inventory_projection(algorithm_id="wca", broker_account_id="paper-b", symbol="SPY")
+        self.assertEqual(account_a.open_quantity, 5)
+        self.assertEqual(account_b.open_quantity, 7)
+        self.assertEqual(len(repository.list_inventory_ledger_events(algorithm_id="wca", broker_account_id="paper-a", symbol="SPY")), 1)
+
+        with self.assertRaises(ValueError):
+            repository.record_inventory_event(
+                WcaInventoryLedgerEvent(
+                    inventory_event_id="foreign-fill",
+                    event_type="FILL_RECEIVED",
+                    algorithm_id="mean_reversion",
+                    broker_account_id="paper-a",
+                    symbol="SPY",
+                    event_timestamp="2026-01-06T14:31:00+00:00",
+                    trade_date="2026-01-06",
+                )
+            )
+        with self.assertRaises(ValueError):
+            repository.read_inventory_projection(algorithm_id="mean_reversion", broker_account_id="paper-a", symbol="SPY")
+
+    def test_inventory_ledger_database_constraints_reject_duplicate_keys_and_impossible_reductions(self) -> None:
+        repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")
+        repository.record_inventory_event(
+            WcaInventoryLedgerEvent(
+                inventory_event_id="duplicate-fill-1",
+                event_type="FILL_RECEIVED",
+                broker_account_id="paper",
+                symbol="SPY",
+                event_timestamp="2026-01-06T14:31:00+00:00",
+                trade_date="2026-01-06",
+                fill_id="same-fill",
+                side="BUY",
+                quantity=1,
+                filled_quantity=1,
+                fill_price=100.0,
+            )
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            repository.record_inventory_event(
+                WcaInventoryLedgerEvent(
+                    inventory_event_id="duplicate-fill-2",
+                    event_type="FILL_RECEIVED",
+                    broker_account_id="paper",
+                    symbol="SPY",
+                    event_timestamp="2026-01-06T14:32:00+00:00",
+                    trade_date="2026-01-06",
+                    fill_id="same-fill",
+                    side="BUY",
+                    quantity=1,
+                    filled_quantity=1,
+                    fill_price=100.0,
+                )
+            )
+        repository.record_inventory_event(
+            WcaInventoryLedgerEvent(
+                inventory_event_id="submitted-client-1",
+                event_type="ORDER_SUBMITTED",
+                broker_account_id="paper",
+                symbol="SPY",
+                event_timestamp="2026-01-06T14:33:00+00:00",
+                trade_date="2026-01-06",
+                client_order_id="same-client-order",
+            )
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            repository.record_inventory_event(
+                WcaInventoryLedgerEvent(
+                    inventory_event_id="submitted-client-2",
+                    event_type="ORDER_SUBMITTED",
+                    broker_account_id="paper",
+                    symbol="SPY",
+                    event_timestamp="2026-01-06T14:34:00+00:00",
+                    trade_date="2026-01-06",
+                    client_order_id="same-client-order",
+                )
+            )
+        with self.assertRaises(ValueError):
+            repository.record_inventory_event(
+                WcaInventoryLedgerEvent(
+                    inventory_event_id="impossible-sell",
+                    event_type="FILL_RECEIVED",
+                    broker_account_id="paper-empty",
+                    symbol="SPY",
+                    event_timestamp="2026-01-06T15:00:00+00:00",
+                    trade_date="2026-01-06",
+                    fill_id="impossible-sell",
+                    side="SELL",
+                    quantity=1,
+                    filled_quantity=1,
+                    fill_price=100.0,
+                )
+            )
+
+    def test_inventory_migration_preserves_existing_records_and_adds_new_tables(self) -> None:
+        with sqlite3.connect(":memory:") as conn:
+            conn.execute(
+                """
+                CREATE TABLE wca_attributed_fills (
+                    fill_id TEXT PRIMARY KEY,
+                    algorithm_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    configuration_version TEXT NOT NULL,
+                    engine_version TEXT NOT NULL,
+                    market_snapshot_id TEXT NOT NULL,
+                    decision_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO wca_attributed_fills (
+                    fill_id, algorithm_id, symbol, timestamp, configuration_version,
+                    engine_version, market_snapshot_id, decision_id, run_id, side, quantity, payload_json
+                )
+                VALUES ('legacy-fill', 'wca', 'SPY', '2026-01-05T15:00:00+00:00', 'cfg',
+                        'engine', 'market', 'decision', 'run', 'BUY', 1, '{}')
+                """
+            )
+            apply_wca_persistence_migrations(conn)
+
+            row = conn.execute("SELECT fill_id, account_id FROM wca_attributed_fills WHERE fill_id = 'legacy-fill'").fetchone()
+            tables = {record[0] for record in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+            self.assertEqual(row, ("legacy-fill", "paper"))
+            self.assertIn("wca_inventory_ledger", tables)
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """
+                    INSERT INTO wca_inventory_ledger (
+                        inventory_event_id, event_type, algorithm_id, broker_account_id, symbol,
+                        trade_date, event_timestamp, source_authority
+                    )
+                    VALUES ('bad-algo', 'ORDER_SUBMITTED', 'other', 'paper', 'SPY',
+                            '2026-01-06', '2026-01-06T14:30:00+00:00', 'test')
+                    """
+                )
 
     def test_wca_lot_reduction_requires_wca_owned_lot_not_broker_net_position(self) -> None:
         repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")
@@ -124,7 +406,7 @@ class WcaStep6InventoryPersistenceTests(unittest.TestCase):
 
     def test_unexplained_reconciliation_discrepancy_blocks_new_entries_fail_closed(self) -> None:
         repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")
-        self.assertFalse(repository.reconciliation_blocks_new_entries(account_id="paper", symbol="SPY"))
+        self.assertTrue(repository.reconciliation_blocks_new_entries(account_id="paper", symbol="SPY"))
 
         repository.write_broker_reconciliation(
             WcaBrokerReconciliationResult(
@@ -199,6 +481,7 @@ def decision_with_order(decision_id: str, order_intent_id: str, idempotency_key:
         ),
         voters=fake_voters(WcaSide.BUY),
     ).decision
+    entry_price = decision.market_snapshot.candles[-1].close
     proposed = ProposedOrder(
         decision_id=decision.decision_id,
         configuration_version=decision.configuration_version,
@@ -209,11 +492,61 @@ def decision_with_order(decision_id: str, order_intent_id: str, idempotency_key:
         symbol=decision.market_snapshot.symbol,
         side=WcaSide.BUY,
         quantity=5,
-        trigger_price=decision.market_snapshot.candles[-1].close,
-        stop_price=decision.market_snapshot.candles[-1].close - 1,
-        target_price=decision.market_snapshot.candles[-1].close + 2,
+        trigger_price=entry_price,
+        limit_price=entry_price,
+        stop_price=entry_price - 1,
+        target_price=entry_price + 2,
     )
-    return decision.model_copy(update={"proposed_order": proposed})
+    sizing = decision.sizing.model_copy(
+        update={
+            "final_quantity": 5,
+            "risk_dollars": 5,
+            "stop_distance": 1,
+            "shares_by_risk": 5,
+            "shares_by_order": 5,
+            "shares_by_capital": 5,
+            "shares_by_buying_power": 5,
+            "shares_by_liquidity": 5,
+            "limiting_factor": "test_fixture",
+            "blocked_reason": "",
+            "side": WcaSide.BUY,
+            "entry_price": entry_price,
+            "stop_price": entry_price - 1,
+            "target_price": entry_price + 2,
+            "minimum_reward_risk": 1.5,
+            "reward_risk_ratio": 2,
+            "approved_risk_budget": 1000,
+            "stop_risk_dollars": 5,
+            "shares_by_global_gate": 5,
+        }
+    )
+    return decision.model_copy(update={"sizing": sizing, "proposed_order": proposed})
+
+
+def validation_context(decision) -> WcaOrderValidationContext:
+    return WcaOrderValidationContext(
+        evaluation_timestamp=decision.decision_timestamp,
+        account_id="paper",
+        broker_endpoint="paper",
+        runtime_mode=WcaRuntimeMode.MANUAL_PAPER,
+        requires_executable_paper_stage=True,
+        data_ready=decision.market_snapshot.data_ready,
+        quote_freshness_seconds=15,
+        candle_freshness_seconds=120,
+        available_buying_power=100_000,
+        account_equity=100_000,
+        max_position_value=100_000,
+        max_spread_percent=decision.effective_settings.final_max_spread_percent,
+        average_one_minute_volume=100_000,
+        max_participation_percent=decision.effective_settings.final_max_participation_percent,
+        expected_net_edge=1,
+        minimum_net_edge=0,
+        idempotency_required=True,
+        max_approved_quantity=1000,
+        order_type="LIMIT",
+        time_in_force="DAY",
+        protective_exit_plan_present=True,
+    )
 
 
 def temp_db_path() -> Path:

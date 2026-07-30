@@ -2,21 +2,28 @@ import { escapeHtml, formatCurrency, formatInteger, formatNumber, formatPercent,
 import type { WcaBacktestResult, WcaBacktestTrade } from "./types";
 
 export function renderWcaBacktestPanel(backtest: WcaBacktestResult | null, status = "idle", error: string | null = null): string {
+  if (status === "loading") {
+    return renderBacktestShell("Backtest status: Loading", "Loading backend WCA backtest status.", backtest?.trades ?? [], Boolean(backtest?.trades?.length));
+  }
   if (status === "running") {
-    return renderBacktestShell("Backtest status: Queued", "Backend-authoritative WCA research job is queued or running.", []);
+    return renderBacktestShell("Backtest status: Queued", "Backend-authoritative WCA research job is queued or running.", [], false);
   }
   if (status === "waiting") {
-    return renderBacktestShell("Backtest status: Waiting", error || "Waiting for a complete backend dataset.", backtest?.trades ?? []);
+    return renderBacktestShell("Backtest status: Waiting", error || "Waiting for a complete backend dataset.", backtest?.trades ?? [], Boolean(backtest?.trades?.length));
   }
   if (status === "error") {
-    return renderBacktestShell("Backtest status: Error", error || "Backend WCA backtest failed.", []);
+    return renderBacktestShell("Backtest status: Error", error || "Backend WCA backtest failed.", [], true);
   }
   if (!backtest) {
-    return renderBacktestShell("Backtest status: Scheduled", "Backtests are enqueued as WCA research jobs; no inline browser result is authoritative.", []);
+    return renderBacktestShell("Backtest status: Not run yet", "Daily WCA backtest will enqueue as a backend research job after the prepared dataset is current.", [], false);
   }
   const metrics = backtest.metrics ?? {};
-  if (String(backtest.status ?? "").toUpperCase() === "QUEUED") {
-    return renderBacktestShell("Backtest status: Queued", `Research job ${stringValue((metrics as Record<string, unknown>).jobId, "pending")} accepted by backend.`, []);
+  const backtestStatus = String(backtest.status ?? "").toUpperCase();
+  if (["QUEUED", "CLAIMED", "RUNNING"].includes(backtestStatus)) {
+    return renderBacktestShell("Backtest status: Queued", `Research job ${stringValue((metrics as Record<string, unknown>).jobId, "pending")} accepted by backend.`, [], false);
+  }
+  if (["FAILED", "CANCELLED", "EXPIRED", "QUARANTINED", "NOT_FOUND"].includes(backtestStatus)) {
+    return renderBacktestShell("Backtest status: Attention", `Research job ${stringValue((metrics as Record<string, unknown>).jobId, "pending")} is ${backtestStatus.toLowerCase()}.`, [], false);
   }
   const runConfig = backtest.runConfiguration ?? backtest.run_configuration ?? {};
   const diagnostics = backtest.diagnostics ?? {};
@@ -29,28 +36,34 @@ export function renderWcaBacktestPanel(backtest: WcaBacktestResult | null, statu
     <span>Reason: <strong>${escapeHtml(reasonText(backtest) || "backend WCA backtest engine")}</strong></span>
   `;
   return `
-    <section class="wca-section">
-      <div class="wca-section-header">
-        <div class="algo-section-title">Backtest Status</div>
-        <span class="wca-pill">Backend authoritative</span>
+    <details class="wca-expander">
+      <summary class="algo-expand-toggle wca-expand-summary">
+        <span>Backtest Status</span>
+        <strong>Backend authoritative</strong>
+        <b>+</b>
+      </summary>
+      <div class="wca-expander-body">
+        <div class="confidence-backtest-summary wca-backtest-summary">${summary}</div>
+        <div class="wca-note">Diagnostics: ${escapeHtml(stringValue(diagnostics.status, diagnostics.summary, "available in backend report when returned"))}</div>
+        ${renderTradeTable(backtest.trades ?? [])}
       </div>
-      <div class="wca-backtest-summary">${summary}</div>
-      <div class="wca-note">Diagnostics: ${escapeHtml(stringValue(diagnostics.status, diagnostics.summary, "available in backend report when returned"))}</div>
-      ${renderTradeTable(backtest.trades ?? [])}
-    </section>
+    </details>
   `;
 }
 
-function renderBacktestShell(title: string, message: string, trades: WcaBacktestTrade[]): string {
+function renderBacktestShell(title: string, message: string, trades: WcaBacktestTrade[], showTradePlaceholder = true): string {
   return `
-    <section class="wca-section">
-      <div class="wca-section-header">
-        <div class="algo-section-title">Backtest Status</div>
-        <span class="wca-pill">${escapeHtml(title)}</span>
+    <details class="wca-expander">
+      <summary class="algo-expand-toggle wca-expand-summary">
+        <span>Backtest Status</span>
+        <strong>${escapeHtml(title)}</strong>
+        <b>+</b>
+      </summary>
+      <div class="wca-expander-body">
+        <div class="wca-empty">${escapeHtml(message)}</div>
+        ${showTradePlaceholder ? renderTradeTable(trades) : ""}
       </div>
-      <div class="wca-empty">${escapeHtml(message)}</div>
-      ${renderTradeTable(trades)}
-    </section>
+    </details>
   `;
 }
 
@@ -59,8 +72,8 @@ function renderTradeTable(trades: WcaBacktestTrade[]): string {
     return `<div class="wca-empty">No backend WCA trades to display.</div>`;
   }
   return `
-    <div class="wca-table-wrap">
-      <table class="wca-table">
+    <div class="algo-table-wrap wca-table-wrap">
+      <table class="algo-trade-table wca-table">
         <thead>
           <tr>
             <th>Side</th>

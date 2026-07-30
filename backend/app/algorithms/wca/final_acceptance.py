@@ -142,15 +142,15 @@ def _apply_runtime_evidence(item: WcaAcceptanceItem, evidence: WcaFinalAcceptanc
     if statement == "Duplicate broker orders are prevented atomically.":
         return _pass_or_pending(
             item,
-            "no_duplicate_broker_orders" in rollout.persisted_evidence_ids and rollout.duplicate_broker_orders == 0,
-            ("wca.rollout.evidence.no_duplicate_broker_orders",),
+            "zero_duplicate_broker_orders" in rollout.persisted_evidence_ids and rollout.duplicate_broker_orders == 0,
+            ("wca.rollout.evidence.zero_duplicate_broker_orders",),
             ("Requires persisted duplicate-submission evidence with zero duplicate broker orders.",),
         )
     if statement == "Broker positions and orders are reconciled.":
         return _pass_or_pending(
             item,
-            "successful_reconciliation" in rollout.persisted_evidence_ids and rollout.reconciliation_passed,
-            ("wca.rollout.evidence.successful_reconciliation",),
+            "accepted_reconciliation" in rollout.persisted_evidence_ids and rollout.reconciliation_passed,
+            ("wca.rollout.evidence.accepted_reconciliation",),
             ("Requires persisted broker reconciliation evidence.",),
         )
     if statement == "Dynamic settings use the same resolver as paper trading.":
@@ -163,9 +163,9 @@ def _apply_runtime_evidence(item: WcaAcceptanceItem, evidence: WcaFinalAcceptanc
     if statement == "Shadow comparison completed.":
         return _pass_or_pending(
             item,
-            "no_unexplained_decision_mismatches" in rollout.persisted_evidence_ids
+            "zero_unexplained_decision_mismatches" in rollout.persisted_evidence_ids
             and rollout.unexplained_decision_mismatches == 0,
-            ("wca.rollout.evidence.no_unexplained_decision_mismatches",),
+            ("wca.rollout.evidence.zero_unexplained_decision_mismatches",),
             ("Requires persisted shadow comparison evidence with no unexplained decision mismatches.",),
         )
     if statement == "Critical tests pass.":
@@ -266,7 +266,7 @@ def _paper_stability_accepted(evidence: WcaRolloutEvidence) -> bool:
 
 def _latency_accepted(evidence: WcaRolloutEvidence) -> bool:
     return (
-        {"acceptable_event_lag", "acceptable_decision_latency", "acceptable_broker_latency"}.issubset(
+        {"accepted_event_latency", "accepted_decision_latency", "accepted_broker_latency"}.issubset(
             evidence.persisted_evidence_ids
         )
         and evidence.max_event_lag_seconds is not None
@@ -280,7 +280,7 @@ def _latency_accepted(evidence: WcaRolloutEvidence) -> bool:
 
 def _multi_condition_evidence_accepted(evidence: WcaRolloutEvidence) -> bool:
     return (
-        {"multiple_market_conditions", "opening_midday_closing_periods", "high_volatility_and_economic_event_sessions"}.issubset(
+        {"opening_session_evidence", "midday_evidence", "closing_session_evidence", "high_volatility_evidence", "economic_event_session_evidence"}.issubset(
             evidence.persisted_evidence_ids
         )
         and len(set(evidence.market_conditions)) >= 3

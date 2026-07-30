@@ -124,3 +124,33 @@ WCA modernization remains blocked by these required items:
 - Record stable paper-trading validation evidence across multiple market conditions.
 - Record accepted latency performance evidence.
 - Record tested rollback evidence that restored a safe state.
+
+## Phase 15 Rollout Acceptance
+
+Promotion remains evidence-controlled. A user request, API call, feature flag, deployment, or code completion cannot promote WCA beyond the highest stage whose evidence has been recorded and accepted.
+
+Required promotion evidence:
+
+| Evidence | Status | Acceptance evidence |
+| --- | --- | --- |
+| `deterministic_replay_parity` | PENDING | Golden replay/parity fixtures must show identical decisions across replay, shadow, manual paper, limited automatic paper, and automatic paper. |
+| `zero_unexplained_decision_mismatches` | PENDING | Shadow comparison evidence must show zero unexplained mismatches. |
+| `zero_duplicate_broker_orders` | PENDING | Broker/order-outbox evidence must show one WCA intent creates at most one broker order. |
+| `zero_cross_algorithm_inventory_mutations` | PENDING | Isolation tests must show no cross-algorithm inventory writes. |
+| `successful_restart_recovery` | PENDING | Worker restart evidence must show recovery without duplicate decisions or orders. |
+| `accepted_reconciliation` | PENDING | WCA broker/local reconciliation must be accepted. |
+| `zero_unprotected_positions` | PENDING | Paper evidence must show no WCA position exceeded the protection tolerance. |
+| `accepted_event_latency` | PENDING | Event latency metrics must be accepted. |
+| `accepted_decision_latency` | PENDING | Decision latency metrics must be accepted. |
+| `accepted_broker_latency` | PENDING | Broker latency metrics must be accepted. |
+| `recorded_slippage` | PENDING | Paper fills must record slippage. |
+| `opening_session_evidence` | PENDING | Opening-session paper evidence must be recorded. |
+| `midday_evidence` | PENDING | Midday paper evidence must be recorded. |
+| `closing_session_evidence` | PENDING | Closing-session paper evidence must be recorded. |
+| `high_volatility_evidence` | PENDING | High-volatility paper evidence must be recorded. |
+| `economic_event_session_evidence` | PENDING | Economic-event-session paper evidence must be recorded. |
+| `minimum_paper_observation_duration` | PENDING | Minimum paper observation duration must be met. |
+| `sufficient_paper_trade_count` | PENDING | Sufficient paper trade count must be met. |
+| `tested_rollback` | PENDING | Rollback must be tested and safe state verified. |
+
+The accepted stage sequence is `DISABLED`, `HISTORICAL_REPLAY`, `SHADOW`, `PAPER_RECOMMENDATION`, `MANUAL_PAPER`, `LIMITED_AUTOMATIC_PAPER`, `AUTOMATIC_PAPER`. Rollback to `SHADOW` or `DISABLED` must stop new entries, cancel WCA entry orders, preserve protective exits, reconcile broker and local state, preserve inventory, preserve evidence, verify safe state, and require explicit re-promotion.

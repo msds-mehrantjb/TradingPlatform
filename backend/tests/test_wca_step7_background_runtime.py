@@ -11,11 +11,13 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from backend.app.algorithms.wca.configuration import default_wca_configuration
-from backend.app.algorithms.wca.repository import WcaSqliteRepository
+from backend.app.algorithms.wca.contracts import WcaBrokerReconciliationResult
+from backend.app.algorithms.wca.repository import WcaInventoryLedgerEvent, WcaSqliteRepository
 from backend.app.algorithms.wca.runtime_events import WcaFinalizedBarEvent
 from backend.app.algorithms.wca.runtime_repository import WcaRuntimeRepository
 from backend.app.algorithms.wca.runtime_supervisor import WCA_RUNTIME_REQUIRES_OS_PROCESS, WCA_RUNTIME_WORKERS, WcaRuntimeSettings, WcaRuntimeSupervisor
 from backend.app.algorithms.wca.weights import baseline_weight_snapshot
+from backend.app.gates import BrokerAccountSnapshot
 from backend.tests.test_wca_step5_production_pipeline import market_snapshot
 from backend.tests.test_wca_step6_inventory_persistence import decision_with_order
 
@@ -113,22 +115,32 @@ class WcaStep7BackgroundRuntimeTests(unittest.TestCase):
         )
         fake_decision = decision_with_order("runtime-decision", "runtime-intent", "runtime-idempotency")
 
-        with patch("backend.app.algorithms.wca.runtime_supervisor.run_wca_paper_pipeline_adapter", return_value=type("PipelineResult", (), {"decision": fake_decision})()):
+        with patch.dict("os.environ", {}, clear=True), patch(
+            "backend.app.algorithms.wca.runtime_supervisor.run_wca_paper_pipeline_adapter",
+            return_value=type("PipelineResult", (), {"decision": fake_decision})(),
+        ):
             first = supervisor.run_once()
             second = supervisor.run_once()
 
         self.assertEqual(first["workers"]["decision_worker"]["status"], "completed")
+        self.assertEqual(first["workers"]["execution_outbox_worker"]["status"], "blocked")
+        self.assertIn(
+            "wca.paper_account.automatic_paper_disabled",
+            first["workers"]["execution_outbox_worker"]["reasonCodes"],
+        )
         self.assertEqual(second["workers"]["finalised_bar_consumer"]["status"], "idle")
         with sqlite3.connect(repository.path) as conn:
             event_rows = conn.execute("SELECT status, decision_id FROM wca_runtime_event_queue WHERE event_id = ?", (event.event_id,)).fetchall()
             decision_count = conn.execute("SELECT COUNT(*) FROM wca_decisions WHERE decision_id = ?", (fake_decision.decision_id,)).fetchone()[0]
             checkpoint_count = conn.execute("SELECT COUNT(*) FROM wca_runtime_checkpoints WHERE checkpoint_key = ?", (event.checkpoint_key,)).fetchone()[0]
             outbox_count = conn.execute("SELECT COUNT(*) FROM wca_execution_outbox").fetchone()[0]
+            broker_count = conn.execute("SELECT COUNT(*) FROM wca_broker_orders").fetchone()[0]
 
         self.assertEqual(event_rows, [("completed", fake_decision.decision_id)])
         self.assertEqual(decision_count, 1)
         self.assertEqual(checkpoint_count, 1)
-        self.assertEqual(outbox_count, 1)
+        self.assertEqual(outbox_count, 0)
+        self.assertEqual(broker_count, 0)
 
     def test_lag_pauses_new_entries_while_protective_management_continues(self) -> None:
         repository = seeded_repository()
@@ -203,6 +215,50 @@ def seeded_repository() -> WcaSqliteRepository:
         weight_snapshot=baseline_weight_snapshot(cutoff=snapshot.decision_timestamp, weight_version="step7.weights.v1"),
         engine_version="step7-test",
     )
+    timestamp = snapshot.decision_timestamp.astimezone(timezone.utc)
+    repository.record_inventory_event(
+        WcaInventoryLedgerEvent(
+            inventory_event_id=f"step7-runtime-reset-{uuid4().hex}",
+            event_type="DAILY_STATE_RESET",
+            broker_account_id="paper",
+            symbol="SPY",
+            event_timestamp=(timestamp - timedelta(seconds=5)).isoformat(),
+            trade_date=timestamp.date().isoformat(),
+            reconciliation_watermark="step7-reconciled",
+        )
+    )
+    repository.write_broker_account_snapshot(
+        BrokerAccountSnapshot(
+            accountId="paper",
+            equity=100_000,
+            buyingPower=100_000,
+            realizedPnlToday=0,
+            positions=[],
+            pendingOrders=[],
+            partiallyFilledOrders=[],
+            observedAt=timestamp - timedelta(seconds=1),
+            sessionDate=timestamp.date(),
+            sourceAuthority="broker",
+            positionsReconciled=True,
+            openOrdersReconciled=True,
+        ),
+        cash=100_000,
+        configuration_version=configuration.configuration_version,
+        run_id="step7-runtime-state",
+    )
+    repository.write_broker_reconciliation(
+        WcaBrokerReconciliationResult(
+            reconciliation_id=f"step7-clean-reconciliation-{uuid4().hex}",
+            account_id="paper",
+            evaluated_at=timestamp - timedelta(seconds=1),
+            intents_checked=0,
+            broker_open_orders_checked=0,
+            broker_positions_checked=0,
+            discrepancies=(),
+            hard_operational_warning=False,
+            reason_codes=("wca.broker_reconciliation.clean",),
+        )
+    )
     return repository
 
 
@@ -215,6 +271,12 @@ def finalized_event(
     is_finalized: bool = True,
 ) -> WcaFinalizedBarEvent:
     finalized_at = snapshot.decision_timestamp + timedelta(minutes=bar_offset_minutes)
+    event_snapshot = snapshot.model_copy(
+        update={
+            "data_timestamp": finalized_at,
+            "decision_timestamp": finalized_at,
+        }
+    )
     return WcaFinalizedBarEvent(
         event_id=event_id,
         symbol="SPY",
@@ -224,7 +286,7 @@ def finalized_event(
         source="test.completed_bar_publisher",
         replay_or_recovery=False,
         is_finalized=is_finalized,
-        snapshot=snapshot,
+        snapshot=event_snapshot,
     )
 
 

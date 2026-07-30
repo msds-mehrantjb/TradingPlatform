@@ -23,10 +23,13 @@ from backend.app.algorithms.wca.contracts import (
     WcaEffectiveSettings,
     WcaMarketStatus,
     WcaOrderStatus,
+    WcaOrderValidationContext,
     WcaPaperStabilityValidationResult,
     WcaShadowComparisonEvidence,
     WcaStrategyPerformanceRecord,
     WcaWeightSnapshot,
+    coerce_wca_order_status,
+    validate_wca_order_state_transition,
 )
 from backend.app.algorithms.wca.configuration import (
     WcaConfiguration,
@@ -37,10 +40,12 @@ from backend.app.algorithms.wca.configuration import (
 )
 from backend.app.algorithms.wca.position_management import WcaManagedPosition
 from backend.app.algorithms.wca.strategy_registry import WCA_STRATEGY_REGISTRY
+from backend.app.algorithms.wca.weights import adapt_v1_weight_snapshot_to_multipliers
 from backend.app.config import get_settings
 from backend.app.database import _sqlite_path
+from backend.app.gates import BrokerAccountSnapshot
 
-WCA_PERSISTENCE_MIGRATION_VERSION = "wca_authoritative_persistence_002"
+WCA_PERSISTENCE_MIGRATION_VERSION = "wca_authoritative_persistence_004"
 WCA_IGNORED_LOCAL_STORAGE_KEYS = frozenset(
     {
         "weighted-confidence-decision-settings-v1",
@@ -55,6 +60,28 @@ WCA_IGNORED_LOCAL_STORAGE_KEYS = frozenset(
     }
 )
 WCA_ALLOWED_LOCAL_STORAGE_PREFIXES = ("ui-", "display-", "chart-", "panel-", "tab-")
+WCA_INVENTORY_EVENT_TYPES = frozenset(
+    {
+        "ORDER_INTENT_RESERVED",
+        "ORDER_SUBMITTED",
+        "ORDER_ACKNOWLEDGED",
+        "ORDER_REJECTED",
+        "ORDER_CANCELLED",
+        "PARTIAL_FILL_RECEIVED",
+        "FILL_RECEIVED",
+        "POSITION_OPENED",
+        "POSITION_INCREASED",
+        "POSITION_REDUCED",
+        "POSITION_CLOSED",
+        "PROTECTIVE_ORDER_CREATED",
+        "PROTECTIVE_ORDER_REPLACED",
+        "RISK_RESERVED",
+        "RISK_RELEASED",
+        "DAILY_STATE_RESET",
+        "RECONCILIATION_CORRECTION",
+        "END_OF_SESSION_FLATTEN",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -91,9 +118,15 @@ WCA_PERSISTENCE_RECORD_INVENTORY: tuple[WcaPersistenceRecordDefinition, ...] = (
     WcaPersistenceRecordDefinition("wca_positions", "wca_positions", "WCA-attributed position records."),
     WcaPersistenceRecordDefinition("wca_virtual_positions", "wca_virtual_positions", "WCA virtual position records."),
     WcaPersistenceRecordDefinition("wca_trades", "wca_trade_ledger", "WCA trade ledger records."),
+    WcaPersistenceRecordDefinition("inventory_event_ledger", "wca_inventory_ledger", "Append-only WCA inventory event ledger."),
+    WcaPersistenceRecordDefinition("inventory_projection", "wca_inventory_projection", "Restartable WCA inventory projection by account and symbol."),
+    WcaPersistenceRecordDefinition("daily_state_projection", "wca_daily_state", "Authoritative WCA daily-state projection by account, symbol, and session."),
+    WcaPersistenceRecordDefinition("broker_account_snapshots", "wca_broker_account_snapshots", "WCA-owned broker account observations for runtime decisions."),
     WcaPersistenceRecordDefinition("exit_state", "wca_exit_state", "WCA exit-state records."),
     WcaPersistenceRecordDefinition("reconciliation_results", "wca_broker_reconciliations", "WCA reconciliation result records."),
     WcaPersistenceRecordDefinition("runtime_health", "wca_runtime_health", "WCA runtime health records."),
+    WcaPersistenceRecordDefinition("runtime_latency_observations", "wca_runtime_latency_observations", "WCA durable component latency measurements."),
+    WcaPersistenceRecordDefinition("runtime_latency_summaries", "wca_runtime_latency_summaries", "WCA persisted latency percentiles and failure counts."),
     WcaPersistenceRecordDefinition("background_jobs", "wca_background_jobs", "WCA background job records."),
     WcaPersistenceRecordDefinition("research_candidates", "wca_research_candidates", "WCA research-generated candidate records awaiting promotion."),
     WcaPersistenceRecordDefinition("backtest_runs", "wca_backtest_runs", "WCA backtest run records."),
@@ -122,6 +155,9 @@ class WcaRepository(Protocol):
         ...
 
     def activate_configuration_version(self, configuration_version: str) -> WcaConfiguration:
+        ...
+
+    def activate_configuration_version_at_candle_boundary(self, configuration_version: str, *, candle_timestamp: datetime) -> WcaConfiguration:
         ...
 
     def read_active_configuration(self) -> WcaConfiguration | None:
@@ -160,13 +196,16 @@ class WcaRepository(Protocol):
     def compare_and_swap_runtime_checkpoint(self, *, checkpoint_key: str, expected_version: int | None, payload: dict[str, Any], account_id: str = "paper", symbol: str = "SPY", configuration_version: str = "", run_id: str = "") -> bool:
         ...
 
-    def create_execution_outbox_record(self, decision: WcaDecision, *, account_id: str, idempotency_key: str, payload: dict[str, Any] | None = None) -> bool:
+    def create_execution_outbox_record(self, decision: WcaDecision, *, account_id: str, idempotency_key: str, payload: dict[str, Any] | None = None, final_validation_context: WcaOrderValidationContext | None = None) -> bool:
         ...
 
-    def reserve_decision_order_and_outbox(self, decision: WcaDecision, *, run_id: str, account_id: str, idempotency_key: str, client_order_id: str, request_payload: dict[str, Any]) -> WcaOutboxReservation:
+    def reserve_decision_order_and_outbox(self, decision: WcaDecision, *, run_id: str, account_id: str, idempotency_key: str, client_order_id: str, request_payload: dict[str, Any], final_validation_context: WcaOrderValidationContext) -> WcaOutboxReservation:
         ...
 
     def claim_next_execution_outbox(self, *, owner_id: str) -> WcaExecutionOutboxRecord | None:
+        ...
+
+    def list_execution_outbox_records(self, *, account_id: str | None = None) -> tuple[WcaExecutionOutboxRecord, ...]:
         ...
 
     def update_execution_outbox_state(self, *, outbox_id: str, status: WcaOrderStatus | str, response_payload: dict[str, Any] | None = None, error_payload: dict[str, Any] | None = None) -> bool:
@@ -176,6 +215,27 @@ class WcaRepository(Protocol):
         ...
 
     def apply_fill_and_update_position(self, decision: WcaDecision, *, fill_id: str, account_id: str, quantity: int, broker_order_id: str | None = None, payload: dict[str, Any] | None = None) -> bool:
+        ...
+
+    def record_inventory_event(self, event: WcaInventoryLedgerEvent) -> bool:
+        ...
+
+    def read_inventory_projection(self, *, algorithm_id: str, broker_account_id: str, symbol: str) -> WcaInventoryProjection:
+        ...
+
+    def read_daily_state_projection(self, *, algorithm_id: str, broker_account_id: str, symbol: str, session_date: str) -> WcaDailyStateProjection:
+        ...
+
+    def list_inventory_ledger_events(self, *, algorithm_id: str, broker_account_id: str, symbol: str) -> tuple[WcaInventoryLedgerEvent, ...]:
+        ...
+
+    def rebuild_inventory_projections(self, *, algorithm_id: str, broker_account_id: str, symbol: str) -> None:
+        ...
+
+    def write_broker_account_snapshot(self, snapshot: BrokerAccountSnapshot, *, symbol: str = "SPY", cash: float | None = None, account_status: str = "active", pattern_day_trading_restrictions: str | None = None, trading_restrictions: tuple[str, ...] = (), configuration_version: str = "", decision_id: str = "", run_id: str = "") -> str:
+        ...
+
+    def read_latest_broker_account_snapshot(self, *, algorithm_id: str, broker_account_id: str) -> BrokerAccountSnapshot | None:
         ...
 
     def authorize_wca_lot_reduction(self, *, lot_id: str, account_id: str, symbol: str, quantity: int) -> WcaInventoryOwnershipDecision:
@@ -268,6 +328,74 @@ class WcaExecutionOutboxRecord:
     proposed_order: ProposedOrder
     request_payload: dict[str, Any]
     response_payload: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class WcaInventoryLedgerEvent:
+    inventory_event_id: str
+    event_type: str
+    broker_account_id: str
+    symbol: str
+    event_timestamp: datetime | str
+    trade_date: str
+    algorithm_id: str = WCA_ALGORITHM_ID
+    order_intent_id: str | None = None
+    client_order_id: str | None = None
+    broker_order_id: str | None = None
+    fill_id: str | None = None
+    side: str | None = None
+    quantity: int = 0
+    filled_quantity: int = 0
+    remaining_quantity: int = 0
+    average_entry_price: float = 0.0
+    fill_price: float = 0.0
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    reserved_risk: float = 0.0
+    source_authority: str = "wca_repository"
+    reconciliation_watermark: str | None = None
+    configuration_version: str = ""
+    decision_id: str = ""
+    run_id: str = ""
+    payload: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class WcaInventoryProjection:
+    algorithm_id: str
+    broker_account_id: str
+    symbol: str
+    open_quantity: int
+    average_entry_price: float
+    realized_pnl: float
+    unrealized_pnl: float
+    reserved_risk: float
+    last_event_timestamp: str | None
+    reconciliation_watermark: str | None
+    configuration_version: str
+    decision_id: str
+    run_id: str
+
+
+@dataclass(frozen=True)
+class WcaDailyStateProjection:
+    algorithm_id: str
+    broker_account_id: str
+    symbol: str
+    session_date: str
+    trades_completed_today: int
+    entries_attempted_today: int
+    realized_pnl_today: float
+    daily_loss: float
+    consecutive_losses: int
+    current_reserved_risk: float
+    maximum_intraday_exposure: float
+    cooldown_until: str | None
+    last_entry_timestamp: str | None
+    last_exit_timestamp: str | None
+    circuit_breaker_state: str
+    last_successful_reconciliation: str | None
+    isolation_enforced: bool
 
 
 @dataclass(frozen=True)
@@ -832,6 +960,126 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS wca_inventory_ledger (
+            inventory_event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL CHECK (event_type IN (
+                'ORDER_INTENT_RESERVED',
+                'ORDER_SUBMITTED',
+                'ORDER_ACKNOWLEDGED',
+                'ORDER_REJECTED',
+                'ORDER_CANCELLED',
+                'PARTIAL_FILL_RECEIVED',
+                'FILL_RECEIVED',
+                'POSITION_OPENED',
+                'POSITION_INCREASED',
+                'POSITION_REDUCED',
+                'POSITION_CLOSED',
+                'PROTECTIVE_ORDER_CREATED',
+                'PROTECTIVE_ORDER_REPLACED',
+                'RISK_RESERVED',
+                'RISK_RELEASED',
+                'DAILY_STATE_RESET',
+                'RECONCILIATION_CORRECTION',
+                'END_OF_SESSION_FLATTEN'
+            )),
+            algorithm_id TEXT NOT NULL CHECK (algorithm_id = 'wca'),
+            broker_account_id TEXT NOT NULL CHECK (broker_account_id <> ''),
+            symbol TEXT NOT NULL CHECK (symbol <> ''),
+            order_intent_id TEXT,
+            client_order_id TEXT,
+            broker_order_id TEXT,
+            fill_id TEXT,
+            side TEXT,
+            quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+            filled_quantity INTEGER NOT NULL DEFAULT 0 CHECK (filled_quantity >= 0),
+            remaining_quantity INTEGER NOT NULL DEFAULT 0 CHECK (remaining_quantity >= 0),
+            average_entry_price REAL NOT NULL DEFAULT 0 CHECK (average_entry_price >= 0),
+            fill_price REAL NOT NULL DEFAULT 0 CHECK (fill_price >= 0),
+            realized_pnl REAL NOT NULL DEFAULT 0,
+            unrealized_pnl REAL NOT NULL DEFAULT 0,
+            reserved_risk REAL NOT NULL DEFAULT 0 CHECK (reserved_risk >= 0),
+            trade_date TEXT NOT NULL CHECK (trade_date <> ''),
+            event_timestamp TEXT NOT NULL CHECK (event_timestamp <> ''),
+            source_authority TEXT NOT NULL CHECK (source_authority <> ''),
+            reconciliation_watermark TEXT,
+            configuration_version TEXT NOT NULL DEFAULT '',
+            decision_id TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_inventory_projection (
+            algorithm_id TEXT NOT NULL CHECK (algorithm_id = 'wca'),
+            broker_account_id TEXT NOT NULL CHECK (broker_account_id <> ''),
+            symbol TEXT NOT NULL CHECK (symbol <> ''),
+            open_quantity INTEGER NOT NULL DEFAULT 0 CHECK (open_quantity >= 0),
+            average_entry_price REAL NOT NULL DEFAULT 0 CHECK (average_entry_price >= 0),
+            realized_pnl REAL NOT NULL DEFAULT 0,
+            unrealized_pnl REAL NOT NULL DEFAULT 0,
+            reserved_risk REAL NOT NULL DEFAULT 0 CHECK (reserved_risk >= 0),
+            last_event_timestamp TEXT,
+            reconciliation_watermark TEXT,
+            configuration_version TEXT NOT NULL DEFAULT '',
+            decision_id TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (algorithm_id, broker_account_id, symbol)
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_daily_state (
+            algorithm_id TEXT NOT NULL CHECK (algorithm_id = 'wca'),
+            broker_account_id TEXT NOT NULL CHECK (broker_account_id <> ''),
+            symbol TEXT NOT NULL CHECK (symbol <> ''),
+            session_date TEXT NOT NULL CHECK (session_date <> ''),
+            trades_completed_today INTEGER NOT NULL DEFAULT 0 CHECK (trades_completed_today >= 0),
+            entries_attempted_today INTEGER NOT NULL DEFAULT 0 CHECK (entries_attempted_today >= 0),
+            realized_pnl_today REAL NOT NULL DEFAULT 0,
+            daily_loss REAL NOT NULL DEFAULT 0 CHECK (daily_loss >= 0),
+            consecutive_losses INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_losses >= 0),
+            current_reserved_risk REAL NOT NULL DEFAULT 0 CHECK (current_reserved_risk >= 0),
+            maximum_intraday_exposure REAL NOT NULL DEFAULT 0 CHECK (maximum_intraday_exposure >= 0),
+            cooldown_until TEXT,
+            last_entry_timestamp TEXT,
+            last_exit_timestamp TEXT,
+            circuit_breaker_state TEXT NOT NULL DEFAULT 'closed',
+            last_successful_reconciliation TEXT,
+            isolation_enforced INTEGER NOT NULL DEFAULT 1 CHECK (isolation_enforced IN (0, 1)),
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (algorithm_id, broker_account_id, symbol, session_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_broker_account_snapshots (
+            broker_snapshot_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL CHECK (algorithm_id = 'wca'),
+            broker_account_id TEXT NOT NULL CHECK (broker_account_id <> ''),
+            symbol TEXT NOT NULL DEFAULT 'SPY' CHECK (symbol <> ''),
+            timestamp TEXT NOT NULL CHECK (timestamp <> ''),
+            configuration_version TEXT NOT NULL DEFAULT '',
+            engine_version TEXT NOT NULL DEFAULT 'wca_authoritative_runtime_state_v1',
+            market_snapshot_id TEXT NOT NULL DEFAULT '',
+            decision_id TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL DEFAULT '',
+            observed_at TEXT NOT NULL CHECK (observed_at <> ''),
+            session_date TEXT NOT NULL CHECK (session_date <> ''),
+            source_authority TEXT NOT NULL CHECK (source_authority <> ''),
+            equity REAL NOT NULL CHECK (equity >= 0),
+            buying_power REAL NOT NULL CHECK (buying_power >= 0),
+            cash REAL CHECK (cash IS NULL OR cash >= 0),
+            account_status TEXT NOT NULL DEFAULT 'unknown',
+            pattern_day_trading_restrictions TEXT,
+            trading_restrictions_json TEXT NOT NULL DEFAULT '[]',
+            positions_json TEXT NOT NULL DEFAULT '[]',
+            pending_orders_json TEXT NOT NULL DEFAULT '[]',
+            partially_filled_orders_json TEXT NOT NULL DEFAULT '[]',
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS wca_broker_reconciliations (
             reconciliation_id TEXT PRIMARY KEY,
             algorithm_id TEXT NOT NULL,
@@ -883,6 +1131,38 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
             block_new_entries INTEGER NOT NULL,
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_runtime_latency_observations (
+            latency_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL CHECK (algorithm_id = 'wca'),
+            account_id TEXT NOT NULL DEFAULT 'paper',
+            symbol TEXT NOT NULL DEFAULT 'SPY',
+            timestamp TEXT NOT NULL CHECK (timestamp <> ''),
+            component TEXT NOT NULL CHECK (component <> ''),
+            value_seconds REAL CHECK (value_seconds IS NULL OR value_seconds >= 0),
+            failed INTEGER NOT NULL DEFAULT 0 CHECK (failed IN (0, 1)),
+            reason_codes_json TEXT NOT NULL DEFAULT '[]',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_runtime_latency_summaries (
+            summary_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL CHECK (algorithm_id = 'wca'),
+            account_id TEXT NOT NULL DEFAULT 'paper',
+            symbol TEXT NOT NULL DEFAULT 'SPY',
+            component TEXT NOT NULL CHECK (component <> ''),
+            sample_count INTEGER NOT NULL DEFAULT 0 CHECK (sample_count >= 0),
+            failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+            p50_seconds REAL CHECK (p50_seconds IS NULL OR p50_seconds >= 0),
+            p95_seconds REAL CHECK (p95_seconds IS NULL OR p95_seconds >= 0),
+            p99_seconds REAL CHECK (p99_seconds IS NULL OR p99_seconds >= 0),
+            max_seconds REAL CHECK (max_seconds IS NULL OR max_seconds >= 0),
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (algorithm_id, account_id, symbol, component)
         );
 
         CREATE TABLE IF NOT EXISTS wca_background_jobs (
@@ -1061,6 +1341,16 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
             ON wca_trade_ledger(decision_id);
         CREATE INDEX IF NOT EXISTS idx_wca_owned_lots_symbol_account
             ON wca_owned_lots(account_id, symbol, status);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wca_inventory_ledger_fill_id
+            ON wca_inventory_ledger(fill_id)
+            WHERE fill_id IS NOT NULL AND fill_id <> '';
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wca_inventory_ledger_client_order_submission
+            ON wca_inventory_ledger(client_order_id)
+            WHERE client_order_id IS NOT NULL AND client_order_id <> '' AND event_type = 'ORDER_SUBMITTED';
+        CREATE INDEX IF NOT EXISTS idx_wca_inventory_ledger_scope
+            ON wca_inventory_ledger(algorithm_id, broker_account_id, symbol, trade_date, event_timestamp);
+        CREATE INDEX IF NOT EXISTS idx_wca_broker_account_snapshots_scope
+            ON wca_broker_account_snapshots(algorithm_id, broker_account_id, symbol, observed_at);
         CREATE INDEX IF NOT EXISTS idx_wca_runtime_event_queue_symbol_status
             ON wca_runtime_event_queue(symbol, status, finalized_candle_timestamp);
         CREATE INDEX IF NOT EXISTS idx_wca_runtime_command_queue_type_status
@@ -1099,6 +1389,11 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "wca_broker_orders", "client_order_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "wca_broker_orders", "request_payload_json", "TEXT NOT NULL DEFAULT '{}'")
     _ensure_column(conn, "wca_broker_orders", "response_payload_json", "TEXT NOT NULL DEFAULT '{}'")
+    for table in ("wca_execution_outbox", "wca_attributed_orders", "wca_broker_orders"):
+        conn.execute(f"UPDATE {table} SET status = 'RESERVED' WHERE status = 'OUTBOX_RESERVED'")
+        conn.execute(f"UPDATE {table} SET status = 'ACKNOWLEDGED' WHERE status = 'BROKER_ACKNOWLEDGED'")
+        conn.execute(f"UPDATE {table} SET status = 'UNKNOWN' WHERE status = 'SUBMISSION_UNKNOWN'")
+        conn.execute(f"UPDATE {table} SET status = 'RECONCILING' WHERE status = 'RECONCILIATION_REQUIRED'")
     for table in (
         "wca_strategy_settings_versions",
         "wca_weight_snapshots",
@@ -1156,6 +1451,7 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
             WHERE idempotency_key IS NOT NULL
         """
     )
+    _install_wca_table_integrity_triggers(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
         (WCA_PERSISTENCE_MIGRATION_VERSION,),
@@ -1263,6 +1559,31 @@ class WcaSqliteRepository:
                     WCA_ALGORITHM_ID,
                     activated.configuration_version,
                     _dt(activated.activation_timestamp),
+                    activated.content_hash,
+                    activated.model_dump_json(),
+                ),
+            )
+        return activated
+
+    def activate_configuration_version_at_candle_boundary(self, configuration_version: str, *, candle_timestamp: datetime) -> WcaConfiguration:
+        active = self.read_configuration_by_version(configuration_version)
+        if active is None:
+            raise ValueError(f"unknown WCA configuration version: {configuration_version}")
+        boundary = candle_timestamp.astimezone(timezone.utc)
+        activated = active.with_lifecycle(WcaConfigurationLifecycle.ACTIVE, activation_timestamp=boundary)
+        with self.connect() as conn:
+            self._insert_configuration_revision(conn, activated, symbol="SPY", engine_version="wca_configuration_repository")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO wca_active_configuration (
+                    algorithm_id, configuration_version, activated_at, content_hash, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    WCA_ALGORITHM_ID,
+                    activated.configuration_version,
+                    _dt(boundary),
                     activated.content_hash,
                     activated.model_dump_json(),
                 ),
@@ -1394,7 +1715,7 @@ class WcaSqliteRepository:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO wca_weight_snapshots (
+                INSERT OR IGNORE INTO wca_weight_snapshots (
                     weight_version, algorithm_id, symbol, timestamp, configuration_version,
                     engine_version, market_snapshot_id, decision_id, run_id, payload_json
                 )
@@ -1409,11 +1730,14 @@ class WcaSqliteRepository:
         cutoff = as_of.astimezone(timezone.utc) if as_of is not None else None
         for row in rows:
             snapshot = WcaWeightSnapshot.model_validate_json(row["payload_json"])
+            status = snapshot.status.value if hasattr(snapshot.status, "value") else str(snapshot.status)
+            if status not in {"ACTIVE", "WcaEvaluationStatus.ACTIVE"}:
+                continue
             if cutoff is None or (
                 snapshot.created_at.astimezone(timezone.utc) <= cutoff
                 and (snapshot.metrics_cutoff_timestamp is None or snapshot.metrics_cutoff_timestamp.astimezone(timezone.utc) <= cutoff)
             ):
-                return snapshot
+                return adapt_v1_weight_snapshot_to_multipliers(snapshot)
         return None
 
     def save_confidence_calibration(self, calibration: WcaConfidenceCalibrationTable, *, symbol: str, configuration_version: str, engine_version: str) -> None:
@@ -1576,9 +1900,24 @@ class WcaSqliteRepository:
             )
         return cursor.rowcount == 1
 
-    def create_execution_outbox_record(self, decision: WcaDecision, *, account_id: str, idempotency_key: str, payload: dict[str, Any] | None = None) -> bool:
+    def create_execution_outbox_record(self, decision: WcaDecision, *, account_id: str, idempotency_key: str, payload: dict[str, Any] | None = None, final_validation_context: WcaOrderValidationContext | None = None) -> bool:
         if decision.proposed_order is None:
             raise ValueError("cannot create WCA execution outbox without an order intent")
+        if final_validation_context is not None:
+            from backend.app.algorithms.wca.order_validation import assert_wca_final_pre_outbox_validation
+
+            decision = assert_wca_final_pre_outbox_validation(
+                decision.model_copy(
+                    update={
+                        "proposed_order": decision.proposed_order.model_copy(
+                            update={"status": WcaOrderStatus.OUTBOX_RESERVED, "account_id": account_id, "idempotency_key": idempotency_key}
+                        )
+                    }
+                ),
+                final_validation_context,
+            )
+        elif "wca.order_validation.final_pre_outbox.passed" not in decision.proposed_order.reason_codes:
+            raise ValueError("WCA execution outbox requires final pre-outbox validation")
         common = _decision_common(decision, decision.decision_id)
         proposed = decision.proposed_order.model_copy(update={"status": WcaOrderStatus.OUTBOX_RESERVED, "account_id": account_id, "idempotency_key": idempotency_key})
         outbox_id = f"wca-outbox-{proposed.order_intent_id}"
@@ -1597,7 +1936,7 @@ class WcaSqliteRepository:
             )
         return cursor.rowcount == 1
 
-    def reserve_decision_order_and_outbox(self, decision: WcaDecision, *, run_id: str, account_id: str, idempotency_key: str, client_order_id: str, request_payload: dict[str, Any]) -> WcaOutboxReservation:
+    def reserve_decision_order_and_outbox(self, decision: WcaDecision, *, run_id: str, account_id: str, idempotency_key: str, client_order_id: str, request_payload: dict[str, Any], final_validation_context: WcaOrderValidationContext) -> WcaOutboxReservation:
         if decision.proposed_order is None:
             raise ValueError("cannot reserve WCA outbox without a proposed order")
         proposed = decision.proposed_order.model_copy(
@@ -1614,6 +1953,12 @@ class WcaSqliteRepository:
                 "reason_codes": (*decision.reason_codes, "wca.outbox.atomic_decision_intent_outbox"),
             }
         )
+        from backend.app.algorithms.wca.order_validation import assert_wca_final_pre_outbox_validation
+
+        decision_to_persist = assert_wca_final_pre_outbox_validation(decision_to_persist, final_validation_context)
+        proposed = decision_to_persist.proposed_order
+        if proposed is None:
+            raise ValueError("cannot reserve WCA outbox without a validated proposed order")
         common = _decision_common(decision_to_persist, run_id)
         outbox_id = f"wca-outbox-{proposed.order_intent_id}"
         payload = {
@@ -1677,6 +2022,51 @@ class WcaSqliteRepository:
                 if existing is not None:
                     return WcaOutboxReservation(False, existing.outbox_id, existing.proposed_order, existing.idempotency_key, existing.client_order_id)
                 raise RuntimeError("failed to reserve WCA execution outbox")
+            self._record_inventory_event_in_conn(
+                conn,
+                WcaInventoryLedgerEvent(
+                    inventory_event_id=f"wca-order-intent-event-{proposed.order_intent_id}",
+                    event_type="ORDER_INTENT_RESERVED",
+                    broker_account_id=account_id,
+                    symbol=proposed.symbol,
+                    event_timestamp=common["timestamp"],
+                    trade_date=common["timestamp"][:10],
+                    order_intent_id=proposed.order_intent_id,
+                    client_order_id=client_order_id,
+                    side=_value(proposed.side),
+                    quantity=proposed.quantity,
+                    remaining_quantity=proposed.quantity,
+                    configuration_version=common["configuration_version"],
+                    decision_id=common["decision_id"],
+                    run_id=common["run_id"],
+                    source_authority="wca_repository",
+                    payload=payload,
+                ),
+            )
+            reserved_risk = _reserved_risk_from_decision(decision_to_persist)
+            if reserved_risk > 0:
+                self._record_inventory_event_in_conn(
+                    conn,
+                    WcaInventoryLedgerEvent(
+                        inventory_event_id=f"wca-risk-reserved-event-{proposed.order_intent_id}",
+                        event_type="RISK_RESERVED",
+                        broker_account_id=account_id,
+                        symbol=proposed.symbol,
+                        event_timestamp=common["timestamp"],
+                        trade_date=common["timestamp"][:10],
+                        order_intent_id=proposed.order_intent_id,
+                        client_order_id=client_order_id,
+                        side=_value(proposed.side),
+                        quantity=proposed.quantity,
+                        remaining_quantity=proposed.quantity,
+                        reserved_risk=reserved_risk,
+                        configuration_version=common["configuration_version"],
+                        decision_id=common["decision_id"],
+                        run_id=common["run_id"],
+                        source_authority="wca_repository",
+                        payload=payload,
+                    ),
+                )
         return WcaOutboxReservation(True, outbox_id, proposed, idempotency_key, client_order_id)
 
     def claim_next_execution_outbox(self, *, owner_id: str) -> WcaExecutionOutboxRecord | None:
@@ -1700,7 +2090,14 @@ class WcaSqliteRepository:
                 SET status = ?, version = version + 1, claim_owner = ?, claimed_at = ?, updated_at = ?
                 WHERE outbox_id = ? AND status = ?
                 """,
-                (WcaOrderStatus.SUBMITTING.value, owner_id, now, now, row["outbox_id"], WcaOrderStatus.OUTBOX_RESERVED.value),
+                (
+                    validate_wca_order_state_transition(row["status"], WcaOrderStatus.SUBMITTING),
+                    owner_id,
+                    now,
+                    now,
+                    row["outbox_id"],
+                    coerce_wca_order_status(row["status"]),
+                ),
             )
             if cursor.rowcount != 1:
                 return None
@@ -1711,15 +2108,27 @@ class WcaSqliteRepository:
             claimed = conn.execute("SELECT * FROM wca_execution_outbox WHERE outbox_id = ?", (row["outbox_id"],)).fetchone()
             return _outbox_record_from_row(claimed)
 
+    def list_execution_outbox_records(self, *, account_id: str | None = None) -> tuple[WcaExecutionOutboxRecord, ...]:
+        sql = "SELECT * FROM wca_execution_outbox WHERE algorithm_id = ?"
+        params: tuple[str, ...] = (WCA_ALGORITHM_ID,)
+        if account_id is not None:
+            sql += " AND account_id = ?"
+            params = (WCA_ALGORITHM_ID, account_id)
+        sql += " ORDER BY created_at"
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return tuple(_outbox_record_from_row(row) for row in rows)
+
     def update_execution_outbox_state(self, *, outbox_id: str, status: WcaOrderStatus | str, response_payload: dict[str, Any] | None = None, error_payload: dict[str, Any] | None = None) -> bool:
         now = _utc_now()
-        status_value = _value(status)
+        target_status = coerce_wca_order_status(status)
         response = response_payload or {}
         error = error_payload or {}
         with self.connect() as conn:
-            row = conn.execute("SELECT order_intent_id FROM wca_execution_outbox WHERE outbox_id = ? AND algorithm_id = ?", (outbox_id, WCA_ALGORITHM_ID)).fetchone()
+            row = conn.execute("SELECT order_intent_id, status FROM wca_execution_outbox WHERE outbox_id = ? AND algorithm_id = ?", (outbox_id, WCA_ALGORITHM_ID)).fetchone()
             if row is None:
                 return False
+            status_value = validate_wca_order_state_transition(row["status"], target_status)
             cursor = conn.execute(
                 """
                 UPDATE wca_execution_outbox
@@ -1728,7 +2137,7 @@ class WcaSqliteRepository:
                     submitted_at = CASE WHEN ? IN (?, ?, ?, ?, ?, ?) THEN COALESCE(submitted_at, ?) ELSE submitted_at END,
                     acknowledged_at = CASE WHEN ? IN (?, ?, ?, ?, ?) THEN COALESCE(acknowledged_at, ?) ELSE acknowledged_at END,
                     updated_at = ?
-                WHERE outbox_id = ? AND algorithm_id = ?
+                WHERE outbox_id = ? AND algorithm_id = ? AND status = ?
                 """,
                 (
                     status_value,
@@ -1752,6 +2161,7 @@ class WcaSqliteRepository:
                     now,
                     outbox_id,
                     WCA_ALGORITHM_ID,
+                    coerce_wca_order_status(row["status"]),
                 ),
             )
             conn.execute(
@@ -1780,7 +2190,7 @@ class WcaSqliteRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (broker_order_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], proposed.order_intent_id, idempotency_key, _value(proposed.side), proposed.quantity, status, client_order_id, _json(request_payload), _json(response_payload), _json(record)),
+                (broker_order_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], proposed.order_intent_id, idempotency_key, _value(proposed.side), proposed.quantity, coerce_wca_order_status(status), client_order_id, _json(request_payload), _json(response_payload), _json(record)),
             )
         return cursor.rowcount == 1
 
@@ -1806,6 +2216,7 @@ class WcaSqliteRepository:
         record.setdefault("stop_price", proposed.stop_price)
         record.setdefault("target_price", proposed.target_price)
         record.setdefault("opened_at", _dt(_fill_timestamp_from_payload(record) or decision.decision_timestamp))
+        record.setdefault("position_effect", "entry")
         with self.connect() as conn:
             cursor = conn.execute(
                 """
@@ -1864,7 +2275,342 @@ class WcaSqliteRepository:
                 """,
                 (f"wca-exit-{position_id}", common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], position_id, "monitoring", _json(record)),
             )
+        remaining_quantity = max(0, int(record.get("remaining_quantity") or proposed.quantity - quantity))
+        fill_event_type = "PARTIAL_FILL_RECEIVED" if quantity < proposed.quantity or remaining_quantity > 0 else "FILL_RECEIVED"
+        self.record_inventory_event(
+            WcaInventoryLedgerEvent(
+                inventory_event_id=f"wca-fill-event-{fill_id}",
+                event_type=fill_event_type,
+                broker_account_id=account_id,
+                symbol=proposed.symbol,
+                event_timestamp=record["opened_at"],
+                trade_date=str(record["opened_at"])[:10],
+                order_intent_id=proposed.order_intent_id,
+                client_order_id=str(record.get("client_order_id") or ""),
+                broker_order_id=broker_order_id,
+                fill_id=fill_id,
+                side=_value(proposed.side),
+                quantity=proposed.quantity,
+                filled_quantity=quantity,
+                remaining_quantity=remaining_quantity,
+                average_entry_price=float(record["entry_price"]),
+                fill_price=float(record["entry_price"]),
+                configuration_version=common["configuration_version"],
+                decision_id=common["decision_id"],
+                run_id=common["run_id"],
+                source_authority="wca_repository",
+                payload=record,
+            )
+        )
+        self.record_protective_order_created(
+            decision.model_copy(update={"proposed_order": proposed}),
+            account_id=account_id,
+            client_order_id=str(record.get("client_order_id") or ""),
+            broker_order_id=broker_order_id,
+            source_fill_id=fill_id,
+            protected_quantity=quantity,
+            event_timestamp=record["opened_at"],
+            payload=record,
+        )
         return True
+
+    def record_inventory_event(self, event: WcaInventoryLedgerEvent) -> bool:
+        _require_wca_identity(event.algorithm_id)
+        _require_broker_account_identity(event.broker_account_id)
+        _validate_inventory_event(event)
+        with self.connect() as conn:
+            return self._record_inventory_event_in_conn(conn, event)
+
+    def record_protective_order_created(
+        self,
+        decision: WcaDecision,
+        *,
+        account_id: str,
+        client_order_id: str = "",
+        broker_order_id: str | None = None,
+        source_fill_id: str | None = None,
+        protected_quantity: int | None = None,
+        event_timestamp: datetime | str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        proposed = decision.proposed_order
+        if proposed is None:
+            raise ValueError("cannot record WCA protective order without an order intent")
+        if proposed.stop_price is None and proposed.target_price is None:
+            return False
+        timestamp = _dt(event_timestamp or decision.decision_timestamp)
+        event_suffix = source_fill_id or client_order_id or broker_order_id or proposed.order_intent_id
+        protective_order_id = f"wca-protection-{account_id}-{proposed.symbol}-{proposed.order_intent_id}"
+        event_payload = {
+            **(payload or {}),
+            "protective_order_id": protective_order_id,
+            "protective_state": "created",
+            "source_fill_id": source_fill_id,
+            "stop_price": proposed.stop_price,
+            "target_price": proposed.target_price,
+            "protected_quantity": int(protected_quantity or proposed.quantity),
+        }
+        return self.record_inventory_event(
+            WcaInventoryLedgerEvent(
+                inventory_event_id=f"wca-protective-order-event-{proposed.order_intent_id}-{event_suffix}",
+                event_type="PROTECTIVE_ORDER_CREATED",
+                broker_account_id=account_id,
+                symbol=proposed.symbol,
+                event_timestamp=timestamp,
+                trade_date=timestamp[:10],
+                order_intent_id=proposed.order_intent_id,
+                client_order_id=client_order_id,
+                broker_order_id=broker_order_id,
+                side=_value(proposed.side),
+                quantity=int(protected_quantity or proposed.quantity),
+                remaining_quantity=0,
+                average_entry_price=float(proposed.limit_price or proposed.trigger_price or 0),
+                source_authority="wca_position_management",
+                configuration_version=decision.configuration_version,
+                decision_id=decision.decision_id,
+                run_id=decision.decision_id,
+                payload=event_payload,
+            )
+        )
+
+    def record_order_terminal_inventory_event(
+        self,
+        decision: WcaDecision,
+        *,
+        account_id: str,
+        client_order_id: str = "",
+        broker_order_id: str | None = None,
+        event_type: str,
+        event_timestamp: datetime | str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if event_type not in {"ORDER_REJECTED", "ORDER_CANCELLED"}:
+            raise ValueError("WCA terminal order inventory event must be ORDER_REJECTED or ORDER_CANCELLED")
+        proposed = decision.proposed_order
+        if proposed is None:
+            raise ValueError("cannot record WCA terminal order event without an order intent")
+        timestamp = _dt(event_timestamp or decision.decision_timestamp)
+        reserved_risk = _reserved_risk_from_decision(decision)
+        return self.record_inventory_event(
+            WcaInventoryLedgerEvent(
+                inventory_event_id=f"wca-{event_type.lower()}-event-{proposed.order_intent_id}",
+                event_type=event_type,
+                broker_account_id=account_id,
+                symbol=proposed.symbol,
+                event_timestamp=timestamp,
+                trade_date=timestamp[:10],
+                order_intent_id=proposed.order_intent_id,
+                client_order_id=client_order_id,
+                broker_order_id=broker_order_id,
+                side=_value(proposed.side),
+                quantity=proposed.quantity,
+                remaining_quantity=proposed.quantity,
+                reserved_risk=reserved_risk,
+                source_authority="wca_order_lifecycle",
+                configuration_version=decision.configuration_version,
+                decision_id=decision.decision_id,
+                run_id=decision.decision_id,
+                payload=payload or {},
+            )
+        )
+
+    def record_position_management_critical_event(self, position: WcaManagedPosition, *, evaluated_at: datetime) -> bool:
+        timestamp = _dt(evaluated_at)
+        return self.record_inventory_event(
+            WcaInventoryLedgerEvent(
+                inventory_event_id=f"wca-position-critical-event-{position.account_id}-{position.symbol}-{timestamp}",
+                event_type="RECONCILIATION_CORRECTION",
+                broker_account_id=position.account_id,
+                symbol=position.symbol,
+                event_timestamp=timestamp,
+                trade_date=timestamp[:10],
+                side=_value(position.side),
+                quantity=position.open_quantity,
+                average_entry_price=position.average_entry_price,
+                unrealized_pnl=position.unrealized_pnl,
+                source_authority="wca_position_management",
+                configuration_version="wca_position_management",
+                decision_id=f"wca-position-management-{position.account_id}-{position.symbol}",
+                run_id="wca-position-management",
+                payload={
+                    "critical": True,
+                    "circuit_breaker_state": "open",
+                    "protective_exit_required": True,
+                    "pending_exit_orders": [order.model_dump(mode="json") for order in position.pending_exit_orders],
+                    "reason_codes": position.reason_codes,
+                },
+            )
+        )
+
+    def read_inventory_projection(self, *, algorithm_id: str, broker_account_id: str, symbol: str) -> WcaInventoryProjection:
+        _require_wca_identity(algorithm_id)
+        _require_broker_account_identity(broker_account_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM wca_inventory_projection
+                WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ?
+                """,
+                (algorithm_id, broker_account_id, symbol),
+            ).fetchone()
+        if row is None:
+            return WcaInventoryProjection(algorithm_id, broker_account_id, symbol, 0, 0.0, 0.0, 0.0, 0.0, None, None, "", "", "")
+        return WcaInventoryProjection(
+            row["algorithm_id"],
+            row["broker_account_id"],
+            row["symbol"],
+            int(row["open_quantity"]),
+            float(row["average_entry_price"]),
+            float(row["realized_pnl"]),
+            float(row["unrealized_pnl"]),
+            float(row["reserved_risk"]),
+            row["last_event_timestamp"],
+            row["reconciliation_watermark"],
+            row["configuration_version"],
+            row["decision_id"],
+            row["run_id"],
+        )
+
+    def read_daily_state_projection(self, *, algorithm_id: str, broker_account_id: str, symbol: str, session_date: str) -> WcaDailyStateProjection:
+        _require_wca_identity(algorithm_id)
+        _require_broker_account_identity(broker_account_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM wca_daily_state
+                WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ? AND session_date = ?
+                """,
+                (algorithm_id, broker_account_id, symbol, session_date),
+            ).fetchone()
+        if row is None:
+            return WcaDailyStateProjection(algorithm_id, broker_account_id, symbol, session_date, 0, 0, 0.0, 0.0, 0, 0.0, 0.0, None, None, None, "closed", None, True)
+        return WcaDailyStateProjection(
+            row["algorithm_id"],
+            row["broker_account_id"],
+            row["symbol"],
+            row["session_date"],
+            int(row["trades_completed_today"]),
+            int(row["entries_attempted_today"]),
+            float(row["realized_pnl_today"]),
+            float(row["daily_loss"]),
+            int(row["consecutive_losses"]),
+            float(row["current_reserved_risk"]),
+            float(row["maximum_intraday_exposure"]),
+            row["cooldown_until"],
+            row["last_entry_timestamp"],
+            row["last_exit_timestamp"],
+            row["circuit_breaker_state"],
+            row["last_successful_reconciliation"],
+            bool(row["isolation_enforced"]),
+        )
+
+    def list_inventory_ledger_events(self, *, algorithm_id: str, broker_account_id: str, symbol: str) -> tuple[WcaInventoryLedgerEvent, ...]:
+        _require_wca_identity(algorithm_id)
+        _require_broker_account_identity(broker_account_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM wca_inventory_ledger
+                WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ?
+                ORDER BY event_timestamp, inventory_event_id
+                """,
+                (algorithm_id, broker_account_id, symbol),
+            ).fetchall()
+        return tuple(_inventory_event_from_row(row) for row in rows)
+
+    def rebuild_inventory_projections(self, *, algorithm_id: str, broker_account_id: str, symbol: str) -> None:
+        _require_wca_identity(algorithm_id)
+        _require_broker_account_identity(broker_account_id)
+        with self.connect() as conn:
+            self._rebuild_inventory_projections_in_conn(conn, algorithm_id=algorithm_id, broker_account_id=broker_account_id, symbol=symbol)
+
+    def write_broker_account_snapshot(
+        self,
+        snapshot: BrokerAccountSnapshot,
+        *,
+        symbol: str = "SPY",
+        cash: float | None = None,
+        account_status: str = "active",
+        pattern_day_trading_restrictions: str | None = None,
+        trading_restrictions: tuple[str, ...] = (),
+        configuration_version: str = "",
+        decision_id: str = "",
+        run_id: str = "",
+    ) -> str:
+        _require_broker_account_identity(snapshot.accountId)
+        if cash is not None and cash < 0:
+            raise ValueError("WCA broker snapshot cash cannot be negative")
+        observed_at = _dt(snapshot.observedAt)
+        broker_snapshot_id = f"wca-broker-snapshot-{snapshot.accountId}-{observed_at}-{_hash_json(snapshot.model_dump(mode='json'))[:12]}"
+        payload = {
+            "snapshot": snapshot.model_dump(mode="json"),
+            "cash": cash,
+            "account_status": account_status,
+            "pattern_day_trading_restrictions": pattern_day_trading_restrictions,
+            "trading_restrictions": list(trading_restrictions),
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO wca_broker_account_snapshots (
+                    broker_snapshot_id, algorithm_id, broker_account_id, symbol, timestamp,
+                    configuration_version, engine_version, market_snapshot_id, decision_id,
+                    run_id, observed_at, session_date, source_authority, equity, buying_power,
+                    cash, account_status, pattern_day_trading_restrictions,
+                    trading_restrictions_json, positions_json, pending_orders_json,
+                    partially_filled_orders_json, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    broker_snapshot_id,
+                    WCA_ALGORITHM_ID,
+                    snapshot.accountId,
+                    symbol,
+                    observed_at,
+                    configuration_version,
+                    "wca_authoritative_runtime_state_v1",
+                    f"wca-broker-{snapshot.accountId}-{observed_at}",
+                    decision_id,
+                    run_id,
+                    observed_at,
+                    snapshot.sessionDate.isoformat(),
+                    snapshot.sourceAuthority,
+                    float(snapshot.equity),
+                    float(snapshot.buyingPower),
+                    float(cash) if cash is not None else None,
+                    account_status,
+                    pattern_day_trading_restrictions,
+                    _json(trading_restrictions),
+                    _json([position.model_dump(mode="json") for position in snapshot.positions]),
+                    _json([order.model_dump(mode="json") for order in snapshot.pendingOrders]),
+                    _json([order.model_dump(mode="json") for order in snapshot.partiallyFilledOrders]),
+                    _json(payload),
+                ),
+            )
+        return broker_snapshot_id
+
+    def read_latest_broker_account_snapshot(self, *, algorithm_id: str, broker_account_id: str) -> BrokerAccountSnapshot | None:
+        _require_wca_identity(algorithm_id)
+        _require_broker_account_identity(broker_account_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT payload_json
+                FROM wca_broker_account_snapshots
+                WHERE algorithm_id = ? AND broker_account_id = ?
+                ORDER BY observed_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (algorithm_id, broker_account_id),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["payload_json"] or "{}")
+        return BrokerAccountSnapshot.model_validate(payload["snapshot"])
 
     def authorize_wca_lot_reduction(self, *, lot_id: str, account_id: str, symbol: str, quantity: int) -> WcaInventoryOwnershipDecision:
         if quantity <= 0:
@@ -2103,7 +2849,9 @@ class WcaSqliteRepository:
                 """,
                 (account_id, symbol),
             ).fetchone()
-        return bool(row and (int(row["hard_operational_warning"]) or int(row["discrepancy_count"]) > 0))
+        if row is None:
+            return True
+        return bool(int(row["hard_operational_warning"]) or int(row["discrepancy_count"]) > 0)
 
     def reserve_order_intent(self, decision: WcaDecision, *, run_id: str, account_id: str, idempotency_key: str) -> WcaOrderIntentReservation:
         if decision.proposed_order is None:
@@ -2118,8 +2866,29 @@ class WcaSqliteRepository:
             ).fetchone()
         if row is None:
             raise RuntimeError("failed to read reserved WCA order intent")
+        created = cursor.rowcount > 0
+        if created:
+            self.record_inventory_event(
+                WcaInventoryLedgerEvent(
+                    inventory_event_id=f"wca-order-intent-event-{proposed.order_intent_id}",
+                    event_type="ORDER_INTENT_RESERVED",
+                    broker_account_id=account_id,
+                    symbol=proposed.symbol,
+                    event_timestamp=common["timestamp"],
+                    trade_date=common["timestamp"][:10],
+                    order_intent_id=proposed.order_intent_id,
+                    side=_value(proposed.side),
+                    quantity=proposed.quantity,
+                    remaining_quantity=proposed.quantity,
+                    configuration_version=common["configuration_version"],
+                    decision_id=common["decision_id"],
+                    run_id=common["run_id"],
+                    source_authority="wca_repository",
+                    payload=proposed.model_dump(mode="json"),
+                )
+            )
         return WcaOrderIntentReservation(
-            created=cursor.rowcount > 0,
+            created=created,
             proposed_order=ProposedOrder.model_validate_json(row["payload_json"]),
             idempotency_key=idempotency_key,
         )
@@ -2186,6 +2955,41 @@ class WcaSqliteRepository:
                     result.model_dump_json(),
                 ),
             )
+            if result.discrepancies:
+                affected_symbols = sorted({row.symbol for row in result.discrepancies} or {common["symbol"]})
+                for symbol in affected_symbols:
+                    exit_state_id = f"wca-exit-state-{result.account_id}-{symbol}"
+                    conn.execute(
+                        """
+                        INSERT INTO wca_exit_state (
+                            exit_state_id, algorithm_id, account_id, symbol, timestamp,
+                            configuration_version, engine_version, market_snapshot_id,
+                            decision_id, run_id, position_id, status, payload_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(exit_state_id) DO UPDATE SET
+                            timestamp = excluded.timestamp,
+                            status = excluded.status,
+                            payload_json = excluded.payload_json,
+                            version = wca_exit_state.version + 1,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            exit_state_id,
+                            WCA_ALGORITHM_ID,
+                            result.account_id,
+                            symbol,
+                            common["timestamp"],
+                            common["configuration_version"],
+                            common["engine_version"],
+                            result.reconciliation_id,
+                            common["decision_id"],
+                            common["run_id"],
+                            f"wca-virtual-{result.account_id}-{symbol}",
+                            "circuit_breaker_open",
+                            result.model_dump_json(),
+                        ),
+                    )
 
     def write_shadow_comparison_evidence(self, evidence: WcaShadowComparisonEvidence) -> None:
         common = _common_row(
@@ -2682,6 +3486,270 @@ class WcaSqliteRepository:
         )
         return cursor
 
+    def _record_inventory_event_in_conn(self, conn: sqlite3.Connection, event: WcaInventoryLedgerEvent) -> bool:
+        _validate_inventory_event(event)
+        existing = conn.execute(
+            "SELECT 1 FROM wca_inventory_ledger WHERE inventory_event_id = ?",
+            (event.inventory_event_id,),
+        ).fetchone()
+        if existing is not None:
+            return False
+        conn.execute(
+            """
+            INSERT INTO wca_inventory_ledger (
+                inventory_event_id, event_type, algorithm_id, broker_account_id, symbol,
+                order_intent_id, client_order_id, broker_order_id, fill_id, side,
+                quantity, filled_quantity, remaining_quantity, average_entry_price,
+                fill_price, realized_pnl, unrealized_pnl, reserved_risk, trade_date,
+                event_timestamp, source_authority, reconciliation_watermark,
+                configuration_version, decision_id, run_id, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.inventory_event_id,
+                event.event_type,
+                event.algorithm_id,
+                event.broker_account_id,
+                event.symbol,
+                event.order_intent_id,
+                event.client_order_id,
+                event.broker_order_id,
+                event.fill_id,
+                event.side,
+                int(event.quantity),
+                int(event.filled_quantity),
+                int(event.remaining_quantity),
+                float(event.average_entry_price),
+                float(event.fill_price),
+                float(event.realized_pnl),
+                float(event.unrealized_pnl),
+                float(event.reserved_risk),
+                event.trade_date,
+                _dt(event.event_timestamp),
+                event.source_authority,
+                event.reconciliation_watermark,
+                event.configuration_version,
+                event.decision_id,
+                event.run_id,
+                _json(event.payload or {}),
+            ),
+        )
+        self._rebuild_inventory_projections_in_conn(
+            conn,
+            algorithm_id=event.algorithm_id,
+            broker_account_id=event.broker_account_id,
+            symbol=event.symbol,
+        )
+        return True
+
+    def _rebuild_inventory_projections_in_conn(self, conn: sqlite3.Connection, *, algorithm_id: str, broker_account_id: str, symbol: str) -> None:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM wca_inventory_ledger
+            WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ?
+            ORDER BY event_timestamp, inventory_event_id
+            """,
+            (algorithm_id, broker_account_id, symbol),
+        ).fetchall()
+        conn.execute(
+            "DELETE FROM wca_inventory_projection WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ?",
+            (algorithm_id, broker_account_id, symbol),
+        )
+        conn.execute(
+            "DELETE FROM wca_daily_state WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ?",
+            (algorithm_id, broker_account_id, symbol),
+        )
+        if not rows:
+            return
+
+        open_quantity = 0
+        average_entry_price = 0.0
+        realized_pnl = 0.0
+        unrealized_pnl = 0.0
+        reserved_risk = 0.0
+        last_event_timestamp: str | None = None
+        reconciliation_watermark: str | None = None
+        configuration_version = ""
+        decision_id = ""
+        run_id = ""
+        daily: dict[str, dict[str, Any]] = {}
+
+        def daily_state(session_date: str) -> dict[str, Any]:
+            if session_date not in daily:
+                daily[session_date] = {
+                    "trades_completed_today": 0,
+                    "entries_attempted_today": 0,
+                    "realized_pnl_today": 0.0,
+                    "daily_loss": 0.0,
+                    "consecutive_losses": 0,
+                    "current_reserved_risk": 0.0,
+                    "maximum_intraday_exposure": 0.0,
+                    "cooldown_until": None,
+                    "last_entry_timestamp": None,
+                    "last_exit_timestamp": None,
+                    "circuit_breaker_state": "closed",
+                    "last_successful_reconciliation": None,
+                }
+            return daily[session_date]
+
+        def increase(quantity: int, price: float) -> None:
+            nonlocal open_quantity, average_entry_price
+            if quantity <= 0:
+                return
+            total_cost = (open_quantity * average_entry_price) + (quantity * price)
+            open_quantity += quantity
+            average_entry_price = round(total_cost / open_quantity, 10) if open_quantity else 0.0
+
+        def reduce(quantity: int, event: WcaInventoryLedgerEvent) -> float:
+            nonlocal open_quantity, average_entry_price
+            if quantity <= 0:
+                return 0.0
+            if quantity > open_quantity:
+                raise ValueError("WCA inventory event reduces more quantity than WCA owns")
+            computed_pnl = 0.0
+            if event.fill_price > 0:
+                computed_pnl = round((event.fill_price - average_entry_price) * quantity, 10)
+            open_quantity -= quantity
+            if open_quantity == 0:
+                average_entry_price = 0.0
+            return event.realized_pnl if event.realized_pnl != 0 else computed_pnl
+
+        for row in rows:
+            event = _inventory_event_from_row(row)
+            payload = event.payload or {}
+            state = daily_state(event.trade_date)
+            quantity = int(event.filled_quantity or event.quantity)
+            price = float(event.fill_price or event.average_entry_price)
+            event_realized = float(event.realized_pnl)
+
+            if event.event_type == "DAILY_STATE_RESET":
+                daily.pop(event.trade_date, None)
+                daily[event.trade_date] = daily_state(event.trade_date)
+                state = daily[event.trade_date]
+            elif event.event_type == "ORDER_INTENT_RESERVED":
+                state["entries_attempted_today"] += 1
+            elif event.event_type == "RISK_RESERVED":
+                reserved_risk = round(reserved_risk + float(event.reserved_risk), 10)
+            elif event.event_type in {"RISK_RELEASED", "ORDER_REJECTED", "ORDER_CANCELLED"} and event.reserved_risk:
+                if float(event.reserved_risk) > reserved_risk:
+                    raise ValueError("WCA inventory event releases more risk than is reserved")
+                reserved_risk = round(reserved_risk - float(event.reserved_risk), 10)
+            elif event.event_type in {"FILL_RECEIVED", "PARTIAL_FILL_RECEIVED"}:
+                position_effect = str(payload.get("position_effect") or "").lower()
+                if position_effect == "entry":
+                    increase(quantity, price)
+                    state["last_entry_timestamp"] = _dt(event.event_timestamp)
+                elif position_effect == "exit":
+                    event_realized = reduce(quantity, event)
+                    state["last_exit_timestamp"] = _dt(event.event_timestamp)
+                    state["trades_completed_today"] += 1 if open_quantity == 0 else 0
+                elif _value(event.side).upper() == "BUY":
+                    increase(quantity, price)
+                    state["last_entry_timestamp"] = _dt(event.event_timestamp)
+                elif _value(event.side).upper() == "SELL":
+                    event_realized = reduce(quantity, event)
+                    state["last_exit_timestamp"] = _dt(event.event_timestamp)
+                    state["trades_completed_today"] += 1 if open_quantity == 0 else 0
+            elif event.event_type in {"POSITION_OPENED", "POSITION_INCREASED"}:
+                increase(quantity, float(event.average_entry_price or event.fill_price))
+                state["last_entry_timestamp"] = _dt(event.event_timestamp)
+            elif event.event_type == "POSITION_REDUCED":
+                event_realized = reduce(quantity, event)
+                state["last_exit_timestamp"] = _dt(event.event_timestamp)
+            elif event.event_type in {"POSITION_CLOSED", "END_OF_SESSION_FLATTEN"}:
+                close_quantity = quantity or open_quantity
+                event_realized = reduce(close_quantity, event)
+                state["last_exit_timestamp"] = _dt(event.event_timestamp)
+                state["trades_completed_today"] += 1
+            elif event.event_type == "RECONCILIATION_CORRECTION":
+                if "open_quantity" in payload:
+                    corrected_quantity = int(payload["open_quantity"])
+                    if corrected_quantity < 0:
+                        raise ValueError("WCA reconciliation correction cannot set negative quantity")
+                    open_quantity = corrected_quantity
+                    average_entry_price = float(payload.get("average_entry_price") or event.average_entry_price or average_entry_price)
+                state["last_successful_reconciliation"] = _dt(event.event_timestamp)
+
+            if event_realized:
+                realized_pnl = round(realized_pnl + event_realized, 10)
+                state["realized_pnl_today"] = round(float(state["realized_pnl_today"]) + event_realized, 10)
+                state["consecutive_losses"] = int(state["consecutive_losses"]) + 1 if event_realized < 0 else 0
+            unrealized_pnl = float(event.unrealized_pnl)
+            exposure = abs(open_quantity * average_entry_price)
+            state["daily_loss"] = max(0.0, -float(state["realized_pnl_today"]))
+            state["current_reserved_risk"] = reserved_risk
+            state["maximum_intraday_exposure"] = max(float(state["maximum_intraday_exposure"]), exposure)
+            state["cooldown_until"] = payload.get("cooldown_until", state["cooldown_until"])
+            state["circuit_breaker_state"] = str(payload.get("circuit_breaker_state") or state["circuit_breaker_state"])
+            last_event_timestamp = _dt(event.event_timestamp)
+            reconciliation_watermark = event.reconciliation_watermark or reconciliation_watermark
+            configuration_version = event.configuration_version
+            decision_id = event.decision_id
+            run_id = event.run_id
+
+        conn.execute(
+            """
+            INSERT INTO wca_inventory_projection (
+                algorithm_id, broker_account_id, symbol, open_quantity, average_entry_price,
+                realized_pnl, unrealized_pnl, reserved_risk, last_event_timestamp,
+                reconciliation_watermark, configuration_version, decision_id, run_id, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                algorithm_id,
+                broker_account_id,
+                symbol,
+                open_quantity,
+                average_entry_price,
+                realized_pnl,
+                unrealized_pnl,
+                reserved_risk,
+                last_event_timestamp,
+                reconciliation_watermark,
+                configuration_version,
+                decision_id,
+                run_id,
+                _json({"rebuilt_from_event_count": len(rows)}),
+            ),
+        )
+        for session_date, state in daily.items():
+            conn.execute(
+                """
+                INSERT INTO wca_daily_state (
+                    algorithm_id, broker_account_id, symbol, session_date,
+                    trades_completed_today, entries_attempted_today, realized_pnl_today,
+                    daily_loss, consecutive_losses, current_reserved_risk,
+                    maximum_intraday_exposure, cooldown_until, last_entry_timestamp,
+                    last_exit_timestamp, circuit_breaker_state, last_successful_reconciliation,
+                    isolation_enforced, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    algorithm_id,
+                    broker_account_id,
+                    symbol,
+                    session_date,
+                    int(state["trades_completed_today"]),
+                    int(state["entries_attempted_today"]),
+                    float(state["realized_pnl_today"]),
+                    float(state["daily_loss"]),
+                    int(state["consecutive_losses"]),
+                    float(state["current_reserved_risk"]),
+                    float(state["maximum_intraday_exposure"]),
+                    state["cooldown_until"],
+                    state["last_entry_timestamp"],
+                    state["last_exit_timestamp"],
+                    state["circuit_breaker_state"],
+                    state["last_successful_reconciliation"],
+                    1,
+                    _json({"rebuilt_from_ledger": True}),
+                ),
+            )
+
     def _insert_rollout_status(self, conn: sqlite3.Connection, payload: dict[str, Any], common: dict[str, str]) -> None:
         rollout_version = str(payload.get("rollout_version") or payload.get("rolloutVersion") or "wca_rollout_unversioned")
         conn.execute(
@@ -2816,6 +3884,12 @@ def _json(payload: Any) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
+def _hash_json(payload: Any) -> str:
+    import hashlib
+
+    return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+
+
 def _dt(value: datetime | str | None) -> str:
     if value is None:
         return _utc_now()
@@ -2830,6 +3904,47 @@ def _utc_now() -> str:
 
 def _value(value: Any) -> str:
     return value.value if hasattr(value, "value") else str(value)
+
+
+def _require_wca_identity(algorithm_id: str) -> None:
+    if algorithm_id != WCA_ALGORITHM_ID:
+        raise ValueError("WCA repository requires algorithm_id='wca'")
+
+
+def _require_broker_account_identity(broker_account_id: str) -> None:
+    if not broker_account_id:
+        raise ValueError("WCA repository requires a broker account identity")
+
+
+def _inventory_event_from_row(row: sqlite3.Row) -> WcaInventoryLedgerEvent:
+    return WcaInventoryLedgerEvent(
+        inventory_event_id=row["inventory_event_id"],
+        event_type=row["event_type"],
+        algorithm_id=row["algorithm_id"],
+        broker_account_id=row["broker_account_id"],
+        symbol=row["symbol"],
+        order_intent_id=row["order_intent_id"],
+        client_order_id=row["client_order_id"],
+        broker_order_id=row["broker_order_id"],
+        fill_id=row["fill_id"],
+        side=row["side"],
+        quantity=int(row["quantity"]),
+        filled_quantity=int(row["filled_quantity"]),
+        remaining_quantity=int(row["remaining_quantity"]),
+        average_entry_price=float(row["average_entry_price"]),
+        fill_price=float(row["fill_price"]),
+        realized_pnl=float(row["realized_pnl"]),
+        unrealized_pnl=float(row["unrealized_pnl"]),
+        reserved_risk=float(row["reserved_risk"]),
+        trade_date=row["trade_date"],
+        event_timestamp=row["event_timestamp"],
+        source_authority=row["source_authority"],
+        reconciliation_watermark=row["reconciliation_watermark"],
+        configuration_version=row["configuration_version"],
+        decision_id=row["decision_id"],
+        run_id=row["run_id"],
+        payload=json.loads(row["payload_json"] or "{}"),
+    )
 
 
 def _optional_value(value: Any) -> str | None:
@@ -2858,6 +3973,33 @@ def _fill_timestamp_from_payload(record: dict[str, Any]) -> str | None:
     fill = record.get("fill") if isinstance(record.get("fill"), dict) else {}
     value = record.get("opened_at") or fill.get("filled_at") or fill.get("filledAt") or fill.get("updatedAt")
     return str(value) if value is not None else None
+
+
+def _validate_inventory_event(event: WcaInventoryLedgerEvent) -> None:
+    if not event.symbol:
+        raise ValueError("WCA inventory event requires a symbol")
+    if event.event_type not in WCA_INVENTORY_EVENT_TYPES:
+        raise ValueError(f"unsupported WCA inventory event type: {event.event_type}")
+    for field_name in ("quantity", "filled_quantity", "remaining_quantity"):
+        if int(getattr(event, field_name)) < 0:
+            raise ValueError(f"WCA inventory event {field_name} cannot be negative")
+    for field_name in ("average_entry_price", "fill_price", "reserved_risk"):
+        if float(getattr(event, field_name)) < 0:
+            raise ValueError(f"WCA inventory event {field_name} cannot be negative")
+    if event.quantity and event.filled_quantity > event.quantity:
+        raise ValueError("WCA inventory event filled quantity cannot exceed quantity")
+    if event.quantity and event.remaining_quantity > event.quantity:
+        raise ValueError("WCA inventory event remaining quantity cannot exceed quantity")
+
+
+def _reserved_risk_from_decision(decision: WcaDecision) -> float:
+    if decision.global_gate_result is not None and decision.global_gate_result.approved_risk > 0:
+        return float(decision.global_gate_result.approved_risk)
+    if decision.sizing.stop_risk_dollars > 0:
+        return float(decision.sizing.stop_risk_dollars)
+    if decision.sizing.risk_dollars > 0:
+        return float(decision.sizing.risk_dollars)
+    return 0.0
 
 
 def _configuration_from_payload(payload: dict[str, Any]) -> WcaConfiguration:
@@ -2892,12 +4034,67 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+def _install_wca_table_integrity_triggers(conn: sqlite3.Connection) -> None:
+    for table in WCA_PERSISTENCE_TABLES:
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "algorithm_id" in columns:
+            trigger_prefix = table.replace("-", "_")
+            conn.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS trg_{trigger_prefix}_algorithm_insert
+                BEFORE INSERT ON {table}
+                WHEN NEW.algorithm_id <> 'wca'
+                BEGIN
+                    SELECT RAISE(ABORT, 'non-WCA algorithm_id rejected');
+                END
+                """
+            )
+            conn.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS trg_{trigger_prefix}_algorithm_update
+                BEFORE UPDATE ON {table}
+                WHEN NEW.algorithm_id <> 'wca'
+                BEGIN
+                    SELECT RAISE(ABORT, 'non-WCA algorithm_id rejected');
+                END
+                """
+            )
+        for column in ("quantity", "filled_quantity", "remaining_quantity", "reserved_risk", "open_quantity", "daily_loss", "current_reserved_risk", "maximum_intraday_exposure", "trades_completed_today", "entries_attempted_today", "consecutive_losses"):
+            if column not in columns:
+                continue
+            trigger_prefix = f"{table}_{column}".replace("-", "_")
+            conn.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS trg_{trigger_prefix}_nonnegative_insert
+                BEFORE INSERT ON {table}
+                WHEN NEW.{column} < 0
+                BEGIN
+                    SELECT RAISE(ABORT, 'negative WCA quantity rejected');
+                END
+                """
+            )
+            conn.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS trg_{trigger_prefix}_nonnegative_update
+                BEFORE UPDATE ON {table}
+                WHEN NEW.{column} < 0
+                BEGIN
+                    SELECT RAISE(ABORT, 'negative WCA quantity rejected');
+                END
+                """
+            )
+
+
 __all__ = [
     "WCA_IGNORED_LOCAL_STORAGE_KEYS",
+    "WCA_INVENTORY_EVENT_TYPES",
     "WCA_PERSISTENCE_MIGRATION_VERSION",
     "WCA_PERSISTENCE_RECORD_IDS",
     "WCA_PERSISTENCE_RECORD_INVENTORY",
     "WCA_PERSISTENCE_TABLES",
+    "WcaDailyStateProjection",
+    "WcaInventoryLedgerEvent",
+    "WcaInventoryProjection",
     "WcaOrderIntentReservation",
     "WcaPersistenceRecordDefinition",
     "WcaPersistenceSummary",

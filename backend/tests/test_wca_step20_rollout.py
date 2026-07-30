@@ -189,7 +189,7 @@ class WcaStep20RolloutTest(unittest.TestCase):
 
     def test_missing_market_session_latency_or_slippage_evidence_blocks_automation(self) -> None:
         evidence = complete_evidence(
-            persisted_evidence_ids=WCA_REQUIRED_ROLLOUT_EVIDENCE - {"opening_midday_closing_periods"},
+            persisted_evidence_ids=WCA_REQUIRED_ROLLOUT_EVIDENCE - {"closing_session_evidence"},
             session_periods=("opening", "midday"),
             max_decision_latency_seconds=10,
             average_realised_slippage_per_share=0.10,
@@ -202,7 +202,7 @@ class WcaStep20RolloutTest(unittest.TestCase):
         )
 
         self.assertFalse(status.enabled)
-        self.assertIn("wca.rollout.missing_persisted_evidence.opening_midday_closing_periods", status.reason_codes)
+        self.assertIn("wca.rollout.missing_persisted_evidence.closing_session_evidence", status.reason_codes)
         self.assertIn("wca.rollout.session_periods_not_validated", status.reason_codes)
         self.assertIn("wca.rollout.decision_latency_unacceptable", status.reason_codes)
         self.assertIn("wca.rollout.realised_slippage_unacceptable", status.reason_codes)

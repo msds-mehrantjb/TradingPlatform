@@ -60,6 +60,10 @@ class WcaStep8ResearchWorkerTests(unittest.TestCase):
                 "confidence_calibration",
                 "performance_statistics_update",
                 "weight_candidate_calculation",
+                "compute_strategy_weight_candidate",
+                "validate_strategy_weight_candidate",
+                "promote_strategy_weight_version",
+                "rollback_strategy_weight_version",
                 "correlation_analysis",
                 "strategy_health_analysis",
                 "shadow_comparison",
@@ -86,6 +90,19 @@ class WcaStep8ResearchWorkerTests(unittest.TestCase):
             backtests = conn.execute("SELECT COUNT(*) FROM wca_backtest_runs").fetchone()[0]
         self.assertEqual(jobs, 1)
         self.assertEqual(backtests, 0)
+
+    def test_backtest_status_can_poll_queued_job_by_run_id(self) -> None:
+        repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")
+        research_repository = WcaResearchRepository(repository)
+        service = WcaService(repository=repository, research_repository=research_repository)
+        request = backtest_request()
+
+        receipt = service.enqueue_backtest(request)
+        status = service.backtest_status(request.configuration.run_id)
+
+        self.assertEqual(status["status"], "queued")
+        self.assertEqual(status["jobId"], receipt.job_id)
+        self.assertEqual(status["runId"], request.configuration.run_id)
 
     def test_worker_runs_backtest_job_through_lifecycle_and_persists_result_reference(self) -> None:
         repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")
@@ -137,6 +154,38 @@ class WcaStep8ResearchWorkerTests(unittest.TestCase):
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(ending_weights, starting_weights)
         self.assertEqual(candidate[0], "pending_promotion")
+
+    def test_weight_candidate_validation_and_promotion_require_persisted_evidence(self) -> None:
+        repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")
+        research_repository = WcaResearchRepository(repository)
+        compute_receipt = research_repository.enqueue_job(
+            research_job(
+                WcaResearchJobType.COMPUTE_STRATEGY_WEIGHT_CANDIDATE,
+                payload={"cutoff": "2026-07-30T20:00:00+00:00", "performance_records": []},
+                run_id="weight-compute",
+            )
+        )
+        worker = WcaResearchWorker(repository=repository, research_repository=research_repository, owner_id="step8-weight-lifecycle")
+        compute = worker.run_once()
+        candidate_id = compute["resultReference"]["candidateId"]
+        validate_receipt = research_repository.enqueue_job(
+            research_job(WcaResearchJobType.VALIDATE_STRATEGY_WEIGHT_CANDIDATE, payload={"candidate_id": candidate_id}, run_id="weight-validate")
+        )
+
+        validation = worker.run_once()
+        promote_receipt = research_repository.enqueue_job(
+            research_job(WcaResearchJobType.PROMOTE_STRATEGY_WEIGHT_VERSION, payload={"candidate_id": candidate_id}, run_id="weight-promote", expires_in_seconds=None)
+        )
+        promotion = worker.run_once()
+
+        candidate = research_repository.read_candidate_result(candidate_id)
+        self.assertEqual(compute_receipt.status, WcaResearchJobStatus.QUEUED)
+        self.assertEqual(validate_receipt.status, WcaResearchJobStatus.QUEUED)
+        self.assertEqual(promote_receipt.status, WcaResearchJobStatus.QUEUED)
+        self.assertEqual(validation["resultReference"]["validationStatus"], "blocked")
+        self.assertEqual(promotion["status"], "failed")
+        self.assertEqual(candidate["validation_status"], "blocked")
+        self.assertEqual(repository.table_counts().table_counts["wca_weight_snapshots"], 0)
 
     def test_retry_limit_quarantines_failed_job(self) -> None:
         repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")

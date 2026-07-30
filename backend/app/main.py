@@ -9,14 +9,14 @@ import os
 import re
 import subprocess
 import sys
-from collections import defaultdict
+from collections import defaultdict, deque
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from math import exp
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 from xml.etree import ElementTree
 
@@ -35,7 +35,9 @@ from .algorithms.session.router import resolve_session_profile
 from .algorithms.session.transition import SessionTransitionManager
 from .algorithms.meta_strategy.api import router as meta_strategy_router
 from .algorithms.voting_ensemble.api import router as voting_ensemble_router
-from .algorithms.wca.api import router as wca_router
+from .algorithms.wca.api import WCA_API_SERVICE, router as wca_router
+from .algorithms.wca.contracts import BacktestRunConfiguration
+from .algorithms.wca.research_jobs import WcaResearchJobType
 from .algorithms.wca.strategy_registry import assert_wca_module_catalog_valid
 from .algorithms.weighted_voting.api import router as weighted_voting_router
 from .algorithms.weighted_voting.runtime_supervisor import get_weighted_voting_runtime_supervisor
@@ -2143,6 +2145,7 @@ def backtest_data_candles(
     timeframe: Literal["1Min", "5Min", "1Day"] = "1Min",
     start_date: str = Query("2020-07-28", pattern=r"^\d{4}-\d{2}-\d{2}$"),
     end_date: str = Query("2026-06-18", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    limit: int | None = Query(None, ge=1, le=10000),
 ) -> dict:
     normalized_symbol = symbol.upper()
     manifest = backtest_data_manifest_for_range(symbol=normalized_symbol, start_date=start_date, end_date=end_date)
@@ -2150,6 +2153,7 @@ def backtest_data_candles(
     data_path = Path(manifest.get("files", {}).get(file_key, ""))
     if not data_path.exists():
         raise HTTPException(status_code=404, detail=f"{timeframe} prepared backtest candles missing")
+    candles = read_jsonl_tail(data_path, limit) if limit else read_jsonl(data_path)
     return {
         "source": "prepared-backtest-data",
         "symbol": normalized_symbol,
@@ -2157,8 +2161,78 @@ def backtest_data_candles(
         "startDate": start_date,
         "endDate": end_date,
         "sourceManifest": manifest.get("manifest") or str(data_path.parent / "manifest.json"),
-        "candles": read_jsonl(data_path),
+        "limit": limit,
+        "candles": candles,
     }
+
+
+@app.post("/api/wca/backtests/prepared-data", status_code=202)
+def enqueue_wca_prepared_data_backtest(payload: dict[str, Any] = Body(default_factory=dict)) -> dict:
+    configuration_payload = dict(payload.get("configuration") or {})
+    normalized_symbol = str(payload.get("symbol") or configuration_payload.get("symbol") or "SPY").upper()
+    start_date = str(payload.get("startDate") or payload.get("start_date") or "2020-07-28")[:10]
+    end_date = str(payload.get("endDate") or payload.get("end_date") or configuration_payload.get("end") or "2026-06-18")[:10]
+    manifest = backtest_data_manifest_for_range(symbol=normalized_symbol, start_date=start_date, end_date=end_date)
+    data_path = Path(str(manifest.get("files", {}).get("continuous1mJsonl", "")))
+    if not data_path.exists():
+        raise HTTPException(status_code=404, detail="Prepared 1Min WCA backtest data missing")
+
+    coverage = dict((manifest.get("coverage") or {}).get("oneMinute") or {})
+    count = int(coverage.get("count") or 0)
+    first_timestamp = str(coverage.get("start") or "")
+    last_timestamp = str(coverage.get("end") or "")
+    if count < 2 or not first_timestamp or not last_timestamp:
+        summary = read_jsonl_file_summary(data_path)
+        count = summary["count"]
+        first_timestamp = str(summary["start"] or "")
+        last_timestamp = str(summary["end"] or "")
+    if count < 2 or not first_timestamp or not last_timestamp:
+        raise HTTPException(status_code=422, detail="Prepared 1Min WCA backtest data requires at least two candles")
+
+    data_manifest_hash = prepared_backtest_data_hash(data_path, manifest, first_timestamp, last_timestamp, count)
+    configuration_payload.update(
+        {
+            "run_id": str(configuration_payload.get("run_id") or configuration_payload.get("runId") or f"wca-full-history-{normalized_symbol}-{end_date}"),
+            "mode": str(configuration_payload.get("mode") or "FULL_HISTORY"),
+            "symbol": normalized_symbol,
+            "start": first_timestamp,
+            "end": last_timestamp,
+            "configuration_version": str(configuration_payload.get("configuration_version") or configuration_payload.get("configurationVersion") or "wca_prepared_full_history_v1"),
+            "data_manifest_hash": data_manifest_hash,
+        }
+    )
+    configuration = BacktestRunConfiguration.model_validate(configuration_payload)
+    receipt = WCA_API_SERVICE.enqueue_research_job(
+        WcaResearchJobType.BACKTEST,
+        payload={
+            "prepared_data": {
+                "schemaVersion": "wca_prepared_backtest_job_v1",
+                "timeframe": "1Min",
+                "symbol": normalized_symbol,
+                "dataPath": str(data_path),
+                "sourceManifest": manifest.get("manifest") or str(data_path.parent / "manifest.json"),
+                "configuration": configuration.model_dump(mode="json"),
+                "coverage": {
+                    "count": count,
+                    "start": first_timestamp,
+                    "end": last_timestamp,
+                },
+            }
+        },
+        run_id=configuration.run_id,
+        configuration_version=configuration.configuration_version,
+        priority=30,
+        reason_codes=("wca.api.prepared_backtest.enqueued_research_job", "wca.api.prepared_backtest.backend_reads_full_history"),
+    )
+    result = receipt.model_dump(mode="json")
+    result["preparedData"] = {
+        "bars": count,
+        "start": first_timestamp,
+        "end": last_timestamp,
+        "sourceManifest": manifest.get("manifest") or str(data_path.parent / "manifest.json"),
+        "dataManifestHash": data_manifest_hash,
+    }
+    return result
 
 
 @app.post("/api/backtest-data/artifacts/regenerate")
@@ -8593,6 +8667,39 @@ def write_jsonl(path: Path, rows: list[dict]) -> str:
 def read_jsonl(path: Path) -> list[dict]:
     with path.open("r", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def read_jsonl_tail(path: Path, limit: int) -> list[dict]:
+    rows: deque[dict] = deque(maxlen=max(1, limit))
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return list(rows)
+
+
+def read_jsonl_file_summary(path: Path) -> dict:
+    count = 0
+    first_timestamp: str | None = None
+    last_timestamp: str | None = None
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            timestamp = str(row.get("timestamp") or "")
+            if count == 0:
+                first_timestamp = timestamp
+            last_timestamp = timestamp
+            count += 1
+    return {"count": count, "start": first_timestamp, "end": last_timestamp}
+
+
+def prepared_backtest_data_hash(path: Path, manifest: dict, first_timestamp: str, last_timestamp: str, count: int) -> str:
+    stat = path.stat()
+    manifest_path = str(manifest.get("manifest") or path.parent / "manifest.json")
+    fingerprint = f"{path}|{manifest_path}|{stat.st_size}|{stat.st_mtime_ns}|{first_timestamp}|{last_timestamp}|{count}"
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
 
 
 def write_csv(path: Path, rows: list[dict]) -> str:

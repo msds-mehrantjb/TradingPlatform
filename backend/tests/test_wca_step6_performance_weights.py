@@ -52,7 +52,8 @@ class WcaStep6PerformanceWeightsTest(unittest.TestCase):
         second = performance_weight_snapshot(records=records, cutoff=cutoff, config=config)
 
         self.assertEqual(first.deterministic_json(), second.deterministic_json())
-        self.assertAlmostEqual(sum(first.weights.values()), 1.0, places=8)
+        self.assertAlmostEqual(sum(first.weights.values()) / len(first.weights), 1.0, places=8)
+        self.assertAlmostEqual(sum(detail.normalized_share for detail in first.details), 1.0, places=8)
         self.assertTrue(first.details)
         self.assertTrue(all(detail.metrics_cutoff_timestamp == cutoff for detail in first.details))
 
@@ -81,9 +82,10 @@ class WcaStep6PerformanceWeightsTest(unittest.TestCase):
         for strategy_id, weight in snapshot.weights.items():
             family = family_by_strategy[strategy_id]
             family_totals[family] = family_totals.get(family, 0) + weight
-            self.assertLessEqual(weight, config.strategy_cap + 1e-8)
-            self.assertGreaterEqual(weight, config.strategy_floor - 1e-8)
-        self.assertTrue(all(total <= config.family_cap + 1e-8 for total in family_totals.values()))
+            self.assertLessEqual(weight, 2.0 + 1e-8)
+            self.assertGreaterEqual(weight, 0.25 - 1e-8)
+        strategy_count = len(WCA_STRATEGY_REGISTRY)
+        self.assertTrue(all(total / strategy_count <= config.family_cap + 1e-8 for total in family_totals.values()))
         self.assertTrue(all(detail.weight_version == config.weight_version for detail in snapshot.details))
 
     def test_small_losing_sample_does_not_zero_strategy(self) -> None:
@@ -102,10 +104,11 @@ class WcaStep6PerformanceWeightsTest(unittest.TestCase):
 
         snapshot = baseline_weight_snapshot(cutoff=cutoff)
 
-        expected = {definition.strategy_id: definition.base_weight for definition in WCA_STRATEGY_REGISTRY}
+        expected = {definition.strategy_id: 1.0 for definition in WCA_STRATEGY_REGISTRY}
         self.assertEqual(snapshot.weights, expected)
+        self.assertAlmostEqual(sum(detail.normalized_share for detail in snapshot.details), 1.0, places=8)
         self.assertEqual(snapshot.metrics_cutoff_timestamp, cutoff)
-        self.assertIn("wca.weights.static_baseline", snapshot.reason_codes)
+        self.assertIn("wca.weights.neutral_baseline_multipliers", snapshot.reason_codes)
 
     def test_non_wca_algorithm_modules_cannot_modify_wca_weights(self) -> None:
         violations: list[str] = []

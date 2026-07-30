@@ -34,9 +34,10 @@ from backend.app.algorithms.wca.contracts import (
     WcaPaperStabilityValidationRequest,
     WcaPaperStabilityValidationResult,
     WcaQuote,
+    WcaRuntimeMode,
     WcaShadowComparisonEvidence,
 )
-from backend.app.algorithms.wca.engine import WCA_ENGINE_VERSION, base_weight_map
+from backend.app.algorithms.wca.engine import WCA_ENGINE_VERSION, WcaEngineInputError, base_weight_map
 from backend.app.algorithms.wca.execution_pipeline import WCA_EXECUTION_PIPELINE_VERSION, WCA_PRODUCTION_PIPELINE_VERSION, WcaExecutionPipelineInput, run_wca_execution_pipeline
 from backend.app.algorithms.wca.exits import WcaBacktestOpenPosition
 from backend.app.algorithms.wca.final_acceptance import build_wca_final_acceptance_report
@@ -237,12 +238,38 @@ class WcaService:
             )
         candidate = self._repository.validate_configuration_revision(candidate)
         saved = self._repository.save_candidate_configuration(candidate, symbol="SPY", engine_version=WCA_ENGINE_VERSION)
+        baseline = saved.to_baseline_settings()
         return {
             "algorithmId": WCA_ALGORITHM_ID,
             "status": "CANDIDATE_SAVED",
             "configurationVersion": saved.configuration_version,
             "configurationHash": saved.content_hash,
             "lifecycle": saved.lifecycle,
+            "decisionSettings": {
+                "strongBuyThreshold": baseline.strong_buy_threshold,
+                "buyThreshold": baseline.buy_threshold,
+                "sellThreshold": baseline.sell_threshold,
+                "strongSellThreshold": baseline.strong_sell_threshold,
+                "minimumActiveStrategies": baseline.minimum_active_strategies,
+                "minimumDirectionalAgreement": baseline.minimum_directional_agreement,
+                "minimumAverageConfidence": baseline.minimum_average_confidence,
+            },
+            "tradingSettings": {
+                "baseRiskPercent": baseline.base_risk_percent,
+                "orderAllocationPercent": baseline.order_allocation_percent,
+                "dailyAllocationPercent": baseline.daily_allocation_percent,
+                "maxPositionPercent": baseline.max_position_percent,
+                "maxDailyLossPercent": baseline.max_daily_loss_percent,
+                "maxDailyTrades": baseline.max_daily_trades,
+                "atrStopMultiplier": baseline.atr_stop_multiplier,
+                "minimumStopDistancePercent": baseline.minimum_stop_distance_percent,
+                "takeProfitR": baseline.take_profit_r,
+                "slippagePerShare": baseline.assumed_slippage_per_share,
+                "maxSpreadPercent": baseline.max_spread_percent,
+                "maxParticipationPercent": baseline.max_participation_percent,
+                "maxAllowedShares": baseline.max_allowed_shares,
+                "pyramidingEnabled": baseline.pyramiding_enabled,
+            },
             "activationRequired": True,
             "reasonCodes": ("wca.configuration.candidate_saved", "wca.api.configuration_does_not_activate_inline"),
         }
@@ -264,6 +291,8 @@ class WcaService:
         )
 
     def enqueue_evaluation_request(self, request: WcaEvaluateRequest) -> WcaResearchJobReceipt:
+        if not request.strategy_signals:
+            raise WcaEngineInputError("strategySignals are required for WCA legacy evaluation enqueue")
         return self.enqueue_shadow_comparison(request)
 
     def enqueue_paper_command(self, request: WcaPaperExecutionRequest, *, mode: str | None = None) -> dict[str, Any]:
@@ -417,7 +446,7 @@ class WcaService:
                 configuration=configuration,
                 weight_snapshot=self._read_active_weights_as_of(snapshot.decision_timestamp) or baseline_weight_snapshot(cutoff=snapshot.decision_timestamp),
                 calibration_tables=self._read_active_calibrations_as_of(symbol=snapshot.symbol, as_of=snapshot.decision_timestamp),
-                runtime_mode="shadow",
+                runtime_mode=WcaRuntimeMode.SHADOW,
                 synthetic_quote_allowed=False,
                 account_equity=sizing_inputs.account_equity if sizing_inputs else request.trading_settings.starting_capital,
                 available_buying_power=sizing_inputs.account_equity if sizing_inputs else request.trading_settings.starting_capital,
@@ -462,7 +491,7 @@ class WcaService:
                 snapshot=snapshot,
                 configuration_version=configuration.configuration_version,
                 configuration=configuration,
-                runtime_mode="automatic_paper" if request.mode == "automatic" else "manual_paper",
+                runtime_mode=WcaRuntimeMode.AUTOMATIC_PAPER if request.mode == "automatic" else WcaRuntimeMode.MANUAL_PAPER,
                 synthetic_quote_allowed=False,
                 account_id=request.account_id,
                 weight_snapshot=self._read_active_weights_as_of(snapshot.decision_timestamp) or baseline_weight_snapshot(cutoff=snapshot.decision_timestamp),
@@ -501,7 +530,15 @@ class WcaService:
             status = WcaOrderStatus.VALIDATED.value
             submitted = False
             reasons = ("wca.paper.execution_path_completed", f"wca.paper.mode.{request.mode}")
-            proposed = proposed.model_copy(update={"status": WcaOrderStatus.VALIDATED})
+            key = proposed.idempotency_key or _paper_order_idempotency_key(request.account_id, pipeline.decision)
+            proposed = proposed.model_copy(
+                update={
+                    "status": WcaOrderStatus.VALIDATED,
+                    "idempotency_key": key,
+                    "account_id": request.account_id,
+                    "reason_codes": (*proposed.reason_codes, "wca.paper.idempotency_key_generated"),
+                }
+            )
             decision = pipeline.decision.model_copy(update={"proposed_order": proposed, "reason_codes": (*pipeline.decision.reason_codes, *reasons)})
             decision = apply_wca_final_order_validation(decision, _paper_order_validation_context(request, snapshot))
             if decision.proposed_order is None:
@@ -510,14 +547,7 @@ class WcaService:
                 reasons = (*reasons, "wca.paper.final_order_validation_failed")
                 decision = decision.model_copy(update={"reason_codes": (*decision.reason_codes, "wca.paper.final_order_validation_failed")})
             else:
-                key = decision.proposed_order.idempotency_key or _paper_order_idempotency_key(request.account_id, decision)
-                proposed = decision.proposed_order.model_copy(
-                    update={
-                        "idempotency_key": key,
-                        "account_id": request.account_id,
-                        "reason_codes": (*decision.proposed_order.reason_codes, "wca.paper.idempotency_key_generated"),
-                    }
-                )
+                proposed = decision.proposed_order
                 decision = decision.model_copy(update={"proposed_order": proposed})
                 broker_request = build_wca_paper_broker_request(proposed)
                 reservation = self._repository.reserve_decision_order_and_outbox(
@@ -527,6 +557,13 @@ class WcaService:
                     idempotency_key=key,
                     client_order_id=broker_request.client_order_id,
                     request_payload=broker_request.model_dump(mode="json"),
+                    final_validation_context=_paper_order_validation_context(
+                        request,
+                        snapshot,
+                        order_type=broker_request.order_type,
+                        time_in_force=broker_request.time_in_force,
+                        automatic_paper_enabled=paper_execution_allowed(),
+                    ),
                 )
                 proposed = reservation.proposed_order
                 if reservation.created:
@@ -662,13 +699,13 @@ class WcaService:
         return self._research_repository.enqueue_job(job)
 
     def backtest_status(self, run_id: str) -> dict[str, Any]:
-        job = self._research_repository.read_job(run_id)
-        if job is not None:
-            return {"runId": run_id, "jobId": run_id, "status": job.status.lower(), "backendAuthoritative": True, "researchJob": job.model_dump(mode="json")}
         if run_id in self._backtest_results or self._repository.load_backtest_result(run_id) is not None:
             return {"runId": run_id, "status": "complete", "backendAuthoritative": True}
         if run_id in self._backtest_suites:
             return {"runId": run_id, "status": "complete", "backendAuthoritative": True, "suite": True}
+        job = self._research_repository.read_job(run_id) or self._research_repository.read_latest_job_for_run(run_id)
+        if job is not None:
+            return {"runId": run_id, "jobId": job.job_id, "status": str(job.status).lower(), "backendAuthoritative": True, "researchJob": job.model_dump(mode="json")}
         return {"runId": run_id, "status": "not_found", "backendAuthoritative": True}
 
     def backtest_result(self, run_id: str) -> BacktestResult | WcaBacktestSuiteResult | None:
@@ -758,14 +795,49 @@ def _manual_override(request: WcaPaperExecutionRequest) -> WcaManualSizingOverri
     )
 
 
-def _paper_order_validation_context(request: WcaPaperExecutionRequest, snapshot: WcaMarketSnapshot) -> WcaOrderValidationContext:
+def _paper_order_validation_context(
+    request: WcaPaperExecutionRequest,
+    snapshot: WcaMarketSnapshot,
+    *,
+    order_type: str = "LIMIT",
+    time_in_force: str = "DAY",
+    automatic_paper_enabled: bool = True,
+) -> WcaOrderValidationContext:
     return WcaOrderValidationContext(
         evaluation_timestamp=snapshot.decision_timestamp,
         paper_only_mode=True,
+        account_id=request.account_id,
+        broker_endpoint="paper",
+        runtime_mode=WcaRuntimeMode.AUTOMATIC_PAPER if request.mode == "automatic" else WcaRuntimeMode.MANUAL_PAPER,
+        requires_executable_paper_stage=True,
+        automatic_paper_enabled=automatic_paper_enabled,
+        market_is_open=True,
+        allowed_session_window=True,
+        candle_freshness_seconds=120,
+        data_ready=snapshot.data_ready,
+        inventory_consistent=True,
+        order_type=order_type,
+        time_in_force=time_in_force,
+        protective_exit_plan_present=True,
         current_position_quantity=request.current_position_quantity,
         current_position_side=request.current_position_side,
         allow_position_increase=request.allow_position_increase,
         position_owned_by_wca=True,
+        quote_freshness_seconds=None if request.emergency_exit else 15,
+        available_buying_power=request.available_buying_power,
+        account_equity=request.account_equity,
+        max_position_value=request.account_equity,
+        realized_daily_loss=request.realized_daily_loss,
+        max_daily_loss=request.allocated_daily_loss_budget,
+        trades_today=request.trades_today,
+        max_daily_trades=None,
+        max_approved_quantity=request.global_gate_quantity_cap,
+        expected_net_edge=request.estimated_expectancy_after_costs,
+        minimum_net_edge=0,
+        idempotency_required=True,
+        new_entry_permitted=True,
+        risk_reducing_exit_permitted=True,
+        is_risk_reducing_exit=request.emergency_exit,
     )
 
 

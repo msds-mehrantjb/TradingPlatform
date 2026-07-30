@@ -3,7 +3,7 @@ import { API_BASE, BACKTEST_API_CANDIDATES, TRADING_ALGORITHM_INVENTORY_ENDPOINT
 import { directionalSignal, isEligibleStrategyVote, winningVoteSignal } from "./domain/tradingSignals";
 import type { RegimeBacktestResult } from "./features/regime/types";
 import { evaluateRegimeOnBackend, runRegimeBacktestOnBackend } from "./features/regime/api";
-import { fetchWcaBaselineSettings, fetchWcaConfiguration, fetchWcaStatus, updateWcaConfiguration } from "./features/wca/api";
+import { fetchLatestWcaDecision, fetchWcaBacktest, fetchWcaBacktestStatus, fetchWcaBaselineSettings, fetchWcaConfiguration, fetchWcaStatus, runWcaPreparedBacktest, updateWcaConfiguration } from "./features/wca/api";
 import {
   createInitialWcaState,
   withWcaConfigurationSaved,
@@ -1164,6 +1164,7 @@ type BacktestResult = {
   startDate?: string;
   endDate?: string;
   strategyDescription?: string;
+  backendQueued?: boolean;
   riskConfig?: {
     startingCapital: number;
     riskPerTradePercent: number;
@@ -2351,6 +2352,10 @@ type MarketContext = {
 type BacktestRange = {
   startDate: string;
   endDate: string;
+  oneMinuteBars?: number;
+  oneMinuteStart?: string | null;
+  oneMinuteEnd?: string | null;
+  sourceManifest?: string;
 };
 
 const BROWSER_STORAGE_SNAPSHOT_INTERVAL_MS = 5 * 60_000;
@@ -2717,6 +2722,8 @@ let confidenceBacktestNextDatasetCheckAt = 0;
 let dailyAlgorithmBacktestsInFlight = false;
 let dailyAlgorithmBacktestsNextCheckAt = 0;
 let dailyAlgorithmBacktestsLastRunKey = "";
+let wcaPreparedBacktestInFlight = false;
+let wcaPreparedBacktestLastRunKey = "";
 const BAR_CLOSE_REFRESH_MODE = -1;
 const BAR_CLOSE_REFRESH_DELAY_MS = 2500;
 const refreshOptions = [
@@ -3029,6 +3036,7 @@ const weightedAuxiliarySymbols = [...weightedRelativeStrengthSymbols, ...weighte
 const weightedBreadthProxySymbols = Array.from(new Set([...weightedSectorEtfSymbols, ...weightedSpyBasketSampleSymbols]));
 const weightedSpyContextTimeframes = ["1Min", "5Min"] as const;
 type WeightedSpyContextTimeframe = (typeof weightedSpyContextTimeframes)[number];
+const CORE_MARKET_DATA_TIMEOUT_MS = 30000;
 
 const persistedUiState = loadUiState();
 
@@ -3251,6 +3259,11 @@ let tradingSettingsMountKey = "";
 let weightedTradingSettingsMountKey = "";
 let weightedMarketDataInFlight = false;
 let weightedInitialWeightsInFlight = false;
+let lastWeightedMarketDataNetworkRefreshAt = 0;
+let candleLoadInFlightKey = "";
+let marketContextLoadInFlightKey = "";
+let wcaPresentationRefreshTimer: number | undefined;
+let lastWcaPresentationRefreshAt = 0;
 let isDragging = false;
 let lastDragX = 0;
 let dragCarry = 0;
@@ -3258,6 +3271,8 @@ const minVisibleCandles = 30;
 const maxVisibleCandles = 500;
 const defaultVisibleCandles = 180;
 const zoomFactor = 1.25;
+const WEIGHTED_MARKET_DATA_NETWORK_REFRESH_MS = 5 * 60 * 1000;
+const WCA_PRESENTATION_REFRESH_MIN_INTERVAL_MS = 15 * 1000;
 
 const timeframeItems: Array<{ label: string; value: Timeframe; limit: number }> = [
   { label: "1m", value: "1Min", limit: 1000 },
@@ -3667,9 +3682,9 @@ leftRail.innerHTML = `
         <div class="algo-header">
           <div id="confidenceFinalSignal" class="algo-final hold">Hold</div>
         </div>
-        <div id="wcaPresentationPanel" class="wca-presentation-mount"></div>
         <div id="confidenceScoreGrid" class="weighted-score-grid"></div>
         <div id="confidenceSummary" class="algo-rule-list weighted-summary"></div>
+        <div id="wcaPresentationPanel" class="wca-presentation-mount"></div>
         <div id="confidenceTradingSettingsMount" class="algo-stable-settings"></div>
         <div class="confidence-backtest-panel">
           <div class="confidence-backtest-head">
@@ -5543,6 +5558,11 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
   }
   const candlesPath = `/api/candles?${params.toString()}`;
   let candlesUrl = `${API_BASE}${candlesPath}`;
+  const candleLoadKey = candlesPath;
+  if (candleLoadInFlightKey === candleLoadKey) {
+    return;
+  }
+  candleLoadInFlightKey = candleLoadKey;
 
   if (showLoading) {
     state.source = "loading";
@@ -5560,7 +5580,7 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
   }
 
   try {
-    const result = await fetchFromBackendCandidates(candlesPath, 15000);
+    const result = await fetchFromBackendCandidates(candlesPath, CORE_MARKET_DATA_TIMEOUT_MS);
     const response = result.response;
     candlesUrl = result.url;
     if (!response.ok) {
@@ -5599,6 +5619,9 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
     }
     markRefresh("failed");
   } finally {
+    if (candleLoadInFlightKey === candleLoadKey) {
+      candleLoadInFlightKey = "";
+    }
     if (candleStartupTimer) {
       window.clearTimeout(candleStartupTimer);
       candleStartupTimer = undefined;
@@ -5611,7 +5634,9 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
   updateMeta();
   drawChart();
   void loadMarketForecast({ refresh: false });
-  void loadWeightedMarketData({ refresh: shouldRefresh });
+  if (state.algoTab === "weighted" || state.tradingWindowMode === "weighted") {
+    void loadWeightedMarketData({ refresh: shouldRefresh && shouldRefreshWeightedMarketDataFromNetwork() });
+  }
   void maybeRunDailyAlgorithmBacktests("candles");
   if (state.algoBacktestTimeframe !== "Trading") {
     scheduleVisibleContextUpdate(0);
@@ -5655,7 +5680,15 @@ async function getBacktestRange(options: { refresh?: boolean } = {}) {
       const manifest = await response.json();
       const startDate = String(manifest.requestedStartDate || DEFAULT_BACKTEST_START_DATE).slice(0, 10);
       const endDate = String(manifest.requestedEndDate || manifest.latestSessionDate || DEFAULT_BACKTEST_END_DATE).slice(0, 10);
-      backtestRangeCache = { startDate, endDate };
+      const oneMinuteCoverage = isRecord(manifest.coverage) && isRecord(manifest.coverage.oneMinute) ? manifest.coverage.oneMinute : null;
+      backtestRangeCache = {
+        startDate,
+        endDate,
+        oneMinuteBars: numberFromUnknown(oneMinuteCoverage?.count, 0),
+        oneMinuteStart: oneMinuteCoverage?.start ? String(oneMinuteCoverage.start) : null,
+        oneMinuteEnd: oneMinuteCoverage?.end ? String(oneMinuteCoverage.end) : null,
+        sourceManifest: manifest.manifest ? String(manifest.manifest) : undefined,
+      };
       return backtestRangeCache;
     } catch {
       // Try the next backend fallback.
@@ -5675,7 +5708,7 @@ async function backtestRangeParams(extra: Record<string, string> = {}) {
   });
 }
 
-async function fetchPreparedBacktestCandles(timeframe: "1Min" | "5Min" | "1Day") {
+async function fetchPreparedBacktestCandles(timeframe: "1Min" | "5Min" | "1Day", options: { limit?: number } = {}) {
   const range = await getBacktestRange();
   const params = new URLSearchParams({
     symbol: state.symbol,
@@ -5683,6 +5716,9 @@ async function fetchPreparedBacktestCandles(timeframe: "1Min" | "5Min" | "1Day")
     start_date: range.startDate,
     end_date: range.endDate,
   });
+  if (options.limit) {
+    params.set("limit", String(options.limit));
+  }
   let lastStatus = 0;
   for (const baseUrl of BACKTEST_API_CANDIDATES) {
     try {
@@ -5743,6 +5779,92 @@ async function ensureBacktestDatasetThrough(targetDate: string) {
   }
   const range = await getBacktestRange({ refresh: true });
   return { ready: range.endDate >= targetDate, range, refreshResult };
+}
+
+async function refreshWcaBacktestFromPreparedDataset(
+  reason: string,
+  options: { refreshDailyDataset?: boolean; force?: boolean } = {},
+) {
+  if (wcaPreparedBacktestInFlight || state.symbol !== "SPY") {
+    return;
+  }
+  wcaPreparedBacktestInFlight = true;
+  try {
+    let range = await getBacktestRange({ refresh: Boolean(options.refreshDailyDataset) });
+    const latestLoadedSessionDate = latestRegularSessionDateForConfidenceBacktest(state.candles);
+    const canRefreshDailyDataset = options.refreshDailyDataset && latestLoadedSessionDate && (state.marketStatus === "closed" || state.marketStatus === "holiday");
+    if (canRefreshDailyDataset) {
+      const dataset = await ensureBacktestDatasetThrough(latestLoadedSessionDate);
+      range = dataset.range;
+      if (!dataset.ready) {
+        confidenceBacktestStatus = "waiting";
+        confidenceBacktestError = `Running with prepared data through ${range.endDate}; waiting to append closed session ${latestLoadedSessionDate}.`;
+        renderConfidenceBacktestState();
+      }
+    }
+
+    if ((range.oneMinuteBars ?? 0) < 2) {
+      confidenceBacktestStatus = "waiting";
+      confidenceBacktestError = "Waiting for prepared 1m backtest candles from the backend dataset.";
+      renderConfidenceBacktestState();
+      return;
+    }
+    const cacheKey = confidencePreparedBacktestCacheKey(range);
+    const latestPreparedSessionDate = String(range.oneMinuteEnd || range.endDate).slice(0, 10);
+    const runKey = `${state.symbol}:${range.startDate}:${range.endDate}:${cacheKey}`;
+    if (!options.force && wcaPreparedBacktestLastRunKey === runKey) {
+      if (confidenceBacktestResult?.backendQueued) {
+        const metrics = (latestWcaBackendBacktestResult?.metrics ?? {}) as Record<string, unknown>;
+        const queuedRunId = String(latestWcaBackendBacktestResult?.runId ?? latestWcaBackendBacktestResult?.run_id ?? metrics.runId ?? "");
+        const queuedJobId = String(metrics.jobId ?? "");
+        const backendResult = queuedRunId ? await waitForWcaBacktestResult(queuedRunId, queuedJobId) : null;
+        if (backendResult) {
+          const result = backendWcaBacktestToFrontendResult(backendResult);
+          confidenceBacktestResult = result;
+          confidenceBacktestStatus = "ready";
+          confidenceBacktestError = "";
+          confidenceBacktestCache = { key: cacheKey, result };
+          latestWcaBackendBacktestResult = backendResult;
+          wcaPresentationState = withWcaReady(wcaPresentationState, { latestBacktest: backendResult });
+          saveStoredConfidenceBacktest(cacheKey, result, latestPreparedSessionDate);
+          renderWcaPresentationMount();
+          renderConfidenceBacktestState();
+        }
+      }
+      return;
+    }
+    if (!options.force && confidenceBacktestCache?.key === cacheKey && confidenceBacktestResult && !confidenceBacktestResult.backendQueued) {
+      confidenceBacktestStatus = "ready";
+      renderConfidenceBacktestState();
+      return;
+    }
+    wcaPreparedBacktestLastRunKey = runKey;
+    confidenceBacktestStatus = "running";
+    confidenceBacktestError = canRefreshDailyDataset
+      ? `Updating WCA backtest after market close (${reason}).`
+      : `Running WCA full-history backtest from prepared dataset through ${range.endDate} (${reason}).`;
+    renderConfidenceBacktestState();
+
+    const result = await runBackendConfidencePreparedDataBacktest(range, latestPreparedSessionDate);
+    confidenceBacktestResult = result;
+    if (result.backendQueued) {
+      confidenceBacktestStatus = "waiting";
+      confidenceBacktestError = result.rangeLabel || "WCA backtest is queued in the backend research worker.";
+      renderConfidenceBacktestState();
+      return;
+    }
+    confidenceBacktestStatus = "ready";
+    confidenceBacktestError = "";
+    confidenceBacktestCache = { key: cacheKey, result };
+    saveStoredConfidenceBacktest(cacheKey, result, latestPreparedSessionDate);
+    renderConfidenceBacktestState();
+  } catch (error) {
+    confidenceBacktestStatus = "error";
+    confidenceBacktestError = error instanceof Error ? error.message : "Unable to run WCA prepared-data backtest";
+    renderConfidenceBacktestState();
+  } finally {
+    wcaPreparedBacktestInFlight = false;
+  }
 }
 
 async function loadAlgoBacktestCandles() {
@@ -6636,6 +6758,15 @@ async function loadWeightedMarketData(options: { refresh?: boolean } = {}) {
   }
 }
 
+function shouldRefreshWeightedMarketDataFromNetwork() {
+  const now = Date.now();
+  if (now - lastWeightedMarketDataNetworkRefreshAt < WEIGHTED_MARKET_DATA_NETWORK_REFRESH_MS) {
+    return false;
+  }
+  lastWeightedMarketDataNetworkRefreshAt = now;
+  return true;
+}
+
 async function fetchWeightedSymbolCandles(symbol: string, refresh: boolean) {
   const params = new URLSearchParams({
     symbol,
@@ -6695,6 +6826,7 @@ async function loadMarketStatus() {
     updateMarketStatus(payload);
     void handleTradeHistoryMarketRollover(payload);
     void maybeRunDailyAlgorithmBacktests("market-status");
+    void refreshWcaBacktestFromPreparedDataset("market-status", { refreshDailyDataset: payload.status === "closed" || payload.status === "holiday" });
     return payload;
   } catch (error) {
     const fallback = {
@@ -6706,6 +6838,7 @@ async function loadMarketStatus() {
     updateMarketStatus(fallback);
     void handleTradeHistoryMarketRollover(fallback);
     void maybeRunDailyAlgorithmBacktests("market-status");
+    void refreshWcaBacktestFromPreparedDataset("market-status");
     return fallback;
   }
 }
@@ -7209,9 +7342,14 @@ async function loadMarketContext(options: { showLoading?: boolean; refresh?: boo
   }
   const contextPath = `/api/market-context?${params.toString()}`;
   let contextUrl = `${API_BASE}${contextPath}`;
+  const contextLoadKey = contextPath;
+  if (marketContextLoadInFlightKey === contextLoadKey) {
+    return;
+  }
+  marketContextLoadInFlightKey = contextLoadKey;
 
   try {
-    const result = await fetchFromBackendCandidates(contextPath, 15000);
+    const result = await fetchFromBackendCandidates(contextPath, CORE_MARKET_DATA_TIMEOUT_MS);
     const response = result.response;
     contextUrl = result.url;
     if (!response.ok) {
@@ -7232,6 +7370,9 @@ async function loadMarketContext(options: { showLoading?: boolean; refresh?: boo
     const message = error instanceof Error ? error.message : "Unable to load market context";
     state.contextError = `${message}. Tried ${contextUrl}`;
   } finally {
+    if (marketContextLoadInFlightKey === contextLoadKey) {
+      marketContextLoadInFlightKey = "";
+    }
     if (contextStartupTimer) {
       window.clearTimeout(contextStartupTimer);
       contextStartupTimer = undefined;
@@ -10708,7 +10849,7 @@ function setAlgoTab(tab: AlgoTab) {
   }
   if (confidence) {
     updateConfidenceAggregationPanel();
-    void refreshWcaPresentationPanel();
+    scheduleWcaPresentationRefresh();
   }
   if (regime) {
     scheduleRegimeSelectionPanelUpdate();
@@ -12031,6 +12172,21 @@ function renderWcaPresentationMount() {
   });
 }
 
+function scheduleWcaPresentationRefresh() {
+  if (state.algoTab !== "confidence" && state.tradingWindowMode !== "confidence") {
+    return;
+  }
+  if (wcaPresentationRefreshTimer !== undefined) {
+    return;
+  }
+  const elapsed = Date.now() - lastWcaPresentationRefreshAt;
+  const delay = Math.max(0, WCA_PRESENTATION_REFRESH_MIN_INTERVAL_MS - elapsed);
+  wcaPresentationRefreshTimer = window.setTimeout(() => {
+    wcaPresentationRefreshTimer = undefined;
+    void refreshWcaPresentationPanel();
+  }, delay);
+}
+
 async function submitWcaBaselineConfiguration(configuration: Parameters<typeof updateWcaConfiguration>[0]) {
   wcaPresentationState = withWcaConfigurationSaving(wcaPresentationState);
   renderWcaPresentationMount();
@@ -12047,19 +12203,22 @@ async function refreshWcaPresentationPanel() {
   if (wcaPresentationRefreshInFlight) {
     return;
   }
+  lastWcaPresentationRefreshAt = Date.now();
   wcaPresentationRefreshInFlight = true;
   wcaPresentationState = withWcaLoading(wcaPresentationState);
   renderWcaPresentationMount();
   try {
-    const [backendStatus, configuration, baselineSettings] = await Promise.all([
+    const [backendStatus, configuration, baselineSettings, latestDecision] = await Promise.all([
       fetchWcaStatus(),
       fetchWcaConfiguration(),
       fetchWcaBaselineSettings(),
+      fetchLatestWcaDecision(),
     ]);
     wcaPresentationState = withWcaReady(wcaPresentationState, {
       backendStatus,
       configuration,
       baselineSettings,
+      latestDecision,
       latestBacktest: latestWcaBackendBacktestResult,
     });
   } catch (error) {
@@ -12097,12 +12256,15 @@ function wcaBackendDecisionAsConfidenceResult(): ConfidenceAggregationResult {
     childRecord(decisionRecord, "gate_result") ??
     null;
   const signal = algoSignalFromUnknown(
-    decisionRecord.finalDecision ??
+      decisionRecord.finalDecision ??
       decisionRecord.final_decision ??
       decisionRecord.effectiveDecision ??
       decisionRecord.effective_decision ??
       decisionRecord.signal ??
-      decisionRecord.direction,
+      decisionRecord.direction ??
+      aggregation?.postLocalGateDecision ??
+      aggregation?.post_local_gate_decision ??
+      aggregation?.signal,
   );
   const strategies = wcaBackendStrategyRows(decisionRecord, aggregation);
   const buyScore = wcaNumberFromKeys(aggregation, ["buyScore", "buy_score", "buy"], 0);
@@ -12206,20 +12368,21 @@ function wcaBackendQueuedBacktestResult(reason: string): BacktestResult {
     bars: 0,
     sessions: 0,
     strategyDescription: "Backend-authoritative WCA backtest job",
+    backendQueued: true,
   };
 }
 
 function wcaBackendStrategyRows(decision: Record<string, unknown>, aggregation: Record<string, unknown> | null): ConfidenceStrategyResult[] {
   const rows =
-    arrayFromUnknown(decision.strategyEvaluations ?? decision.strategy_evaluations ?? decision.strategies).filter(isRecord) ??
+    arrayFromUnknown(decision.strategyEvaluations ?? decision.strategy_evaluations ?? decision.strategies ?? aggregation?.strategyEvaluations ?? aggregation?.strategy_evaluations).filter(isRecord) ??
     [];
-  const contributions = arrayFromUnknown(aggregation?.contributions).filter(isRecord);
+  const contributions = arrayFromUnknown(aggregation?.strategyContributions ?? aggregation?.strategy_contributions ?? aggregation?.contributions).filter(isRecord);
   const source = rows.length ? rows : contributions;
   return source.map((row, index) => {
     const signal = algoSignalFromUnknown(row.direction ?? row.signal ?? row.finalDecision ?? row.final_decision);
     const contractSignal = confidenceContractSignal(signal);
     const confidence = wcaNumberFromKeys(row, ["calibratedConfidence", "calibrated_confidence", "confidence", "rawConfidence", "raw_confidence"], 0);
-    const effectiveWeight = wcaNumberFromKeys(row, ["effectiveWeight", "effective_weight", "finalWeight", "final_weight"], 0);
+    const effectiveWeight = wcaNumberFromKeys(row, ["effectiveWeight", "effective_weight", "adjustedWeight", "adjusted_weight", "finalWeight", "final_weight"], 0);
     const baseWeight = wcaNumberFromKeys(row, ["baseWeight", "base_weight", "originalWeight", "original_weight"], effectiveWeight);
     return {
       strategy: stringFromUnknown(row.strategyId ?? row.strategy_id ?? row.strategy ?? row.slug, `wca_strategy_${index + 1}`),
@@ -12231,7 +12394,7 @@ function wcaBackendStrategyRows(decision: Record<string, unknown>, aggregation: 
       reason: stringFromUnknown(row.reason ?? row.explanation ?? arrayFromUnknown(row.reasonCodes ?? row.reason_codes).join("; "), "Backend WCA strategy output"),
       key: stringFromUnknown(row.key ?? row.strategyId ?? row.strategy_id, `WCA${index + 1}`),
       name: stringFromUnknown(row.name ?? row.strategyName ?? row.strategy_name ?? row.strategyId ?? row.strategy_id, `WCA Strategy ${index + 1}`),
-      contribution: wcaNumberFromKeys(row, ["contribution"], 0),
+      contribution: wcaNumberFromKeys(row, ["contribution", "scoreContribution", "score_contribution"], 0),
     };
   });
 }
@@ -14123,7 +14286,8 @@ function applyConfidenceTargetOrderOverrides(order: ManualOrderRecommendation, m
 
 function renderConfidenceTargetOrderSettings(order: ManualOrderRecommendation, sourceLabel = "WCA", mode: TradingWindowMode = "confidence") {
   const defaultsOn = tradingSettingsForMode(mode).useDefaultSizingSettings;
-  const showSummary = order.eligible || !order.failedGates.length;
+  const visibleBlockers = targetOrderVisibleBlockers(order, mode);
+  const showSummary = order.eligible || (!order.failedGates.length && !visibleBlockers.length);
   const targetDataset =
     mode === "regime"
       ? "regime-target-setting"
@@ -14136,7 +14300,7 @@ function renderConfidenceTargetOrderSettings(order: ManualOrderRecommendation, s
     <div class="target-settings-panel weighted-target-settings-panel" data-side="${escapeHtml(order.side.toLowerCase())}">
       <strong>Target Order</strong>
       <span class="target-settings-note">${defaultsOn ? `Generated from ${escapeHtml(sourceLabel)} sizing and default settings` : "Manual target-order overrides enabled"}</span>
-      ${renderTargetOrderBlockers(order)}
+      ${renderTargetOrderBlockers(order, mode)}
       <div class="target-settings-grid">
         ${renderConfidenceTargetSettingInput("accountBalance", "Total balance", order.accountBalance, "number", 0.01, undefined, defaultsOn, targetDataset)}
         ${renderConfidenceTargetSettingInput("dailyLimitDollars", "Buying power", order.dailyLimitDollars, "number", 0.01, undefined, defaultsOn, targetDataset)}
@@ -15310,9 +15474,19 @@ function weightedVotingBackendSummary(): WeightedVotingBackendSummary {
   const scores = childRecord(decision, "vote_scores") ?? childRecord(decision, "voteScores");
   const signal = algoSignalFromUnknown(decision?.signal ?? decision?.proposed_side ?? decision?.proposedSide);
   const rawWinner = algoSignalFromUnknown(decision?.raw_winner ?? decision?.rawWinner ?? decision?.proposed_side ?? decision?.proposedSide);
-  const buyScore = numberFromUnknown(scores?.buy_score ?? scores?.buyScore ?? decision?.buy_score ?? decision?.buyScore, 0);
-  const sellScore = numberFromUnknown(scores?.sell_score ?? scores?.sellScore ?? decision?.sell_score ?? decision?.sellScore, 0);
-  const holdScore = numberFromUnknown(scores?.hold_score ?? scores?.holdScore ?? decision?.hold_score ?? decision?.holdScore, signal === "Hold" ? 1 : 0);
+  const buyScore = numberFromUnknown(
+    scores?.normalized_buy_score ?? scores?.normalizedBuyScore ?? scores?.buy_score ?? scores?.buyScore ?? decision?.buy_score ?? decision?.buyScore,
+    0,
+  );
+  const sellScore = numberFromUnknown(
+    scores?.normalized_sell_score ?? scores?.normalizedSellScore ?? scores?.sell_score ?? scores?.sellScore ?? decision?.sell_score ?? decision?.sellScore,
+    0,
+  );
+  const rawHoldScore = numberFromUnknown(
+    scores?.normalized_hold_score ?? scores?.normalizedHoldScore ?? scores?.hold_score ?? scores?.holdScore ?? decision?.hold_score ?? decision?.holdScore,
+    0,
+  );
+  const holdScore = signal === "Hold" && buyScore + sellScore + rawHoldScore <= 0 ? 1 : rawHoldScore;
   const winnerScore = numberFromUnknown(scores?.winner_score ?? scores?.winnerScore, Math.max(buyScore, sellScore, holdScore));
   const edge = numberFromUnknown(scores?.winner_edge ?? scores?.winnerEdge ?? decision?.winner_edge ?? decision?.winnerEdge, 0);
   const gates = weightedVotingGateRows();
@@ -15325,7 +15499,10 @@ function weightedVotingBackendSummary(): WeightedVotingBackendSummary {
     holdScore,
     winnerScore,
     edge,
-    activeStrategyCount: signals.filter((signalRow) => numberFromUnknown(signalRow.effective_weight ?? signalRow.effectiveWeight ?? signalRow.finalWeight, 0) > 0).length,
+    activeStrategyCount: Math.max(
+      numberFromUnknown(scores?.active_strategy_count ?? scores?.activeStrategyCount, 0),
+      signals.filter((signalRow) => numberFromUnknown(signalRow.final_weight ?? signalRow.finalWeight ?? signalRow.effective_weight ?? signalRow.effectiveWeight, 0) > 0).length,
+    ),
     failedGateCount: gates.filter((gate) => gate.status === "fail").length,
     infoGateCount: gates.filter((gate) => gate.status === "info").length,
     marketConditionLabel: weightedVotingMarketConditionLabel(),
@@ -15797,7 +15974,7 @@ function updateWeightedVotingPanel(options: { refresh?: boolean } = {}) {
   weightedFinalSignal.className = `algo-final ${summary.signal.toLowerCase()}`;
   weightedScoreGrid.innerHTML = renderWeightedBackendScoreGrid(summary);
   updateWeightedTradingSettingsMount();
-  weightedStrategiesToggleMeta.textContent = `${summary.activeStrategyCount} active / ${weightedAlphaStrategies.length} strategies`;
+  weightedStrategiesToggleMeta.textContent = `${summary.activeStrategyCount} trade setups / ${weightedAlphaStrategies.length} strategies`;
   weightedStrategiesList.innerHTML = renderWeightedBackendStrategies();
   weightedDataToggleMeta.textContent = summary.marketConditionLabel;
   weightedDataGrid.innerHTML = renderWeightedBackendDataGrid();
@@ -16603,16 +16780,34 @@ function renderTargetOrderSettings(order: ManualOrderRecommendation) {
   `;
 }
 
-function renderTargetOrderBlockers(order: ManualOrderRecommendation) {
-  if (order.eligible || !order.failedGates.length) {
+function renderTargetOrderBlockers(order: ManualOrderRecommendation, mode: TradingWindowMode = state.tradingWindowMode) {
+  const blockers = targetOrderVisibleBlockers(order, mode);
+  if (order.eligible || !blockers.length) {
     return "";
   }
   return `
     <div class="target-order-blockers">
       <b>Blocked by</b>
-      <span>${escapeHtml(order.failedGates.join(" | "))}</span>
+      <span>${escapeHtml(blockers.join(" | "))}</span>
     </div>
   `;
+}
+
+function targetOrderVisibleBlockers(order: ManualOrderRecommendation, mode: TradingWindowMode = state.tradingWindowMode) {
+  const blockers = uniqueStrings(order.failedGates);
+  if (mode !== "weighted") {
+    return blockers;
+  }
+  const riskGateKeys = new Set(
+    weightedVotingGateRows()
+      .filter((gate) => gate.status === "fail")
+      .map((gate) => normalizedBlockerKey(`${gate.label}: ${gate.detail}`)),
+  );
+  return blockers.filter((blocker) => !riskGateKeys.has(normalizedBlockerKey(blocker)));
+}
+
+function normalizedBlockerKey(value: string) {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 function renderTargetSettingInput(
@@ -18832,6 +19027,70 @@ function backendRegimeBacktestCacheKey(symbol: string, candles: Candle[]): strin
   return `${symbol.toUpperCase()}:${first}:${last}:${candles.length}`;
 }
 
+async function runBackendConfidencePreparedDataBacktest(range: BacktestRange, latestSessionDate: string): Promise<BacktestResult> {
+  const settings = state.confidenceTradingSettings;
+  const defaults = confidenceDefaultSizingSettings();
+  const runId = `wca-full-history-${state.symbol}-${range.endDate}`;
+  const receipt = await runWcaPreparedBacktest({
+    symbol: state.symbol,
+    startDate: range.startDate,
+    endDate: range.endDate,
+    configuration: {
+      run_id: runId,
+      mode: "FULL_HISTORY",
+      symbol: state.symbol,
+      start: range.oneMinuteStart ?? `${range.startDate}T00:00:00Z`,
+      end: range.oneMinuteEnd ?? `${range.endDate}T23:59:59Z`,
+      configuration_version: "wca_prepared_full_history_v1",
+      data_manifest_hash: confidencePreparedBacktestCacheKey(range),
+      side_mode: "long_only",
+      starting_equity: settings.startingCapital,
+      slippage_per_share: settings.slippagePerShare,
+      fee_per_share: 0,
+      spread_bps: 2,
+      market_impact_bps: 1,
+      max_participation_percent: defaults.maxParticipationPercent,
+      allow_partial_fills: true,
+      smoke_sessions: 3,
+    },
+  });
+  const jobId = String(receipt.job_id ?? receipt.jobId ?? "");
+  const preparedData = isRecord(receipt.preparedData) ? receipt.preparedData : {};
+  const barCount = numberFromUnknown(preparedData.bars, range.oneMinuteBars ?? 0);
+  const preparedStart = String(preparedData.start ?? range.oneMinuteStart ?? range.startDate);
+  const preparedEnd = String(preparedData.end ?? range.oneMinuteEnd ?? range.endDate);
+  latestWcaBackendBacktestResult = {
+    status: receipt.status ?? "QUEUED",
+    runId,
+    run_id: runId,
+    reason_codes: receipt.reason_codes ?? receipt.reasonCodes ?? ["wca.frontend.prepared_backtest_job_queued"],
+    metrics: { jobId, runId, queued: true, backendAuthoritative: true, bars: barCount, fullHistory: true },
+    trades: [],
+    decisions: [],
+  };
+  wcaPresentationState = withWcaReady(wcaPresentationState, {
+    latestBacktest: latestWcaBackendBacktestResult,
+  });
+  renderWcaPresentationMount();
+  const backendResult = await waitForWcaBacktestResult(runId, jobId);
+  if (backendResult) {
+    latestWcaBackendBacktestResult = backendResult;
+    wcaPresentationState = withWcaReady(wcaPresentationState, {
+      latestBacktest: latestWcaBackendBacktestResult,
+    });
+    renderWcaPresentationMount();
+    return backendWcaBacktestToFrontendResult(backendResult);
+  }
+  const startLabel = preparedStart.slice(0, 10);
+  const endLabel = preparedEnd.slice(0, 10) || latestSessionDate;
+  const barLabel = barCount.toLocaleString();
+  return wcaBackendQueuedBacktestResult(
+    jobId
+      ? `Backend WCA full-history backtest queued as ${jobId}: ${barLabel} prepared 1m bars from ${startLabel} to ${endLabel}.`
+      : `Backend WCA full-history backtest queued: ${barLabel} prepared 1m bars from ${startLabel} to ${endLabel}.`,
+  );
+}
+
 async function runBackendConfidenceBacktest(preparedOneMinuteCandles: Candle[], latestSessionDate: string): Promise<BacktestResult> {
   const sorted = preparedOneMinuteCandles.slice().sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
   if (sorted.length < 2) {
@@ -18880,10 +19139,13 @@ async function runBackendConfidenceBacktest(preparedOneMinuteCandles: Candle[], 
   }
   const receipt = (await response.json()) as { job_id?: string; jobId?: string; status?: string; reason_codes?: string[]; reasonCodes?: string[] };
   const jobId = receipt.job_id ?? receipt.jobId ?? "";
+  const runId = String(payload.configuration.run_id);
   latestWcaBackendBacktestResult = {
     status: receipt.status ?? "QUEUED",
+    runId,
+    run_id: runId,
     reason_codes: receipt.reason_codes ?? receipt.reasonCodes ?? ["wca.frontend.backtest_job_queued"],
-    metrics: { jobId, queued: true, backendAuthoritative: true },
+    metrics: { jobId, runId, queued: true, backendAuthoritative: true },
     trades: [],
     decisions: [],
   };
@@ -18891,7 +19153,57 @@ async function runBackendConfidenceBacktest(preparedOneMinuteCandles: Candle[], 
     latestBacktest: latestWcaBackendBacktestResult,
   });
   renderWcaPresentationMount();
-  return wcaBackendQueuedBacktestResult(jobId ? `Backend WCA backtest queued as ${jobId}. Results load from the WCA job endpoint.` : "Backend WCA backtest queued.");
+  const backendResult = await waitForWcaBacktestResult(runId, jobId);
+  if (backendResult) {
+    latestWcaBackendBacktestResult = backendResult;
+    wcaPresentationState = withWcaReady(wcaPresentationState, {
+      latestBacktest: latestWcaBackendBacktestResult,
+    });
+    renderWcaPresentationMount();
+    return backendWcaBacktestToFrontendResult(backendResult);
+  }
+  return wcaBackendQueuedBacktestResult(jobId ? `Backend WCA backtest queued as ${jobId}. Worker has not completed it yet.` : "Backend WCA backtest queued.");
+}
+
+async function waitForWcaBacktestResult(runId: string, jobId = ""): Promise<WcaBacktestResult | null> {
+  const deadline = Date.now() + 2 * 60 * 1000;
+  let lastStatus = "queued";
+  while (Date.now() < deadline) {
+    await wait(5000);
+    try {
+      const status = await fetchWcaBacktestStatus(runId);
+      lastStatus = String(status.status ?? lastStatus).toLowerCase();
+      latestWcaBackendBacktestResult = {
+        ...(latestWcaBackendBacktestResult ?? {}),
+        status: lastStatus.toUpperCase(),
+        runId,
+        run_id: runId,
+        metrics: {
+          ...((latestWcaBackendBacktestResult?.metrics ?? {}) as Record<string, unknown>),
+          jobId: String(status.jobId ?? status.job_id ?? jobId),
+          runId,
+          backendAuthoritative: true,
+          progressPercent: status.researchJob && isRecord(status.researchJob) ? status.researchJob.progress_percent ?? status.researchJob.progressPercent : undefined,
+        },
+        reason_codes: latestWcaBackendBacktestResult?.reason_codes ?? ["wca.frontend.backtest_job_queued"],
+        trades: latestWcaBackendBacktestResult?.trades ?? [],
+        decisions: latestWcaBackendBacktestResult?.decisions ?? [],
+      };
+      wcaPresentationState = withWcaReady(wcaPresentationState, {
+        latestBacktest: latestWcaBackendBacktestResult,
+      });
+      renderWcaPresentationMount();
+      if (lastStatus === "complete" || lastStatus === "succeeded") {
+        return await fetchWcaBacktest(runId);
+      }
+      if (["failed", "cancelled", "expired", "quarantined", "not_found"].includes(lastStatus)) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 function backendWcaBacktestToFrontendResult(backend: any): BacktestResult {
@@ -19038,6 +19350,34 @@ function confidenceBacktestCacheKey(candles: Candle[]) {
     first,
     last,
     symbol: state.symbol,
+    decision: state.confidenceDecisionSettings,
+    trading: {
+      startingCapital: state.confidenceTradingSettings.startingCapital,
+      dailyAllocationPercent: state.confidenceTradingSettings.dailyAllocationPercent,
+      takeProfitR: state.confidenceTradingSettings.takeProfitR,
+      slippagePerShare: state.confidenceTradingSettings.slippagePerShare,
+      useDefaultSizingSettings: state.confidenceTradingSettings.useDefaultSizingSettings,
+      baseRiskPercent: state.confidenceTradingSettings.baseRiskPercent,
+      maxPositionPercent: state.confidenceTradingSettings.maxPositionPercent,
+      maxDailyTrades: state.confidenceTradingSettings.maxTradesPerDay,
+      maxSpreadPercent: state.confidenceTradingSettings.maxSpreadPercent,
+      minimumOneMinuteVolume: state.confidenceTradingSettings.minimumOneMinuteVolume,
+      maxParticipationPercent: state.confidenceTradingSettings.maxParticipationPercent,
+      maxAllowedShares: state.confidenceTradingSettings.maxAllowedShares,
+    },
+  });
+}
+
+function confidencePreparedBacktestCacheKey(range: BacktestRange) {
+  return JSON.stringify({
+    source: "prepared-full-history",
+    symbol: state.symbol,
+    startDate: range.startDate,
+    endDate: range.endDate,
+    oneMinuteBars: range.oneMinuteBars ?? 0,
+    oneMinuteStart: range.oneMinuteStart ?? "",
+    oneMinuteEnd: range.oneMinuteEnd ?? "",
+    sourceManifest: range.sourceManifest ?? "",
     decision: state.confidenceDecisionSettings,
     trading: {
       startingCapital: state.confidenceTradingSettings.startingCapital,
@@ -22149,5 +22489,6 @@ void loadMarketContext();
 void loadCandles();
 void loadLatestDynamicTradingArtifact();
 void loadAlgoBacktestCandles();
+void refreshWcaBacktestFromPreparedDataset("startup");
 
 

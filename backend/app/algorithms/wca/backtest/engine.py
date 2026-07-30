@@ -23,6 +23,7 @@ from backend.app.algorithms.wca.contracts import (
     WcaEvaluationStatus,
     WcaMarketSnapshot,
     WcaQuote,
+    WcaRuntimeMode,
     WcaSide,
 )
 from backend.app.algorithms.wca.backtest.execution import WCA_BACKTEST_EXECUTION_SIMULATION_VERSION, simulate_wca_backtest_execution
@@ -87,7 +88,7 @@ def run_wca_backtest(request: WcaBacktestRequest, *, configuration: WcaConfigura
                 snapshot=snapshot,
                 configuration_version=configuration.configuration_version,
                 configuration=configuration,
-                runtime_mode="backtest",
+                runtime_mode=WcaRuntimeMode.HISTORICAL_REPLAY,
                 synthetic_quote_allowed=True,
                 weight_snapshot=weight_snapshot,
                 previous_market_status=previous_market_status,
@@ -317,7 +318,7 @@ def prove_wca_production_parity(
             global_gate_quantity_cap=2_147_483_647,
             approved_risk_budget=configuration.to_baseline_settings().base_risk_percent / 100.0 * 100_000,
         )
-        runtime_decision = run_wca_execution_pipeline(replace(command, runtime_mode="shadow")).decision
+        runtime_decision = run_wca_execution_pipeline(replace(command, runtime_mode=WcaRuntimeMode.SHADOW)).decision
         replay_result = run_wca_replay_pipeline_adapter(command)
         backtest_result = run_wca_backtest_pipeline_adapter(command)
         replay = replay_result.decision

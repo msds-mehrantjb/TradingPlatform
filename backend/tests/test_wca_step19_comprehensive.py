@@ -273,8 +273,9 @@ class WcaStep19AggregationTests(unittest.TestCase):
             records.append(_record("C1", cutoff - timedelta(days=50 - index), value, index))
             records.append(_record("C2", cutoff - timedelta(days=50 - index), value, index))
         snapshot = performance_weight_snapshot(records=tuple(records), cutoff=cutoff, config=WcaWeightEngineConfig(high_correlation_threshold=0.50))
-        self.assertAlmostEqual(sum(snapshot.weights.values()), 1.0, places=6)
-        self.assertTrue(all(weight >= 0 for weight in snapshot.weights.values()))
+        self.assertAlmostEqual(sum(snapshot.weights.values()) / len(snapshot.weights), 1.0, places=6)
+        self.assertAlmostEqual(sum(detail.normalized_share for detail in snapshot.details), 1.0, places=6)
+        self.assertTrue(all(0.25 <= weight <= 2.0 for weight in snapshot.weights.values()))
         penalized = [detail for detail in snapshot.details if detail.strategy_id in {"C1", "C2"}]
         self.assertTrue(all(detail.correlation_factor < 1 for detail in penalized))
 

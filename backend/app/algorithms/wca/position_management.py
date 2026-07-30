@@ -23,6 +23,9 @@ class WcaPositionManagementSettings:
     trailing_distance: float = 1.0
     time_exit_minutes: int | None = None
     end_of_day_flatten_buffer_minutes: int = 5
+    protective_order_tolerance_seconds: int = 0
+    short_positions_allowed: bool = False
+    allow_position_increase: bool = False
 
 
 class WcaManagedPosition(WcaContractModel):
@@ -61,6 +64,9 @@ class WcaPositionManagementRepository(Protocol):
     def realized_pnl_for_wca_position(self, *, account_id: str, symbol: str) -> float:
         ...
 
+    def record_position_management_critical_event(self, position: WcaManagedPosition, *, evaluated_at: datetime) -> bool:
+        ...
+
 
 def manage_wca_position(
     *,
@@ -93,6 +99,8 @@ def manage_wca_position(
         calendar=calendar or WcaMarketCalendar(),
     )
     repository.write_position_management_snapshot(position, evaluated_at=evaluated)
+    if position.circuit_breaker_open and hasattr(repository, "record_position_management_critical_event"):
+        repository.record_position_management_critical_event(position, evaluated_at=evaluated)
     return position
 
 
@@ -137,9 +145,28 @@ def build_managed_position(
     protective_triggered = (side == WcaSide.BUY.value and mark_price <= stop_price) or (side == WcaSide.SELL.value and mark_price >= stop_price)
     target_triggered = (side == WcaSide.BUY.value and mark_price >= target_price) or (side == WcaSide.SELL.value and mark_price <= target_price)
     unprotected = not any(lot.get("stop_price") for lot in lots)
-    exit_due = protective_triggered or target_triggered or signal_exit_due or time_exit_due or eod_due or emergency_due or unprotected
+    protection_age_seconds = max(0.0, (evaluated_at - opened_at).total_seconds())
+    protection_overdue = unprotected and protection_age_seconds >= config.protective_order_tolerance_seconds
+    short_disallowed = side == WcaSide.SELL.value and not config.short_positions_allowed
+    distinct_intents = {str(lot.get("payload", {}).get("order_intent_id") or lot.get("lot_id")) for lot in lots}
+    increase_disallowed = len(distinct_intents) > 1 and not config.allow_position_increase
+    exit_due = protective_triggered or target_triggered or signal_exit_due or time_exit_due or eod_due or emergency_due or unprotected or short_disallowed or increase_disallowed
+    if protective_triggered:
+        reason_codes.append("wca.position.exit.stop_loss")
+    if target_triggered:
+        reason_codes.append("wca.position.exit.profit_target")
+    if signal_exit_due:
+        reason_codes.append("wca.position.exit.signal")
+    if time_exit_due:
+        reason_codes.append("wca.position.exit.time_based")
     if unprotected:
+        reason_codes.append("wca.position.protection_missing")
+    if protection_overdue:
         reason_codes.append("wca.position.circuit_breaker.unprotected_position")
+    if short_disallowed:
+        reason_codes.append("wca.position.circuit_breaker.short_not_allowed")
+    if increase_disallowed:
+        reason_codes.append("wca.position.circuit_breaker.position_increase_not_allowed")
     if emergency_due:
         reason_codes.append("wca.position.global_emergency_risk_reduction")
     if eod_due:
@@ -163,7 +190,7 @@ def build_managed_position(
         signal_exit_due=signal_exit_due,
         end_of_day_exit_due=eod_due,
         emergency_exit_due=emergency_due,
-        circuit_breaker_open=unprotected,
+        circuit_breaker_open=protection_overdue or short_disallowed or increase_disallowed,
         pending_exit_orders=pending,
         reason_codes=tuple(dict.fromkeys(reason_codes)),
     )

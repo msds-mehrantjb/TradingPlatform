@@ -74,17 +74,21 @@ class WcaStep16DiagnosticsTests(unittest.TestCase):
         self.assertFalse(rejected_ids & trade_ids)
 
     def test_global_rejected_orders_have_counterfactuals_without_executed_trades(self) -> None:
-        def reject_all_global_gates(*args, **kwargs):
-            return SimpleNamespace(
-                allow_new_entries=False,
-                approved_quantity=0,
-                proposed_quantity=kwargs.get("quantity", args[2] if len(args) > 2 else 0),
-                reason_codes=("global_gate.test_reject",),
-            )
+        class RejectAllGlobalRiskAdapter:
+            def evaluate_wca_proposal(self, proposal):
+                return SimpleNamespace(
+                    approved_quantity=0,
+                    approved_risk=0.0,
+                    entry_permitted=False,
+                    risk_reducing_exit_permitted=True,
+                    idempotency_key=proposal.idempotency_key,
+                    reason_codes=("global_gate.test_reject",),
+                    explanation="Test rejection.",
+                )
 
         with (
             patch("backend.app.algorithms.wca.backtest.engine.WCA_PRIMARY_VOTERS", fake_voters(WcaSide.BUY)),
-            patch("backend.app.algorithms.wca.backtest.engine._simulate_global_gate", reject_all_global_gates),
+            patch("backend.app.algorithms.wca.execution_pipeline.WcaGlobalRiskAdapter", RejectAllGlobalRiskAdapter),
         ):
             result = run_wca_backtest(backtest_request(side_mode=WcaBacktestSideMode.LONG_AND_SHORT), configuration=default_wca_configuration())
 

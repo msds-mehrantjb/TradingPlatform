@@ -79,13 +79,12 @@ class WcaStep2LegacyBackendEngineTest(unittest.TestCase):
         self.assertEqual(updated.json()["decisionSettings"]["buyThreshold"], 0.36)
 
         response = client.post("/api/wca/evaluate", json=self.snapshots[0])
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 202)
         body = response.json()
-        self.assertEqual(body["algorithmId"], "wca")
-        self.assertEqual(body["engineVersion"], "wca_legacy_compatible_v1")
-        self.assertIn("strategyEvaluations", body)
-        self.assertIn("localGateResult", body)
-        self.assertIn("sizingResult", body)
+        self.assertTrue(body["queued"])
+        self.assertEqual(body["job_type"], "shadow_comparison")
+        self.assertIn("job_id", body)
+        self.assertIn("wca.api.shadow_comparison.enqueued_research_job", body["reason_codes"])
 
     def test_api_rejects_missing_strategy_snapshot(self) -> None:
         client = TestClient(app)

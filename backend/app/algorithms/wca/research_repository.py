@@ -212,10 +212,69 @@ class WcaResearchRepository:
             )
         return candidate_id
 
+    def read_candidate_result(self, candidate_id: str) -> dict[str, Any] | None:
+        with self.repository.connect() as conn:
+            row = conn.execute("SELECT * FROM wca_research_candidates WHERE candidate_id = ? AND algorithm_id = ?", (candidate_id, WCA_ALGORITHM_ID)).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row["payload_json"] or "{}")
+        return {
+            "candidate_id": row["candidate_id"],
+            "candidate_type": row["candidate_type"],
+            "candidate_version": row["candidate_version"],
+            "validation_status": row["validation_status"],
+            "promotion_status": row["promotion_status"],
+            "payload": payload,
+        }
+
+    def update_candidate_status(
+        self,
+        candidate_id: str,
+        *,
+        validation_status: str | None = None,
+        promotion_status: str | None = None,
+        payload_updates: dict[str, Any] | None = None,
+    ) -> None:
+        candidate = self.read_candidate_result(candidate_id)
+        if candidate is None:
+            raise KeyError(candidate_id)
+        payload = dict(candidate["payload"])
+        payload.update(payload_updates or {})
+        with self.repository.connect() as conn:
+            conn.execute(
+                """
+                UPDATE wca_research_candidates
+                SET validation_status = COALESCE(?, validation_status),
+                    promotion_status = COALESCE(?, promotion_status),
+                    payload_json = ?
+                WHERE candidate_id = ? AND algorithm_id = ?
+                """,
+                (validation_status, promotion_status, _json(payload), candidate_id, WCA_ALGORITHM_ID),
+            )
+
     def read_job(self, job_id: str) -> WcaResearchJobSnapshot | None:
         row = self._row(job_id)
         if row is None:
             return None
+        return self._snapshot(row)
+
+    def read_latest_job_for_run(self, run_id: str) -> WcaResearchJobSnapshot | None:
+        with self.repository.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM wca_background_jobs
+                WHERE algorithm_id = ? AND run_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (WCA_ALGORITHM_ID, run_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._snapshot(row)
+
+    def _snapshot(self, row) -> WcaResearchJobSnapshot:
         return WcaResearchJobSnapshot(
             job_id=row["job_id"],
             job_type=row["job_type"],

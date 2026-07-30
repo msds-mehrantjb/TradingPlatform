@@ -19,7 +19,9 @@ from backend.app.algorithms.wca.contracts import (
     WcaEffectiveSettings,
     WcaEvaluationStatus,
     WcaMarketStatus,
+    WcaRuntimeMode,
     WcaTradingSettings,
+    coerce_wca_runtime_mode,
 )
 from backend.app.algorithms.wca.dynamic_profile import WcaDynamicProfileConfig, resolve_dynamic_profile
 from backend.app.algorithms.wca.strategy_registry import (
@@ -187,10 +189,55 @@ class WcaWeightSettings(WcaContractModel):
 
 class WcaRuntimeSettings(WcaContractModel):
     settings_version: str = WCA_SETTINGS_VERSION
+    runtime_mode: WcaRuntimeMode = WcaRuntimeMode.SHADOW
     fail_closed_for_missing_configuration: bool = True
     require_completed_one_minute_bars: bool = True
     block_new_entries_on_configuration_error: bool = True
     runtime_default_baseline_construction_allowed: bool = False
+    maximum_finalized_bar_age_seconds: int = Field(default=20, ge=1)
+    maximum_quote_age_seconds: int = Field(default=15, ge=1)
+    maximum_authoritative_account_state_age_seconds: int = Field(default=120, ge=1)
+    maximum_reconciliation_age_seconds: int = Field(default=120, ge=1)
+    maximum_queue_delay_seconds: int = Field(default=20, ge=1)
+    maximum_clock_skew_seconds: int = Field(default=2, ge=0)
+
+    @field_validator("runtime_mode", mode="before")
+    @classmethod
+    def validate_runtime_mode(cls, value: WcaRuntimeMode | str) -> WcaRuntimeMode:
+        return coerce_wca_runtime_mode(value)
+
+
+class WcaLimitedAutomaticPaperSettings(WcaContractModel):
+    settings_version: str = WCA_SETTINGS_VERSION
+    enabled: bool = True
+    symbol: str = "SPY"
+    max_quantity: int = Field(default=10, ge=1)
+    max_daily_trades: int = Field(default=3, ge=0)
+    max_daily_loss_dollars: float = Field(default=100.0, ge=0)
+    entry_windows: tuple[str, ...] = ("10:00-11:30 America/New_York", "13:30-15:30 America/New_York")
+    permitted_strategy_ids: tuple[str, ...] = ("C1", "C4", "C7")
+    shadow_strategy_ids: tuple[str, ...] = tuple(entry.strategy_id for entry in WCA_STRATEGY_REGISTRY if entry.strategy_id not in {"C1", "C4", "C7"})
+    broker_account_id: str = "paper"
+    rollout_stage: str = "LIMITED_AUTOMATIC_PAPER"
+    permitted_order_types: tuple[str, ...] = ("LIMIT",)
+
+    @model_validator(mode="after")
+    def validate_limited_controls(self) -> "WcaLimitedAutomaticPaperSettings":
+        if self.symbol.upper() != "SPY":
+            raise ValueError("limited automatic paper is currently SPY-only")
+        expected = {entry.strategy_id for entry in WCA_STRATEGY_REGISTRY}
+        unknown = set(self.permitted_strategy_ids) - expected
+        if unknown:
+            raise ValueError(f"unknown WCA limited-paper strategy IDs: {sorted(unknown)}")
+        if not self.permitted_strategy_ids:
+            raise ValueError("limited automatic paper requires at least one permitted strategy")
+        if any(order_type.upper() not in {"LIMIT", "STOP_LIMIT"} for order_type in self.permitted_order_types):
+            raise ValueError("limited automatic paper permits only explicit WCA paper order types")
+        for window in self.entry_windows:
+            _validate_entry_window(window)
+        if not self.broker_account_id:
+            raise ValueError("limited automatic paper requires WCA broker account identity")
+        return self
 
 
 class WcaModuleSettings(WcaContractModel):
@@ -625,6 +672,7 @@ class WcaConfiguration(WcaContractModel):
     calibration: WcaCalibrationSettings = Field(default_factory=WcaCalibrationSettings)
     weights: WcaWeightSettings = Field(default_factory=WcaWeightSettings)
     runtime: WcaRuntimeSettings = Field(default_factory=WcaRuntimeSettings)
+    limited_automatic_paper: WcaLimitedAutomaticPaperSettings = Field(default_factory=WcaLimitedAutomaticPaperSettings)
     primary_strategy_settings: WcaPrimaryStrategySettings = Field(default_factory=WcaPrimaryStrategySettings)
     modifier_settings: WcaModifierSettings = Field(default_factory=WcaModifierSettings)
     hard_filter_settings: WcaHardFilterSettings = Field(default_factory=WcaHardFilterSettings)
@@ -657,6 +705,8 @@ class WcaConfiguration(WcaContractModel):
         return WcaConfiguration.model_validate(payload)
 
     def to_baseline_settings(self) -> WcaBaselineSettings:
+        limited_active = coerce_wca_runtime_mode(self.runtime.runtime_mode) == WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER and self.limited_automatic_paper.enabled
+        controls = self.limited_automatic_paper
         return WcaBaselineSettings(
             settings_version=f"{self.configuration_version}:{self.content_hash[:12]}",
             created_at=self.created_at,
@@ -670,12 +720,18 @@ class WcaConfiguration(WcaContractModel):
             minimum_average_confidence=self.aggregation.minimum_average_confidence,
             base_risk_percent=self.risk.base_risk_percent,
             max_daily_loss_percent=self.risk.max_daily_loss_percent,
+            max_daily_loss_dollars=controls.max_daily_loss_dollars if limited_active else None,
             max_daily_trades=self.risk.max_daily_trades,
             order_allocation_percent=self.sizing.order_allocation_percent,
             daily_allocation_percent=self.sizing.daily_allocation_percent,
             max_position_percent=self.sizing.max_position_percent,
             max_participation_percent=self.sizing.max_participation_percent,
             max_allowed_shares=self.sizing.max_allowed_shares,
+            entry_windows=controls.entry_windows if limited_active else (),
+            permitted_strategy_ids=controls.permitted_strategy_ids if limited_active else tuple(entry.strategy_id for entry in WCA_STRATEGY_REGISTRY),
+            permitted_order_types=controls.permitted_order_types if limited_active else ("LIMIT", "STOP_LIMIT"),
+            rollout_stage=controls.rollout_stage if limited_active else _enum_value(self.runtime.runtime_mode),
+            broker_account_id=controls.broker_account_id,
             configured_fee_per_share=self.execution.configured_fee_per_share,
             market_impact_bps=self.execution.market_impact_bps,
             adverse_selection_bps=self.execution.adverse_selection_bps,
@@ -698,6 +754,26 @@ class WcaConfiguration(WcaContractModel):
             hard_max_position_percent=self.sizing.hard_max_position_percent,
             hard_max_allowed_shares=self.sizing.hard_max_allowed_shares,
         )
+
+    def for_runtime_mode(self, runtime_mode: WcaRuntimeMode | str) -> "WcaConfiguration":
+        mode = coerce_wca_runtime_mode(runtime_mode)
+        if mode != WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER or not self.limited_automatic_paper.enabled:
+            return self
+        controls = self.limited_automatic_paper
+        payload = self.model_dump(mode="python")
+        payload["sizing"] = {
+            **payload["sizing"],
+            "max_allowed_shares": min(_positive_or_unlimited(self.sizing.max_allowed_shares, controls.max_quantity), controls.max_quantity),
+            "hard_max_allowed_shares": min(_positive_or_unlimited(self.sizing.hard_max_allowed_shares, controls.max_quantity), controls.max_quantity),
+        }
+        payload["risk"] = {
+            **payload["risk"],
+            "max_daily_trades": min(self.risk.max_daily_trades, controls.max_daily_trades),
+            "hard_max_daily_trades": min(self.risk.hard_max_daily_trades, controls.max_daily_trades),
+        }
+        payload["runtime"] = {**payload["runtime"], "runtime_mode": mode.value}
+        payload["content_hash"] = ""
+        return WcaConfiguration.model_validate(payload)
 
 
 def content_hash_for_configuration(configuration: WcaConfiguration | dict[str, Any]) -> str:
@@ -844,3 +920,27 @@ def _validate_catalog_settings_alignment(configuration: WcaConfiguration) -> Non
         raise ValueError("modifier_settings must match the authoritative WCA modifier catalog")
     if filters != expected_filters:
         raise ValueError("hard_filter_settings must match the authoritative WCA hard-filter catalog")
+
+
+def _validate_entry_window(window: str) -> None:
+    try:
+        times, timezone_name = window.rsplit(" ", 1)
+        start, end = times.split("-", 1)
+        start_hour, start_minute = (int(part) for part in start.split(":", 1))
+        end_hour, end_minute = (int(part) for part in end.split(":", 1))
+    except Exception as exc:
+        raise ValueError("entry window must be 'HH:MM-HH:MM America/New_York'") from exc
+    if timezone_name != "America/New_York":
+        raise ValueError("WCA limited-paper entry windows must use America/New_York")
+    if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23 and 0 <= start_minute <= 59 and 0 <= end_minute <= 59):
+        raise ValueError("entry window time is out of range")
+    if (end_hour, end_minute) <= (start_hour, start_minute):
+        raise ValueError("entry window end must be after start")
+
+
+def _positive_or_unlimited(value: int, fallback: int) -> int:
+    return value if value > 0 else fallback
+
+
+def _enum_value(value: Any) -> str:
+    return value.value if hasattr(value, "value") else str(value)

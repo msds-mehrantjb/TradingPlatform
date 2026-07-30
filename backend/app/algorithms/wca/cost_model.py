@@ -41,6 +41,9 @@ def estimate_wca_round_trip_cost(model_input: WcaCostModelInput) -> WcaCostEstim
     replacement = _bps(price, baseline.replacement_cost_bps)
     fees = baseline.configured_fee_per_share * 2.0
     observed_slippage = baseline.observed_slippage_per_share
+    partial_fill_risk = replacement
+    order_delay_cost = adverse_selection
+    regulatory_fees = fees
     conservative_round_trip = max(
         0.0,
         (spread / 2.0)
@@ -66,6 +69,9 @@ def estimate_wca_round_trip_cost(model_input: WcaCostModelInput) -> WcaCostEstim
         market_impact_per_share=impact,
         adverse_selection_per_share=adverse_selection,
         nonfill_or_replacement_per_share=replacement,
+        partial_fill_risk_per_share=partial_fill_risk,
+        order_delay_cost_per_share=order_delay_cost,
+        regulatory_fees_per_share=regulatory_fees,
         fees_per_share=fees,
         observed_wca_slippage_per_share=observed_slippage,
         conservative_round_trip_cost_per_share=conservative_round_trip,

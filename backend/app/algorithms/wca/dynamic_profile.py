@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from backend.app.algorithms.wca.contracts import (
     WcaAlgorithmRiskStatus,
@@ -114,9 +115,10 @@ def resolve_dynamic_profile(
         return proposed
     previous_age = (calculated_at - previous_profile.calculation_timestamp).total_seconds()
     if previous_age < config.minimum_profile_hold_seconds and previous_profile.expiration_timestamp > calculated_at:
-        return previous_profile.model_copy(
+        held = previous_profile.model_copy(
             update={"reason_codes": (*previous_profile.reason_codes, "wca.dynamic_profile.hold_previous")}
         )
+        return held.model_copy(update={"effective_settings": _with_transition_state(held.effective_settings, "held_previous")})
     return proposed
 
 
@@ -134,6 +136,7 @@ def _baseline_effective_settings(
         baseline=baseline,
         baseline_settings_version=baseline.settings_version,
         profile_id="baseline",
+        dynamic_profile_name="baseline",
         profile_version=profile_version,
         market_status=market_status,
         active_overlays=("baseline",),
@@ -149,8 +152,14 @@ def _baseline_effective_settings(
         final_daily_allocation_percent=min(baseline.daily_allocation_percent, baseline.hard_max_daily_allocation_percent),
         final_max_position_percent=min(baseline.max_position_percent, baseline.hard_max_position_percent),
         final_max_daily_loss_percent=min(baseline.max_daily_loss_percent, baseline.hard_max_daily_loss_percent),
+        final_max_daily_loss_dollars=baseline.max_daily_loss_dollars,
         final_max_daily_trades=baseline.max_daily_trades,
         final_max_allowed_shares=_min_nonzero_cap(baseline.max_allowed_shares, baseline.hard_max_allowed_shares),
+        final_entry_windows=baseline.entry_windows,
+        final_permitted_strategy_ids=baseline.permitted_strategy_ids,
+        final_permitted_order_types=baseline.permitted_order_types,
+        final_rollout_stage=baseline.rollout_stage,
+        final_broker_account_id=baseline.broker_account_id,
         final_minimum_score=baseline.minimum_score,
         final_minimum_agreement=baseline.minimum_directional_agreement,
         final_minimum_confidence=baseline.minimum_average_confidence,
@@ -166,6 +175,9 @@ def _baseline_effective_settings(
         final_uncertainty_buffer_per_share=baseline.uncertainty_buffer_per_share,
         final_pyramiding_enabled=baseline.pyramiding_enabled,
         entries_blocked=False,
+        overlay_values={"baseline": True},
+        effective_configuration=_effective_configuration_payload(baseline, "baseline", ("baseline",)),
+        profile_transition_state="calculated",
         reason_codes=("wca.dynamic_profile.baseline",),
     )
 
@@ -193,13 +205,17 @@ def _effective_from_overlays(
     stop_multiplier_cap = min(overlay.stop_multiplier_cap for overlay in overlays)
     entries_blocked = any(overlay.block_entries for overlay in overlays)
 
+    profile_id = _profile_id(overlays)
+    active_overlays = tuple(overlay.name for overlay in overlays)
+    overlay_values = _overlay_values(overlays)
     return WcaEffectiveSettings(
         baseline=baseline,
         baseline_settings_version=baseline.settings_version,
-        profile_id=_profile_id(overlays),
+        profile_id=profile_id,
+        dynamic_profile_name=profile_id,
         profile_version=config.profile_version,
         market_status=market_status,
-        active_overlays=tuple(overlay.name for overlay in overlays),
+        active_overlays=active_overlays,
         effective_at=calculated_at,
         expiration_timestamp=calculated_at + timedelta(seconds=config.profile_ttl_seconds),
         risk_multiplier=risk_multiplier,
@@ -212,8 +228,14 @@ def _effective_from_overlays(
         final_daily_allocation_percent=min(baseline.daily_allocation_percent * allocation_multiplier, baseline.daily_allocation_percent, baseline.hard_max_daily_allocation_percent),
         final_max_position_percent=min(baseline.max_position_percent * quantity_multiplier, baseline.max_position_percent, baseline.hard_max_position_percent),
         final_max_daily_loss_percent=min(baseline.max_daily_loss_percent, baseline.hard_max_daily_loss_percent),
+        final_max_daily_loss_dollars=baseline.max_daily_loss_dollars,
         final_max_daily_trades=max(0, int(baseline.max_daily_trades * max_trades_multiplier)),
         final_max_allowed_shares=_scaled_share_cap(baseline.max_allowed_shares, baseline.hard_max_allowed_shares, quantity_multiplier),
+        final_entry_windows=baseline.entry_windows,
+        final_permitted_strategy_ids=baseline.permitted_strategy_ids,
+        final_permitted_order_types=baseline.permitted_order_types,
+        final_rollout_stage=baseline.rollout_stage,
+        final_broker_account_id=baseline.broker_account_id,
         final_minimum_score=min(1, baseline.minimum_score + threshold_adjustment),
         final_minimum_agreement=min(1, baseline.minimum_directional_agreement + agreement_adjustment),
         final_minimum_confidence=min(1, baseline.minimum_average_confidence + confidence_adjustment),
@@ -229,6 +251,9 @@ def _effective_from_overlays(
         final_uncertainty_buffer_per_share=baseline.uncertainty_buffer_per_share * slippage_multiplier,
         final_pyramiding_enabled=baseline.pyramiding_enabled and False,
         entries_blocked=entries_blocked,
+        overlay_values=overlay_values,
+        effective_configuration=_effective_configuration_payload(baseline, profile_id, active_overlays, overlay_values=overlay_values),
+        profile_transition_state="calculated",
         reason_codes=("wca.dynamic_profile.effective",),
     )
 
@@ -310,6 +335,54 @@ def _defensiveness_score(settings: WcaEffectiveSettings) -> float:
         + (1 if settings.entries_blocked else 0)
         + max(0, settings.final_cooldown_seconds / 900)
     )
+
+
+def _with_transition_state(settings: WcaEffectiveSettings, state: str) -> WcaEffectiveSettings:
+    return settings.model_copy(update={"profile_transition_state": state})
+
+
+def _overlay_values(overlays: tuple[_Overlay, ...]) -> dict[str, object]:
+    return {
+        overlay.name: {
+            "risk_multiplier": overlay.risk_multiplier,
+            "quantity_multiplier": overlay.quantity_multiplier,
+            "allocation_multiplier": overlay.allocation_multiplier,
+            "threshold_adjustment": overlay.threshold_adjustment,
+            "agreement_adjustment": overlay.agreement_adjustment,
+            "confidence_adjustment": overlay.confidence_adjustment,
+            "max_trades_multiplier": overlay.max_trades_multiplier,
+            "cooldown_seconds": overlay.cooldown_seconds,
+            "slippage_multiplier": overlay.slippage_multiplier,
+            "stop_multiplier_cap": overlay.stop_multiplier_cap,
+            "block_entries": overlay.block_entries,
+        }
+        for overlay in overlays
+    }
+
+
+def _effective_configuration_payload(
+    baseline: WcaBaselineSettings,
+    profile_id: str,
+    active_overlays: tuple[str, ...],
+    *,
+    overlay_values: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "baseline_configuration_version": baseline.settings_version,
+        "dynamic_profile_name": profile_id,
+        "active_overlays": active_overlays,
+        "overlay_values": overlay_values or {"baseline": True},
+        "limited_automatic_paper": {
+            "entry_windows": baseline.entry_windows,
+            "permitted_strategy_ids": baseline.permitted_strategy_ids,
+            "max_allowed_shares": baseline.max_allowed_shares,
+            "max_daily_trades": baseline.max_daily_trades,
+            "max_daily_loss_dollars": baseline.max_daily_loss_dollars,
+            "broker_account_id": baseline.broker_account_id,
+            "permitted_order_types": baseline.permitted_order_types,
+            "rollout_stage": baseline.rollout_stage,
+        },
+    }
 
 
 def _scaled_share_cap(max_allowed_shares: int, hard_cap: int, multiplier: float) -> int:

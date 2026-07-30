@@ -28,6 +28,10 @@ export type WcaStrategyEvaluation = WcaReasonedRecord & {
   calibrated_confidence?: number;
   effectiveWeight?: number;
   effective_weight?: number;
+  adjustedWeight?: number;
+  adjusted_weight?: number;
+  scoreContribution?: number;
+  score_contribution?: number;
   baseWeight?: number;
   base_weight?: number;
   contribution?: number;
@@ -49,6 +53,10 @@ export type WcaStrategyContribution = WcaReasonedRecord & {
   base_weight?: number;
   effectiveWeight?: number;
   effective_weight?: number;
+  adjustedWeight?: number;
+  adjusted_weight?: number;
+  scoreContribution?: number;
+  score_contribution?: number;
   contribution?: number;
   excluded?: boolean;
   exclusionReason?: string;
@@ -57,6 +65,10 @@ export type WcaStrategyContribution = WcaReasonedRecord & {
 
 export type WcaFamilyContribution = WcaReasonedRecord & {
   family?: string;
+  buyScore?: number;
+  buy_score?: number;
+  sellScore?: number;
+  sell_score?: number;
   buyContribution?: number;
   buy_contribution?: number;
   sellContribution?: number;
@@ -65,28 +77,53 @@ export type WcaFamilyContribution = WcaReasonedRecord & {
   hold_contribution?: number;
   activeWeight?: number;
   active_weight?: number;
+  directionalWeight?: number;
+  directional_weight?: number;
+  totalWeight?: number;
+  total_weight?: number;
   capped?: boolean;
 };
 
 export type WcaAggregationResult = WcaReasonedRecord & {
+  signal?: WcaSide;
+  decisionLabel?: string;
+  decision_label?: string;
   buyScore?: number;
   buy_score?: number;
   sellScore?: number;
   sell_score?: number;
+  netScore?: number;
+  net_score?: number;
   activeWeight?: number;
   active_weight?: number;
   normalizedNetScore?: number;
   normalized_net_score?: number;
   agreement?: number;
+  activeStrategyCount?: number;
+  active_strategy_count?: number;
+  buyAgreement?: number;
+  buy_agreement?: number;
+  sellAgreement?: number;
+  sell_agreement?: number;
   averageConfidence?: number;
   average_confidence?: number;
+  buyAverageConfidence?: number;
+  buy_average_confidence?: number;
+  sellAverageConfidence?: number;
+  sell_average_confidence?: number;
   winnerEdge?: number;
   winner_edge?: number;
   preGateDecision?: WcaSide;
   pre_gate_decision?: WcaSide;
+  postLocalGateDecision?: WcaSide;
+  post_local_gate_decision?: WcaSide;
   effectiveDecision?: WcaSide;
   effective_decision?: WcaSide;
   contributions?: WcaStrategyContribution[];
+  strategyContributions?: WcaStrategyContribution[];
+  strategy_contributions?: WcaStrategyContribution[];
+  strategyEvaluations?: WcaStrategyEvaluation[];
+  strategy_evaluations?: WcaStrategyEvaluation[];
   familyContributions?: WcaFamilyContribution[];
   family_contributions?: WcaFamilyContribution[];
   exclusions?: WcaStrategyContribution[];
@@ -144,10 +181,18 @@ export type WcaLocalGateEvaluation = WcaReasonedRecord & {
 };
 
 export type WcaLocalGateResult = WcaReasonedRecord & {
+  gateId?: string;
+  gate_id?: string;
   decision?: WcaGateStatus;
   status?: WcaGateStatus;
   allowEntry?: boolean;
   allow_entry?: boolean;
+  blocksEntry?: boolean;
+  blocks_entry?: boolean;
+  entryBlocked?: boolean;
+  entry_blocked?: boolean;
+  exitAllowed?: boolean;
+  exit_allowed?: boolean;
   evaluations?: WcaLocalGateEvaluation[];
   gates?: WcaLocalGateEvaluation[];
 };
@@ -163,6 +208,18 @@ export type WcaGlobalGateResult = WcaReasonedRecord & {
   requested_quantity?: number;
   approvedQuantity?: number;
   approved_quantity?: number;
+  proposedQuantity?: number;
+  proposed_quantity?: number;
+  allowedQuantity?: number;
+  allowed_quantity?: number;
+  entryPermitted?: boolean;
+  entry_permitted?: boolean;
+  riskReducingExitPermitted?: boolean;
+  risk_reducing_exit_permitted?: boolean;
+  requestedRisk?: number;
+  requested_risk?: number;
+  approvedRisk?: number;
+  approved_risk?: number;
   blockers?: string[];
   warnings?: string[];
 };
@@ -176,10 +233,19 @@ export type WcaSizingResult = WcaReasonedRecord & {
   globally_approved_quantity?: number;
   limitingCap?: string;
   limiting_cap?: string;
+  limitingFactor?: string;
+  limiting_factor?: string;
   stopDistance?: number;
   stop_distance?: number;
   riskDollars?: number;
   risk_dollars?: number;
+  entryPrice?: number;
+  entry_price?: number;
+  stopPrice?: number;
+  stop_price?: number;
+  targetPrice?: number;
+  target_price?: number;
+  side?: WcaSide;
 };
 
 export type WcaProposedOrder = WcaReasonedRecord & {
@@ -228,8 +294,13 @@ export type WcaDecision = WcaReasonedRecord & {
   effective_settings?: WcaEffectiveSettings;
   localGateResult?: WcaLocalGateResult;
   local_gate_result?: WcaLocalGateResult;
+  localGates?: WcaLocalGateResult[];
+  local_gates?: WcaLocalGateResult[];
+  hardFilterResults?: WcaLocalGateResult[];
+  hard_filter_results?: WcaLocalGateResult[];
   globalGateResult?: WcaGlobalGateResult;
   global_gate_result?: WcaGlobalGateResult;
+  sizing?: WcaSizingResult;
   sizingResult?: WcaSizingResult;
   sizing_result?: WcaSizingResult;
   proposedOrder?: WcaProposedOrder;
@@ -335,6 +406,12 @@ export type WcaStatusResponse = {
   virtual_inventory?: Record<string, unknown>;
   reasonCodes?: string[];
   reason_codes?: string[];
+};
+
+export type WcaDecisionsResponse = {
+  algorithmId?: string;
+  algorithm_id?: string;
+  decisions?: WcaDecision[];
 };
 
 export type WcaBaselineSettings = Record<string, unknown>;

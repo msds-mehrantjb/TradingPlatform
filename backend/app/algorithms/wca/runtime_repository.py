@@ -7,8 +7,10 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 
 from backend.app.algorithms.wca.contracts import WCA_ALGORITHM_ID
+from backend.app.algorithms.wca.contracts import WcaLatencySnapshot
 from backend.app.algorithms.wca.repository import WcaSqliteRepository
 from backend.app.algorithms.wca.runtime_commands import WcaRuntimeCommand, WcaRuntimeCommandStatus, WcaRuntimeCommandType
 from backend.app.algorithms.wca.runtime_events import WCA_RUNTIME_EVENT_SCHEMA_VERSION, WcaFinalizedBarEvent
@@ -61,6 +63,17 @@ class WcaRuntimeRepository:
             ).fetchone()[0]
             if latest and event.finalized_candle_timestamp.astimezone(timezone.utc).isoformat() <= str(latest):
                 return WcaRuntimeQueueResult(False, "rejected", ("wca.runtime.event.out_of_order",))
+            queue_reason_codes = ["wca.runtime.event.accepted", *event.reason_codes]
+            if latest:
+                latest_timestamp = _parse_dt(str(latest))
+                if event.finalized_candle_timestamp.astimezone(timezone.utc) - latest_timestamp > timedelta(minutes=1):
+                    queue_reason_codes.append("wca.runtime.event.missing_minute_gap")
+                    event = event.model_copy(
+                        update={
+                            "reason_codes": tuple(dict.fromkeys((*event.reason_codes, "wca.runtime.event.missing_minute_gap"))),
+                            "missing_input_reason_codes": tuple(dict.fromkeys((*event.missing_input_reason_codes, "wca.runtime.event.missing_minute_gap"))),
+                        }
+                    )
             conn.execute(
                 """
                 INSERT INTO wca_runtime_event_queue (
@@ -91,12 +104,12 @@ class WcaRuntimeRepository:
                     event.source,
                     1 if event.replay_or_recovery else 0,
                     "queued",
-                    _json(("wca.runtime.event.accepted",)),
+                    _json(tuple(dict.fromkeys(queue_reason_codes))),
                     event.model_dump_json(),
                     _dt(current),
                 ),
             )
-        return WcaRuntimeQueueResult(True, "queued", ("wca.runtime.event.accepted",))
+        return WcaRuntimeQueueResult(True, "queued", tuple(dict.fromkeys(queue_reason_codes)))
 
     def claim_next_event(self, *, owner_id: str, lease_seconds: int = 30) -> WcaFinalizedBarEvent | None:
         now = _utc_now()
@@ -337,6 +350,141 @@ class WcaRuntimeRepository:
                 "commands": _count_queue(conn, "wca_runtime_command_queue"),
             }
 
+    def queue_ages(self, *, now: datetime | None = None) -> dict[str, float]:
+        current = now or _utc_now()
+        with self.repository.connect() as conn:
+            event_age = _oldest_age_seconds(conn, "wca_runtime_event_queue", current)
+            command_age = _oldest_age_seconds(conn, "wca_runtime_command_queue", current)
+        return {"events": event_age, "commands": command_age, "maximum": max(event_age, command_age)}
+
+    def database_available(self) -> bool:
+        try:
+            with self.repository.connect() as conn:
+                conn.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            return False
+
+    def record_latency_snapshot(self, latency: WcaLatencySnapshot | None, *, account_id: str = "paper", symbol: str = "SPY", timestamp: datetime | None = None) -> None:
+        if latency is None:
+            return
+        current = timestamp or _utc_now()
+        metrics = latency.metrics.model_dump(mode="python")
+        for field_name, value in metrics.items():
+            if not field_name.endswith("_seconds"):
+                continue
+            self.record_latency_observation(
+                component=field_name.removesuffix("_seconds"),
+                value_seconds=value,
+                account_id=account_id,
+                symbol=symbol,
+                timestamp=current,
+                reason_codes=latency.metrics.reason_codes,
+                payload={"timestamps": latency.timestamps.model_dump(mode="json")},
+            )
+
+    def record_latency_observation(
+        self,
+        *,
+        component: str,
+        value_seconds: float | None,
+        account_id: str = "paper",
+        symbol: str = "SPY",
+        timestamp: datetime | None = None,
+        failed: bool = False,
+        reason_codes: tuple[str, ...] = (),
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        current = timestamp or _utc_now()
+        latency_id = f"wca-latency-{account_id}-{symbol}-{component}-{uuid4().hex}"
+        with self.repository.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO wca_runtime_latency_observations (
+                    latency_id, algorithm_id, account_id, symbol, timestamp,
+                    component, value_seconds, failed, reason_codes_json, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (latency_id, WCA_ALGORITHM_ID, account_id, symbol, _dt(current), component, value_seconds, 1 if failed else 0, _json(reason_codes), _json(payload or {})),
+            )
+            rows = conn.execute(
+                """
+                SELECT value_seconds, failed
+                FROM wca_runtime_latency_observations
+                WHERE algorithm_id = ? AND account_id = ? AND symbol = ? AND component = ?
+                """,
+                (WCA_ALGORITHM_ID, account_id, symbol, component),
+            ).fetchall()
+            values = sorted(float(row["value_seconds"]) for row in rows if row["value_seconds"] is not None)
+            failures = sum(1 for row in rows if int(row["failed"]))
+            summary = {
+                "component": component,
+                "sample_count": len(values),
+                "failure_count": failures,
+                "p50_seconds": _percentile(values, 0.50),
+                "p95_seconds": _percentile(values, 0.95),
+                "p99_seconds": _percentile(values, 0.99),
+                "max_seconds": max(values) if values else None,
+            }
+            conn.execute(
+                """
+                INSERT INTO wca_runtime_latency_summaries (
+                    summary_id, algorithm_id, account_id, symbol, component,
+                    sample_count, failure_count, p50_seconds, p95_seconds,
+                    p99_seconds, max_seconds, payload_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(algorithm_id, account_id, symbol, component) DO UPDATE SET
+                    sample_count = excluded.sample_count,
+                    failure_count = excluded.failure_count,
+                    p50_seconds = excluded.p50_seconds,
+                    p95_seconds = excluded.p95_seconds,
+                    p99_seconds = excluded.p99_seconds,
+                    max_seconds = excluded.max_seconds,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    f"wca-latency-summary-{account_id}-{symbol}-{component}",
+                    WCA_ALGORITHM_ID,
+                    account_id,
+                    symbol,
+                    component,
+                    summary["sample_count"],
+                    summary["failure_count"],
+                    summary["p50_seconds"],
+                    summary["p95_seconds"],
+                    summary["p99_seconds"],
+                    summary["max_seconds"],
+                    _json(summary),
+                    _dt(current),
+                ),
+            )
+
+    def read_latency_summaries(self, *, account_id: str = "paper", symbol: str = "SPY") -> dict[str, dict[str, Any]]:
+        with self.repository.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT component, sample_count, failure_count, p50_seconds, p95_seconds, p99_seconds, max_seconds
+                FROM wca_runtime_latency_summaries
+                WHERE algorithm_id = ? AND account_id = ? AND symbol = ?
+                ORDER BY component
+                """,
+                (WCA_ALGORITHM_ID, account_id, symbol),
+            ).fetchall()
+        return {
+            row["component"]: {
+                "sample_count": int(row["sample_count"]),
+                "failure_count": int(row["failure_count"]),
+                "p50_seconds": row["p50_seconds"],
+                "p95_seconds": row["p95_seconds"],
+                "p99_seconds": row["p99_seconds"],
+                "max_seconds": row["max_seconds"],
+            }
+            for row in rows
+        }
+
     def last_processed_bar(self, *, symbol: str = "SPY") -> datetime | None:
         key = f"wca.runtime.finalized_bar.{symbol}"
         with self.repository.connect() as conn:
@@ -402,12 +550,29 @@ def _count_queue(conn: sqlite3.Connection, table: str) -> int:
     return int(conn.execute(f"SELECT COUNT(*) FROM {table} WHERE status IN ('queued', 'running', 'processing', 'decision_queued')").fetchone()[0])
 
 
+def _oldest_age_seconds(conn: sqlite3.Connection, table: str, current: datetime) -> float:
+    row = conn.execute(f"SELECT MIN(created_at) FROM {table} WHERE status IN ('queued', 'running', 'processing', 'decision_queued')").fetchone()
+    if row is None or row[0] is None:
+        return 0.0
+    return max(0.0, (current - _parse_dt(str(row[0]))).total_seconds())
+
+
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    index = max(0, min(len(values) - 1, int(round((len(values) - 1) * percentile))))
+    return values[index]
+
+
 def _dt(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
 def _parse_dt(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _utc_now() -> datetime:

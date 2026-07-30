@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 from uuid import uuid4
 
-from backend.app.algorithms.wca.contracts import WcaOrderStatus
+from backend.app.algorithms.wca.contracts import WcaOrderStatus, WcaOrderValidationContext, WcaRuntimeMode
 from backend.app.algorithms.wca.paper_broker import (
     WCA_REAL_MONEY_ENDPOINTS_AVAILABLE,
     WcaDeterministicPaperBroker,
@@ -14,6 +14,15 @@ from backend.app.algorithms.wca.paper_broker import (
     cancel_wca_paper_order,
     redact_secret_payload,
     replace_wca_paper_order_requires_new_intent,
+)
+from backend.app.algorithms.wca.paper_account import (
+    WCA_ALPACA_PAPER_ACCOUNT_ID,
+    WCA_ALPACA_PAPER_API_KEY_ID,
+    WCA_ALPACA_PAPER_API_SECRET_KEY,
+    WCA_ALPACA_PAPER_BASE_URL,
+    WCA_AUTOMATIC_PAPER_ENABLED,
+    WCA_REQUIRED_ALPACA_PAPER_BASE_URL,
+    validate_wca_automatic_paper_account,
 )
 from backend.app.algorithms.wca.repository import WcaSqliteRepository
 from backend.tests.test_wca_paper_execution_pipeline import decision_with_order
@@ -115,6 +124,7 @@ def test_idempotent_retry_never_generates_second_economic_order() -> None:
         idempotency_key=request.idempotency_key,
         client_order_id=request.client_order_id,
         request_payload=request.model_dump(mode="json"),
+        final_validation_context=validation_context(decision, request),
     )
     broker = WcaDeterministicPaperBroker()
     first = WcaPaperBrokerOutboxAdapter().process_next_outbox(repository, broker, owner_id="step10")
@@ -151,11 +161,51 @@ def test_cancel_replace_redaction_and_live_endpoint_guards() -> None:
         raise AssertionError("replacement with same idempotency key must fail")
 
 
+def test_wca_automatic_paper_account_requires_dedicated_valid_env() -> None:
+    missing = validate_wca_automatic_paper_account(account_id="wca-paper-1", environ={})
+    live_endpoint = validate_wca_automatic_paper_account(
+        account_id="wca-paper-1",
+        environ=valid_wca_paper_env()
+        | {
+            WCA_ALPACA_PAPER_BASE_URL: "https://api.alpaca.markets",
+        },
+    )
+    shared_credentials = validate_wca_automatic_paper_account(
+        account_id="wca-paper-1",
+        environ=valid_wca_paper_env()
+        | {
+            "APCA_API_KEY_ID": "wca-key",
+            "APCA_API_SECRET_KEY": "wca-secret",
+        },
+    )
+    account_mismatch = validate_wca_automatic_paper_account(
+        account_id="other-paper",
+        environ=valid_wca_paper_env(),
+    )
+    valid = validate_wca_automatic_paper_account(
+        account_id="wca-paper-1",
+        environ=valid_wca_paper_env(),
+    )
+
+    assert missing.verified is False
+    assert "wca.paper_account.automatic_paper_disabled" in missing.reason_codes
+    assert "wca.paper_account.api_key_missing" in missing.reason_codes
+    assert live_endpoint.verified is False
+    assert "wca.paper_account.paper_base_url_invalid" in live_endpoint.reason_codes
+    assert shared_credentials.verified is False
+    assert "wca.paper_account.shared_alpaca_credentials_rejected" in shared_credentials.reason_codes
+    assert account_mismatch.verified is False
+    assert "wca.paper_account.account_id_mismatch" in account_mismatch.reason_codes
+    assert valid.verified is True
+    assert valid.reason_codes[-1] == "wca.paper_account.verified"
+
+
 def reserve(repository: WcaSqliteRepository, *, suffix: str = "ack"):
     decision = decision_with_order()
     assert decision.proposed_order is not None
     proposed = decision.proposed_order.model_copy(
         update={
+            "decision_id": f"{decision.decision_id}-{suffix}",
             "idempotency_key": f"step10-{suffix}",
             "account_id": "paper-step10",
             "configuration_version": decision.configuration_version,
@@ -171,9 +221,31 @@ def reserve(repository: WcaSqliteRepository, *, suffix: str = "ack"):
         idempotency_key=proposed.idempotency_key,
         client_order_id=request.client_order_id,
         request_payload=request.model_dump(mode="json"),
+        final_validation_context=validation_context(decision, request),
     )
     assert reservation.created is True
     return decision, request
+
+
+def validation_context(decision, request) -> WcaOrderValidationContext:
+    return WcaOrderValidationContext(
+        evaluation_timestamp=decision.decision_timestamp,
+        account_id=request.account_id,
+        broker_endpoint="paper",
+        runtime_mode=WcaRuntimeMode.MANUAL_PAPER,
+        requires_executable_paper_stage=True,
+        data_ready=decision.market_snapshot.data_ready,
+        quote_freshness_seconds=None,
+        candle_freshness_seconds=120,
+        available_buying_power=100_000,
+        account_equity=100_000,
+        max_position_value=100_000,
+        max_approved_quantity=1000,
+        order_type=request.order_type,
+        time_in_force=request.time_in_force,
+        protective_exit_plan_present=True,
+        idempotency_required=True,
+    )
 
 
 def repository_for_step10() -> WcaSqliteRepository:
@@ -190,3 +262,13 @@ def state_for(repository: WcaSqliteRepository, idempotency_key: str) -> str:
 def fill_count(repository: WcaSqliteRepository, fill_id: str) -> int:
     with sqlite3.connect(repository.path) as conn:
         return conn.execute("SELECT COUNT(*) FROM wca_attributed_fills WHERE fill_id = ?", (fill_id,)).fetchone()[0]
+
+
+def valid_wca_paper_env() -> dict[str, str]:
+    return {
+        WCA_ALPACA_PAPER_API_KEY_ID: "wca-key",
+        WCA_ALPACA_PAPER_API_SECRET_KEY: "wca-secret",
+        WCA_ALPACA_PAPER_BASE_URL: WCA_REQUIRED_ALPACA_PAPER_BASE_URL,
+        WCA_ALPACA_PAPER_ACCOUNT_ID: "wca-paper-1",
+        WCA_AUTOMATIC_PAPER_ENABLED: "true",
+    }

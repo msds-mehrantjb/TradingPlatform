@@ -37,9 +37,13 @@ if (-not $SkipStop) {
 $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 $backendRunner = Join-Path $PSScriptRoot "run-backend.ps1"
 $frontendRunner = Join-Path $PSScriptRoot "run-frontend.ps1"
+$wcaRuntimeRunner = Join-Path $PSScriptRoot "run-wca-runtime.ps1"
+$wcaResearchWorkerRunner = Join-Path $PSScriptRoot "run-wca-research-worker.ps1"
 
 Start-Process -FilePath $powershell -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$backendRunner`"" -WorkingDirectory $root -WindowStyle Hidden
 Start-Sleep -Seconds 2
+Start-Process -FilePath $powershell -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$wcaRuntimeRunner`"" -WorkingDirectory $root -WindowStyle Hidden
+Start-Process -FilePath $powershell -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$wcaResearchWorkerRunner`"" -WorkingDirectory $root -WindowStyle Hidden
 Start-Process -FilePath $powershell -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$frontendRunner`"" -WorkingDirectory $root -WindowStyle Hidden
 
 $backendReady = Wait-ForUrl $backendUrl 45
@@ -59,3 +63,5 @@ if ($backendReady -and $frontendReady -and -not $NoBrowser) {
 
 Write-Host "Backend:  $backendUrl"
 Write-Host "Frontend: $frontendUrl"
+Write-Host "WCA runtime: background process (wca-runtime.out.log / wca-runtime.err.log)"
+Write-Host "WCA research: background process (wca-research-worker.out.log / wca-research-worker.err.log)"

@@ -24,5 +24,5 @@ export type ApiClient = {
 
 export const defaultApiClient: ApiClient = {
   baseUrl: API_BASE,
-  fetch,
+  fetch: (input, init) => fetch(input, init),
 };

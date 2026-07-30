@@ -11,11 +11,13 @@ from pydantic import Field, model_validator
 
 from backend.app.algorithms.wca.contracts import WCA_ALGORITHM_ID, ProposedOrder, WcaContractModel, WcaOrderStatus, WcaSide
 from backend.app.algorithms.wca.latency import utc_now, with_order_latency
+from backend.app.algorithms.wca.order_validation import WCA_FINAL_PRE_OUTBOX_VALIDATION_PASSED
 from backend.app.algorithms.wca.repository import WcaExecutionOutboxRecord, WcaRepository
 
 
 WCA_PAPER_BROKER_ADAPTER_VERSION = "wca_paper_broker_outbox_v1"
 WCA_REAL_MONEY_ENDPOINTS_AVAILABLE = False
+WCA_ALPACA_CLIENT_ORDER_ID_LIMIT = 48
 
 
 class WcaPaperBrokerTimeout(TimeoutError):
@@ -124,12 +126,26 @@ class WcaPaperBrokerOutboxAdapter:
         record = repository.claim_next_execution_outbox(owner_id=owner_id)
         if record is None:
             return WcaPaperBrokerSubmissionResult(state="IDLE", submitted=False, reason_codes=("wca.paper_broker.outbox_idle",))
+        if WCA_FINAL_PRE_OUTBOX_VALIDATION_PASSED not in record.proposed_order.reason_codes:
+            repository.update_execution_outbox_state(
+                outbox_id=record.outbox_id,
+                status=WcaOrderStatus.CANCELLED,
+                error_payload={"reason_codes": (WCA_PAPER_BROKER_ADAPTER_VERSION, "wca.paper_broker.final_validation_missing")},
+            )
+            return WcaPaperBrokerSubmissionResult(
+                outbox_id=record.outbox_id,
+                client_order_id=record.client_order_id,
+                submitted=False,
+                state=WcaOrderStatus.CANCELLED,
+                outbox_record=record,
+                reason_codes=(WCA_PAPER_BROKER_ADAPTER_VERSION, "wca.paper_broker.final_validation_missing"),
+            )
         request = WcaPaperBrokerOrderRequest.model_validate(record.request_payload)
         broker_request_timestamp = utc_now()
         try:
             ack = broker.submit_order(request)
         except WcaPaperBrokerTimeout as exc:
-            latency = with_order_latency(record.decision.latency, broker_request=broker_request_timestamp)
+            latency = with_order_latency(record.decision.latency, outbox_reservation=broker_request_timestamp, broker_request=broker_request_timestamp)
             repository.update_execution_outbox_state(
                 outbox_id=record.outbox_id,
                 status=WcaOrderStatus.SUBMISSION_UNKNOWN,
@@ -160,6 +176,7 @@ class WcaPaperBrokerOutboxAdapter:
         fill_quality = _fill_quality(record.proposed_order, ack.fill)
         latency = with_order_latency(
             record.decision.latency,
+            outbox_reservation=broker_request_timestamp,
             broker_request=broker_request_timestamp,
             broker_acknowledgement=acknowledgement_timestamp,
             first_fill=ack.fill.filled_at if ack.fill is not None and ack.fill.filled_quantity > 0 else None,
@@ -185,6 +202,16 @@ class WcaPaperBrokerOutboxAdapter:
             status=_value(state),
             payload={"request": request_payload, "response": response_payload, "client_order_id": record.client_order_id, "latency": latency.model_dump(mode="json")},
         )
+        if ack.status == "REJECTED":
+            repository.record_order_terminal_inventory_event(
+                record.decision.model_copy(update={"proposed_order": record.proposed_order}),
+                account_id=record.account_id,
+                client_order_id=record.client_order_id,
+                broker_order_id=broker_order_id,
+                event_type="ORDER_REJECTED",
+                event_timestamp=acknowledgement_timestamp,
+                payload={"request": request_payload, "response": response_payload, "reason_codes": reasons},
+            )
         if ack.fill is not None and ack.fill.filled_quantity > 0:
             repository.apply_fill_and_update_position(
                 record.decision.model_copy(update={"proposed_order": record.proposed_order}),
@@ -266,6 +293,8 @@ def build_wca_paper_broker_request(proposed: ProposedOrder) -> WcaPaperBrokerOrd
 
 def _fill_position_payload(record: WcaExecutionOutboxRecord, fill: WcaPaperBrokerFill, *, client_order_id: str, delayed: bool, latency: object) -> dict[str, object]:
     proposed = record.proposed_order
+    reason_codes = tuple(str(code) for code in proposed.reason_codes)
+    position_effect = "exit" if any("risk_reducing_exit" in code or ".exit" in code for code in reason_codes) else "entry"
     return {
         "fill": redact_secret_payload(fill.model_dump(mode="json")),
         "client_order_id": client_order_id,
@@ -277,6 +306,8 @@ def _fill_position_payload(record: WcaExecutionOutboxRecord, fill: WcaPaperBroke
         "stop_price": proposed.stop_price,
         "target_price": proposed.target_price,
         "opened_at": fill.filled_at.astimezone(timezone.utc).isoformat(),
+        "remaining_quantity": fill.remaining_quantity,
+        "position_effect": position_effect,
         "order_intent_id": proposed.order_intent_id,
         "decision_id": proposed.decision_id,
         "configuration_version": proposed.configuration_version,
@@ -286,15 +317,27 @@ def _fill_position_payload(record: WcaExecutionOutboxRecord, fill: WcaPaperBroke
 
 
 def stable_wca_client_order_id(proposed: ProposedOrder) -> str:
-    digest = hashlib.sha256(f"{proposed.account_id}:{proposed.symbol}:{proposed.order_intent_id}:{proposed.idempotency_key}".encode("utf-8")).hexdigest()[:12]
-    raw = f"wca-{proposed.account_id}-{proposed.symbol}-{proposed.order_intent_id}-{digest}"
-    return re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-")[:96]
+    digest = hashlib.sha256(f"{proposed.account_id}:{proposed.symbol}:{proposed.decision_id}:{proposed.order_intent_id}:{proposed.idempotency_key}".encode("utf-8")).hexdigest()[:12]
+    raw = f"wca-{proposed.account_id}-{proposed.decision_id}-{proposed.order_intent_id}-{digest}"
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-")[:WCA_ALPACA_CLIENT_ORDER_ID_LIMIT]
 
 
 def cancel_wca_paper_order(repository: WcaRepository, *, outbox_id: str, cancellation_idempotency_key: str, original_idempotency_key: str) -> bool:
     if cancellation_idempotency_key == original_idempotency_key:
         raise ValueError("WCA cancellation requires a new cancellation idempotency key")
-    return repository.update_execution_outbox_state(outbox_id=outbox_id, status=WcaOrderStatus.CANCELLED, response_payload={"cancellation_idempotency_key": cancellation_idempotency_key})
+    record = next((row for row in repository.list_execution_outbox_records() if row.outbox_id == outbox_id), None)
+    updated = repository.update_execution_outbox_state(outbox_id=outbox_id, status=WcaOrderStatus.CANCELLED, response_payload={"cancellation_idempotency_key": cancellation_idempotency_key})
+    if updated and record is not None:
+        repository.record_order_terminal_inventory_event(
+            record.decision.model_copy(update={"proposed_order": record.proposed_order}),
+            account_id=record.account_id,
+            client_order_id=record.client_order_id,
+            broker_order_id=None,
+            event_type="ORDER_CANCELLED",
+            event_timestamp=utc_now(),
+            payload={"cancellation_idempotency_key": cancellation_idempotency_key},
+        )
+    return updated
 
 
 def replace_wca_paper_order_requires_new_intent(*, replacement_idempotency_key: str, original_idempotency_key: str) -> None:
@@ -353,6 +396,7 @@ def _value(value: Any) -> str:
 
 __all__ = [
     "WCA_PAPER_BROKER_ADAPTER_VERSION",
+    "WCA_ALPACA_CLIENT_ORDER_ID_LIMIT",
     "WCA_REAL_MONEY_ENDPOINTS_AVAILABLE",
     "WcaDeterministicPaperBroker",
     "WcaPaperBrokerAck",

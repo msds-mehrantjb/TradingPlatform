@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from math import floor
-from typing import Any, Literal
+from typing import Any
+from zoneinfo import ZoneInfo
 
 from backend.app.algorithms.wca.aggregation import aggregate_wca
 from backend.app.algorithms.wca.confidence import ConfidenceCalibrationConfig, calibrate_evaluations, conservative_fallback_calibration_table
@@ -15,13 +16,16 @@ from backend.app.algorithms.wca.contracts import (
     WcaConfidenceCalibrationTable,
     WcaDecision,
     WcaDynamicProfile,
+    WcaEvaluationStatus,
     WcaGateStatus,
     WcaLatencyTimestamps,
     WcaMarketSnapshot,
     WcaMarketStatus,
+    WcaRuntimeMode,
     WcaSide,
     WcaStrategyEvaluation,
     WcaWeightSnapshot,
+    coerce_wca_runtime_mode,
 )
 from backend.app.algorithms.wca.cost_model import WCA_COST_MODEL_ADAPTER_VERSION, WcaCostModelInput, estimate_wca_round_trip_cost
 from backend.app.algorithms.wca.dynamic_profile import WcaDynamicProfileConfig, resolve_dynamic_profile
@@ -36,7 +40,7 @@ from backend.app.algorithms.wca.strategies.indicators import atr
 from backend.app.algorithms.wca.modifiers import evaluate_all_modifiers
 from backend.app.algorithms.wca.strategies.primary_voters import WCA_PRIMARY_VOTERS
 from backend.app.algorithms.wca.strategy_registry import WcaStrategy
-from backend.app.algorithms.wca.weights import baseline_weight_snapshot
+from backend.app.algorithms.wca.weights import adapt_v1_weight_snapshot_to_multipliers, baseline_weight_snapshot
 
 
 WCA_EXECUTION_PIPELINE_VERSION = "wca_execution_pipeline_v1"
@@ -75,7 +79,7 @@ WCA_PIPELINE_MODULE_VERSIONS = {
     "latency_observability": WCA_LATENCY_OBSERVABILITY_VERSION,
 }
 
-WcaPipelineRuntimeMode = Literal["manual_paper", "automatic_paper", "shadow", "historical_replay", "backtest", "test_simulation"]
+WcaPipelineRuntimeMode = WcaRuntimeMode | str
 
 
 @dataclass(frozen=True)
@@ -85,7 +89,7 @@ class WcaExecutionPipelineInput:
     order_intent_id: str
     snapshot: WcaMarketSnapshot
     configuration_version: str
-    runtime_mode: WcaPipelineRuntimeMode = "manual_paper"
+    runtime_mode: WcaPipelineRuntimeMode = WcaRuntimeMode.MANUAL_PAPER
     synthetic_quote_allowed: bool = False
     account_id: str = "paper"
     configuration: WcaConfiguration | None = None
@@ -116,6 +120,12 @@ class WcaExecutionPipelineInput:
     manual_sizing_override: WcaManualSizingOverride | None = None
     emergency_exit: bool = False
     session_exit_minutes: int = 15 * 60 + 59
+    authoritative_state_version: str = ""
+    authoritative_state_hash: str = ""
+    authoritative_state_reason_codes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "runtime_mode", coerce_wca_runtime_mode(self.runtime_mode))
 
 
 @dataclass(frozen=True)
@@ -139,6 +149,7 @@ def run_wca_execution_pipeline(
 
     configuration = pipeline_input.configuration
     if configuration is not None:
+        _validate_runtime_configuration_controls(configuration, pipeline_input)
         baseline = configuration.to_baseline_settings()
         configuration_version = configuration.configuration_version
         configuration_hash = configuration.content_hash
@@ -159,6 +170,7 @@ def run_wca_execution_pipeline(
         cutoff=snapshot.decision_timestamp,
         weight_version=f"{configuration_version}.baseline_weights",
     )
+    weight_snapshot = adapt_v1_weight_snapshot_to_multipliers(weight_snapshot)
     hard_filters = evaluate_wca_hard_filters(
         snapshot=snapshot,
         context=_gate_context(pipeline_input, baseline),
@@ -193,6 +205,7 @@ def run_wca_execution_pipeline(
         )
         for evaluation in (voter.evaluate(snapshot) for voter in voters)
     )
+    evaluations = _apply_runtime_strategy_permissions(evaluations, effective_settings, pipeline_input.runtime_mode)
     strategy_completion = _observability_timestamp(pipeline_input, snapshot)
     modifiers = evaluate_all_modifiers(snapshot, configuration.modifier_settings if configuration is not None else None)
     evaluations = _apply_modifier_effects(evaluations, modifiers)
@@ -328,6 +341,9 @@ def run_wca_execution_pipeline(
         )
         if sized.proposed_order is not None
         else None,
+        authoritative_state_version=pipeline_input.authoritative_state_version,
+        authoritative_state_hash=pipeline_input.authoritative_state_hash,
+        authoritative_state_reason_codes=pipeline_input.authoritative_state_reason_codes,
         reason_codes=(WCA_PRODUCTION_PIPELINE_VERSION, WCA_EXECUTION_PIPELINE_VERSION, *cost_estimate.reason_codes),
     )
     decision = _apply_global_risk_approval(draft_decision, pipeline_input, global_risk_client=global_risk_client)
@@ -354,12 +370,21 @@ def run_wca_execution_pipeline(
             current_position_side=pipeline_input.open_position.side if pipeline_input.open_position else None,
             allow_position_increase=pipeline_input.allow_position_increase,
             position_owned_by_wca=True,
-            quote_freshness_seconds=None if pipeline_input.synthetic_quote_allowed else 15,
+            quote_freshness_seconds=None if pipeline_input.synthetic_quote_allowed or exit_order else 15,
+            runtime_mode=pipeline_input.runtime_mode,
+            automatic_paper_enabled=True,
+            candle_freshness_seconds=None if pipeline_input.synthetic_quote_allowed or exit_order else 120,
+            data_ready=snapshot.data_ready,
+            allowed_session_window=_allowed_entry_window(snapshot.decision_timestamp, effective_settings),
+            max_approved_quantity=pipeline_input.global_gate_quantity_cap,
+            order_type="LIMIT",
+            time_in_force="DAY",
+            protective_exit_plan_present=decision.proposed_order is None or (decision.proposed_order.stop_price is not None and decision.proposed_order.target_price is not None),
             available_buying_power=pipeline_input.available_buying_power,
             account_equity=pipeline_input.account_equity,
             max_position_value=max(0.0, pipeline_input.account_equity * (effective_settings.final_max_position_percent / 100.0)),
             realized_daily_loss=pipeline_input.realized_daily_loss,
-            max_daily_loss=_budget(pipeline_input.allocated_daily_loss_budget, pipeline_input.account_equity, effective_settings.final_max_daily_loss_percent),
+            max_daily_loss=_daily_loss_budget(pipeline_input, effective_settings),
             trades_today=pipeline_input.trades_today,
             max_daily_trades=effective_settings.final_max_daily_trades,
             aggregate_global_risk_used=_global_risk_used_after_order(pipeline_input.total_account_exposure_snapshot, decision.sizing.stop_risk_dollars),
@@ -388,15 +413,15 @@ def run_wca_execution_pipeline(
 
 
 def run_wca_paper_pipeline_adapter(pipeline_input: WcaExecutionPipelineInput, **kwargs) -> WcaExecutionPipelineResult:
-    return run_wca_execution_pipeline(replace(pipeline_input, runtime_mode="manual_paper", synthetic_quote_allowed=False), **kwargs)
+    return run_wca_execution_pipeline(replace(pipeline_input, runtime_mode=_paper_runtime_mode(pipeline_input.runtime_mode), synthetic_quote_allowed=False), **kwargs)
 
 
 def run_wca_replay_pipeline_adapter(pipeline_input: WcaExecutionPipelineInput, **kwargs) -> WcaExecutionPipelineResult:
-    return run_wca_execution_pipeline(replace(pipeline_input, runtime_mode="historical_replay", synthetic_quote_allowed=False), **kwargs)
+    return run_wca_execution_pipeline(replace(pipeline_input, runtime_mode=WcaRuntimeMode.HISTORICAL_REPLAY, synthetic_quote_allowed=False), **kwargs)
 
 
 def run_wca_backtest_pipeline_adapter(pipeline_input: WcaExecutionPipelineInput, **kwargs) -> WcaExecutionPipelineResult:
-    return run_wca_execution_pipeline(replace(pipeline_input, runtime_mode="backtest", synthetic_quote_allowed=True), **kwargs)
+    return run_wca_execution_pipeline(replace(pipeline_input, runtime_mode=WcaRuntimeMode.HISTORICAL_REPLAY, synthetic_quote_allowed=True), **kwargs)
 
 
 def _apply_weights(evaluations: tuple[WcaStrategyEvaluation, ...], weight_snapshot: WcaWeightSnapshot) -> tuple[WcaStrategyEvaluation, ...]:
@@ -491,10 +516,78 @@ def _validate_command(pipeline_input: WcaExecutionPipelineInput, snapshot: WcaMa
         raise ValueError("WCA pipeline snapshot timestamp must match the latest completed bar")
     if snapshot.decision_timestamp < snapshot.data_timestamp:
         raise ValueError("WCA pipeline cannot decide before the completed bar timestamp")
-    if snapshot.quote is None and pipeline_input.runtime_mode in ("manual_paper", "automatic_paper") and not pipeline_input.synthetic_quote_allowed:
+    if snapshot.quote is None and pipeline_input.runtime_mode in {WcaRuntimeMode.PAPER_RECOMMENDATION, WcaRuntimeMode.MANUAL_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER} and not pipeline_input.synthetic_quote_allowed:
         return
     if snapshot.quote is None and not pipeline_input.synthetic_quote_allowed:
         return
+
+
+def _validate_runtime_configuration_controls(configuration: WcaConfiguration, pipeline_input: WcaExecutionPipelineInput) -> None:
+    if coerce_wca_runtime_mode(configuration.runtime.runtime_mode) != WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER or not configuration.limited_automatic_paper.enabled:
+        return
+    controls = configuration.limited_automatic_paper
+    if pipeline_input.snapshot.symbol.upper() != controls.symbol.upper():
+        raise ValueError("limited automatic paper configuration is SPY-only")
+    if pipeline_input.account_id != controls.broker_account_id:
+        raise ValueError("limited automatic paper requires the configured WCA broker account")
+
+
+def _apply_runtime_strategy_permissions(
+    evaluations: tuple[WcaStrategyEvaluation, ...],
+    effective_settings,
+    runtime_mode: WcaPipelineRuntimeMode,
+) -> tuple[WcaStrategyEvaluation, ...]:
+    if coerce_wca_runtime_mode(runtime_mode) != WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER:
+        return evaluations
+    permitted = set(effective_settings.final_permitted_strategy_ids or ())
+    if not permitted:
+        return evaluations
+    adjusted = []
+    for evaluation in evaluations:
+        if evaluation.strategy_id in permitted:
+            adjusted.append(evaluation)
+            continue
+        adjusted.append(
+            evaluation.model_copy(
+                update={
+                    "status": WcaEvaluationStatus.NOT_APPLICABLE,
+                    "signal": WcaSide.HOLD,
+                    "direction": WcaSide.HOLD,
+                    "confidence": 0,
+                    "raw_confidence": 0,
+                    "calibrated_confidence": 0,
+                    "evidence_strength": 0,
+                    "effective_weight": 0,
+                    "contribution": 0,
+                    "reason_codes": (*evaluation.reason_codes, "wca.limited_paper.strategy_shadow_only"),
+                    "explanation": "Strategy evaluated for evidence but excluded from limited automatic-paper execution.",
+                }
+            )
+        )
+    return tuple(adjusted)
+
+
+def _allowed_entry_window(timestamp, effective_settings) -> bool:
+    windows = tuple(effective_settings.final_entry_windows or ())
+    if not windows:
+        return True
+    local = timestamp.astimezone(ZoneInfo("America/New_York"))
+    current = local.hour * 60 + local.minute
+    for window in windows:
+        times = str(window).rsplit(" ", 1)[0]
+        start, end = times.split("-", 1)
+        start_minutes = _minutes(start)
+        end_minutes = _minutes(end)
+        if start_minutes <= current <= end_minutes:
+            return True
+    return False
+
+
+def _paper_runtime_mode(runtime_mode: WcaPipelineRuntimeMode) -> WcaRuntimeMode:
+    mode = coerce_wca_runtime_mode(runtime_mode)
+    if mode not in {WcaRuntimeMode.PAPER_RECOMMENDATION, WcaRuntimeMode.MANUAL_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}:
+        raise ValueError(f"WCA paper adapter cannot execute runtime mode {mode.value}")
+    return mode
 
 
 def _apply_global_risk_approval(decision: WcaDecision, pipeline_input: WcaExecutionPipelineInput, *, global_risk_client: WcaGlobalRiskClient | None = None) -> WcaDecision:
@@ -658,6 +751,19 @@ def _observability_timestamp(pipeline_input: WcaExecutionPipelineInput, snapshot
 
 def _budget(value: float | None, account_equity: float, percent: float) -> float:
     return value if value is not None else max(0.0, account_equity * (percent / 100.0))
+
+
+def _daily_loss_budget(pipeline_input: WcaExecutionPipelineInput, effective_settings) -> float:
+    if pipeline_input.allocated_daily_loss_budget is not None:
+        return pipeline_input.allocated_daily_loss_budget
+    if effective_settings.final_max_daily_loss_dollars is not None:
+        return effective_settings.final_max_daily_loss_dollars
+    return _budget(None, pipeline_input.account_equity, effective_settings.final_max_daily_loss_percent)
+
+
+def _minutes(value: str) -> int:
+    hour, minute = (int(part) for part in value.split(":", 1))
+    return hour * 60 + minute
 
 
 def _pipeline_idempotency_key(account_id: str, decision: WcaDecision, order_intent_id: str) -> str:

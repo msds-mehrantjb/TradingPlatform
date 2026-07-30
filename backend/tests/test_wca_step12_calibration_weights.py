@@ -90,7 +90,8 @@ def test_future_weight_snapshot_and_future_performance_records_do_not_leak_into_
 
     assert active is not None
     assert active.weight_version == "step12.past.weights"
-    assert candidate.weights["C1"] < 0.80
+    assert candidate.weights["C1"] == 1.0
+    assert candidate.weight_schema_version == "wca_weight_snapshot_v2"
     assert all(detail.trade_count <= 1 for detail in candidate.details if detail.strategy_id == "C1")
 
 
@@ -134,7 +135,8 @@ def test_research_worker_creates_real_calibration_and_weight_candidates_without_
     assert weight_result["status"] == "succeeded"
     assert weight_result["resultReference"]["kind"] == "research_candidate"
     assert payloads[WcaResearchJobType.CONFIDENCE_CALIBRATION.value]["calibration_tables"]
-    assert payloads[WcaResearchJobType.WEIGHT_CANDIDATE_CALCULATION.value]["weight_snapshot"]["weight_version"].startswith(weight_job.job_id)
+    assert payloads[WcaResearchJobType.WEIGHT_CANDIDATE_CALCULATION.value]["weight_snapshot"]["weight_version"].startswith("wca-weight-candidate-")
+    assert payloads[WcaResearchJobType.WEIGHT_CANDIDATE_CALCULATION.value]["weight_snapshot"]["weight_schema_version"] == "wca_weight_snapshot_v2"
     assert active_calibrations == 0
     assert active_weights == 0
 

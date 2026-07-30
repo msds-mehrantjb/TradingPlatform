@@ -21,3 +21,11 @@ WCA may reduce or close only lots recorded in `wca_owned_lots` with `algorithm_i
 Broker reconciliation may compare broker net exposure against attributed inventories, but it must preserve WCA attribution. An unexplained reconciliation discrepancy or hard operational warning blocks new WCA entries while leaving protective exits possible.
 
 Frontend local storage is never authoritative for WCA settings, orders, fills, positions, trades, backtests, or rollout state.
+
+## Inspection
+
+Inspect inventory by querying the WCA inventory ledger and daily-state projection with both `algorithm_id="wca"` and the configured broker-account identity. Reads without both identities are not acceptance evidence.
+
+Inspect orders and fills through the WCA order intent, outbox, broker-order, fill, and inventory-ledger records. Broker fills remain auditable even when projections are rebuilt.
+
+Inspect reconciliation by reading the latest WCA reconciliation result, discrepancy evidence, reconciliation watermark, broker account snapshot, SPY position snapshot, WCA open orders, and ledger projection version. New entries must remain blocked until startup reconciliation has completed successfully.
