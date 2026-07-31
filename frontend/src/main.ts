@@ -2,7 +2,7 @@
 import { API_BASE, BACKTEST_API_CANDIDATES, TRADING_ALGORITHM_INVENTORY_ENDPOINTS } from "./api/client";
 import { directionalSignal, isEligibleStrategyVote, winningVoteSignal } from "./domain/tradingSignals";
 import type { RegimeBacktestResult } from "./features/regime/types";
-import { evaluateRegimeOnBackend, runRegimeBacktestOnBackend } from "./features/regime/api";
+import { readLatestRegimeDecisionFromBackend, runRegimeBacktestOnBackend, setRegimeAutomaticPaperTrading } from "./features/regime/api";
 import { fetchLatestWcaDecision, fetchWcaBacktest, fetchWcaBacktestStatus, fetchWcaBaselineSettings, fetchWcaConfiguration, fetchWcaStatus, runWcaPreparedBacktest, updateWcaConfiguration } from "./features/wca/api";
 import {
   createInitialWcaState,
@@ -800,6 +800,8 @@ type BackendRegimeEvaluationResponse = {
   algorithmId: "regime";
   runtime: "backend.app.algorithms.regime.execution_pipeline";
   pipeline: string[];
+  dataTimestamp?: string;
+  featureTimestamp?: string;
   decision: Record<string, unknown>;
   sizing: Record<string, unknown>;
   orderIntent: BackendRegimeOrderIntent | null;
@@ -2001,6 +2003,7 @@ type PersistedUiState = {
   confidenceStrategiesExpanded?: boolean;
   regimeTradingSettingsExpanded?: boolean;
   regimeDefaultSizingExpanded?: boolean;
+  regimeConditionExpanded?: boolean;
   regimeIndicatorsExpanded?: boolean;
   regimeStrategiesExpanded?: boolean;
   metaStrategiesExpanded?: boolean;
@@ -2079,6 +2082,7 @@ function saveUiState() {
     confidenceStrategiesExpanded: state.confidenceStrategiesExpanded,
     regimeTradingSettingsExpanded: state.regimeTradingSettingsExpanded,
     regimeDefaultSizingExpanded: state.regimeDefaultSizingExpanded,
+    regimeConditionExpanded: state.regimeConditionExpanded,
     regimeIndicatorsExpanded: state.regimeIndicatorsExpanded,
     regimeStrategiesExpanded: state.regimeStrategiesExpanded,
     metaStrategiesExpanded: state.metaStrategiesExpanded,
@@ -2709,6 +2713,8 @@ let confidenceBacktestError = "";
 let regimeBacktestStatus: "idle" | "waiting" | "running" | "ready" | "error" = storedRegimeBacktest ? "ready" : "idle";
 let regimeBacktestResult: RegimeBacktestResult | null = storedRegimeBacktest?.result ?? null;
 let regimeBacktestError = "";
+let regimePreparedBacktestInFlight = false;
+let regimePreparedBacktestNextCheckAt = 0;
 let wcaPresentationState = createInitialWcaState();
 let wcaPresentationRefreshInFlight = false;
 let latestWcaBackendBacktestResult: WcaBacktestResult | null = null;
@@ -3095,8 +3101,9 @@ const state = {
   confidenceTradingSettingsExpanded: persistedUiState.confidenceTradingSettingsExpanded ?? false,
   confidenceDefaultSizingExpanded: persistedUiState.confidenceDefaultSizingExpanded ?? false,
   confidenceStrategiesExpanded: persistedUiState.confidenceStrategiesExpanded ?? true,
-  regimeTradingSettingsExpanded: persistedUiState.regimeTradingSettingsExpanded ?? false,
+  regimeTradingSettingsExpanded: persistedUiState.regimeTradingSettingsExpanded ?? true,
   regimeDefaultSizingExpanded: persistedUiState.regimeDefaultSizingExpanded ?? false,
+  regimeConditionExpanded: persistedUiState.regimeConditionExpanded ?? false,
   regimeIndicatorsExpanded: persistedUiState.regimeIndicatorsExpanded ?? false,
   regimeStrategiesExpanded: persistedUiState.regimeStrategiesExpanded ?? false,
   metaStrategiesExpanded: persistedUiState.metaStrategiesExpanded ?? false,
@@ -3724,13 +3731,13 @@ leftRail.innerHTML = `
           <div id="regimeFinalSignal" class="algo-final hold">Hold</div>
         </div>
         <div id="regimeScoreGrid" class="weighted-score-grid"></div>
-        <div id="regimeSummary" class="algo-rule-list weighted-summary"></div>
-        <div id="regimeConditionPanel" class="regime-detail-panel"></div>
-        <div id="regimeRoutingPanel" class="regime-detail-panel"></div>
-        <div id="regimeDecisionPanel" class="regime-detail-panel"></div>
         <div id="regimeTradingSettingsMount" class="algo-stable-settings"></div>
-        <div id="regimeMlPanel" class="regime-detail-panel"></div>
-        <div id="regimeGlobalGatesPanel" class="regime-detail-panel"></div>
+        <button id="regimeConditionToggle" class="algo-expand-toggle regime-condition-toggle" type="button" aria-expanded="false" aria-controls="regimeConditionPanel">
+          <span>Market condition</span>
+          <strong id="regimeConditionToggleMeta">Waiting</strong>
+          <b id="regimeConditionToggleIcon">+</b>
+        </button>
+        <div id="regimeConditionPanel" class="regime-detail-panel"></div>
         <div class="confidence-backtest-panel">
           <div class="confidence-backtest-head">
             <div class="algo-section-title">Dedicated Regime Backtest</div>
@@ -4211,13 +4218,11 @@ const confidenceStrategiesToggleIcon = document.querySelector<HTMLElement>("#con
 const confidenceStrategiesList = document.querySelector<HTMLDivElement>("#confidenceStrategiesList")!;
 const regimeFinalSignal = document.querySelector<HTMLDivElement>("#regimeFinalSignal")!;
 const regimeScoreGrid = document.querySelector<HTMLDivElement>("#regimeScoreGrid")!;
-const regimeSummary = document.querySelector<HTMLDivElement>("#regimeSummary")!;
+const regimeConditionToggle = document.querySelector<HTMLButtonElement>("#regimeConditionToggle")!;
+const regimeConditionToggleMeta = document.querySelector<HTMLElement>("#regimeConditionToggleMeta")!;
+const regimeConditionToggleIcon = document.querySelector<HTMLElement>("#regimeConditionToggleIcon")!;
 const regimeConditionPanel = document.querySelector<HTMLDivElement>("#regimeConditionPanel")!;
-const regimeRoutingPanel = document.querySelector<HTMLDivElement>("#regimeRoutingPanel")!;
-const regimeDecisionPanel = document.querySelector<HTMLDivElement>("#regimeDecisionPanel")!;
 const regimeTradingSettingsMount = document.querySelector<HTMLDivElement>("#regimeTradingSettingsMount")!;
-const regimeMlPanel = document.querySelector<HTMLDivElement>("#regimeMlPanel")!;
-const regimeGlobalGatesPanel = document.querySelector<HTMLDivElement>("#regimeGlobalGatesPanel")!;
 const regimeBacktestStatusLabel = document.querySelector<HTMLSpanElement>("#regimeBacktestStatusLabel")!;
 const regimeBacktestSummary = document.querySelector<HTMLDivElement>("#regimeBacktestSummary")!;
 const regimeBacktestTradesTable = document.querySelector<HTMLTableSectionElement>("#regimeBacktestTradesTable")!;
@@ -4493,6 +4498,7 @@ tradeToggleButton.addEventListener("click", () => {
   updateTradeToggleButton();
   updateQuoteCard(currentCandle());
   void syncWeightedVotingAutomaticPaperControl(globalPaperTradingEnabled());
+  void syncRegimeAutomaticPaperControl(globalPaperTradingEnabled());
   if (globalPaperTradingEnabled()) {
     maybeAutoSubmitAllAlgorithms();
   }
@@ -4724,6 +4730,12 @@ algoVotesToggle.addEventListener("click", () => {
 algoTradePlanToggle.addEventListener("click", () => {
   state.algoTradeDecisionExpanded = !state.algoTradeDecisionExpanded;
   renderAlgoTradeDecisionExpandedState();
+});
+
+regimeConditionToggle.addEventListener("click", () => {
+  state.regimeConditionExpanded = !state.regimeConditionExpanded;
+  saveUiState();
+  renderRegimeConditionExpandedState();
 });
 
 regimeStrategiesToggle.addEventListener("click", () => {
@@ -8495,8 +8507,8 @@ function updateTradeToggleButton() {
   tradeToggleButton.setAttribute("aria-pressed", String(enabled));
   tradeToggleButton.dataset.enabled = String(enabled);
   tradeToggleButton.title = enabled
-    ? "Automatic paper trading enabled for Voting Ensemble and other dashboard algorithms"
-    : "Automatic paper trading disabled for Voting Ensemble and other dashboard algorithms; manual orders remain available while the market is open";
+    ? "Automatic paper trading requested for Voting Ensemble, Regime, and other dashboard algorithms"
+    : "Automatic paper trading disabled for Voting Ensemble, Regime, and other dashboard algorithms; manual orders remain available while the market is open";
 }
 
 function updateOrderButtonStates(position: PositionSummary) {
@@ -11049,6 +11061,13 @@ function renderConfidenceRequirementsExpandedState() {
   confidenceRequirementsToggleIcon.textContent = state.confidenceRequirementsExpanded ? "-" : "+";
 }
 
+function renderRegimeConditionExpandedState() {
+  regimeConditionToggle.setAttribute("aria-expanded", String(state.regimeConditionExpanded));
+  regimeConditionPanel.hidden = !state.regimeConditionExpanded;
+  regimeConditionPanel.classList.toggle("expanded", state.regimeConditionExpanded);
+  regimeConditionToggleIcon.textContent = state.regimeConditionExpanded ? "-" : "+";
+}
+
 function renderRegimeStrategiesExpandedState() {
   regimeStrategiesToggle.setAttribute("aria-expanded", String(state.regimeStrategiesExpanded));
   regimeStrategiesList.hidden = !state.regimeStrategiesExpanded;
@@ -11369,15 +11388,11 @@ function updateRegimeSelectionPanel() {
   regimeFinalSignal.textContent = result.signal;
   regimeFinalSignal.className = `algo-final ${regimeSignalClass(result.signal)}`;
   regimeScoreGrid.innerHTML = renderRegimeScoreGrid(result);
-  regimeSummary.innerHTML = renderRegimeSummary(result, targetOrder);
   regimeConditionPanel.innerHTML = renderRegimeConditionPanel(result);
-  regimeRoutingPanel.innerHTML = renderRegimeRoutingPanel(result);
-  regimeDecisionPanel.innerHTML = renderRegimeDecisionPanel(result, targetOrder);
+  regimeConditionToggleMeta.textContent = `${result.confirmedCondition} / ${formatProbability(result.confidence)}`;
   if (!isEditingWithin(regimeTradingSettingsMount)) {
     regimeTradingSettingsMount.innerHTML = renderRegimeTradingSettingsPanel(result, targetOrder);
   }
-  regimeMlPanel.innerHTML = renderRegimeMlPanel(result);
-  regimeGlobalGatesPanel.innerHTML = renderRegimeGlobalGatesPanel(targetOrder);
   renderRegimeBacktestState();
   if (state.regimeIndicatorsExpanded) {
     regimeFeatureGrid.innerHTML = renderRegimeFeatureGrid(result.features);
@@ -11387,8 +11402,10 @@ function updateRegimeSelectionPanel() {
   if (state.regimeStrategiesExpanded) {
     regimeStrategiesList.innerHTML = renderRegimeStrategyList(result);
   }
+  renderRegimeConditionExpandedState();
   renderRegimeIndicatorsExpandedState();
   renderRegimeStrategiesExpandedState();
+  void maybeRunRegimePreparedBacktest("prepared-dataset-panel");
   updateQuoteCard(currentCandle());
   maybeAutoSubmitRegimeTargetOrder();
   maybeAutoSubmitOpenOrderControls();
@@ -11433,26 +11450,19 @@ function calculateRegimeSelection(): RegimeSelectionResult {
 }
 
 function backendRegimeEvaluationPayload(market: RegimeFrontendMarketContext) {
+  const latest = market.candles.at(-1);
   return {
-    marketData: {
-      symbol: state.symbol,
-      primaryCandles: market.candles,
-      candles: market.candles,
-      oneMinuteCandles: market.oneMinuteCandles,
-      fiveMinuteCandles: market.fiveMinuteCandles,
-    },
+    requestType: "diagnostic_shadow",
+    symbol: state.symbol,
+    latestObservedBarTimestamp: latest?.timestamp ?? null,
   };
 }
 
 function backendRegimeEvaluationKey(payload: ReturnType<typeof backendRegimeEvaluationPayload>) {
-  const marketData = payload.marketData;
-  const candles = marketData.primaryCandles;
-  const latest = candles.at(-1);
   return JSON.stringify({
-    symbol: marketData.symbol,
-    candleCount: candles.length,
-    latestTimestamp: latest?.timestamp ?? "none",
-    latestClose: latest?.close ?? null,
+    symbol: payload.symbol,
+    requestType: payload.requestType,
+    latestTimestamp: payload.latestObservedBarTimestamp ?? "none",
   });
 }
 
@@ -11462,7 +11472,16 @@ async function requestBackendRegimeSelection(key: string, payload: ReturnType<ty
   }
   backendRegimeEvaluationInFlightKey = key;
   try {
-    const response = await evaluateRegimeOnBackend<BackendRegimeEvaluationResponse>(payload);
+    const latest = await readLatestRegimeDecisionFromBackend<Record<string, unknown>>();
+    const response = latestRegimeDecisionEnvelopeAsEvaluation(latest);
+    if (!response || !regimeBackendEvaluationIsUsableForPanel(response, payload.latestObservedBarTimestamp)) {
+      const reason = response
+        ? "Waiting for backend Regime worker to process the latest finalized one-minute bar"
+        : "Waiting for backend Regime worker to publish its first finalized one-minute decision";
+      backendRegimeSelectionCache = { key, result: emptyRegimeSelectionResult(reason) };
+      backendRegimeEvaluationError = null;
+      return;
+    }
     backendRegimeSelectionCache = { key, result: regimeBackendEvaluationAsSelectionResult(response) };
     backendRegimeEvaluationError = null;
   } catch (error) {
@@ -11473,6 +11492,56 @@ async function requestBackendRegimeSelection(key: string, payload: ReturnType<ty
     }
     scheduleRegimeSelectionPanelUpdate();
   }
+}
+
+function latestRegimeDecisionEnvelopeAsEvaluation(envelope: Record<string, unknown>): BackendRegimeEvaluationResponse | null {
+  const latest = childRecord(envelope, "decision");
+  if (!latest) {
+    return null;
+  }
+  if (childRecord(latest, "decision")) {
+    return latest as BackendRegimeEvaluationResponse;
+  }
+  return {
+    algorithmId: "regime",
+    runtime: "backend.app.algorithms.regime.execution_pipeline",
+    pipeline: [],
+    decision: latest,
+    sizing: {},
+    orderIntent: null,
+    orderValidation: { valid: false, reasonCodes: ["regime.frontend.latest_decision_summary_only"] },
+    globalRiskApproval: null,
+    brokerSubmission: null,
+  };
+}
+
+function regimeBackendEvaluationIsUsableForPanel(response: BackendRegimeEvaluationResponse, latestObservedBarTimestamp: string | null) {
+  const decision = response.decision;
+  const rawClassification = childRecord(decision, "raw_classification") ?? {};
+  const dataTimestamp = stringFromUnknown(
+    response.dataTimestamp ?? response.featureTimestamp ?? rawClassification.timestamp ?? response.decision?.timestamp,
+    "",
+  );
+  const blockers = [
+    ...arrayFromUnknown(decision.trade_blockers).map((item) => String(item)),
+    ...arrayFromUnknown(rawClassification.no_trade_reasons).map((item) => String(item)),
+    ...arrayFromUnknown(response.orderValidation?.reasonCodes).map((item) => String(item)),
+  ];
+  if (blockers.some((blocker) => blocker.toLowerCase().includes("requires at least one primary candle"))) {
+    return false;
+  }
+  if (!dataTimestamp) {
+    return false;
+  }
+  if (!latestObservedBarTimestamp) {
+    return true;
+  }
+  const backendTime = Date.parse(dataTimestamp);
+  const observedTime = Date.parse(latestObservedBarTimestamp);
+  if (!Number.isFinite(backendTime) || !Number.isFinite(observedTime)) {
+    return true;
+  }
+  return backendTime >= observedTime - 60_000;
 }
 
 function regimeBackendEvaluationAsSelectionResult(response: BackendRegimeEvaluationResponse): RegimeSelectionResult {
@@ -11874,35 +11943,6 @@ function renderRegimeScoreGrid(result: RegimeSelectionResult) {
     .join("");
 }
 
-function renderRegimeSummary(result: RegimeSelectionResult, targetOrder: ManualOrderRecommendation) {
-  const sizingBlocker = targetOrder.failedGates.find((gate) => gate.startsWith("Sizing:")) ?? "";
-  const quantityBlockers = uniqueStrings([...result.tradeBlockers, sizingBlocker].filter(Boolean));
-  const noTrade = result.noTradeReasons.length
-    ? renderRegimeSummaryRow("No-trade checks", escapeHtml(result.noTradeReasons.join("; ")), "warn")
-    : "";
-  const blockers = quantityBlockers.length
-    ? renderRegimeSummaryRow("Quantity gate", `0 - ${escapeHtml(quantityBlockers.join("; "))}`, "block")
-    : renderRegimeSummaryRow("Quantity gate", `${targetOrder.quantity} shares - Winning direction passed: score, edge, condition confidence, opportunity, and Regime sizing.`, "pass");
-  const confirmation = result.conditionHeld
-    ? `Raw ${escapeHtml(result.rawCondition)} has ${result.confirmationCount}/3 confirmation, keeping ${escapeHtml(result.confirmedCondition)}.`
-    : `${result.confirmationCount}/3 recent candles support ${escapeHtml(result.confirmedCondition)}, or confidence is >= 65%.`;
-  return `
-    <div class="regime-summary-grid">
-      ${renderRegimeSummaryRow("Condition", `${escapeHtml(result.primaryTrend)} + ${escapeHtml(result.volatility)} + ${escapeHtml(result.opportunity)}`, "info")}
-      ${renderRegimeSummaryRow(result.conditionHeld ? "Condition hold" : "Confirmation", confirmation, result.conditionHeld ? "pass" : "info")}
-      ${renderRegimeSummaryRow("Aggregate winner", `${escapeHtml(result.aggregateSignal)} (${result.activeStrategyCount} active strategy outputs)`, "info")}
-      ${renderRegimeSummaryRow(
-        "Trade decision",
-        `${escapeHtml(result.signal)}; target qty ${targetOrder.quantity}; buy ${formatProbability(result.scores.buy)}, sell ${formatProbability(result.scores.sell)}, second best ${formatProbability(result.secondBestScore)}, edge ${formatProbability(result.scoreEdge)}`,
-        quantityBlockers.length || result.signal === "No-trade" ? "block" : result.signal === "Hold" ? "warn" : "pass",
-      )}
-      ${blockers}
-      ${renderRegimeSummaryRow("Selector", "Strategies are filtered before voting; skipped strategies cannot affect this result.", "neutral")}
-      ${noTrade}
-    </div>
-  `;
-}
-
 function renderRegimeConditionPanel(result: RegimeSelectionResult) {
   const axes = result.rawClassification?.axes;
   const confirmed = result.confirmedState;
@@ -11912,10 +11952,6 @@ function renderRegimeConditionPanel(result: RegimeSelectionResult) {
   ]);
   return `
     <section class="regime-section-card" aria-label="Market condition">
-      <div class="regime-section-head">
-        <strong>Market condition</strong>
-        <span>${escapeHtml(result.primaryTrend)} / ${escapeHtml(result.volatility)} / ${escapeHtml(result.opportunity)}</span>
-      </div>
       <div class="regime-detail-grid">
         ${renderRegimeDetailItem("Raw regime", result.rawClassification?.rawRegime ?? result.rawCondition)}
         ${renderRegimeDetailItem("Confirmed regime", confirmed?.confirmedRegime ?? result.confirmedCondition)}
@@ -11930,136 +11966,6 @@ function renderRegimeConditionPanel(result: RegimeSelectionResult) {
         ${renderRegimeDetailItem("Regime dwell", `${confirmed?.dwellBars ?? 0} bars`)}
         ${renderRegimeDetailItem("Transition reason", confirmed?.transitionReason ?? "No confirmed transition")}
         ${renderRegimeDetailItem("Missing or stale inputs", missingOrStale.length ? missingOrStale.join("; ") : "None reported", "wide")}
-      </div>
-    </section>
-  `;
-}
-
-function renderRegimeRoutingPanel(result: RegimeSelectionResult) {
-  const selected = result.selectedStrategies.filter((strategy) => strategy.role === "directional");
-  const skipped = result.routing?.skippedStrategies ?? result.skippedStrategies.map((strategy) => ({ strategyId: strategy.name, reason: strategy.reason }));
-  return `
-    <section class="regime-section-card" aria-label="Strategy routing">
-      <div class="regime-section-head">
-        <strong>Strategy routing</strong>
-        <span>${selected.length} selected directional strategies / ${skipped.length} skipped</span>
-      </div>
-      <div class="regime-routing-columns">
-        <div>
-          <h4>Selected directional strategies</h4>
-          ${selected.length ? selected.map((strategy) => renderRegimeRoutingStrategy(strategy, result)).join("") : `<p class="regime-empty">No directional strategies selected.</p>`}
-        </div>
-        <div>
-          <h4>Skipped strategies and reasons</h4>
-          <div class="regime-skipped-list">
-            ${skipped.length ? skipped.slice(0, 12).map((strategy) => `<span>${escapeHtml(strategy.strategyId)} - ${escapeHtml(strategy.reason)}</span>`).join("") : `<span>None skipped.</span>`}
-          </div>
-        </div>
-      </div>
-    </section>
-  `;
-}
-
-function renderRegimeRoutingStrategy(strategy: RegimeSelectedStrategy, result: RegimeSelectionResult) {
-  const familyScore = strategyFamilyScoreValue(strategy, result);
-  return `
-    <article class="regime-routing-card" data-signal="${strategy.signal}">
-      <div>
-        <strong>${escapeHtml(strategy.name)}</strong>
-        <span>Strategy role: ${escapeHtml(strategy.role)}</span>
-        <span>Strategy family: ${escapeHtml(strategy.family)}</span>
-        <span>Raw confidence: ${formatProbability(strategy.rawConfidence ?? strategy.directionalResult?.confidence ?? strategy.confidence)}</span>
-        <span>Effective confidence: ${formatProbability(strategy.effectiveConfidence ?? strategy.confidence)}</span>
-        <span>Correlation penalty: ${formatMultiplier(strategy.correlationPenalty ?? 1)}</span>
-        <span>Family score: ${familyScore}</span>
-      </div>
-      <b class="algo-signal-badge">${escapeHtml(strategy.signal === "buy" ? "Buy" : strategy.signal === "sell" ? "Sell" : "Hold")}</b>
-    </article>
-  `;
-}
-
-function renderRegimeDecisionPanel(result: RegimeSelectionResult, targetOrder: ManualOrderRecommendation) {
-  const blockers = uniqueStrings([...result.tradeBlockers, ...targetOrder.failedGates]);
-  return `
-    <section class="regime-section-card" aria-label="Decision">
-      <div class="regime-section-head">
-        <strong>Decision</strong>
-        <span>${escapeHtml(result.signal)} / ${escapeHtml(result.winningDirection)}</span>
-      </div>
-      <div class="regime-detail-grid">
-        ${renderRegimeDetailItem("Buy score", result.buyScore.toFixed(2))}
-        ${renderRegimeDetailItem("Sell score", result.sellScore.toFixed(2))}
-        ${renderRegimeDetailItem("Winning direction", result.winningDirection)}
-        ${renderRegimeDetailItem("Winning score", result.winningScore.toFixed(2))}
-        ${renderRegimeDetailItem("Directional edge", result.directionalEdge.toFixed(2))}
-        ${renderRegimeDetailItem("Active strategy count", String(result.activeStrategyCount))}
-        ${renderRegimeDetailItem("Independent family count", String(result.activeFamilyCount))}
-        ${renderRegimeDetailItem("Hold/abstention rate", formatProbability(result.abstentionRate))}
-        ${renderRegimeDetailItem("Trade blockers", blockers.length ? blockers.join("; ") : "None", "wide")}
-      </div>
-    </section>
-  `;
-}
-
-function renderRegimeMlPanel(result: RegimeSelectionResult) {
-  const ml = result.ml;
-  const prediction = ml?.prediction;
-  const probabilities = prediction?.probabilityVector ? Object.entries(prediction.probabilityVector) : [];
-  const trustedArtifactLoaded = Boolean(result.decisionSnapshot?.modelVersion && prediction?.enabled && !ml?.reasonCodes.some((reason) => /untrusted|unsupported|schema|hash|artifact/i.test(reason)));
-  const artifactStatus = trustedArtifactLoaded ? "Trusted compatible artifact loaded" : "No trusted compatible artifact loaded";
-  const agreement =
-    prediction?.predictedRegime && result.confirmedState?.confirmedRegime
-      ? prediction.predictedRegime === result.confirmedState.confirmedRegime
-        ? "Agreement"
-        : "Disagreement"
-      : "Not available";
-  return `
-    <section class="regime-section-card" aria-label="ML">
-      <div class="regime-section-head">
-        <strong>ML</strong>
-        <span>${escapeHtml(ml?.mode ?? "shadow")}</span>
-      </div>
-      <div class="regime-detail-grid">
-        ${renderRegimeDetailItem("ML mode", ml?.mode ?? "shadow")}
-        ${renderRegimeDetailItem("Artifact status", artifactStatus)}
-        ${renderRegimeDetailItem("Model version", result.decisionSnapshot?.modelVersion ?? "None")}
-        ${renderRegimeDetailItem("Predicted regime", prediction?.predictedRegime ?? "None")}
-        ${renderRegimeDetailItem("Rule/ML agreement", agreement)}
-        ${renderRegimeDetailItem("Transition probability", prediction?.transitionProbability === null || prediction?.transitionProbability === undefined ? "NA" : formatProbability(prediction.transitionProbability))}
-        ${renderRegimeDetailItem("Shadow result", ml?.appliedEffect === "shadow_only" ? "Shadow only; decision unchanged" : ml?.appliedEffect ?? "none")}
-        ${renderRegimeDetailItem("Promotion status", trustedArtifactLoaded ? "Compatible artifact loaded" : "Not promoted")}
-        ${renderRegimeDetailItem("Fallback reason", ml?.reasonCodes.length ? ml.reasonCodes.join("; ") : "Rule-based fallback remains authoritative", "wide")}
-        ${renderRegimeDetailItem(
-          "Probability vector",
-          probabilities.length ? probabilities.map(([key, value]) => `${key}: ${formatProbability(Number(value))}`).join("; ") : "None",
-          "wide",
-        )}
-      </div>
-    </section>
-  `;
-}
-
-function renderRegimeGlobalGatesPanel(targetOrder: ManualOrderRecommendation) {
-  const status = targetOrder.failedGates.length ? "denied" : "pending server evaluation";
-  const passed = targetOrder.gates.filter((gate) => gate.status === "pass");
-  const failed = targetOrder.gates.filter((gate) => gate.status === "fail");
-  const warnings = targetOrder.gates.filter((gate) => gate.status === "caution" || gate.status === "info");
-  return `
-    <section class="regime-section-card" aria-label="Global gates">
-      <div class="regime-section-head">
-        <strong>Global gates</strong>
-        <span>Approved/resized/denied: ${escapeHtml(status)}</span>
-      </div>
-      <div class="regime-detail-grid">
-        ${renderRegimeDetailItem("Requested quantity", targetOrder.regimeSizing?.requestedQuantityBeforeGlobalCapacity?.toLocaleString() ?? targetOrder.quantity.toLocaleString())}
-        ${renderRegimeDetailItem("Approved quantity", targetOrder.failedGates.length ? "0" : "Pending global manager")}
-        ${renderRegimeDetailItem("Requested risk", currency(targetOrder.riskDollars))}
-        ${renderRegimeDetailItem("Approved risk", targetOrder.failedGates.length ? currency(0) : "Pending global manager")}
-        ${renderRegimeDetailItem("Account snapshot time", targetOrder.levels.lastTime ?? "Unavailable")}
-        ${renderRegimeDetailItem("Reservation ID status", targetOrder.orderIntent ? "Intent created; reservation pending server gate" : "No reservation")}
-        ${renderRegimeDetailItem("Passed gates", passed.length ? passed.map((gate) => `${gate.layer}: ${gate.detail}`).join("; ") : "None", "wide")}
-        ${renderRegimeDetailItem("Failed gates", failed.length ? failed.map((gate) => `${gate.layer}: ${gate.detail}`).join("; ") : "None", "wide")}
-        ${renderRegimeDetailItem("Warnings", warnings.length ? warnings.map((gate) => `${gate.layer}: ${gate.detail}`).join("; ") : "None", "wide")}
       </div>
     </section>
   `;
@@ -12089,15 +11995,6 @@ function formatMultiplier(value: number) {
 
 function startCase(value: string) {
   return value.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-function renderRegimeSummaryRow(label: string, value: string, tone: "info" | "pass" | "warn" | "block" | "neutral") {
-  return `
-    <div class="regime-summary-row" data-tone="${tone}">
-      <b>${escapeHtml(label)}</b>
-      <span>${value}</span>
-    </div>
-  `;
 }
 
 function renderRegimeFeatureGrid(features: RegimeSelectionFeature[]) {
@@ -13568,29 +13465,49 @@ function renderRegimeTradingSettingsPanel(result: RegimeSelectionResult, targetO
   const settings = state.regimeTradingSettings;
   const expanded = state.regimeTradingSettingsExpanded;
   return `
-    <div class="trading-settings-panel weighted-trading-settings-panel" data-status="ready" data-expanded="${String(expanded)}">
+    <div class="trading-settings-panel weighted-trading-settings-panel regime-trading-settings-panel" data-status="ready" data-expanded="${String(expanded)}">
       <button id="regimeTradingSettingsToggle" class="trading-settings-head" type="button" aria-expanded="${String(expanded)}" aria-controls="regimeTradingSettingsBody">
         <span class="trading-settings-title">
           <b>${expanded ? "-" : "+"}</b>
-          <strong>Strategy Settings</strong>
+          <strong>Trading Settings</strong>
         </span>
-        <span class="trading-settings-summary">${escapeHtml(regimeTradingSettingsSummary(result, targetOrder))}</span>
+        <span class="trading-settings-summary">${escapeHtml(regimeTradingSettingsVersionSummary(result))}</span>
       </button>
-      <div id="regimeTradingSettingsBody" class="trading-settings-body" ${expanded ? "" : "hidden"}>
-        <div class="regime-reset-actions">
-          <button id="regimeResetBaselineDefaults" class="secondary-action" type="button">Reset baseline to defaults</button>
-          <button id="regimeResetProfileMatrixDefaults" class="secondary-action" type="button">Reset profile matrix to defaults</button>
-        </div>
-        ${renderRegimeProfileComparison(result)}
+      <div id="regimeTradingSettingsBody" class="trading-settings-body regime-trading-settings-body" ${expanded ? "" : "hidden"}>
+        ${renderRegimeTradingSettingsGrid(settings)}
         ${renderConfidenceTargetOrderSettings(targetOrder, "Regime", "regime")}
         ${renderRegimeDefaultSizingSection(settings, targetOrder.regimeSizing ?? emptyRegimeSizingForUi(settings, "Regime sizing unavailable"))}
+        <div class="trading-settings-actions regime-trading-actions">
+          <span>
+            <button id="regimeResetBaselineDefaults" class="secondary-action" type="button">Reset Baseline</button>
+            <button id="regimeResetProfileMatrixDefaults" class="secondary-action" type="button">Refresh Profile Matrix</button>
+          </span>
+        </div>
       </div>
     </div>
   `;
 }
 
-function regimeTradingSettingsSummary(result: RegimeSelectionResult, targetOrder: ManualOrderRecommendation) {
-  return `Qty ${targetOrder.quantity} - ${formatProbability(result.scores.buy)} buy / ${formatProbability(result.scores.sell)} sell - edge ${formatProbability(result.scoreEdge)} - ${formatProbability(result.confidence)} condition`;
+function regimeTradingSettingsVersionSummary(result: RegimeSelectionResult) {
+  const config = result.effectiveSettings?.baseSettingsVersion ?? result.decisionSnapshot?.settingsVersion ?? "backend config pending";
+  const engine = result.decisionSnapshot?.algorithmVersion ?? result.decisionSnapshot?.runtime ?? "engine pending";
+  return `${config} / ${engine}`;
+}
+
+function renderRegimeTradingSettingsGrid(settings: TradingSettings) {
+  return `
+    <div class="trading-settings-grid regime-trading-settings-grid">
+      ${renderRegimeTradingSettingInput("startingCapital", "Total balance", settings.startingCapital, 1000, 10000000, 100)}
+      ${renderRegimeTradingSettingInput("orderAllocationPercent", "Order limit %", settings.orderAllocationPercent, 0.1, REGIME_MAX_ORDER_ALLOCATION_PERCENT, 0.1)}
+      ${renderRegimeTradingSettingInput("dailyAllocationPercent", "Daily max %", settings.dailyAllocationPercent, 0.1, 100, 0.1)}
+      ${renderRegimeTradingSettingInput("riskBudgetPercentOfOrder", "Risk budget %", settings.riskBudgetPercentOfOrder, 0.1, 100, 0.1)}
+      ${renderRegimeTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 1, 50, 1)}
+      ${renderRegimeTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
+      ${renderRegimeTradingSettingInput("stopLossPercent", "Stop %", settings.stopLossPercent, 0.01, 20, 0.01)}
+      ${renderRegimeTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
+      ${renderRegimeTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
+    </div>
+  `;
 }
 
 function renderRegimeProfileComparison(result: RegimeSelectionResult) {
@@ -13701,8 +13618,8 @@ function renderRegimeDefaultSizingSection(settings: TradingSettings, sizing: Reg
       </div>
       <div id="regimeDefaultSizingBody" class="trading-default-body" ${expanded ? "" : "hidden"}>
         <div class="trading-settings-grid trading-default-grid">
-          ${renderRegimeTradingSettingInput("minimumBuyScore", "Minimum winning score", settings.minimumBuyScore, 0, 1, 0.01)}
-          ${renderRegimeTradingSettingInput("minimumSignalEdge", "Minimum winning direction edge", settings.minimumSignalEdge, 0, 1, 0.01)}
+          ${renderRegimeTradingSettingInput("minimumBuyScore", "Minimum buy score", settings.minimumBuyScore, 0, 1, 0.01)}
+          ${renderRegimeTradingSettingInput("minimumSignalEdge", "Minimum signal edge", settings.minimumSignalEdge, 0, 1, 0.01)}
           ${renderRegimeTradingSettingInput("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0.01, 10, 0.01)}
           ${renderRegimeTradingSettingInput("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0.1, 100, 0.1)}
           ${renderRegimeTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
@@ -14296,10 +14213,14 @@ function renderConfidenceTargetOrderSettings(order: ManualOrderRecommendation, s
         : mode === "weighted"
           ? "weighted-target-setting"
           : "confidence-target-setting";
+  const generatedNote =
+    mode === "regime"
+      ? "Generated from Regime sizing, Regime settings, and Regime isolated inventory"
+      : `Generated from ${escapeHtml(sourceLabel)} sizing and default settings`;
   return `
     <div class="target-settings-panel weighted-target-settings-panel" data-side="${escapeHtml(order.side.toLowerCase())}">
       <strong>Target Order</strong>
-      <span class="target-settings-note">${defaultsOn ? `Generated from ${escapeHtml(sourceLabel)} sizing and default settings` : "Manual target-order overrides enabled"}</span>
+      <span class="target-settings-note">${defaultsOn ? generatedNote : "Manual target-order overrides enabled"}</span>
       ${renderTargetOrderBlockers(order, mode)}
       <div class="target-settings-grid">
         ${renderConfidenceTargetSettingInput("accountBalance", "Total balance", order.accountBalance, "number", 0.01, undefined, defaultsOn, targetDataset)}
@@ -15611,6 +15532,26 @@ async function syncWeightedVotingAutomaticPaperControl(enabled: boolean) {
   } catch (error) {
     weightedVotingBackendState.warning = error instanceof Error ? error.message : "Weighted Voting automatic paper control sync failed";
     updateWeightedVotingPanel({ refresh: false });
+  }
+}
+
+async function syncRegimeAutomaticPaperControl(enabled: boolean) {
+  try {
+    const reason = enabled
+      ? "regime.runtime.dashboard.global_paper_toggle_on"
+      : "regime.runtime.dashboard.global_paper_toggle_off";
+    const result = await setRegimeAutomaticPaperTrading<Record<string, unknown>>({
+      enabled,
+      actor: "dashboard.global_paper_toggle",
+      reason,
+    });
+    const control = childRecord(result, "automaticPaperControl") ?? result;
+    const automaticEnabled = weightedTruthFromUnknown(control.automaticPaperTradingEnabled, false);
+    if (enabled && !automaticEnabled) {
+      console.info("Regime automatic paper remains gated by backend rollout evidence.", control);
+    }
+  } catch (error) {
+    console.warn(error instanceof Error ? error.message : "Regime automatic paper control sync failed");
   }
 }
 
@@ -19021,6 +18962,40 @@ async function runRegimeDailyBacktestFromPreparedCandles(preparedOneMinuteCandle
   renderRegimeBacktestState();
 }
 
+async function maybeRunRegimePreparedBacktest(reason: string) {
+  if (regimePreparedBacktestInFlight || regimeBacktestStatus === "running" || regimeBacktestStatus === "ready") {
+    return;
+  }
+  if (Date.now() < regimePreparedBacktestNextCheckAt) {
+    return;
+  }
+  regimePreparedBacktestInFlight = true;
+  regimePreparedBacktestNextCheckAt = Date.now() + 10 * 60 * 1000;
+  try {
+    const range = await getBacktestRange({ refresh: true });
+    const rangeLabel = `${range.startDate} through ${range.endDate}`;
+    regimeBacktestStatus = "waiting";
+    regimeBacktestError = `Loading prepared 1-minute Regime backtest data from ${rangeLabel}.`;
+    renderRegimeBacktestState();
+
+    const preparedOneMinuteCandles = normalizeCandles(await fetchPreparedBacktestCandles("1Min"));
+    if (preparedOneMinuteCandles.length < 2) {
+      regimeBacktestStatus = "waiting";
+      regimeBacktestError = `Prepared Regime backtest data from ${rangeLabel} has fewer than two one-minute candles.`;
+      renderRegimeBacktestState();
+      return;
+    }
+    const latestPreparedDate = String(range.oneMinuteEnd || range.endDate).slice(0, 10);
+    await runRegimeDailyBacktestFromPreparedCandles(preparedOneMinuteCandles, latestPreparedDate, `${reason}: ${rangeLabel}`);
+  } catch (error) {
+    regimeBacktestStatus = "waiting";
+    regimeBacktestError = error instanceof Error ? error.message : "Waiting for prepared Regime backtest data.";
+    renderRegimeBacktestState();
+  } finally {
+    regimePreparedBacktestInFlight = false;
+  }
+}
+
 function backendRegimeBacktestCacheKey(symbol: string, candles: Candle[]): string {
   const first = candles[0]?.timestamp ?? "na";
   const last = candles[candles.length - 1]?.timestamp ?? "na";
@@ -19298,21 +19273,21 @@ function renderConfidenceBacktestState() {
 function renderRegimeBacktestState() {
   regimeBacktestStatusLabel.textContent =
     regimeBacktestStatus === "running"
-      ? "Running after close"
+      ? "Running prepared replay"
       : regimeBacktestStatus === "ready"
-        ? "Daily result ready"
+        ? "Prepared replay ready"
         : regimeBacktestStatus === "waiting"
-          ? "Waiting for dataset"
+          ? "Loading prepared data"
           : regimeBacktestStatus === "error"
             ? "Backtest error"
-            : "Daily closed-market run";
+            : "Prepared dataset replay";
   if (regimeBacktestStatus === "running") {
-    regimeBacktestSummary.innerHTML = `<span>Backtest status: <strong>Running Regime replay after market close...</strong></span><span>${escapeHtml(regimeBacktestError || "Dataset is current; daily Regime backtest is running.")}</span>`;
+    regimeBacktestSummary.innerHTML = `<span>Backtest status: <strong>Running Regime prepared-data replay...</strong></span><span>${escapeHtml(regimeBacktestError || "Prepared dataset is loaded; Regime backtest is running.")}</span>`;
     regimeBacktestTradesTable.innerHTML = renderRegimeBacktestTrades([]);
     return;
   }
   if (regimeBacktestStatus === "waiting") {
-    regimeBacktestSummary.innerHTML = `<span>Backtest status: <strong>Waiting</strong></span><span>${escapeHtml(regimeBacktestError || "Regime backtest runs after market close once the prepared candles are current.")}</span>`;
+    regimeBacktestSummary.innerHTML = `<span>Backtest status: <strong>Waiting</strong></span><span>${escapeHtml(regimeBacktestError || "Loading prepared Regime backtest candles.")}</span>`;
     regimeBacktestTradesTable.innerHTML = regimeBacktestResult ? renderRegimeBacktestTrades(regimeBacktestResult.trades) : renderRegimeBacktestTrades([]);
     return;
   }
@@ -19322,7 +19297,7 @@ function renderRegimeBacktestState() {
     return;
   }
   if (!regimeBacktestResult) {
-    regimeBacktestSummary.innerHTML = `<span>Backtest status: <strong>Scheduled</strong></span><span>Runs daily after market close as an isolated Regime replay.</span>`;
+    regimeBacktestSummary.innerHTML = `<span>Backtest status: <strong>Prepared data</strong></span><span>Loads the backend 1-minute prepared dataset, starting from the available 2020 range, as an isolated Regime replay.</span>`;
     regimeBacktestTradesTable.innerHTML = renderRegimeBacktestTrades([]);
     return;
   }

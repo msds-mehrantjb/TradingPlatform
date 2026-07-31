@@ -13,8 +13,18 @@ type RegimeSettingsCommand = {
   identity?: Record<string, unknown>;
   settings?: Record<string, unknown>;
   settingsSnapshot?: Record<string, unknown>;
+  settingsVersion?: string;
   targetSettingsVersion?: string;
   rollbackToSettingsVersion?: string;
+  reason?: string;
+  activationReason?: string;
+  rollbackReason?: string;
+};
+
+type RegimeAutomaticPaperControlCommand = {
+  enabled: boolean;
+  actor: string;
+  reason: string;
 };
 
 const AUTHORITATIVE_REGIME_PAYLOAD_KEYS = new Set([
@@ -23,11 +33,15 @@ const AUTHORITATIVE_REGIME_PAYLOAD_KEYS = new Set([
   "account",
   "accountSnapshot",
   "position",
+  "currentPosition",
   "positionState",
   "positions",
   "inventory",
   "inventorySnapshot",
   "availableBuyingPower",
+  "availableRisk",
+  "buyingPower",
+  "dailyPnl",
   "remainingAlgorithmRiskDollars",
   "globalRiskCapacityQuantity",
   "authoritativeDecision",
@@ -46,6 +60,24 @@ const AUTHORITATIVE_REGIME_PAYLOAD_KEYS = new Set([
   "brokerSubmission",
   "decisionResult",
   "backtestResult",
+]);
+const DIRECT_EVALUATION_DATA_KEYS = new Set([
+  "marketData",
+  "candles",
+  "bars",
+  "quotes",
+  "latestBar",
+  "features",
+  "classificationInput",
+]);
+const REGIME_PROMOTION_EVIDENCE_KEYS = new Set([
+  "evidence",
+  "promotionEvidence",
+  "promotion_evidence",
+  "readinessEvidence",
+  "readiness_evidence",
+  "paperStabilityEvidence",
+  "paper_stability_evidence",
 ]);
 
 export async function runRegimeBacktestOnBackend<T>(
@@ -80,6 +112,14 @@ export async function evaluateRegimeOnBackend<T>(
   return await unwrapRegimeJobResponse<T>(await response.json(), client);
 }
 
+export async function readLatestRegimeDecisionFromBackend<T>(client: ApiClient = defaultApiClient): Promise<T> {
+  const response = await client.fetch(`${client.baseUrl || API_BASE}/api/regime/runtime/latest-decision`);
+  if (!response.ok) {
+    throw new Error(`Backend Regime latest decision read failed: ${response.status}`);
+  }
+  return (await response.json()) as T;
+}
+
 export async function createRegimeSettingsVersion<T>(
   payload: RegimeSettingsCommand,
   client: ApiClient = defaultApiClient,
@@ -106,6 +146,22 @@ export async function rollbackRegimeSettingsVersion<T>(
   client: ApiClient = defaultApiClient,
 ): Promise<T> {
   return await submitRegimeSettingsCommand<T>("/api/regime/settings/versions/rollback", payload, client);
+}
+
+export async function setRegimeAutomaticPaperTrading<T>(
+  payload: RegimeAutomaticPaperControlCommand,
+  client: ApiClient = defaultApiClient,
+): Promise<T> {
+  assertRegimeControlPayload(payload, "automatic paper control");
+  const response = await client.fetch(`${client.baseUrl || API_BASE}/api/regime/rollout/automatic-paper`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw new Error(`Backend Regime automatic paper control failed: ${response.status}`);
+  }
+  return (await response.json()) as T;
 }
 
 export async function readActiveRegimeSettings<T>(
@@ -143,6 +199,26 @@ function assertRegimeTransportOnlyPayload(payload: Record<string, unknown>, kind
   for (const key of AUTHORITATIVE_REGIME_PAYLOAD_KEYS) {
     if (Object.prototype.hasOwnProperty.call(payload, key)) {
       throw new Error(`Regime ${kind} payload cannot submit authoritative ${key}; backend workers own decisions`);
+    }
+  }
+  if (kind === "evaluation") {
+    for (const key of DIRECT_EVALUATION_DATA_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(payload, key)) {
+        throw new Error(`Regime evaluation payload cannot submit ${key}; use a trusted finalized-bar reference`);
+      }
+    }
+  }
+}
+
+function assertRegimeControlPayload(payload: Record<string, unknown>, kind: string) {
+  for (const key of REGIME_PROMOTION_EVIDENCE_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(payload, key)) {
+      throw new Error(`Regime ${kind} cannot submit promotion evidence; backend workers own rollout evidence`);
+    }
+  }
+  for (const key of AUTHORITATIVE_REGIME_PAYLOAD_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(payload, key)) {
+      throw new Error(`Regime ${kind} cannot submit authoritative ${key}; backend workers own decisions`);
     }
   }
 }

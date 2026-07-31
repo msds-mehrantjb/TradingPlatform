@@ -20,6 +20,51 @@ from backend.app.algorithms.regime.trade_management import evaluate_regime_exit
 REGIME_BACKTEST_ENGINE_VERSION = "regime_backtest_v3_backend"
 execute_regime_pipeline = _production_execute_regime_pipeline
 
+REGIME_BACKTEST_PARITY_COMPONENTS = (
+    {
+        "component": "market_snapshot_builder",
+        "paperImplementation": "backend.app.algorithms.regime.market_snapshot.build_regime_market_snapshot",
+        "backtestImplementation": "backend.app.algorithms.regime.market_snapshot.build_regime_market_snapshot",
+        "adapterBoundary": "data_adapter",
+    },
+    {
+        "component": "classifier_hysteresis_transition_router_strategy_profile_family_local_gates_sizing_entry",
+        "paperImplementation": "backend.app.algorithms.regime.stateful_core.process_regime_bar",
+        "backtestImplementation": "backend.app.algorithms.regime.stateful_core.process_regime_bar",
+        "adapterBoundary": "clock_and_persistence_adapter",
+    },
+    {
+        "component": "strategy_registry_and_implementations",
+        "paperImplementation": "backend.app.algorithms.regime.strategy_registry",
+        "backtestImplementation": "backend.app.algorithms.regime.strategy_registry",
+        "adapterBoundary": "none",
+    },
+    {
+        "component": "cost_model_interface",
+        "paperImplementation": "backend.app.algorithms.regime.execution_cost_adapter",
+        "backtestImplementation": "backend.app.algorithms.regime.execution_cost_adapter",
+        "adapterBoundary": "model_feature_source_adapter",
+    },
+    {
+        "component": "exit_logic_trade_management",
+        "paperImplementation": "backend.app.algorithms.regime.trade_management.evaluate_regime_exit",
+        "backtestImplementation": "backend.app.algorithms.regime.trade_management.evaluate_regime_exit",
+        "adapterBoundary": "broker_fill_and_persistence_adapter",
+    },
+    {
+        "component": "broker_fill_execution_adapter",
+        "paperImplementation": "backend.app.algorithms.regime.execution_worker",
+        "backtestImplementation": "backend.app.algorithms.regime.backtest.execution.simulate_order_execution",
+        "adapterBoundary": "allowed_difference",
+    },
+    {
+        "component": "position_ledger",
+        "paperImplementation": "backend.app.algorithms.regime.inventory",
+        "backtestImplementation": "backend.app.algorithms.regime.backtest.ledger",
+        "adapterBoundary": "persistence_adapter",
+    },
+)
+
 
 def run_regime_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     symbol = str(payload.get("symbol") or "SPY").upper()
@@ -51,13 +96,12 @@ def run_regime_backtest(payload: dict[str, Any]) -> dict[str, Any]:
             "symbol": symbol,
             "primaryCandles": history,
             "oneMinuteCandles": history,
-            "fiveMinuteCandles": _point_in_time_feed(payload.get("fiveMinuteCandles") or [], candle),
             "contextFeeds": _point_in_time_context(context_feeds, candle),
         }
         snapshot = build_regime_market_snapshot(snapshot_payload)
         inventory_snapshot = {
             **identity,
-            "dataManifestHash": _data_manifest_hash(symbol, history, snapshot_payload),
+            "dataManifestHash": _data_manifest_hash(symbol, history, snapshot),
             "openPosition": _inventory_position(open_trade),
         }
         output = _process_backtest_bar(snapshot, settings_snapshot, previous_state, inventory_snapshot, account_snapshot)
@@ -66,14 +110,14 @@ def run_regime_backtest(payload: dict[str, Any]) -> dict[str, Any]:
         duplicate = decision_id in seen_decision_ids
         seen_decision_ids.add(decision_id)
         if open_trade is not None:
-            exit_result = evaluate_regime_exit(open_trade, candle, output["decision"]["confirmed_state"]["confirmed_regime"])
+            exit_result = evaluate_regime_exit(open_trade, {**candle, "barIndex": index}, output["decision"]["confirmed_state"]["confirmed_regime"], settings)
             if exit_result["action"] != "hold":
                 reason = str((exit_result.get("reasonCodes") or ("regime.exit.policy",))[0])
                 exit_price = float(exit_result.get("price") or candle.get("close", 0))
                 exit_cost = _exit_cost(open_trade, candle, exit_price, settings, market_model)
                 trades.append(close_trade(open_trade, candle, exit_price, reason, exit_cost=exit_cost["totalCost"], exit_slippage=exit_cost["slippage"], exit_bar_index=index))
                 open_trade = None
-        decision_record = _decision_record(output, candle, index, warmup_bars, duplicate)
+        decision_record = _decision_record(output, candle, index, warmup_bars, duplicate, snapshot)
         decisions.append(decision_record)
         intent = output["orderProposal"]
         if open_trade is not None or duplicate or intent is None or not output["orderValidation"].get("valid"):
@@ -108,6 +152,8 @@ def run_regime_backtest(payload: dict[str, Any]) -> dict[str, Any]:
         minimum_fold_net_profit=(payload.get("walkForward") or {}).get("minimumFoldNetProfit"),
         minimum_holdout_net_profit=(payload.get("walkForward") or {}).get("minimumHoldoutNetProfit"),
     )
+    replay = _replay_manifest(symbol, candles, decisions, trades, settings, warmup_bars, market_model)
+    daily_session_replays = _daily_session_replays(decisions, trades)
     first_day = str(candles[0].get("timestamp", "na"))[:10] if candles else "na"
     last_day = str(candles[-1].get("timestamp", "na"))[:10] if candles else "na"
     return {
@@ -126,6 +172,22 @@ def run_regime_backtest(payload: dict[str, Any]) -> dict[str, Any]:
         "walkForward": [walk_forward],
         "walkForwardValidation": walk_forward,
         "acceptance": {"accepted": bool(walk_forward["accepted"]), "reasonCodes": _acceptance_reasons(walk_forward)},
+        "parity": _parity_report(),
+        "replay": replay,
+        "dailySessionReplays": daily_session_replays,
+        "restartDeterminism": {
+            "checkpointPolicy": "previous_runtime_state_replayed_from_each_completed_bar",
+            "checkpointCount": sum(1 for decision in decisions if decision.get("runtimeState") is not None),
+            "decisionHash": replay["decisionHash"],
+            "tradeHash": replay["tradeHash"],
+            "resultHash": replay["resultHash"],
+        },
+        "holdoutPolicy": {
+            "untouched": True,
+            "optimizationAllowed": False,
+            "holdoutFraction": float((payload.get("walkForward") or {}).get("holdoutFraction", 0.2)),
+            "reasonCodes": ("regime.backtest.holdout_not_used_for_optimization",),
+        },
         "diagnostics": ("backend_authoritative_runtime", "point_in_time_replay", "production_stateful_core", "simulated_paper_execution"),
         "settingsVersion": settings.get("settingsVersion"),
         "settingsSnapshot": settings_snapshot,
@@ -249,14 +311,15 @@ def _point_in_time_context(context_feeds: dict[str, Any], candle: dict[str, Any]
     return filtered
 
 
-def _data_manifest_hash(symbol: str, history: list[dict[str, Any]], snapshot_payload: dict[str, Any]) -> str:
+def _data_manifest_hash(symbol: str, history: list[dict[str, Any]], snapshot: Any) -> str:
     latest = history[-1] if history else {}
     payload = {
         "symbol": symbol,
         "latestTimestamp": latest.get("timestamp"),
         "oneMinuteCount": len(history),
-        "fiveMinuteCount": len(snapshot_payload.get("fiveMinuteCandles") or []),
-        "contextFeedCounts": {key: len(value) for key, value in (snapshot_payload.get("contextFeeds") or {}).items() if isinstance(value, list)},
+        "fiveMinuteCount": len(getattr(snapshot, "five_minute_candles", ()) or ()),
+        "fifteenMinuteCount": len(getattr(snapshot, "fifteen_minute_candles", ()) or ()),
+        "higherTimeframePolicy": "derived_point_in_time_from_finalized_one_minute",
         "latestClose": latest.get("close"),
         "latestVolume": latest.get("volume"),
     }
@@ -280,10 +343,13 @@ def _inventory_position(open_trade: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _decision_record(output: dict[str, Any], candle: dict[str, Any], index: int, warmup_bars: int, duplicate: bool) -> dict[str, Any]:
+def _decision_record(output: dict[str, Any], candle: dict[str, Any], index: int, warmup_bars: int, duplicate: bool, snapshot: Any) -> dict[str, Any]:
     decision = output["decision"]
     eligible = [item for item in decision["strategy_outputs"] if item["eligible"]]
     primary_strategy = eligible[0] if eligible else {}
+    source_metadata = _record(snapshot.context_feeds.get("marketDataSource") if hasattr(snapshot, "context_feeds") else {})
+    local_risk = _record(output.get("localRiskResult"))
+    local_details = _record(local_risk.get("details"))
     return {
         "timestamp": candle.get("timestamp"),
         "barIndex": index,
@@ -310,6 +376,24 @@ def _decision_record(output: dict[str, Any], candle: dict[str, Any], index: int,
             "warmupBars": warmup_bars,
             "latestTimestamp": candle.get("timestamp"),
             "futureCandlesVisible": 0,
+            "higherTimeframePolicy": source_metadata.get("higherTimeframePolicy") or "derived_point_in_time_from_finalized_one_minute",
+            "derivedFiveMinuteBars": len(getattr(snapshot, "five_minute_candles", ()) or ()),
+            "derivedFifteenMinuteBars": len(getattr(snapshot, "fifteen_minute_candles", ()) or ()),
+            "suppliedFiveMinuteBarsIgnoredForEvidence": int(source_metadata.get("suppliedFiveMinuteCount") or 0),
+            "suppliedFifteenMinuteBarsIgnoredForEvidence": int(source_metadata.get("suppliedFifteenMinuteCount") or 0),
+        },
+        "attribution": {
+            "algorithmId": "regime",
+            "settingsVersion": output.get("decision", {}).get("settings_version"),
+            "profileVersion": output.get("decision", {}).get("profile_version"),
+            "strategyIds": [item["strategy_id"] for item in eligible],
+            "strategyFamilies": sorted({str(item.get("family")) for item in eligible if item.get("family")}),
+            "familyAggregation": output.get("familyAggregation"),
+        },
+        "costModel": {
+            "interface": "backend.app.algorithms.regime.execution_cost_adapter",
+            "estimate": local_details.get("executionCostEstimate"),
+            "gate": local_details.get("executionCostGate"),
         },
     }
 
@@ -422,3 +506,125 @@ def _acceptance_reasons(walk_forward: dict[str, Any]) -> tuple[str, ...]:
     if holdout and not holdout.get("accepted"):
         reasons.append("regime.backtest.holdout_failed")
     return tuple(reasons)
+
+
+def _parity_report() -> dict[str, Any]:
+    return {
+        "version": "regime_backtest_paper_parity_v1",
+        "deterministicPipelineAuthoritative": True,
+        "apiOrFrontendTradingAuthority": False,
+        "allowedAdapterDifferences": ("data", "clock", "broker_fill", "persistence"),
+        "components": [dict(component, sameAuthoritativeImplementation=component["adapterBoundary"] != "allowed_difference") for component in REGIME_BACKTEST_PARITY_COMPONENTS],
+        "reasonCodes": ("regime.backtest.paper_parity_components_declared",),
+    }
+
+
+def _replay_manifest(
+    symbol: str,
+    candles: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    trades: list[dict[str, Any]],
+    settings: dict[str, Any],
+    warmup_bars: int,
+    market_model: dict[str, Any],
+) -> dict[str, Any]:
+    decision_hash = _stable_hash(_decision_fingerprint(decisions))
+    trade_hash = _stable_hash(_trade_fingerprint(trades))
+    payload = {
+        "engineVersion": REGIME_BACKTEST_ENGINE_VERSION,
+        "symbol": symbol,
+        "settingsVersion": settings.get("settingsVersion"),
+        "candleCount": len(candles),
+        "firstTimestamp": candles[0].get("timestamp") if candles else None,
+        "lastTimestamp": candles[-1].get("timestamp") if candles else None,
+        "warmupBars": warmup_bars,
+        "marketModel": market_model,
+        "decisionHash": decision_hash,
+        "tradeHash": trade_hash,
+    }
+    return {
+        **payload,
+        "eventType": "finalized_one_minute_bar_replay",
+        "barFinalizationRequired": True,
+        "higherTimeframePolicy": "derived_point_in_time_from_finalized_one_minute",
+        "executionPolicy": "next_bar_or_explicitly_modeled_execution",
+        "partialFillPolicy": "modeled_when_participation_or_available_volume_limits_fill",
+        "orderExpirationModeled": True,
+        "positionLedger": "backend.app.algorithms.regime.backtest.ledger",
+        "deterministic": True,
+        "decisionHash": decision_hash,
+        "tradeHash": trade_hash,
+        "resultHash": _stable_hash(payload),
+        "reasonCodes": (
+            "regime.backtest.finalized_one_minute_replay",
+            "regime.backtest.no_lookahead",
+            "regime.backtest.deterministic_versions_and_data",
+        ),
+    }
+
+
+def _daily_session_replays(decisions: list[dict[str, Any]], trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    days = sorted({str(decision.get("timestamp") or "")[:10] for decision in decisions if decision.get("timestamp")})
+    rows: list[dict[str, Any]] = []
+    for day in days:
+        day_decisions = [decision for decision in decisions if str(decision.get("timestamp") or "").startswith(day)]
+        day_trades = [trade for trade in trades if str(trade.get("exitAt") or trade.get("entryAt") or "").startswith(day)]
+        rows.append(
+            {
+                "sessionDate": day,
+                "finalizedOneMinuteBars": len(day_decisions),
+                "decisions": len(day_decisions),
+                "trades": len(day_trades),
+                "firstBar": day_decisions[0].get("timestamp") if day_decisions else None,
+                "lastBar": day_decisions[-1].get("timestamp") if day_decisions else None,
+                "restartCheckpointAvailable": any(decision.get("runtimeState") is not None for decision in day_decisions),
+            }
+        )
+    return rows
+
+
+def _decision_fingerprint(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "timestamp": decision.get("timestamp"),
+            "decisionId": decision.get("decisionId"),
+            "signal": decision.get("signal"),
+            "regime": decision.get("regime"),
+            "settingsVersion": decision.get("settingsVersion"),
+            "profileVersion": decision.get("profileVersion"),
+            "orderIntent": _record(decision.get("orderIntent")),
+            "execution": _record(decision.get("execution")),
+            "runtimeState": decision.get("runtimeState"),
+            "dataManifestHash": decision.get("dataManifestHash"),
+        }
+        for decision in decisions
+    ]
+
+
+def _trade_fingerprint(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "tradeId": trade.get("tradeId"),
+            "side": trade.get("side"),
+            "quantity": trade.get("quantity"),
+            "entryAt": trade.get("entryAt"),
+            "exitAt": trade.get("exitAt"),
+            "entryPrice": trade.get("entryPrice"),
+            "exitPrice": trade.get("exitPrice"),
+            "exitReason": trade.get("exitReason"),
+            "netPnl": trade.get("netPnl"),
+            "settingsVersion": trade.get("settingsVersion"),
+            "strategyId": trade.get("strategyId"),
+            "strategyFamily": trade.get("strategyFamily"),
+            "regime": trade.get("regime"),
+        }
+        for trade in trades
+    ]
+
+
+def _stable_hash(payload: Any) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+
+
+def _record(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}

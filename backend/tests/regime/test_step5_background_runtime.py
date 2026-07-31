@@ -74,9 +74,10 @@ def test_worker_loads_shared_account_snapshot_inside_background_processing() -> 
                 }
             ]
             assert service.last_evaluate_payload is not None
-            assert service.last_evaluate_payload["account"]["availableBuyingPower"] == 12_345.0
-            assert service.last_evaluate_payload["account"]["globalRiskCapacityQuantity"] == 7
-            assert service.last_evaluate_payload["account"]["runtimeLoadedBy"].startswith("regime_runtime_supervisor")
+            account = service.last_evaluate_payload["__regime_account_snapshot"]
+            assert account["availableBuyingPower"] == 12_345.0
+            assert account["globalRiskCapacityQuantity"] == 7
+            assert account["runtimeLoadedBy"].startswith("regime_runtime_supervisor")
         finally:
             await supervisor.shutdown()
 

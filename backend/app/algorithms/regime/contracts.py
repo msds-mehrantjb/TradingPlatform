@@ -46,7 +46,6 @@ MarketRegimeId = Literal[
     "strong_downtrend",
     "weak_downtrend",
     "range_bound",
-    "sideways_range",
     "choppy_mixed",
     "opening_breakout",
     "intraday_expansion",
@@ -57,6 +56,7 @@ MarketRegimeId = Literal[
     "event_risk",
     "liquidity_stress",
     "extreme_volatility_no_trade",
+    "unknown",
 ]
 
 
@@ -66,7 +66,6 @@ CANONICAL_MARKET_REGIMES: tuple[str, ...] = (
     "strong_downtrend",
     "weak_downtrend",
     "range_bound",
-    "sideways_range",
     "choppy_mixed",
     "opening_breakout",
     "intraday_expansion",
@@ -77,8 +76,10 @@ CANONICAL_MARKET_REGIMES: tuple[str, ...] = (
     "event_risk",
     "liquidity_stress",
     "extreme_volatility_no_trade",
+    "unknown",
 )
 LEGACY_REGIME_ALIASES: tuple[str, ...] = (
+    "sideways_range",
     "low_volatility",
     "normal_volatility",
     "high_volatility",
@@ -118,6 +119,7 @@ class RegimeMarketSnapshot:
     one_minute_candles: tuple[RegimeCandle, ...]
     five_minute_candles: tuple[RegimeCandle, ...]
     context_feeds: dict[str, Any]
+    fifteen_minute_candles: tuple[RegimeCandle, ...] = ()
 
     @property
     def latest(self) -> RegimeCandle:
@@ -132,6 +134,8 @@ class RegimeAxes:
     liquidity: str
     session: str
     event_risk: str
+    trend_strength: str = "unknown"
+    data_quality: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,11 @@ class RegimeHysteresisState:
     transition_confidence: float
     transition_reason: str
     transition_evidence: dict[str, Any] = field(default_factory=dict)
+    candidate_start_time: str | None = None
+    regime_confidence: float = 0.0
+    last_transition_time: str | None = None
+    bars_in_current_regime: int = 1
+    state_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -170,6 +179,16 @@ class RegimeStrategyEvaluation:
     eligible: bool
     reason: str
     evidence: dict[str, Any] = field(default_factory=dict)
+    strategy_version: str = "unknown"
+    lifecycle_status: str = "active"
+    expected_gross_edge_bps: float = 0.0
+    entry_reference: dict[str, Any] | None = None
+    stop_reference: dict[str, Any] | None = None
+    target_reference: dict[str, Any] | None = None
+    valid_until: str | None = None
+    setup_id: str | None = None
+    reason_codes: tuple[str, ...] = ()
+    data_ready: bool = True
 
 
 @dataclass(frozen=True)

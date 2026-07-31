@@ -9,14 +9,19 @@ from typing import Any
 
 REGIME_RUNTIME_HEALTH_VERSION = "regime_runtime_health_v1"
 REGIME_HEALTH_COMPONENTS = (
+    "runtime_supervisor",
     "market_event_ingestion",
     "settings_repository",
     "runtime_state",
+    "strategy_registry",
     "decision_worker",
     "local_risk",
     "global_risk_connection",
+    "risk_reservations",
     "execution_outbox",
     "paper_broker",
+    "broker_connectivity",
+    "inventory",
     "order_reconciliation",
     "position_reconciliation",
     "backtest_worker",
@@ -27,11 +32,28 @@ REGIME_HEALTH_COMPONENTS = (
 @dataclass
 class RegimeRuntimeMetrics:
     supervisor_started: bool = False
+    supervisor_heartbeat_at: str | None = None
     paused: bool = False
+    kill_switch_active: bool = False
+    kill_switch_reason: str | None = None
+    kill_switch_actor: str | None = None
+    kill_switch_activated_at: str | None = None
+    kill_switch_state_version: int = 0
+    pending_entry_orders_cancel_requested: int = 0
     emergency_flatten_requested: bool = False
     entry_creation_paused_for_reconciliation: bool = True
     inventory_reconciled: bool = False
+    inventory_available: bool = True
     recovery_succeeded: bool = False
+    broker_paper_mode_verified: bool = False
+    broker_connectivity_ok: bool = False
+    current_rollout_stage: str = "decision_shadow"
+    rollout_stage_version: int = 0
+    rollout_stage_policy: dict[str, Any] = field(default_factory=dict)
+    simulated_execution_active: bool = False
+    strategy_registry_valid: bool = True
+    outbox_stuck: bool = False
+    risk_reservations_consistent: bool = True
     risk_reducing_exits_allowed: bool = True
     persistence_available: bool = True
     settings_available: bool = True
@@ -49,7 +71,9 @@ class RegimeRuntimeMetrics:
     broker_latency_ms: float | None = None
     processed_events: int = 0
     duplicate_events: int = 0
+    gap_events: int = 0
     stale_events: int = 0
+    missing_bar_count: int = 0
     out_of_order_events: int = 0
     rejected_events: int = 0
     persisted_events: int = 0
@@ -82,12 +106,24 @@ class RegimeRuntimeMetrics:
     last_checkpoint: dict[str, Any] | None = None
     latest_decision: dict[str, Any] | None = None
     latest_event: dict[str, Any] | None = None
+    last_received_bar: dict[str, Any] | None = None
+    last_finalized_bar: dict[str, Any] | None = None
+    last_processed_bar: dict[str, Any] | None = None
     latest_command: dict[str, Any] | None = None
     latest_recovery: dict[str, Any] = field(default_factory=dict)
     latest_reconciliation: dict[str, Any] | None = None
     alert_conditions: list[dict[str, Any]] = field(default_factory=list)
     disabled_strategy_ids: list[str] = field(default_factory=list)
     active_settings_version: str | None = None
+    current_strategy_routing: dict[str, Any] = field(default_factory=dict)
+    current_inventory: dict[str, Any] = field(default_factory=dict)
+    open_orders: list[dict[str, Any]] = field(default_factory=list)
+    risk_reservations: list[dict[str, Any]] = field(default_factory=list)
+    outbox_status: dict[str, Any] = field(default_factory=dict)
+    reconciliation_status: dict[str, Any] = field(default_factory=dict)
+    broker_connectivity: dict[str, Any] = field(default_factory=dict)
+    daily_regime_pnl: float = 0.0
+    daily_trade_count: int = 0
     processing_lag_seconds: float | None = None
     last_processed_bar_by_instance_symbol: dict[str, str] = field(default_factory=dict)
     worker_status: dict[str, str] = field(default_factory=dict)
@@ -101,23 +137,31 @@ class RegimeRuntimeMetrics:
 
 
 def health_from_metrics(metrics: RegimeRuntimeMetrics) -> dict[str, Any]:
+    _derive_required_component_health(metrics)
     metrics.alert_conditions = alert_conditions_from_metrics(metrics)
     unhealthy_components = {
         name: health
         for name, health in metrics.component_health.items()
         if str(health.get("status")) == "unhealthy"
     }
-    healthy = metrics.supervisor_started and not unhealthy_components and not metrics.quarantined and (metrics.recovery_succeeded or metrics.entry_creation_paused_for_reconciliation)
+    healthy = metrics.supervisor_started and not unhealthy_components and not metrics.quarantined and not metrics.kill_switch_active
     return {
         "algorithmId": "regime",
         "healthVersion": REGIME_RUNTIME_HEALTH_VERSION,
         "healthy": healthy,
         "failClosed": metrics.entry_creation_paused_for_reconciliation and not metrics.recovery_succeeded,
-        "newEntriesBlocked": bool(metrics.entry_block_reason_codes or metrics.entry_creation_paused_for_reconciliation or metrics.paused),
+        "newEntriesBlocked": bool(metrics.entry_block_reason_codes or metrics.entry_creation_paused_for_reconciliation or metrics.paused or metrics.kill_switch_active),
         "entryBlockReasonCodes": list(metrics.entry_block_reason_codes),
+        "killSwitch": kill_switch_status_from_metrics(metrics),
         "quarantined": metrics.quarantined,
         "persistenceAvailable": metrics.persistence_available,
         "settingsAvailable": metrics.settings_available,
+        "inventoryAvailable": metrics.inventory_available,
+        "brokerPaperModeVerified": metrics.broker_paper_mode_verified,
+        "brokerConnectivityOk": metrics.broker_connectivity_ok,
+        "strategyRegistryValid": metrics.strategy_registry_valid,
+        "outboxStuck": metrics.outbox_stuck,
+        "riskReservationsConsistent": metrics.risk_reservations_consistent,
         "checkpointConsistent": metrics.checkpoint_consistent,
         "queueLagBlockActive": metrics.queue_lag_block_active,
         "queueDepth": metrics.queue_depth,
@@ -228,16 +272,28 @@ def observe_execution_result(metrics: RegimeRuntimeMetrics, result: dict[str, An
 
 
 def operational_snapshot_from_metrics(metrics: RegimeRuntimeMetrics) -> dict[str, Any]:
+    _derive_required_component_health(metrics)
     metrics.alert_conditions = alert_conditions_from_metrics(metrics)
     return {
         "algorithmId": "regime",
         "healthVersion": REGIME_RUNTIME_HEALTH_VERSION,
+        "telemetryVersion": "regime_operational_telemetry_v1",
+        "supervisorHeartbeat": {
+            "started": metrics.supervisor_started,
+            "heartbeatAt": metrics.supervisor_heartbeat_at,
+            "workerStatus": dict(metrics.worker_status),
+        },
+        "lastReceivedBar": metrics.last_received_bar,
+        "lastFinalizedBar": metrics.last_finalized_bar,
+        "lastProcessedBar": metrics.last_processed_bar,
         "supervisorHealth": health_from_metrics(metrics),
         "componentHealth": {name: dict(value) for name, value in metrics.component_health.items()},
         "workerHealth": dict(metrics.worker_status),
         "queueDepth": metrics.queue_depth,
         "queueLagSeconds": metrics.queue_lag_seconds if metrics.queue_lag_seconds is not None else metrics.processing_lag_seconds,
+        "queueLag": {"seconds": metrics.queue_lag_seconds if metrics.queue_lag_seconds is not None else metrics.processing_lag_seconds, "blockActive": metrics.queue_lag_block_active},
         "eventAgeSeconds": metrics.latest_event_age_seconds,
+        "processingLatency": {"decisionMs": metrics.decision_latency_ms},
         "latency": {
             "decisionMs": metrics.decision_latency_ms,
             "classifierMs": metrics.classifier_latency_ms,
@@ -246,17 +302,36 @@ def operational_snapshot_from_metrics(metrics: RegimeRuntimeMetrics) -> dict[str
             "brokerMs": metrics.broker_latency_ms,
         },
         "decisionCounts": dict(metrics.decision_counts),
+        "duplicateBarCount": metrics.duplicate_events,
+        "missingBarCount": metrics.missing_bar_count,
+        "staleDataState": {
+            "staleEvents": metrics.stale_events,
+            "queueLagBlockActive": metrics.queue_lag_block_active,
+            "latestEventAgeSeconds": metrics.latest_event_age_seconds,
+        },
         "signalCounts": dict(metrics.signal_counts),
         "blockersByReason": dict(metrics.blockers_by_reason),
+        "entryBlockers": list(metrics.entry_block_reason_codes),
         "regimeOccupancy": dict(metrics.regime_occupancy),
+        "currentConfirmedRegime": _current_regime(metrics),
+        "currentStrategyRouting": dict(metrics.current_strategy_routing),
         "strategyOpportunities": dict(metrics.strategy_opportunities),
         "strategySignals": {key: dict(value) for key, value in metrics.strategy_signals.items()},
         "familyContributions": dict(metrics.family_contributions),
         "proposedVsApprovedQuantity": dict(metrics.proposed_vs_approved_quantity),
         "orderStatusCounts": dict(metrics.order_status_counts),
+        "outboxStatus": dict(metrics.outbox_status),
+        "openOrders": list(metrics.open_orders),
+        "riskReservations": list(metrics.risk_reservations),
         "fillQuality": dict(metrics.fill_quality),
         "slippage": dict(metrics.slippage),
+        "currentInventory": dict(metrics.current_inventory),
         "reconciliationDiscrepancies": metrics.reconciliation_discrepancies,
+        "reconciliationStatus": dict(metrics.reconciliation_status or (metrics.latest_reconciliation or {})),
+        "brokerConnectivity": dict(metrics.broker_connectivity),
+        "dailyRegimePnl": metrics.daily_regime_pnl,
+        "dailyTradeCount": metrics.daily_trade_count,
+        "killSwitch": kill_switch_status_from_metrics(metrics),
         "recoveryState": dict(metrics.latest_recovery),
         "lastCompletedCheckpoint": metrics.last_checkpoint,
         "latestDecision": metrics.latest_decision,
@@ -270,12 +345,26 @@ def operational_snapshot_from_metrics(metrics: RegimeRuntimeMetrics) -> dict[str
 
 def alert_conditions_from_metrics(metrics: RegimeRuntimeMetrics) -> list[dict[str, Any]]:
     alerts: list[dict[str, Any]] = []
+    if not metrics.supervisor_started:
+        alerts.append(_alert("regime.alert.supervisor_stopped", "critical", {}))
     if metrics.stale_events or metrics.out_of_order_events:
         alerts.append(_alert("regime.alert.missed_bars", "warning", {"staleEvents": metrics.stale_events, "outOfOrderEvents": metrics.out_of_order_events}))
     if metrics.rejected_events:
         alerts.append(_alert("regime.alert.queue_overflow", "critical" if metrics.queue_depth else "warning", {"rejectedEvents": metrics.rejected_events}))
     if not metrics.settings_available:
         alerts.append(_alert("regime.alert.stale_settings", "critical", {}))
+    if not metrics.inventory_available:
+        alerts.append(_alert("regime.alert.inventory_unavailable", "critical", {}))
+    if metrics.kill_switch_active:
+        alerts.append(_alert("regime.alert.kill_switch_active", "critical", kill_switch_status_from_metrics(metrics)))
+    if not metrics.broker_paper_mode_verified:
+        alerts.append(_alert("regime.alert.paper_broker_not_verified", "critical", dict(metrics.broker_connectivity)))
+    if not metrics.strategy_registry_valid:
+        alerts.append(_alert("regime.alert.strategy_registry_invalid", "critical", {}))
+    if metrics.outbox_stuck:
+        alerts.append(_alert("regime.alert.execution_outbox_stuck", "critical", dict(metrics.outbox_status)))
+    if not metrics.risk_reservations_consistent:
+        alerts.append(_alert("regime.alert.risk_reservation_inconsistent", "critical", {"riskReservations": list(metrics.risk_reservations)}))
     if not metrics.persistence_available:
         alerts.append(_alert("regime.alert.persistence_failure", "critical", {}))
     for name, health in metrics.component_health.items():
@@ -307,6 +396,56 @@ def _number(value: Any, fallback: float | None) -> float | None:
         return fallback
 
 
+def kill_switch_status_from_metrics(metrics: RegimeRuntimeMetrics) -> dict[str, Any]:
+    return {
+        "algorithmId": "regime",
+        "active": metrics.kill_switch_active,
+        "reason": metrics.kill_switch_reason,
+        "actor": metrics.kill_switch_actor,
+        "activatedAt": metrics.kill_switch_activated_at,
+        "stateVersion": metrics.kill_switch_state_version,
+        "blocksNewEntries": metrics.kill_switch_active,
+        "riskReducingExitsAllowed": metrics.risk_reducing_exits_allowed,
+        "pendingEntryOrdersCancelRequested": metrics.pending_entry_orders_cancel_requested,
+    }
+
+
+def _derive_required_component_health(metrics: RegimeRuntimeMetrics) -> None:
+    checks = {
+        "runtime_supervisor": (metrics.supervisor_started, "regime.health.supervisor.stopped"),
+        "market_event_ingestion": (not (metrics.stale_events or metrics.queue_lag_block_active), "regime.health.market_data.stale"),
+        "settings_repository": (metrics.settings_available, "regime.health.settings.unavailable"),
+        "inventory": (metrics.inventory_available and metrics.inventory_reconciled, "regime.health.inventory.unavailable_or_unreconciled"),
+        "paper_broker": (metrics.broker_paper_mode_verified, "regime.health.paper_broker.not_verified"),
+        "broker_connectivity": (metrics.broker_connectivity_ok or not metrics.submitted_orders, "regime.health.broker_connectivity.unhealthy"),
+        "strategy_registry": (metrics.strategy_registry_valid, "regime.health.strategy_registry.invalid"),
+        "execution_outbox": (not metrics.outbox_stuck, "regime.health.execution_outbox.stuck"),
+        "risk_reservations": (metrics.risk_reservations_consistent, "regime.health.risk_reservations.inconsistent"),
+        "order_reconciliation": (not metrics.reconciliation_discrepancies, "regime.health.reconciliation.unresolved"),
+        "position_reconciliation": (not metrics.reconciliation_discrepancies and metrics.inventory_reconciled, "regime.health.reconciliation.unresolved"),
+    }
+    for component, (ok, reason) in checks.items():
+        current = metrics.component_health.get(component, {})
+        if ok or str(current.get("status")) == "unhealthy":
+            continue
+        metrics.component_health[component] = {
+            "component": component,
+            "status": "unhealthy",
+            "reasonCodes": [reason],
+            "lastError": None,
+            "lastCheckedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "retryCount": int(current.get("retryCount") or 0),
+            "details": dict(current.get("details") or {}),
+        }
+
+
+def _current_regime(metrics: RegimeRuntimeMetrics) -> str:
+    latest = metrics.latest_decision if isinstance(metrics.latest_decision, dict) else {}
+    decision = latest.get("decision") if isinstance(latest.get("decision"), dict) else {}
+    confirmed = decision.get("confirmed_state") if isinstance(decision.get("confirmed_state"), dict) else {}
+    return str(confirmed.get("confirmed_regime") or "unknown")
+
+
 __all__ = [
     "REGIME_HEALTH_COMPONENTS",
     "REGIME_RUNTIME_HEALTH_VERSION",
@@ -314,6 +453,7 @@ __all__ = [
     "alert_conditions_from_metrics",
     "health_from_metrics",
     "mark_component_health",
+    "kill_switch_status_from_metrics",
     "observe_decision_result",
     "observe_execution_result",
     "operational_snapshot_from_metrics",

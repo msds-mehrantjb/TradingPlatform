@@ -144,6 +144,17 @@ class RegimeTradingSettings:
             "previousSettingsVersion": self.previous_settings_version,
             "configurationHash": self.configuration_hash,
             "settingsHash": self.configuration_hash,
+            "immutableVersionId": self.settings_version,
+            "contentHash": self.configuration_hash,
+            "createdSource": self.created_by,
+            "sourceMetadata": {"createdBy": self.created_by, "source": self.created_by},
+            "baselineSettings": _deepcopy_json(DEFAULT_REGIME_SETTINGS),
+            "hardSafetyLimits": _hard_safety_limits(),
+            "strategyLifecycleStates": _strategy_lifecycle_view(self.strategy_settings),
+            "regimeProfileMatrixVersion": self.profile_version,
+            "activationStatus": "inactive",
+            "activationTimestamp": None,
+            "reasonForActivationOrRollback": None,
         }
         snapshot.update(
             {
@@ -166,10 +177,15 @@ class RegimeTradingSettings:
 
 
 DEFAULT_REGIME_SETTINGS: dict[str, Any] = {
+    "symbolAllowlist": ["SPY"],
+    "timeframe": "1Min",
+    "paperOnly": True,
+    "regularHoursOnly": True,
     "startingCapital": 25_000.0,
     "baseRiskPercent": 0.10,
     "maxPositionPercent": 10.0,
     "dailyAllocationPercent": 20.0,
+    "maxOpenRegimePositions": 1,
     "minimumWinningScore": 0.60,
     "minimumSignalEdge": 0.20,
     "minimumNetExpectedEdge": 0.02,
@@ -191,10 +207,21 @@ DEFAULT_REGIME_SETTINGS: dict[str, Any] = {
     "maxHoldingBars": 45,
     "orderTimeToLiveSeconds": 60,
     "maxCancelReplaceAttempts": 2,
+    "allowMarketEntryOrders": False,
     "maximumSlippageBps": 8.0,
+    "maximumCostToEdgeRatio": 0.75,
+    "conservativeCostFallbackApproved": False,
+    "uncertaintyBufferBps": 1.0,
+    "estimatedFeesBps": 0.1,
+    "estimatedRegulatoryFeesBps": 0.0,
+    "marketImpactBps": 0.0,
+    "marketImpactBpsPerParticipationPct": 0.0,
+    "adverseSelectionBufferBps": 0.5,
+    "maximumCostModelAgeSeconds": 900,
     "staleBarToleranceSeconds": 90,
     "quoteAgeToleranceSeconds": 5,
     "shortEntriesEnabled": False,
+    "allowShortEntries": False,
     "pyramidingEnabled": False,
     "mlMode": "shadow",
     "confirmationBars": 3,
@@ -205,7 +232,11 @@ DEFAULT_REGIME_SETTINGS: dict[str, Any] = {
     "maximumUnknownBars": 3,
     "entryCutoffTimeEt": "15:30",
     "flattenTimeEt": "15:55",
-    "maxTradesPerDay": 5,
+    "endOfDayFlattenEnabled": True,
+    "mandatoryStop": True,
+    "mandatoryMaxHoldingTime": True,
+    "maxTradesPerDay": 3,
+    "maxEntriesPerDay": 3,
     "maxConsecutiveLosses": 3,
     "maxDailyLossPercent": 0.50,
     "perStrategyMaxTradesPerDay": 1,
@@ -259,23 +290,34 @@ _SETTINGS_METADATA_FIELDS = {
     "previousSettingsVersion",
     "configurationHash",
     "settingsHash",
+    "immutableVersionId",
+    "contentHash",
+    "createdSource",
+    "sourceMetadata",
+    "baselineSettings",
+    "hardSafetyLimits",
+    "strategyLifecycleStates",
+    "regimeProfileMatrixVersion",
+    "activationStatus",
+    "activationTimestamp",
+    "reasonForActivationOrRollback",
 }
 
 _SECTION_ALLOWED_FIELDS: dict[str, set[str]] = {
     "identity": {"algorithmId", "algorithmInstanceId", "accountId", "runtimeMode", "symbol"},
-    "runtime": {"runtimeMode", "backgroundWorkersRequired", "liveTradingEnabled", "paperTradingOnly", "shadowOperationEnabled"},
-    "data_quality": {"staleBarToleranceSeconds", "quoteAgeToleranceSeconds", "requireOneMinuteBars", "requiredSymbol"},
+    "runtime": {"runtimeMode", "backgroundWorkersRequired", "liveTradingEnabled", "paperTradingOnly", "paperOnly", "shadowOperationEnabled", "symbolAllowlist", "timeframe", "regularHoursOnly"},
+    "data_quality": {"staleBarToleranceSeconds", "quoteAgeToleranceSeconds", "requireOneMinuteBars", "requiredSymbol", "timeframe", "regularHoursOnly"},
     "classifier": {"minimumRegimeConfidence", "minimumOneMinuteVolume", "maxSpreadPercent"},
     "hysteresis": {"confirmationBars", "minimumDwellBars", "transitionConfidenceGap", "cooldownBars", "maximumUnknownBars", "immediateConfidenceThreshold"},
     "strategy_catalog": {"catalogVersion", "strategyIds", "strategyCount"},
-    "family_aggregation": {"minimumWinningScore", "minimumSignalEdge", "minimumNetExpectedEdge", "minimumActiveStrategies", "minimumIndependentFamilies", "maximumAbstentionRate", "maximumContributionPerFamily"},
+    "family_aggregation": {"minimumWinningScore", "minimumSignalEdge", "minimumNetExpectedEdge", "minimumNetExpectedEdgeBps", "minimumActiveStrategies", "minimumIndependentFamilies", "maximumAbstentionRate", "maximumContributionPerFamily", "maximumCostToEdgeRatio"},
     "local_risk": {"baseRiskPercent", "maxDailyLossPercent", "maxConsecutiveLosses", "familyRiskLimits"},
     "dynamic_profiles": {"profileVersion", "overlays"},
-    "position_sizing": {"startingCapital", "baseRiskPercent", "maxPositionPercent", "dailyAllocationPercent", "maxParticipationPercent", "maxAllowedShares", "maxOrderNotionalDollars", "maxPositionNotionalDollars", "maxNotionalDollars"},
-    "entry_policy": {"pyramidingEnabled", "shortEntriesEnabled", "confirmationBars", "entryCutoffTimeEt", "minimumNetExpectedEdge"},
-    "exit_policy": {"flattenTimeEt", "maxHoldingBars", "atrStopMultiplier", "minimumStopDistancePercent", "takeProfitR"},
-    "execution": {"orderTimeToLiveSeconds", "maxCancelReplaceAttempts", "maximumSlippageBps", "brokerTransportMode"},
-    "daily_limits": {"maxTradesPerDay", "maxConsecutiveLosses", "maxDailyLossPercent", "dailyAllocationPercent", "perStrategyTradeLimits", "perFamilyDailyRiskLimits"},
+    "position_sizing": {"startingCapital", "baseRiskPercent", "maxPositionPercent", "dailyAllocationPercent", "maxParticipationPercent", "maxAllowedShares", "maxOrderNotionalDollars", "maxPositionNotionalDollars", "maxNotionalDollars", "maxOpenRegimePositions"},
+    "entry_policy": {"pyramidingEnabled", "shortEntriesEnabled", "allowShortEntries", "confirmationBars", "entryCutoffTimeEt", "minimumNetExpectedEdge", "minimumNetExpectedEdgeBps"},
+    "exit_policy": {"flattenTimeEt", "maxHoldingBars", "atrStopMultiplier", "minimumStopDistancePercent", "takeProfitR", "endOfDayFlattenEnabled", "mandatoryStop", "mandatoryMaxHoldingTime"},
+    "execution": {"orderTimeToLiveSeconds", "maxCancelReplaceAttempts", "maximumSlippageBps", "maximumCostToEdgeRatio", "conservativeCostFallbackApproved", "uncertaintyBufferBps", "estimatedFeesBps", "estimatedRegulatoryFeesBps", "marketImpactBps", "marketImpactBpsPerParticipationPct", "adverseSelectionBufferBps", "maximumCostModelAgeSeconds", "allowMarketEntryOrders", "brokerTransportMode"},
+    "daily_limits": {"maxTradesPerDay", "maxEntriesPerDay", "maxConsecutiveLosses", "maxDailyLossPercent", "dailyAllocationPercent", "perStrategyTradeLimits", "perFamilyDailyRiskLimits"},
     "rollout": {"runtimeMode", "requireRolloutEvidence", "mlMayPromoteOrders", "liveTradingEnabled"},
     "backtest": {"engineVersion", "oneMinuteOnly", "symbol", "settingsSource"},
     "ml_shadow": {"mode", "mayAlterSignals", "mayAlterSizing", "mayAlterOrders"},
@@ -286,7 +328,17 @@ _PROFILE_OVERLAY_FIELDS = {
     "maxPositionPercentCap",
     "maxParticipationPercentCap",
     "maximumSlippageBps",
+    "maximumCostToEdgeRatio",
+    "conservativeCostFallbackApproved",
+    "uncertaintyBufferBps",
+    "estimatedFeesBps",
+    "estimatedRegulatoryFeesBps",
+    "marketImpactBps",
+    "marketImpactBpsPerParticipationPct",
+    "adverseSelectionBufferBps",
+    "maximumCostModelAgeSeconds",
     "minimumNetExpectedEdge",
+    "minimumNetExpectedEdgeBps",
     "orderTimeToLiveSeconds",
     "maxCancelReplaceAttempts",
     "pyramidingEnabled",
@@ -346,20 +398,28 @@ def flatten_regime_trading_settings(settings: RegimeTradingSettings | dict[str, 
     execution = _record(snapshot.get("execution")) or _record(snapshot.get("paperExecution"))
     daily = _record(snapshot.get("daily_limits")) or _record(snapshot.get("dailyLimits"))
     ml = _record(snapshot.get("ml_shadow")) or _record(snapshot.get("mlShadow"))
+    runtime = _record(snapshot.get("runtime"))
+    data_quality = _record(snapshot.get("data_quality")) or _record(snapshot.get("dataQuality"))
     flat = {
         **DEFAULT_REGIME_SETTINGS,
+        "symbolAllowlist": runtime.get("symbolAllowlist", DEFAULT_REGIME_SETTINGS["symbolAllowlist"]),
+        "timeframe": runtime.get("timeframe", data_quality.get("timeframe", DEFAULT_REGIME_SETTINGS["timeframe"])),
+        "paperOnly": runtime.get("paperOnly", runtime.get("paperTradingOnly", DEFAULT_REGIME_SETTINGS["paperOnly"])),
+        "regularHoursOnly": runtime.get("regularHoursOnly", data_quality.get("regularHoursOnly", DEFAULT_REGIME_SETTINGS["regularHoursOnly"])),
         "startingCapital": position.get("startingCapital", DEFAULT_REGIME_SETTINGS["startingCapital"]),
         "baseRiskPercent": position.get("baseRiskPercent", DEFAULT_REGIME_SETTINGS["baseRiskPercent"]),
         "maxPositionPercent": position.get("maxPositionPercent", DEFAULT_REGIME_SETTINGS["maxPositionPercent"]),
         "dailyAllocationPercent": position.get("dailyAllocationPercent", DEFAULT_REGIME_SETTINGS["dailyAllocationPercent"]),
         "maxParticipationPercent": position.get("maxParticipationPercent", DEFAULT_REGIME_SETTINGS["maxParticipationPercent"]),
         "maxAllowedShares": position.get("maxAllowedShares", DEFAULT_REGIME_SETTINGS["maxAllowedShares"]),
+        "maxOpenRegimePositions": position.get("maxOpenRegimePositions", DEFAULT_REGIME_SETTINGS["maxOpenRegimePositions"]),
         "maxOrderNotionalDollars": position.get("maxOrderNotionalDollars", position.get("maxNotionalDollars", DEFAULT_REGIME_SETTINGS["maxOrderNotionalDollars"])),
         "maxPositionNotionalDollars": position.get("maxPositionNotionalDollars", position.get("maxNotionalDollars", DEFAULT_REGIME_SETTINGS["maxPositionNotionalDollars"])),
         "maxNotionalDollars": position.get("maxNotionalDollars", position.get("maxOrderNotionalDollars", DEFAULT_REGIME_SETTINGS["maxNotionalDollars"])),
         "minimumWinningScore": aggregation.get("minimumWinningScore", DEFAULT_REGIME_SETTINGS["minimumWinningScore"]),
         "minimumSignalEdge": aggregation.get("minimumSignalEdge", DEFAULT_REGIME_SETTINGS["minimumSignalEdge"]),
         "minimumNetExpectedEdge": aggregation.get("minimumNetExpectedEdge", DEFAULT_REGIME_SETTINGS["minimumNetExpectedEdge"]),
+        "minimumNetExpectedEdgeBps": aggregation.get("minimumNetExpectedEdgeBps", entry.get("minimumNetExpectedEdgeBps", DEFAULT_REGIME_SETTINGS["minimumNetExpectedEdge"] * 100.0)),
         "minimumActiveStrategies": aggregation.get("minimumActiveStrategies", DEFAULT_REGIME_SETTINGS["minimumActiveStrategies"]),
         "minimumIndependentFamilies": aggregation.get("minimumIndependentFamilies", DEFAULT_REGIME_SETTINGS["minimumIndependentFamilies"]),
         "maximumAbstentionRate": aggregation.get("maximumAbstentionRate", DEFAULT_REGIME_SETTINGS["maximumAbstentionRate"]),
@@ -374,21 +434,36 @@ def flatten_regime_trading_settings(settings: RegimeTradingSettings | dict[str, 
         "maximumUnknownBars": hysteresis.get("maximumUnknownBars", DEFAULT_REGIME_SETTINGS["maximumUnknownBars"]),
         "immediateConfidenceThreshold": hysteresis.get("immediateConfidenceThreshold", DEFAULT_REGIME_SETTINGS["immediateConfidenceThreshold"]),
         "pyramidingEnabled": entry.get("pyramidingEnabled", DEFAULT_REGIME_SETTINGS["pyramidingEnabled"]),
-        "shortEntriesEnabled": entry.get("shortEntriesEnabled", DEFAULT_REGIME_SETTINGS["shortEntriesEnabled"]),
+        "shortEntriesEnabled": entry.get("shortEntriesEnabled", entry.get("allowShortEntries", DEFAULT_REGIME_SETTINGS["shortEntriesEnabled"])),
+        "allowShortEntries": entry.get("allowShortEntries", entry.get("shortEntriesEnabled", DEFAULT_REGIME_SETTINGS["allowShortEntries"])),
         "entryCutoffTimeEt": entry.get("entryCutoffTimeEt", DEFAULT_REGIME_SETTINGS["entryCutoffTimeEt"]),
         "atrStopMultiplier": exit_policy.get("atrStopMultiplier", DEFAULT_REGIME_SETTINGS["atrStopMultiplier"]),
         "minimumStopDistancePercent": exit_policy.get("minimumStopDistancePercent", DEFAULT_REGIME_SETTINGS["minimumStopDistancePercent"]),
         "takeProfitR": exit_policy.get("takeProfitR", DEFAULT_REGIME_SETTINGS["takeProfitR"]),
         "flattenTimeEt": exit_policy.get("flattenTimeEt", DEFAULT_REGIME_SETTINGS["flattenTimeEt"]),
         "maxHoldingBars": exit_policy.get("maxHoldingBars", DEFAULT_REGIME_SETTINGS["maxHoldingBars"]),
+        "endOfDayFlattenEnabled": exit_policy.get("endOfDayFlattenEnabled", DEFAULT_REGIME_SETTINGS["endOfDayFlattenEnabled"]),
+        "mandatoryStop": exit_policy.get("mandatoryStop", DEFAULT_REGIME_SETTINGS["mandatoryStop"]),
+        "mandatoryMaxHoldingTime": exit_policy.get("mandatoryMaxHoldingTime", DEFAULT_REGIME_SETTINGS["mandatoryMaxHoldingTime"]),
         "orderTimeToLiveSeconds": execution.get("orderTimeToLiveSeconds", DEFAULT_REGIME_SETTINGS["orderTimeToLiveSeconds"]),
         "maxCancelReplaceAttempts": execution.get("maxCancelReplaceAttempts", DEFAULT_REGIME_SETTINGS["maxCancelReplaceAttempts"]),
+        "allowMarketEntryOrders": execution.get("allowMarketEntryOrders", DEFAULT_REGIME_SETTINGS["allowMarketEntryOrders"]),
         "maximumSlippageBps": execution.get("maximumSlippageBps", DEFAULT_REGIME_SETTINGS["maximumSlippageBps"]),
-        "maxTradesPerDay": daily.get("maxTradesPerDay", DEFAULT_REGIME_SETTINGS["maxTradesPerDay"]),
+        "maximumCostToEdgeRatio": execution.get("maximumCostToEdgeRatio", aggregation.get("maximumCostToEdgeRatio", DEFAULT_REGIME_SETTINGS["maximumCostToEdgeRatio"])),
+        "conservativeCostFallbackApproved": execution.get("conservativeCostFallbackApproved", DEFAULT_REGIME_SETTINGS["conservativeCostFallbackApproved"]),
+        "uncertaintyBufferBps": execution.get("uncertaintyBufferBps", DEFAULT_REGIME_SETTINGS["uncertaintyBufferBps"]),
+        "estimatedFeesBps": execution.get("estimatedFeesBps", DEFAULT_REGIME_SETTINGS["estimatedFeesBps"]),
+        "estimatedRegulatoryFeesBps": execution.get("estimatedRegulatoryFeesBps", DEFAULT_REGIME_SETTINGS["estimatedRegulatoryFeesBps"]),
+        "marketImpactBps": execution.get("marketImpactBps", DEFAULT_REGIME_SETTINGS["marketImpactBps"]),
+        "marketImpactBpsPerParticipationPct": execution.get("marketImpactBpsPerParticipationPct", DEFAULT_REGIME_SETTINGS["marketImpactBpsPerParticipationPct"]),
+        "adverseSelectionBufferBps": execution.get("adverseSelectionBufferBps", DEFAULT_REGIME_SETTINGS["adverseSelectionBufferBps"]),
+        "maximumCostModelAgeSeconds": execution.get("maximumCostModelAgeSeconds", DEFAULT_REGIME_SETTINGS["maximumCostModelAgeSeconds"]),
+        "maxTradesPerDay": daily.get("maxTradesPerDay", daily.get("maxEntriesPerDay", DEFAULT_REGIME_SETTINGS["maxTradesPerDay"])),
+        "maxEntriesPerDay": daily.get("maxEntriesPerDay", daily.get("maxTradesPerDay", DEFAULT_REGIME_SETTINGS["maxEntriesPerDay"])),
         "maxConsecutiveLosses": daily.get("maxConsecutiveLosses", DEFAULT_REGIME_SETTINGS["maxConsecutiveLosses"]),
         "maxDailyLossPercent": daily.get("maxDailyLossPercent", DEFAULT_REGIME_SETTINGS["maxDailyLossPercent"]),
-        "staleBarToleranceSeconds": (_record(snapshot.get("data_quality")) or _record(snapshot.get("dataQuality"))).get("staleBarToleranceSeconds", DEFAULT_REGIME_SETTINGS["staleBarToleranceSeconds"]),
-        "quoteAgeToleranceSeconds": (_record(snapshot.get("data_quality")) or _record(snapshot.get("dataQuality"))).get("quoteAgeToleranceSeconds", DEFAULT_REGIME_SETTINGS["quoteAgeToleranceSeconds"]),
+        "staleBarToleranceSeconds": data_quality.get("staleBarToleranceSeconds", DEFAULT_REGIME_SETTINGS["staleBarToleranceSeconds"]),
+        "quoteAgeToleranceSeconds": data_quality.get("quoteAgeToleranceSeconds", DEFAULT_REGIME_SETTINGS["quoteAgeToleranceSeconds"]),
         "mlMode": ml.get("mode", DEFAULT_REGIME_SETTINGS["mlMode"]),
         "settingsVersion": snapshot.get("settingsVersion", REGIME_SETTINGS_VERSION),
         "settingsModelVersion": snapshot.get("settingsModelVersion", REGIME_SETTINGS_MODEL_VERSION),
@@ -404,6 +479,10 @@ def validate_regime_settings(settings: dict[str, Any] | None = None) -> dict[str
     if _looks_like_settings_snapshot(settings or {}):
         return flatten_regime_trading_settings(settings)
     merged = {**DEFAULT_REGIME_SETTINGS, **(settings or {})}
+    merged["symbolAllowlist"] = [str(symbol).upper() for symbol in (merged.get("symbolAllowlist") or ["SPY"])]
+    merged["timeframe"] = str(merged.get("timeframe") or "1Min")
+    merged["paperOnly"] = bool(merged.get("paperOnly", True))
+    merged["regularHoursOnly"] = bool(merged.get("regularHoursOnly", True))
     merged["startingCapital"] = max(0.0, float(merged["startingCapital"]))
     merged["baseRiskPercent"] = max(0.0, min(5.0, float(merged["baseRiskPercent"])))
     merged["maxPositionPercent"] = max(0.0, min(100.0, float(merged["maxPositionPercent"])))
@@ -411,6 +490,7 @@ def validate_regime_settings(settings: dict[str, Any] | None = None) -> dict[str
     merged["minimumWinningScore"] = max(0.0, min(1.0, float(merged["minimumWinningScore"])))
     merged["minimumSignalEdge"] = max(0.0, min(1.0, float(merged["minimumSignalEdge"])))
     merged["minimumNetExpectedEdge"] = max(0.0, min(1.0, float(merged.get("minimumNetExpectedEdge", merged["minimumSignalEdge"]))))
+    merged["minimumNetExpectedEdgeBps"] = max(0.0, float(merged.get("minimumNetExpectedEdgeBps", merged["minimumNetExpectedEdge"] * 100.0)))
     merged["minimumRegimeConfidence"] = max(0.0, min(1.0, float(merged["minimumRegimeConfidence"])))
     merged["minimumActiveStrategies"] = max(0, int(merged["minimumActiveStrategies"]))
     merged["minimumIndependentFamilies"] = max(1, int(merged["minimumIndependentFamilies"]))
@@ -423,17 +503,32 @@ def validate_regime_settings(settings: dict[str, Any] | None = None) -> dict[str
     merged["takeProfitR"] = max(0.1, float(merged["takeProfitR"]))
     merged["maxParticipationPercent"] = max(0.0, min(1.0, float(merged["maxParticipationPercent"])))
     merged["maxAllowedShares"] = max(0, int(merged["maxAllowedShares"]))
+    merged["maxOpenRegimePositions"] = max(0, int(merged.get("maxOpenRegimePositions", DEFAULT_REGIME_SETTINGS["maxOpenRegimePositions"])))
     merged["maxOrderNotionalDollars"] = max(0.0, float(merged.get("maxOrderNotionalDollars", merged.get("maxNotionalDollars", 0.0))))
     merged["maxPositionNotionalDollars"] = max(0.0, float(merged.get("maxPositionNotionalDollars", merged.get("maxNotionalDollars", 0.0))))
     merged["maxNotionalDollars"] = max(0.0, float(merged["maxNotionalDollars"]))
     merged["maxHoldingBars"] = max(1, int(merged["maxHoldingBars"]))
     merged["orderTimeToLiveSeconds"] = max(1, int(merged["orderTimeToLiveSeconds"]))
     merged["maxCancelReplaceAttempts"] = max(0, int(merged["maxCancelReplaceAttempts"]))
+    merged["allowMarketEntryOrders"] = bool(merged.get("allowMarketEntryOrders", DEFAULT_REGIME_SETTINGS["allowMarketEntryOrders"]))
     merged["maximumSlippageBps"] = max(0.0, float(merged["maximumSlippageBps"]))
+    merged["maximumCostToEdgeRatio"] = max(0.0, float(merged.get("maximumCostToEdgeRatio", DEFAULT_REGIME_SETTINGS["maximumCostToEdgeRatio"])))
+    merged["conservativeCostFallbackApproved"] = bool(merged.get("conservativeCostFallbackApproved", DEFAULT_REGIME_SETTINGS["conservativeCostFallbackApproved"]))
+    merged["uncertaintyBufferBps"] = max(0.0, float(merged.get("uncertaintyBufferBps", DEFAULT_REGIME_SETTINGS["uncertaintyBufferBps"])))
+    merged["estimatedFeesBps"] = max(0.0, float(merged.get("estimatedFeesBps", DEFAULT_REGIME_SETTINGS["estimatedFeesBps"])))
+    merged["estimatedRegulatoryFeesBps"] = max(0.0, float(merged.get("estimatedRegulatoryFeesBps", DEFAULT_REGIME_SETTINGS["estimatedRegulatoryFeesBps"])))
+    merged["marketImpactBps"] = max(0.0, float(merged.get("marketImpactBps", DEFAULT_REGIME_SETTINGS["marketImpactBps"])))
+    merged["marketImpactBpsPerParticipationPct"] = max(0.0, float(merged.get("marketImpactBpsPerParticipationPct", DEFAULT_REGIME_SETTINGS["marketImpactBpsPerParticipationPct"])))
+    merged["adverseSelectionBufferBps"] = max(0.0, float(merged.get("adverseSelectionBufferBps", DEFAULT_REGIME_SETTINGS["adverseSelectionBufferBps"])))
+    merged["maximumCostModelAgeSeconds"] = max(1, int(merged.get("maximumCostModelAgeSeconds", DEFAULT_REGIME_SETTINGS["maximumCostModelAgeSeconds"])))
     merged["staleBarToleranceSeconds"] = max(1, int(merged["staleBarToleranceSeconds"]))
     merged["quoteAgeToleranceSeconds"] = max(1, int(merged["quoteAgeToleranceSeconds"]))
-    merged["shortEntriesEnabled"] = bool(merged["shortEntriesEnabled"])
+    merged["shortEntriesEnabled"] = bool(merged.get("shortEntriesEnabled", merged.get("allowShortEntries", False)))
+    merged["allowShortEntries"] = bool(merged.get("allowShortEntries", merged["shortEntriesEnabled"]))
     merged["pyramidingEnabled"] = bool(merged["pyramidingEnabled"])
+    merged["endOfDayFlattenEnabled"] = bool(merged.get("endOfDayFlattenEnabled", DEFAULT_REGIME_SETTINGS["endOfDayFlattenEnabled"]))
+    merged["mandatoryStop"] = bool(merged.get("mandatoryStop", DEFAULT_REGIME_SETTINGS["mandatoryStop"]))
+    merged["mandatoryMaxHoldingTime"] = bool(merged.get("mandatoryMaxHoldingTime", DEFAULT_REGIME_SETTINGS["mandatoryMaxHoldingTime"]))
     if merged["mlMode"] not in {"off", "shadow", "confirm_only"}:
         merged["mlMode"] = "shadow"
     merged["confirmationBars"] = max(1, int(merged["confirmationBars"]))
@@ -442,7 +537,8 @@ def validate_regime_settings(settings: dict[str, Any] | None = None) -> dict[str
     merged["transitionConfidenceGap"] = max(0.0, min(1.0, float(merged["transitionConfidenceGap"])))
     merged["cooldownBars"] = max(0, int(merged["cooldownBars"]))
     merged["maximumUnknownBars"] = max(0, int(merged["maximumUnknownBars"]))
-    merged["maxTradesPerDay"] = max(0, int(merged["maxTradesPerDay"]))
+    merged["maxTradesPerDay"] = max(0, int(merged.get("maxTradesPerDay", merged.get("maxEntriesPerDay", 0))))
+    merged["maxEntriesPerDay"] = max(0, int(merged.get("maxEntriesPerDay", merged["maxTradesPerDay"])))
     merged["maxConsecutiveLosses"] = max(0, int(merged["maxConsecutiveLosses"]))
     merged["maxDailyLossPercent"] = max(0.0, min(100.0, float(merged["maxDailyLossPercent"])))
     merged["settingsVersion"] = str(merged.get("settingsVersion") or REGIME_SETTINGS_VERSION)
@@ -495,6 +591,10 @@ def _default_sections(identity: dict[str, Any] | None = None) -> dict[str, Any]:
             "backgroundWorkersRequired": True,
             "liveTradingEnabled": False,
             "paperTradingOnly": True,
+            "paperOnly": DEFAULT_REGIME_SETTINGS["paperOnly"],
+            "symbolAllowlist": list(DEFAULT_REGIME_SETTINGS["symbolAllowlist"]),
+            "timeframe": DEFAULT_REGIME_SETTINGS["timeframe"],
+            "regularHoursOnly": DEFAULT_REGIME_SETTINGS["regularHoursOnly"],
             "shadowOperationEnabled": normalized["runtimeMode"] == "shadow",
         },
         "data_quality": {
@@ -502,6 +602,8 @@ def _default_sections(identity: dict[str, Any] | None = None) -> dict[str, Any]:
             "quoteAgeToleranceSeconds": DEFAULT_REGIME_SETTINGS["quoteAgeToleranceSeconds"],
             "requireOneMinuteBars": True,
             "requiredSymbol": "SPY",
+            "timeframe": DEFAULT_REGIME_SETTINGS["timeframe"],
+            "regularHoursOnly": DEFAULT_REGIME_SETTINGS["regularHoursOnly"],
         },
         "classifier": {
             "minimumRegimeConfidence": DEFAULT_REGIME_SETTINGS["minimumRegimeConfidence"],
@@ -526,10 +628,12 @@ def _default_sections(identity: dict[str, Any] | None = None) -> dict[str, Any]:
             "minimumWinningScore": DEFAULT_REGIME_SETTINGS["minimumWinningScore"],
             "minimumSignalEdge": DEFAULT_REGIME_SETTINGS["minimumSignalEdge"],
             "minimumNetExpectedEdge": DEFAULT_REGIME_SETTINGS["minimumNetExpectedEdge"],
+            "minimumNetExpectedEdgeBps": DEFAULT_REGIME_SETTINGS["minimumNetExpectedEdge"] * 100.0,
             "minimumActiveStrategies": DEFAULT_REGIME_SETTINGS["minimumActiveStrategies"],
             "minimumIndependentFamilies": DEFAULT_REGIME_SETTINGS["minimumIndependentFamilies"],
             "maximumAbstentionRate": DEFAULT_REGIME_SETTINGS["maximumAbstentionRate"],
             "maximumContributionPerFamily": DEFAULT_REGIME_SETTINGS["maximumContributionPerFamily"],
+            "maximumCostToEdgeRatio": DEFAULT_REGIME_SETTINGS["maximumCostToEdgeRatio"],
         },
         "local_risk": {
             "baseRiskPercent": DEFAULT_REGIME_SETTINGS["baseRiskPercent"],
@@ -557,6 +661,7 @@ def _default_sections(identity: dict[str, Any] | None = None) -> dict[str, Any]:
             "dailyAllocationPercent": DEFAULT_REGIME_SETTINGS["dailyAllocationPercent"],
             "maxParticipationPercent": DEFAULT_REGIME_SETTINGS["maxParticipationPercent"],
             "maxAllowedShares": DEFAULT_REGIME_SETTINGS["maxAllowedShares"],
+            "maxOpenRegimePositions": DEFAULT_REGIME_SETTINGS["maxOpenRegimePositions"],
             "maxOrderNotionalDollars": DEFAULT_REGIME_SETTINGS["maxOrderNotionalDollars"],
             "maxPositionNotionalDollars": DEFAULT_REGIME_SETTINGS["maxPositionNotionalDollars"],
             "maxNotionalDollars": DEFAULT_REGIME_SETTINGS["maxNotionalDollars"],
@@ -564,9 +669,11 @@ def _default_sections(identity: dict[str, Any] | None = None) -> dict[str, Any]:
         "entry_policy": {
             "pyramidingEnabled": DEFAULT_REGIME_SETTINGS["pyramidingEnabled"],
             "shortEntriesEnabled": DEFAULT_REGIME_SETTINGS["shortEntriesEnabled"],
+            "allowShortEntries": DEFAULT_REGIME_SETTINGS["allowShortEntries"],
             "confirmationBars": DEFAULT_REGIME_SETTINGS["confirmationBars"],
             "entryCutoffTimeEt": DEFAULT_REGIME_SETTINGS["entryCutoffTimeEt"],
             "minimumNetExpectedEdge": DEFAULT_REGIME_SETTINGS["minimumNetExpectedEdge"],
+            "minimumNetExpectedEdgeBps": DEFAULT_REGIME_SETTINGS["minimumNetExpectedEdge"] * 100.0,
         },
         "exit_policy": {
             "flattenTimeEt": DEFAULT_REGIME_SETTINGS["flattenTimeEt"],
@@ -574,15 +681,29 @@ def _default_sections(identity: dict[str, Any] | None = None) -> dict[str, Any]:
             "atrStopMultiplier": DEFAULT_REGIME_SETTINGS["atrStopMultiplier"],
             "minimumStopDistancePercent": DEFAULT_REGIME_SETTINGS["minimumStopDistancePercent"],
             "takeProfitR": DEFAULT_REGIME_SETTINGS["takeProfitR"],
+            "endOfDayFlattenEnabled": DEFAULT_REGIME_SETTINGS["endOfDayFlattenEnabled"],
+            "mandatoryStop": DEFAULT_REGIME_SETTINGS["mandatoryStop"],
+            "mandatoryMaxHoldingTime": DEFAULT_REGIME_SETTINGS["mandatoryMaxHoldingTime"],
         },
         "execution": {
             "orderTimeToLiveSeconds": DEFAULT_REGIME_SETTINGS["orderTimeToLiveSeconds"],
             "maxCancelReplaceAttempts": DEFAULT_REGIME_SETTINGS["maxCancelReplaceAttempts"],
+            "allowMarketEntryOrders": DEFAULT_REGIME_SETTINGS["allowMarketEntryOrders"],
             "maximumSlippageBps": DEFAULT_REGIME_SETTINGS["maximumSlippageBps"],
+            "maximumCostToEdgeRatio": DEFAULT_REGIME_SETTINGS["maximumCostToEdgeRatio"],
+            "conservativeCostFallbackApproved": DEFAULT_REGIME_SETTINGS["conservativeCostFallbackApproved"],
+            "uncertaintyBufferBps": DEFAULT_REGIME_SETTINGS["uncertaintyBufferBps"],
+            "estimatedFeesBps": DEFAULT_REGIME_SETTINGS["estimatedFeesBps"],
+            "estimatedRegulatoryFeesBps": DEFAULT_REGIME_SETTINGS["estimatedRegulatoryFeesBps"],
+            "marketImpactBps": DEFAULT_REGIME_SETTINGS["marketImpactBps"],
+            "marketImpactBpsPerParticipationPct": DEFAULT_REGIME_SETTINGS["marketImpactBpsPerParticipationPct"],
+            "adverseSelectionBufferBps": DEFAULT_REGIME_SETTINGS["adverseSelectionBufferBps"],
+            "maximumCostModelAgeSeconds": DEFAULT_REGIME_SETTINGS["maximumCostModelAgeSeconds"],
             "brokerTransportMode": "paper",
         },
         "daily_limits": {
             "maxTradesPerDay": DEFAULT_REGIME_SETTINGS["maxTradesPerDay"],
+            "maxEntriesPerDay": DEFAULT_REGIME_SETTINGS["maxEntriesPerDay"],
             "maxConsecutiveLosses": DEFAULT_REGIME_SETTINGS["maxConsecutiveLosses"],
             "maxDailyLossPercent": DEFAULT_REGIME_SETTINGS["maxDailyLossPercent"],
             "dailyAllocationPercent": DEFAULT_REGIME_SETTINGS["dailyAllocationPercent"],
@@ -691,8 +812,14 @@ def _validate_sections(sections: dict[str, Any]) -> None:
     _validate_identity(_record(sections.get("identity")))
     if _record(sections["runtime"]).get("liveTradingEnabled") is not False:
         raise ValueError("Regime settings cannot enable live trading")
+    if _record(sections["runtime"]).get("paperTradingOnly") is not True or _record(sections["runtime"]).get("paperOnly") is not True:
+        raise ValueError("Regime settings must remain paper-only")
     if _record(sections["rollout"]).get("liveTradingEnabled") is not False:
         raise ValueError("Regime rollout settings cannot enable live trading")
+    if _record(sections["execution"]).get("allowMarketEntryOrders") is True:
+        raise ValueError("Regime automatic paper entries cannot use market orders")
+    if _record(sections["entry_policy"]).get("shortEntriesEnabled") is True or _record(sections["entry_policy"]).get("allowShortEntries") is True:
+        raise ValueError("Regime initial automatic paper settings cannot enable short entries")
     if _record(sections["ml_shadow"]).get("mode") not in {"off", "shadow"}:
         raise ValueError("Regime ML must remain disabled or shadow-only")
     for key in ("mayAlterSignals", "mayAlterSizing", "mayAlterOrders"):
@@ -709,19 +836,39 @@ def _validate_sections(sections: dict[str, Any]) -> None:
             "dailyAllocationPercent",
             "maxParticipationPercent",
             "maxAllowedShares",
+            "maxOpenRegimePositions",
             "maxOrderNotionalDollars",
             "maxPositionNotionalDollars",
             "maxNotionalDollars",
         ),
     )
-    _require_non_negative(_record(sections["execution"]), ("orderTimeToLiveSeconds", "maxCancelReplaceAttempts", "maximumSlippageBps"))
-    _require_non_negative(_record(sections["daily_limits"]), ("maxTradesPerDay", "maxConsecutiveLosses", "maxDailyLossPercent", "dailyAllocationPercent"))
+    _require_non_negative(
+        _record(sections["execution"]),
+        (
+            "orderTimeToLiveSeconds",
+            "maxCancelReplaceAttempts",
+            "maximumSlippageBps",
+            "maximumCostToEdgeRatio",
+            "uncertaintyBufferBps",
+            "estimatedFeesBps",
+            "estimatedRegulatoryFeesBps",
+            "marketImpactBps",
+            "marketImpactBpsPerParticipationPct",
+            "adverseSelectionBufferBps",
+            "maximumCostModelAgeSeconds",
+        ),
+    )
+    _require_non_negative(_record(sections["daily_limits"]), ("maxTradesPerDay", "maxEntriesPerDay", "maxConsecutiveLosses", "maxDailyLossPercent", "dailyAllocationPercent"))
     if float(_record(sections["position_sizing"])["baseRiskPercent"]) > 0.10:
         raise ValueError("Initial paper baseRiskPercent cannot exceed 0.10")
     if float(_record(sections["position_sizing"])["maxPositionPercent"]) > 10.0:
         raise ValueError("Initial paper maxPositionPercent cannot exceed 10.0")
     if float(_record(sections["position_sizing"])["dailyAllocationPercent"]) > 20.0:
         raise ValueError("Initial paper dailyAllocationPercent cannot exceed 20.0")
+    if int(_record(sections["position_sizing"])["maxOpenRegimePositions"]) > 1:
+        raise ValueError("Initial paper maxOpenRegimePositions cannot exceed 1")
+    if int(_record(sections["daily_limits"])["maxEntriesPerDay"]) > 3 or int(_record(sections["daily_limits"])["maxTradesPerDay"]) > 3:
+        raise ValueError("Initial paper max entries per day cannot exceed 3")
     _validate_dynamic_profile_bounds(_record(sections["dynamic_profiles"]), sections)
 
 
@@ -798,8 +945,15 @@ def _validate_dynamic_profile_bounds(dynamic_profiles: dict[str, Any], sections:
                 raise ValueError(f"Regime dynamic overlay {regime}.{field} cannot increase risk beyond baseline")
         if "maximumSlippageBps" in overlay_record and float(overlay_record["maximumSlippageBps"]) > float(execution["maximumSlippageBps"]):
             raise ValueError(f"Regime dynamic overlay {regime}.maximumSlippageBps cannot exceed baseline")
+        if "maximumCostToEdgeRatio" in overlay_record and float(overlay_record["maximumCostToEdgeRatio"]) > float(execution["maximumCostToEdgeRatio"]):
+            raise ValueError(f"Regime dynamic overlay {regime}.maximumCostToEdgeRatio cannot exceed baseline")
         if "minimumNetExpectedEdge" in overlay_record and float(overlay_record["minimumNetExpectedEdge"]) < float(aggregation["minimumNetExpectedEdge"]):
             raise ValueError(f"Regime dynamic overlay {regime}.minimumNetExpectedEdge cannot reduce baseline edge")
+        baseline_edge_bps = float(aggregation.get("minimumNetExpectedEdgeBps", float(aggregation["minimumNetExpectedEdge"]) * 100.0))
+        if "minimumNetExpectedEdgeBps" in overlay_record and float(overlay_record["minimumNetExpectedEdgeBps"]) < baseline_edge_bps:
+            raise ValueError(f"Regime dynamic overlay {regime}.minimumNetExpectedEdgeBps cannot reduce baseline edge")
+        if overlay_record.get("conservativeCostFallbackApproved") is True and _record(sections["execution"]).get("conservativeCostFallbackApproved") is not True:
+            raise ValueError(f"Regime dynamic overlay {regime}.conservativeCostFallbackApproved cannot enable fallback beyond baseline")
         if overlay_record.get("pyramidingEnabled") is True or overlay_record.get("shortEntriesEnabled") is True:
             raise ValueError(f"Regime dynamic overlay {regime} cannot enable pyramiding or short entries")
 
@@ -849,6 +1003,34 @@ def _strategy_lifecycle_view(strategy_settings: dict[str, Any]) -> dict[str, Any
             "family": str(_record(settings).get("family") or "regime"),
         }
         for strategy_id, settings in strategy_settings.items()
+    }
+
+
+def _hard_safety_limits() -> dict[str, Any]:
+    return {
+        "baseRiskPercent": DEFAULT_REGIME_SETTINGS["baseRiskPercent"],
+        "maxPositionPercent": DEFAULT_REGIME_SETTINGS["maxPositionPercent"],
+        "dailyAllocationPercent": DEFAULT_REGIME_SETTINGS["dailyAllocationPercent"],
+        "maxOpenRegimePositions": DEFAULT_REGIME_SETTINGS["maxOpenRegimePositions"],
+        "maxAllowedShares": DEFAULT_REGIME_SETTINGS["maxAllowedShares"],
+        "maxOrderNotionalDollars": DEFAULT_REGIME_SETTINGS["maxOrderNotionalDollars"],
+        "maxPositionNotionalDollars": DEFAULT_REGIME_SETTINGS["maxPositionNotionalDollars"],
+        "maximumSlippageBps": DEFAULT_REGIME_SETTINGS["maximumSlippageBps"],
+        "maximumCostToEdgeRatio": DEFAULT_REGIME_SETTINGS["maximumCostToEdgeRatio"],
+        "minimumNetExpectedEdgeBps": DEFAULT_REGIME_SETTINGS["minimumNetExpectedEdge"] * 100.0,
+        "conservativeCostFallbackApproved": DEFAULT_REGIME_SETTINGS["conservativeCostFallbackApproved"],
+        "maxTradesPerDay": DEFAULT_REGIME_SETTINGS["maxTradesPerDay"],
+        "maxEntriesPerDay": DEFAULT_REGIME_SETTINGS["maxEntriesPerDay"],
+        "maxDailyLossPercent": DEFAULT_REGIME_SETTINGS["maxDailyLossPercent"],
+        "maxHoldingBars": DEFAULT_REGIME_SETTINGS["maxHoldingBars"],
+        "paperOnly": True,
+        "allowMarketEntryOrders": False,
+        "allowShortEntries": False,
+        "endOfDayFlattenEnabled": True,
+        "mandatoryStop": True,
+        "mandatoryMaxHoldingTime": True,
+        "liveTradingEnabled": False,
+        "mlMayAlterOrders": False,
     }
 
 

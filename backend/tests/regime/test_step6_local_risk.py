@@ -81,7 +81,7 @@ def test_local_risk_emits_stable_blocker_reason_codes(mutate, expected) -> None:
     [
         (lambda c, s: s.update({"maxAllowedShares": 50}), 50, "regime.local_risk.reduce.maximum_shares"),
         (lambda c, s: s.update({"maxOrderNotionalDollars": 5_000.0}), 50, "regime.local_risk.reduce.maximum_order_notional"),
-        (lambda c, s: (s.update({"maxPositionNotionalDollars": 5_000.0}), c.update({"openPosition": {"notional": 2_500.0}}), s.update({"pyramidingEnabled": True})), 25, "regime.local_risk.reduce.maximum_position_notional"),
+        (lambda c, s: (s.update({"maxPositionNotionalDollars": 5_000.0, "maxOpenRegimePositions": 2}), c.update({"openPosition": {"notional": 2_500.0}}), s.update({"pyramidingEnabled": True})), 25, "regime.local_risk.reduce.maximum_position_notional"),
         (lambda c, s: (c["quoteFreshness"].update({"expectedFillQuantity": 1_000}), s.update({"maxParticipationPercent": 0.02})), 20, "regime.local_risk.reduce.maximum_participation"),
         (lambda c, s: c["accountSnapshot"].update({"availableBuyingPower": 2_500.0}), 25, "regime.local_risk.reduce.buying_power"),
     ],
@@ -138,6 +138,20 @@ def test_execution_blocks_missing_stale_or_mismatched_local_risk(risk_payload, e
     assert expected_reason in outbox["reasonCodes"]
 
 
+def test_execution_accepts_order_quantity_reduced_below_local_risk_approval_by_global_risk() -> None:
+    repository, identity = _repository()
+    _insert_intent(repository, identity, quantity=5)
+    _insert_local_risk(repository, identity, requestedQuantity=7, approvedQuantity=7)
+    broker = _FakeBroker()
+    gateway = PaperOrderGateway(broker, RegimePaperGatewayStore(repository, identity))
+
+    result = process_regime_execution_outbox_once(repository=repository, identity=identity, paper_gateway=gateway, evaluated_at=NOW)
+
+    assert result is not None
+    assert result.status in {"accepted", "submitted", "acknowledged"}
+    assert broker.submit_count == 1
+
+
 def _settings() -> dict:
     return {
         "settingsVersion": "regime-settings-v1",
@@ -156,7 +170,12 @@ def _settings() -> dict:
         "entryCutoffTimeEt": "15:30",
         "orderTimeToLiveSeconds": 60,
         "maximumSlippageBps": 1.0,
+        "maximumCostToEdgeRatio": 0.75,
+        "conservativeCostFallbackApproved": True,
+        "uncertaintyBufferBps": 0.0,
         "estimatedFeesBps": 0.1,
+        "estimatedRegulatoryFeesBps": 0.0,
+        "marketImpactBps": 0.0,
         "adverseSelectionBufferBps": 0.1,
         "minimumNetExpectedEdgeBps": 5.0,
         "maximumTransactionCostBps": 50.0,
@@ -169,7 +188,8 @@ def _context() -> dict:
         "barAgeSeconds": 1,
         "decisionAgeSeconds": 1,
         "quoteFreshness": {"status": "fresh", "ageMs": 100, "bid": 99.99, "ask": 100.01, "spreadBps": 2.0, "expectedFillQuantity": 10_000},
-        "accountSnapshot": {"availableBuyingPower": 100_000.0, "buyingPower": 100_000.0},
+        "accountSnapshot": {"sourceAuthority": "shared_backend_service", "equity": 100_000.0, "availableBuyingPower": 100_000.0, "buyingPower": 100_000.0},
+        "inventorySnapshot": {"algorithmId": "regime", "symbol": "SPY", "quantity": 0, "openOrderQuantity": 0, "reservedCash": 0.0},
         "inventoryReconciled": True,
         "recoverySucceeded": True,
         "dailyCounters": {"tradeCount": 0, "consecutiveLosses": 0, "dailyLossPercent": 0.0, "strategyTradeCounts": {}, "familyTradeCounts": {}},

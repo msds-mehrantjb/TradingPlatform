@@ -16,6 +16,7 @@ from backend.app.algorithms.regime.indicators import (
     relative_volume,
     vwap,
 )
+from backend.app.algorithms.regime.market_data_validation import validate_regime_market_data
 
 VOLATILITY_PERCENTILE_POLICY = {
     "version": "regime_intraday_volatility_percentiles_v1",
@@ -70,12 +71,27 @@ INDICATOR_WARMUP_REQUIREMENTS = {
     "openingRange": 30,
 }
 
+CLASSIFIER_MINIMUM_WARMUP_BARS = max(
+    INDICATOR_WARMUP_REQUIREMENTS[name]
+    for name in (
+        "ema20Slope",
+        "ema50Slope",
+        "atr",
+        "adx",
+        "directionalMovementSpread",
+        "efficiencyRatio",
+        "realizedVolatility",
+        "marketStructure",
+    )
+)
+
 
 def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassification:
     candles = snapshot.candles
     closes = [c.close for c in candles]
     latest = snapshot.latest
     session_evidence = exchange_session(latest.timestamp)
+    data_quality_evidence = _data_quality_evidence(snapshot)
     computed_vwap = vwap(candles)
     ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
@@ -101,6 +117,7 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
         previous_vwap=previous_vwap,
     )
     trend_strength_evidence = _trend_strength_evidence(movement, efficiency)
+    trend_strength_axis = _trend_strength_axis(trend_strength_evidence)
     direction_axis = _direction_axis(direction_evidence["score"], trend_strength_evidence["score"])
     bull_score = max(0, round(direction_evidence["score"] * 5))
     bear_score = max(0, round(-direction_evidence["score"] * 5))
@@ -118,6 +135,15 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
         session_evidence=session_evidence,
     )
     no_trade = _no_trade_reasons(snapshot, volatility_evidence, liquidity_evidence, session_evidence=session_evidence)
+    warmup_evidence = _warmup_evidence(snapshot)
+    if not warmup_evidence["sufficient"]:
+        missing = tuple(dict.fromkeys((*missing, *warmup_evidence["missingInputs"])))
+        no_trade = tuple(dict.fromkeys((*no_trade, "regime.safety.insufficient_classifier_warmup")))
+        data_quality_evidence = {
+            **data_quality_evidence,
+            "warmup": warmup_evidence,
+            "reasonCodes": tuple(dict.fromkeys((*data_quality_evidence["reasonCodes"], *warmup_evidence["reasonCodes"]))),
+        }
     structure_evidence = _structure_evidence(
         snapshot,
         bull_score,
@@ -137,12 +163,17 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
         liquidity=liquidity_axis,
         session=session_evidence.status,
         event_risk=event_axis,
+        trend_strength=trend_strength_axis,
+        data_quality=_data_quality_axis(data_quality_evidence, missing, no_trade),
     )
     raw_regime = _composite_regime(axes)
+    if axes.data_quality in {"invalid", "insufficient_warmup"}:
+        raw_regime = "unknown"
     confidence_evidence = _confidence_evidence(
         axes,
         raw_regime,
         direction_evidence=direction_evidence,
+        trend_strength_evidence=trend_strength_evidence,
         volatility_evidence=volatility_evidence,
         structure_evidence=structure_evidence,
         liquidity_evidence=liquidity_evidence,
@@ -177,6 +208,7 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
         "quoteAgeMs": liquidity_evidence["quoteAgeMs"],
         "unitConvention": LIQUIDITY_POLICY["unitConvention"],
         "directionConfidence": confidence_evidence["directionConfidence"],
+        "trendStrengthConfidence": confidence_evidence["trendStrengthConfidence"],
         "volatilityConfidence": confidence_evidence["volatilityConfidence"],
         "structureConfidence": confidence_evidence["structureConfidence"],
         "liquidityConfidence": confidence_evidence["liquidityConfidence"],
@@ -189,6 +221,9 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
         "bearScore": bear_score,
         "directionScore": direction_evidence["score"],
         "trendStrengthScore": trend_strength_evidence["score"],
+        "trendStrengthAxis": trend_strength_axis,
+        "dataQualityAxis": axes.data_quality,
+        "classifierMinimumWarmupBars": CLASSIFIER_MINIMUM_WARMUP_BARS,
         "realizedVolatility": latest_rv,
         "realizedVolatilityPercentile": volatility_evidence.get("realizedVolatilityPercentile"),
         "currentRangeVsExpected": volatility_evidence.get("currentRangeVsExpected"),
@@ -239,6 +274,8 @@ def classify_market_regime(snapshot: RegimeMarketSnapshot) -> RegimeClassificati
         "structureEvidence": structure_evidence,
         "liquidityEvidence": liquidity_evidence,
         "eventEvidence": event_evidence,
+        "dataQualityEvidence": data_quality_evidence,
+        "warmupEvidence": warmup_evidence,
         "confidenceEvidence": confidence_evidence,
         "indicatorReadiness": _indicator_readiness(
             snapshot,
@@ -351,6 +388,18 @@ def _trend_strength_evidence(movement: dict, efficiency: float | None) -> dict:
         "components": components,
         "rule": "ADX, +DI/-DI spread, and efficiency ratio determine whether a directional move is strong or weak; they do not determine direction.",
     }
+
+
+def _trend_strength_axis(evidence: dict) -> str:
+    components = evidence.get("components") or {}
+    if not any(component.get("dataReady") for component in components.values()):
+        return "unknown"
+    score = float(evidence.get("score") or 0.0)
+    if score >= float(evidence.get("strongThreshold") or 0.62):
+        return "strong"
+    if score >= 0.30:
+        return "weak"
+    return "neutral"
 
 
 def _cross_market_context_evidence(
@@ -629,6 +678,29 @@ def _indicator_readiness(
         "observationsAvailable": observations,
         "requirements": INDICATOR_WARMUP_REQUIREMENTS,
         "indicators": readiness,
+    }
+
+
+def _warmup_evidence(snapshot: RegimeMarketSnapshot) -> dict:
+    observations = len(snapshot.candles)
+    one_minute_observations = len(snapshot.one_minute_candles)
+    sufficient = observations >= CLASSIFIER_MINIMUM_WARMUP_BARS and one_minute_observations >= CLASSIFIER_MINIMUM_WARMUP_BARS
+    reason_codes: list[str] = []
+    missing_inputs: list[str] = []
+    if observations < CLASSIFIER_MINIMUM_WARMUP_BARS:
+        reason_codes.append("regime.classifier.insufficient_warmup.primary_candles")
+        missing_inputs.append("classifierWarmup")
+    if one_minute_observations < CLASSIFIER_MINIMUM_WARMUP_BARS:
+        reason_codes.append("regime.classifier.insufficient_warmup.one_minute_candles")
+        missing_inputs.append("oneMinuteClassifierWarmup")
+    return {
+        "sufficient": sufficient,
+        "requiredObservations": CLASSIFIER_MINIMUM_WARMUP_BARS,
+        "primaryObservationsAvailable": observations,
+        "oneMinuteObservationsAvailable": one_minute_observations,
+        "missingInputs": tuple(dict.fromkeys(missing_inputs)),
+        "reasonCodes": tuple(reason_codes),
+        "rule": "Insufficient classifier warm-up returns unknown and blocks new entries; no strategy can override this state.",
     }
 
 
@@ -1215,7 +1287,42 @@ def _event_evidence(snapshot: RegimeMarketSnapshot) -> dict:
     }
 
 
+def _data_quality_evidence(snapshot: RegimeMarketSnapshot) -> dict:
+    validation = validate_regime_market_data(snapshot)
+    payload = validation.as_dict()
+    quote_reasons = tuple(str(code) for code in payload.get("evidence", {}).get("quoteValidationReasonCodes") or ())
+    bar_reason_codes = tuple(str(code) for code in payload.get("reasonCodes") or ())
+    return {
+        "validationVersion": payload["validationVersion"],
+        "barValidationPassed": bool(payload["passed"]),
+        "reasonCodes": tuple(dict.fromkeys((*bar_reason_codes, *quote_reasons))),
+        "barReasonCodes": bar_reason_codes,
+        "quoteReasonCodes": quote_reasons,
+        "dataTimestamp": payload.get("dataTimestamp"),
+        "featureTimestamp": payload.get("featureTimestamp"),
+        "missingBarCount": payload.get("missingBarCount"),
+        "duplicateTimestampCount": payload.get("duplicateTimestampCount"),
+        "futureDated": payload.get("futureDated"),
+        "pointInTimeHigherTimeframes": payload.get("pointInTimeHigherTimeframes"),
+        "warmup": {},
+        "rule": "Data-quality is its own axis. Invalid bars fail closed; degraded quotes remain visible to liquidity and safety gates.",
+    }
+
+
+def _data_quality_axis(data_quality_evidence: dict, missing_inputs: tuple[str, ...], no_trade: tuple[str, ...]) -> str:
+    warmup = data_quality_evidence.get("warmup") or {}
+    if warmup and not warmup.get("sufficient", True):
+        return "insufficient_warmup"
+    if not data_quality_evidence.get("barValidationPassed", False):
+        return "invalid"
+    if missing_inputs or no_trade or data_quality_evidence.get("quoteReasonCodes"):
+        return "degraded"
+    return "valid"
+
+
 def _composite_regime(axes: RegimeAxes) -> str:
+    if axes.data_quality in {"invalid", "insufficient_warmup"}:
+        return "unknown"
     if axes.volatility == "extreme":
         return "extreme_volatility_no_trade"
     if axes.event_risk in {"blackout", "elevated"}:
@@ -1224,8 +1331,13 @@ def _composite_regime(axes: RegimeAxes) -> str:
         return "liquidity_stress"
     if axes.structure in {"failed_breakout", "liquidity_sweep", "reversal"}:
         return "failed_breakout_reversal"
-    if axes.structure == "opening_range_breakout" or (axes.session == "opening" and axes.structure in {"breakout", "valid_breakout"}):
+    if axes.structure == "opening_range_breakout" or (
+        axes.session == "opening"
+        and axes.structure in {"breakout", "valid_breakout", "prior_day_level_breakout", "premarket_level_breakout"}
+    ):
         return "opening_breakout"
+    if axes.session == "opening" and axes.structure == "trend" and axes.direction in {"strong_up", "weak_up", "strong_down", "weak_down"}:
+        return "gap_session"
     if axes.structure in {"breakout", "valid_breakout", "prior_day_level_breakout", "premarket_level_breakout"} and axes.volatility == "expanded":
         return "intraday_expansion"
     if axes.structure in {"mixed", "choppy_mixed"}:
@@ -1322,6 +1434,7 @@ def _confidence_evidence(
     raw_regime: str,
     *,
     direction_evidence: dict,
+    trend_strength_evidence: dict,
     volatility_evidence: dict,
     structure_evidence: dict,
     liquidity_evidence: dict,
@@ -1332,6 +1445,7 @@ def _confidence_evidence(
     context_evidence: dict | None = None,
 ) -> dict:
     direction_confidence = _direction_confidence(direction_evidence, missing_inputs, context_evidence)
+    trend_strength_confidence = _trend_strength_confidence(trend_strength_evidence)
     volatility_confidence = _volatility_confidence(volatility_evidence)
     structure_confidence = _structure_confidence(structure_evidence)
     liquidity_confidence = _liquidity_confidence(liquidity_evidence)
@@ -1341,6 +1455,7 @@ def _confidence_evidence(
     required_axes = _required_confidence_axes(raw_regime, axes)
     axis_values = {
         "direction": direction_confidence,
+        "trendStrength": trend_strength_confidence,
         "volatility": volatility_confidence,
         "structure": structure_confidence,
         "liquidity": liquidity_confidence,
@@ -1358,6 +1473,7 @@ def _confidence_evidence(
     )
     return {
         "directionConfidence": direction_confidence,
+        "trendStrengthConfidence": trend_strength_confidence,
         "volatilityConfidence": volatility_confidence,
         "structureConfidence": structure_confidence,
         "liquidityConfidence": liquidity_confidence,
@@ -1382,6 +1498,17 @@ def _direction_confidence(direction_evidence: dict, missing_inputs: tuple[str, .
     confidence -= min(0.12, len(missing_inputs) * 0.03)
     if context_evidence:
         confidence += float(context_evidence.get("confidenceAdjustment") or 0.0) * 0.5
+    return round(_clamp(confidence, 0.05, 1.0), 4)
+
+
+def _trend_strength_confidence(trend_strength_evidence: dict) -> float:
+    components = trend_strength_evidence.get("components") or {}
+    available = sum(1 for component in components.values() if component.get("value") is not None)
+    ready = sum(1 for component in components.values() if component.get("dataReady"))
+    total = max(len(components), 1)
+    confidence = 0.25 + (available / total) * 0.20 + (ready / total) * 0.35
+    score = float(trend_strength_evidence.get("score") or 0.0)
+    confidence += min(0.20, abs(score - 0.30) * 0.20)
     return round(_clamp(confidence, 0.05, 1.0), 4)
 
 
@@ -1465,6 +1592,8 @@ def _event_confidence(event_state: str | dict | None) -> float:
 def _data_quality_confidence(missing_inputs: tuple[str, ...], no_trade: tuple[str, ...]) -> float:
     critical = {
         "completedPrimaryCandle",
+        "classifierWarmup",
+        "oneMinuteClassifierWarmup",
         "usableRecentHistory",
         "validTimestamp",
         "freshQuote",
@@ -1483,6 +1612,8 @@ def _data_quality_confidence(missing_inputs: tuple[str, ...], no_trade: tuple[st
 
 
 def _required_confidence_axes(raw_regime: str, axes: RegimeAxes) -> tuple[str, ...]:
+    if raw_regime == "unknown":
+        return ("dataQuality", "session")
     if raw_regime in {"event_risk"}:
         return ("event", "liquidity", "session", "dataQuality")
     if raw_regime in {"liquidity_stress"}:
@@ -1490,10 +1621,12 @@ def _required_confidence_axes(raw_regime: str, axes: RegimeAxes) -> tuple[str, .
     if raw_regime in {"extreme_volatility_no_trade", "high_volatility_trend", "low_volatility_quiet"}:
         return ("volatility", "liquidity", "event", "session", "dataQuality")
     if raw_regime in {"opening_breakout", "intraday_expansion", "failed_breakout_reversal"}:
-        return ("structure", "volatility", "liquidity", "event", "session", "dataQuality")
+        return ("structure", "trendStrength", "volatility", "liquidity", "event", "session", "dataQuality")
+    if raw_regime == "gap_session":
+        return ("direction", "trendStrength", "structure", "liquidity", "event", "session", "dataQuality")
     if axes.structure in {"range", "mixed"} or raw_regime in {"range_bound", "choppy_mixed"}:
         return ("structure", "volatility", "liquidity", "event", "session", "dataQuality")
-    return ("direction", "structure", "volatility", "liquidity", "event", "session", "dataQuality")
+    return ("direction", "trendStrength", "structure", "volatility", "liquidity", "event", "session", "dataQuality")
 
 
 def _safety_block_confidence(

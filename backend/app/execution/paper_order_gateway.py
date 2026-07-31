@@ -201,6 +201,8 @@ class PaperOrderGateway:
                 return self._result(proposal, client_order_id, mode, False, False, "NOT_SUBMITTED", ("paper_gateway.global_portfolio_risk_denied",), "Shared global portfolio risk manager reduced quantity to zero.", evaluated_at)
 
         if not self.broker.verify_paper_account():
+            if global_risk_decision.reservationId:
+                self.global_risk_manager.release_reservation(global_risk_decision.reservationId)
             blocked = intent.model_copy(update={"status": "NOT_SUBMITTED", "reasonCodes": (*intent.reasonCodes, "paper_gateway.paper_account_unverified")})
             self.store.write_snapshot(_intent_key(proposal.orderIntentId), blocked.model_dump(mode="json"))
             return self._result(proposal, client_order_id, mode, False, False, "NOT_SUBMITTED", ("paper_gateway.paper_account_unverified",), "Paper account verification failed; live trading is never used.", evaluated_at)
@@ -253,7 +255,22 @@ class PaperOrderGateway:
                 continue
             canceled = self.broker.cancel_order(intent.clientOrderId)
             status = "CANCELED" if canceled else intent.status
-            updated = intent.model_copy(update={"status": status, "reasonCodes": (*intent.reasonCodes, "paper_gateway.stale_order_cancelled")})
+            reason_codes = [*intent.reasonCodes, "paper_gateway.stale_order_cancelled"]
+            if canceled:
+                risk_snapshot = _read_optional(self.store, _global_risk_key(intent.orderIntentId)) or {}
+                reservation_id = risk_snapshot.get("reservationId") if isinstance(risk_snapshot, dict) else None
+                if reservation_id:
+                    self.global_risk_manager.release_reservation(str(reservation_id))
+                    reason_codes.append("paper_gateway.global_risk_reservation_released")
+                    self.store.write_snapshot(
+                        _global_risk_key(intent.orderIntentId),
+                        {
+                            **risk_snapshot,
+                            "reservationReleasedAt": evaluated_at.isoformat().replace("+00:00", "Z"),
+                            "reservationReleaseReason": "paper_gateway.stale_order_cancelled",
+                        },
+                    )
+            updated = intent.model_copy(update={"status": status, "reasonCodes": tuple(reason_codes)})
             self.store.write_snapshot(key, updated.model_dump(mode="json"))
             results.append(
                 PaperOrderGatewayResult(

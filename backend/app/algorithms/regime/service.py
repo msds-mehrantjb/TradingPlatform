@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timezone
 from typing import Any
 
 from backend.app.algorithms.regime.backtest.engine import run_regime_backtest
@@ -14,6 +15,8 @@ from backend.app.algorithms.regime.global_risk_adapter import regime_global_risk
 from backend.app.algorithms.regime.market_snapshot import build_regime_market_snapshot
 from backend.app.algorithms.regime.ml.promotion_policy import RegimeMlCandidateArtifact, evaluate_regime_ml_promotion_policy
 from backend.app.algorithms.regime.repository import RegimeRepository, regime_repository_inventory
+from backend.app.algorithms.regime.rollout import apply_operational_rollout_stage_to_decision_result
+from backend.app.algorithms.regime.settings_repository import RegimeSettingsRepository, regime_settings_repository_inventory
 from backend.app.algorithms.regime.stateful_core import deterministic_data_manifest_hash, deterministic_regime_decision_id
 
 REGIME_SERVICE_VERSION = "regime_service_v1"
@@ -23,6 +26,7 @@ REGIME_BACKEND_FILE_INVENTORY = (
     "contracts.py",
     "configuration.py",
     "market_snapshot.py",
+    "market_data_validation.py",
     "indicators.py",
     "classification_axes.py",
     "classifier.py",
@@ -33,6 +37,7 @@ REGIME_BACKEND_FILE_INVENTORY = (
     "family_aggregation.py",
     "decision_engine.py",
     "local_gates.py",
+    "execution_cost_adapter.py",
     "dynamic_profile.py",
     "sizing.py",
     "position_manager.py",
@@ -51,8 +56,10 @@ REGIME_BACKEND_FILE_INVENTORY = (
     "runtime_workers.py",
     "runtime_commands.py",
     "runtime_health.py",
+    "reconciliation.py",
     "service.py",
     "repository.py",
+    "settings_repository.py",
     "global_risk_adapter.py",
     "broker_adapter.py",
     "ml/paper_stability.py",
@@ -106,6 +113,7 @@ REGIME_NEVER_SHARED_COMPONENTS = (
 class RegimeApplicationService:
     def __init__(self, repository: RegimeRepository | None = None) -> None:
         self.repository = repository or RegimeRepository()
+        self.settings_repository = RegimeSettingsRepository(self.repository)
 
     def record_decision_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         return self.repository.record_decision_snapshot(snapshot)
@@ -118,7 +126,8 @@ class RegimeApplicationService:
 
     def evaluate(self, payload: dict[str, Any]) -> dict[str, Any]:
         normalize_regime_runtime_mode((payload or {}).get("runtimeMode") or (payload or {}).get("runtime_mode"), default=RegimeRuntimeMode.SHADOW)
-        settings_context = self.repository.ensure_active_settings_snapshot(regime_settings_identity_from_payload(payload))
+        _reject_authoritative_request_state(payload)
+        settings_context = self.settings_repository.ensure_active_settings_snapshot(regime_settings_identity_from_payload(payload))
         snapshot = build_regime_market_snapshot(payload.get("marketData") or payload)
         inventory_snapshot = self._inventory_snapshot(payload, settings_context)
         previous_state = self.repository.read_runtime_checkpoint(settings_context["identity"])
@@ -131,10 +140,26 @@ class RegimeApplicationService:
             data_manifest_hash=data_manifest_hash,
             settings_version=str(settings_context["settingsVersion"]),
         )
-        if _last_processed_bar(previous_state) == snapshot.latest.timestamp:
+        bar_order = _bar_order(snapshot.latest.timestamp, _last_processed_bar(previous_state))
+        if bar_order == "duplicate":
             existing = self.repository.read_decision_snapshot_by_id(settings_context["identity"], decision_id)
             if existing is not None:
                 return existing
+            return _ignored_bar_result(
+                identity=settings_context["identity"],
+                snapshot=snapshot,
+                previous_state=previous_state,
+                decision_id=decision_id,
+                reason="regime.hysteresis.duplicate_bar_ignored",
+            )
+        if bar_order == "out_of_order":
+            return _ignored_bar_result(
+                identity=settings_context["identity"],
+                snapshot=snapshot,
+                previous_state=previous_state,
+                decision_id=decision_id,
+                reason="regime.hysteresis.out_of_order_bar_ignored",
+            )
         safe_payload = self._payload_with_authoritative_settings(payload, settings_context)
         safe_payload["__regime_previous_state"] = previous_state
         safe_payload["__regime_inventory_snapshot"] = {**inventory_snapshot, "dataManifestHash": data_manifest_hash}
@@ -144,13 +169,17 @@ class RegimeApplicationService:
         result["accountId"] = identity["accountId"]
         result["runtimeMode"] = identity["runtimeMode"]
         result["settingsSource"] = REGIME_SETTINGS_AUTHORITATIVE_SOURCE
+        rollout_stage = _trusted_rollout_stage(payload)
+        if rollout_stage:
+            result = apply_operational_rollout_stage_to_decision_result(result, rollout_stage)
         self.record_stateful_bar_result(result)
         return result
 
     def run_backtest(self, payload: dict[str, Any]) -> dict[str, Any]:
         if (payload or {}).get("runtimeMode") or (payload or {}).get("runtime_mode"):
             normalize_regime_runtime_mode((payload or {}).get("runtimeMode") or (payload or {}).get("runtime_mode"), default=RegimeRuntimeMode.BACKTEST)
-        settings_context = self.repository.ensure_active_settings_snapshot(
+        _reject_authoritative_request_state(payload)
+        settings_context = self.settings_repository.ensure_active_settings_snapshot(
             regime_settings_identity_from_payload({**payload, "runtimeMode": RegimeRuntimeMode.BACKTEST.value})
         )
         safe_payload = self._payload_with_authoritative_settings(payload, settings_context)
@@ -166,10 +195,10 @@ class RegimeApplicationService:
         return result
 
     def active_settings(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self.repository.ensure_active_settings_snapshot(regime_settings_identity_from_payload(payload or {}))
+        return self.settings_repository.ensure_active_settings_snapshot(regime_settings_identity_from_payload(payload or {}))
 
     def activate_settings(self, command: dict[str, Any]) -> dict[str, Any]:
-        return self.repository.activate_settings_snapshot(command)
+        return self.settings_repository.activate_settings_snapshot(command)
 
     def handle_settings_command(self, command: dict[str, Any]) -> dict[str, Any]:
         command_type = str(
@@ -179,13 +208,13 @@ class RegimeApplicationService:
             or "activate_version"
         )
         if command_type in {"validate", "validate_version", "settings_validate"}:
-            return self.repository.validate_settings_snapshot_command(command)
+            return self.settings_repository.validate_settings_snapshot_command(command)
         if command_type in {"create", "create_version", "settings_create"}:
-            return self.repository.create_settings_version(command)
+            return self.settings_repository.create_settings_version(command)
         if command_type in {"activate", "activate_version", "settings_activate"}:
-            return self.repository.activate_settings_snapshot(command)
+            return self.settings_repository.activate_settings_snapshot(command)
         if command_type in {"rollback", "rollback_version", "settings_rollback"}:
-            return self.repository.rollback_settings_snapshot(command)
+            return self.settings_repository.rollback_settings_snapshot(command)
         raise ValueError(f"Unsupported Regime settings command: {command_type}")
 
     def record_ml_promotion_evidence(self, evidence: dict[str, Any]) -> dict[str, Any]:
@@ -226,8 +255,8 @@ class RegimeApplicationService:
     @staticmethod
     def _payload_with_authoritative_settings(payload: dict[str, Any], settings_context: dict[str, Any]) -> dict[str, Any]:
         safe_payload = copy.deepcopy(payload)
-        safe_payload.pop("settings", None)
-        safe_payload.pop("settingsSnapshot", None)
+        for key in FORBIDDEN_AUTHORITATIVE_REQUEST_FIELDS:
+            safe_payload.pop(key, None)
         safe_payload["__regime_authoritative_settings"] = settings_context["flatSettings"]
         safe_payload["__regime_settings_snapshot"] = settings_context["settingsSnapshot"]
         safe_payload["__regime_settings_source"] = REGIME_SETTINGS_AUTHORITATIVE_SOURCE
@@ -237,16 +266,8 @@ class RegimeApplicationService:
         safe_payload["runtimeMode"] = identity["runtimeMode"]
         return safe_payload
 
-    @staticmethod
-    def _inventory_snapshot(payload: dict[str, Any], settings_context: dict[str, Any]) -> dict[str, Any]:
-        inventory = payload.get("inventorySnapshot") if isinstance(payload.get("inventorySnapshot"), dict) else {}
-        return {
-            **inventory,
-            "algorithmInstanceId": settings_context["identity"]["algorithmInstanceId"],
-            "accountId": settings_context["identity"]["accountId"],
-            "runtimeMode": settings_context["identity"]["runtimeMode"],
-            "symbol": settings_context["identity"]["symbol"],
-        }
+    def _inventory_snapshot(self, payload: dict[str, Any], settings_context: dict[str, Any]) -> dict[str, Any]:
+        return self.repository.current_inventory_snapshot(settings_context["identity"])
 
 
 def _last_processed_bar(state: dict[str, Any] | None) -> str | None:
@@ -256,13 +277,131 @@ def _last_processed_bar(state: dict[str, Any] | None) -> str | None:
     return str(value) if value else None
 
 
+def _bar_order(current_timestamp: str, last_timestamp: str | None) -> str:
+    if not last_timestamp:
+        return "new"
+    current = _parse_timestamp(current_timestamp)
+    last = _parse_timestamp(last_timestamp)
+    if current is None or last is None:
+        return "new"
+    if current == last:
+        return "duplicate"
+    if current < last:
+        return "out_of_order"
+    return "new"
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _trusted_rollout_stage(payload: dict[str, Any]) -> str | None:
+    if str(payload.get("__regime_rollout_source") or "") != "backend.app.algorithms.regime.runtime_supervisor":
+        return None
+    stage = str(payload.get("__regime_rollout_stage") or "")
+    return stage or None
+
+
+def _ignored_bar_result(
+    *,
+    identity: dict[str, Any],
+    snapshot,
+    previous_state: dict[str, Any] | None,
+    decision_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    state = copy.deepcopy(previous_state or {})
+    reason_codes = (reason,)
+    confirmed = str(state.get("confirmedRegime") or state.get("confirmed_regime") or "unknown")
+    transition = {
+        "confirmed_regime": confirmed,
+        "previous_regime": state.get("previousConfirmedRegime"),
+        "candidate_regime": state.get("candidateRegime"),
+        "candidate_confirmation_count": int(state.get("candidateConfirmationCount") or 0),
+        "regime_start_time": state.get("regimeStartTimestamp") or snapshot.latest.timestamp,
+        "transition_confidence": float(state.get("regimeConfidence") or 0.0),
+        "transition_reason": reason,
+        "transition_evidence": {
+            "rawRegime": "ignored_bar",
+            "lastProcessedBarTimestamp": state.get("lastProcessedBarTimestamp"),
+            "incomingBarTimestamp": snapshot.latest.timestamp,
+            "reasonCodes": reason_codes,
+            "mutated": False,
+        },
+        "candidate_start_time": state.get("candidateStartTimestamp"),
+        "regime_confidence": float(state.get("regimeConfidence") or 0.0),
+        "last_transition_time": state.get("lastTransitionTimestamp") or state.get("regimeStartTimestamp") or snapshot.latest.timestamp,
+        "bars_in_current_regime": int(state.get("regimeDwellBars") or state.get("barsInCurrentRegime") or 0),
+        "state_version": int(state.get("sequenceVersion") or state.get("stateVersion") or 0),
+    }
+    classification = {
+        "raw_regime": "unknown",
+        "axes": {
+            "direction": "unknown",
+            "trend_strength": "unknown",
+            "volatility": "unknown",
+            "structure": "unknown",
+            "liquidity": "unknown",
+            "session": "unknown",
+            "event_risk": "unknown",
+            "data_quality": "invalid",
+        },
+        "confidence": 0.0,
+        "features": {"dataTimestamp": snapshot.latest.timestamp},
+        "evidence": {"runtimeStateIgnoredBar": transition["transition_evidence"]},
+        "missing_inputs": reason_codes,
+        "no_trade_reasons": reason_codes,
+        "timestamp": snapshot.latest.timestamp,
+    }
+    return {
+        "algorithmId": "regime",
+        "algorithmInstanceId": identity["algorithmInstanceId"],
+        "accountId": identity["accountId"],
+        "runtimeMode": identity["runtimeMode"],
+        "settingsSource": REGIME_SETTINGS_AUTHORITATIVE_SOURCE,
+        "ignoredBar": True,
+        "reasonCodes": reason_codes,
+        "dataTimestamp": snapshot.latest.timestamp,
+        "featureTimestamp": snapshot.latest.timestamp,
+        "decisionId": decision_id,
+        "decision": {
+            "algorithm_id": "regime",
+            "decision_id": decision_id,
+            "symbol": snapshot.symbol,
+            "signal": "Hold",
+            "aggregate_signal": "Hold",
+            "trade_allowed": False,
+            "trade_blockers": reason_codes,
+            "raw_classification": classification,
+            "confirmed_state": transition,
+            "strategy_outputs": (),
+            "family_scores": {},
+            "effective_settings": {"noNewEntries": True, "effectiveSettingsReasonCodes": reason_codes},
+            "score": 0.0,
+            "confidence": 0.0,
+        },
+        "nextRuntimeState": state,
+        "classification": classification,
+        "transition": transition,
+        "orderProposal": None,
+    }
+
+
 def regime_backend_inventory() -> dict[str, Any]:
     return {
         "algorithmId": "regime",
         "version": REGIME_SERVICE_VERSION,
         "files": REGIME_BACKEND_FILE_INVENTORY,
         "productionDecisionCore": "backend.app.algorithms.regime.execution_pipeline.execute_regime_pipeline",
-        "productionStateTransitionCore": "backend.app.algorithms.regime.stateful_core.process_regime_bar",
+        "productionStateTransitionCore": "backend.app.algorithms.regime.stateful_core.process_completed_bar",
         "productionBacktestCore": "backend.app.algorithms.regime.backtest.engine.run_regime_backtest",
         "authoritativeRuntime": "backend.app.algorithms.regime.execution_pipeline",
         "authoritativeBacktestEngine": "backend.app.algorithms.regime.backtest.engine",
@@ -289,6 +428,7 @@ def regime_backend_inventory() -> dict[str, Any]:
         "frontendMayPromoteMl": False,
         "service": "backend.app.algorithms.regime.service.RegimeApplicationService",
         "repository": regime_repository_inventory(),
+        "settingsRepository": regime_settings_repository_inventory(),
         "regimeOwnedPersistence": "backend.app.algorithms.regime.persistence.RegimeSqliteRepository",
         "globalRiskAdapter": regime_global_risk_adapter_inventory(),
         "brokerAdapter": regime_broker_adapter_inventory(),
@@ -305,6 +445,29 @@ def regime_backend_inventory() -> dict[str, Any]:
         "settingsChangePath": "API enqueues settings_activation commands for background processing.",
         "liveTradingEnabled": False,
     }
+
+
+FORBIDDEN_AUTHORITATIVE_REQUEST_FIELDS = frozenset(
+    {
+        "settings",
+        "settingsSnapshot",
+        "account",
+        "accountSnapshot",
+        "position",
+        "currentPosition",
+        "inventorySnapshot",
+        "globalRiskCapacityQuantity",
+        "dailyPnl",
+        "availableRisk",
+        "buyingPower",
+    }
+)
+
+
+def _reject_authoritative_request_state(payload: dict[str, Any]) -> None:
+    present = sorted(key for key in FORBIDDEN_AUTHORITATIVE_REQUEST_FIELDS if key in (payload or {}))
+    if present:
+        raise ValueError(f"Regime service rejects authoritative request fields: {present}")
 
 
 __all__ = [

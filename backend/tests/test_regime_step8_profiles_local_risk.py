@@ -121,6 +121,8 @@ def test_transaction_cost_estimate_uses_half_spread_slippage_fees_and_adverse_se
         "halfSpreadBps": 5.0,
         "expectedSlippageBps": 3.0,
         "feesBps": 0.5,
-        "adverseSelectionBufferBps": 1.25,
+        "adverseSelectionBps": 1.25,
+        "marketImpactBps": 0.0,
+        "uncertaintyBufferBps": 0.0,
         "totalCostBps": 9.75,
     }

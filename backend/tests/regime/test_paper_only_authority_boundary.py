@@ -91,10 +91,12 @@ class RegimePaperOnlyAuthorityBoundaryTest(unittest.TestCase):
         self.assertIsNotNone(payload_fn)
         payload_body = payload_fn.group(1)
 
-        self.assertIn("marketData", payload_body)
+        self.assertIn('requestType: "diagnostic_shadow"', payload_body)
+        self.assertNotIn("marketData", payload_body)
         self.assertNotIn("settings:", payload_body)
         self.assertNotIn("account:", payload_body)
         self.assertIn("AUTHORITATIVE_REGIME_PAYLOAD_KEYS", api_source)
+        self.assertIn("DIRECT_EVALUATION_DATA_KEYS", api_source)
         self.assertIn("backend workers own decisions", api_source)
 
 

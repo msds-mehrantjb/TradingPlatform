@@ -89,7 +89,8 @@ class StructureAxisTest(unittest.TestCase):
         self.assertGreaterEqual(evidence["vwapCrossingFrequency"], 3)
 
     def test_classifier_exposes_structure_evidence_and_choppy_composite(self):
-        candles = regular_candles([100.10, 99.90, 100.08, 99.92, 100.06, 99.94, 100.04, 99.96, 100.03, 99.97])
+        pattern = [100.10, 99.90, 100.08, 99.92, 100.06, 99.94, 100.04, 99.96, 100.03, 99.97]
+        candles = regular_candles([pattern[index % len(pattern)] for index in range(70)])
         market = build_regime_market_snapshot({"symbol": "SPY", "primaryCandles": candles, "contextFeeds": {"quoteFreshness": FRESH_QUOTE}})
 
         classification = classify_market_regime(market)

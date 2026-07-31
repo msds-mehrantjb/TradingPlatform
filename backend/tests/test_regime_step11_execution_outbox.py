@@ -34,6 +34,9 @@ def test_accepted_order_reserves_submits_reconciles_into_regime_inventory() -> N
     assert broker.last_intent.persistedBeforeSubmission is True
     outbox = repository.read_execution_outbox_record(identity, "regime-intent-1")
     assert outbox["processingStatus"] == "filled"
+    assert outbox["brokerClientOrderId"] == broker.last_intent.clientOrderId
+    assert outbox["orderReplacementPolicy"] == "cancel_stale_unfilled_orders_replace_requires_new_intent"
+    assert outbox["stateMachine"]["version"] == "regime_execution_outbox_state_machine_v2"
     assert outbox["reservationId"]
     assert outbox["immutableProposal"]["decisionId"] == "regime-decision-1"
     assert outbox["immutableProposal"]["stopPrice"] == 99.0
@@ -114,6 +117,8 @@ def test_stale_order_cancellation_updates_regime_outbox() -> None:
     assert cancellations[0].status == "cancelled"
     outbox = repository.read_execution_outbox_record(identity, "regime-intent-1")
     assert outbox["processingStatus"] == "cancelled"
+    statuses = [record["processingStatus"] for record in repository.read_owned_records("regime_execution_outbox", identity)]
+    assert "cancel_pending" in statuses
 
 
 def test_duplicate_gateway_response_does_not_resubmit_broker_order() -> None:
@@ -162,6 +167,64 @@ def test_live_mode_is_hard_rejected_before_shared_gateway() -> None:
     assert "regime.execution.live_mode_rejected" in result.reason_codes
 
 
+def test_market_entry_order_is_rejected_before_broker_submission() -> None:
+    repository, identity = _repository()
+    _insert_intent(repository, identity, execution={"orderTimeToLiveSeconds": 300, "orderType": "market"})
+    broker = FakeRegimePaperBroker()
+    gateway = _gateway(repository, identity, broker)
+
+    result = process_regime_execution_outbox_once(repository=repository, identity=identity, paper_gateway=gateway, evaluated_at=NOW)
+
+    assert result.status == "rejected"
+    assert broker.submit_count == 0
+    assert "regime.execution.market_entry_order_rejected" in result.reason_codes
+
+
+def test_expired_entry_is_not_submitted_and_moves_to_expired() -> None:
+    repository, identity = _repository()
+    _insert_intent(repository, identity, created_at=NOW - timedelta(minutes=10), risk_expires_at=NOW - timedelta(minutes=5))
+    broker = FakeRegimePaperBroker()
+    gateway = _gateway(repository, identity, broker)
+
+    result = process_regime_execution_outbox_once(repository=repository, identity=identity, paper_gateway=gateway, evaluated_at=NOW)
+
+    assert result.status == "expired"
+    assert broker.submit_count == 0
+    assert "regime.execution.entry_intent_expired_before_submission" in result.reason_codes
+
+
+def test_live_broker_configuration_is_rejected_before_submission() -> None:
+    repository, identity = _repository()
+    _insert_intent(repository, identity)
+    broker = FakeRegimePaperBroker(base_url="https://api.alpaca.markets/v2", paper_only=False, live_trading_enabled=True, account_type="live")
+    gateway = _gateway(repository, identity, broker)
+
+    result = process_regime_execution_outbox_once(repository=repository, identity=identity, paper_gateway=gateway, evaluated_at=NOW)
+
+    assert result.status == "rejected"
+    assert broker.submit_count == 0
+    assert "regime.execution.paper_broker.live_trading_enabled" in result.reason_codes
+    assert "regime.execution.paper_broker.live_base_url_rejected" in result.reason_codes
+
+
+def test_safe_gateway_failure_uses_bounded_retry_backoff() -> None:
+    repository, identity = _repository()
+    _insert_intent(repository, identity)
+    broker = FakeRegimePaperBroker(raise_safe_before_submit=True)
+    gateway = _gateway(repository, identity, broker)
+
+    first = process_regime_execution_outbox_once(repository=repository, identity=identity, paper_gateway=gateway, evaluated_at=NOW)
+    waiting = process_regime_execution_outbox_once(repository=repository, identity=identity, paper_gateway=gateway, evaluated_at=NOW + timedelta(seconds=1))
+
+    outbox = repository.read_execution_outbox_record(identity, "regime-intent-1")
+    assert first.status == "retry_scheduled"
+    assert waiting.duplicate is True
+    assert "regime.execution.retry_backoff_wait" in waiting.reason_codes
+    assert outbox["retryCount"] == 1
+    assert outbox["nextRetryAt"] > NOW.isoformat()
+    assert broker.submit_count == 0
+
+
 def test_decision_core_has_no_direct_strategy_to_broker_call() -> None:
     source = (Path(__file__).resolve().parents[1] / "app" / "algorithms" / "regime" / "stateful_core.py").read_text(encoding="utf-8")
     assert "PaperOrderGateway" not in source
@@ -186,7 +249,15 @@ def _gateway(repository: RegimeRepository, identity: dict[str, str], broker: "Fa
     return PaperOrderGateway(broker, RegimePaperGatewayStore(repository, identity))
 
 
-def _insert_intent(repository: RegimeRepository, identity: dict[str, str], *, quantity: int = 7) -> None:
+def _insert_intent(
+    repository: RegimeRepository,
+    identity: dict[str, str],
+    *,
+    quantity: int = 7,
+    execution: dict | None = None,
+    created_at: datetime = NOW,
+    risk_expires_at: datetime | None = None,
+) -> None:
     result = repository.insert_order_intent(
         {
             **identity,
@@ -206,10 +277,10 @@ def _insert_intent(repository: RegimeRepository, identity: dict[str, str], *, qu
             "settingsSnapshot": {
                 "settingsVersion": "regime-settings-v1",
                 "profileVersion": "regime-profile-v1",
-                "execution": {"orderTimeToLiveSeconds": 300, "orderType": "limit", "maximumCancelReplaceAttempts": 1},
+                "execution": execution or {"orderTimeToLiveSeconds": 300, "orderType": "limit", "maximumCancelReplaceAttempts": 1},
             },
             "dataManifestHash": "manifest-1",
-            "createdAt": NOW.isoformat().replace("+00:00", "Z"),
+            "createdAt": created_at.isoformat().replace("+00:00", "Z"),
         }
     )
     assert result["inserted"] is True
@@ -229,8 +300,8 @@ def _insert_intent(repository: RegimeRepository, identity: dict[str, str], *, qu
             "estimatedNetEdge": 35.0,
             "blockers": [],
             "reductions": [],
-            "evaluatedAt": NOW.isoformat().replace("+00:00", "Z"),
-            "expiresAt": (NOW + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+            "evaluatedAt": created_at.isoformat().replace("+00:00", "Z"),
+            "expiresAt": (risk_expires_at or NOW + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
         },
     )
     assert risk["recorded"] is True
@@ -245,18 +316,42 @@ class FakeRegimePaperBroker:
         filled_quantity: int = 7,
         ack_delay_seconds: int = 0,
         raise_on_submit: bool = False,
+        raise_safe_before_submit: bool = False,
+        base_url: str = "https://paper-api.alpaca.markets/v2",
+        paper_only: bool = True,
+        live_trading_enabled: bool = False,
+        account_type: str = "paper",
     ) -> None:
         self.ack_status = ack_status
         self.fill_status = fill_status
         self.filled_quantity = filled_quantity
         self.ack_delay_seconds = ack_delay_seconds
         self.raise_on_submit = raise_on_submit
+        self.raise_safe_before_submit = raise_safe_before_submit
+        self.base_url = base_url
+        self.paper_only = paper_only
+        self.live_trading_enabled = live_trading_enabled
+        self.account_type = account_type
+        self.credentials_verified = True
         self.submit_count = 0
         self.cancel_count = 0
         self.last_intent = None
 
     def verify_paper_account(self) -> bool:
+        if self.raise_safe_before_submit:
+            exc = ConnectionError("paper broker pre-submit health check failed")
+            exc.safe_to_retry = True
+            raise exc
         return True
+
+    def paper_trading_configuration(self) -> dict:
+        return {
+            "baseUrl": self.base_url,
+            "paperOnly": self.paper_only,
+            "liveTradingEnabled": self.live_trading_enabled,
+            "accountType": self.account_type,
+            "credentialsVerified": self.credentials_verified,
+        }
 
     def submit_bracket_order(self, intent) -> PaperGatewayBrokerAck:
         self.submit_count += 1

@@ -70,6 +70,16 @@ def valid_evidence() -> dict:
         tests_passed=True,
         evidence_generated_at=(NOW - timedelta(days=1)).isoformat(),
         evidence_expiration_at=(NOW + timedelta(days=1)).isoformat(),
+        backend_evidence_source="regime_ml_promotion_worker",
+        replay_evidence_id="replay-run-1",
+        walk_forward_evidence_id="walk-forward-run-1",
+        holdout_evidence_id="holdout-run-1",
+        paper_stability_evidence_id="paper-stability-run-1",
+        promotion_audit_id="ml-promotion-audit-1",
+        created_by="regime-ml-promotion-worker",
+        activation_reason="backend-recorded confirm-only validation",
+        rollback_artifact_id="artifact-rollback-1",
+        previous_mode="shadow",
     ).as_dict()
 
 
@@ -134,6 +144,20 @@ class RegimeMlPromotionPolicyTest(unittest.TestCase):
             ({"paper_trading_day_count": 0}, "regime.ml.promotion.paper_days_required"),
             ({"paper_shadow_decision_count": 0}, "regime.ml.promotion.paper_shadow_decisions_required"),
             ({"distinct_regimes_observed": 1}, "regime.ml.promotion.multi_regime_paper_evidence_required"),
+        )
+        for patch, reason in cases:
+            with self.subTest(reason=reason):
+                self.assert_blocked(patch, reason)
+
+    def test_backend_replay_walk_forward_holdout_and_paper_evidence_references_are_mandatory(self) -> None:
+        cases = (
+            ({"replay_evidence_id": ""}, "regime.ml.promotion.replay_evidence_id_required"),
+            ({"walk_forward_evidence_id": ""}, "regime.ml.promotion.walk_forward_evidence_id_required"),
+            ({"holdout_evidence_id": ""}, "regime.ml.promotion.holdout_evidence_id_required"),
+            ({"paper_stability_evidence_id": ""}, "regime.ml.promotion.paper_stability_evidence_id_required"),
+            ({"backend_evidence_source": "frontend"}, "regime.ml.promotion.untrusted_backend_evidence_source"),
+            ({"promotion_audit_id": ""}, "regime.ml.promotion.versioned_reversible_audited_required"),
+            ({"rollback_artifact_id": ""}, "regime.ml.promotion.versioned_reversible_audited_required"),
         )
         for patch, reason in cases:
             with self.subTest(reason=reason):
@@ -204,6 +228,19 @@ class RegimeMlPromotionPolicyTest(unittest.TestCase):
         self.assertTrue(record["recorded"])
         self.assertTrue(decision.promoted)
         self.assertEqual(decision.target_mode, "confirm_only")
+        self.assertEqual(decision.maximum_automatic_promotion_mode, "confirm_only")
+
+    def test_repository_rejects_frontend_or_incomplete_promotion_evidence(self) -> None:
+        path = ROOT / "backend" / "tests" / "tmp" / "regime_ml_promotion" / f"{uuid4().hex}.sqlite"
+        repository = RegimeRepository(f"sqlite:///{path}")
+
+        frontend = repository.record_regime_ml_promotion_evidence({**valid_evidence(), "requestSource": "frontend"})
+        incomplete = repository.record_regime_ml_promotion_evidence({**valid_evidence(), "replay_evidence_id": ""})
+
+        self.assertFalse(frontend["recorded"])
+        self.assertEqual(frontend["reason"], "frontend_supplied_evidence_rejected")
+        self.assertFalse(incomplete["recorded"])
+        self.assertEqual(incomplete["reason"], "missing_replay_evidence_id")
 
 
 if __name__ == "__main__":

@@ -6,10 +6,10 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal, Mapping, Protocol
+from typing import Any, Literal, Mapping, Protocol
 
 
-REGIME_ROLLOUT_VERSION = "regime_staged_paper_deployment_v2"
+REGIME_ROLLOUT_VERSION = "regime_staged_paper_deployment_v3"
 
 REGIME_V2_ENABLED = "REGIME_V2_ENABLED"
 REGIME_DYNAMIC_PROFILE_ENABLED = "REGIME_DYNAMIC_PROFILE_ENABLED"
@@ -21,6 +21,100 @@ REGIME_AUTOMATIC_ORDER_SUBMISSION_ENABLED = "REGIME_AUTOMATIC_ORDER_SUBMISSION_E
 
 REGIME_ROLLOUT_STATE_KEY = "regime.rollout.active"
 REGIME_ROLLBACK_STATE_KEY = "regime.rollout.previous_valid"
+REGIME_OPERATIONAL_ROLLOUT_STATE_KEY = "paper_rollout_stage"
+REGIME_OPERATIONAL_ROLLOUT_EVIDENCE_SOURCE = "regime_backend_rollout_worker"
+
+RegimeOperationalRolloutStage = Literal[
+    "disabled",
+    "decision_shadow",
+    "simulated_execution",
+    "limited_paper",
+    "normal_paper",
+]
+
+REGIME_OPERATIONAL_ROLLOUT_STAGES: tuple[RegimeOperationalRolloutStage, ...] = (
+    "disabled",
+    "decision_shadow",
+    "simulated_execution",
+    "limited_paper",
+    "normal_paper",
+)
+REGIME_DEFAULT_OPERATIONAL_ROLLOUT_STAGE: RegimeOperationalRolloutStage = "decision_shadow"
+
+OPERATIONAL_STAGE_LABELS: dict[str, str] = {
+    "disabled": "Disabled",
+    "decision_shadow": "Decision shadow",
+    "simulated_execution": "Simulated execution",
+    "limited_paper": "Limited paper",
+    "normal_paper": "Normal paper",
+}
+
+OPERATIONAL_STAGE_PERMISSIONS: dict[str, dict[str, bool]] = {
+    "disabled": {
+        "processFinalizedBars": False,
+        "createEntryIntents": False,
+        "submitBrokerOrders": False,
+        "useSimulatedBroker": False,
+        "riskReducingExitsAllowed": True,
+    },
+    "decision_shadow": {
+        "processFinalizedBars": True,
+        "createEntryIntents": False,
+        "submitBrokerOrders": False,
+        "useSimulatedBroker": False,
+        "riskReducingExitsAllowed": True,
+    },
+    "simulated_execution": {
+        "processFinalizedBars": True,
+        "createEntryIntents": True,
+        "submitBrokerOrders": False,
+        "useSimulatedBroker": True,
+        "riskReducingExitsAllowed": True,
+    },
+    "limited_paper": {
+        "processFinalizedBars": True,
+        "createEntryIntents": True,
+        "submitBrokerOrders": True,
+        "useSimulatedBroker": False,
+        "riskReducingExitsAllowed": True,
+    },
+    "normal_paper": {
+        "processFinalizedBars": True,
+        "createEntryIntents": True,
+        "submitBrokerOrders": True,
+        "useSimulatedBroker": False,
+        "riskReducingExitsAllowed": True,
+    },
+}
+
+LIMITED_PAPER_PROMOTION_EVIDENCE: tuple[str, ...] = (
+    "stable_supervisor_operation",
+    "no_duplicate_orders",
+    "no_unexplained_inventory_mismatches",
+    "successful_restart_recovery",
+    "valid_protective_exits",
+    "acceptable_queue_and_decision_latency",
+    "cost_model_availability",
+    "passing_replay_and_holdout_tests",
+    "passing_paper_stability_period",
+    "no_critical_unresolved_alerts",
+)
+
+SIMULATED_EXECUTION_PROMOTION_EVIDENCE: tuple[str, ...] = (
+    "stable_supervisor_operation",
+    "no_duplicate_orders",
+    "successful_restart_recovery",
+    "acceptable_queue_and_decision_latency",
+    "passing_replay_and_holdout_tests",
+)
+
+OPERATIONAL_STAGE_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "disabled": (),
+    "decision_shadow": (),
+    "simulated_execution": SIMULATED_EXECUTION_PROMOTION_EVIDENCE,
+    "limited_paper": LIMITED_PAPER_PROMOTION_EVIDENCE,
+    "normal_paper": LIMITED_PAPER_PROMOTION_EVIDENCE,
+}
 
 RegimeMlMode = Literal["off", "shadow", "confirm_only", "active"]
 RegimeRolloutStage = Literal[
@@ -344,6 +438,60 @@ class RegimeRolloutEvidence:
 
 
 @dataclass(frozen=True)
+class RegimePaperPromotionEvidence:
+    persisted_evidence_ids: frozenset[str] = frozenset()
+    stable_supervisor_operation: bool = False
+    no_duplicate_orders: bool = False
+    no_unexplained_inventory_mismatches: bool = False
+    successful_restart_recovery: bool = False
+    valid_protective_exits: bool = False
+    acceptable_queue_and_decision_latency: bool = False
+    cost_model_availability: bool = False
+    passing_replay_and_holdout_tests: bool = False
+    passing_paper_stability_period: bool = False
+    no_critical_unresolved_alerts: bool = False
+    live_trading_enabled: bool = False
+    automatic_order_submission_enabled: bool = False
+    broker_orders_created_in_decision_shadow: int = 0
+    unresolved_reconciliation_alerts: int = 0
+    critical_unresolved_alerts: int = 0
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any] | None) -> "RegimePaperPromotionEvidence":
+        if payload is None:
+            return cls()
+        normalized = {
+            "persisted_evidence_ids": frozenset(
+                payload.get("persisted_evidence_ids")
+                or payload.get("persistedEvidenceIds")
+                or payload.get("evidenceIds")
+                or ()
+            ),
+            "stable_supervisor_operation": _boolish(payload.get("stable_supervisor_operation") or payload.get("stableSupervisorOperation")),
+            "no_duplicate_orders": _boolish(payload.get("no_duplicate_orders") or payload.get("noDuplicateOrders")),
+            "no_unexplained_inventory_mismatches": _boolish(payload.get("no_unexplained_inventory_mismatches") or payload.get("noUnexplainedInventoryMismatches")),
+            "successful_restart_recovery": _boolish(payload.get("successful_restart_recovery") or payload.get("successfulRestartRecovery")),
+            "valid_protective_exits": _boolish(payload.get("valid_protective_exits") or payload.get("validProtectiveExits")),
+            "acceptable_queue_and_decision_latency": _boolish(payload.get("acceptable_queue_and_decision_latency") or payload.get("acceptableQueueAndDecisionLatency")),
+            "cost_model_availability": _boolish(payload.get("cost_model_availability") or payload.get("costModelAvailability")),
+            "passing_replay_and_holdout_tests": _boolish(payload.get("passing_replay_and_holdout_tests") or payload.get("passingReplayAndHoldoutTests")),
+            "passing_paper_stability_period": _boolish(payload.get("passing_paper_stability_period") or payload.get("passingPaperStabilityPeriod")),
+            "no_critical_unresolved_alerts": _boolish(payload.get("no_critical_unresolved_alerts") or payload.get("noCriticalUnresolvedAlerts")),
+            "live_trading_enabled": _boolish(payload.get("live_trading_enabled") or payload.get("liveTradingEnabled")),
+            "automatic_order_submission_enabled": _boolish(payload.get("automatic_order_submission_enabled") or payload.get("automaticOrderSubmissionEnabled")),
+            "broker_orders_created_in_decision_shadow": int(payload.get("broker_orders_created_in_decision_shadow") or payload.get("brokerOrdersCreatedInDecisionShadow") or 0),
+            "unresolved_reconciliation_alerts": int(payload.get("unresolved_reconciliation_alerts") or payload.get("unresolvedReconciliationAlerts") or 0),
+            "critical_unresolved_alerts": int(payload.get("critical_unresolved_alerts") or payload.get("criticalUnresolvedAlerts") or 0),
+        }
+        return cls(**normalized)
+
+    def model_dump(self) -> dict[str, object]:
+        data = self.__dict__.copy()
+        data["persisted_evidence_ids"] = tuple(sorted(self.persisted_evidence_ids))
+        return data
+
+
+@dataclass(frozen=True)
 class RegimePaperReadinessEvidence:
     rollout_evidence: RegimeRolloutEvidence = field(default_factory=RegimeRolloutEvidence)
     flags: RegimeRolloutFlags = field(default_factory=RegimeRolloutFlags)
@@ -597,6 +745,193 @@ def paper_submission_allowed(
         flags=active_flags,
         evidence=evidence or _coerce_evidence(validation),
     )
+
+
+def operational_rollout_stage_policy(stage: str) -> dict[str, object]:
+    canonical = _canonical_operational_stage(stage)
+    return {
+        "algorithmId": "regime",
+        "stage": canonical,
+        "label": OPERATIONAL_STAGE_LABELS[canonical],
+        "permissions": dict(OPERATIONAL_STAGE_PERMISSIONS[canonical]),
+        "requirements": OPERATIONAL_STAGE_REQUIREMENTS[canonical],
+        "paperOnly": True,
+        "liveTradingEnabled": False,
+        "automaticLiveTradingAllowed": False,
+    }
+
+
+def default_operational_rollout_snapshot(*, recorded_at: datetime | None = None) -> dict[str, object]:
+    now = (recorded_at or datetime.now(timezone.utc)).isoformat()
+    return {
+        "algorithmId": "regime",
+        "rolloutVersion": REGIME_ROLLOUT_VERSION,
+        "stage": REGIME_DEFAULT_OPERATIONAL_ROLLOUT_STAGE,
+        "status": "active",
+        "stateVersion": 1,
+        "activatedAt": now,
+        "activatedBy": "system",
+        "activationReason": "regime.rollout.default_decision_shadow",
+        "reasonCodes": ("regime.rollout.default_decision_shadow",),
+        "policy": operational_rollout_stage_policy(REGIME_DEFAULT_OPERATIONAL_ROLLOUT_STAGE),
+        "paperOnly": True,
+        "liveTradingEnabled": False,
+        "automaticPaperSubmissionEnabled": False,
+    }
+
+
+def read_or_initialize_operational_rollout_stage(
+    store: RegimeRolloutStore,
+    *,
+    recorded_at: datetime | None = None,
+) -> dict[str, object]:
+    current = _read_optional(store, REGIME_OPERATIONAL_ROLLOUT_STATE_KEY)
+    if current:
+        stage = _canonical_operational_stage(str(current.get("stage") or REGIME_DEFAULT_OPERATIONAL_ROLLOUT_STAGE))
+        return {
+            **current,
+            "stage": stage,
+            "policy": operational_rollout_stage_policy(stage),
+            "paperOnly": True,
+            "liveTradingEnabled": False,
+        }
+    snapshot = default_operational_rollout_snapshot(recorded_at=recorded_at)
+    store.write_snapshot(REGIME_OPERATIONAL_ROLLOUT_STATE_KEY, snapshot)
+    return snapshot
+
+
+def evaluate_operational_rollout_stage(
+    requested_stage: str,
+    *,
+    current_stage: str = REGIME_DEFAULT_OPERATIONAL_ROLLOUT_STAGE,
+    evidence: RegimePaperPromotionEvidence | Mapping[str, Any] | None = None,
+) -> dict[str, object]:
+    requested = _canonical_operational_stage(requested_stage)
+    current = _canonical_operational_stage(current_stage)
+    promotion_evidence = evidence if isinstance(evidence, RegimePaperPromotionEvidence) else RegimePaperPromotionEvidence.from_mapping(evidence)
+    blockers = _operational_stage_blockers(requested, current, promotion_evidence)
+    return {
+        "algorithmId": "regime",
+        "requestedStage": requested,
+        "currentStage": current,
+        "allowed": not blockers,
+        "reasonCodes": tuple(blockers) if blockers else (f"regime.rollout.{requested}.allowed",),
+        "requirementStatus": _operational_requirement_status(requested, promotion_evidence),
+        "policy": operational_rollout_stage_policy(requested),
+        "evidence": promotion_evidence.model_dump(),
+    }
+
+
+def activate_operational_rollout_stage(
+    store: RegimeRolloutStore,
+    requested_stage: str,
+    *,
+    actor: str,
+    reason: str,
+    evidence: RegimePaperPromotionEvidence | Mapping[str, Any] | None = None,
+    activated_at: datetime | None = None,
+) -> dict[str, object]:
+    current = read_or_initialize_operational_rollout_stage(store, recorded_at=activated_at)
+    evaluated = evaluate_operational_rollout_stage(
+        requested_stage,
+        current_stage=str(current.get("stage") or REGIME_DEFAULT_OPERATIONAL_ROLLOUT_STAGE),
+        evidence=evidence,
+    )
+    if not evaluated["allowed"]:
+        blocked = {
+            **evaluated,
+            "activated": False,
+            "status": "blocked",
+            "actor": actor,
+            "activationReason": reason,
+            "previousStage": current.get("stage"),
+        }
+        store.write_snapshot(
+            REGIME_OPERATIONAL_ROLLOUT_STATE_KEY,
+            {
+                **current,
+                "lastRejectedActivation": blocked,
+                "reasonCodes": tuple(evaluated["reasonCodes"]),
+            },
+        )
+        return blocked
+    now = (activated_at or datetime.now(timezone.utc)).isoformat()
+    next_version = int(current.get("stateVersion") or 0) + 1
+    snapshot = {
+        "algorithmId": "regime",
+        "rolloutVersion": REGIME_ROLLOUT_VERSION,
+        "stage": evaluated["requestedStage"],
+        "status": "active",
+        "stateVersion": next_version,
+        "previousStage": current.get("stage"),
+        "activatedAt": now,
+        "activatedBy": actor,
+        "activationReason": reason,
+        "reasonCodes": tuple(evaluated["reasonCodes"]),
+        "requirementStatus": evaluated["requirementStatus"],
+        "policy": evaluated["policy"],
+        "evidence": evaluated["evidence"],
+        "paperOnly": True,
+        "liveTradingEnabled": False,
+        "automaticPaperSubmissionEnabled": evaluated["requestedStage"] in {"limited_paper", "normal_paper"},
+    }
+    store.write_snapshot(REGIME_OPERATIONAL_ROLLOUT_STATE_KEY, snapshot)
+    return {"activated": True, **snapshot}
+
+
+def operational_stage_allows_entry_intents(stage: str) -> bool:
+    return bool(OPERATIONAL_STAGE_PERMISSIONS[_canonical_operational_stage(stage)]["createEntryIntents"])
+
+
+def operational_stage_allows_real_paper_submission(stage: str, evidence: RegimePaperPromotionEvidence | Mapping[str, Any] | None = None) -> bool:
+    canonical = _canonical_operational_stage(stage)
+    if canonical not in {"limited_paper", "normal_paper"}:
+        return False
+    return bool(evaluate_operational_rollout_stage(canonical, current_stage=canonical, evidence=evidence)["allowed"])
+
+
+def operational_stage_uses_simulated_broker(stage: str) -> bool:
+    return bool(OPERATIONAL_STAGE_PERMISSIONS[_canonical_operational_stage(stage)]["useSimulatedBroker"])
+
+
+def apply_operational_rollout_stage_to_decision_result(result: dict[str, Any], stage: str) -> dict[str, Any]:
+    canonical = _canonical_operational_stage(stage)
+    if operational_stage_allows_entry_intents(canonical):
+        return {
+            **result,
+            "rolloutStage": canonical,
+            "rolloutPolicy": operational_rollout_stage_policy(canonical),
+        }
+    order_proposal = result.get("orderProposal") if isinstance(result.get("orderProposal"), dict) else None
+    if not order_proposal:
+        return {
+            **result,
+            "rolloutStage": canonical,
+            "rolloutPolicy": operational_rollout_stage_policy(canonical),
+        }
+    decision = dict(result.get("decision") or {})
+    blockers = list(decision.get("trade_blockers") or ())
+    blockers.append(f"regime.rollout.{canonical}.entry_intent_suppressed")
+    decision["trade_blockers"] = tuple(dict.fromkeys(blockers))
+    hypothetical_fill = _hypothetical_fill_from_order_proposal(result, order_proposal, canonical)
+    return {
+        **result,
+        "decision": decision,
+        "rolloutStage": canonical,
+        "rolloutPolicy": operational_rollout_stage_policy(canonical),
+        "suppressedOrderProposal": order_proposal,
+        "hypotheticalFills": (hypothetical_fill,),
+        "orderProposal": None,
+        "orderIntent": None,
+        "brokerSubmission": {
+            "algorithmId": "regime",
+            "submitted": False,
+            "paperOnly": True,
+            "liveTradingEnabled": False,
+            "reasonCodes": [f"regime.rollout.{canonical}.no_broker_orders"],
+        },
+        "rolloutReasonCodes": (f"regime.rollout.{canonical}.entry_intent_suppressed",),
+    }
 
 
 def rollback_configuration() -> dict[str, object]:
@@ -861,6 +1196,48 @@ def _stage_blockers(stage: RegimeRolloutStage, flags: RegimeRolloutFlags, eviden
     return list(dict.fromkeys(blockers))
 
 
+def _operational_stage_blockers(stage: RegimeOperationalRolloutStage, current: RegimeOperationalRolloutStage, evidence: RegimePaperPromotionEvidence) -> list[str]:
+    blockers: list[str] = []
+    if evidence.live_trading_enabled:
+        blockers.append("regime.rollout.live_trading_never_allowed")
+    if evidence.automatic_order_submission_enabled:
+        blockers.append("regime.rollout.automatic_order_submission_requires_stage_gate")
+    if evidence.broker_orders_created_in_decision_shadow:
+        blockers.append("regime.rollout.decision_shadow_created_broker_orders")
+    if evidence.unresolved_reconciliation_alerts:
+        blockers.append("regime.rollout.unresolved_reconciliation_alerts")
+    if evidence.critical_unresolved_alerts:
+        blockers.append("regime.rollout.critical_unresolved_alerts")
+    if stage != current and not _operational_transition_allowed(current, stage):
+        blockers.append(f"regime.rollout.invalid_stage_transition:{current}->{stage}")
+    for requirement in OPERATIONAL_STAGE_REQUIREMENTS[stage]:
+        if not _paper_promotion_requirement_passed(evidence, requirement):
+            blockers.append(f"regime.rollout.evidence_missing:{requirement}")
+    return list(dict.fromkeys(blockers))
+
+
+def _operational_requirement_status(stage: RegimeOperationalRolloutStage, evidence: RegimePaperPromotionEvidence) -> dict[str, str]:
+    return {
+        requirement: "PASS" if _paper_promotion_requirement_passed(evidence, requirement) else "INSUFFICIENT_EVIDENCE"
+        for requirement in OPERATIONAL_STAGE_REQUIREMENTS[stage]
+    }
+
+
+def _paper_promotion_requirement_passed(evidence: RegimePaperPromotionEvidence, requirement: str) -> bool:
+    return bool(getattr(evidence, requirement)) and (
+        requirement in evidence.persisted_evidence_ids
+        or f"regime.rollout.evidence:{requirement}" in evidence.persisted_evidence_ids
+    )
+
+
+def _operational_transition_allowed(current: RegimeOperationalRolloutStage, requested: RegimeOperationalRolloutStage) -> bool:
+    if requested == "disabled":
+        return True
+    current_index = REGIME_OPERATIONAL_ROLLOUT_STAGES.index(current)
+    requested_index = REGIME_OPERATIONAL_ROLLOUT_STAGES.index(requested)
+    return requested_index <= current_index + 1
+
+
 def _stage_requirement_status(stage: RegimeRolloutStage, evidence: RegimeRolloutEvidence) -> dict[str, str]:
     return {
         requirement: "PASS" if _requirement_passed(evidence, requirement) else "INSUFFICIENT_EVIDENCE"
@@ -889,6 +1266,23 @@ def _canonical_stage(stage: str) -> RegimeRolloutStage:
     if canonical not in REGIME_ROLLOUT_STAGES:
         raise ValueError(f"unknown Regime rollout stage: {stage}")
     return canonical  # type: ignore[return-value]
+
+
+def _canonical_operational_stage(stage: str) -> RegimeOperationalRolloutStage:
+    alias = {
+        "stage_a_offline_validation": "decision_shadow",
+        "stage_b_shadow_runtime": "decision_shadow",
+        "stage_c_paper_intent_validation": "simulated_execution",
+        "stage_d_limited_spy_paper_submission": "limited_paper",
+        "stage_e_expanded_paper_validation": "normal_paper",
+        "paper_shadow_decisions": "decision_shadow",
+        "paper_intent_validation": "simulated_execution",
+        "limited_paper_orders": "limited_paper",
+        "normal": "normal_paper",
+    }.get(stage, stage)
+    if alias not in REGIME_OPERATIONAL_ROLLOUT_STAGES:
+        raise ValueError(f"unknown Regime operational rollout stage: {stage}")
+    return alias  # type: ignore[return-value]
 
 
 def _coerce_evidence(validation: RegimeRolloutValidation | RegimeRolloutEvidence | None) -> RegimeRolloutEvidence:
@@ -953,6 +1347,35 @@ def _all_stage_requirements() -> frozenset[str]:
     return frozenset(requirement for requirements in STAGE_REQUIREMENTS.values() for requirement in requirements)
 
 
+def _hypothetical_fill_from_order_proposal(result: dict[str, Any], order_proposal: dict[str, Any], stage: str) -> dict[str, object]:
+    decision = result.get("decision") if isinstance(result.get("decision"), dict) else {}
+    quantity = int(order_proposal.get("quantity") or order_proposal.get("approvedQuantity") or order_proposal.get("requestedQuantity") or 0)
+    price = float(order_proposal.get("entryPrice") or order_proposal.get("limitPrice") or order_proposal.get("triggerPrice") or 0.0)
+    decision_id = str(decision.get("decision_id") or result.get("decisionId") or order_proposal.get("decisionId") or "")
+    order_intent_id = str(order_proposal.get("orderIntentId") or order_proposal.get("order_intent_id") or f"hypothetical:{decision_id}")
+    return {
+        "algorithmId": "regime",
+        "rolloutStage": stage,
+        "hypothetical": True,
+        "fillId": f"regime-hypothetical-fill:{order_intent_id}",
+        "decisionId": decision_id,
+        "orderIntentId": order_intent_id,
+        "symbol": order_proposal.get("symbol") or result.get("symbol") or "SPY",
+        "side": order_proposal.get("side") or order_proposal.get("direction") or decision.get("signal") or "Hold",
+        "filledQuantity": max(0, quantity),
+        "averageFillPrice": price,
+        "inventoryAuthoritative": False,
+        "inventoryMutationAllowed": False,
+        "reasonCodes": (f"regime.rollout.{stage}.hypothetical_fill_recorded",),
+    }
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "pass", "passed"}
+    return bool(value)
+
+
 def _env_bool(source: Mapping[str, str], key: str, default: bool) -> bool:
     raw = source.get(key)
     if raw is None:
@@ -989,6 +1412,10 @@ __all__ = [
     "REGIME_PAPER_READINESS_TEST_PATHS",
     "REGIME_PAPER_READINESS_VERSION",
     "REGIME_PAPER_SUBMISSION_ENABLED",
+    "REGIME_DEFAULT_OPERATIONAL_ROLLOUT_STAGE",
+    "REGIME_OPERATIONAL_ROLLOUT_EVIDENCE_SOURCE",
+    "REGIME_OPERATIONAL_ROLLOUT_STAGES",
+    "REGIME_OPERATIONAL_ROLLOUT_STATE_KEY",
     "REGIME_ROLLBACK_STATE_KEY",
     "REGIME_ROLLOUT_PHASES",
     "REGIME_ROLLOUT_STAGES",
@@ -997,7 +1424,12 @@ __all__ = [
     "REGIME_SHORT_ENTRIES_ENABLED",
     "REGIME_V2_ENABLED",
     "REQUIRED_ML_PROMOTION_EVIDENCE",
+    "LIMITED_PAPER_PROMOTION_EVIDENCE",
+    "OPERATIONAL_STAGE_PERMISSIONS",
+    "OPERATIONAL_STAGE_REQUIREMENTS",
     "STAGE_REQUIREMENTS",
+    "RegimeOperationalRolloutStage",
+    "RegimePaperPromotionEvidence",
     "RegimePaperReadinessEvidence",
     "RegimeReadinessStatus",
     "RegimeRolloutEvidence",
@@ -1007,11 +1439,20 @@ __all__ = [
     "RegimeRolloutStage",
     "RegimeRolloutStageStatus",
     "RegimeRolloutValidation",
+    "activate_operational_rollout_stage",
+    "apply_operational_rollout_stage_to_decision_result",
     "build_regime_paper_readiness_report",
+    "default_operational_rollout_snapshot",
+    "evaluate_operational_rollout_stage",
     "evaluate_regime_rollout_phase",
     "evaluate_regime_rollout_stage",
     "limited_paper_orders_allowed",
+    "operational_rollout_stage_policy",
+    "operational_stage_allows_entry_intents",
+    "operational_stage_allows_real_paper_submission",
+    "operational_stage_uses_simulated_broker",
     "paper_submission_allowed",
+    "read_or_initialize_operational_rollout_stage",
     "record_valid_regime_rollout_state",
     "regime_rollout_feature_flags",
     "regime_rollout_status",

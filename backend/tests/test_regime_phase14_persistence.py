@@ -67,6 +67,7 @@ EXPECTED_REGIME_OWNED_TABLES = (
     "regime_execution_outbox",
     "regime_orders",
     "regime_fills",
+    "regime_hypothetical_fills",
     "regime_positions",
     "regime_trades",
     "regime_reconciliation_events",
@@ -76,6 +77,13 @@ EXPECTED_REGIME_OWNED_TABLES = (
     "regime_rollout_evidence",
     "regime_ml_predictions",
     "regime_ml_artifacts",
+    "regime_runtime_state",
+    "regime_bar_processing",
+    "regime_inventory_events",
+    "regime_inventory_snapshots",
+    "regime_daily_risk_state",
+    "regime_reconciliation_runs",
+    "regime_runtime_alerts",
 )
 
 EXPECTED_SHARED_ATTRIBUTED_TABLES = (

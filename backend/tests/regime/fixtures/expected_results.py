@@ -4,7 +4,6 @@ CANONICAL_REGIMES = {
     "strong_downtrend",
     "weak_downtrend",
     "range_bound",
-    "sideways_range",
     "choppy_mixed",
     "opening_breakout",
     "intraday_expansion",
@@ -15,6 +14,7 @@ CANONICAL_REGIMES = {
     "event_risk",
     "liquidity_stress",
     "extreme_volatility_no_trade",
+    "unknown",
 }
 
 DIRECTIONAL_STRATEGIES = (
@@ -48,4 +48,3 @@ SAFETY_GATES = (
     "circuit_breaker",
     "unsupported_session",
 )
-

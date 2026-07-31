@@ -8,7 +8,9 @@ from backend.app.algorithms.regime.ml.paper_stability import (
 )
 from backend.app.algorithms.regime.ml.predictor import evaluate_regime_ml_shadow
 from backend.app.algorithms.regime.ml.promotion_policy import (
+    REGIME_ML_MAX_AUTOMATIC_PROMOTION_MODE,
     REGIME_ML_PROMOTION_POLICY_VERSION,
+    REGIME_ML_TRUSTED_BACKEND_EVIDENCE_SOURCES,
     RegimeMlCandidateArtifact,
     RegimeMlPromotionDecision,
     RegimeMlPromotionEvidence,
@@ -17,7 +19,9 @@ from backend.app.algorithms.regime.ml.promotion_policy import (
 
 __all__ = [
     "REGIME_ML_PAPER_STABILITY_POLICY_VERSION",
+    "REGIME_ML_MAX_AUTOMATIC_PROMOTION_MODE",
     "REGIME_ML_PROMOTION_POLICY_VERSION",
+    "REGIME_ML_TRUSTED_BACKEND_EVIDENCE_SOURCES",
     "RegimeMlCandidateArtifact",
     "RegimeMlPaperStabilityEvidence",
     "RegimeMlPaperStabilityPolicy",

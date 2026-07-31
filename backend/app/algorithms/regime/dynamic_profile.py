@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from typing import Any
 
 
 PROFILE_VERSION = "regime_profile_matrix_v3_backend"
@@ -17,6 +18,8 @@ NO_ENTRY_PROFILE = {
     "minimumWinningScore": 1.0,
     "minimumIndependentFamilies": 99,
     "minimumNetExpectedEdge": 1.0,
+    "minimumNetExpectedEdgeBps": 100.0,
+    "maximumCostToEdgeRatio": 0.0,
     "maxSpreadPercent": 0.0,
     "orderType": "none",
     "entryTimeoutSeconds": 0,
@@ -264,6 +267,10 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
         **NO_ENTRY_PROFILE,
         "profileReason": "regime.profile.no_entry_extreme_volatility",
     },
+    "unknown": {
+        **NO_ENTRY_PROFILE,
+        "profileReason": "regime.profile.unknown_no_trade",
+    },
     "low_volatility_quiet": {
         "preferredStrategyFamilies": ("mean_reversion", "vwap", "structure"),
         "allowedStrategyFamilies": ("mean_reversion", "vwap", "reversal", "structure"),
@@ -344,22 +351,141 @@ REGIME_PROFILE_POLICIES: dict[str, dict] = {
 }
 
 
-def resolve_effective_regime_profile(settings: dict, confirmed_regime: str) -> dict:
+def resolve_effective_regime_profile(settings: dict, confirmed_regime: str, classification: Any | None = None, snapshot: Any | None = None) -> dict:
     effective = deepcopy(settings)
     policy = _policy_for_regime(confirmed_regime)
     reasons = [str(policy.get("profileReason") or "regime.profile.default")]
+    overlay_chain = ["regime_immutable_baseline"]
     _apply_profile_policy(effective, settings, policy)
+    overlay_chain.append("confirmed_regime_profile")
+    _apply_configured_regime_overlay(effective, settings, confirmed_regime, reasons)
+    for overlay_name, overlay in _dynamic_market_overlays(classification, snapshot):
+        _apply_bounded_overlay(effective, settings, overlay, overlay_name, reasons)
+        overlay_chain.append(overlay_name)
     effective["profileId"] = f"{confirmed_regime}:{PROFILE_VERSION}"
     effective["baselineSettingsVersion"] = str(settings.get("settingsVersion") or "regime_base_settings")
     effective["baselineProfileVersion"] = str(settings.get("profileVersion") or PROFILE_VERSION)
     effective["profileVersion"] = PROFILE_VERSION
     effective["profileReasons"] = reasons
     effective["overlayReasons"] = tuple(reasons)
+    effective["effectiveSettingsOrder"] = tuple(
+        (
+            *overlay_chain,
+            "regime_local_risk_reduction",
+            "shared_global_risk_reduction_or_rejection",
+        )
+    )
     effective["profilePolicy"] = _public_policy(policy)
     effective["finalValues"] = _final_values(effective)
     effective["riskOffPositionManagementAllowed"] = True
     _assert_profile_bounds(settings, effective)
     return effective
+
+
+def _apply_configured_regime_overlay(effective: dict, settings: dict, confirmed_regime: str, reasons: list[str]) -> None:
+    overlays = {}
+    dynamic_profiles = settings.get("dynamic_profiles") if isinstance(settings.get("dynamic_profiles"), dict) else settings.get("dynamicProfiles")
+    if isinstance(dynamic_profiles, dict):
+        overlays = dynamic_profiles.get("overlays") if isinstance(dynamic_profiles.get("overlays"), dict) else {}
+    overlay = overlays.get(confirmed_regime)
+    if isinstance(overlay, dict) and overlay:
+        _apply_bounded_overlay(effective, settings, overlay, "configured_regime_overlay", reasons)
+
+
+def _dynamic_market_overlays(classification: Any | None, snapshot: Any | None) -> tuple[tuple[str, dict], ...]:
+    axes = getattr(classification, "axes", None)
+    overlays: list[tuple[str, dict]] = []
+    volatility = str(getattr(axes, "volatility", "") or "")
+    liquidity = str(getattr(axes, "liquidity", "") or "")
+    session = str(getattr(axes, "session", "") or "")
+    event_risk = str(getattr(axes, "event_risk", "") or "")
+    if volatility in {"high", "extreme"}:
+        overlays.append(
+            (
+                "volatility_overlay",
+                {
+                    "baseRiskPercentCap": 0.05 if volatility == "extreme" else 0.08,
+                    "maxPositionPercentCap": 5.0 if volatility == "extreme" else 8.0,
+                    "maximumSlippageBps": 4.0 if volatility == "extreme" else 6.0,
+                    "minimumNetExpectedEdge": 0.35 if volatility == "extreme" else 0.28,
+                    "minimumNetExpectedEdgeBps": 35.0 if volatility == "extreme" else 28.0,
+                    "maximumCostToEdgeRatio": 0.45 if volatility == "extreme" else 0.55,
+                    "maximumHoldingBars": 15 if volatility == "extreme" else 25,
+                    "reasonCode": f"regime.overlay.volatility.{volatility}",
+                },
+            )
+        )
+    if liquidity in {"thin", "poor", "stress"}:
+        overlays.append(
+            (
+                "liquidity_overlay",
+                {
+                    "maxParticipationPercentCap": 0.005,
+                    "maximumSlippageBps": 3.0,
+                    "orderType": "limit",
+                    "minimumNetExpectedEdge": 0.35,
+                    "minimumNetExpectedEdgeBps": 35.0,
+                    "maximumCostToEdgeRatio": 0.45,
+                    "reasonCode": f"regime.overlay.liquidity.{liquidity}",
+                },
+            )
+        )
+    if session in {"open", "close", "unsupported"}:
+        overlays.append(
+            (
+                "session_overlay",
+                {
+                    "orderTimeToLiveSeconds": 30,
+                    "maximumHoldingBars": 12 if session == "close" else 20,
+                    "noNewEntries": session == "unsupported",
+                    "reasonCode": f"regime.overlay.session.{session}",
+                },
+            )
+        )
+    if event_risk in {"blackout", "elevated"}:
+        overlays.append(
+            (
+                "economic_event_overlay",
+                {
+                    "noNewEntries": event_risk == "blackout",
+                    "baseRiskPercentCap": 0.0 if event_risk == "blackout" else 0.04,
+                    "maxPositionPercentCap": 0.0 if event_risk == "blackout" else 4.0,
+                    "maximumHoldingBars": 0 if event_risk == "blackout" else 10,
+                    "reasonCode": f"regime.overlay.economic_event.{event_risk}",
+                },
+            )
+        )
+    return tuple(overlays)
+
+
+def _apply_bounded_overlay(effective: dict, settings: dict, overlay: dict, overlay_name: str, reasons: list[str]) -> None:
+    reason = str(overlay.get("reasonCode") or f"regime.overlay.{overlay_name}")
+    reasons.append(reason)
+    if overlay.get("noNewEntries"):
+        effective["noNewEntries"] = True
+        effective["baseRiskPercent"] = 0.0
+        effective["maxPositionPercent"] = 0.0
+        effective["maxParticipationPercent"] = 0.0
+    for field, target in (
+        ("baseRiskPercentCap", "baseRiskPercent"),
+        ("maxPositionPercentCap", "maxPositionPercent"),
+        ("maxParticipationPercentCap", "maxParticipationPercent"),
+        ("maximumSlippageBps", "maximumSlippageBps"),
+        ("maximumCostToEdgeRatio", "maximumCostToEdgeRatio"),
+    ):
+        if field in overlay:
+            effective[target] = min(float(effective.get(target, settings.get(target, 0.0))), float(overlay[field]), float(settings.get(target, overlay[field])))
+    if "minimumNetExpectedEdge" in overlay:
+        effective["minimumNetExpectedEdge"] = max(float(effective.get("minimumNetExpectedEdge", 0.0)), float(overlay["minimumNetExpectedEdge"]), float(settings.get("minimumNetExpectedEdge", 0.0)))
+    if "minimumNetExpectedEdgeBps" in overlay:
+        effective["minimumNetExpectedEdgeBps"] = max(float(effective.get("minimumNetExpectedEdgeBps", 0.0)), float(overlay["minimumNetExpectedEdgeBps"]), float(settings.get("minimumNetExpectedEdgeBps", 0.0)))
+    if "orderTimeToLiveSeconds" in overlay:
+        effective["orderTimeToLiveSeconds"] = min(int(effective.get("orderTimeToLiveSeconds", settings.get("orderTimeToLiveSeconds", 60))), int(overlay["orderTimeToLiveSeconds"]))
+    if "maximumHoldingBars" in overlay:
+        effective["maximumHoldingBars"] = min(int(effective.get("maximumHoldingBars", settings.get("maxHoldingBars", 1))), int(overlay["maximumHoldingBars"]))
+        effective["maxHoldingBars"] = min(int(effective.get("maxHoldingBars", settings.get("maxHoldingBars", 1))), effective["maximumHoldingBars"])
+    if "orderType" in overlay:
+        effective["orderType"] = str(overlay["orderType"])
 
 
 def _policy_for_regime(regime: str) -> dict:
@@ -412,6 +538,10 @@ def _apply_profile_policy(effective: dict, settings: dict, policy: dict) -> None
         float(settings.get("minimumNetExpectedEdge", settings.get("minimumSignalEdge", 0.0))),
         float(policy.get("minimumNetExpectedEdge", settings.get("minimumSignalEdge", 0.0))),
     )
+    effective["minimumNetExpectedEdgeBps"] = max(
+        float(settings.get("minimumNetExpectedEdgeBps", effective["minimumNetExpectedEdge"] * 100.0)),
+        float(policy.get("minimumNetExpectedEdgeBps", effective["minimumNetExpectedEdge"] * 100.0)),
+    )
     if policy.get("minimumIndependentFamilies") is not None:
         effective["minimumIndependentFamilies"] = max(int(settings["minimumIndependentFamilies"]), int(policy["minimumIndependentFamilies"]))
     _cap_float(effective, settings, "maxSpreadPercent", policy.get("maxSpreadPercentCap"))
@@ -436,7 +566,11 @@ def _apply_profile_policy(effective: dict, settings: dict, policy: dict) -> None
     effective["pyramidingEnabled"] = bool(effective.get("pyramidingEnabled", False) and policy.get("pyramidingEnabled", effective.get("pyramidingEnabled", False)))
     effective["maximumSlippageBps"] = min(float(settings.get("maximumSlippageBps", 0.0)), float(policy.get("slippageAllowanceBps", policy.get("maximumSlippageBps", settings.get("maximumSlippageBps", 0.0)))))
     effective["slippageAllowanceBps"] = effective["maximumSlippageBps"]
-    effective["maxExecutionCostToEdgeRatio"] = float(policy.get("maxExecutionCostToEdgeRatio", effective.get("maxExecutionCostToEdgeRatio", 0.35)))
+    effective["maximumCostToEdgeRatio"] = min(
+        float(settings.get("maximumCostToEdgeRatio", 0.0)),
+        float(policy.get("maximumCostToEdgeRatio", policy.get("maxExecutionCostToEdgeRatio", settings.get("maximumCostToEdgeRatio", 0.0)))),
+    )
+    effective["maxExecutionCostToEdgeRatio"] = effective["maximumCostToEdgeRatio"]
     if policy.get("eventBlackoutBeforeMinutes") is not None:
         effective["eventBlackoutBeforeMinutes"] = int(policy["eventBlackoutBeforeMinutes"])
     if policy.get("eventBlackoutAfterMinutes") is not None:
@@ -478,19 +612,26 @@ def _final_values(effective: dict) -> dict:
         "minimumWinningScore",
         "minimumSignalEdge",
         "minimumNetExpectedEdge",
+        "minimumNetExpectedEdgeBps",
+        "maximumCostToEdgeRatio",
+        "maxExecutionCostToEdgeRatio",
         "atrStopMultiplier",
         "takeProfitR",
         "maximumHoldingBars",
         "cooldownBars",
         "entryWindowEt",
+        "orderType",
+        "orderTimeToLiveSeconds",
         "maximumSlippageBps",
     )
     return {key: deepcopy(effective.get(key)) for key in keys}
 
 
 def _assert_profile_bounds(settings: dict, effective: dict) -> None:
-    for key in ("baseRiskPercent", "maxPositionPercent", "maxParticipationPercent", "maximumSlippageBps"):
+    for key in ("baseRiskPercent", "maxPositionPercent", "maxParticipationPercent", "maximumSlippageBps", "maximumCostToEdgeRatio"):
         if float(effective.get(key, 0.0)) > float(settings.get(key, 0.0)):
             raise ValueError(f"Regime dynamic profile exceeded baseline {key}")
+    if float(effective.get("minimumNetExpectedEdgeBps", 0.0)) < float(settings.get("minimumNetExpectedEdgeBps", 0.0)):
+        raise ValueError("Regime dynamic profile reduced baseline minimumNetExpectedEdgeBps")
     if bool(effective.get("pyramidingEnabled")) and not bool(settings.get("pyramidingEnabled")):
         raise ValueError("Regime dynamic profile cannot enable pyramiding beyond baseline")

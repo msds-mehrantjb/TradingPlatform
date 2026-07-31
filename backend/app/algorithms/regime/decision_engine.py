@@ -19,7 +19,7 @@ from backend.app.algorithms.regime.contracts import (
     RegimeMarketSnapshot,
 )
 from backend.app.algorithms.regime.dynamic_profile import resolve_effective_regime_profile
-from backend.app.algorithms.regime.family_aggregation import aggregate_family_scores
+from backend.app.algorithms.regime.family_aggregation import aggregate_directional_strategies, apply_confirmation_layer, apply_safety_layer
 from backend.app.algorithms.regime.hysteresis import confirm_regime_transition
 from backend.app.algorithms.regime.local_gates import estimate_entry_transaction_cost_bps, evaluate_regime_local_gates
 from backend.app.algorithms.regime.router import (
@@ -44,7 +44,7 @@ def calculate_regime_decision(
     classification = classify_market_regime(snapshot)
     risk_off_blockers = _immediate_risk_off_blockers(classification)
     state = confirm_regime_transition(classification, previous_state, validated_settings)
-    effective_profile = resolve_effective_regime_profile(validated_settings, state.confirmed_regime)
+    effective_profile = resolve_effective_regime_profile(validated_settings, state.confirmed_regime, classification, snapshot)
     if safety_blockers or risk_off_blockers:
         effective_profile = {**effective_profile, "noNewEntries": True}
     context_outputs = evaluate_regime_role("regime_context", snapshot, classification, settings=validated_settings)
@@ -59,11 +59,24 @@ def calculate_regime_decision(
     confirmation_outputs = evaluate_regime_role("confirmation", snapshot, classification, settings=validated_settings)
     adjusted_directional_outputs = apply_confirmation_modules(directional_outputs, confirmation_outputs, settings=validated_settings)
     outputs = (*pre_safety_outputs, *context_outputs, *adjusted_directional_outputs, *confirmation_outputs)
-    aggregation = aggregate_family_scores(adjusted_directional_outputs, contextual_profile)
-    local_blockers = evaluate_regime_local_gates(aggregation, classification, state, contextual_profile)
+    directional_aggregation = aggregate_directional_strategies(directional_outputs, contextual_profile, classification=routing_classification)
+    confirmation_aggregation = apply_confirmation_layer(
+        directional_aggregation,
+        confirmation_outputs,
+        context_outputs,
+        settings=contextual_profile,
+    )
+    local_blockers = evaluate_regime_local_gates(confirmation_aggregation, classification, state, contextual_profile)
     transaction_cost = estimate_entry_transaction_cost_bps(classification, contextual_profile)
     blockers = tuple(dict.fromkeys((*safety_blockers, *risk_off_blockers, *local_blockers)))
-    signal = aggregation["signal"] if not blockers else "Hold"
+    safety_aggregation = apply_safety_layer(
+        confirmation_aggregation,
+        safety_outputs=pre_safety_outputs,
+        blockers=blockers,
+        runtime_context=validated_settings,
+    )
+    aggregation = safety_aggregation
+    signal = str(aggregation["signal"])
     decision_id = _decision_id(snapshot.symbol, snapshot.latest.timestamp, classification.raw_regime)
     return RegimeDecision(
         algorithm_id=REGIME_ALGORITHM_ID,
@@ -99,6 +112,9 @@ def calculate_regime_decision(
                 "order_proposal",
             ),
             "familyAggregation": aggregation,
+            "directionalAggregation": directional_aggregation,
+            "confirmationLayer": confirmation_aggregation,
+            "safetyLayer": safety_aggregation,
             "skippedStrategies": skipped,
             "localGateTransactionCostEstimate": transaction_cost,
         },

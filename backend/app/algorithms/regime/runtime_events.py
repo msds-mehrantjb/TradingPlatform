@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 from backend.app.algorithms.regime.contracts import normalize_regime_runtime_mode
+from backend.app.algorithms.regime.exchange_calendar import exchange_session
 from backend.app.algorithms.regime.runtime_idempotency import deterministic_regime_event_id
 
 
@@ -48,6 +49,14 @@ class RegimeFinalisedBarEvent:
             raise ValueError("Regime finalised-bar events must reference a completed one-minute bar boundary")
         if not self.completed:
             raise ValueError("Regime finalised-bar events must be completed bars")
+        if published < completed_ts:
+            raise ValueError("Regime finalised-bar publication timestamp cannot precede the completed bar timestamp")
+        timeframe = str(self.market_payload.get("timeframe") or self.market_payload.get("timeFrame") or self.market_payload.get("time_frame") or "1Min")
+        if timeframe not in {"1Min", "1min", "1m", "1M"}:
+            raise ValueError("Regime finalised-bar events must use one-minute candles")
+        session = exchange_session(completed_ts.isoformat().replace("+00:00", "Z"))
+        if session.status == "outside_regular":
+            raise ValueError(f"Regime finalised-bar timestamp is outside the supported exchange session: {session.reason}")
         if self.data_manifest_hash and self.settings_version:
             object.__setattr__(
                 self,
@@ -66,7 +75,13 @@ class RegimeFinalisedBarEvent:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "RegimeFinalisedBarEvent":
-        market_payload = payload.get("marketData") if isinstance(payload.get("marketData"), dict) else payload.get("market_payload")
+        market_payload = (
+            payload.get("marketData")
+            if isinstance(payload.get("marketData"), dict)
+            else payload.get("marketPayload")
+            if isinstance(payload.get("marketPayload"), dict)
+            else payload.get("market_payload")
+        )
         if not isinstance(market_payload, dict):
             market_payload = {key: value for key, value in payload.items() if key not in _CONTROL_KEYS}
         timestamp = payload.get("completedBarTimestamp") or payload.get("completed_bar_timestamp") or payload.get("finalisedCandleTimestamp")
@@ -74,6 +89,7 @@ class RegimeFinalisedBarEvent:
             candles = market_payload.get("primaryCandles") or market_payload.get("candles") or []
             if candles:
                 timestamp = candles[-1].get("timestamp")
+        completed = _completed_flag(payload)
         return cls(
             algorithm_id="regime",
             algorithm_instance_id=str(payload.get("algorithmInstanceId") or payload.get("algorithm_instance_id") or "regime-default"),
@@ -86,7 +102,7 @@ class RegimeFinalisedBarEvent:
             data_manifest_hash=str(payload.get("dataManifestHash") or payload.get("data_manifest_hash") or "") or None,
             settings_version=str(payload.get("settingsVersion") or payload.get("settings_version") or "") or None,
             event_id=str(payload.get("eventId") or payload.get("event_id") or ""),
-            completed=bool(payload.get("completed", True)),
+            completed=completed,
             replay_recovery=bool(payload.get("replayRecovery") or payload.get("replay_recovery") or False),
         )
 
@@ -130,8 +146,12 @@ _CONTROL_KEYS = {
     "accountState",
     "accountSnapshot",
     "availableBuyingPower",
+    "availableRisk",
     "buyingPower",
+    "currentPosition",
+    "dailyPnl",
     "fills",
+    "globalRiskCapacityQuantity",
     "inventory",
     "inventorySnapshot",
     "orders",
@@ -178,6 +198,13 @@ def _aware(value: datetime) -> datetime:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _completed_flag(payload: dict[str, Any]) -> bool:
+    for key in ("completed", "isCompleted", "finalized", "finalised", "isFinalized", "isFinalised"):
+        if key in payload:
+            return bool(payload.get(key))
+    return True
 
 
 def _hash_payload(payload: dict[str, Any]) -> str:

@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta, time
 from typing import Any
 
+from backend.app.algorithms.regime.execution_cost_adapter import estimate_regime_execution_cost, evaluate_regime_execution_cost_gate
 from backend.app.algorithms.regime.exchange_calendar import exchange_session, parse_exchange_timestamp
 
 
@@ -69,9 +70,19 @@ def evaluate_regime_local_risk(
     strategy_id = str(context.get("strategyId") or context.get("strategy_id") or _selected_strategy_id(aggregation))
     family_id = str(context.get("familyId") or context.get("family_id") or _selected_family_id(aggregation))
     quantity = max(0, int(requested_quantity or 0))
+    side = str(context.get("side") or aggregation.get("signal") or "Buy")
+    position_effect = str(context.get("positionEffect") or context.get("position_effect") or ("enter_short" if side == "Sell" else "enter_long"))
 
     if not context.get("completedPrimaryCandle", context.get("completedBar", True)):
         blockers.append("regime.local_risk.completed_bar_required")
+    if context.get("requireAccountSnapshot", True) and (not account or str(account.get("sourceAuthority") or "").lower() in {"", "shared_backend_unavailable", "api", "frontend"}):
+        blockers.append("regime.local_risk.account_snapshot_unavailable")
+    if account.get("buyingPowerCurrent") is False or account.get("accountSnapshotFresh") is False:
+        blockers.append("regime.local_risk.account_snapshot_stale")
+    if context.get("requireInventory", True) and (not inventory or str(inventory.get("algorithmId") or "").lower() != "regime"):
+        blockers.append("regime.local_risk.inventory_snapshot_unavailable")
+    if inventory and str(inventory.get("symbol") or getattr(classification, "symbol", None) or settings.get("symbol") or "SPY").upper() != str(context.get("symbol") or getattr(classification, "symbol", None) or settings.get("symbol") or "SPY").upper():
+        blockers.append("regime.local_risk.inventory_symbol_mismatch")
     if settings.get("noNewEntries"):
         blockers.append("regime.local_gate.profile_no_new_entries")
     raw_regime = str(getattr(classification, "raw_regime", "") or "")
@@ -105,9 +116,19 @@ def evaluate_regime_local_risk(
         blockers.append("regime.local_risk.recovery_incomplete")
     if context.get("inventoryReconciled") is False or context.get("reconciliationRequired"):
         blockers.append("regime.local_risk.reconciliation_incomplete")
-    if open_position and not bool(settings.get("pyramidingEnabled", False)):
+    inventory_quantity = int(_number(inventory.get("quantity")) or 0)
+    open_order_quantity = int(_number(inventory.get("openOrderQuantity") or inventory.get("open_order_quantity")) or 0)
+    if open_order_quantity > 0 and position_effect in {"enter_long", "enter_short"}:
+        blockers.append("regime.local_risk.open_entry_order_exists")
+    if (open_position or inventory_quantity != 0) and not bool(settings.get("pyramidingEnabled", False)) and position_effect in {"enter_long", "enter_short"}:
         blockers.append("regime.local_risk.existing_position")
         blockers.append("regime.local_risk.pyramiding_disabled")
+    if (open_position or inventory_quantity != 0) and int(settings.get("maxOpenRegimePositions", 1)) <= 1 and position_effect in {"enter_long", "enter_short"}:
+        blockers.append("regime.local_risk.max_open_regime_positions")
+    if side == "Sell" and position_effect == "enter_short" and not bool(settings.get("shortEntriesEnabled") or settings.get("allowShortEntries")):
+        blockers.append("regime.local_risk.short_entries_disabled")
+    if side == "Sell" and position_effect in {"exit_long", "close_long"} and quantity > max(0, inventory_quantity):
+        blockers.append("regime.local_risk.sell_quantity_exceeds_regime_long")
     if context.get("duplicateProposal") or context.get("duplicateOrderIntent"):
         blockers.append("regime.local_risk.duplicate_proposal")
     if int(_number(_record(context.get("cooldownState")).get("remainingBars")) or 0) > 0:
@@ -118,7 +139,7 @@ def evaluate_regime_local_risk(
         blockers.append("regime.local_risk.per_strategy_daily_limit")
     if _daily_count(daily, "familyTradeCounts", family_id) >= _family_limit(settings, family_id):
         blockers.append("regime.local_risk.per_family_daily_limit")
-    if int(_number(daily.get("tradeCount") or daily.get("totalTrades")) or 0) >= int(settings.get("maxTradesPerDay", 0)):
+    if int(_number(daily.get("entryCount") or daily.get("tradeCount") or daily.get("totalTrades")) or 0) >= int(settings.get("maxEntriesPerDay", settings.get("maxTradesPerDay", 0))):
         blockers.append("regime.local_risk.total_daily_trade_limit")
     if int(_number(daily.get("consecutiveLosses")) or 0) >= int(settings.get("maxConsecutiveLosses", 0)):
         blockers.append("regime.local_risk.consecutive_loss_breaker")
@@ -132,7 +153,15 @@ def evaluate_regime_local_risk(
         blockers.append("regime.local_gate.minimum_winning_score")
     if float(_number(aggregation.get("winningEdge")) or 0.0) < float(settings.get("minimumSignalEdge", 0.0)):
         blockers.append("regime.local_gate.minimum_signal_edge")
-    if float(_number(aggregation.get("winningEdge")) or 0.0) < float(settings.get("minimumNetExpectedEdge", settings.get("minimumSignalEdge", 0.0))):
+    gross_edge = _gross_edge_bps(context, aggregation, classification)
+    expected_gross_edge_bps = _number(
+        aggregation.get("expectedGrossEdgeBps")
+        or context.get("estimatedGrossEdgeBps")
+        or context.get("expectedGrossEdgeBps")
+        or getattr(classification, "features", {}).get("expectedGrossEdgeBps")
+    )
+    minimum_net_expected_edge_ratio = float(settings.get("minimumNetExpectedEdge", settings.get("minimumSignalEdge", 0.0)))
+    if expected_gross_edge_bps is None or expected_gross_edge_bps < minimum_net_expected_edge_ratio * 100.0:
         blockers.append("regime.local_gate.minimum_net_expected_edge")
     if float(_number(aggregation.get("abstentionRate")) or 0.0) > float(settings.get("maximumAbstentionRate", 1.0)):
         blockers.append("regime.local_gate.maximum_abstention_rate")
@@ -151,7 +180,8 @@ def evaluate_regime_local_risk(
         quantity = _reduce_quantity(quantity, max_participation_quantity, "regime.local_risk.reduce.maximum_participation", reductions)
     buying_power = _number(account.get("availableBuyingPower") or account.get("buyingPower"))
     if buying_power is not None:
-        quantity = _reduce_quantity(quantity, int(max(0.0, buying_power / max(entry_price, 0.01))), "regime.local_risk.reduce.buying_power", reductions)
+        reserved_cash = max(0.0, _number(inventory.get("reservedCash") or inventory.get("reserved_cash")) or 0.0)
+        quantity = _reduce_quantity(quantity, int(max(0.0, (buying_power - reserved_cash) / max(entry_price, 0.01))), "regime.local_risk.reduce.buying_power", reductions)
     elif context.get("requireBuyingPower", True):
         blockers.append("regime.local_risk.buying_power_unavailable")
 
@@ -166,13 +196,26 @@ def evaluate_regime_local_risk(
     if requested_quantity <= 0:
         blockers.append("regime.local_risk.requested_quantity_required")
 
-    cost = estimate_round_trip_transaction_cost_bps(classification, settings, context)
+    cost_estimate = estimate_regime_execution_cost(
+        symbol=str(context.get("symbol") or getattr(classification, "symbol", None) or settings.get("symbol") or "SPY"),
+        side=side,
+        order_type=str(context.get("orderType") or settings.get("orderType") or "limit"),
+        entry_price=entry_price,
+        quantity=max(1, int(requested_quantity or quantity or 1)),
+        expected_gross_edge_bps=gross_edge,
+        classification=classification,
+        settings=settings,
+        runtime_context=context,
+        evaluated_at=evaluated,
+    )
+    cost_gate = evaluate_regime_execution_cost_gate(cost_estimate, settings)
+    blockers.extend(str(reason) for reason in cost_gate["reasonCodes"] if reason != "regime.execution_cost.gate_passed")
+    cost = _legacy_cost_components(cost_estimate.as_dict())
     max_cost_bps = _number(settings.get("maximumTransactionCostBps") or settings.get("maximumAcceptableTransactionCostBps"))
-    if max_cost_bps is not None and cost["totalCostBps"] > max_cost_bps:
+    if max_cost_bps is not None and cost_estimate.total_cost_bps > max_cost_bps:
         blockers.append("regime.local_risk.transaction_cost_too_high")
-    gross_edge = _gross_edge_bps(context, aggregation, classification)
     safety_margin = max(0.0, _number(context.get("safetyMarginBps") or settings.get("safetyMarginBps")) or 0.0)
-    net_edge = gross_edge - cost["totalCostBps"] - safety_margin
+    net_edge = cost_estimate.expected_net_edge_bps - safety_margin
     minimum_edge = _minimum_net_edge_bps(settings)
     if net_edge < minimum_edge:
         blockers.append("regime.local_risk.minimum_expected_net_edge")
@@ -211,6 +254,8 @@ def evaluate_regime_local_risk(
         details={
             "localRiskVersion": REGIME_LOCAL_RISK_VERSION,
             "costComponentsBps": cost,
+            "executionCostEstimate": cost_estimate.as_dict(),
+            "executionCostGate": cost_gate,
             "minimumNetExpectedEdgeBps": minimum_edge,
             "safetyMarginBps": safety_margin,
             "strategyId": strategy_id,
@@ -237,34 +282,93 @@ def evaluate_regime_local_gates(
         classification=classification,
         state=state,
         settings=settings,
-        runtime_context={**context, "requireBuyingPower": False, "requireQuote": bool(context.get("quoteFreshness") or context.get("quote"))},
+        runtime_context={
+            **context,
+            "requireBuyingPower": False,
+            "requireAccountSnapshot": False,
+            "requireInventory": False,
+            "requireQuote": bool(context.get("quoteFreshness") or context.get("quote")),
+        },
     )
-    return result.blockers
+    blockers = list(result.blockers)
+    blockers.extend(_local_gate_compatibility_codes(result, settings, context))
+    return tuple(dict.fromkeys(blockers))
 
 
 def estimate_entry_transaction_cost_bps(classification, settings: dict, runtime_context: dict[str, Any] | None = None) -> dict[str, float]:
-    return estimate_round_trip_transaction_cost_bps(classification, settings, runtime_context)
+    context = runtime_context or {}
+    estimate = estimate_regime_execution_cost(
+        symbol=str(context.get("symbol") or settings.get("symbol") or "SPY"),
+        side=str(context.get("side") or "Buy"),
+        order_type=str(context.get("orderType") or settings.get("orderType") or "limit"),
+        entry_price=max(0.01, _number(context.get("entryPrice") or context.get("limitPrice") or getattr(classification, "features", {}).get("close")) or 100.0),
+        quantity=max(1, int(_number(context.get("quantity") or context.get("requestedQuantity")) or 1)),
+        expected_gross_edge_bps=max(0.0, _number(context.get("expectedGrossEdgeBps")) or _number(context.get("estimatedGrossEdgeBps")) or 0.0),
+        classification=classification,
+        settings=settings,
+        runtime_context={**context, "conservativeCostFallbackApproved": True},
+    )
+    return _legacy_cost_components(estimate.as_dict())
 
 
 def estimate_round_trip_transaction_cost_bps(classification, settings: dict, runtime_context: dict[str, Any] | None = None) -> dict[str, float]:
     context = runtime_context or {}
-    liquidity = _record(getattr(classification, "evidence", {}).get("liquidityEvidence"))
-    spread_bps = _number(context.get("spreadBps") or liquidity.get("spreadBps") or getattr(classification, "features", {}).get("spreadBps")) or 0.0
-    entry_half_spread_bps = max(0.0, _number(context.get("entryHalfSpreadBps")) or spread_bps / 2)
-    exit_half_spread_bps = max(0.0, _number(context.get("exitHalfSpreadBps")) or spread_bps / 2)
-    entry_slippage_bps = max(0.0, _number(context.get("expectedEntrySlippageBps") or context.get("expectedSlippageBps") or settings.get("maximumSlippageBps")) or 0.0)
-    exit_slippage_bps = max(0.0, _number(context.get("expectedExitSlippageBps") or context.get("expectedSlippageBps") or settings.get("maximumSlippageBps")) or 0.0)
-    fees_bps = max(0.0, _number(context.get("feesBps") or settings.get("estimatedFeesBps")) or 0.0)
-    adverse_selection_bps = max(0.0, _number(context.get("adverseSelectionBufferBps") or settings.get("adverseSelectionBufferBps")) or 0.0)
-    return {
-        "entryHalfSpreadBps": entry_half_spread_bps,
-        "exitHalfSpreadBps": exit_half_spread_bps,
-        "expectedEntrySlippageBps": entry_slippage_bps,
-        "expectedExitSlippageBps": exit_slippage_bps,
-        "feesBps": fees_bps,
-        "adverseSelectionBufferBps": adverse_selection_bps,
-        "totalCostBps": entry_half_spread_bps + exit_half_spread_bps + entry_slippage_bps + exit_slippage_bps + fees_bps + adverse_selection_bps,
+    estimate = estimate_regime_execution_cost(
+        symbol=str(context.get("symbol") or settings.get("symbol") or "SPY"),
+        side=str(context.get("side") or "Buy"),
+        order_type=str(context.get("orderType") or settings.get("orderType") or "limit"),
+        entry_price=max(0.01, _number(context.get("entryPrice") or context.get("limitPrice") or getattr(classification, "features", {}).get("close")) or 100.0),
+        quantity=max(1, int(_number(context.get("quantity") or context.get("requestedQuantity")) or 1)),
+        expected_gross_edge_bps=max(0.0, _number(context.get("expectedGrossEdgeBps")) or _number(context.get("estimatedGrossEdgeBps")) or 0.0),
+        classification=classification,
+        settings=settings,
+        runtime_context={**context, "conservativeCostFallbackApproved": True},
+    )
+    return _legacy_cost_components(estimate.as_dict(), round_trip=True)
+
+
+def _local_gate_compatibility_codes(result: RegimeLocalRiskResult, settings: dict[str, Any], context: dict[str, Any]) -> tuple[str, ...]:
+    aliases = {
+        "regime.local_risk.bid_ask_required": "regime.local_gate.data_completeness",
+        "regime.local_risk.completed_bar_stale": "regime.local_gate.stale_candle",
+        "regime.local_risk.quote_stale": "regime.local_gate.stale_quote",
+        "regime.local_risk.liquidity_blocked": "regime.local_gate.liquidity_permission",
+        "regime.local_risk.session_permission": "regime.local_gate.session_permission",
+        "regime.local_risk.event_blackout": "regime.local_gate.event_blackout",
+        "regime.local_risk.daily_loss_limit": "regime.local_gate.daily_loss_limit",
+        "regime.local_risk.consecutive_loss_breaker": "regime.local_gate.consecutive_loss_limit",
+        "regime.local_risk.total_daily_trade_limit": "regime.local_gate.maximum_trades",
+        "regime.local_risk.cooldown": "regime.local_gate.strategy_cooldown",
+        "regime.local_risk.family_cooldown": "regime.local_gate.family_cooldown",
+        "regime.local_risk.existing_position": "regime.local_gate.existing_position",
+        "regime.local_risk.pyramiding_disabled": "regime.local_gate.pyramiding_disabled",
+        "regime.local_risk.minimum_expected_net_edge": "regime.local_gate.minimum_expected_net_edge",
+        "regime.local_risk.decision_age": "regime.local_gate.decision_age",
+        "regime.local_risk.order_ttl": "regime.local_gate.order_ttl",
+        "regime.local_risk.entry_cutoff": "regime.local_gate.entry_cutoff",
+        "regime.local_risk.duplicate_proposal": "regime.local_gate.duplicate_proposal",
     }
+    codes = [aliases[blocker] for blocker in result.blockers if blocker in aliases]
+    reduction_aliases = {
+        "regime.local_risk.reduce.maximum_shares": "regime.local_gate.maximum_shares",
+        "regime.local_risk.reduce.maximum_order_notional": "regime.local_gate.maximum_notional",
+        "regime.local_risk.reduce.maximum_position_notional": "regime.local_gate.maximum_notional",
+        "regime.local_risk.reduce.maximum_participation": "regime.local_gate.maximum_participation",
+    }
+    for reduction in result.reductions:
+        reason = str(reduction.get("reasonCode") or "")
+        if reason in reduction_aliases:
+            codes.append(reduction_aliases[reason])
+    halt = _record(context.get("haltLuldCircuitBreaker"))
+    if halt.get("newEntriesBlocked") or str(halt.get("haltState") or "").lower() in {"halted", "active"} or str(halt.get("circuitBreakerState") or "").lower() == "active":
+        codes.append("regime.local_gate.halt_luld_circuit_breaker")
+    if _number(context.get("proposedNotional")) is not None and _number(context.get("proposedNotional")) > float(settings.get("maxNotionalDollars", 0.0)):
+        codes.append("regime.local_gate.maximum_notional")
+    if _number(context.get("proposedShares")) is not None and _number(context.get("proposedShares")) > float(settings.get("maxAllowedShares", 0.0)):
+        codes.append("regime.local_gate.maximum_shares")
+    if _number(context.get("proposedParticipationRate")) is not None and _number(context.get("proposedParticipationRate")) > float(settings.get("maxParticipationPercent", 0.0)):
+        codes.append("regime.local_gate.maximum_participation")
+    return tuple(codes)
 
 
 def _merged_context(settings: dict, runtime_context: dict[str, Any] | None) -> dict[str, Any]:
@@ -345,12 +449,43 @@ def _spread_percent(liquidity: dict[str, Any], quote: dict[str, Any]) -> float |
     return None if bps is None else bps / 10_000
 
 
+def _legacy_cost_components(estimate: dict[str, Any], *, round_trip: bool = False) -> dict[str, float]:
+    spread = float(estimate.get("expectedSpreadCostBps") or 0.0)
+    slippage = float(estimate.get("expectedSlippageBps") or 0.0)
+    fees = float(estimate.get("expectedFeesBps") or 0.0) + float(estimate.get("expectedRegulatoryFeesBps") or 0.0)
+    adverse = float(estimate.get("adverseSelectionAllowanceBps") or 0.0)
+    market_impact = float(estimate.get("expectedMarketImpactBps") or 0.0)
+    uncertainty = float(estimate.get("uncertaintyBufferBps") or 0.0)
+    total = float(estimate.get("totalCostBps") or spread + slippage + fees + adverse + market_impact + uncertainty)
+    if round_trip:
+        return {
+            "entryHalfSpreadBps": spread,
+            "exitHalfSpreadBps": 0.0,
+            "expectedEntrySlippageBps": slippage,
+            "expectedExitSlippageBps": 0.0,
+            "feesBps": fees,
+            "adverseSelectionBps": adverse,
+            "marketImpactBps": market_impact,
+            "uncertaintyBufferBps": uncertainty,
+            "totalCostBps": total,
+        }
+    return {
+        "halfSpreadBps": spread,
+        "expectedSlippageBps": slippage,
+        "feesBps": fees,
+        "adverseSelectionBps": adverse,
+        "marketImpactBps": market_impact,
+        "uncertaintyBufferBps": uncertainty,
+        "totalCostBps": total,
+    }
+
+
 def _gross_edge_bps(context: dict[str, Any], aggregation: dict[str, object], classification) -> float:
     explicit = _number(context.get("estimatedGrossEdgeBps") or context.get("expectedGrossEdgeBps") or getattr(classification, "features", {}).get("expectedGrossEdgeBps"))
     if explicit is not None:
         return explicit
-    edge = _number(aggregation.get("winningEdge"))
-    return max(0.0, edge or 0.0) * 100.0
+    aggregation_edge = _number(aggregation.get("expectedGrossEdgeBps"))
+    return max(0.0, aggregation_edge or 0.0)
 
 
 def _minimum_net_edge_bps(settings: dict[str, Any]) -> float:

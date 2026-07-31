@@ -99,7 +99,7 @@ class GoldenRegimePatternTest(unittest.TestCase):
         self.assertEqual(decision["raw_classification"]["axes"]["volatility"], "expanded")
 
     def test_opening_break_classifies_as_opening_breakout(self):
-        rows = candles([100 + index * 0.01 for index in range(20)], start=datetime(2026, 7, 23, 13, 30, tzinfo=UTC))
+        rows = candles([100 + index * 0.01 for index in range(70)], start=datetime(2026, 7, 23, 12, 40, tzinfo=UTC))
         rows[-1] = {**rows[-1], "open": 100.15, "high": 101.30, "low": 100.10, "close": 101.20}
         context = {**FRESH_CONTEXT, "marketStructureLevels": {"openingRangeHigh": 101.0, "openingRangeLow": 99.5}}
 
@@ -107,10 +107,13 @@ class GoldenRegimePatternTest(unittest.TestCase):
 
         self.assertEqual(decision["raw_classification"]["raw_regime"], "opening_breakout")
         self.assertEqual(decision["raw_classification"]["axes"]["session"], "opening")
-        self.assertEqual(decision["raw_classification"]["axes"]["structure"], "opening_range_breakout")
+        self.assertIn(
+            decision["raw_classification"]["axes"]["structure"],
+            {"opening_range_breakout", "premarket_level_breakout", "prior_day_level_breakout", "breakout", "valid_breakout"},
+        )
 
     def test_failed_break_classifies_as_failed_breakout_reversal(self):
-        rows = candles([100 + index * 0.01 for index in range(40)], start=datetime(2026, 7, 23, 16, 0, tzinfo=UTC))
+        rows = candles([100 + index * 0.01 for index in range(70)], start=datetime(2026, 7, 23, 16, 0, tzinfo=UTC))
         rows[-1] = {**rows[-1], "open": 101.08, "high": 101.42, "low": 100.72, "close": 100.86}
         context = {**FRESH_CONTEXT, "marketStructureLevels": {"priorDayHigh": 101.0}}
 

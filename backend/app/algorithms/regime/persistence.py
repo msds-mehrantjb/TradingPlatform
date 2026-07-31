@@ -21,9 +21,18 @@ from backend.app.algorithms.regime.runtime_idempotency import REGIME_RUNTIME_STA
 from backend.app.config import get_settings
 from backend.app.database import _sqlite_path
 
-REGIME_PERSISTENCE_MIGRATION_VERSION = "regime_persistence_step2_005"
+REGIME_PERSISTENCE_MIGRATION_VERSION = "regime_persistence_phase21_rollout_001"
 REGIME_LEGACY_MIGRATION_VERSION = "regime_persistence_step2_003"
 REGIME_ALGORITHM_ID = "regime"
+REGIME_ML_TRUSTED_BACKEND_EVIDENCE_SOURCES = frozenset(
+    {
+        "backend_worker",
+        "regime_backtest_worker",
+        "regime_replay_worker",
+        "regime_paper_stability_worker",
+        "regime_ml_promotion_worker",
+    }
+)
 REGIME_OWNED_TABLES = (
     "regime_settings_versions",
     "regime_active_settings",
@@ -49,6 +58,7 @@ REGIME_OWNED_TABLES = (
     "regime_execution_outbox",
     "regime_orders",
     "regime_fills",
+    "regime_hypothetical_fills",
     "regime_positions",
     "regime_trades",
     "regime_reconciliation_events",
@@ -58,6 +68,13 @@ REGIME_OWNED_TABLES = (
     "regime_rollout_evidence",
     "regime_ml_predictions",
     "regime_ml_artifacts",
+    "regime_runtime_state",
+    "regime_bar_processing",
+    "regime_inventory_events",
+    "regime_inventory_snapshots",
+    "regime_daily_risk_state",
+    "regime_reconciliation_runs",
+    "regime_runtime_alerts",
 )
 REGIME_SHARED_ATTRIBUTED_TABLES = (
     "global_gate_evaluations",
@@ -90,17 +107,25 @@ REGIME_MUTABLE_STATE_TABLES = (
     "regime_runtime_checkpoints",
     "regime_hysteresis_state",
     "regime_daily_counters",
+    "regime_daily_risk_state",
     "regime_strategy_performance",
     "regime_positions",
+    "regime_runtime_state",
+    "regime_inventory_snapshots",
 )
 REGIME_PROCESSING_STATUS_TABLES = (
     "regime_runtime_commands",
     "regime_runtime_events",
+    "regime_bar_processing",
     "regime_execution_outbox",
     "regime_orders",
     "regime_fills",
+    "regime_hypothetical_fills",
+    "regime_inventory_events",
     "regime_reconciliation_events",
+    "regime_reconciliation_runs",
     "regime_backtest_jobs",
+    "regime_runtime_alerts",
 )
 SECRET_KEY_PARTS = ("secret", "api_key", "apikey", "token", "password", "authorization", "alpaca_key")
 
@@ -134,6 +159,22 @@ def migrate_regime_sqlite_database(path: str | Path) -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_regime_decisions_unique_decision
             ON regime_decisions(algorithm_instance_id, account_id, runtime_mode, symbol, decision_id)
             WHERE decision_id IS NOT NULL AND decision_id <> ''
+            """
+        )
+        _create_unique_index_if_possible(conn,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_regime_decisions_unique_finalized_bar
+            ON regime_decisions(algorithm_instance_id, account_id, runtime_mode, symbol, data_timestamp, algorithm_version, settings_version)
+            WHERE data_timestamp IS NOT NULL AND data_timestamp <> ''
+            """
+        )
+        _create_unique_index_if_possible(conn,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_regime_order_intents_unique_entry_bar
+            ON regime_order_intents(algorithm_instance_id, account_id, runtime_mode, symbol, data_timestamp, algorithm_version, settings_version)
+            WHERE order_intent_id LIKE 'regime-intent-%'
+              AND data_timestamp IS NOT NULL
+              AND data_timestamp <> ''
             """
         )
         _create_unique_index_if_possible(conn,
@@ -195,6 +236,24 @@ def migrate_regime_sqlite_database(path: str | Path) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_regime_runtime_checkpoints_event_status
             ON regime_runtime_checkpoints(decision_id, processing_status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_regime_inventory_events_fill_trace
+            ON regime_inventory_events(algorithm_instance_id, account_id, runtime_mode, symbol, broker_order_id, trade_id, order_intent_id, processing_status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_regime_inventory_snapshots_current
+            ON regime_inventory_snapshots(algorithm_instance_id, account_id, runtime_mode, symbol, sequence_version)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_regime_reconciliation_runs_status
+            ON regime_reconciliation_runs(algorithm_instance_id, account_id, runtime_mode, symbol, processing_status, event_timestamp)
             """
         )
         conn.execute(
@@ -342,6 +401,37 @@ class RegimeSqliteRepository:
             ).fetchone()
             if duplicate:
                 return {"recorded": False, "reason": "duplicate_decision", "decisionId": common["decision_id"], "tableCounts": counts}
+            duplicate_bar = conn.execute(
+                """
+                SELECT decision_id
+                FROM regime_decisions
+                WHERE algorithm_id = 'regime'
+                  AND algorithm_instance_id = ?
+                  AND account_id = ?
+                  AND runtime_mode = ?
+                  AND symbol = ?
+                  AND data_timestamp = ?
+                  AND algorithm_version = ?
+                  AND settings_version = ?
+                LIMIT 1
+                """,
+                (
+                    common["algorithm_instance_id"],
+                    common["account_id"],
+                    common["runtime_mode"],
+                    common["symbol"],
+                    common["data_timestamp"],
+                    common["algorithm_version"],
+                    common["settings_version"],
+                ),
+            ).fetchone()
+            if duplicate_bar:
+                return {
+                    "recorded": False,
+                    "reason": "duplicate_finalized_bar_decision",
+                    "decisionId": str(duplicate_bar["decision_id"]),
+                    "tableCounts": counts,
+                }
             self._insert(conn, "regime_decisions", common, "decision", snapshot)
             counts["regime_decisions"] += 1
             self._insert(conn, "regime_classifications", common, "classification", _first_record(regime, decision_snapshot, "rawClassification", "rawRuleRegime"))
@@ -413,12 +503,20 @@ class RegimeSqliteRepository:
                 intent_common = {**common, "order_id": str(order_intent.get("idempotencyKey") or common["order_id"] or "")}
                 self._insert(conn, "regime_order_intents", intent_common, "order-intent", order_intent)
                 counts["regime_order_intents"] += 1
-                self._insert(conn, "regime_execution_outbox", intent_common, "execution-outbox", {"processingStatus": "pending", "orderIntent": order_intent}, processing_status="pending")
+                gate = _record(regime.get("globalGateOutcome") or decision_snapshot.get("globalGateOutcome"))
+                if gate:
+                    self._insert(conn, "global_gate_evaluations", common, "global-gate", gate)
+                    counts["global_gate_evaluations"] += 1
+                self._insert_execution_outbox_in_transaction(conn, intent_common, {**order_intent, "globalRiskApproval": gate})
                 counts["regime_execution_outbox"] += 1
-            gate = _record(regime.get("globalGateOutcome") or decision_snapshot.get("globalGateOutcome"))
-            if gate:
-                self._insert(conn, "global_gate_evaluations", common, "global-gate", gate)
-                counts["global_gate_evaluations"] += 1
+            else:
+                gate = _record(regime.get("globalGateOutcome") or decision_snapshot.get("globalGateOutcome"))
+                if gate:
+                    self._insert(conn, "global_gate_evaluations", common, "global-gate", gate)
+                    counts["global_gate_evaluations"] += 1
+            for index, hypothetical in enumerate(_list(regime.get("hypotheticalFills") or decision_snapshot.get("hypotheticalFills"))):
+                self._insert(conn, "regime_hypothetical_fills", common, f"hypothetical-fill-{index}", hypothetical, processing_status="hypothetical")
+                counts["regime_hypothetical_fills"] += 1
             broker = _record(regime.get("brokerReconciliationResult") or decision_snapshot.get("brokerReconciliationResult"))
             if broker:
                 self._insert(conn, "broker_orders", common, "broker-reconciliation", broker)
@@ -434,7 +532,9 @@ class RegimeSqliteRepository:
             next_state = _record(snapshot.get("nextRuntimeState") or regime.get("nextRuntimeState") or decision_snapshot.get("nextRuntimeState"))
             if next_state:
                 self._insert(conn, "regime_runtime_checkpoints", common, "runtime-state", next_state, sequence_version=_sequence_version(next_state))
+                self._insert(conn, "regime_runtime_state", common, "runtime-state", next_state, sequence_version=_sequence_version(next_state))
                 counts["regime_runtime_checkpoints"] += 1
+                counts["regime_runtime_state"] += 1
         return {"recorded": True, "decisionId": common["decision_id"], "tableCounts": counts}
 
     def record_stateful_bar_result(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -610,7 +710,19 @@ class RegimeSqliteRepository:
         artifact_id = str(evidence.get("artifact_id") or evidence.get("artifactId") or "")
         if not artifact_id:
             return {"recorded": False, "reason": "missing_artifact_id"}
-        payload = {**evidence, "trusted_backend_record": True}
+        trusted, reason = _validate_regime_ml_backend_evidence_source(evidence)
+        if not trusted:
+            return {"recorded": False, "reason": reason, "artifactId": artifact_id}
+        payload = {
+            **evidence,
+            "trusted_backend_record": True,
+            "backend_evidence_source": str(evidence.get("backend_evidence_source") or evidence.get("backendEvidenceSource") or evidence.get("source") or ""),
+            "authority": "regime_backend_recorded_ml_evidence",
+            "maximumAutomaticPromotionMode": "confirm_only",
+            "mayCreateDirection": False,
+            "mayIncreaseQuantity": False,
+            "mayLoosenGate": False,
+        }
         common = _common_metadata(
             {},
             {
@@ -626,6 +738,87 @@ class RegimeSqliteRepository:
             self._insert(conn, "regime_ml_artifacts", common, f"promotion-evidence-{artifact_id}", payload)
             self._insert(conn, "regime_rollout_evidence", common, f"promotion-evidence-{artifact_id}", payload)
         return {"recorded": True, "artifactId": artifact_id}
+
+    def record_regime_rollout_promotion_evidence(self, identity: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+        source = str(evidence.get("backendEvidenceSource") or evidence.get("backend_evidence_source") or evidence.get("source") or "")
+        if source not in {
+            "regime_backend_rollout_worker",
+            "regime_replay_worker",
+            "regime_backtest_worker",
+            "regime_paper_stability_worker",
+            "regime_runtime_supervisor",
+        }:
+            return {"recorded": False, "reason": "regime.rollout.frontend_or_untrusted_evidence_rejected"}
+        evidence_id = str(evidence.get("evidenceId") or evidence.get("evidence_id") or evidence.get("artifactId") or evidence.get("artifact_id") or "")
+        if not evidence_id:
+            evidence_id = _stable_snapshot_key(json.dumps(evidence, sort_keys=True, default=str))
+        payload = {
+            **evidence,
+            "algorithmId": REGIME_ALGORITHM_ID,
+            "evidenceId": evidence_id,
+            "trustedBackendRecord": True,
+            "backendEvidenceSource": source,
+            "liveTradingEnabled": False,
+            "recordedAt": evidence.get("recordedAt") or _utc_now(),
+        }
+        common = _common_metadata(
+            {},
+            {
+                **identity,
+                **payload,
+                "decisionId": f"regime-rollout-evidence:{evidence_id}",
+                "timestamp": payload["recordedAt"],
+            },
+            {},
+        )
+        _validate_common_metadata(common)
+        with self.connect() as conn:
+            self._insert(conn, "regime_rollout_evidence", common, f"paper-promotion-evidence-{evidence_id}", payload)
+        return {"recorded": True, "evidenceId": evidence_id}
+
+    def read_regime_rollout_promotion_evidence(self, identity: dict[str, Any]) -> dict[str, Any]:
+        common = _common_metadata({}, identity, identity)
+        _validate_common_metadata(common)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT payload_json
+                FROM regime_rollout_evidence
+                WHERE algorithm_id = 'regime'
+                  AND algorithm_instance_id = ?
+                  AND account_id = ?
+                  AND runtime_mode = ?
+                  AND symbol = ?
+                ORDER BY rowid ASC
+                """,
+                (
+                    common["algorithm_instance_id"],
+                    common["account_id"],
+                    common["runtime_mode"],
+                    common["symbol"],
+                ),
+            ).fetchall()
+        aggregate: dict[str, Any] = {
+            "algorithmId": REGIME_ALGORITHM_ID,
+            "persistedEvidenceIds": set(),
+            "evidenceRecords": [],
+        }
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            if not isinstance(payload, dict) or payload.get("trustedBackendRecord") is not True:
+                continue
+            aggregate["evidenceRecords"].append(payload)
+            evidence_id = str(payload.get("evidenceId") or "")
+            if evidence_id:
+                aggregate["persistedEvidenceIds"].add(evidence_id)
+            for key, value in payload.items():
+                if isinstance(value, bool) and value:
+                    aggregate[key] = True
+                    aggregate["persistedEvidenceIds"].add(key)
+                elif isinstance(value, int) and value and key.endswith(("Alerts", "Mismatches", "Orders")):
+                    aggregate[key] = int(aggregate.get(key) or 0) + int(value)
+        aggregate["persistedEvidenceIds"] = tuple(sorted(aggregate["persistedEvidenceIds"]))
+        return aggregate
 
     def insert_order_intent(self, intent: dict[str, Any]) -> dict[str, Any]:
         common = _common_metadata({}, intent, intent)
@@ -655,6 +848,38 @@ class RegimeSqliteRepository:
             ).fetchone()
             if duplicate:
                 return {"inserted": False, "reason": "duplicate_order_intent", "orderIntentId": order_intent_id}
+            if str(order_intent_id).startswith("regime-intent-"):
+                duplicate_entry_bar = conn.execute(
+                    """
+                    SELECT order_intent_id
+                    FROM regime_order_intents
+                    WHERE algorithm_id = 'regime'
+                      AND algorithm_instance_id = ?
+                      AND account_id = ?
+                      AND runtime_mode = ?
+                      AND symbol = ?
+                      AND data_timestamp = ?
+                      AND algorithm_version = ?
+                      AND settings_version = ?
+                      AND order_intent_id LIKE 'regime-intent-%'
+                    LIMIT 1
+                    """,
+                    (
+                        common["algorithm_instance_id"],
+                        common["account_id"],
+                        common["runtime_mode"],
+                        common["symbol"],
+                        common["data_timestamp"],
+                        common["algorithm_version"],
+                        common["settings_version"],
+                    ),
+                ).fetchone()
+                if duplicate_entry_bar:
+                    return {
+                        "inserted": False,
+                        "reason": "duplicate_finalized_bar_entry_intent",
+                        "orderIntentId": str(duplicate_entry_bar["order_intent_id"]),
+                    }
             self._insert(conn, "regime_order_intents", common, "order-intent", intent)
             self._insert_execution_outbox_in_transaction(conn, common, intent)
         return {"inserted": True, "orderIntentId": order_intent_id}
@@ -677,7 +902,7 @@ class RegimeSqliteRepository:
                   AND runtime_mode = ?
                   AND symbol = ?
                   AND order_intent_id = ?
-                  AND processing_status = 'pending'
+                  AND processing_status IN ('created', 'pending')
                 LIMIT 1
                 """,
                 (
@@ -704,6 +929,90 @@ class RegimeSqliteRepository:
         with self.connect() as conn:
             self._insert(conn, "regime_runtime_events", {**common, "decision_id": event_id}, event_id, event, processing_status=str(event.get("processingStatus") or event.get("processing_status") or "recorded"))
         return {"recorded": True, "eventId": event_id}
+
+    def read_runtime_event(self, identity: dict[str, Any], event_id: str) -> dict[str, Any] | None:
+        common = _common_metadata({}, {**identity, "decisionId": event_id}, {**identity, "decisionId": event_id})
+        _validate_common_metadata(common)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT payload_json, processing_status, created_at
+                FROM regime_runtime_events
+                WHERE algorithm_id = 'regime'
+                  AND algorithm_instance_id = ?
+                  AND account_id = ?
+                  AND runtime_mode = ?
+                  AND symbol = ?
+                  AND decision_id = ?
+                  AND json_extract(payload_json, '$.eventType') = 'finalised_bar'
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (
+                    common["algorithm_instance_id"],
+                    common["account_id"],
+                    common["runtime_mode"],
+                    common["symbol"],
+                    event_id,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(str(row["payload_json"]))
+        if isinstance(payload, dict):
+            payload["processingStatus"] = str(row["processing_status"])
+            payload["createdAt"] = str(row["created_at"])
+            return payload
+        return {"eventId": event_id, "processingStatus": str(row["processing_status"]), "payload": payload}
+
+    def recover_unprocessed_finalized_bar_events(self, identity: dict[str, Any], *, limit: int = 100) -> list[dict[str, Any]]:
+        common = _common_metadata({}, identity, identity)
+        _validate_common_metadata(common)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT events.decision_id, events.payload_json, events.processing_status, events.created_at
+                FROM regime_runtime_events events
+                WHERE events.algorithm_id = 'regime'
+                  AND events.algorithm_instance_id = ?
+                  AND events.account_id = ?
+                  AND events.runtime_mode = ?
+                  AND events.symbol = ?
+                  AND json_extract(events.payload_json, '$.eventType') = 'finalised_bar'
+                  AND events.processing_status IN ('queued', 'processing', 'failed')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM regime_runtime_checkpoints checkpoints
+                      WHERE checkpoints.algorithm_id = 'regime'
+                        AND checkpoints.algorithm_instance_id = events.algorithm_instance_id
+                        AND checkpoints.account_id = events.account_id
+                        AND checkpoints.runtime_mode = events.runtime_mode
+                        AND checkpoints.symbol = events.symbol
+                        AND checkpoints.decision_id = events.decision_id
+                        AND checkpoints.processing_status = 'completed'
+                        AND json_extract(checkpoints.payload_json, '$.stage') = 'decision_persisted'
+                  )
+                GROUP BY events.decision_id
+                ORDER BY events.event_timestamp ASC, events.created_at ASC
+                LIMIT ?
+                """,
+                (
+                    common["algorithm_instance_id"],
+                    common["account_id"],
+                    common["runtime_mode"],
+                    common["symbol"],
+                    int(limit),
+                ),
+            ).fetchall()
+        recovered: list[dict[str, Any]] = []
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            if not isinstance(payload, dict):
+                continue
+            payload["processingStatus"] = str(row["processing_status"])
+            payload["createdAt"] = str(row["created_at"])
+            recovered.append(payload)
+        return recovered
 
     def record_stage_checkpoint(
         self,
@@ -735,6 +1044,14 @@ class RegimeSqliteRepository:
                 common,
                 f"stage-{stage}",
                 checkpoint_payload,
+                processing_status=status,
+            )
+            self._insert(
+                conn,
+                "regime_bar_processing",
+                common,
+                f"bar-processing-{event_id}-{stage}",
+                {"eventType": "bar_processing_stage", **checkpoint_payload},
                 processing_status=status,
             )
             self._insert(
@@ -836,6 +1153,7 @@ class RegimeSqliteRepository:
                 }
             next_version = current_version + 1
             self._insert(conn, "regime_runtime_checkpoints", common, f"checkpoint-{next_version}", checkpoint, sequence_version=next_version)
+            self._insert(conn, "regime_runtime_state", common, f"runtime-state-{next_version}", checkpoint, sequence_version=next_version)
         return {"updated": True, "sequenceVersion": next_version}
 
     def read_runtime_checkpoint(self, identity: dict[str, Any]) -> dict[str, Any] | None:
@@ -928,7 +1246,7 @@ class RegimeSqliteRepository:
     def recover_unfinished_outbox_records(self, identity: dict[str, Any]) -> dict[str, Any]:
         common = _common_metadata({}, identity, identity)
         _validate_common_metadata(common)
-        recoverable_statuses = {"queued", "pending", "reserved", "risk_reserved", "submitting", "submitted", "broker_pending", "acknowledged", "partially_filled", "reconciliation_required"}
+        recoverable_statuses = {"created", "risk_approved", "queued", "retry_scheduled", "pending", "reserved", "risk_reserved", "submitting", "submitted", "broker_pending", "acknowledged", "partially_filled", "reconciliation_required"}
         recovered: list[str] = []
         with self.connect() as conn:
             rows = conn.execute(
@@ -944,12 +1262,12 @@ class RegimeSqliteRepository:
                 """,
                 (common["algorithm_instance_id"], common["account_id"], common["runtime_mode"], common["symbol"]),
             ).fetchall()
+            latest_status_by_intent: dict[str, str] = {}
             for row in rows:
-                status = str(row["processing_status"])
-                if status in recoverable_statuses:
-                    order_intent_id = str(row["order_intent_id"] or "")
-                    if order_intent_id:
-                        recovered.append(order_intent_id)
+                order_intent_id = str(row["order_intent_id"] or "")
+                if order_intent_id:
+                    latest_status_by_intent[order_intent_id] = str(row["processing_status"])
+            recovered.extend(order_intent_id for order_intent_id, status in latest_status_by_intent.items() if status in recoverable_statuses)
             if recovered:
                 self._insert(
                     conn,
@@ -965,7 +1283,7 @@ class RegimeSqliteRepository:
         self,
         identity: dict[str, Any],
         *,
-        statuses: tuple[str, ...] = ("pending", "risk_reserved", "submitting", "submitted", "acknowledged", "partially_filled", "cancel_requested", "reconciliation_required"),
+            statuses: tuple[str, ...] = ("created", "risk_approved", "queued", "retry_scheduled", "pending", "risk_reserved", "submitting", "submitted", "acknowledged", "partially_filled", "cancel_pending", "cancel_requested", "reconciliation_required"),
     ) -> list[dict[str, Any]]:
         common = _common_metadata({}, identity, identity)
         _validate_common_metadata(common)
@@ -1123,7 +1441,7 @@ class RegimeSqliteRepository:
                     status,
                 ),
             ).fetchone()
-            if duplicate_status:
+            if duplicate_status and not payload.get("allowDuplicateStatusUpdate"):
                 return {"updated": False, "orderIntentId": order_intent_id, "status": status, "reason": "duplicate_execution_outbox_status"}
             self._insert(conn, "regime_execution_outbox", common, f"execution-outbox-{order_intent_id}-{status}-{_stable_snapshot_key(_utc_now())}", merged, processing_status=status)
         return {"updated": True, "orderIntentId": order_intent_id, "status": status}
@@ -1147,8 +1465,38 @@ class RegimeSqliteRepository:
             "executionOutboxId": execution_outbox_id,
             "idempotencyKey": idempotency_key,
             "orderIntentId": order_intent_id,
-            "processingStatus": str(payload.get("processingStatus") or payload.get("processing_status") or "pending"),
+            "processingStatus": str(payload.get("processingStatus") or payload.get("processing_status") or "created"),
             "orderIntent": _record(payload.get("orderIntent")) or payload,
+            "stateMachine": {
+                "version": "regime_execution_outbox_state_machine_v2",
+                "allowedStates": [
+                    "created",
+                    "risk_approved",
+                    "queued",
+                    "retry_scheduled",
+                    "submitting",
+                    "acknowledged",
+                    "partially_filled",
+                    "filled",
+                    "cancel_pending",
+                    "cancelled",
+                    "rejected",
+                    "expired",
+                    "reconciliation_required",
+                    "dead_letter",
+                ],
+            },
+            "retryPolicy": {
+                "maxAttempts": int(payload.get("maxRetryAttempts") or payload.get("max_retry_attempts") or 3),
+                "backoffSeconds": [5, 15, 45],
+                "retryOnlySafeOperations": True,
+            },
+            "retryCount": int(payload.get("retryCount") or payload.get("retry_count") or 0),
+            "nextRetryAt": payload.get("nextRetryAt") or payload.get("next_retry_at"),
+            "expiresAt": payload.get("expiresAt") or payload.get("expires_at"),
+            "globalRiskApproval": _record(payload.get("globalRiskApproval") or payload.get("global_risk_approval")),
+            "globalRiskReservationId": payload.get("globalRiskReservationId") or payload.get("reservationId"),
+            "orderReplacementPolicy": "cancel_stale_unfilled_orders_replace_requires_new_intent",
         }
         self._insert(
             conn,
@@ -1233,7 +1581,166 @@ class RegimeSqliteRepository:
         _validate_common_metadata(common)
         with self.connect() as conn:
             inserted = self._copy_broker_observation_in_transaction(conn, observation, common)
+        if inserted == "regime_orders":
+            self.record_inventory_order_status(observation)
+        elif inserted == "regime_reconciliation_events":
+            self.record_reconciliation_run(observation, status=str(observation.get("processingStatus") or "observed"))
         return {"copied": bool(inserted), "table": inserted}
+
+    def current_inventory_snapshot(self, identity: dict[str, Any]) -> dict[str, Any]:
+        _require_full_ownership_identity(identity)
+        common = _common_metadata({}, identity, identity)
+        _validate_common_metadata(common)
+        with self.connect() as conn:
+            row = self._latest_mutable_row(conn, "regime_inventory_snapshots", common)
+        return _row_payload(row) if row else _base_inventory_snapshot(identity, common)
+
+    def apply_inventory_fill(
+        self,
+        identity: dict[str, Any],
+        fill: dict[str, Any],
+        *,
+        settings_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if str(fill.get("algorithmId") or fill.get("algorithm_id") or "") != REGIME_ALGORITHM_ID:
+            raise ValueError("Regime inventory rejects cross-algorithm fill observations")
+        _require_full_ownership_identity(identity)
+        common = _common_metadata({}, {**identity, **fill}, {**identity, **fill})
+        _validate_common_metadata(common)
+        event = _inventory_event_from_fill(identity, fill, settings_snapshot=settings_snapshot)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if self._inventory_event_exists(conn, common, event["inventoryEventId"]):
+                snapshot = self._latest_inventory_snapshot(conn, identity, common)
+                return {
+                    "updated": False,
+                    "duplicate": True,
+                    "reason": "regime.inventory.duplicate_fill_ignored",
+                    "inventoryEventId": event["inventoryEventId"],
+                    "snapshot": snapshot,
+                }
+            previous = self._latest_inventory_snapshot(conn, identity, common)
+            next_snapshot = _apply_fill_to_inventory_snapshot(previous, event)
+            self._insert_inventory_event_and_snapshot(conn, common, event, next_snapshot, processing_status="fill_applied")
+        return {"updated": True, "inventoryEventId": event["inventoryEventId"], "snapshot": next_snapshot}
+
+    def record_inventory_order_status(self, observation: dict[str, Any]) -> dict[str, Any]:
+        common = _common_metadata({}, observation, observation)
+        _validate_common_metadata(common)
+        event = _inventory_event_from_order_status(observation)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if self._inventory_event_exists(conn, common, event["inventoryEventId"]):
+                return {"recorded": False, "duplicate": True, "inventoryEventId": event["inventoryEventId"]}
+            previous = self._latest_inventory_snapshot(conn, observation, common)
+            next_snapshot = _apply_order_status_to_inventory_snapshot(previous, event)
+            self._insert_inventory_event_and_snapshot(conn, common, event, next_snapshot, processing_status=str(event["orderStatus"]))
+        return {"recorded": True, "inventoryEventId": event["inventoryEventId"], "snapshot": next_snapshot}
+
+    def record_inventory_broker_correction(self, identity: dict[str, Any], correction: dict[str, Any]) -> dict[str, Any]:
+        payload = {"algorithmId": REGIME_ALGORITHM_ID, **correction, "type": "broker_correction"}
+        common = _common_metadata({}, {**identity, **payload}, {**identity, **payload})
+        _validate_common_metadata(common)
+        event = _inventory_event_from_broker_correction(identity, payload)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if self._inventory_event_exists(conn, common, event["inventoryEventId"]):
+                return {"recorded": False, "duplicate": True, "inventoryEventId": event["inventoryEventId"]}
+            previous = self._latest_inventory_snapshot(conn, identity, common)
+            next_snapshot = _apply_fill_to_inventory_snapshot(previous, event)
+            self._insert_inventory_event_and_snapshot(conn, common, event, next_snapshot, processing_status="broker_correction_applied")
+        return {"recorded": True, "inventoryEventId": event["inventoryEventId"], "snapshot": next_snapshot}
+
+    def verify_or_rebuild_inventory_snapshot(
+        self,
+        identity: dict[str, Any],
+        *,
+        broker_positions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        _require_full_ownership_identity(identity)
+        common = _common_metadata({}, identity, identity)
+        _validate_common_metadata(common)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rebuilt = self._rebuild_inventory_snapshot_from_events(conn, identity, common)
+            current = self._latest_inventory_snapshot(conn, identity, common)
+            snapshot_matches = _inventory_snapshots_equivalent(current, rebuilt)
+            if not snapshot_matches:
+                rebuilt = {**rebuilt, "rebuildReason": "ledger_verification_mismatch"}
+                self._insert(
+                    conn,
+                    "regime_inventory_snapshots",
+                    {**common, "position_id": rebuilt.get("positionId"), "trade_id": rebuilt.get("tradeId")},
+                    f"inventory-rebuild-{int(current.get('stateVersion') or 0) + 1}",
+                    rebuilt,
+                    processing_status="rebuilt",
+                    sequence_version=int(current.get("stateVersion") or 0) + 1,
+                )
+                current = rebuilt
+            discrepancies = _broker_inventory_discrepancies(current, broker_positions or [])
+            reconciled_at = _utc_now()
+            current = {**current, "lastBrokerReconciliationTime": reconciled_at}
+            self._insert(
+                conn,
+                "regime_inventory_snapshots",
+                {**common, "position_id": current.get("positionId"), "trade_id": current.get("tradeId")},
+                f"inventory-reconciliation-{_stable_snapshot_key(reconciled_at)}",
+                current,
+                processing_status="reconciled" if not discrepancies else "unresolved_discrepancy",
+                sequence_version=int(current.get("stateVersion") or 0),
+            )
+            run = {
+                "algorithmId": REGIME_ALGORITHM_ID,
+                "eventType": "inventory_startup_verification",
+                "snapshotMatchesLedger": snapshot_matches,
+                "snapshot": current,
+                "brokerPositionCount": len(broker_positions or []),
+                "discrepancies": discrepancies,
+                "timestamp": reconciled_at,
+            }
+            self._insert(
+                conn,
+                "regime_reconciliation_runs",
+                common,
+                f"inventory-startup-verification-{_stable_snapshot_key(json.dumps(discrepancies, sort_keys=True, default=str))}",
+                run,
+                processing_status="reconciled" if not discrepancies else "unresolved_discrepancy",
+            )
+        return {
+            "algorithmId": REGIME_ALGORITHM_ID,
+            "verified": snapshot_matches,
+            "rebuilt": not snapshot_matches,
+            "reconciled": not discrepancies,
+            "snapshot": current,
+            "discrepancies": discrepancies,
+        }
+
+    def record_reconciliation_run(self, observation: dict[str, Any], *, status: str = "observed") -> dict[str, Any]:
+        common = _common_metadata({}, observation, observation)
+        _validate_common_metadata(common)
+        payload = {
+            "algorithmId": REGIME_ALGORITHM_ID,
+            "eventType": "broker_reconciliation_run",
+            "timestamp": observation.get("timestamp") or _utc_now(),
+            "observation": sanitize_persistence_payload(observation),
+        }
+        with self.connect() as conn:
+            self._insert(conn, "regime_reconciliation_runs", common, f"reconciliation-run-{_stable_snapshot_key(str(payload))}", payload, processing_status=status)
+        return {"recorded": True, "status": status}
+
+    def record_runtime_alert(self, identity: dict[str, Any], alert: dict[str, Any], *, status: str = "active") -> dict[str, Any]:
+        common = _common_metadata({}, identity, identity)
+        _validate_common_metadata(common)
+        payload = {
+            "algorithmId": REGIME_ALGORITHM_ID,
+            "eventType": "runtime_alert",
+            "status": status,
+            "timestamp": alert.get("timestamp") or _utc_now(),
+            "alert": sanitize_persistence_payload(alert),
+        }
+        with self.connect() as conn:
+            self._insert(conn, "regime_runtime_alerts", common, f"runtime-alert-{_stable_snapshot_key(str(payload))}", payload, processing_status=status)
+        return {"recorded": True, "status": status}
 
     def record_position_state(self, identity: dict[str, Any], position: dict[str, Any]) -> dict[str, Any]:
         payload = {**position, "algorithmId": REGIME_ALGORITHM_ID}
@@ -1367,7 +1874,12 @@ class RegimeSqliteRepository:
             previous_settings_version=previous_version,
         )
         snapshot = regime_trading_settings_to_dict(settings)
-        return self._persist_settings_snapshot(snapshot, actor=actor, previous_settings_version=previous_version)
+        return self._persist_settings_snapshot(
+            snapshot,
+            actor=actor,
+            previous_settings_version=previous_version,
+            activation_reason=str(command.get("activationReason") or command.get("reason") or "activate_version"),
+        )
 
     def validate_settings_snapshot_command(self, command: dict[str, Any]) -> dict[str, Any]:
         actor = str(command.get("actor") or command.get("submittedBy") or command.get("createdBy") or "unknown")
@@ -1396,8 +1908,15 @@ class RegimeSqliteRepository:
     def create_settings_version(self, command: dict[str, Any]) -> dict[str, Any]:
         validated = self.validate_settings_snapshot_command(command)
         snapshot = _record(validated.get("settingsSnapshot"))
-        identity = _record(validated.get("identity"))
         actor = str(command.get("actor") or command.get("submittedBy") or command.get("createdBy") or "unknown")
+        snapshot = _settings_snapshot_with_activation_metadata(
+            snapshot,
+            activation_status="inactive",
+            activated_at=None,
+            reason=str(command.get("activationReason") or command.get("reason") or "create_version"),
+            source=str(command.get("source") or actor),
+        )
+        identity = _record(validated.get("identity"))
         settings_version = str(snapshot["settingsVersion"])
         common = _settings_common(identity, settings_version)
         audit_id = f"settings-create-audit:{settings_version}"
@@ -1425,7 +1944,13 @@ class RegimeSqliteRepository:
                     "settingsSnapshot": snapshot,
                 },
             )
-        return {**validated, "created": True, "activated": False}
+        return {
+            **validated,
+            "settingsSnapshot": snapshot,
+            "settingsHash": snapshot.get("settingsHash") or snapshot.get("contentHash"),
+            "created": True,
+            "activated": False,
+        }
 
     def rollback_settings_snapshot(self, command: dict[str, Any]) -> dict[str, Any]:
         actor = str(command.get("actor") or command.get("submittedBy") or command.get("createdBy") or "unknown")
@@ -1446,7 +1971,12 @@ class RegimeSqliteRepository:
             "createdAt": _utc_now(),
             "createdBy": actor,
         }
-        return self._persist_settings_snapshot(snapshot, actor=actor, previous_settings_version=current_version)
+        return self._persist_settings_snapshot(
+            snapshot,
+            actor=actor,
+            previous_settings_version=current_version,
+            activation_reason=str(command.get("rollbackReason") or command.get("reason") or f"rollback_to:{target_version}"),
+        )
 
     def settings_version_snapshot(self, identity: dict[str, Any], settings_version: str) -> dict[str, Any] | None:
         resolved_identity = regime_settings_identity_from_payload(identity)
@@ -1475,11 +2005,26 @@ class RegimeSqliteRepository:
             ).fetchone()
         return _row_payload(row) if row else None
 
-    def _persist_settings_snapshot(self, snapshot: dict[str, Any], *, actor: str, previous_settings_version: str | None) -> dict[str, Any]:
+    def _persist_settings_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        actor: str,
+        previous_settings_version: str | None,
+        activation_reason: str = "activate_version",
+    ) -> dict[str, Any]:
         identity = regime_settings_identity_from_payload(snapshot)
         settings_version = str(snapshot["settingsVersion"])
         common = _settings_common(identity, settings_version)
         audit_id = f"settings-audit:{settings_version}"
+        activated_at = _utc_now()
+        snapshot = _settings_snapshot_with_activation_metadata(
+            snapshot,
+            activation_status="active",
+            activated_at=activated_at,
+            reason=activation_reason,
+            source=actor,
+        )
         with self.connect() as conn:
             active_row = self._latest_mutable_row(conn, "regime_active_settings", common)
             sequence_version = int(active_row["sequence_version"]) + 1 if active_row else 1
@@ -1495,6 +2040,9 @@ class RegimeSqliteRepository:
             active_payload = {
                 "activeSettingsVersion": settings_version,
                 "previousSettingsVersion": previous_settings_version,
+                "activationStatus": "active",
+                "activationTimestamp": activated_at,
+                "reasonForActivationOrRollback": activation_reason,
                 "settingsSnapshot": snapshot,
                 "settingsSource": REGIME_SETTINGS_AUTHORITATIVE_SOURCE,
             }
@@ -1507,9 +2055,12 @@ class RegimeSqliteRepository:
                 {
                     "eventType": "settings_activation_audit",
                     "actor": actor,
-                    "timestamp": snapshot.get("createdAt"),
+                    "timestamp": activated_at,
                     "previousSettingsVersion": previous_settings_version,
                     "newSettingsVersion": settings_version,
+                    "activationStatus": "active",
+                    "activationTimestamp": activated_at,
+                    "reasonForActivationOrRollback": activation_reason,
                     "settingsSnapshot": snapshot,
                 },
             )
@@ -1537,7 +2088,7 @@ class RegimeSqliteRepository:
         for row in rows:
             payload = json.loads(str(row["payload_json"]))
             if str(payload.get("artifact_id") or payload.get("artifactId") or "") == artifact_id:
-                payload["trusted_backend_record"] = payload.get("trusted_backend_record", True)
+                payload["trusted_backend_record"] = bool(payload.get("trusted_backend_record"))
                 return payload
         return None
 
@@ -1654,6 +2205,99 @@ class RegimeSqliteRepository:
             (common["algorithm_instance_id"], common["account_id"], common["runtime_mode"], common["symbol"]),
         ).fetchone()
 
+    def _latest_inventory_snapshot(self, conn: sqlite3.Connection, identity: dict[str, Any], common: dict[str, str | None]) -> dict[str, Any]:
+        row = self._latest_mutable_row(conn, "regime_inventory_snapshots", common)
+        return _row_payload(row) if row else _base_inventory_snapshot(identity, common)
+
+    def _inventory_event_exists(self, conn: sqlite3.Connection, common: dict[str, str | None], inventory_event_id: str) -> bool:
+        rows = conn.execute(
+            """
+            SELECT payload_json
+            FROM regime_inventory_events
+            WHERE algorithm_id = 'regime'
+              AND algorithm_instance_id = ?
+              AND account_id = ?
+              AND runtime_mode = ?
+              AND symbol = ?
+            ORDER BY rowid DESC
+            """,
+            (common["algorithm_instance_id"], common["account_id"], common["runtime_mode"], common["symbol"]),
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            if isinstance(payload, dict) and str(payload.get("inventoryEventId") or "") == inventory_event_id:
+                return True
+        return False
+
+    def _insert_inventory_event_and_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        common: dict[str, str | None],
+        event: dict[str, Any],
+        snapshot: dict[str, Any],
+        *,
+        processing_status: str,
+    ) -> None:
+        event_version = int(event.get("stateVersion") or snapshot.get("stateVersion") or 1)
+        event_common = {
+            **common,
+            "decision_id": str(event.get("decisionId") or common.get("decision_id") or event.get("inventoryEventId")),
+            "order_id": _string_or_none(event.get("orderId") or common.get("order_id")),
+            "order_intent_id": _string_or_none(event.get("orderIntentId") or common.get("order_intent_id")),
+            "broker_order_id": _string_or_none(event.get("brokerOrderId") or common.get("broker_order_id")),
+            "position_id": _string_or_none(event.get("positionId") or snapshot.get("positionId")),
+            "trade_id": _string_or_none(event.get("tradeId") or snapshot.get("tradeId")),
+        }
+        self._insert(
+            conn,
+            "regime_inventory_events",
+            event_common,
+            str(event["inventoryEventId"]),
+            event,
+            processing_status=processing_status,
+            sequence_version=event_version,
+        )
+        self._insert(
+            conn,
+            "regime_inventory_snapshots",
+            event_common,
+            f"inventory-snapshot-{snapshot['stateVersion']}",
+            snapshot,
+            processing_status=str(snapshot.get("inventoryStatus") or "current"),
+            sequence_version=int(snapshot["stateVersion"]),
+        )
+
+    def _rebuild_inventory_snapshot_from_events(
+        self,
+        conn: sqlite3.Connection,
+        identity: dict[str, Any],
+        common: dict[str, str | None],
+    ) -> dict[str, Any]:
+        rows = conn.execute(
+            """
+            SELECT payload_json
+            FROM regime_inventory_events
+            WHERE algorithm_id = 'regime'
+              AND algorithm_instance_id = ?
+              AND account_id = ?
+              AND runtime_mode = ?
+              AND symbol = ?
+            ORDER BY sequence_version ASC, rowid ASC
+            """,
+            (common["algorithm_instance_id"], common["account_id"], common["runtime_mode"], common["symbol"]),
+        ).fetchall()
+        snapshot = _base_inventory_snapshot(identity, common)
+        for row in rows:
+            event = json.loads(str(row["payload_json"]))
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("eventType") or "")
+            if event_type in {"broker_fill", "broker_correction"}:
+                snapshot = _apply_fill_to_inventory_snapshot(snapshot, event)
+            elif event_type == "broker_order_status":
+                snapshot = _apply_order_status_to_inventory_snapshot(snapshot, event)
+        return snapshot
+
     def _copy_broker_observation_in_transaction(self, conn: sqlite3.Connection, observation: dict[str, Any], common: dict[str, str | None]) -> str | None:
         table = _regime_ledger_table_for_observation(observation)
         if table is None:
@@ -1758,6 +2402,35 @@ def _settings_common(identity: dict[str, Any], settings_version: str) -> dict[st
     }
 
 
+def _settings_snapshot_with_activation_metadata(
+    snapshot: dict[str, Any],
+    *,
+    activation_status: str,
+    activated_at: str | None,
+    reason: str,
+    source: str,
+) -> dict[str, Any]:
+    content_hash = str(snapshot.get("contentHash") or snapshot.get("settingsHash") or snapshot.get("configurationHash") or "")
+    settings_version = str(snapshot.get("settingsVersion") or snapshot.get("immutableVersionId") or "")
+    return {
+        **snapshot,
+        "immutableVersionId": settings_version,
+        "contentHash": content_hash,
+        "settingsHash": str(snapshot.get("settingsHash") or content_hash),
+        "activationStatus": activation_status,
+        "activationTimestamp": activated_at,
+        "activatedAt": activated_at,
+        "createdSource": str(source),
+        "sourceMetadata": {
+            **_record(snapshot.get("sourceMetadata")),
+            "source": str(_record(snapshot.get("sourceMetadata")).get("source") or source),
+            "createdBy": str(snapshot.get("createdBy") or source),
+        },
+        "reasonForActivationOrRollback": reason,
+        "regimeProfileMatrixVersion": str(snapshot.get("regimeProfileMatrixVersion") or snapshot.get("profileVersion") or ""),
+    }
+
+
 def _validate_common_metadata(common: dict[str, str | None]) -> None:
     if common.get("algorithm_id") != REGIME_ALGORITHM_ID:
         raise ValueError("Regime repository rejects non-regime algorithm_id")
@@ -1796,7 +2469,11 @@ def _record(value: Any) -> dict[str, Any]:
 
 
 def _list(value: Any) -> list[Any]:
-    return value if isinstance(value, list) else []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
 
 
 def _first_record(parent: dict[str, Any], fallback: dict[str, Any], *keys: str) -> dict[str, Any]:
@@ -1843,6 +2520,247 @@ def _string_or_none(value: Any) -> str | None:
     return text if text else None
 
 
+def _base_inventory_snapshot(identity: dict[str, Any], common: dict[str, str | None]) -> dict[str, Any]:
+    return {
+        "algorithmId": REGIME_ALGORITHM_ID,
+        "algorithmInstanceId": common["algorithm_instance_id"],
+        "accountId": common["account_id"],
+        "runtimeMode": common["runtime_mode"],
+        "symbol": common["symbol"],
+        "quantity": 0,
+        "averageEntryPrice": 0.0,
+        "realizedPnl": 0.0,
+        "unrealizedPnl": 0.0,
+        "reservedCash": 0.0,
+        "reservedRisk": 0.0,
+        "openOrderQuantity": 0,
+        "positionId": None,
+        "tradeId": None,
+        "lastBrokerReconciliationTime": None,
+        "stateVersion": 0,
+        "inventoryStatus": "flat",
+        "lastDecisionId": None,
+        "lastOrderIntentId": None,
+        "lastOrderId": None,
+        "lastBrokerOrderId": None,
+        "lastFillId": None,
+        "lastInventoryEventId": None,
+    }
+
+
+def _inventory_event_from_fill(identity: dict[str, Any], fill: dict[str, Any], *, settings_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+    quantity = abs(_int(fill.get("filledQuantity") or fill.get("filled_quantity") or fill.get("quantity")))
+    price = _float(fill.get("averageFillPrice") or fill.get("average_fill_price") or fill.get("fillPrice") or fill.get("price"))
+    side = _normal_inventory_side(fill.get("side") or fill.get("orderSide") or "Buy")
+    fill_id = str(fill.get("fillId") or fill.get("fill_id") or f"{fill.get('orderIntentId') or fill.get('order_intent_id')}:{fill.get('filledAt') or fill.get('timestamp')}:{quantity}:{price}")
+    event_id = f"regime-inventory-fill-{_stable_snapshot_key(fill_id)}"
+    return {
+        "algorithmId": REGIME_ALGORITHM_ID,
+        "eventType": "broker_fill",
+        "inventoryEventId": event_id,
+        "fillId": fill_id,
+        "decisionId": fill.get("decisionId") or fill.get("decision_id"),
+        "orderIntentId": fill.get("orderIntentId") or fill.get("order_intent_id"),
+        "orderId": fill.get("orderId") or fill.get("order_id"),
+        "brokerOrderId": fill.get("brokerOrderId") or fill.get("broker_order_id"),
+        "positionId": fill.get("positionId") or fill.get("position_id"),
+        "tradeId": fill.get("tradeId") or fill.get("trade_id"),
+        "symbol": str(fill.get("symbol") or identity.get("symbol") or "SPY").upper(),
+        "runtimeMode": fill.get("runtimeMode") or fill.get("runtime_mode") or identity.get("runtimeMode"),
+        "side": side,
+        "signedQuantity": quantity if side == "Buy" else -quantity,
+        "quantity": quantity,
+        "price": price,
+        "timestamp": fill.get("filledAt") or fill.get("timestamp") or _utc_now(),
+        "settingsVersion": (settings_snapshot or {}).get("settingsVersion") or fill.get("settingsVersion") or fill.get("settings_version"),
+        "profileVersion": (settings_snapshot or {}).get("profileVersion") or fill.get("profileVersion") or fill.get("profile_version"),
+        "submittedQuantity": _int(fill.get("submittedQuantity") or fill.get("submitted_quantity")),
+        "brokerStatus": fill.get("status") or fill.get("fillStatus") or fill.get("processingStatus"),
+    }
+
+
+def _inventory_event_from_order_status(observation: dict[str, Any]) -> dict[str, Any]:
+    ack = _record(observation.get("brokerAck"))
+    status = str(observation.get("status") or observation.get("processingStatus") or ack.get("status") or "observed").lower()
+    order_id = observation.get("orderId") or observation.get("order_id") or observation.get("brokerOrderId") or observation.get("broker_order_id") or ack.get("brokerOrderId")
+    order_intent_id = observation.get("orderIntentId") or observation.get("order_intent_id")
+    event_key = f"{order_id}:{order_intent_id}:{status}:{observation.get('timestamp') or ack.get('submittedAt') or ''}"
+    return {
+        "algorithmId": REGIME_ALGORITHM_ID,
+        "eventType": "broker_order_status",
+        "inventoryEventId": f"regime-inventory-order-{_stable_snapshot_key(event_key)}",
+        "orderStatus": status,
+        "decisionId": observation.get("decisionId") or observation.get("decision_id"),
+        "orderIntentId": order_intent_id,
+        "orderId": order_id,
+        "brokerOrderId": observation.get("brokerOrderId") or observation.get("broker_order_id") or ack.get("brokerOrderId"),
+        "positionId": observation.get("positionId") or observation.get("position_id"),
+        "tradeId": observation.get("tradeId") or observation.get("trade_id"),
+        "quantity": _int(observation.get("quantity") or observation.get("submittedQuantity") or ack.get("quantity")),
+        "remainingQuantity": _int(observation.get("remainingQuantity") or observation.get("remaining_quantity") or ack.get("remainingQuantity")),
+        "timestamp": observation.get("timestamp") or ack.get("submittedAt") or _utc_now(),
+        "rawStatus": observation.get("status") or ack.get("status"),
+    }
+
+
+def _inventory_event_from_broker_correction(identity: dict[str, Any], correction: dict[str, Any]) -> dict[str, Any]:
+    delta = _int(correction.get("deltaQuantity") or correction.get("delta_quantity") or correction.get("quantity"))
+    side = "Buy" if delta >= 0 else "Sell"
+    correction_id = str(correction.get("correctionId") or correction.get("correction_id") or f"{correction.get('brokerOrderId')}:{delta}:{correction.get('timestamp')}")
+    return {
+        **_inventory_event_from_fill(
+            identity,
+            {
+                **correction,
+                "fillId": correction_id,
+                "filledQuantity": abs(delta),
+                "side": side,
+                "averageFillPrice": correction.get("price") or correction.get("averageFillPrice") or 0,
+            },
+        ),
+        "eventType": "broker_correction",
+        "inventoryEventId": f"regime-inventory-correction-{_stable_snapshot_key(correction_id)}",
+        "correctionId": correction_id,
+    }
+
+
+def _apply_fill_to_inventory_snapshot(snapshot: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    previous_quantity = _int(snapshot.get("quantity"))
+    previous_average = _float(snapshot.get("averageEntryPrice"))
+    fill_signed_quantity = _int(event.get("signedQuantity"))
+    fill_quantity = abs(fill_signed_quantity)
+    fill_price = _float(event.get("price"))
+    if fill_quantity <= 0:
+        return snapshot
+    new_quantity = previous_quantity + fill_signed_quantity
+    realized_delta = 0.0
+    if previous_quantity == 0 or (previous_quantity > 0 and fill_signed_quantity > 0) or (previous_quantity < 0 and fill_signed_quantity < 0):
+        total_quantity = abs(previous_quantity) + fill_quantity
+        average = ((previous_average * abs(previous_quantity)) + (fill_price * fill_quantity)) / total_quantity if total_quantity else 0.0
+    else:
+        closing_quantity = min(abs(previous_quantity), fill_quantity)
+        realized_delta = (fill_price - previous_average) * closing_quantity * (1 if previous_quantity > 0 else -1)
+        if new_quantity == 0:
+            average = 0.0
+        elif (previous_quantity > 0 and new_quantity > 0) or (previous_quantity < 0 and new_quantity < 0):
+            average = previous_average
+        else:
+            average = fill_price
+    state_version = _int(snapshot.get("stateVersion")) + 1
+    open_order_quantity = max(0, _int(snapshot.get("openOrderQuantity")) - fill_quantity)
+    position_id = event.get("positionId") or snapshot.get("positionId") or f"regime-position-{event.get('symbol', 'SPY')}-{event.get('orderIntentId') or event.get('fillId')}"
+    trade_id = event.get("tradeId") or snapshot.get("tradeId") or f"regime-trade-{event.get('symbol', 'SPY')}-{event.get('orderIntentId') or event.get('fillId')}"
+    return {
+        **snapshot,
+        "quantity": new_quantity,
+        "averageEntryPrice": round(average, 8),
+        "realizedPnl": round(_float(snapshot.get("realizedPnl")) + realized_delta, 8),
+        "unrealizedPnl": 0.0 if new_quantity == 0 else round((fill_price - average) * abs(new_quantity) * (1 if new_quantity > 0 else -1), 8),
+        "openOrderQuantity": open_order_quantity,
+        "positionId": None if new_quantity == 0 else position_id,
+        "tradeId": trade_id,
+        "inventoryStatus": "flat" if new_quantity == 0 else "open",
+        "stateVersion": state_version,
+        "lastDecisionId": event.get("decisionId") or snapshot.get("lastDecisionId"),
+        "lastOrderIntentId": event.get("orderIntentId") or snapshot.get("lastOrderIntentId"),
+        "lastOrderId": event.get("orderId") or snapshot.get("lastOrderId"),
+        "lastBrokerOrderId": event.get("brokerOrderId") or snapshot.get("lastBrokerOrderId"),
+        "lastFillId": event.get("fillId"),
+        "lastInventoryEventId": event.get("inventoryEventId"),
+        "lastUpdatedAt": event.get("timestamp") or _utc_now(),
+    }
+
+
+def _apply_order_status_to_inventory_snapshot(snapshot: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    status = str(event.get("orderStatus") or "").lower()
+    terminal = {"cancelled", "canceled", "rejected", "expired"}
+    open_status = {"acknowledged", "accepted", "new", "partially_filled", "replaced", "submitted"}
+    next_open_quantity = _int(snapshot.get("openOrderQuantity"))
+    if status in terminal:
+        next_open_quantity = 0
+    elif status in open_status:
+        quantity = _int(event.get("remainingQuantity")) or _int(event.get("quantity"))
+        next_open_quantity = max(next_open_quantity, quantity)
+    state_version = _int(snapshot.get("stateVersion")) + 1
+    return {
+        **snapshot,
+        "openOrderQuantity": next_open_quantity,
+        "stateVersion": state_version,
+        "lastDecisionId": event.get("decisionId") or snapshot.get("lastDecisionId"),
+        "lastOrderIntentId": event.get("orderIntentId") or snapshot.get("lastOrderIntentId"),
+        "lastOrderId": event.get("orderId") or snapshot.get("lastOrderId"),
+        "lastBrokerOrderId": event.get("brokerOrderId") or snapshot.get("lastBrokerOrderId"),
+        "lastInventoryEventId": event.get("inventoryEventId"),
+        "lastUpdatedAt": event.get("timestamp") or _utc_now(),
+    }
+
+
+def _inventory_snapshots_equivalent(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    keys = (
+        "quantity",
+        "averageEntryPrice",
+        "realizedPnl",
+        "unrealizedPnl",
+        "reservedCash",
+        "reservedRisk",
+        "openOrderQuantity",
+        "positionId",
+        "tradeId",
+        "stateVersion",
+        "lastDecisionId",
+        "lastOrderIntentId",
+        "lastOrderId",
+        "lastBrokerOrderId",
+        "lastFillId",
+        "lastInventoryEventId",
+    )
+    return {key: left.get(key) for key in keys} == {key: right.get(key) for key in keys}
+
+
+def _broker_inventory_discrepancies(snapshot: dict[str, Any], broker_positions: list[dict[str, Any]]) -> list[str]:
+    own_quantity = _int(snapshot.get("quantity"))
+    own_position_id = str(snapshot.get("positionId") or "")
+    discrepancies: list[str] = []
+    regime_positions = [position for position in broker_positions if str(position.get("algorithmId") or position.get("algorithm_id") or "") == REGIME_ALGORITHM_ID]
+    unattributed_positions = [
+        position
+        for position in broker_positions
+        if str(position.get("algorithmId") or position.get("algorithm_id") or "") == ""
+        and _int(position.get("quantity") or position.get("filledQuantity")) != 0
+    ]
+    if unattributed_positions:
+        discrepancies.append("regime.inventory.unattributed_broker_position_requires_manual_review")
+    if not regime_positions and own_quantity != 0:
+        discrepancies.append("regime.inventory.broker_missing_open_position")
+    for position in regime_positions:
+        broker_position_id = str(position.get("positionId") or position.get("position_id") or "")
+        broker_quantity = _int(position.get("quantity") or position.get("filledQuantity"))
+        if own_position_id and broker_position_id and broker_position_id != own_position_id:
+            discrepancies.append(f"regime.inventory.position_id_mismatch:{broker_position_id}")
+        if broker_quantity != own_quantity:
+            discrepancies.append(f"regime.inventory.quantity_mismatch:{broker_position_id or snapshot.get('symbol')}")
+    return discrepancies
+
+
+def _normal_inventory_side(value: Any) -> str:
+    text = str(getattr(value, "value", value)).upper()
+    return "Sell" if text in {"SELL", "SHORT"} else "Buy"
+
+
+def _float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -1853,6 +2771,11 @@ def _backend_result_as_regime(snapshot: dict[str, Any]) -> dict[str, Any]:
     decision = _record(snapshot.get("decision"))
     classification = _record(decision.get("raw_classification"))
     confirmed = _record(decision.get("confirmed_state"))
+    broker_submission = _record(snapshot.get("brokerSubmission"))
+    if broker_submission and broker_submission.get("submitted") is False and not (
+        broker_submission.get("brokerOrderId") or broker_submission.get("broker_order_id") or broker_submission.get("brokerOrder")
+    ):
+        broker_submission = {}
     return {
         "algorithmId": REGIME_ALGORITHM_ID,
         "algorithmInstanceId": snapshot.get("algorithmInstanceId") or "regime-default",
@@ -1877,8 +2800,9 @@ def _backend_result_as_regime(snapshot: dict[str, Any]) -> dict[str, Any]:
         "settingsSnapshot": _record(snapshot.get("settingsSnapshot")),
         "localRiskResult": _record(snapshot.get("localRiskResult")),
         "orderIntent": _record(snapshot.get("orderIntent")),
+        "hypotheticalFills": _list(snapshot.get("hypotheticalFills")),
         "globalGateOutcome": _record(snapshot.get("globalRiskApproval")),
-        "brokerReconciliationResult": _record(snapshot.get("brokerSubmission")),
+        "brokerReconciliationResult": broker_submission,
     }
 
 
@@ -2021,6 +2945,26 @@ def _stable_id(prefix: str, common: dict[str, str | None], payload: dict[str, An
 
 def _stable_snapshot_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+
+
+def _validate_regime_ml_backend_evidence_source(evidence: dict[str, Any]) -> tuple[bool, str]:
+    source = str(evidence.get("backend_evidence_source") or evidence.get("backendEvidenceSource") or evidence.get("source") or "").strip()
+    if source not in REGIME_ML_TRUSTED_BACKEND_EVIDENCE_SOURCES:
+        return False, "untrusted_backend_evidence_source"
+    if str(evidence.get("requestSource") or evidence.get("request_source") or "").lower() in {"frontend", "api", "client", "browser"}:
+        return False, "frontend_supplied_evidence_rejected"
+    required = (
+        ("replay_evidence_id", "replayEvidenceId"),
+        ("walk_forward_evidence_id", "walkForwardEvidenceId"),
+        ("holdout_evidence_id", "holdoutEvidenceId"),
+        ("paper_stability_evidence_id", "paperStabilityEvidenceId"),
+        ("promotion_audit_id", "promotionAuditId"),
+        ("rollback_artifact_id", "rollbackArtifactId"),
+    )
+    for snake, camel in required:
+        if not str(evidence.get(snake) or evidence.get(camel) or "").strip():
+            return False, f"missing_{snake}"
+    return True, "trusted_backend_evidence"
 
 
 __all__ = [

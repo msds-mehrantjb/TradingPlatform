@@ -25,18 +25,19 @@ TEST_TMP_ROOT = Path(__file__).resolve().parents[2] / ".pytest_regime_step7"
 
 def test_step7_outbox_status_contract_and_idempotency_key_are_durable() -> None:
     required = {
-        "pending",
-        "risk_reserved",
+        "created",
+        "risk_approved",
+        "queued",
         "submitting",
-        "submitted",
         "acknowledged",
         "partially_filled",
         "filled",
-        "cancel_requested",
+        "cancel_pending",
         "cancelled",
         "rejected",
         "expired",
         "reconciliation_required",
+        "dead_letter",
     }
     repository, identity, _ = _repository()
 
@@ -62,8 +63,10 @@ def test_step7_acceptance_records_risk_reserved_submit_fill_and_restart_position
     assert result.submitted is True
     assert broker.submit_count == 1
     assert "submitting" in statuses
+    assert "risk_approved" in statuses
+    assert "queued" in statuses
     assert "risk_reserved" in statuses
-    assert "submitted" in statuses
+    assert "acknowledged" in statuses
     assert "filled" in statuses
     assert repository.table_counts()["regime_orders"] == 1
     assert repository.table_counts()["regime_fills"] == 1
@@ -102,7 +105,7 @@ def test_step7_partial_fill_restart_does_not_create_second_economic_order() -> N
     assert first.status == "partially_filled"
     assert duplicate.duplicate is True
     assert restarted_broker.submit_count == 0
-    assert restarted_repository.table_counts()["regime_positions"] == 1
+    assert len(restarted_repository.latest_open_regime_positions(identity)) == 1
     assert restarted_repository.latest_open_regime_positions(identity)[0]["filledQuantity"] == 4
 
 
@@ -168,7 +171,7 @@ def test_step7_supervisor_blocks_new_entry_submission_until_recovery_and_reconci
     assert blocked["processed"] is False
     assert "regime.execution.recovery_or_reconciliation_unhealthy" in blocked["reasonCodes"]
     assert broker.submit_count == 0
-    assert repository.read_execution_outbox_record(identity, "regime-intent-1")["processingStatus"] == "pending"
+    assert repository.read_execution_outbox_record(identity, "regime-intent-1")["processingStatus"] == "created"
 
 
 def test_step7_pause_keeps_existing_position_protected_and_end_of_day_flatten_available() -> None:

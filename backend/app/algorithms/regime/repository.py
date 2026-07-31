@@ -34,10 +34,15 @@ def regime_repository_inventory() -> dict[str, Any]:
         "sharedTablesAreInfrastructureOnly": True,
         "sharedInfrastructureIsAttributionOnly": True,
         "authoritativeOrderFillPositionTradeInventory": (
+            "regime_inventory_events",
+            "regime_inventory_snapshots",
             "regime_orders",
             "regime_fills",
             "regime_positions",
             "regime_trades",
+        ),
+        "nonAuthoritativeShadowExecutionRecords": (
+            "regime_hypothetical_fills",
         ),
         "ownershipKey": ("algorithm_id", "algorithm_instance_id", "account_id", "runtime_mode", "symbol"),
         "optimisticLockingColumn": "sequence_version",

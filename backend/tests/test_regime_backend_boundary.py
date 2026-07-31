@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -21,9 +22,11 @@ from backend.app.algorithms.regime.service import (
     regime_backend_inventory,
 )
 from backend.app.main import app
+from backend.app.risk.manager import GlobalPortfolioRiskManager
 
 
 ROOT = Path(__file__).resolve().parents[2]
+NOW = datetime(2026, 1, 5, 15, 30, tzinfo=UTC)
 
 
 class RegimeBackendBoundaryTest(unittest.TestCase):
@@ -34,6 +37,7 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
             "contracts.py",
             "configuration.py",
             "market_snapshot.py",
+            "market_data_validation.py",
             "indicators.py",
             "classification_axes.py",
             "classifier.py",
@@ -44,6 +48,7 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
             "family_aggregation.py",
             "decision_engine.py",
             "local_gates.py",
+            "execution_cost_adapter.py",
             "dynamic_profile.py",
             "sizing.py",
             "position_manager.py",
@@ -62,8 +67,10 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
             "runtime_workers.py",
             "runtime_commands.py",
             "runtime_health.py",
+            "reconciliation.py",
             "service.py",
             "repository.py",
+            "settings_repository.py",
             "global_risk_adapter.py",
             "broker_adapter.py",
             "ml/paper_stability.py",
@@ -169,17 +176,32 @@ class RegimeBackendBoundaryTest(unittest.TestCase):
         self.assertEqual(body["authoritativeRuntime"], "backend.app.algorithms.regime.execution_pipeline")
 
     def test_global_risk_adapter_can_only_reduce_or_reject_regime_quantity(self) -> None:
+        manager = GlobalPortfolioRiskManager()
         approval = evaluate_regime_global_risk_request(
             RegimeGlobalRiskRequest(
+                algorithm_id="regime",
                 decision_id="regime-decision-1",
                 order_intent_id="regime-intent-1",
                 symbol="SPY",
+                side="Buy",
                 requested_quantity=100,
                 requested_risk_dollars=500.0,
+                stop_price=99.0,
+                target_price=102.0,
+                estimated_notional=10_000.0,
+                existing_regime_exposure={"quantity": 0, "marketValue": 0.0},
+                existing_account_exposure={"positions": (), "pendingOrders": ()},
                 algorithm_version="regime_algorithm_v2",
                 settings_version="regime_base_settings_v1",
-                global_quantity_cap=25,
-            )
+                expiration_timestamp=NOW + timedelta(minutes=5),
+                idempotency_key="regime:paper:SPY:2026-01-05T15:30:00Z:regime_algorithm_v2:regime_base_settings_v1",
+                entry_price=100.0,
+                account_snapshot={"accountSnapshotId": "acct-1", "equity": 100_000, "availableBuyingPower": 2_500, "observedAt": NOW},
+                market_snapshot={"candleTimestamp": NOW, "quoteTimestamp": NOW, "spreadPercent": 0.01, "oneMinuteVolume": 100_000, "estimatedSlippagePercent": 0.01},
+                generated_at=NOW,
+                market_data_timestamp=NOW,
+            ),
+            manager=manager,
         )
         inventory = regime_global_risk_adapter_inventory()
 

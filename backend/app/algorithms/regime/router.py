@@ -5,13 +5,14 @@ from __future__ import annotations
 from dataclasses import replace
 
 from backend.app.algorithms.regime.contracts import RegimeClassification, RegimeMarketSnapshot, RegimeStrategyEvaluation, StrategyRole
-from backend.app.algorithms.regime.strategy_registry import REGIME_STRATEGY_DEFINITIONS, evaluate_strategy
-
-
-NO_ENTRY_REGIMES = {"event_risk", "liquidity_stress", "extreme_volatility_no_trade"}
-RANGE_REGIMES = {"range_bound", "sideways_range", "choppy_mixed", "low_volatility_quiet"}
-TREND_REGIMES = {"strong_uptrend", "weak_uptrend", "strong_downtrend", "weak_downtrend", "high_volatility_trend"}
-BREAKOUT_REGIMES = {"opening_breakout", "intraday_expansion"}
+from backend.app.algorithms.regime.family_aggregation import aggregate_directional_strategies, apply_confirmation_layer, apply_safety_layer
+from backend.app.algorithms.regime.strategy_registry import (
+    REGIME_MINIMUM_INDEPENDENT_DIRECTIONAL_FAMILIES,
+    REGIME_NO_TRADE_REGIMES,
+    REGIME_STRATEGY_DEFINITIONS,
+    evaluate_strategy,
+    regime_strategy_can_route,
+)
 
 
 def route_regime_strategies(
@@ -32,6 +33,17 @@ def route_regime_strategies(
     adjusted_directional = apply_confirmation_modules(directional_outputs, confirmation_outputs, settings=settings)
     safety_outputs = evaluate_regime_role("safety_gate", snapshot, classification, settings=settings)
     outputs = (*safety_outputs, *context_outputs, *adjusted_directional, *confirmation_outputs)
+    authoritative = _order_authoritative_directionals(adjusted_directional)
+    represented_families = tuple(sorted({output.family for output in authoritative}))
+    minimum_families = _minimum_independent_families(contextual_profile, settings)
+    directional_aggregation = aggregate_directional_strategies(directional_outputs, contextual_profile, classification=classification)
+    confirmation_layer = apply_confirmation_layer(directional_aggregation, confirmation_outputs, context_outputs, settings=contextual_profile)
+    route_blockers: list[str] = []
+    if classification.raw_regime in REGIME_NO_TRADE_REGIMES:
+        route_blockers.append("regime.router.no_trade_regime")
+    if len(represented_families) < minimum_families:
+        route_blockers.append("regime.router.minimum_independent_strategies_not_met")
+    safety_layer = apply_safety_layer(confirmation_layer, safety_outputs=safety_outputs, blockers=tuple(route_blockers))
     return {
         "outputs": tuple(outputs),
         "safetyOutputs": safety_outputs,
@@ -39,8 +51,15 @@ def route_regime_strategies(
         "directionalOutputs": adjusted_directional,
         "confirmationOutputs": confirmation_outputs,
         "skippedStrategies": tuple(skipped),
-        "selectedStrategyIds": tuple(output.strategy_id for output in adjusted_directional if output.role == "directional" and output.eligible),
-        "representedFamilies": tuple(sorted({output.family for output in adjusted_directional if output.role == "directional" and output.eligible})),
+        "selectedStrategyIds": tuple(output.strategy_id for output in authoritative),
+        "representedFamilies": represented_families,
+        "eligibleIndependentStrategyCount": len(represented_families),
+        "minimumIndependentStrategiesRequired": minimum_families,
+        "routeSignal": "Hold" if route_blockers else "Routed",
+        "routeBlockers": tuple(route_blockers),
+        "directionalAggregation": directional_aggregation,
+        "confirmationLayer": confirmation_layer,
+        "safetyLayer": safety_layer,
         "profileRouting": _profile_routing(contextual_profile),
     }
 
@@ -74,7 +93,10 @@ def evaluate_directional_strategies(
     for definition in REGIME_STRATEGY_DEFINITIONS:
         if definition.role != "directional":
             continue
-        compatible = _compatible(definition.family, definition.role, classification.raw_regime, profile)
+        if definition.lifecycle_status in {"disabled", "unavailable"}:
+            skipped.append({"strategyId": definition.strategy_id, "reason": f"regime.router.lifecycle_{definition.lifecycle_status}"})
+            continue
+        compatible = regime_strategy_can_route(definition, classification.raw_regime, profile)
         if not compatible:
             skipped.append({"strategyId": definition.strategy_id, "reason": _profile_skip_reason(definition.family, classification.raw_regime, profile)})
             continue
@@ -155,27 +177,24 @@ def _profile_routing(profile: dict) -> dict[str, object]:
     }
 
 
-def _compatible(family: str, role: str, regime: str, profile: dict | None = None) -> bool:
-    if role != "directional":
-        return True
-    profile = profile or {}
-    if profile.get("noNewEntries"):
-        return False
-    disabled = set(profile.get("disabledStrategyFamilies", ()))
-    if family in disabled:
-        return False
-    allowed = set(profile.get("allowedStrategyFamilies", ()))
-    if allowed:
-        return family in allowed
-    if regime in NO_ENTRY_REGIMES:
-        return False
-    if regime in RANGE_REGIMES:
-        return family in {"mean_reversion", "vwap", "reversal", "structure"}
-    if regime in BREAKOUT_REGIMES:
-        return family in {"breakout", "momentum", "trend", "vwap", "structure", "event"}
-    if regime in TREND_REGIMES:
-        return family in {"trend", "momentum", "vwap", "breakout", "structure", "event"}
-    return True
+def _order_authoritative_directionals(outputs: tuple[RegimeStrategyEvaluation, ...]) -> tuple[RegimeStrategyEvaluation, ...]:
+    return tuple(
+        output
+        for output in outputs
+        if output.role == "directional"
+        and output.eligible
+        and output.lifecycle_status == "active"
+        and output.signal in {"Buy", "Sell"}
+    )
+
+
+def _minimum_independent_families(profile: dict | None, settings: dict | None) -> int:
+    raw = (profile or {}).get("minimumIndependentFamilies")
+    if raw is None:
+        raw = (settings or {}).get("minimumIndependentFamilies")
+    if raw is None:
+        raw = REGIME_MINIMUM_INDEPENDENT_DIRECTIONAL_FAMILIES
+    return max(1, int(raw))
 
 
 def _profile_skip_reason(family: str, regime: str, profile: dict) -> str:
@@ -185,4 +204,6 @@ def _profile_skip_reason(family: str, regime: str, profile: dict) -> str:
         return "regime.router.profile_family_disabled"
     if profile.get("allowedStrategyFamilies"):
         return "regime.router.profile_family_not_allowed"
+    if regime in REGIME_NO_TRADE_REGIMES:
+        return "regime.router.no_trade_regime"
     return "regime.router.incompatible_with_confirmed_regime"

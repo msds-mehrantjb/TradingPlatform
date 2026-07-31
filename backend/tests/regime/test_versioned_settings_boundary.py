@@ -161,10 +161,14 @@ def test_settings_command_routes_enqueue_background_jobs_without_inline_mutation
         "/api/regime/settings/versions/rollback",
     ):
         payload: dict[str, object] = {"actor": "settings-admin", "identity": base_identity}
-        if not path.endswith("/rollback"):
+        if path.endswith("/activate"):
+            payload["settingsVersion"] = "regime-settings-does-not-need-to-exist-for-queue"
+            payload["reason"] = "route enqueue audit metadata"
+        elif not path.endswith("/rollback"):
             payload["settings"] = {"identity": base_identity, "positionSizing": {"baseRiskPercent": 0.04}}
         else:
             payload["targetSettingsVersion"] = "regime-settings-does-not-need-to-exist-for-queue"
+            payload["reason"] = "route rollback audit metadata"
         response = client.post(path, json=payload)
         assert response.status_code == 202, response.text
         body = response.json()
@@ -179,6 +183,10 @@ def test_frontend_regime_requests_reject_settings_account_and_inventory_payloads
     assert '"settingsSnapshot"' in frontend
     assert '"account"' in frontend
     assert '"inventorySnapshot"' in frontend
+    assert '"currentPosition"' in frontend
+    assert '"availableRisk"' in frontend
+    assert '"buyingPower"' in frontend
+    assert '"dailyPnl"' in frontend
     assert "createRegimeSettingsVersion" in frontend
     assert "validateRegimeSettingsVersion" in frontend
     assert "activateRegimeSettingsVersion" in frontend

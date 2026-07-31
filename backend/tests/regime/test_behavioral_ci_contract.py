@@ -155,7 +155,7 @@ class RegimeBehavioralCiContractTest(unittest.TestCase):
     def test_canonical_regime_fixtures_drive_profile_and_routing_behavior(self):
         settings = validate_regime_settings({})
         market, raw = classified_snapshot("up")
-        no_entry_regimes = {"event_risk", "liquidity_stress", "extreme_volatility_no_trade", "choppy_mixed"}
+        no_entry_regimes = {"event_risk", "liquidity_stress", "extreme_volatility_no_trade", "choppy_mixed", "unknown"}
 
         for regime in CANONICAL_MARKET_REGIMES:
             with self.subTest(regime=regime):

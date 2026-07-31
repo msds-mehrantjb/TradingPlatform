@@ -27,7 +27,6 @@ GOLDEN_CANONICAL_AXIS_FIXTURES = {
     "strong_downtrend": RegimeAxes("strong_down", "normal", "trend", "good", "midday", "none"),
     "weak_downtrend": RegimeAxes("weak_down", "normal", "trend", "good", "midday", "none"),
     "range_bound": RegimeAxes("neutral", "normal", "range", "good", "midday", "none"),
-    "sideways_range": RegimeAxes("neutral", "normal", "range", "good", "midday", "none"),
     "choppy_mixed": RegimeAxes("neutral", "normal", "mixed", "good", "midday", "none"),
     "opening_breakout": RegimeAxes("weak_up", "normal", "opening_range_breakout", "good", "opening", "none"),
     "intraday_expansion": RegimeAxes("weak_up", "expanded", "valid_breakout", "good", "midday", "none"),
@@ -38,6 +37,7 @@ GOLDEN_CANONICAL_AXIS_FIXTURES = {
     "event_risk": RegimeAxes("strong_up", "normal", "trend", "good", "midday", "blackout"),
     "liquidity_stress": RegimeAxes("strong_up", "normal", "trend", "unknown", "midday", "none"),
     "extreme_volatility_no_trade": RegimeAxes("strong_up", "extreme", "trend", "good", "midday", "none"),
+    "unknown": RegimeAxes("neutral", "normal", "range", "good", "midday", "none", "neutral", "insufficient_warmup"),
 }
 
 
@@ -47,12 +47,7 @@ class RegimeStep5ClassifierCorrectionsTest(unittest.TestCase):
         for expected, axes in GOLDEN_CANONICAL_AXIS_FIXTURES.items():
             with self.subTest(expected=expected):
                 actual = _composite_regime(axes)
-                if expected == "sideways_range":
-                    self.assertEqual(actual, "range_bound")
-                elif expected == "gap_session":
-                    self.assertIn(actual, {"weak_uptrend", "opening_breakout"})
-                else:
-                    self.assertEqual(actual, expected)
+                self.assertEqual(actual, expected)
 
     def test_volatility_percent_inputs_are_normalized_and_do_not_create_extreme_unit_error(self) -> None:
         classification = classify_market_regime(
@@ -104,6 +99,7 @@ class RegimeStep5ClassifierCorrectionsTest(unittest.TestCase):
         self.assertIn("regime.safety.market_holiday_or_weekend", classification.no_trade_reasons)
         self.assertIn("regime.safety.missing_quote_freshness", classification.no_trade_reasons)
         self.assertEqual(classification.evidence["confidenceEvidence"]["dataQualityConfidence"], 0.10)
+        self.assertEqual(classification.axes.data_quality, "invalid")
 
 
 def snapshot(*, trend: str, context: dict, start: datetime | None = None) -> object:

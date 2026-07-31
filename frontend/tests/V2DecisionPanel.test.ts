@@ -27,7 +27,8 @@ test("frontend Regime panel consumes the backend authoritative runtime", () => {
   const main = read("frontend/src/main.ts");
   const api = read("frontend/src/features/regime/api.ts");
 
-  assert.match(main, /evaluateRegimeOnBackend/);
+  assert.match(main, /readLatestRegimeDecisionFromBackend/);
+  assert.match(api, /\/api\/regime\/runtime\/latest-decision/);
   assert.match(api, /\/api\/regime\/evaluate/);
   assert.match(api, /\/api\/regime\/backtests\/run/);
   assert.doesNotMatch(main, /\bcalculateRegimeDecision\(/);

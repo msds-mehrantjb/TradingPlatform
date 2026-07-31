@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from statistics import mean
 from typing import Any
 
@@ -272,3 +274,81 @@ def cost_bps(snapshot: RegimeMarketSnapshot, classification: RegimeClassificatio
 
 def expected_edge_bps(distance: float, price: float) -> float:
     return abs(distance) / max(price, 0.01) * 10_000
+
+
+def timeframe_trend(candles: tuple[RegimeCandle, ...], *, label: str) -> dict[str, Any]:
+    values = [candle.close for candle in candles]
+    if len(values) < 6:
+        return {"label": label, "direction": "unknown", "slope": None, "emaFast": None, "emaSlow": None, "dataReady": False}
+    fast = ema(values, min(6, len(values)))
+    slow = ema(values, min(12, len(values)))
+    slope = (values[-1] - values[-min(6, len(values))]) / max(values[-1], 0.01)
+    direction = "up" if fast is not None and slow is not None and fast > slow and slope > 0 else "down" if fast is not None and slow is not None and fast < slow and slope < 0 else "flat"
+    return {"label": label, "direction": direction, "slope": slope, "emaFast": fast, "emaSlow": slow, "dataReady": True}
+
+
+def reference_payload(kind: str, price: float | None, *, source: str, timestamp: str | None = None) -> dict[str, Any] | None:
+    if price is None:
+        return None
+    return {"type": kind, "price": float(price), "source": source, "timestamp": timestamp}
+
+
+def valid_until(timestamp: str, *, seconds: int) -> str | None:
+    parsed = _parse_timestamp(timestamp)
+    if parsed is None:
+        return None
+    return (parsed + timedelta(seconds=max(0, int(seconds)))).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def setup_id(strategy_id: str, symbol: str, timestamp: str, *parts: Any) -> str:
+    digest = sha256(":".join(str(part) for part in (strategy_id, symbol, timestamp, *parts)).encode("utf-8")).hexdigest()[:16]
+    return f"{strategy_id}:{digest}"
+
+
+def structured_evidence(
+    *,
+    strategy_id: str,
+    strategy_version: str,
+    family: str,
+    signal: str,
+    confidence: float,
+    reason_codes: tuple[str, ...],
+    evidence: dict[str, Any],
+    data_ready: bool,
+    expected_gross_edge_bps: float = 0.0,
+    entry_reference: dict[str, Any] | None = None,
+    stop_reference: dict[str, Any] | None = None,
+    target_reference: dict[str, Any] | None = None,
+    valid_until_timestamp: str | None = None,
+    setup_identifier: str | None = None,
+    lifecycle_status: str = "active",
+) -> dict[str, Any]:
+    return {
+        **evidence,
+        "strategy_id": strategy_id,
+        "strategy_version": strategy_version,
+        "family": family,
+        "role": "directional",
+        "lifecycle_status": lifecycle_status,
+        "signal": signal,
+        "confidence": clamp01(confidence),
+        "expected_gross_edge_bps": round(max(0.0, float(expected_gross_edge_bps)), 4),
+        "entry_reference": entry_reference,
+        "stop_reference": stop_reference,
+        "target_reference": target_reference,
+        "valid_until": valid_until_timestamp,
+        "setup_id": setup_identifier,
+        "reason_codes": tuple(dict.fromkeys(reason_codes)),
+        "data_ready": bool(data_ready),
+        "paperLongOnlyPositionEffect": "reduce_or_close_long_only" if signal == "Sell" else "open_or_add_long" if signal == "Buy" else "none",
+    }
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)

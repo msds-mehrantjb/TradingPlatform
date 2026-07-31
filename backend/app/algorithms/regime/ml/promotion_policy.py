@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime
 from typing import Protocol
 
 
 REGIME_ML_PROMOTION_POLICY_VERSION = "regime_ml_promotion_policy_v1"
 REGIME_ML_MAX_AUTOMATIC_PROMOTION_MODE = "confirm_only"
+REGIME_ML_TRUSTED_BACKEND_EVIDENCE_SOURCES = frozenset(
+    {
+        "backend_worker",
+        "regime_backtest_worker",
+        "regime_replay_worker",
+        "regime_paper_stability_worker",
+        "regime_ml_promotion_worker",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +58,16 @@ class RegimeMlPromotionEvidence:
     evidence_generated_at: str
     evidence_expiration_at: str
     trusted_backend_record: bool = True
+    backend_evidence_source: str = ""
+    replay_evidence_id: str = ""
+    walk_forward_evidence_id: str = ""
+    holdout_evidence_id: str = ""
+    paper_stability_evidence_id: str = ""
+    promotion_audit_id: str = ""
+    created_by: str = ""
+    activation_reason: str = ""
+    rollback_artifact_id: str = ""
+    previous_mode: str = "shadow"
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -64,6 +83,8 @@ class RegimeMlPromotionDecision:
     evidence_current: bool
     evidence_matches_candidate_artifact: bool
     frontend_supplied_evidence_rejected: bool
+    backend_evidence_source: str
+    versioned_reversible_audited: bool
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -95,6 +116,8 @@ def evaluate_regime_ml_promotion_policy(
     current = evidence_is_current(evidence, current_time)
     if not evidence.trusted_backend_record:
         reasons.append("regime.ml.promotion.untrusted_backend_evidence")
+    if evidence.backend_evidence_source not in REGIME_ML_TRUSTED_BACKEND_EVIDENCE_SOURCES:
+        reasons.append("regime.ml.promotion.untrusted_backend_evidence_source")
     if not current:
         reasons.append("regime.ml.promotion.stale_evidence")
     if not matches:
@@ -114,6 +137,18 @@ def evaluate_regime_ml_promotion_policy(
     for field, passed in mandatory_checks.items():
         if not passed:
             reasons.append(f"regime.ml.promotion.{field}_required")
+    required_references = {
+        "replay_evidence_id": evidence.replay_evidence_id,
+        "walk_forward_evidence_id": evidence.walk_forward_evidence_id,
+        "holdout_evidence_id": evidence.holdout_evidence_id,
+        "paper_stability_evidence_id": evidence.paper_stability_evidence_id,
+    }
+    for field, value in required_references.items():
+        if not str(value or "").strip():
+            reasons.append(f"regime.ml.promotion.{field}_required")
+    versioned_reversible_audited = _versioned_reversible_audited(evidence)
+    if not versioned_reversible_audited:
+        reasons.append("regime.ml.promotion.versioned_reversible_audited_required")
     if evidence.paper_trading_day_count <= 0:
         reasons.append("regime.ml.promotion.paper_days_required")
     if evidence.paper_shadow_decision_count <= 0:
@@ -138,6 +173,8 @@ def evaluate_regime_ml_promotion_policy(
         evidence_current=current,
         evidence_matches_candidate_artifact=matches,
         frontend_supplied_evidence_rejected=frontend_rejected,
+        backend_evidence_source=evidence.backend_evidence_source,
+        versioned_reversible_audited=versioned_reversible_audited,
     )
 
 
@@ -184,7 +221,8 @@ def _coerce_evidence(raw: dict | RegimeMlPromotionEvidence | None) -> RegimeMlPr
     if isinstance(raw, RegimeMlPromotionEvidence):
         return raw
     try:
-        return RegimeMlPromotionEvidence(**raw)
+        accepted = {field.name for field in fields(RegimeMlPromotionEvidence)}
+        return RegimeMlPromotionEvidence(**{key: value for key, value in raw.items() if key in accepted})
     except TypeError:
         return None
 
@@ -204,6 +242,8 @@ def _blocked(
         evidence_current=current,
         evidence_matches_candidate_artifact=matches,
         frontend_supplied_evidence_rejected=frontend_rejected,
+        backend_evidence_source="",
+        versioned_reversible_audited=False,
     )
 
 
@@ -212,3 +252,31 @@ def _parse_time(value: str) -> datetime:
     parsed = datetime.fromisoformat(normalized)
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
+
+def _versioned_reversible_audited(evidence: RegimeMlPromotionEvidence) -> bool:
+    return all(
+        (
+            evidence.artifact_id,
+            evidence.artifact_hash,
+            evidence.model_version,
+            evidence.feature_schema_version,
+            evidence.label_version,
+            evidence.deterministic_baseline_version,
+            evidence.promotion_audit_id,
+            evidence.created_by,
+            evidence.activation_reason,
+            evidence.rollback_artifact_id,
+        )
+    )
+
+
+__all__ = [
+    "REGIME_ML_MAX_AUTOMATIC_PROMOTION_MODE",
+    "REGIME_ML_PROMOTION_POLICY_VERSION",
+    "REGIME_ML_TRUSTED_BACKEND_EVIDENCE_SOURCES",
+    "RegimeMlCandidateArtifact",
+    "RegimeMlPromotionDecision",
+    "RegimeMlPromotionEvidence",
+    "RegimeMlPromotionEvidenceRepository",
+    "evaluate_regime_ml_promotion_policy",
+]

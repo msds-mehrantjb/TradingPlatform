@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
 
@@ -17,6 +15,7 @@ REGIME_RUNTIME_STAGES = (
     "risk_requested",
     "risk_reserved",
     "outbox_created",
+    "position_management",
     "order_submitted",
     "broker_acknowledged",
     "fill_observed",
@@ -43,20 +42,34 @@ def deterministic_regime_event_id(
     data_manifest_hash: str,
     settings_version: str,
 ) -> str:
-    encoded = json.dumps(
-        {
-            "algorithmInstanceId": algorithm_instance_id,
-            "runtimeMode": runtime_mode,
-            "symbol": symbol.upper(),
-            "finalisedBarTimestamp": finalised_bar_timestamp,
-            "dataManifestHash": data_manifest_hash,
-            "settingsVersion": settings_version,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+    del algorithm_instance_id, data_manifest_hash
+    return regime_bar_idempotency_key(
+        runtime_mode=runtime_mode,
+        symbol=symbol,
+        finalised_bar_timestamp=finalised_bar_timestamp,
+        algorithm_version="regime_stateful_completed_bar_v1",
+        settings_version=settings_version,
     )
-    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
-    return f"regime-event-{digest}"
+
+
+def regime_bar_idempotency_key(
+    *,
+    runtime_mode: str,
+    symbol: str,
+    finalised_bar_timestamp: str,
+    algorithm_version: str,
+    settings_version: str,
+) -> str:
+    return ":".join(
+        (
+            "regime",
+            runtime_mode,
+            symbol.upper(),
+            finalised_bar_timestamp,
+            algorithm_version,
+            settings_version,
+        )
+    )
 
 
 def event_identity_payload(
@@ -87,4 +100,5 @@ __all__ = [
     "REGIME_RUNTIME_STAGES",
     "deterministic_regime_event_id",
     "event_identity_payload",
+    "regime_bar_idempotency_key",
 ]

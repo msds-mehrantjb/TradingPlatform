@@ -695,70 +695,6 @@ select {
   line-height: 1.2;
 }
 
-.regime-summary-grid {
-  display: grid;
-  overflow: hidden;
-  border: 1px solid #bfdbfe;
-  border-radius: 6px;
-  background: #ffffff;
-}
-
-.regime-summary-row {
-  display: grid;
-  grid-template-columns: minmax(112px, 0.34fr) minmax(0, 1fr);
-  gap: 10px;
-  align-items: start;
-  min-width: 0;
-  border-top: 1px solid #e2e8f0;
-  padding: 8px 10px;
-  background: #f8fbff;
-}
-
-.regime-summary-row:first-child {
-  border-top: 0;
-}
-
-.regime-summary-row b {
-  color: #334155;
-  font-size: 11px;
-  font-weight: 900;
-  line-height: 1.35;
-  text-transform: uppercase;
-}
-
-.regime-summary-row span {
-  min-width: 0;
-  color: #111827;
-  font-size: 12px;
-  font-weight: 850;
-  line-height: 1.4;
-  overflow-wrap: anywhere;
-}
-
-.regime-summary-row[data-tone="pass"] {
-  border-left: 3px solid #16a34a;
-  background: #f0fdf4;
-}
-
-.regime-summary-row[data-tone="warn"] {
-  border-left: 3px solid #f59e0b;
-  background: #fffbeb;
-}
-
-.regime-summary-row[data-tone="block"] {
-  border-left: 3px solid #dc2626;
-  background: #fef2f2;
-}
-
-.regime-summary-row[data-tone="neutral"] {
-  border-left: 3px solid #64748b;
-  background: #f8fafc;
-}
-
-.regime-summary-row[data-tone="info"] {
-  border-left: 3px solid #2563eb;
-}
-
 .regime-feature {
   display: grid;
   gap: 3px;
@@ -818,6 +754,10 @@ select {
 .regime-detail-panel {
   display: grid;
   gap: 8px;
+}
+
+.regime-detail-panel[hidden] {
+  display: none;
 }
 
 .regime-section-card {
@@ -1079,6 +1019,24 @@ select {
 
 .algo-expand-toggle strong {
   color: #475467;
+}
+
+.regime-condition-toggle {
+  border-color: #c4b5fd;
+  background: #f5f3ff;
+}
+
+.regime-condition-toggle span {
+  color: #312e81;
+}
+
+.regime-condition-toggle strong {
+  color: #4338ca;
+}
+
+.regime-condition-toggle[aria-expanded="true"] {
+  border-color: #8b5cf6;
+  background: #ede9fe;
 }
 
 .regime-strategies-toggle {
@@ -2749,6 +2707,60 @@ select {
 
 .wca-trading-settings-body {
   background: #ffffff;
+}
+
+.regime-trading-settings-panel {
+  border-color: #f0abfc;
+  background: #fdf4ff;
+}
+
+.regime-trading-settings-body {
+  background: #ffffff;
+}
+
+.regime-trading-settings-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.regime-trading-actions {
+  justify-content: flex-end;
+  color: #86198f;
+  padding-top: 2px;
+}
+
+.regime-trading-actions > span:last-child {
+  display: inline-flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.regime-trading-actions .secondary-action,
+.regime-trading-actions .primary-action {
+  border: 1px solid #2563eb;
+  border-radius: 5px;
+  background: #2563eb;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1.2;
+  padding: 7px 10px;
+  white-space: nowrap;
+}
+
+.regime-trading-actions .secondary-action:hover,
+.regime-trading-actions .primary-action:hover {
+  background: #1d4ed8;
+}
+
+.regime-trading-settings-panel .target-settings-panel {
+  background: #fdf4ff;
+  border-color: #f0abfc;
+}
+
+.regime-trading-settings-panel .target-settings-panel > strong,
+.regime-trading-settings-panel .target-settings-note,
+.regime-trading-settings-panel .target-settings-grid span {
+  color: #86198f;
 }
 
 .wca-switch-display {

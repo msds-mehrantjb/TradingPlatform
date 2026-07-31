@@ -32,6 +32,7 @@ EXPECTED_REQUIRED_STEP2_TABLES = (
     "regime_execution_outbox",
     "regime_orders",
     "regime_fills",
+    "regime_hypothetical_fills",
     "regime_positions",
     "regime_trades",
     "regime_reconciliation_events",
