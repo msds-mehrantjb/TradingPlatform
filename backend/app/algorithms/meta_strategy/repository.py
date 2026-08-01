@@ -85,6 +85,9 @@ META_STRATEGY_INVENTORY_TABLES = (
     "meta_strategy_inventory_daily_statistics",
     "meta_strategy_inventory_strategy_exposure",
     "meta_strategy_inventory_symbol_exposure",
+    "meta_strategy_inventory_family_exposure",
+    "meta_strategy_inventory_position_lifecycle",
+    "meta_strategy_inventory_quarantine",
     "meta_strategy_inventory_reconciliation_checkpoints",
     "meta_strategy_inventory_snapshots",
 )
@@ -103,6 +106,9 @@ META_STRATEGY_INVENTORY_QUERY_TABLES: dict[str, str] = {
     "daily_statistics": "meta_strategy_inventory_daily_statistics",
     "strategy_exposure": "meta_strategy_inventory_strategy_exposure",
     "symbol_exposure": "meta_strategy_inventory_symbol_exposure",
+    "family_exposure": "meta_strategy_inventory_family_exposure",
+    "position_lifecycle": "meta_strategy_inventory_position_lifecycle",
+    "quarantine": "meta_strategy_inventory_quarantine",
     "reconciliation_checkpoints": "meta_strategy_inventory_reconciliation_checkpoints",
     "snapshots": "meta_strategy_inventory_snapshots",
 }
@@ -172,6 +178,8 @@ class MetaStrategyInventoryLot:
     settings_version: str
     capital_partition_id: str
     correlation_id: str
+    strategy_id: str = "meta_strategy"
+    family: str = "UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -199,10 +207,12 @@ class MetaStrategyInventorySnapshot:
     open_lots: tuple[MetaStrategyInventoryLot, ...]
     realised_pnl: float
     unrealised_pnl: float
+    fees_and_slippage: float
     reserved_risk_dollars: float
     allocated_capital: float
     daily_trade_count: int
     strategy_exposure: dict[str, float]
+    family_exposure: dict[str, float]
     symbol_exposure: dict[str, float]
     reconciliation_checkpoint_id: str | None
     created_at: str
@@ -248,7 +258,8 @@ def apply_meta_strategy_persistence_migrations(conn: sqlite3.Connection) -> None
 
 
 class MetaStrategySqliteRepository:
-    def __init__(self, database_url: str | None = None) -> None:
+    def __init__(self, database_url: str | None = None, *, capital_partition_id: str = META_STRATEGY_DEFAULT_CAPITAL_PARTITION) -> None:
+        self.capital_partition_id = str(capital_partition_id)
         self.path = _sqlite_path(database_url or os.getenv("DATABASE_URL", "sqlite:///./data/trading.db"))
         migrate_meta_strategy_sqlite_database(self.path)
 
@@ -417,6 +428,8 @@ class MetaStrategySqliteRepository:
             self._insert_inventory_record(conn, "meta_strategy_inventory_order_status_history", normalized)
             if status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
                 self._release_reserved_risk(conn, normalized, reason=f"ORDER_{status}")
+            if status in {"UNKNOWN", "TIMEOUT", "RECONCILIATION_REQUIRED"}:
+                self._quarantine_inventory_record(conn, normalized, reason=f"ORDER_{status}")
             self._store_inventory_projection(conn, mark_prices={})
         return {"algorithmId": ALGORITHM_ID, "status": "RECORDED", "reasonCodes": ("meta_strategy.inventory.order_status_recorded",)}
 
@@ -451,6 +464,44 @@ class MetaStrategySqliteRepository:
             self._store_inventory_projection(conn, mark_prices={})
         return {"algorithmId": ALGORITHM_ID, "status": "RECORDED", "reasonCodes": ("meta_strategy.inventory.reconciliation_checkpoint_recorded",)}
 
+    def record_position_lifecycle(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = _normalize_inventory_payload(payload)
+        with self.connect() as conn:
+            self._insert_inventory_record(conn, "meta_strategy_inventory_position_lifecycle", normalized)
+        return {"algorithmId": ALGORITHM_ID, "status": "RECORDED", "reasonCodes": ("meta_strategy.inventory.position_lifecycle_recorded",)}
+
+    def latest_position_lifecycle(self, *, position_id: str | None = None, symbol: str | None = None) -> dict[str, Any] | None:
+        clauses = ["algorithm_id = ?"]
+        params: list[Any] = [ALGORITHM_ID]
+        if position_id:
+            clauses.append("json_extract(payload_json, '$.positionId') = ?")
+            params.append(position_id)
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol.upper())
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT record_id, algorithm_id, capital_partition_id, settings_version, correlation_id,
+                       decision_id, order_intent_id, client_order_id, broker_order_id, broker_fill_id,
+                       symbol, side, quantity, price, status, realised_pnl, timestamp, payload_json
+                FROM meta_strategy_inventory_position_lifecycle
+                WHERE {' AND '.join(clauses)}
+                ORDER BY timestamp DESC, created_at DESC, record_id DESC
+                LIMIT 1
+                """,
+                tuple(params),
+            ).fetchone()
+        if row is None:
+            return None
+        return _inventory_row_to_dict(row)
+
+    def record_quarantine(self, payload: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
+        normalized = _normalize_inventory_payload({**dict(payload), "quarantineReason": reason, "status": "QUARANTINED", "orderStatus": "QUARANTINED"})
+        with self.connect() as conn:
+            self._quarantine_inventory_record(conn, normalized, reason=reason)
+        return {"algorithmId": ALGORITHM_ID, "status": "QUARANTINED", "reasonCodes": ("meta_strategy.inventory.quarantined",)}
+
     def current_inventory_snapshot(self, *, mark_prices: Mapping[str, float] | None = None) -> MetaStrategyInventorySnapshot:
         with self.connect() as conn:
             snapshot = self._rebuild_inventory_from_ledger(conn, mark_prices=mark_prices or {})
@@ -472,6 +523,12 @@ class MetaStrategySqliteRepository:
                 stored = derived
             else:
                 stored = _snapshot_from_payload(json.loads(str(stored_row["payload_json"])))
+            if stored != derived:
+                self._quarantine_inventory_record(
+                    conn,
+                    _snapshot_payload(derived),
+                    reason="PROJECTION_MISMATCH",
+                )
         return {
             "algorithmId": ALGORITHM_ID,
             "consistent": stored == derived,
@@ -525,6 +582,10 @@ class MetaStrategySqliteRepository:
     def _insert_inventory_record(self, conn: sqlite3.Connection, table: str, payload: Mapping[str, Any], *, record_id: str | None = None) -> None:
         normalized = _normalize_inventory_payload(payload)
         metadata = _inventory_metadata(normalized)
+        if metadata["capital_partition_id"] != self.capital_partition_id:
+            raise MetaStrategyRepositoryAttributionError(
+                f"Meta-Strategy inventory partition mismatch: {metadata['capital_partition_id']} != {self.capital_partition_id}"
+            )
         payload_json = _json_dumps(normalized)
         persisted_record_id = record_id or _inventory_record_id(table, metadata, payload_json)
         conn.execute(
@@ -559,6 +620,10 @@ class MetaStrategySqliteRepository:
                 payload_json,
             ),
         )
+
+    def _quarantine_inventory_record(self, conn: sqlite3.Connection, payload: Mapping[str, Any], *, reason: str) -> None:
+        normalized = {**dict(payload), "quarantineReason": reason, "status": "QUARANTINED", "orderStatus": "QUARANTINED"}
+        self._insert_inventory_record(conn, "meta_strategy_inventory_quarantine", normalized)
 
     def _release_reserved_risk(self, conn: sqlite3.Connection, payload: Mapping[str, Any], *, reason: str) -> None:
         outstanding = self._reserved_risk_outstanding(conn, payload)
@@ -596,9 +661,9 @@ class MetaStrategySqliteRepository:
             """
             SELECT COALESCE(SUM(CAST(json_extract(payload_json, '$.reservedRiskDelta') AS REAL)), 0.0)
             FROM meta_strategy_inventory_reserved_risk
-            WHERE order_intent_id=? OR client_order_id=?
+            WHERE capital_partition_id=? AND (order_intent_id=? OR client_order_id=?)
             """,
-            (order_intent_id, client_order_id),
+            (self.capital_partition_id, order_intent_id, client_order_id),
         ).fetchone()
         return round(float(row[0] or 0.0), 10)
 
@@ -609,9 +674,9 @@ class MetaStrategySqliteRepository:
             """
             SELECT COALESCE(SUM(MAX(CAST(json_extract(payload_json, '$.reservedRiskDelta') AS REAL), 0.0)), 0.0)
             FROM meta_strategy_inventory_reserved_risk
-            WHERE order_intent_id=? OR client_order_id=?
+            WHERE capital_partition_id=? AND (order_intent_id=? OR client_order_id=?)
             """,
-            (order_intent_id, client_order_id),
+            (self.capital_partition_id, order_intent_id, client_order_id),
         ).fetchone()
         return round(float(row[0] or 0.0), 10)
 
@@ -622,29 +687,31 @@ class MetaStrategySqliteRepository:
             """
             SELECT COALESCE(SUM(quantity), 0.0)
             FROM meta_strategy_inventory_fills
-            WHERE side='BUY' AND (order_intent_id=? OR client_order_id=?)
+            WHERE capital_partition_id=? AND (order_intent_id=? OR client_order_id=?)
             """,
-            (order_intent_id, client_order_id),
+            (self.capital_partition_id, order_intent_id, client_order_id),
         ).fetchone()
         return round(float(row[0] or 0.0), 10)
 
     def _order_intent_quantity(self, conn: sqlite3.Connection, payload: Mapping[str, Any]) -> float:
         order_intent_id = _string_value(payload, "", "orderIntentId", "order_intent_id")
         row = conn.execute(
-            "SELECT quantity FROM meta_strategy_inventory_order_intents WHERE order_intent_id=? ORDER BY created_at DESC LIMIT 1",
-            (order_intent_id,),
+            "SELECT quantity FROM meta_strategy_inventory_order_intents WHERE capital_partition_id=? AND order_intent_id=? ORDER BY created_at DESC LIMIT 1",
+            (self.capital_partition_id, order_intent_id),
         ).fetchone()
         return float(row["quantity"]) if row is not None else 0.0
 
     def _reserved_risk_total(self, conn: sqlite3.Connection) -> float:
         row = conn.execute(
-            "SELECT COALESCE(SUM(CAST(json_extract(payload_json, '$.reservedRiskDelta') AS REAL)), 0.0) FROM meta_strategy_inventory_reserved_risk"
+            "SELECT COALESCE(SUM(CAST(json_extract(payload_json, '$.reservedRiskDelta') AS REAL)), 0.0) FROM meta_strategy_inventory_reserved_risk WHERE capital_partition_id=?",
+            (self.capital_partition_id,),
         ).fetchone()
         return round(max(0.0, float(row[0] or 0.0)), 10)
 
     def _allocated_capital(self, conn: sqlite3.Connection) -> float:
         row = conn.execute(
-            "SELECT payload_json FROM meta_strategy_inventory_allocated_capital ORDER BY timestamp DESC, created_at DESC LIMIT 1"
+            "SELECT payload_json FROM meta_strategy_inventory_allocated_capital WHERE capital_partition_id=? ORDER BY timestamp DESC, created_at DESC LIMIT 1",
+            (self.capital_partition_id,),
         ).fetchone()
         if row is None:
             return 0.0
@@ -653,19 +720,22 @@ class MetaStrategySqliteRepository:
 
     def _latest_reconciliation_checkpoint(self, conn: sqlite3.Connection) -> str | None:
         row = conn.execute(
-            "SELECT record_id FROM meta_strategy_inventory_reconciliation_checkpoints ORDER BY timestamp DESC, created_at DESC LIMIT 1"
+            "SELECT record_id FROM meta_strategy_inventory_reconciliation_checkpoints WHERE capital_partition_id=? ORDER BY timestamp DESC, created_at DESC LIMIT 1",
+            (self.capital_partition_id,),
         ).fetchone()
         return None if row is None else str(row["record_id"])
 
     def _rebuild_inventory_from_ledger(self, conn: sqlite3.Connection, *, mark_prices: Mapping[str, float]) -> MetaStrategyInventorySnapshot:
         fill_rows = conn.execute(
-            "SELECT rowid, * FROM meta_strategy_inventory_fills ORDER BY timestamp ASC, rowid ASC"
+            "SELECT rowid, * FROM meta_strategy_inventory_fills WHERE capital_partition_id=? ORDER BY timestamp ASC, rowid ASC",
+            (self.capital_partition_id,),
         ).fetchall()
         lots: list[dict[str, Any]] = []
         realised_pnl = 0.0
+        fees_and_slippage = 0.0
         daily_trade_count = 0
         latest_settings_version = "meta_strategy_settings_v1"
-        capital_partition_id = META_STRATEGY_DEFAULT_CAPITAL_PARTITION
+        capital_partition_id = self.capital_partition_id
         for row in fill_rows:
             payload = json.loads(str(row["payload_json"]))
             latest_settings_version = str(row["settings_version"])
@@ -674,6 +744,7 @@ class MetaStrategySqliteRepository:
             side = str(row["side"]).upper()
             qty = abs(float(row["quantity"]))
             price = float(row["price"])
+            fees_and_slippage += _fees_and_slippage(payload)
             if qty <= 0.0:
                 continue
             if side == "BUY":
@@ -705,6 +776,8 @@ class MetaStrategySqliteRepository:
                 settings_version=str(lot["settings_version"]),
                 capital_partition_id=str(lot["capital_partition_id"]),
                 correlation_id=str(lot["correlation_id"]),
+                strategy_id=str(lot.get("strategy_id") or "meta_strategy"),
+                family=str(lot.get("family") or "UNKNOWN"),
             )
             for lot in lots
             if abs(float(lot["quantity"])) > 1e-9
@@ -712,8 +785,11 @@ class MetaStrategySqliteRepository:
         positions = _positions_from_lots(open_lots, mark_prices)
         unrealised = round(sum(position.unrealised_pnl for position in positions), 10)
         reserved_risk = self._reserved_risk_total(conn)
-        allocated_capital = self._allocated_capital(conn)
+        position_notional = round(sum(abs(position.quantity * position.market_price) for position in positions), 10)
+        allocated_capital = max(self._allocated_capital(conn), position_notional)
         symbol_exposure = {position.symbol: round(position.quantity * position.market_price, 10) for position in positions}
+        strategy_exposure = _exposure_by_key(open_lots, mark_prices, "strategyId", default="meta_strategy")
+        family_exposure = _exposure_by_key(open_lots, mark_prices, "family", default="UNKNOWN")
         created_at = str(fill_rows[-1]["timestamp"]) if fill_rows else datetime.now(UTC).isoformat()
         checkpoint = self._latest_reconciliation_checkpoint(conn)
         return MetaStrategyInventorySnapshot(
@@ -726,10 +802,12 @@ class MetaStrategySqliteRepository:
             open_lots=open_lots,
             realised_pnl=round(realised_pnl, 10),
             unrealised_pnl=unrealised,
+            fees_and_slippage=round(fees_and_slippage, 10),
             reserved_risk_dollars=reserved_risk,
             allocated_capital=allocated_capital,
             daily_trade_count=daily_trade_count,
-            strategy_exposure={"meta_strategy": round(sum(abs(value) for value in symbol_exposure.values()), 10)},
+            strategy_exposure=strategy_exposure or {"meta_strategy": round(sum(abs(value) for value in symbol_exposure.values()), 10)},
+            family_exposure=family_exposure,
             symbol_exposure=symbol_exposure,
             reconciliation_checkpoint_id=checkpoint,
             created_at=created_at,
@@ -751,6 +829,7 @@ class MetaStrategySqliteRepository:
             "meta_strategy_inventory_daily_statistics",
             "meta_strategy_inventory_strategy_exposure",
             "meta_strategy_inventory_symbol_exposure",
+            "meta_strategy_inventory_family_exposure",
             "meta_strategy_inventory_snapshots",
         ):
             conn.execute(f"DELETE FROM {table}")
@@ -763,6 +842,8 @@ class MetaStrategySqliteRepository:
         self._insert_inventory_record(conn, "meta_strategy_inventory_daily_statistics", _projection_payload(current, {"dailyTradeCount": current.daily_trade_count, "realisedPnl": current.realised_pnl, "unrealisedPnl": current.unrealised_pnl}))
         for strategy_id, value in current.strategy_exposure.items():
             self._insert_inventory_record(conn, "meta_strategy_inventory_strategy_exposure", _projection_payload(current, {"strategyId": strategy_id, "exposure": value}))
+        for family, value in current.family_exposure.items():
+            self._insert_inventory_record(conn, "meta_strategy_inventory_family_exposure", _projection_payload(current, {"family": family, "exposure": value}))
         for symbol, value in current.symbol_exposure.items():
             self._insert_inventory_record(conn, "meta_strategy_inventory_symbol_exposure", _projection_payload(current, {"symbolExposure": value}, symbol=symbol))
         self._insert_inventory_record(conn, "meta_strategy_inventory_snapshots", _snapshot_payload(current), record_id=current.snapshot_id)
@@ -782,7 +863,7 @@ def _table_ddl(table: str) -> str:
             record_id TEXT PRIMARY KEY,
             artifact_type TEXT NOT NULL,
             algorithm_id TEXT NOT NULL CHECK(algorithm_id = 'meta_strategy'),
-            capital_partition_id TEXT NOT NULL,
+            capital_partition_id TEXT NOT NULL CHECK(capital_partition_id = '{META_STRATEGY_DEFAULT_CAPITAL_PARTITION}'),
             algorithm_version TEXT NOT NULL,
             configuration_version TEXT NOT NULL,
             settings_version TEXT NOT NULL,
@@ -822,7 +903,7 @@ def _inventory_table_ddl(table: str) -> str:
         CREATE TABLE IF NOT EXISTS {table} (
             record_id TEXT PRIMARY KEY,
             algorithm_id TEXT NOT NULL CHECK(algorithm_id = 'meta_strategy'),
-            capital_partition_id TEXT NOT NULL,
+            capital_partition_id TEXT NOT NULL CHECK(capital_partition_id = '{META_STRATEGY_DEFAULT_CAPITAL_PARTITION}'),
             settings_version TEXT NOT NULL,
             correlation_id TEXT NOT NULL,
             decision_id TEXT NOT NULL,
@@ -1028,7 +1109,8 @@ def _lot_payload(row: sqlite3.Row, payload: Mapping[str, Any], quantity: float, 
         "settings_version": str(row["settings_version"]),
         "capital_partition_id": str(row["capital_partition_id"]),
         "correlation_id": str(row["correlation_id"]),
-        "payload": dict(payload),
+        "strategy_id": _string_value(payload, "meta_strategy", "strategyId", "strategy_id"),
+        "family": _string_value(payload, "UNKNOWN", "family", "strategyFamily", "strategy_family"),
     }
 
 
@@ -1062,6 +1144,23 @@ def _positions_from_lots(open_lots: tuple[MetaStrategyInventoryLot, ...], mark_p
             )
         )
     return tuple(positions)
+
+
+def _fees_and_slippage(payload: Mapping[str, Any]) -> float:
+    return round(
+        _float_value(payload, "commission", "fees", "fee")
+        + _float_value(payload, "estimatedSlippage", "estimated_slippage", "slippage"),
+        10,
+    )
+
+
+def _exposure_by_key(open_lots: tuple[MetaStrategyInventoryLot, ...], mark_prices: Mapping[str, float], key: str, *, default: str) -> dict[str, float]:
+    exposure: dict[str, float] = {}
+    for lot in open_lots:
+        value = str(getattr(lot, "strategy_id" if key == "strategyId" else "family", default) or default)
+        mark = float(mark_prices.get(lot.symbol, lot.average_price))
+        exposure[value] = round(exposure.get(value, 0.0) + abs(float(lot.quantity) * mark), 10)
+    return exposure
 
 
 def _projection_payload(snapshot: MetaStrategyInventorySnapshot, payload: Mapping[str, Any], *, symbol: str = "PORTFOLIO") -> dict[str, Any]:
@@ -1104,14 +1203,39 @@ def _snapshot_from_payload(payload: Mapping[str, Any]) -> MetaStrategyInventoryS
         open_lots=tuple(MetaStrategyInventoryLot(**item) for item in data.get("open_lots", ())),
         realised_pnl=float(data["realised_pnl"]),
         unrealised_pnl=float(data["unrealised_pnl"]),
+        fees_and_slippage=float(data.get("fees_and_slippage", 0.0)),
         reserved_risk_dollars=float(data["reserved_risk_dollars"]),
         allocated_capital=float(data["allocated_capital"]),
         daily_trade_count=int(data["daily_trade_count"]),
         strategy_exposure={str(key): float(value) for key, value in dict(data.get("strategy_exposure", {})).items()},
+        family_exposure={str(key): float(value) for key, value in dict(data.get("family_exposure", {})).items()},
         symbol_exposure={str(key): float(value) for key, value in dict(data.get("symbol_exposure", {})).items()},
         reconciliation_checkpoint_id=data.get("reconciliation_checkpoint_id"),
         created_at=str(data["created_at"]),
     )
+
+
+def _inventory_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "recordId": str(row["record_id"]),
+        "algorithmId": str(row["algorithm_id"]),
+        "capitalPartitionId": str(row["capital_partition_id"]),
+        "settingsVersion": str(row["settings_version"]),
+        "correlationId": str(row["correlation_id"]),
+        "decisionId": str(row["decision_id"]),
+        "orderIntentId": str(row["order_intent_id"]),
+        "clientOrderId": str(row["client_order_id"]),
+        "brokerOrderId": str(row["broker_order_id"]),
+        "brokerFillId": str(row["broker_fill_id"]),
+        "symbol": str(row["symbol"]),
+        "side": str(row["side"]),
+        "quantity": float(row["quantity"]),
+        "price": float(row["price"]),
+        "status": str(row["status"]),
+        "realisedPnl": float(row["realised_pnl"]),
+        "timestamp": str(row["timestamp"]),
+        "payload": json.loads(str(row["payload_json"])),
+    }
 
 
 def _hash(value: Any) -> str:

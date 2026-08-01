@@ -160,7 +160,9 @@ class MetaStrategyPhase8RuntimePersistenceTest(unittest.TestCase):
 
 
 class ConfiguredPaperBroker:
+    broker_kind = "alpaca_paper"
     configured = True
+    paper_endpoint = True
 
     def submit(self, order_intent, *, mode: str):
         return {"status": "PAPER_ACCEPTED", "brokerOrderId": "paper-order", "filledQuantity": 0}

@@ -138,6 +138,9 @@ def _strategy_features(row: dict[str, Any]) -> dict[str, Any]:
         values[f"{prefix}_data_ready"] = _bool(output.get("dataReady") if output else None)
         values[f"{prefix}_regime_fit"] = output.get("regimeFit") if output else None
         values[f"{prefix}_reliability"] = output.get("reliability") if output else None
+        values[f"{prefix}_family"] = output.get("strategyFamily") or output.get("family") if output else None
+        values[f"{prefix}_evidence_quality"] = output.get("evidenceQuality") if output else None
+        values[f"{prefix}_correlation_adjusted_contribution"] = output.get("correlationAdjustedContribution") if output else None
         setup_detected = output.get("setupDetected") if output and "setupDetected" in output else output.get("signal") != "HOLD" if output else None
         values[f"{prefix}_setup_detected"] = _bool(setup_detected)
     return values
@@ -209,6 +212,7 @@ def _candidate_features(row: dict[str, Any], seeded: dict[str, Any]) -> dict[str
         "deterministic_score": deterministic.get("finalScore", seeded.get("deterministic_score")),
         "signal_margin": abs(float(deterministic.get("buyConfidence", 0.0)) - float(deterministic.get("sellConfidence", 0.0))) if deterministic else seeded.get("signal_margin"),
         "expected_transaction_cost": seeded.get("expected_transaction_cost"),
+        "current_meta_strategy_virtual_exposure": seeded.get("current_meta_strategy_virtual_exposure"),
     }
 
 

@@ -17,7 +17,7 @@ from backend.app.risk.types import AccountSnapshot, GlobalGateDecision as Portfo
 
 PAPER_ORDER_GATEWAY_VERSION = "paper_order_gateway_v1"
 SubmissionMode = Literal["manual", "automatic"]
-GatewayOrderStatus = Literal["NOT_SUBMITTED", "PENDING_SUBMISSION", "ACCEPTED", "REJECTED", "PARTIALLY_FILLED", "FILLED", "CANCELED", "DUPLICATE", "RECOVERED"]
+GatewayOrderStatus = Literal["NOT_SUBMITTED", "PENDING_SUBMISSION", "ACCEPTED", "REJECTED", "PARTIALLY_FILLED", "FILLED", "CANCELED", "DUPLICATE", "RECOVERED", "REPLACED"]
 
 
 class PaperGatewayBrokerAck(DomainModel):
@@ -76,9 +76,13 @@ class PaperOrderIntentRecord(DomainModel):
     globallyAllowedQuantity: int = Field(ge=0)
     submittedQuantity: int = Field(ge=0)
     triggerPrice: float | None = Field(default=None, gt=0)
+    orderType: str = Field(default="LIMIT", min_length=1)
+    timeInForce: str = Field(default="DAY", min_length=1)
     limitPrice: float | None = Field(default=None, gt=0)
     stopPrice: float | None = Field(default=None, gt=0)
+    stopLimitPrice: float | None = Field(default=None, gt=0)
     targetPrice: float | None = Field(default=None, gt=0)
+    profitTargetOrderType: str = Field(default="LIMIT", min_length=1)
     plannedRiskDollars: float = Field(ge=0)
     globalAction: str = Field(min_length=1)
     localGatePassed: bool
@@ -90,6 +94,10 @@ class PaperOrderIntentRecord(DomainModel):
     createdAt: datetime
     decisionTimestamp: datetime
     staleAfterSeconds: int = Field(default=300, ge=0)
+    cancelAndReplaceEnabled: bool = False
+    maxReplacementCount: int = Field(default=0, ge=0)
+    replacementCount: int = Field(default=0, ge=0)
+    protectiveExitEscalationPolicy: str = Field(default="CANCEL_AND_MARKETABLE_LIMIT", min_length=1)
 
     @field_validator("createdAt", "decisionTimestamp")
     @classmethod
@@ -165,7 +173,7 @@ class PaperOrderGateway:
         evaluated_at: datetime,
     ) -> PaperOrderGatewayResult:
         evaluated_at = _require_utc(evaluated_at)
-        client_order_id = deterministic_gateway_client_order_id(proposal)
+        client_order_id = _client_order_id_for_proposal(proposal)
         duplicate = _read_optional(self.store, _intent_key(proposal.orderIntentId)) is not None
         if duplicate:
             return self._result(proposal, client_order_id, mode, False, True, "DUPLICATE", ("paper_gateway.duplicate_intent",), "Duplicate order intent was not resubmitted.", evaluated_at)
@@ -354,9 +362,13 @@ class PaperOrderGateway:
             globallyAllowedQuantity=global_application.globallyAllowedQuantity,
             submittedQuantity=submitted_quantity,
             triggerPrice=proposal.triggerPrice,
+            orderType=str(proposal.entryFormula.get("orderType") or proposal.entryFormula.get("kind") or "LIMIT").upper(),
+            timeInForce=str(proposal.entryFormula.get("timeInForce") or proposal.settingsSnapshot.get("timeInForce") or "DAY").upper(),
             limitPrice=proposal.limitPrice,
             stopPrice=proposal.stopPrice,
+            stopLimitPrice=_optional_float(proposal.stopFormula.get("stopLimitPrice") or proposal.settingsSnapshot.get("stopLimitPrice")),
             targetPrice=proposal.targetPrice,
+            profitTargetOrderType=str(proposal.targetFormula.get("orderType") or "LIMIT").upper(),
             plannedRiskDollars=proposal.plannedRiskDollars,
             globalAction=global_application.action,
             localGatePassed=local_gate_passed,
@@ -364,7 +376,10 @@ class PaperOrderGateway:
             reasonCodes=("paper_gateway.intent_persisted_before_submission",),
             createdAt=evaluated_at,
             decisionTimestamp=proposal.proposedAt,
-            staleAfterSeconds=self.max_decision_age_seconds,
+            staleAfterSeconds=int(proposal.settingsSnapshot.get("maximumOrderAgeSeconds") or self.max_decision_age_seconds),
+            cancelAndReplaceEnabled=bool(proposal.settingsSnapshot.get("cancelAndReplaceEnabled") or False),
+            maxReplacementCount=int(proposal.settingsSnapshot.get("maximumReplacementCount") or 0),
+            protectiveExitEscalationPolicy=str(proposal.settingsSnapshot.get("protectiveExitEscalationPolicy") or "CANCEL_AND_MARKETABLE_LIMIT"),
         )
 
     def _evaluate_global_portfolio_risk(self, proposal: GlobalOrderProposal, intent: PaperOrderIntentRecord, evaluated_at: datetime) -> PortfolioGateDecision:
@@ -477,6 +492,13 @@ def deterministic_gateway_client_order_id(proposal: GlobalOrderProposal) -> str:
     return "paper-" + hashlib.sha256(json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
 
 
+def _client_order_id_for_proposal(proposal: GlobalOrderProposal) -> str:
+    configured = proposal.settingsSnapshot.get("clientOrderId") if isinstance(proposal.settingsSnapshot, dict) else None
+    if configured:
+        return str(configured)
+    return deterministic_gateway_client_order_id(proposal)
+
+
 def _protective_order(intent: PaperOrderIntentRecord, fill: PaperGatewayFill | None) -> PaperGatewayProtectiveOrder | None:
     if fill is None or fill.filledQuantity <= 0:
         return None
@@ -547,6 +569,12 @@ def _store_items(store: PaperOrderGatewayStore):
 
 def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
 
 
 def evaluated_error_time() -> str:

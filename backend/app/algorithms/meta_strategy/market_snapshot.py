@@ -266,6 +266,9 @@ def _derived_market_features(
 ) -> dict[str, Any]:
     atr_safe = float(atr_value or 0.0)
     opening = _opening_range(one_minute, decision_timestamp)
+    prior = _previous_day_levels(one_minute, decision_timestamp)
+    premarket = _premarket_levels(one_minute, decision_timestamp)
+    session = _session_levels(one_minute, decision_timestamp)
     latest = one_minute[-1]
     previous = one_minute[-2] if len(one_minute) >= 2 else latest
     recent = one_minute[-20:]
@@ -300,9 +303,22 @@ def _derived_market_features(
         "rejectionWickRatio": round(rejection_wick_ratio, 6),
         "openingRangeHigh": opening["high"],
         "openingRangeLow": opening["low"],
+        "openingRangeDurationMinutes": opening["durationMinutes"],
+        "previousDayHigh": prior["high"],
+        "previousDayLow": prior["low"],
+        "premarketHigh": premarket["high"],
+        "premarketLow": premarket["low"],
+        "sessionHigh": session["high"],
+        "sessionLow": session["low"],
+        "recentSwingHigh": recent_high,
+        "recentSwingLow": recent_low,
+        "marketStructureState": _market_structure_state(one_minute, last_price),
+        "realizedVolatilityPercentile": _realized_volatility_percentile(one_minute),
         "vwapRelationship": vwap_relationship,
         "vwapSlope": round(vwap_slope, 8),
         "bollingerWidthPercentile": round(width_percentile, 6),
+        "priorCompression": width_percentile <= 0.35,
+        "atrExpansion": _atr_expansion(one_minute),
         "gapTradeType": "continuation",
         "haltLuldState": "clear",
     }
@@ -319,7 +335,57 @@ def _opening_range(candles: tuple[MetaStrategySnapshotCandle, ...], decision_tim
     return {
         "high": max((candle.high for candle in source), default=None),
         "low": min((candle.low for candle in source), default=None),
+        "durationMinutes": len(source),
     }
+
+
+def _previous_day_levels(candles: tuple[MetaStrategySnapshotCandle, ...], decision_timestamp: datetime) -> dict[str, float | None]:
+    local_date = decision_timestamp.astimezone(candles[-1].timestamp.tzinfo).date()
+    prior_rows = [candle for candle in candles if candle.timestamp.date() < local_date]
+    return {"high": max((candle.high for candle in prior_rows), default=None), "low": min((candle.low for candle in prior_rows), default=None)}
+
+
+def _premarket_levels(candles: tuple[MetaStrategySnapshotCandle, ...], decision_timestamp: datetime) -> dict[str, float | None]:
+    local_date = decision_timestamp.astimezone(candles[-1].timestamp.tzinfo).date()
+    rows = [candle for candle in candles if candle.timestamp.date() == local_date and 8 <= candle.timestamp.hour < 14]
+    return {"high": max((candle.high for candle in rows), default=None), "low": min((candle.low for candle in rows), default=None)}
+
+
+def _session_levels(candles: tuple[MetaStrategySnapshotCandle, ...], decision_timestamp: datetime) -> dict[str, float | None]:
+    local_date = decision_timestamp.astimezone(candles[-1].timestamp.tzinfo).date()
+    rows = [candle for candle in candles if candle.timestamp.date() == local_date and candle.timestamp <= decision_timestamp]
+    return {"high": max((candle.high for candle in rows), default=None), "low": min((candle.low for candle in rows), default=None)}
+
+
+def _market_structure_state(candles: tuple[MetaStrategySnapshotCandle, ...], last_price: float) -> str:
+    recent = candles[-20:]
+    if len(recent) < 3:
+        return "unknown"
+    midpoint = (max(candle.high for candle in recent) + min(candle.low for candle in recent)) / 2
+    if last_price > midpoint and recent[-1].close > recent[-2].close:
+        return "higher_high_higher_low"
+    if last_price < midpoint and recent[-1].close < recent[-2].close:
+        return "lower_low_lower_high"
+    return "range"
+
+
+def _realized_volatility_percentile(candles: tuple[MetaStrategySnapshotCandle, ...]) -> float:
+    closes = close_values(candles)
+    if len(closes) < 20:
+        return 0.5
+    returns = [abs((closes[index] - closes[index - 1]) / closes[index - 1]) for index in range(1, len(closes)) if closes[index - 1]]
+    if not returns:
+        return 0.5
+    current = sum(returns[-10:]) / min(10, len(returns))
+    return sum(1 for value in returns if value <= current) / len(returns)
+
+
+def _atr_expansion(candles: tuple[MetaStrategySnapshotCandle, ...]) -> bool:
+    if len(candles) < 30:
+        return False
+    current = atr(candles[-14:], 5)
+    prior = atr(candles[-28:-14], 5)
+    return bool(current is not None and prior is not None and current > prior * 1.15)
 
 
 def _atr_distance(left: float, right: float, atr_value: float) -> float:

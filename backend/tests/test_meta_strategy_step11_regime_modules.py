@@ -83,9 +83,10 @@ class MetaStrategyStep11RegimeModulesTest(unittest.TestCase):
         adx_result = strategy_for("adx_atr_regime_classifier").evaluate(snapshot_fixture(adx={"1m": 38.0}, moving_averages={"1m": {"ema20": 102.0, "ema50": 100.0}}))
         atr_result = strategy_for("adx_atr_regime_classifier").evaluate(snapshot_fixture(atr={"1m": 5.0}, relative_volume={"1m": 3.0}, economic_event_state={"state": "blocked", "active": True}))
 
-        self.assertTrue(adx_result.evidence["regimeLabel"].startswith("strong_trend."))
+        self.assertEqual(adx_result.evidence["regimeLabel"], "TREND_UP")
         self.assertEqual(adx_result.evidence["direction"], 1)
         self.assertGreater(adx_result.evidence["strategyFit"]["TREND"], adx_result.evidence["strategyFit"]["MEAN_REVERSION"])
+        self.assertEqual(atr_result.evidence["regimeLabel"], "EVENT_RISK")
         self.assertEqual(atr_result.evidence["volatility"], "EXTREME")
         self.assertLessEqual(atr_result.evidence["strategyFit"]["TREND"], 0.6)
 

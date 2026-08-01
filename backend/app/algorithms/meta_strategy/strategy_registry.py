@@ -16,6 +16,14 @@ from backend.app.algorithms.meta_strategy.versions import META_STRATEGY_STRATEGY
 META_STRATEGY_REGISTRY_VERSION = "meta_strategy_registry_v1"
 META_STRATEGY_STRATEGY_VERSION = "meta_strategy_strategy_v1"
 META_STRATEGY_STRATEGY_PACKAGE = "backend.app.algorithms.meta_strategy.strategies"
+META_STRATEGY_DIRECTIONAL_CORRELATION_GROUPS = (
+    "trend_alignment",
+    "trend_pullback",
+    "breakout_expansion",
+    "failed_breakout_reversal",
+    "mean_reversion",
+    "gap_session",
+)
 MetaStrategyModuleLifecycleStatus = Literal["active", "shadow", "disabled", "unavailable", "not_data_ready", "deprecated_alias"]
 MetaStrategyStrategyMode = Literal["ACTIVE", "SHADOW", "DISABLED"]
 
@@ -135,8 +143,15 @@ def validate_meta_strategy_registry(entries: tuple[MetaStrategyRegistryEntry, ..
     duplicate_ids = tuple(sorted(strategy_id for strategy_id in set(strategy_ids) if strategy_ids.count(strategy_id) > 1))
     foreign = tuple(entry.strategy_id for entry in entries if entry.algorithm_id != ALGORITHM_ID or not entry.implementation_module.startswith(META_STRATEGY_STRATEGY_PACKAGE))
     alias_targets = tuple(sorted(target for target in META_STRATEGY_ALIAS_MAP.values() if target not in strategy_ids))
+    invalid_directional_correlation_groups = tuple(
+        sorted(
+            entry.strategy_id
+            for entry in entries
+            if entry.role == MetaStrategyRole.DIRECTIONAL and entry.correlation_group not in META_STRATEGY_DIRECTIONAL_CORRELATION_GROUPS
+        )
+    )
     input_contracts = validate_required_input_producers(entries)
-    valid = not duplicate_ids and not foreign and not alias_targets and input_contracts["valid"]
+    valid = not duplicate_ids and not foreign and not alias_targets and not invalid_directional_correlation_groups and input_contracts["valid"]
     return {
         "algorithmId": ALGORITHM_ID,
         "registryVersion": META_STRATEGY_REGISTRY_VERSION,
@@ -146,6 +161,7 @@ def validate_meta_strategy_registry(entries: tuple[MetaStrategyRegistryEntry, ..
         "duplicateStrategyIds": duplicate_ids,
         "foreignImplementations": foreign,
         "missingAliasTargets": alias_targets,
+        "invalidDirectionalCorrelationGroups": invalid_directional_correlation_groups,
         "missingRequiredInputProducers": input_contracts["missingProducers"],
         "reasonCodes": ("meta_strategy.registry.valid" if valid else "meta_strategy.registry.invalid",),
     }
@@ -257,18 +273,18 @@ DIRECTIONAL_DIRECTIONS = (MetaStrategyDirection.BUY, MetaStrategyDirection.SELL,
 CONTEXT_DIRECTIONS = (MetaStrategyDirection.HOLD,)
 
 DIRECTIONAL_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (
-    _entry("multi_timeframe_trend_alignment", "Multi-Timeframe Trend Alignment", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.TREND, "trend_continuation", ("candles", "moving_averages", "vwap", "atr", "adx"), 50, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.multi_timeframe_trend_alignment", "MultiTimeframeTrendAlignmentStrategy"),
-    _entry("first_pullback_after_open", "First Pullback After Open", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.TREND, "trend_continuation", ("candles", "session_phase", "vwap", "relative_volume", "pullbackDepthAtr"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.first_pullback_after_open", "FirstPullbackAfterOpenStrategy", supported_sessions=("OPENING", "MORNING")),
-    _entry("opening_range_breakout", "Opening Range Breakout", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.BREAKOUT, "breakout", ("candles", "atr", "relative_volume", "spread", "liquidity", "openingRangeHigh", "openingRangeLow"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.opening_range_breakout", "OpeningRangeBreakoutStrategy", supported_sessions=("OPENING", "MORNING")),
-    _entry("vwap_trend_continuation", "VWAP Trend Continuation", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.TREND, "trend_continuation", ("candles", "vwap", "moving_averages", "relative_volume", "vwap_relationship", "vwap_slope"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.vwap_trend_continuation", "VwapTrendContinuationStrategy"),
-    _entry("volatility_breakout", "Volatility Breakout", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.BREAKOUT, "breakout", ("candles", "atr", "bollinger_bands", "bollingerWidthPercentile", "relative_volume", "spread"), 50, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.volatility_breakout", "VolatilityBreakoutStrategy"),
-    _entry("failed_breakout_reversal", "Failed Breakout Reversal", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.REVERSAL, "failed_breakout_reversal", ("candles", "atr", "spread", "liquidity", "failedBreakoutSide"), 40, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.failed_breakout_reversal", "FailedBreakoutReversalStrategy", aliases=("Failed Breakout Strategy", "Failed Breakout Reversal")),
+    _entry("multi_timeframe_trend_alignment", "Multi-Timeframe Trend Alignment", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.TREND, "trend_alignment", ("candles", "moving_averages", "moving_average_slope", "market_structure", "vwap", "atr", "adx", "reward_to_risk"), 50, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.multi_timeframe_trend_alignment", "MultiTimeframeTrendAlignmentStrategy"),
+    _entry("first_pullback_after_open", "First Pullback After Open", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.TREND, "trend_pullback", ("candles", "session_phase", "vwap", "relative_volume", "pullbackDepthAtr"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.first_pullback_after_open", "FirstPullbackAfterOpenStrategy", supported_sessions=("OPENING", "MORNING")),
+    _entry("opening_range_breakout", "Opening Range Breakout", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.BREAKOUT, "breakout_expansion", ("candles", "atr", "relative_volume", "spread", "liquidity", "opening_range"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.opening_range_breakout", "OpeningRangeBreakoutStrategy", supported_sessions=("OPENING", "MORNING")),
+    _entry("vwap_trend_continuation", "VWAP Trend Continuation", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.TREND, "trend_alignment", ("candles", "vwap", "moving_averages", "market_structure", "relative_volume", "vwap_relationship", "vwap_slope"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.vwap_trend_continuation", "VwapTrendContinuationStrategy"),
+    _entry("volatility_breakout", "Volatility Breakout", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.BREAKOUT, "breakout_expansion", ("candles", "atr", "bollinger_bands", "bollingerWidthPercentile", "relative_volume", "spread", "liquidity"), 50, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.volatility_breakout", "VolatilityBreakoutStrategy"),
+    _entry("failed_breakout_reversal", "Failed Breakout Reversal", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.REVERSAL, "failed_breakout_reversal", ("candles", "atr", "spread", "liquidity", "failedBreakoutSide", "opening_range", "session_levels", "recent_swing_levels"), 40, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.failed_breakout_reversal", "FailedBreakoutReversalStrategy", aliases=("Failed Breakout Strategy", "Failed Breakout Reversal")),
     _entry("bollinger_atr_reversion", "Bollinger/ATR Reversion", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.MEAN_REVERSION, "mean_reversion", ("candles", "bollinger_bands", "atr", "adx", "rsi", "rejectionWickRatio"), 50, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.bollinger_atr_reversion", "BollingerAtrReversionStrategy", aliases=("Bollinger Band Reversion", "ATR Overextension Reversion", "Bollinger/ATR Reversion")),
     _entry("vwap_mean_reversion", "VWAP Mean Reversion", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.MEAN_REVERSION, "mean_reversion", ("candles", "vwap", "atr", "adx", "rsi", "volume", "vwap_relationship", "reclaimDistanceAtr"), 40, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.vwap_mean_reversion", "VwapMeanReversionStrategy"),
-    _entry("liquidity_sweep_reversal", "Liquidity Sweep Reversal", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.REVERSAL, "failed_breakout_reversal", ("candles", "liquidity", "spread", "volume", "sweepSide"), 40, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.liquidity_sweep_reversal", "LiquiditySweepReversalStrategy", mode="SHADOW"),
+    _entry("liquidity_sweep_reversal", "Liquidity Sweep Reversal", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.REVERSAL, "failed_breakout_reversal", ("candles", "liquidity", "spread", "volume", "sweepSide", "microstructure_evidence"), 40, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.liquidity_sweep_reversal", "LiquiditySweepReversalStrategy", mode="SHADOW"),
     _entry("gap_continuation", "Gap Continuation", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.GAP_SESSION, "gap_session", ("candles", "gap_state", "session_phase", "qqq_iwm_context", "economic_event_state"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.gap_continuation", "GapContinuationStrategy", mode="SHADOW", supported_sessions=("OPENING", "MORNING")),
     _entry("gap_fade", "Gap Fade", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.GAP_SESSION, "gap_session", ("candles", "gap_state", "session_phase", "qqq_iwm_context", "economic_event_state"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.gap_fade", "GapFadeStrategy", mode="SHADOW", supported_sessions=("OPENING", "MORNING")),
-    _entry("economic_event_reaction", "Economic Event Reaction", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.EVENT_DRIVEN, "event_driven", ("candles", "economic_event_state", "session_phase", "spread", "relative_volume"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.economic_event_reaction", "EconomicEventReactionStrategy", mode="SHADOW", supported_sessions=("PREMARKET", "OPENING", "MORNING", "MIDDAY", "AFTERNOON")),
+    _entry("economic_event_reaction", "Economic Event Reaction", MetaStrategyRole.DIRECTIONAL, MetaStrategyFamily.EVENT_DRIVEN, "gap_session", ("candles", "economic_event_state", "session_phase", "spread", "relative_volume"), 30, DIRECTIONAL_DIRECTIONS, f"{META_STRATEGY_STRATEGY_PACKAGE}.directional.economic_event_reaction", "EconomicEventReactionStrategy", mode="SHADOW", supported_sessions=("PREMARKET", "OPENING", "MORNING", "MIDDAY", "AFTERNOON")),
 )
 
 CONTEXT_STRATEGIES: tuple[MetaStrategyRegistryEntry, ...] = (

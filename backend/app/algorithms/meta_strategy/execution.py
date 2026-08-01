@@ -5,12 +5,18 @@ import json
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from enum import Enum
+from time import perf_counter
 from typing import Any
 
 from backend.app.algorithms.meta_strategy.identity import ALGORITHM_ID
 from backend.app.algorithms.meta_strategy.jobs import MetaStrategyJobRepository
 from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 from backend.app.algorithms.meta_strategy.repository import MetaStrategySqliteRepository
+from backend.app.algorithms.meta_strategy.versions import (
+    META_STRATEGY_FEATURE_SCHEMA_VERSION,
+    META_STRATEGY_MODEL_VERSION,
+    META_STRATEGY_STRATEGY_CATALOG_VERSION,
+)
 from backend.app.domain.models import Signal
 from backend.app.execution import PaperOrderGateway, PaperOrderGatewayResult
 from backend.app.gates import GlobalGateResponse, GlobalOrderProposal, apply_global_gate_response
@@ -120,10 +126,13 @@ def submit_meta_strategy_outbox_record(
     if not str(payload.get("settingsVersion") or outbox_record.get("settingsVersion") or ""):
         return _reject(repository, inventory_repository, outbox_id, payload, "meta_strategy.execution.settings_version_required", evaluated_at)
 
+    client_order_id = deterministic_meta_strategy_client_order_id(payload)
+    payload = {**payload, "clientOrderId": client_order_id}
     proposal = build_meta_strategy_global_order_proposal(payload, evaluated_at=evaluated_at)
     response = _global_risk_response(global_risk_source, proposal, evaluated_at=evaluated_at)
     application = apply_global_gate_response(proposal, response)
-    if application.globallyAllowedQuantity <= 0 or application.action in {"REJECT_NEW_ENTRY", "EXIT_ONLY", "EMERGENCY_LIQUIDATE"}:
+    proposal_intent = str(proposal.intent)
+    if application.globallyAllowedQuantity <= 0 or application.action == "EMERGENCY_LIQUIDATE" or (proposal_intent == "new_entry" and application.action in {"REJECT_NEW_ENTRY", "EXIT_ONLY"}):
         rejected_payload = {**payload, "reservedRiskDollars": 0.0, "globalApplication": application.model_dump(mode="json")}
         inventory_repository.record_order_intent(rejected_payload)
         inventory_repository.record_order_status({**rejected_payload, "orderStatus": "REJECTED", "status": "REJECTED", "timestamp": evaluated_at.isoformat()})
@@ -138,9 +147,10 @@ def submit_meta_strategy_outbox_record(
     reserved = min(float(payload.get("reservedRiskDollars") or payload.get("reserved_risk_dollars") or proposal.plannedRiskDollars), application.maximumAdditionalRiskDollars)
     intent_payload = {
         **payload,
+        **_identity_envelope(payload),
         "quantity": application.globallyAllowedQuantity,
         "reservedRiskDollars": reserved,
-        "clientOrderId": deterministic_meta_strategy_client_order_id(payload),
+        "clientOrderId": client_order_id,
         "globalApplication": application.model_dump(mode="json"),
         "timestamp": evaluated_at.isoformat(),
     }
@@ -152,6 +162,7 @@ def submit_meta_strategy_outbox_record(
         client_order_id=intent_payload["clientOrderId"],
         now=evaluated_at,
     )
+    submission_started = perf_counter()
     try:
         gateway_result = paper_gateway.submit(
             proposal=proposal,
@@ -160,30 +171,51 @@ def submit_meta_strategy_outbox_record(
             mode="automatic",
             evaluated_at=evaluated_at,
         )
+        order_submission_time_ms = int((perf_counter() - submission_started) * 1000)
     except TimeoutError as exc:
+        order_submission_time_ms = int((perf_counter() - submission_started) * 1000)
         repository.update_execution_outbox(
             outbox_id,
             status="RECONCILIATION_REQUIRED",
-            payload={**intent_payload, "reasonCodes": ["meta_strategy.execution.broker_timeout_no_fill_assumed"]},
+            payload={
+                **intent_payload,
+                "reasonCodes": ["meta_strategy.execution.broker_timeout_no_fill_assumed"],
+                "latencyMeasurements": {**dict(intent_payload.get("latencyMeasurements") or {}), "orderSubmissionTimeMs": order_submission_time_ms},
+            },
             client_order_id=intent_payload["clientOrderId"],
             retryable=False,
             error_category="TimeoutError",
             error_details=str(exc),
             now=evaluated_at,
         )
-        return {"status": "RECONCILIATION_REQUIRED", "submitted": False, "reasonCodes": ("meta_strategy.execution.broker_timeout_no_fill_assumed",)}
+        return {
+            "status": "RECONCILIATION_REQUIRED",
+            "submitted": False,
+            "latencyMeasurements": {"orderSubmissionTimeMs": order_submission_time_ms},
+        "reasonCodes": ("meta_strategy.execution.broker_timeout_no_fill_assumed",),
+        }
     except Exception as exc:
+        order_submission_time_ms = int((perf_counter() - submission_started) * 1000)
         repository.update_execution_outbox(
             outbox_id,
             status="RETRY",
-            payload={**intent_payload, "reasonCodes": ["meta_strategy.execution.retryable_broker_error"]},
+            payload={
+                **intent_payload,
+                "reasonCodes": ["meta_strategy.execution.retryable_broker_error"],
+                "latencyMeasurements": {**dict(intent_payload.get("latencyMeasurements") or {}), "orderSubmissionTimeMs": order_submission_time_ms},
+            },
             client_order_id=intent_payload["clientOrderId"],
             retryable=True,
             error_category=type(exc).__name__,
             error_details=str(exc),
             now=evaluated_at,
         )
-        return {"status": "RETRY", "submitted": False, "reasonCodes": ("meta_strategy.execution.retryable_broker_error",)}
+        return {
+            "status": "RETRY",
+            "submitted": False,
+            "latencyMeasurements": {"orderSubmissionTimeMs": order_submission_time_ms},
+            "reasonCodes": ("meta_strategy.execution.retryable_broker_error",),
+        }
 
     result_payload = gateway_result.model_dump(mode="json")
     status = _outbox_status_from_gateway(gateway_result)
@@ -197,17 +229,28 @@ def submit_meta_strategy_outbox_record(
             "timestamp": evaluated_at.isoformat(),
         }
     )
+    _enqueue_position_management_after_execution(repository, intent_payload, trigger=f"order_status_{status.lower()}", now=evaluated_at)
     repository.update_execution_outbox(
         outbox_id,
         status=status,
-        payload={**intent_payload, "gatewayResult": result_payload, "reasonCodes": list(gateway_result.reasonCodes)},
+        payload={
+            **intent_payload,
+            "gatewayResult": result_payload,
+            "reasonCodes": list(gateway_result.reasonCodes),
+            "latencyMeasurements": {**dict(intent_payload.get("latencyMeasurements") or {}), "orderSubmissionTimeMs": order_submission_time_ms},
+        },
         client_order_id=gateway_result.clientOrderId,
         broker_order_id=broker_order_id,
         now=evaluated_at,
     )
     if gateway_result.fill and gateway_result.fill.filledQuantity > 0:
-        _apply_fill_event(repository, inventory_repository, outbox_id, gateway_result.fill.model_dump(mode="json"), evaluated_at=evaluated_at)
-    return {"status": status, "submitted": gateway_result.submitted, "reasonCodes": tuple(gateway_result.reasonCodes)}
+        _apply_fill_event(repository, inventory_repository, outbox_id, {**intent_payload, **gateway_result.fill.model_dump(mode="json")}, evaluated_at=evaluated_at)
+    return {
+        "status": status,
+        "submitted": gateway_result.submitted,
+        "latencyMeasurements": {"orderSubmissionTimeMs": order_submission_time_ms},
+        "reasonCodes": tuple(gateway_result.reasonCodes),
+    }
 
 
 def reconcile_meta_strategy_paper_orders(
@@ -274,30 +317,63 @@ def cancel_stale_meta_strategy_paper_orders(
         client_order_id = str(outbox.get("clientOrderId") or "")
         if not client_order_id:
             continue
+        payload = dict(outbox["payload"])
+        replacement = _try_replace_stale_order(paper_gateway, outbox, payload)
+        if replacement is not None:
+            replaced_payload = {
+                **payload,
+                "replacementCount": int(payload.get("replacementCount") or 0) + 1,
+                "replacementEvent": replacement,
+                "reasonCodes": ["meta_strategy.execution.stale_order_replaced"],
+            }
+            repository.update_execution_outbox(
+                outbox["outboxId"],
+                status="REPLACED",
+                payload=replaced_payload,
+                client_order_id=str(replacement.get("clientOrderId") or client_order_id),
+                broker_order_id=str(replacement.get("brokerOrderId") or outbox.get("brokerOrderId") or ""),
+                now=evaluated_at,
+            )
+            inventory_repository.record_order_status({**replaced_payload, "clientOrderId": client_order_id, "orderStatus": "REPLACED", "status": "REPLACED", "timestamp": evaluated_at.isoformat()})
+            repository.record_reconciliation_evidence("STALE_ORDER_REPLACEMENT", replaced_payload, client_order_id=client_order_id, order_intent_id=str(outbox["orderIntentId"]), status="REPLACED", now=evaluated_at)
+            continue
         ok = paper_gateway.broker.cancel_order(client_order_id)
         status = "CANCELLED" if ok else "RECONCILIATION_REQUIRED"
-        payload = {**outbox["payload"], "reasonCodes": ["meta_strategy.execution.stale_order_cancelled" if ok else "meta_strategy.execution.stale_order_cancel_unknown"]}
-        repository.update_execution_outbox(outbox["outboxId"], status=status, payload=payload, now=evaluated_at)
-        inventory_repository.record_order_status({**payload, "clientOrderId": client_order_id, "orderStatus": "CANCELLED" if ok else "UNKNOWN", "status": "CANCELLED" if ok else "UNKNOWN", "timestamp": evaluated_at.isoformat()})
-        repository.record_reconciliation_evidence("STALE_ORDER_CANCELLATION", payload, client_order_id=client_order_id, order_intent_id=str(outbox["orderIntentId"]), status=status, now=evaluated_at)
+        cancelled_payload = {**payload, "reasonCodes": ["meta_strategy.execution.stale_order_cancelled" if ok else "meta_strategy.execution.stale_order_cancel_unknown"]}
+        repository.update_execution_outbox(outbox["outboxId"], status=status, payload=cancelled_payload, now=evaluated_at)
+        inventory_repository.record_order_status({**cancelled_payload, "clientOrderId": client_order_id, "orderStatus": "CANCELLED" if ok else "UNKNOWN", "status": "CANCELLED" if ok else "UNKNOWN", "timestamp": evaluated_at.isoformat()})
+        repository.record_reconciliation_evidence("STALE_ORDER_CANCELLATION", cancelled_payload, client_order_id=client_order_id, order_intent_id=str(outbox["orderIntentId"]), status=status, now=evaluated_at)
         cancelled += 1 if ok else 0
     return {"status": "OK", "cancelled": cancelled, "reasonCodes": ("meta_strategy.execution.stale_order_cancellation_completed",)}
 
 
 def build_meta_strategy_global_order_proposal(payload: Mapping[str, Any], *, evaluated_at: datetime) -> GlobalOrderProposal:
+    envelope = _identity_envelope(payload)
     side = _signal(payload.get("side"))
     quantity = max(0, int(payload.get("quantity") or 0))
-    settings_version = str(payload.get("settingsVersion") or payload.get("settings_version") or "")
+    settings_version = envelope["settingsVersion"]
+    effective_settings_hash = envelope["effectiveSettingsHash"]
     proposed_at = _as_utc(_parse_datetime(payload.get("createdAt") or payload.get("timestamp"), evaluated_at))
     price = _positive_float(payload.get("limitPrice") or payload.get("entryPrice") or payload.get("price") or 0.01)
     stop = _optional_positive(payload.get("stopPrice"))
     target = _optional_positive(payload.get("targetPrice"))
+    client_order_id = str(payload.get("clientOrderId") or deterministic_meta_strategy_client_order_id(payload))
+    order_type = _order_type(payload)
+    time_in_force = str(payload.get("timeInForce") or payload.get("time_in_force") or payload.get("timeInForcePolicy") or "DAY").upper()
+    stop_limit_price = _optional_positive(payload.get("stopLimitPrice") or payload.get("stop_limit_price"))
+    replacement_count = int(payload.get("replacementCount") or payload.get("replacement_count") or 0)
+    maximum_order_age_seconds = int(payload.get("maximumOrderAgeSeconds") or payload.get("maxOrderAgeSeconds") or payload.get("staleAfterSeconds") or 300)
+    maximum_replacement_count = int(payload.get("maximumReplacementCount") or payload.get("maxReplacementCount") or 0)
     proposal_hash = _hash_json(
         {
             "algorithmId": ALGORITHM_ID,
             "decisionId": payload.get("decisionId"),
             "orderIntentId": payload.get("orderIntentId"),
             "settingsVersion": settings_version,
+            "effectiveSettingsHash": effective_settings_hash,
+            "strategyCatalogVersion": envelope["strategyCatalogVersion"],
+            "featureSchemaVersion": envelope["featureSchemaVersion"],
+            "modelVersion": envelope["modelVersion"],
             "quantity": quantity,
             "price": price,
             "stop": stop,
@@ -306,10 +382,10 @@ def build_meta_strategy_global_order_proposal(payload: Mapping[str, Any], *, eva
     )
     return GlobalOrderProposal(
         algorithmId=ALGORITHM_ID,
-        capitalPartitionId=str(payload.get("capitalPartitionId") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),
-        decisionId=str(payload.get("decisionId") or ""),
-        orderIntentId=str(payload.get("orderIntentId") or payload.get("order_intent_id") or ""),
-        intent="new_entry",
+        capitalPartitionId=envelope["capitalPartitionId"],
+        decisionId=envelope["decisionId"],
+        orderIntentId=envelope["orderIntentId"],
+        intent=_proposal_intent(payload),
         symbol=str(payload.get("symbol") or "UNKNOWN").upper(),
         side=side,
         quantity=quantity,
@@ -318,10 +394,27 @@ def build_meta_strategy_global_order_proposal(payload: Mapping[str, Any], *, eva
         stopPrice=stop,
         targetPrice=target,
         plannedRiskDollars=float(payload.get("reservedRiskDollars") or payload.get("riskDollars") or 0.0),
-        settingsSnapshot={"settingsVersion": settings_version, "paperOnly": True},
-        entryFormula={"kind": "bracket_limit", "timeInForce": "day"},
-        stopFormula={"stopPrice": stop, "policy": "protective_stop"},
-        targetFormula={"targetPrice": target, "policy": "limit_target"},
+        settingsSnapshot={
+            "settingsVersion": settings_version,
+            "effectiveSettingsHash": effective_settings_hash,
+            "strategyCatalogVersion": envelope["strategyCatalogVersion"],
+            "featureSchemaVersion": envelope["featureSchemaVersion"],
+            "modelVersion": envelope["modelVersion"],
+            "correlationId": envelope["correlationId"],
+            "paperOnly": True,
+            "clientOrderId": client_order_id,
+            "orderType": order_type,
+            "timeInForce": time_in_force,
+            "stopLimitPrice": stop_limit_price,
+            "cancelAndReplaceEnabled": bool(payload.get("cancelAndReplaceEnabled") or payload.get("cancel_and_replace_enabled") or False),
+            "maximumOrderAgeSeconds": maximum_order_age_seconds,
+            "maximumReplacementCount": maximum_replacement_count,
+            "replacementCount": replacement_count,
+            "protectiveExitEscalationPolicy": str(payload.get("protectiveExitEscalationPolicy") or payload.get("protective_exit_escalation_policy") or "CANCEL_AND_MARKETABLE_LIMIT"),
+        },
+        entryFormula={"kind": "bracket_limit", "orderType": order_type, "timeInForce": time_in_force},
+        stopFormula={"stopPrice": stop, "stopLimitPrice": stop_limit_price, "policy": "protective_stop"},
+        targetFormula={"targetPrice": target, "orderType": "LIMIT", "policy": "limit_target"},
         strategyStateHash=proposal_hash,
         proposedAt=proposed_at,
         sessionDate=proposed_at.date(),
@@ -330,14 +423,17 @@ def build_meta_strategy_global_order_proposal(payload: Mapping[str, Any], *, eva
 
 
 def deterministic_meta_strategy_client_order_id(payload: Mapping[str, Any]) -> str:
+    partition = str(payload.get("capitalPartitionId") or payload.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
     stable = {
         "algorithmId": ALGORITHM_ID,
+        "capitalPartitionId": partition,
         "decisionId": payload.get("decisionId"),
         "orderIntentId": payload.get("orderIntentId") or payload.get("order_intent_id"),
         "symbol": str(payload.get("symbol") or "").upper(),
         "side": str(payload.get("side") or "").upper(),
     }
-    return "meta-paper-" + hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:18]
+    partition_slug = "".join(ch if ch.isalnum() else "-" for ch in partition.lower()).strip("-")
+    return "meta-strategy-" + partition_slug[:24] + "-" + hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:18]
 
 
 def _apply_broker_event(
@@ -367,7 +463,7 @@ def _apply_broker_event(
         mapped = "REPLACED"
     else:
         mapped = "RECONCILIATION_REQUIRED"
-    payload = {**outbox["payload"], "brokerEvent": dict(event), "reasonCodes": [f"meta_strategy.execution.broker_event_{mapped.lower()}"]}
+    payload = {**outbox["payload"], **_identity_envelope(outbox["payload"]), "brokerEvent": dict(event), "reasonCodes": [f"meta_strategy.execution.broker_event_{mapped.lower()}"]}
     repository.update_execution_outbox(
         str(outbox["outboxId"]),
         status=mapped,
@@ -377,11 +473,12 @@ def _apply_broker_event(
         now=reconciled_at,
     )
     if mapped in {"PARTIALLY_FILLED", "FILLED"} and float(event.get("filledQuantity") or 0) > 0:
-        _apply_fill_event(repository, inventory_repository, str(outbox["outboxId"]), event, evaluated_at=reconciled_at)
+        _apply_fill_event(repository, inventory_repository, str(outbox["outboxId"]), {**dict(event), **outbox["payload"]}, evaluated_at=reconciled_at)
     if mapped in {"CANCELLED", "EXPIRED", "REJECTED"}:
         inventory_repository.record_order_status(
             {
                 **payload,
+                **_identity_envelope(payload),
                 "orderStatus": mapped,
                 "status": mapped,
                 "clientOrderId": str(event.get("clientOrderId") or outbox.get("clientOrderId") or ""),
@@ -389,6 +486,8 @@ def _apply_broker_event(
                 "timestamp": reconciled_at.isoformat(),
             }
         )
+    if mapped in {"PARTIALLY_FILLED", "FILLED", "CANCELLED", "EXPIRED", "REJECTED", "REPLACED", "RECONCILIATION_REQUIRED"}:
+        _enqueue_position_management_after_execution(repository, payload, trigger=f"broker_event_{mapped.lower()}", now=reconciled_at)
     repository.record_reconciliation_evidence("BROKER_EVENT_RECONCILED", payload, client_order_id=str(event.get("clientOrderId") or ""), broker_order_id=str(event.get("brokerOrderId") or ""), order_intent_id=str(event.get("orderIntentId") or ""), status=mapped, now=reconciled_at)
 
 
@@ -403,19 +502,44 @@ def _apply_fill_event(
     fill_id = str(event.get("brokerFillId") or event.get("fillId") or event.get("brokerEventId") or "")
     if not fill_id:
         return
+    capital_partition_id = str(event.get("capitalPartitionId") or event.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+    settings_version = str(event.get("settingsVersion") or event.get("settings_version") or "")
+    effective_settings_hash = str(event.get("effectiveSettingsHash") or event.get("effective_settings_hash") or "")
+    strategy_catalog_version = str(event.get("strategyCatalogVersion") or event.get("strategy_catalog_version") or META_STRATEGY_STRATEGY_CATALOG_VERSION)
+    feature_schema_version = str(event.get("featureSchemaVersion") or event.get("feature_schema_version") or META_STRATEGY_FEATURE_SCHEMA_VERSION)
+    model_version = str(event.get("modelVersion") or event.get("model_version") or META_STRATEGY_MODEL_VERSION)
+    decision_id = str(event.get("decisionId") or event.get("decision_id") or "")
+    job_id = str(event.get("jobId") or event.get("job_id") or "")
+    event_id = str(event.get("eventId") or event.get("event_id") or event.get("brokerEventId") or fill_id)
+    correlation_id = str(event.get("correlationId") or event.get("correlation_id") or event.get("orderIntentId") or decision_id or fill_id)
     inventory_repository.ingest_broker_fill(
         {
             "algorithmId": ALGORITHM_ID,
-            "capitalPartitionId": META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
-            "settingsVersion": str(event.get("settingsVersion") or "phase9-settings"),
-            "decisionId": str(event.get("decisionId") or "decision-1"),
-            "jobId": str(event.get("jobId") or ""),
-            "eventId": str(event.get("brokerEventId") or fill_id),
+            "algorithm_id": ALGORITHM_ID,
+            "capitalPartitionId": capital_partition_id,
+            "capital_partition_id": capital_partition_id,
+            "settingsVersion": settings_version,
+            "settings_version": settings_version,
+            "effectiveSettingsHash": effective_settings_hash,
+            "effective_settings_hash": effective_settings_hash,
+            "strategyCatalogVersion": strategy_catalog_version,
+            "strategy_catalog_version": strategy_catalog_version,
+            "featureSchemaVersion": feature_schema_version,
+            "feature_schema_version": feature_schema_version,
+            "modelVersion": model_version,
+            "model_version": model_version,
+            "decisionId": decision_id,
+            "decision_id": decision_id,
+            "jobId": job_id,
+            "job_id": job_id,
+            "eventId": event_id,
+            "event_id": event_id,
             "orderIntentId": str(event.get("orderIntentId") or ""),
             "clientOrderId": str(event.get("clientOrderId") or ""),
             "brokerOrderId": str(event.get("brokerOrderId") or ""),
             "brokerFillId": fill_id,
-            "correlationId": str(event.get("correlationId") or event.get("orderIntentId") or fill_id),
+            "correlationId": correlation_id,
+            "correlation_id": correlation_id,
             "symbol": str(event.get("symbol") or "UNKNOWN").upper(),
             "side": str(event.get("side") or "BUY").upper(),
             "filledQuantity": float(event.get("filledQuantity") or 0),
@@ -423,6 +547,7 @@ def _apply_fill_event(
             "timestamp": str(event.get("timestamp") or evaluated_at.isoformat()),
         }
     )
+    _enqueue_position_management_after_execution(repository, event, trigger="broker_fill", now=evaluated_at)
     repository.record_reconciliation_evidence("FILL_APPLIED_TO_INVENTORY", dict(event), client_order_id=str(event.get("clientOrderId") or ""), broker_order_id=str(event.get("brokerOrderId") or ""), order_intent_id=str(event.get("orderIntentId") or ""), status="FILLED", now=evaluated_at)
 
 
@@ -431,13 +556,7 @@ def _global_risk_response(source: Any | None, proposal: GlobalOrderProposal, *, 
         response = source.approve_order(proposal)
         if isinstance(response, GlobalGateResponse):
             return response
-    return GlobalGateResponse(
-        action="ALLOW",
-        maximumAllowedQuantity=proposal.quantity,
-        maximumAdditionalRiskDollars=proposal.plannedRiskDollars,
-        evaluatedAt=evaluated_at,
-        configurationHash=f"meta-strategy-paper-risk-{proposal.configurationHash}",
-    )
+    raise RuntimeError("meta_strategy.execution.global_risk_source_required")
 
 
 def _broker_events(paper_gateway: PaperOrderGateway) -> tuple[dict[str, Any], ...]:
@@ -445,6 +564,52 @@ def _broker_events(paper_gateway: PaperOrderGateway) -> tuple[dict[str, Any], ..
     if hasattr(broker, "list_order_events"):
         return tuple(dict(event) for event in broker.list_order_events())
     return ()
+
+
+def _enqueue_position_management_after_execution(repository: MetaStrategyJobRepository, payload: Mapping[str, Any], *, trigger: str, now: datetime) -> None:
+    envelope = _identity_envelope(payload)
+    symbol = str(payload.get("symbol") or "PORTFOLIO").upper()
+    event_id = str(payload.get("brokerEventId") or payload.get("eventId") or payload.get("event_id") or trigger)
+    mark_price = float(payload.get("averageFillPrice") or payload.get("fillPrice") or payload.get("limitPrice") or payload.get("entryPrice") or 0.0)
+    repository.enqueue_job(
+        job_type="position_management",
+        idempotency_key=f"meta_strategy.position_management.{trigger}.{envelope['capitalPartitionId']}.{symbol}.{event_id}",
+        payload={
+            **envelope,
+            "trigger": trigger,
+            "symbol": symbol,
+            "mode": str(payload.get("mode") or "PAPER"),
+            "markPrices": {symbol: mark_price} if symbol != "PORTFOLIO" and mark_price > 0.0 else {},
+            "sourceOrderIntentId": str(payload.get("orderIntentId") or ""),
+            "sourceClientOrderId": str(payload.get("clientOrderId") or ""),
+            "sourceBrokerOrderId": str(payload.get("brokerOrderId") or ""),
+            "sourceBrokerEventId": event_id,
+        },
+        now=now,
+    )
+
+
+def _try_replace_stale_order(paper_gateway: PaperOrderGateway, outbox: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    if not bool(payload.get("cancelAndReplaceEnabled") or payload.get("cancel_and_replace_enabled") or False):
+        return None
+    replacement_count = int(payload.get("replacementCount") or payload.get("replacement_count") or 0)
+    maximum_replacements = int(payload.get("maximumReplacementCount") or payload.get("maxReplacementCount") or 0)
+    if replacement_count >= maximum_replacements:
+        return None
+    replace_order = getattr(paper_gateway.broker, "replace_order", None)
+    if not callable(replace_order):
+        return None
+    broker_order_id = str(outbox.get("brokerOrderId") or payload.get("brokerOrderId") or "")
+    if not broker_order_id:
+        return None
+    replacement_client_order_id = f"{str(outbox.get('clientOrderId') or payload.get('clientOrderId'))[:116]}-r{replacement_count + 1}"
+    return replace_order(
+        broker_order_id,
+        quantity=int(payload.get("quantity") or 0) or None,
+        limit_price=_optional_positive(payload.get("replacementLimitPrice") or payload.get("limitPrice")),
+        stop_price=_optional_positive(payload.get("replacementStopPrice") or payload.get("stopPrice")),
+        client_order_id=replacement_client_order_id,
+    )
 
 
 def _outbox_for_event(repository: MetaStrategyJobRepository, event: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -479,6 +644,46 @@ def _outbox_payload(outbox_record: Mapping[str, Any]) -> dict[str, Any]:
     return dict(payload) if isinstance(payload, Mapping) else {}
 
 
+def _identity_envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
+    capital_partition_id = str(payload.get("capitalPartitionId") or payload.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+    settings_version = str(payload.get("settingsVersion") or payload.get("settings_version") or "")
+    effective_settings_hash = str(payload.get("effectiveSettingsHash") or payload.get("effective_settings_hash") or "")
+    strategy_catalog_version = str(payload.get("strategyCatalogVersion") or payload.get("strategy_catalog_version") or META_STRATEGY_STRATEGY_CATALOG_VERSION)
+    feature_schema_version = str(payload.get("featureSchemaVersion") or payload.get("feature_schema_version") or META_STRATEGY_FEATURE_SCHEMA_VERSION)
+    model_version = str(payload.get("modelVersion") or payload.get("model_version") or META_STRATEGY_MODEL_VERSION)
+    decision_id = str(payload.get("decisionId") or payload.get("decision_id") or "")
+    job_id = str(payload.get("jobId") or payload.get("job_id") or "")
+    event_id = str(payload.get("eventId") or payload.get("event_id") or "")
+    order_intent_id = str(payload.get("orderIntentId") or payload.get("order_intent_id") or "")
+    correlation_id = str(payload.get("correlationId") or payload.get("correlation_id") or order_intent_id or decision_id or event_id or job_id)
+    return {
+        "algorithmId": ALGORITHM_ID,
+        "algorithm_id": ALGORITHM_ID,
+        "capitalPartitionId": capital_partition_id,
+        "capital_partition_id": capital_partition_id,
+        "settingsVersion": settings_version,
+        "settings_version": settings_version,
+        "effectiveSettingsHash": effective_settings_hash,
+        "effective_settings_hash": effective_settings_hash,
+        "strategyCatalogVersion": strategy_catalog_version,
+        "strategy_catalog_version": strategy_catalog_version,
+        "featureSchemaVersion": feature_schema_version,
+        "feature_schema_version": feature_schema_version,
+        "modelVersion": model_version,
+        "model_version": model_version,
+        "decisionId": decision_id,
+        "decision_id": decision_id,
+        "jobId": job_id,
+        "job_id": job_id,
+        "eventId": event_id,
+        "event_id": event_id,
+        "orderIntentId": order_intent_id,
+        "order_intent_id": order_intent_id,
+        "correlationId": correlation_id,
+        "correlation_id": correlation_id,
+    }
+
+
 def _outbox_status_from_gateway(result: PaperOrderGatewayResult) -> str:
     if result.duplicate:
         return "ACKNOWLEDGED"
@@ -498,6 +703,20 @@ def _outbox_status_from_gateway(result: PaperOrderGatewayResult) -> str:
 def _signal(value: Any) -> Signal:
     side = str(value or "BUY").upper()
     return Signal.SELL if side in {"SELL", "SHORT"} else Signal.BUY
+
+
+def _order_type(payload: Mapping[str, Any]) -> str:
+    normalized = str(payload.get("orderType") or payload.get("order_type") or "").upper()
+    if normalized in {"MARKET", "LIMIT", "STOP", "STOP_LIMIT", "MARKETABLE_LIMIT"}:
+        return normalized
+    return "MARKETABLE_LIMIT" if payload.get("limitPrice") else "MARKET"
+
+
+def _proposal_intent(payload: Mapping[str, Any]) -> str:
+    normalized = str(payload.get("intent") or payload.get("orderIntentType") or payload.get("order_intent_type") or "new_entry").lower()
+    if normalized in {"protective_exit", "risk_reducing", "end_of_day_liquidation", "reconciliation"}:
+        return normalized
+    return "new_entry"
 
 
 def _as_utc(value: datetime) -> datetime:

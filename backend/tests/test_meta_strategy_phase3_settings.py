@@ -10,14 +10,18 @@ from backend.app.algorithms.meta_strategy import (
     DIRECTIONAL_STRATEGIES,
     MetaStrategyApplicationService,
     MetaStrategyDynamicOverlaySettings,
+    MetaStrategyExecutionPipelineConfig,
     MetaStrategyJobRepository,
     MetaStrategySettingsStore,
     MetaStrategyStrategySettings,
+    build_meta_strategy_conservative_paper_settings,
     build_meta_strategy_settings,
     instantiate_meta_strategy,
     resolve_meta_strategy_effective_settings,
     run_meta_strategy_execution_pipeline,
 )
+from backend.app.algorithms.meta_strategy.inference import MetaStrategyInferenceConfig
+from backend.app.algorithms.meta_strategy.feature_schema import meta_strategy_feature_schema_hash
 from backend.app.algorithms.meta_strategy.execution_pipeline import MetaStrategyExecutionPipelineRequest
 from backend.tests.test_meta_strategy_step7_market_snapshot import request_with
 
@@ -55,6 +59,17 @@ class MetaStrategyPhase3SettingsTest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             build_meta_strategy_settings(local_risk={"risk_percentage": -0.01})
 
+        with self.assertRaises(ValidationError):
+            build_meta_strategy_settings(candidate_aggregation={"minimum_independent_families": 1})
+
+        validated_exception = build_meta_strategy_settings(
+            candidate_aggregation={
+                "minimum_independent_families": 1,
+                "independent_family_exception": {"validated": True, "settingsVersion": "exception-v1", "evidenceId": "validated-one-family-profile"},
+            }
+        )
+        self.assertEqual(validated_exception.candidate_aggregation.minimum_independent_families, 1)
+
     def test_dynamic_overlay_cannot_exceed_baseline_risk_caps(self) -> None:
         baseline = build_meta_strategy_settings(created_at=NOW)
 
@@ -87,6 +102,85 @@ class MetaStrategyPhase3SettingsTest(unittest.TestCase):
         self.assertLessEqual(effective.position_sizing.position_cap, baseline.position_sizing.position_cap)
         self.assertLessEqual(effective.local_risk.trade_count_limit, baseline.local_risk.trade_count_limit)
         self.assertEqual(effective.sessions.allowed_sessions, ("OPENING", "MORNING"))
+        self.assertTrue(effective.dynamic_overlay_changes)
+        self.assertTrue(all(change["reason"] == "defensive" for change in effective.dynamic_overlay_changes))
+
+    def test_dedicated_settings_groups_and_conservative_paper_profile_are_versioned(self) -> None:
+        store = MetaStrategySettingsStore(_test_db_path("paper-profile"))
+        baseline = build_meta_strategy_settings(settings_version="baseline-before-paper", created_at=NOW)
+        store.create_baseline(baseline, actor="system")
+        store.activate_settings(baseline.settings_version, actor="system")
+
+        profile = build_meta_strategy_conservative_paper_settings(
+            settings_version="paper-conservative-v1",
+            created_at=NOW,
+            alpaca_paper_configured=True,
+        )
+        promotion = store.create_and_promote_paper_baseline(
+            settings_version="paper-conservative-v2",
+            actor="ops",
+            alpaca_paper_configured=True,
+        )
+        active = store.get_active_settings()
+
+        self.assertEqual(store.get_settings("baseline-before-paper").settings_version, "baseline-before-paper")
+        self.assertEqual(promotion.promoted_settings_version, "paper-conservative-v2")
+        self.assertEqual(active.settings_version, "paper-conservative-v2")
+        self.assertEqual(profile.paper_execution.execution_mode, "PAPER")
+        self.assertFalse(profile.paper_execution.synthetic_immediate_fills_allowed)
+        self.assertFalse(profile.paper_execution.local_diagnostics_only)
+        self.assertEqual(profile.ml_inference.mode, "DISABLED")
+        self.assertEqual(profile.order_construction.order_type, "MARKETABLE_LIMIT")
+        self.assertTrue(profile.position_management.one_position_per_symbol)
+        self.assertTrue(profile.position_management.mandatory_end_of_day_handling)
+        self.assertGreater(profile.position_management.no_new_entry_minutes_before_close, 0)
+        self.assertLessEqual(profile.local_risk.risk_percentage, 0.001)
+        self.assertLessEqual(profile.position_sizing.position_cap, 0.02)
+        self.assertLessEqual(profile.position_sizing.maximum_share_quantity, 100)
+        self.assertLessEqual(profile.local_risk.trade_count_limit, 3)
+        self.assertLessEqual(profile.local_risk.maximum_daily_loss, 250.0)
+        self.assertLessEqual(profile.local_risk.maximum_open_risk, 500.0)
+        self.assertLessEqual(profile.local_risk.spread_limit_bps, 8.0)
+        self.assertGreaterEqual(profile.local_risk.liquidity_requirement, 250_000.0)
+        self.assertGreaterEqual(profile.local_risk.minimum_reward_to_risk, 1.5)
+        self.assertTrue(profile.economic_event_rules.block_high_impact_events)
+        self.assertTrue(profile.operational_limits.block_orders_when_unhealthy)
+
+    def test_effective_settings_version_and_hash_pin_order_intent(self) -> None:
+        settings = build_meta_strategy_conservative_paper_settings(
+            settings_version="paper-pin-v1",
+            created_at=NOW,
+            ml_mode="DISABLED",
+        )
+        result = run_meta_strategy_execution_pipeline(
+            MetaStrategyExecutionPipelineRequest(
+                mode="PAPER",
+                snapshot_request=request_with(),
+                global_available_risk=10_000.0,
+                global_quantity_cap=10,
+                account_equity=100_000.0,
+                available_buying_power=100_000.0,
+                remaining_algorithm_risk=10_000.0,
+                model_artifact={
+                    "featureSchemaHash": meta_strategy_feature_schema_hash(),
+                    "championModel": "none",
+                    "models": {},
+                },
+            ),
+            config=MetaStrategyExecutionPipelineConfig(
+                settings=settings,
+                baseline_settings=settings.to_baseline_settings(),
+                inference_config=MetaStrategyInferenceConfig(mode="DISABLED", fallbackBehavior="NO_TRADE"),
+                submit_to_broker=False,
+            ),
+        )
+
+        self.assertEqual(result.snapshot.settings_version, settings.settings_version)
+        self.assertEqual(result.settings_version, settings.settings_version)
+        if result.order_intent is not None:
+            self.assertEqual(result.order_intent.settings_version, settings.settings_version)
+            self.assertEqual(result.order_intent.effective_settings_hash, settings.effective_settings_hash)
+            self.assertEqual(result.order_intent.order_type, "LIMIT")
 
     def test_strategy_registry_injects_typed_settings(self) -> None:
         baseline = build_meta_strategy_settings(created_at=NOW)

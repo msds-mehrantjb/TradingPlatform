@@ -60,7 +60,10 @@ class ContextSnapshotStrategy:
                 required_input_status=required_status,
             )
         evidence = self.evidence(snapshot)
-        bounded = clamp_adjustments({**evidence, **self.adjustments(snapshot, evidence)})
+        bounded = clamp_adjustments(
+            {**evidence, **self.adjustments(snapshot, evidence)},
+            max_confidence_adjustment=self.context_settings.max_confidence_adjustment,
+        )
         confidence = abs(float(bounded.get("confidenceAdjustment") or 0.0)) * 4.0
         return SnapshotEvaluationResult(
             strategy_id=self.strategy_id,
@@ -98,12 +101,19 @@ def neutral_adjustments() -> dict[str, float]:
     }
 
 
-def clamp_adjustments(evidence: dict[str, Any]) -> dict[str, Any]:
+def clamp_adjustments(evidence: dict[str, Any], *, max_confidence_adjustment: float | None = None) -> dict[str, Any]:
     clamped = dict(evidence)
+    configured_confidence_cap = min(
+        ADJUSTMENT_LIMITS["confidenceAdjustment"][1],
+        max(0.0, float(max_confidence_adjustment if max_confidence_adjustment is not None else ADJUSTMENT_LIMITS["confidenceAdjustment"][1])),
+    )
     for key, (minimum, maximum) in ADJUSTMENT_LIMITS.items():
+        if key == "confidenceAdjustment":
+            minimum, maximum = -configured_confidence_cap, configured_confidence_cap
         raw = float(clamped.get(key, neutral_adjustments()[key]))
         clamped[key] = max(minimum, min(maximum, raw))
     clamped["canGenerateTrade"] = False
+    clamped["settingsAdjustmentCap"] = configured_confidence_cap
     return clamped
 
 

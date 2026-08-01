@@ -8,10 +8,16 @@ from backend.app.algorithms.meta_strategy.backtest.execution_simulator import (
     MetaStrategySimulationConfig,
 )
 from backend.app.algorithms.meta_strategy.backtest.holdout import MetaStrategyHoldoutWindow, validate_holdout_window
-from backend.app.algorithms.meta_strategy.backtest.ledger import MetaStrategyBacktestLedger, MetaStrategyBacktestTrade, ledger_from_pipeline_results
+from backend.app.algorithms.meta_strategy.backtest.ledger import (
+    MetaStrategyBacktestLedger,
+    MetaStrategyBacktestNoTrade,
+    MetaStrategyBacktestTrade,
+    ledger_from_pipeline_results,
+)
 from backend.app.algorithms.meta_strategy.backtest.metrics import MetaStrategyBacktestMetrics, calculate_backtest_metrics
 from backend.app.algorithms.meta_strategy.backtest.reports import MetaStrategyBacktestReport, build_backtest_report
 from backend.app.algorithms.meta_strategy.backtest.runtime_parity import (
+    AUTHORITATIVE_PARITY_COMPONENTS,
     BACKTEST_REPLACES_ONLY_RUNTIME_BOUNDARIES,
     BACKTEST_RUNTIME_PIPELINE_ENTRYPOINT,
     MetaStrategyRuntimeParityReport,
@@ -33,6 +39,7 @@ from backend.app.algorithms.meta_strategy.backtest.comparisons import (
 __all__ = [
     "BACKTEST_REPLACES_ONLY_RUNTIME_BOUNDARIES",
     "BACKTEST_RUNTIME_PIPELINE_ENTRYPOINT",
+    "AUTHORITATIVE_PARITY_COMPONENTS",
     "ComparisonScenario",
     "ComparisonScope",
     "MetaStrategyArtifactTimeline",
@@ -45,6 +52,7 @@ __all__ = [
     "MetaStrategyBacktestReport",
     "MetaStrategyBacktestRequest",
     "MetaStrategyBacktestResult",
+    "MetaStrategyBacktestNoTrade",
     "MetaStrategyBacktestTrade",
     "MetaStrategyHoldoutWindow",
     "MetaStrategyRuntimeParityReport",

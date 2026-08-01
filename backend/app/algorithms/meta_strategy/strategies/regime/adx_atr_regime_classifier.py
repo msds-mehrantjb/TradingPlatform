@@ -21,37 +21,49 @@ class AdxAtrRegimeClassifierStrategy(RegimeSnapshotStrategy):
         ema50 = float(snapshot.moving_averages["1m"].get("ema50") or ema20)
         event_state = str(snapshot.economic_event_state.get("state") or "none").lower()
         event_active = bool(snapshot.economic_event_state.get("active") or event_state in {"active", "blocked", "halt"})
+        structure_state = str(snapshot.features.get("marketStructureState") or snapshot.features.get("breakOfStructure") or "unknown").lower()
+        volatility_percentile = float(snapshot.features.get("realizedVolatilityPercentile") or snapshot.features.get("atrPercentile") or 0.5)
 
         direction = 1 if ema20 > ema50 else -1 if ema20 < ema50 else 0
-        if adx >= 35.0:
-            trend_label = "strong_trend"
+        if event_state in {"blocked", "halt"} or event_active:
+            regime_label = "EVENT_RISK"
+            trend_confidence = 0.9
+            direction = 0
+        elif atr_percent >= 0.045 or relative_volume >= 4.0:
+            regime_label = "VOLATILITY_SHOCK"
             trend_confidence = 0.9
         elif adx >= 22.0:
-            trend_label = "trend"
+            regime_label = "TREND_UP" if direction > 0 else "TREND_DOWN" if direction < 0 else "UNKNOWN"
             trend_confidence = 0.72
         elif adx <= 15.0:
-            trend_label = "range"
+            regime_label = "RANGE"
             trend_confidence = 0.75
             direction = 0
+        elif volatility_percentile <= 0.25:
+            regime_label = "LOW_VOLATILITY"
+            trend_confidence = 0.62
+        elif volatility_percentile >= 0.80:
+            regime_label = "HIGH_VOLATILITY"
+            trend_confidence = 0.68
         else:
-            trend_label = "transition"
+            regime_label = "UNKNOWN"
             trend_confidence = 0.55
 
         if event_state in {"blocked", "halt"} or atr_percent >= 0.045:
             volatility = "EXTREME"
-            volatility_label = "event_or_extreme_volatility"
+            volatility_label = "EVENT_RISK" if event_active else "VOLATILITY_SHOCK"
             volatility_confidence = 0.92
         elif atr_percent >= 0.025 or relative_volume >= 2.0 or event_active:
             volatility = "HIGH"
-            volatility_label = "high_volatility"
+            volatility_label = "EVENT_RISK" if event_active else "HIGH_VOLATILITY"
             volatility_confidence = 0.78
         elif atr_percent <= 0.006 and relative_volume <= 0.75:
             volatility = "LOW"
-            volatility_label = "low_volatility"
+            volatility_label = "LOW_VOLATILITY"
             volatility_confidence = 0.74
         else:
             volatility = "NORMAL"
-            volatility_label = "normal_volatility"
+            volatility_label = "UNKNOWN"
             volatility_confidence = 0.65
 
         trend_fit = clamp(adx / 25.0, 0.5, 1.6)
@@ -60,7 +72,7 @@ class AdxAtrRegimeClassifierStrategy(RegimeSnapshotStrategy):
         high_risk_penalty = 0.4 if volatility == "EXTREME" else 0.0
 
         return {
-            "regimeLabel": f"{trend_label}.{volatility_label}",
+            "regimeLabel": regime_label,
             "direction": direction,
             "volatility": volatility,
             "regimeConfidence": round(max(trend_confidence, volatility_confidence), 6),
@@ -70,8 +82,12 @@ class AdxAtrRegimeClassifierStrategy(RegimeSnapshotStrategy):
             "relativeVolume": relative_volume,
             "ema20": ema20,
             "ema50": ema50,
+            "movingAverageSlope": (ema20 - ema50) / max(snapshot.last_price, 1e-9),
+            "volatilityPercentile": volatility_percentile,
+            "marketStructureState": structure_state,
             "eventState": event_state,
             "eventActive": event_active,
+            "allowedRegimeLabels": ("TREND_UP", "TREND_DOWN", "RANGE", "LOW_VOLATILITY", "HIGH_VOLATILITY", "VOLATILITY_SHOCK", "EVENT_RISK", "UNKNOWN"),
             "evidenceAxes": ("Trend strength", "Volatility level", "Structure", "Liquidity", "Session", "Event risk"),
             "strategyFit": bounded_strategy_fit(
                 {
@@ -83,7 +99,7 @@ class AdxAtrRegimeClassifierStrategy(RegimeSnapshotStrategy):
                 }
             ),
             "reasonCodes": (
-                f"meta_strategy.regime.adx.{trend_label}",
+                f"meta_strategy.regime.label.{regime_label.lower()}",
                 f"meta_strategy.regime.atr.{volatility_label}",
             ),
         }

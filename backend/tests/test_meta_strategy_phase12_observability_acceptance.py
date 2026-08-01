@@ -8,6 +8,7 @@ from uuid import uuid4
 from backend.app.algorithms.meta_strategy import (
     ALGORITHM_ID,
     META_STRATEGY_FINAL_DOD_IDS,
+    META_STRATEGY_OPERATIONAL_CONTROLS,
     META_STRATEGY_RECOVERY_TEST_IDS,
     MetaStrategyApplicationService,
 )
@@ -84,6 +85,130 @@ class MetaStrategyPhase12ObservabilityAcceptanceTest(unittest.TestCase):
         self.assertTrue(self.jobs.operational_events(event_type="control.pause_new_entries"))
         self.assertTrue(self.jobs.operational_events(event_type="cancel_pending_jobs"))
 
+    def test_required_phase15_controls_are_supported_and_audited(self) -> None:
+        for control in META_STRATEGY_OPERATIONAL_CONTROLS:
+            with self.subTest(control=control):
+                result = apply_meta_strategy_operational_control(
+                    job_repository=self.jobs,
+                    control=control,
+                    actor="ops-user",
+                    reason=f"test.{control.lower()}",
+                    payload={"correlationId": f"corr-{control}"},
+                    now=NOW,
+                )
+
+                self.assertEqual(result.status, "RECORDED")
+                self.assertEqual(result.control, control)
+                self.assertEqual(result.payload["actor"], "ops-user")
+                self.assertEqual(result.payload["reason"], f"test.{control.lower()}")
+                self.assertEqual(result.payload["correlationId"], f"corr-{control}")
+                self.assertEqual(result.payload["requestedAt"], NOW.isoformat())
+                self.assertTrue(self.jobs.operational_events(event_type=f"control.{control}"))
+
+        snapshot = build_meta_strategy_observability_snapshot(job_repository=self.jobs, inventory_repository=self.inventory, settings_store=self.settings, now=NOW)
+        self.assertEqual(tuple(snapshot["supportedControls"]), META_STRATEGY_OPERATIONAL_CONTROLS)
+        self.assertTrue(snapshot["controls"]["EXIT_ONLY"]["state"]["exitOnly"])
+        self.assertTrue(snapshot["controls"]["DISABLE_ML_INFLUENCE"]["state"]["mlInfluenceDisabled"])
+        self.assertTrue(snapshot["controls"]["DISABLE_DYNAMIC_OVERLAYS"]["state"]["dynamicOverlaysDisabled"])
+        self.assertTrue(snapshot["controls"]["STOP_META_RUNTIME"]["state"]["paperOrdersBlocked"])
+
+    def test_unknown_operational_control_is_rejected_fail_closed(self) -> None:
+        service = MetaStrategyApplicationService(settings_store=self.settings, job_repository=self.jobs, repository=self.inventory)
+
+        result = service.apply_control("ENABLE_LIVE_TRADING", {"actor": "ops", "reason": "test.unsupported"})
+
+        self.assertEqual(result["status"], "REJECTED")
+        self.assertIn("meta_strategy.controls.unsupported_control_rejected", result["reasonCodes"])
+        self.assertFalse(result["payload"]["payload"]["state"]["supported"])
+
+    def test_phase15_metrics_surface_required_operational_signals(self) -> None:
+        job = self.jobs.enqueue_finalised_bar_decision(mode="PAPER", symbol="SPY", timeframe="1m", bar_end=NOW - timedelta(minutes=1), settings_version="settings-v1", now=NOW)
+        claimed = self.jobs.claim_next_job(queue_name="finalised_bar_decisions", worker_id="decision-worker", now=NOW)
+        assert claimed is not None
+        job_payload = self.jobs.read_payload(job.payload_reference)
+        event_payload = job_payload.get("payload") if isinstance(job_payload.get("payload"), dict) else job_payload
+        event = self.jobs.event_by_id(str(event_payload.get("eventId") or event_payload.get("event_id")))
+        self.jobs.persist_decision_atomic(
+            job=claimed,
+            event=event,
+            decision_id="decision-phase15",
+            payload={
+                "decisionId": "decision-phase15",
+                "symbol": "SPY",
+                "barEnd": (NOW - timedelta(minutes=1)).isoformat(),
+                "settingsVersion": "settings-v1",
+                "modelVersion": "model-v1",
+                "decisionStatus": "HOLD_OR_BLOCKED",
+                "finalValid": False,
+                "latencyMs": 123,
+                "reasonCodes": (
+                    "meta_strategy.local_gate.minimum_independent_families_below_minimum",
+                    "meta_strategy.inference.model_unavailable",
+                    "meta_strategy.inference.ood_detected",
+                ),
+                "stages": {
+                    "aggregateCandidate": {
+                        "direction": "HOLD",
+                        "directionalOutputs": {
+                            "trend": {"signal": "BUY", "eligible": True},
+                            "reversion": {"signal": "HOLD", "eligible": False},
+                        },
+                        "familyConflicts": ("trend_alignment",),
+                    },
+                    "decisionPolicy": {"finalSignal": "HOLD"},
+                    "modelPrediction": {"status": "UNAVAILABLE"},
+                },
+            },
+            order_intent=None,
+            now=NOW,
+        )
+        self.jobs.record_worker_heartbeat(worker_id="decision-worker", queue_name="finalised_bar_decisions", now=NOW)
+        self.jobs.record_operational_event("finalised_candle_enqueued", {"duplicate": False}, now=NOW)
+        self.jobs.record_operational_event("finalised_candle_enqueued", {"duplicate": True}, now=NOW)
+        self.jobs.record_operational_event("finalised_candle_data_quality", {"status": "MISSING_GAP"}, status="MISSING_GAP", now=NOW)
+
+        snapshot = build_meta_strategy_observability_snapshot(job_repository=self.jobs, inventory_repository=self.inventory, settings_store=self.settings, now=NOW)
+        metrics = snapshot["metrics"]
+
+        for key in (
+            "finalizedBarCount",
+            "duplicateBarCount",
+            "missingBarCount",
+            "queueDepth",
+            "queueLagSeconds",
+            "workerHeartbeat",
+            "decisionLatencyMs",
+            "decisionCountsBySide",
+            "noTradeReasons",
+            "strategySignalCounts",
+            "strategyAbstentionCounts",
+            "familyConflicts",
+            "mlInferenceFailures",
+            "oodRate",
+            "orderSubmissionLatency",
+            "brokerRejectionRate",
+            "partialFillRate",
+            "slippage",
+            "inventoryMismatch",
+            "openRisk",
+            "reservedRisk",
+            "realizedPnl",
+            "unrealizedPnl",
+            "dailyDrawdown",
+            "restartFailures",
+            "reconciliationFailures",
+        ):
+            self.assertIn(key, metrics)
+        self.assertEqual(metrics["finalizedBarCount"], 1)
+        self.assertEqual(metrics["duplicateBarCount"], 1)
+        self.assertEqual(metrics["missingBarCount"], 1)
+        self.assertEqual(metrics["decisionCountsBySide"]["BLOCKED"], 1)
+        self.assertEqual(metrics["strategySignalCounts"]["trend"]["BUY"], 1)
+        self.assertEqual(metrics["strategyAbstentionCounts"]["reversion"], 1)
+        self.assertEqual(metrics["familyConflicts"]["trend_alignment"], 1)
+        self.assertEqual(metrics["mlInferenceFailures"], 1)
+        self.assertEqual(metrics["oodRate"], 1.0)
+
     def test_recovery_evidence_paths_are_exercised_and_recorded(self) -> None:
         job = self.jobs.enqueue_job(job_type="training", idempotency_key="lease", payload={}, now=NOW)
         self.jobs.claim_next_job(queue_name="training", worker_id="worker-before-restart", lease_seconds=1, now=NOW)
@@ -139,6 +264,8 @@ class MetaStrategyPhase12ObservabilityAcceptanceTest(unittest.TestCase):
         self.assertEqual(evidence["status"], "OK")
         self.assertEqual(readiness["algorithmId"], ALGORITHM_ID)
         self.assertEqual(readiness["payload"]["currentShadowPaperStatus"]["liveExecutionEnabled"], False)
+        self.assertTrue(readiness["payload"]["apiProcessHealthyDoesNotImplyMetaStrategyReadiness"])
+        self.assertEqual(readiness["payload"]["algorithmSpecificReadiness"]["algorithmId"], ALGORITHM_ID)
 
 
 if __name__ == "__main__":

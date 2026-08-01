@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel
 
@@ -30,6 +30,7 @@ from backend.app.algorithms.meta_strategy.observability import (
     build_meta_strategy_observability_snapshot,
     record_meta_strategy_test_evidence,
 )
+from backend.app.algorithms.meta_strategy.paper_readiness import build_meta_strategy_paper_readiness_acceptance_report
 from backend.app.algorithms.meta_strategy.repository import MetaStrategyRepositoryPersistenceAdapter, MetaStrategySqliteRepository
 from backend.app.algorithms.meta_strategy.settings import (
     MetaStrategySettings,
@@ -40,6 +41,7 @@ from backend.app.algorithms.meta_strategy.versions import meta_strategy_version_
 
 
 ServiceStatus = Literal["OK", "REQUIRES_INPUT", "REJECTED"]
+MetaStrategyRuntimeReadinessProvider = Callable[[], Mapping[str, Any]]
 
 _CALLER_SUPPLIED_TRADING_STATE_KEYS: frozenset[str] = frozenset(
     {
@@ -106,11 +108,16 @@ class MetaStrategyApplicationService:
         settings_store: MetaStrategySettingsStore | None = None,
         job_repository: MetaStrategyJobRepository | None = None,
         repository: MetaStrategySqliteRepository | None = None,
+        runtime_readiness_provider: MetaStrategyRuntimeReadinessProvider | None = None,
     ) -> None:
         self.settings_store = settings_store or MetaStrategySettingsStore(Path("./data/meta_strategy_settings.db"))
         self.job_repository = job_repository or MetaStrategyJobRepository()
         self.repository = repository or MetaStrategySqliteRepository(f"sqlite:///{self.job_repository.path}")
         self.persistence_adapter = MetaStrategyRepositoryPersistenceAdapter(self.repository)
+        self.runtime_readiness_provider = runtime_readiness_provider
+
+    def set_runtime_readiness_provider(self, provider: MetaStrategyRuntimeReadinessProvider | None) -> None:
+        self.runtime_readiness_provider = provider
 
     def status(self) -> dict[str, Any]:
         diagnostics = self.diagnostics()
@@ -244,6 +251,15 @@ class MetaStrategyApplicationService:
         return self._enqueue_evaluation_command("shadow_evaluation_command", "SHADOW", payload).to_dict()
 
     def paper_evaluate(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        runtime = self._runtime_readiness()
+        if runtime and runtime.get("paperOrdersBlocked") is True:
+            return MetaStrategyServiceResult(
+                algorithmId=ALGORITHM_ID,
+                operation="paper_evaluation_command",
+                status="REJECTED",
+                payload={"runtimeSupervisor": _plain(runtime), "orderSubmissionAllowed": False, "liveTradingEnabled": False},
+                reasonCodes=tuple(runtime.get("reasonCodes") or ("meta_strategy.runtime.paper_orders_blocked",)),
+            ).to_dict()
         return self._enqueue_evaluation_command("paper_evaluation_command", "PAPER", payload).to_dict()
 
     def deterministic_activation(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -299,12 +315,14 @@ class MetaStrategyApplicationService:
             settings_version=active_settings.settings_version,
             payload={"source": "api_command"},
         )
+        event_id = _job_event_id(self.job_repository, job)
         return MetaStrategyServiceResult(
             algorithmId=ALGORITHM_ID,
             operation="finalised_bar_event",
             status="OK",
             payload={
                 "job": _job_summary(job),
+                "event": {"eventId": event_id, "algorithmId": ALGORITHM_ID, "jobId": job.job_id},
                 "queued": not job.duplicate,
                 "durableQueue": True,
                 "backgroundWorkerRequired": True,
@@ -652,7 +670,7 @@ class MetaStrategyApplicationService:
             algorithmId=ALGORITHM_ID,
             operation="worker_health_query",
             status="OK",
-            payload={"workers": status["workers"], "queues": status["queues"]},
+            payload={"workers": status["workers"], "queues": status["queues"], "runtimeSupervisor": _plain(self._runtime_readiness())},
             reasonCodes=("meta_strategy.service.worker_health_ready",),
         ).to_dict()
 
@@ -755,20 +773,45 @@ class MetaStrategyApplicationService:
             settings_store=self.settings_store,
         )
         report = build_meta_strategy_evidence_acceptance_report(snapshot)
+        runtime = self._runtime_readiness()
+        paper_readiness = build_meta_strategy_paper_readiness_acceptance_report(snapshot, runtime)
+        ready = bool(report["complete"] and paper_readiness["paperReady"] and not _runtime_blocks_paper(runtime))
         return MetaStrategyServiceResult(
             algorithmId=ALGORITHM_ID,
             operation="readiness_report",
-            status="OK" if report["complete"] else "REJECTED",
+            status="OK" if ready else "REJECTED",
             payload={
                 **report,
+                "complete": ready,
+                "paperReady": bool(paper_readiness["paperReady"]),
+                "paperReadinessAcceptance": paper_readiness,
+                "algorithmSpecificReadiness": snapshot.get("algorithmReadiness"),
+                "apiProcessHealthyDoesNotImplyMetaStrategyReadiness": True,
+                "runtimeSupervisor": _plain(runtime),
                 "currentShadowPaperStatus": {
                     "shadow": report["shadowStatus"],
-                    "paper": report["paperStatus"],
+                    "paper": "blocked" if not ready else "READY",
                     "liveExecutionEnabled": False,
+                    "paperOrdersBlocked": not ready,
                 },
             },
             reasonCodes=("meta_strategy.service.readiness_report_ready",),
         ).to_dict()
+
+    def _runtime_readiness(self) -> Mapping[str, Any] | None:
+        if self.runtime_readiness_provider is None:
+            return None
+        try:
+            return self.runtime_readiness_provider()
+        except Exception as exc:
+            return {
+                "algorithmId": ALGORITHM_ID,
+                "ready": False,
+                "status": "unavailable",
+                "paperOrdersBlocked": True,
+                "reasonCodes": ("meta_strategy.runtime.readiness_provider_failed",),
+                "error": str(exc),
+            }
 
     def apply_control(self, control: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         data = dict(payload or {})
@@ -782,7 +825,7 @@ class MetaStrategyApplicationService:
         return MetaStrategyServiceResult(
             algorithmId=ALGORITHM_ID,
             operation="operational_control",
-            status="OK",
+            status="OK" if result.status == "RECORDED" else "REJECTED",
             payload=result.to_dict(),
             reasonCodes=result.reason_codes,
         ).to_dict()
@@ -893,12 +936,14 @@ class MetaStrategyApplicationService:
                 "requestedSnapshotId": snapshot.snapshot_id,
             },
         )
+        event_id = _job_event_id(self.job_repository, job)
         return MetaStrategyServiceResult(
             algorithmId=ALGORITHM_ID,
             operation=operation,
             status="OK",
             payload={
                 "job": _job_summary(job),
+                "event": {"eventId": event_id, "algorithmId": ALGORITHM_ID, "jobId": job.job_id},
                 "queued": not job.duplicate,
                 "durableQueue": True,
                 "backgroundWorkerRequired": True,
@@ -1095,6 +1140,19 @@ def _correlation_ids(job: MetaStrategyJobRecord) -> dict[str, Any]:
         "payloadReference": job.payload_reference,
         "resultReference": job.result_reference,
     }
+
+
+def _job_event_id(repository: MetaStrategyJobRepository, job: MetaStrategyJobRecord) -> str:
+    try:
+        payload = repository.read_payload(job.payload_reference)
+    except KeyError:
+        return ""
+    nested = payload.get("payload") if isinstance(payload.get("payload"), Mapping) else payload
+    return str(nested.get("eventId") or nested.get("event_id") or "")
+
+
+def _runtime_blocks_paper(runtime: Mapping[str, Any] | None) -> bool:
+    return bool(runtime and runtime.get("paperOrdersBlocked") is True)
 
 
 def _pipeline_summary(result: Any) -> dict[str, Any]:

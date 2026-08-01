@@ -4,8 +4,10 @@ import unittest
 from datetime import UTC, datetime
 
 from backend.app.algorithms.meta_strategy import (
+    ALGORITHM_ID,
     DIRECTIONAL_STRATEGIES,
     FamilyAggregationConfig,
+    META_STRATEGY_DIRECTIONAL_CORRELATION_GROUPS,
     StrategyContribution,
     aggregate_family_scores,
 )
@@ -18,6 +20,19 @@ LOOSE_GATES = FamilyAggregationConfig(minimum_active_strategies=1, minimum_indep
 
 class MetaStrategyStep13FamilyAggregationTest(unittest.TestCase):
     maxDiff = None
+
+    def test_directional_registry_uses_explicit_correlation_groups(self) -> None:
+        groups = {entry.correlation_group for entry in DIRECTIONAL_STRATEGIES}
+
+        self.assertEqual(groups, set(META_STRATEGY_DIRECTIONAL_CORRELATION_GROUPS))
+        self.assertEqual(resolve_group("multi_timeframe_trend_alignment"), "trend_alignment")
+        self.assertEqual(resolve_group("vwap_trend_continuation"), "trend_alignment")
+        self.assertEqual(resolve_group("first_pullback_after_open"), "trend_pullback")
+        self.assertEqual(resolve_group("opening_range_breakout"), "breakout_expansion")
+        self.assertEqual(resolve_group("volatility_breakout"), "breakout_expansion")
+        self.assertEqual(resolve_group("failed_breakout_reversal"), "failed_breakout_reversal")
+        self.assertEqual(resolve_group("bollinger_atr_reversion"), "mean_reversion")
+        self.assertEqual(resolve_group("vwap_mean_reversion"), "mean_reversion")
 
     def test_strategy_contribution_cap_is_enforced(self) -> None:
         result = aggregate_family_scores(
@@ -74,6 +89,34 @@ class MetaStrategyStep13FamilyAggregationTest(unittest.TestCase):
         )
 
         self.assertEqual(family(result, "TREND").buy_score, 0.3)
+        audit = {item.strategy_id: item for item in result.contribution_audit}
+        self.assertEqual(audit["trend-a"].raw_contribution, 1.0)
+        self.assertEqual(audit["trend-a"].strategy_capped_contribution, 0.35)
+        self.assertLess(audit["trend-a"].capped_contribution, audit["trend-a"].strategy_capped_contribution)
+        self.assertIn("correlation_group_cap", audit["trend-a"].caps_applied)
+
+    def test_contribution_audit_records_aliases_holds_and_self_votes_without_counting_them(self) -> None:
+        result = aggregate_family_scores(
+            (
+                contribution("failed_breakout_reversal", "REVERSAL", "BUY", confidence=0.6, canonical="failed_breakout_reversal"),
+                contribution("Failed Breakout Strategy", "REVERSAL", "BUY", confidence=1.0, canonical="failed_breakout_reversal"),
+                contribution(ALGORITHM_ID, "META_STRATEGY", "BUY", confidence=1.0, canonical=ALGORITHM_ID),
+                contribution("trend-hold", "TREND", "HOLD", confidence=0.0),
+                contribution("breakout-a", "BREAKOUT", "BUY", confidence=0.7),
+            ),
+            config=LOOSE_GATES,
+        )
+
+        audit = {item.strategy_id: item for item in result.contribution_audit}
+        self.assertFalse(audit[ALGORITHM_ID].counted)
+        self.assertIn("meta_strategy.aggregation.self_vote_ignored", audit[ALGORITHM_ID].reason_codes)
+        self.assertFalse(audit["failed_breakout_reversal"].counted)
+        self.assertIn("alias_deduplication", audit["failed_breakout_reversal"].caps_applied)
+        self.assertTrue(audit["Failed Breakout Strategy"].counted)
+        self.assertFalse(audit["trend-hold"].counted)
+        self.assertIn("meta_strategy.aggregation.abstained", audit["trend-hold"].reason_codes)
+        self.assertEqual(result.active_strategy_count, 2)
+        self.assertIn("meta_strategy.aggregation.self_vote_ignored", result.reason_codes)
 
     def test_minimum_active_strategy_gate(self) -> None:
         result = aggregate_family_scores(
@@ -198,6 +241,10 @@ def contribution(
 
 def family(result, family_name: str):
     return next(score for score in result.family_scores if score.family == family_name)
+
+
+def resolve_group(strategy_id: str) -> str:
+    return next(entry.correlation_group for entry in DIRECTIONAL_STRATEGIES if entry.strategy_id == strategy_id)
 
 
 if __name__ == "__main__":

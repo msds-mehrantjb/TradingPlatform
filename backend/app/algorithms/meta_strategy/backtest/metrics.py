@@ -19,6 +19,8 @@ class MetaStrategyBacktestMetrics:
     win_rate: float
     total_fees: float
     partial_fill_count: int
+    rejected_trade_count: int
+    no_trade_count: int
 
 
 def calculate_backtest_metrics(ledger: MetaStrategyBacktestLedger) -> MetaStrategyBacktestMetrics:
@@ -37,6 +39,8 @@ def calculate_backtest_metrics(ledger: MetaStrategyBacktestLedger) -> MetaStrate
         win_rate=len(wins) / trade_count if trade_count else 0.0,
         total_fees=ledger.total_fees,
         partial_fill_count=sum(1 for trade in ledger.trades if trade.partial_fill),
+        rejected_trade_count=ledger.rejected_trade_count,
+        no_trade_count=len(ledger.no_trades),
     )
 
 

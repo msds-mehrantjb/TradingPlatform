@@ -18,21 +18,25 @@ class AtrVolatilityRegimeStrategy(RegimeSnapshotStrategy):
         relative_volume = float(snapshot.relative_volume["1m"] or 0.0)
         event_state = str(snapshot.economic_event_state.get("state") or "none").lower()
         event_active = bool(snapshot.economic_event_state.get("active") or event_state in {"active", "blocked", "halt"})
-        if event_state in {"blocked", "halt"} or atr_percent >= 0.045:
+        if event_state in {"blocked", "halt"} or event_active:
             volatility = "EXTREME"
-            label = "event_or_extreme_volatility"
+            label = "EVENT_RISK"
             confidence = 0.92
-        elif atr_percent >= 0.025 or relative_volume >= 2.0 or event_active:
+        elif atr_percent >= 0.045:
+            volatility = "EXTREME"
+            label = "VOLATILITY_SHOCK"
+            confidence = 0.92
+        elif atr_percent >= 0.025 or relative_volume >= 2.0:
             volatility = "HIGH"
-            label = "high_volatility"
+            label = "HIGH_VOLATILITY"
             confidence = 0.78
         elif atr_percent <= 0.006 and relative_volume <= 0.75:
             volatility = "LOW"
-            label = "low_volatility"
+            label = "LOW_VOLATILITY"
             confidence = 0.74
         else:
             volatility = "NORMAL"
-            label = "normal_volatility"
+            label = "UNKNOWN"
             confidence = 0.65
         expansion = clamp((atr_percent / 0.02 + relative_volume / 1.5) / 2.0, 0.0, 2.0)
         high_risk_penalty = 0.4 if volatility == "EXTREME" else 0.0

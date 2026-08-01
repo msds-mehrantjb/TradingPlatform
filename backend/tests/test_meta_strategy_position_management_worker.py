@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from uuid import uuid4
+
+from backend.app.algorithms.meta_strategy.jobs import MetaStrategyJobRepository
+from backend.app.algorithms.meta_strategy.repository import MetaStrategySqliteRepository
+from backend.app.algorithms.meta_strategy.workers import MetaStrategyPositionManagementWorker
+
+
+NOW = datetime(2026, 1, 5, 15, 45, tzinfo=UTC)
+
+
+class MetaStrategyPositionManagementWorkerTest(unittest.TestCase):
+    def test_stop_hit_creates_durable_protective_exit_intent(self) -> None:
+        env = RuntimeEnv()
+        env.seed_long_position()
+        env.enqueue_position_job(candle={"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 100.5, "low": 97.5, "close": 98.0})
+
+        result = env.worker().run_once(now=NOW + timedelta(minutes=1))
+
+        outbox = env.jobs.outbox_for_order_intent("meta_strategy.exit.meta_strategy.position.meta_strategy.paper.default.SPY.PROTECTIVE_STOP")
+        lifecycle = env.inventory.inventory_records("position_lifecycle", limit=5)[0]
+        self.assertEqual(result["status"], "POSITION_MANAGEMENT_EVALUATED")
+        self.assertEqual(result["createdExitIntentCount"], 1)
+        self.assertEqual(outbox["status"], "PENDING")
+        self.assertEqual(outbox["payload"]["intent"], "protective_exit")
+        self.assertEqual(outbox["payload"]["side"], "SELL")
+        self.assertEqual(outbox["payload"]["quantity"], 10)
+        self.assertEqual(lifecycle["payload"]["exitReason"], "PROTECTIVE_STOP")
+        self.assertTrue(lifecycle["payload"]["entryBlockedWhileExitUnresolved"])
+
+    def test_existing_unresolved_exit_prevents_duplicate_exit_intent(self) -> None:
+        env = RuntimeEnv()
+        env.seed_long_position()
+        candle = {"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 100.5, "low": 97.5, "close": 98.0}
+        env.enqueue_position_job(candle=candle, key="first")
+        env.worker().run_once(now=NOW + timedelta(minutes=1))
+        env.enqueue_position_job(candle=candle, key="second")
+
+        result = env.worker().run_once(now=NOW + timedelta(minutes=2))
+
+        self.assertEqual(result["createdExitIntentCount"], 0)
+        self.assertIn("SPY", result["blockedEntrySymbols"])
+
+    def test_missing_protective_state_is_quarantined_without_guessing_exit(self) -> None:
+        env = RuntimeEnv()
+        env.seed_long_position(with_order_intent=False)
+        env.enqueue_position_job(candle={"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 100.5, "low": 97.5, "close": 98.0})
+
+        result = env.worker().run_once(now=NOW + timedelta(minutes=1))
+
+        quarantine = env.inventory.inventory_records("quarantine", limit=5)[0]
+        self.assertEqual(result["createdExitIntentCount"], 0)
+        self.assertEqual(quarantine["payload"]["quarantineReason"], "PROTECTIVE_STATE_MISSING")
+        with self.assertRaises(KeyError):
+            env.jobs.outbox_for_order_intent("meta_strategy.exit.meta_strategy.position.meta_strategy.paper.default.SPY.PROTECTIVE_STOP")
+
+    def test_end_of_day_deadline_creates_liquidation_exit(self) -> None:
+        env = RuntimeEnv()
+        env.seed_long_position()
+        env.enqueue_position_job(
+            candle={"symbol": "SPY", "timestamp": NOW.isoformat(), "open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0},
+            extra={"endOfDayExitAt": NOW.isoformat(), "noOvernight": True},
+        )
+
+        result = env.worker().run_once(now=NOW)
+
+        outbox = env.jobs.outbox_for_order_intent("meta_strategy.exit.meta_strategy.position.meta_strategy.paper.default.SPY.SESSION_END")
+        self.assertEqual(result["createdExitIntentCount"], 1)
+        self.assertEqual(outbox["payload"]["intent"], "end_of_day_liquidation")
+        self.assertEqual(outbox["payload"]["exitReason"], "SESSION_END")
+
+
+class RuntimeEnv:
+    def __init__(self) -> None:
+        database_url = f"sqlite:///{temp_db_path()}"
+        self.jobs = MetaStrategyJobRepository(database_url)
+        self.inventory = MetaStrategySqliteRepository(database_url)
+
+    def worker(self) -> MetaStrategyPositionManagementWorker:
+        return MetaStrategyPositionManagementWorker(repository=self.jobs, inventory_repository=self.inventory)
+
+    def enqueue_position_job(self, *, candle: dict, key: str = "position-job", extra: dict | None = None) -> None:
+        self.jobs.enqueue_job(
+            job_type="position_management",
+            idempotency_key=f"meta_strategy.position_management.test.{key}",
+            payload={
+                "capitalPartitionId": "meta_strategy.paper.default",
+                "settingsVersion": "position-settings",
+                "decisionId": f"position-decision-{key}",
+                "eventId": f"position-event-{key}",
+                "correlationId": f"position-correlation-{key}",
+                "symbol": "SPY",
+                "candle": candle,
+                "markPrices": {"SPY": candle["close"]},
+                "mode": "PAPER",
+                **(extra or {}),
+            },
+            now=NOW,
+        )
+
+    def seed_long_position(self, *, with_order_intent: bool = True) -> None:
+        if with_order_intent:
+            self.inventory.record_order_intent(
+                {
+                    **identity("entry-decision", "entry-job", "entry-event"),
+                    "orderIntentId": "entry-intent",
+                    "symbol": "SPY",
+                    "side": "BUY",
+                    "quantity": 10,
+                    "price": 100.0,
+                    "limitPrice": 100.0,
+                    "stopPrice": 98.0,
+                    "targetPrice": 104.0,
+                    "maximumHoldingMinutes": 30,
+                    "reservedRiskDollars": 20.0,
+                    "timestamp": NOW.isoformat(),
+                }
+            )
+        self.inventory.ingest_broker_fill(
+            {
+                **identity("entry-decision", "entry-job", "entry-event"),
+                "orderIntentId": "entry-intent",
+                "clientOrderId": "entry-client",
+                "brokerOrderId": "entry-broker",
+                "brokerFillId": "entry-fill",
+                "symbol": "SPY",
+                "side": "BUY",
+                "filledQuantity": 10,
+                "fillPrice": 100.0,
+                "timestamp": NOW.isoformat(),
+            }
+        )
+
+
+def identity(decision_id: str, job_id: str, event_id: str) -> dict:
+    return {
+        "algorithmId": "meta_strategy",
+        "capitalPartitionId": "meta_strategy.paper.default",
+        "settingsVersion": "position-settings",
+        "strategyCatalogVersion": "meta_strategy_strategy_catalog_v1",
+        "featureSchemaVersion": "meta_strategy_feature_schema_v1",
+        "modelVersion": "none",
+        "decisionId": decision_id,
+        "jobId": job_id,
+        "eventId": event_id,
+        "correlationId": decision_id,
+    }
+
+
+def temp_db_path() -> Path:
+    root = Path.cwd() / "data" / "test_tmp"
+    root.mkdir(exist_ok=True)
+    return root / f"meta-strategy-position-management-{uuid4().hex}.sqlite"
+
+
+if __name__ == "__main__":
+    unittest.main()

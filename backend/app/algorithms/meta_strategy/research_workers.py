@@ -14,6 +14,27 @@ from backend.app.algorithms.meta_strategy.versions import META_STRATEGY_FEATURE_
 
 
 META_STRATEGY_RESEARCH_WORKFLOW_VERSION = "meta_strategy_research_workflows_v1"
+META_STRATEGY_MODEL_PROMOTION_EVIDENCE_REQUIREMENTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("minimumSampleSize", "meta_strategy.promotion.minimum_sample_size_required", ("minimum_sample_size", "sampleSize", "sample_size")),
+    ("chronologicalHoldout", "meta_strategy.promotion.chronological_holdout_required", ("chronological_holdout",)),
+    ("walkForward", "meta_strategy.promotion.walk_forward_required", ("walk_forward", "walkForwardEvaluation", "walk_forward_evaluation")),
+    ("probabilityCalibration", "meta_strategy.promotion.probability_calibration_required", ("probability_calibration",)),
+    ("costAdjustedPerformance", "meta_strategy.promotion.cost_adjusted_performance_required", ("cost_adjusted_performance",)),
+    ("regimeStability", "meta_strategy.promotion.regime_stability_required", ("regime_stability",)),
+    ("missingDataBehavior", "meta_strategy.promotion.missing_data_behavior_required", ("missing_data_behavior",)),
+    ("outOfDistributionHandling", "meta_strategy.promotion.ood_handling_required", ("out_of_distribution_handling", "oodHandling", "ood_handling")),
+    ("deterministicReplay", "meta_strategy.promotion.deterministic_replay_required", ("deterministic_replay",)),
+    ("paperStability", "meta_strategy.promotion.paper_stability_required", ("paper_stability",)),
+    ("rollbackTesting", "meta_strategy.promotion.rollback_testing_required", ("rollback_testing",)),
+)
+META_STRATEGY_PAPER_EXECUTION_PROHIBITED_MODEL_MARKERS = (
+    "reinforcement_learning",
+    "reinforcement learning",
+    "rl_policy",
+    "q_learning",
+    "policy_gradient",
+    "actor_critic",
+)
 META_STRATEGY_RESEARCH_WORKFLOW_JOB_TYPES = (
     "deterministic_replay",
     "backtesting",
@@ -186,12 +207,66 @@ def _promotion_guardrail_failure(job: MetaStrategyJobRecord, payload: Mapping[st
         return None
     candidate = dict(payload.get("candidateArtifact") or payload.get("candidate_artifact") or {})
     evidence = dict(payload.get("evidence") or {})
-    paper = evidence.get("paperStability") or evidence.get("paper_stability")
-    if not isinstance(paper, Mapping) or paper.get("stable") is not True:
-        return "meta_strategy.promotion.paper_stability_required"
+    if _candidate_uses_reinforcement_learning(candidate):
+        return "meta_strategy.promotion.reinforcement_learning_not_allowed_for_paper_execution"
+    for canonical, reason_code, aliases in META_STRATEGY_MODEL_PROMOTION_EVIDENCE_REQUIREMENTS:
+        if not _evidence_passed(evidence, canonical, aliases):
+            return reason_code
     if str(candidate.get("generatedByJobId") or candidate.get("generated_by_job_id") or "") in {job.job_id, "self"}:
         return "meta_strategy.promotion.model_cannot_promote_itself"
     return None
+
+
+def _evidence_passed(evidence: Mapping[str, Any], canonical: str, aliases: tuple[str, ...]) -> bool:
+    value = _first_present(evidence, canonical, *aliases)
+    if isinstance(value, Mapping):
+        truthy_keys = ("passed", "validated", "stable", "complete", "approved")
+        if any(value.get(key) is True for key in truthy_keys):
+            return True
+        if canonical == "minimumSampleSize":
+            rows = value.get("rows") or value.get("sampleSize") or value.get("sample_size") or value.get("n")
+            return _positive_number(rows)
+        return False
+    return value is True
+
+
+def _candidate_uses_reinforcement_learning(candidate: Mapping[str, Any]) -> bool:
+    fields = (
+        "kind",
+        "modelKind",
+        "model_kind",
+        "trainingMethod",
+        "training_method",
+        "learningMethod",
+        "learning_method",
+        "algorithm",
+        "championModel",
+    )
+    if any(_contains_prohibited_model_marker(candidate.get(field)) for field in fields):
+        return True
+    models = candidate.get("models")
+    if isinstance(models, Mapping):
+        return any(isinstance(model, Mapping) and _candidate_uses_reinforcement_learning(model) for model in models.values())
+    return False
+
+
+def _contains_prohibited_model_marker(value: Any) -> bool:
+    text = str(value or "").replace("-", "_").lower()
+    return any(marker in text for marker in META_STRATEGY_PAPER_EXECUTION_PROHIBITED_MODEL_MARKERS)
+
+
+def _first_present(mapping: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def _positive_number(value: Any) -> bool:
+    try:
+        return float(value) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _code_build_identifier() -> str:

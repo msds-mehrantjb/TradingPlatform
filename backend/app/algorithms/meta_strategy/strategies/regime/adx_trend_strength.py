@@ -19,17 +19,17 @@ class AdxTrendStrengthRegimeStrategy(RegimeSnapshotStrategy):
         ema50 = float(snapshot.moving_averages["1m"].get("ema50") or ema20)
         direction = 1 if ema20 > ema50 else -1 if ema20 < ema50 else 0
         if adx >= 35.0:
-            label = "strong_trend"
+            label = "TREND_UP" if direction > 0 else "TREND_DOWN" if direction < 0 else "UNKNOWN"
             confidence = 0.9
         elif adx >= 22.0:
-            label = "trend"
+            label = "TREND_UP" if direction > 0 else "TREND_DOWN" if direction < 0 else "UNKNOWN"
             confidence = 0.72
         elif adx <= 15.0:
-            label = "range"
+            label = "RANGE"
             confidence = 0.75
             direction = 0
         else:
-            label = "transition"
+            label = "UNKNOWN"
             confidence = 0.55
         volatility = "HIGH" if atr / snapshot.last_price >= 0.025 else "NORMAL"
         trend_fit = clamp(adx / 25.0, 0.5, 1.6)

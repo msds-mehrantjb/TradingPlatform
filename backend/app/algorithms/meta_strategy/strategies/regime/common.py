@@ -116,7 +116,7 @@ class RegimeSnapshotStrategy:
 
 def neutral_regime_evidence() -> dict[str, Any]:
     return {
-        "regimeLabel": "unknown",
+        "regimeLabel": "UNKNOWN",
         "direction": 0,
         "volatility": "NORMAL",
         "regimeConfidence": 0.0,

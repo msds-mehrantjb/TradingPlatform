@@ -75,15 +75,25 @@ class MetaStrategySafetyGateSettings(MetaStrategySettingsModel):
 class MetaStrategyCandidateAggregationSettings(MetaStrategySettingsModel):
     minimum_active_strategies: int = Field(default=2, ge=0)
     minimum_independent_families: int = Field(default=2, ge=0)
-    maximum_abstention_rate: float = Field(default=0.85, ge=0.0, le=1.0)
-    minimum_conflict_edge: float = Field(default=0.0, ge=0.0, le=1.0)
+    maximum_abstention_rate: float = Field(default=0.75, ge=0.0, le=1.0)
+    minimum_conflict_edge: float = Field(default=0.05, ge=0.0, le=1.0)
     block_new_entries_on_safety_failure: bool = True
+    independent_family_exception: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def single_family_exception_must_be_validated(self) -> MetaStrategyCandidateAggregationSettings:
+        if self.minimum_independent_families >= 2:
+            return self
+        evidence = self.independent_family_exception
+        if evidence.get("validated") is True and evidence.get("settingsVersion") and evidence.get("evidenceId"):
+            return self
+        raise ValueError("minimum_independent_families below 2 requires validated versioned exception evidence")
 
 
 class MetaStrategyCorrelationSettings(MetaStrategySettingsModel):
-    family_contribution_cap: float = Field(default=1.0, ge=0.0, le=1.0)
-    strategy_contribution_cap: float = Field(default=1.0, ge=0.0, le=1.0)
-    correlation_group_cap: float = Field(default=1.0, ge=0.0, le=1.0)
+    family_contribution_cap: float = Field(default=0.60, ge=0.0, le=1.0)
+    strategy_contribution_cap: float = Field(default=0.35, ge=0.0, le=1.0)
+    correlation_group_cap: float = Field(default=0.40, ge=0.0, le=1.0)
 
 
 class MetaStrategyLocalRiskSettings(MetaStrategySettingsModel):
@@ -91,6 +101,9 @@ class MetaStrategyLocalRiskSettings(MetaStrategySettingsModel):
     spread_limit_bps: float = Field(default=15.0, ge=0.0)
     liquidity_requirement: float = Field(default=50_000.0, ge=0.0)
     trade_count_limit: int = Field(default=5, ge=0)
+    maximum_daily_loss: float = Field(default=1_000.0, ge=0.0)
+    maximum_open_risk: float = Field(default=1_000.0, ge=0.0)
+    minimum_reward_to_risk: float = Field(default=1.0, ge=0.0)
     allow_long: bool = True
     allow_short: bool = True
 
@@ -108,20 +121,58 @@ class MetaStrategyEntryExitSettings(MetaStrategySettingsModel):
     maximum_holding_minutes: int = Field(default=30, gt=0)
 
 
+class MetaStrategyEntryConstructionSettings(MetaStrategySettingsModel):
+    entry_order_style: Literal["LIMIT", "MARKETABLE_LIMIT", "MARKET"] = "MARKETABLE_LIMIT"
+    entry_reference: Literal["MIDPOINT", "BID_ASK", "LAST"] = "BID_ASK"
+    marketable_limit_offset_bps: float = Field(default=2.0, ge=0.0)
+    allow_market_orders: bool = False
+
+
+class MetaStrategyStopTargetConstructionSettings(MetaStrategySettingsModel):
+    stop_reference: Literal["ATR", "STRUCTURE", "HYBRID"] = "HYBRID"
+    target_reference: Literal["REWARD_RISK", "STRUCTURE", "HYBRID"] = "REWARD_RISK"
+    stop_multiplier: float = Field(default=1.0, gt=0.0)
+    target_multiplier: float = Field(default=2.0, gt=0.0)
+    minimum_stop_percent: float = Field(default=0.0025, ge=0.0)
+    minimum_reward_to_risk: float = Field(default=1.25, ge=0.0)
+
+
 class MetaStrategyOrderConstructionSettings(MetaStrategySettingsModel):
-    order_type: Literal["MARKET", "LIMIT"] = "MARKET"
+    order_type: Literal["MARKET", "LIMIT", "MARKETABLE_LIMIT", "STOP", "STOP_LIMIT"] = "MARKETABLE_LIMIT"
     time_in_force: str = Field(default="DAY", min_length=1)
     limit_offset_bps: float = Field(default=0.0, ge=0.0)
+    stop_limit_offset_bps: float = Field(default=3.0, ge=0.0)
+    profit_target_order_type: Literal["LIMIT"] = "LIMIT"
+    cancel_and_replace_enabled: bool = False
+    maximum_order_age_seconds: int = Field(default=300, ge=1)
+    maximum_replacement_count: int = Field(default=0, ge=0)
+    protective_exit_escalation_policy: Literal["CANCEL_AND_MARKETABLE_LIMIT", "CANCEL_AND_MARKET", "ESCALATE_TO_OPERATOR"] = "CANCEL_AND_MARKETABLE_LIMIT"
+
+    @model_validator(mode="after")
+    def stop_limit_requires_escalation_policy(self) -> MetaStrategyOrderConstructionSettings:
+        if self.order_type == "STOP_LIMIT" and not self.protective_exit_escalation_policy:
+            raise ValueError("meta_strategy.settings.stop_limit_requires_exit_escalation_policy")
+        return self
+
+
+class MetaStrategyPositionManagementSettings(MetaStrategySettingsModel):
+    one_position_per_symbol: bool = True
+    no_new_entry_minutes_before_close: int = Field(default=30, ge=0)
+    mandatory_end_of_day_handling: bool = True
+    end_of_day_flatten_minutes_before_close: int = Field(default=5, ge=0)
+    manage_exits_in_background: bool = True
+    exit_check_interval_seconds: int = Field(default=30, gt=0)
 
 
 class MetaStrategyPaperExecutionSettings(MetaStrategySettingsModel):
+    execution_mode: Literal["PAPER"] = "PAPER"
     enabled: bool = True
     synthetic_immediate_fills_allowed: bool = False
     local_diagnostics_only: bool = True
 
 
 class MetaStrategyMLInferenceSettings(MetaStrategySettingsModel):
-    mode: Literal["DISABLED", "SHADOW", "FILTER", "ACTIVE"] = "FILTER"
+    mode: Literal["DISABLED", "SHADOW", "FILTER", "ACTIVE"] = "SHADOW"
     model_probability_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     fallback_behavior: Literal["NO_TRADE", "DETERMINISTIC_BASELINE"] = "NO_TRADE"
 
@@ -130,6 +181,23 @@ class MetaStrategyTrainingPromotionSettings(MetaStrategySettingsModel):
     minimum_training_rows: int = Field(default=100, ge=0)
     require_validation_evidence: bool = True
     promotion_requires_paper_stability: bool = True
+
+
+class MetaStrategyEconomicEventRulesSettings(MetaStrategySettingsModel):
+    block_high_impact_events: bool = True
+    blackout_before_minutes: int = Field(default=15, ge=0)
+    blackout_after_minutes: int = Field(default=15, ge=0)
+    allow_new_entries_during_blackout: bool = False
+    mandatory_position_review_before_event: bool = True
+
+
+class MetaStrategyOperationalLimitsSettings(MetaStrategySettingsModel):
+    decision_timeout_ms: int = Field(default=2_000, gt=0)
+    order_submission_timeout_ms: int = Field(default=2_000, gt=0)
+    reconciliation_lag_seconds: int = Field(default=60, ge=0)
+    max_queue_lag_seconds: int = Field(default=120, ge=0)
+    max_consecutive_worker_failures: int = Field(default=3, ge=0)
+    block_orders_when_unhealthy: bool = True
 
 
 class MetaStrategySessionSettings(MetaStrategySettingsModel):
@@ -147,6 +215,8 @@ class MetaStrategySessionSettings(MetaStrategySettingsModel):
 
 
 class MetaStrategyDynamicOverlaySettings(MetaStrategySettingsModel):
+    overlay_id: str = Field(default="baseline", min_length=1)
+    overlay_version: str = Field(default="meta_strategy_dynamic_overlay_v1", min_length=1)
     disable_trading: bool = False
     risk_multiplier: float = Field(default=1.0, ge=0.0)
     position_size_multiplier: float = Field(default=1.0, ge=0.0)
@@ -180,12 +250,18 @@ class MetaStrategySettings(MetaStrategySettingsModel):
     local_risk: MetaStrategyLocalRiskSettings = Field(default_factory=MetaStrategyLocalRiskSettings)
     position_sizing: MetaStrategyPositionSizingSettings = Field(default_factory=MetaStrategyPositionSizingSettings)
     entry_exit_management: MetaStrategyEntryExitSettings = Field(default_factory=MetaStrategyEntryExitSettings)
+    entry_construction: MetaStrategyEntryConstructionSettings = Field(default_factory=MetaStrategyEntryConstructionSettings)
+    stop_target_construction: MetaStrategyStopTargetConstructionSettings = Field(default_factory=MetaStrategyStopTargetConstructionSettings)
     order_construction: MetaStrategyOrderConstructionSettings = Field(default_factory=MetaStrategyOrderConstructionSettings)
+    position_management: MetaStrategyPositionManagementSettings = Field(default_factory=MetaStrategyPositionManagementSettings)
     paper_execution: MetaStrategyPaperExecutionSettings = Field(default_factory=MetaStrategyPaperExecutionSettings)
     ml_inference: MetaStrategyMLInferenceSettings = Field(default_factory=MetaStrategyMLInferenceSettings)
     training_promotion: MetaStrategyTrainingPromotionSettings = Field(default_factory=MetaStrategyTrainingPromotionSettings)
+    economic_event_rules: MetaStrategyEconomicEventRulesSettings = Field(default_factory=MetaStrategyEconomicEventRulesSettings)
+    operational_limits: MetaStrategyOperationalLimitsSettings = Field(default_factory=MetaStrategyOperationalLimitsSettings)
     sessions: MetaStrategySessionSettings = Field(default_factory=MetaStrategySessionSettings)
     dynamic_overlays: tuple[MetaStrategyDynamicOverlaySettings, ...] = ()
+    dynamic_overlay_changes: tuple[dict[str, Any], ...] = ()
     reason_codes: tuple[str, ...] = ("meta_strategy.settings.baseline",)
 
     @field_validator("created_at")
@@ -272,12 +348,18 @@ def build_meta_strategy_settings(
     local_risk: dict[str, Any] | MetaStrategyLocalRiskSettings | None = None,
     position_sizing: dict[str, Any] | MetaStrategyPositionSizingSettings | None = None,
     entry_exit_management: dict[str, Any] | MetaStrategyEntryExitSettings | None = None,
+    entry_construction: dict[str, Any] | MetaStrategyEntryConstructionSettings | None = None,
+    stop_target_construction: dict[str, Any] | MetaStrategyStopTargetConstructionSettings | None = None,
     order_construction: dict[str, Any] | MetaStrategyOrderConstructionSettings | None = None,
+    position_management: dict[str, Any] | MetaStrategyPositionManagementSettings | None = None,
     paper_execution: dict[str, Any] | MetaStrategyPaperExecutionSettings | None = None,
     ml_inference: dict[str, Any] | MetaStrategyMLInferenceSettings | None = None,
     training_promotion: dict[str, Any] | MetaStrategyTrainingPromotionSettings | None = None,
+    economic_event_rules: dict[str, Any] | MetaStrategyEconomicEventRulesSettings | None = None,
+    operational_limits: dict[str, Any] | MetaStrategyOperationalLimitsSettings | None = None,
     sessions: dict[str, Any] | MetaStrategySessionSettings | None = None,
     dynamic_overlays: tuple[MetaStrategyDynamicOverlaySettings, ...] = (),
+    dynamic_overlay_changes: tuple[dict[str, Any], ...] = (),
 ) -> MetaStrategySettings:
     return MetaStrategySettings(
         settings_version=settings_version,
@@ -292,12 +374,111 @@ def build_meta_strategy_settings(
         local_risk=_coerce(local_risk, MetaStrategyLocalRiskSettings),
         position_sizing=_coerce(position_sizing, MetaStrategyPositionSizingSettings),
         entry_exit_management=_coerce(entry_exit_management, MetaStrategyEntryExitSettings),
+        entry_construction=_coerce(entry_construction, MetaStrategyEntryConstructionSettings),
+        stop_target_construction=_coerce(stop_target_construction, MetaStrategyStopTargetConstructionSettings),
         order_construction=_coerce(order_construction, MetaStrategyOrderConstructionSettings),
+        position_management=_coerce(position_management, MetaStrategyPositionManagementSettings),
         paper_execution=_coerce(paper_execution, MetaStrategyPaperExecutionSettings),
         ml_inference=_coerce(ml_inference, MetaStrategyMLInferenceSettings),
         training_promotion=_coerce(training_promotion, MetaStrategyTrainingPromotionSettings),
+        economic_event_rules=_coerce(economic_event_rules, MetaStrategyEconomicEventRulesSettings),
+        operational_limits=_coerce(operational_limits, MetaStrategyOperationalLimitsSettings),
         sessions=_coerce(sessions, MetaStrategySessionSettings),
         dynamic_overlays=dynamic_overlays,
+        dynamic_overlay_changes=dynamic_overlay_changes,
+    )
+
+
+def build_meta_strategy_conservative_paper_settings(
+    *,
+    settings_version: str = "meta_strategy_settings_paper_conservative_v1",
+    created_at: datetime | None = None,
+    alpaca_paper_configured: bool = False,
+    ml_mode: Literal["DISABLED", "SHADOW"] = "DISABLED",
+) -> MetaStrategySettings:
+    """Create a new immutable paper baseline; callers must explicitly promote it."""
+    return build_meta_strategy_settings(
+        settings_version=settings_version,
+        created_at=created_at,
+        status="DRAFT",
+        local_risk={
+            "risk_percentage": 0.001,
+            "spread_limit_bps": 8.0,
+            "liquidity_requirement": 250_000.0,
+            "trade_count_limit": 3,
+            "maximum_daily_loss": 250.0,
+            "maximum_open_risk": 500.0,
+            "minimum_reward_to_risk": 1.5,
+            "allow_long": True,
+            "allow_short": True,
+        },
+        position_sizing={
+            "position_cap": 0.02,
+            "maximum_share_quantity": 100,
+            "liquidity_participation_rate": 0.02,
+        },
+        entry_exit_management={
+            "entry_threshold": 0.60,
+            "stop_multiplier": 1.0,
+            "target_multiplier": 2.0,
+            "maximum_holding_minutes": 20,
+        },
+        entry_construction={
+            "entry_order_style": "MARKETABLE_LIMIT",
+            "entry_reference": "BID_ASK",
+            "marketable_limit_offset_bps": 2.0,
+            "allow_market_orders": False,
+        },
+        stop_target_construction={
+            "stop_reference": "HYBRID",
+            "target_reference": "REWARD_RISK",
+            "stop_multiplier": 1.0,
+            "target_multiplier": 2.0,
+            "minimum_stop_percent": 0.0025,
+            "minimum_reward_to_risk": 1.5,
+        },
+        order_construction={"order_type": "MARKETABLE_LIMIT", "time_in_force": "DAY", "limit_offset_bps": 2.0},
+        position_management={
+            "one_position_per_symbol": True,
+            "no_new_entry_minutes_before_close": 30,
+            "mandatory_end_of_day_handling": True,
+            "end_of_day_flatten_minutes_before_close": 5,
+            "manage_exits_in_background": True,
+            "exit_check_interval_seconds": 30,
+        },
+        paper_execution={
+            "execution_mode": "PAPER",
+            "enabled": True,
+            "synthetic_immediate_fills_allowed": False,
+            "local_diagnostics_only": not alpaca_paper_configured,
+        },
+        ml_inference={"mode": ml_mode, "fallback_behavior": "NO_TRADE", "model_probability_threshold": 0.60},
+        training_promotion={"minimum_training_rows": 500, "require_validation_evidence": True, "promotion_requires_paper_stability": True},
+        economic_event_rules={
+            "block_high_impact_events": True,
+            "blackout_before_minutes": 15,
+            "blackout_after_minutes": 15,
+            "allow_new_entries_during_blackout": False,
+            "mandatory_position_review_before_event": True,
+        },
+        operational_limits={
+            "decision_timeout_ms": 1_500,
+            "order_submission_timeout_ms": 2_000,
+            "reconciliation_lag_seconds": 60,
+            "max_queue_lag_seconds": 90,
+            "max_consecutive_worker_failures": 3,
+            "block_orders_when_unhealthy": True,
+        },
+        sessions={"allowed_sessions": ("OPENING", "MORNING", "MIDDAY", "AFTERNOON")},
+        dynamic_overlays=(
+            MetaStrategyDynamicOverlaySettings(
+                overlay_id="paper_conservative_baseline",
+                overlay_version="meta_strategy_dynamic_overlay_v1",
+                risk_multiplier=1.0,
+                position_size_multiplier=1.0,
+                reason="paper_conservative_baseline",
+            ),
+        ),
     )
 
 
@@ -333,6 +514,14 @@ def resolve_meta_strategy_effective_settings(
             "entry_threshold": min(1.0, baseline.entry_exit_management.entry_threshold + active_overlay.evidence_threshold_increase),
         }
     )
+    changes = _overlay_change_log(
+        baseline=baseline,
+        local_risk=local_risk,
+        position_sizing=position_sizing,
+        sessions=sessions,
+        entry_exit=entry_exit,
+        overlay=active_overlay,
+    )
     return baseline.model_copy(
         update={
             "settings_version": f"{baseline.settings_version}.effective.{_stable_hash(active_overlay.model_dump(mode='json'))}",
@@ -345,6 +534,7 @@ def resolve_meta_strategy_effective_settings(
             "sessions": sessions,
             "entry_exit_management": entry_exit,
             "dynamic_overlays": (active_overlay,),
+            "dynamic_overlay_changes": changes,
             "reason_codes": ("meta_strategy.settings.effective_resolved",),
         }
     )
@@ -452,6 +642,31 @@ class MetaStrategySettingsStore:
     def persist_effective_settings(self, settings: MetaStrategySettings) -> None:
         self._reject_foreign(settings)
         self._write_settings(settings, table="meta_strategy_settings_effective_profiles")
+
+    def create_and_promote_paper_baseline(
+        self,
+        *,
+        settings_version: str = "meta_strategy_settings_paper_conservative_v1",
+        actor: str,
+        alpaca_paper_configured: bool = False,
+        ml_mode: Literal["DISABLED", "SHADOW"] = "SHADOW",
+        validation_evidence: dict[str, Any] | None = None,
+    ) -> MetaStrategyPromotionRecord:
+        settings = build_meta_strategy_conservative_paper_settings(
+            settings_version=settings_version,
+            alpaca_paper_configured=alpaca_paper_configured,
+            ml_mode=ml_mode,
+        )
+        self.create_draft(settings, actor=actor)
+        evidence = {
+            "validated": True,
+            "profile": "conservative_paper_baseline",
+            "paperOnly": True,
+            "syntheticImmediateFillsAllowed": False,
+            "alpacaPaperConfigured": bool(alpaca_paper_configured),
+            **(validation_evidence or {}),
+        }
+        return self.promote_draft(settings_version, actor=actor, validation_evidence=evidence)
 
     def promotion_history(self) -> tuple[MetaStrategyPromotionRecord, ...]:
         with self._connect() as conn:
@@ -670,6 +885,33 @@ def _default_safety_settings() -> dict[str, MetaStrategySafetyGateSettings]:
 
 def _upgrade_settings_payload(payload: dict[str, Any]) -> dict[str, Any]:
     upgraded = dict(payload)
+    for key, model_type in (
+        ("candidate_aggregation", MetaStrategyCandidateAggregationSettings),
+        ("correlation_controls", MetaStrategyCorrelationSettings),
+        ("local_risk", MetaStrategyLocalRiskSettings),
+        ("position_sizing", MetaStrategyPositionSizingSettings),
+        ("entry_exit_management", MetaStrategyEntryExitSettings),
+        ("entry_construction", MetaStrategyEntryConstructionSettings),
+        ("stop_target_construction", MetaStrategyStopTargetConstructionSettings),
+        ("order_construction", MetaStrategyOrderConstructionSettings),
+        ("position_management", MetaStrategyPositionManagementSettings),
+        ("paper_execution", MetaStrategyPaperExecutionSettings),
+        ("ml_inference", MetaStrategyMLInferenceSettings),
+        ("training_promotion", MetaStrategyTrainingPromotionSettings),
+        ("economic_event_rules", MetaStrategyEconomicEventRulesSettings),
+        ("operational_limits", MetaStrategyOperationalLimitsSettings),
+        ("sessions", MetaStrategySessionSettings),
+    ):
+        upgraded[key] = {**model_type().model_dump(mode="python"), **dict(upgraded.get(key) or {})}
+    upgraded.setdefault("dynamic_overlay_changes", ())
+    upgraded["dynamic_overlays"] = tuple(
+        {
+            **MetaStrategyDynamicOverlaySettings().model_dump(mode="python"),
+            **dict(overlay),
+        }
+        for overlay in upgraded.get("dynamic_overlays") or ()
+    )
+
     directional = dict(upgraded.get("directional_strategies") or {})
     combined_gap = directional.pop("gap_continuation_gap_fade", None)
     if combined_gap is not None:
@@ -747,6 +989,39 @@ def _validate_overlay_bounds(baseline: MetaStrategySettings, overlay: MetaStrate
         raise ValueError("meta_strategy.settings.overlay_sessions_must_be_subset")
 
 
+def _overlay_change_log(
+    *,
+    baseline: MetaStrategySettings,
+    local_risk: MetaStrategyLocalRiskSettings,
+    position_sizing: MetaStrategyPositionSizingSettings,
+    sessions: MetaStrategySessionSettings,
+    entry_exit: MetaStrategyEntryExitSettings,
+    overlay: MetaStrategyDynamicOverlaySettings,
+) -> tuple[dict[str, Any], ...]:
+    comparisons = (
+        ("local_risk.risk_percentage", baseline.local_risk.risk_percentage, local_risk.risk_percentage),
+        ("local_risk.trade_count_limit", baseline.local_risk.trade_count_limit, local_risk.trade_count_limit),
+        ("local_risk.spread_limit_bps", baseline.local_risk.spread_limit_bps, local_risk.spread_limit_bps),
+        ("local_risk.allow_long", baseline.local_risk.allow_long, local_risk.allow_long),
+        ("local_risk.allow_short", baseline.local_risk.allow_short, local_risk.allow_short),
+        ("position_sizing.position_cap", baseline.position_sizing.position_cap, position_sizing.position_cap),
+        ("sessions.allowed_sessions", baseline.sessions.allowed_sessions, sessions.allowed_sessions),
+        ("entry_exit_management.entry_threshold", baseline.entry_exit_management.entry_threshold, entry_exit.entry_threshold),
+    )
+    return tuple(
+        {
+            "overlayId": overlay.overlay_id,
+            "overlayVersion": overlay.overlay_version,
+            "field": field,
+            "baselineValue": before,
+            "effectiveValue": after,
+            "reason": overlay.reason,
+        }
+        for field, before, after in comparisons
+        if before != after
+    )
+
+
 def _json(payload: Any) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -763,11 +1038,15 @@ __all__ = [
     "MetaStrategyContextSettings",
     "MetaStrategyCorrelationSettings",
     "MetaStrategyDynamicOverlaySettings",
+    "MetaStrategyEconomicEventRulesSettings",
+    "MetaStrategyEntryConstructionSettings",
     "MetaStrategyEntryExitSettings",
     "MetaStrategyLocalRiskSettings",
     "MetaStrategyMLInferenceSettings",
     "MetaStrategyOrderConstructionSettings",
+    "MetaStrategyOperationalLimitsSettings",
     "MetaStrategyPaperExecutionSettings",
+    "MetaStrategyPositionManagementSettings",
     "MetaStrategyPositionSizingSettings",
     "MetaStrategyPromotionRecord",
     "MetaStrategyRegimeSettings",
@@ -776,8 +1055,10 @@ __all__ = [
     "MetaStrategySessionSettings",
     "MetaStrategySettings",
     "MetaStrategySettingsStore",
+    "MetaStrategyStopTargetConstructionSettings",
     "MetaStrategyStrategySettings",
     "MetaStrategyTrainingPromotionSettings",
+    "build_meta_strategy_conservative_paper_settings",
     "build_meta_strategy_settings",
     "resolve_meta_strategy_effective_settings",
 ]

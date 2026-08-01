@@ -15,6 +15,13 @@ class SnapshotEvaluationResult:
     signal: str
     confidence: float
     eligible: bool
+    strategy_version: str = "meta_strategy_strategy_v1"
+    required_inputs: tuple[str, ...] = ()
+    minimum_warmup: int = 0
+    supported_directions: tuple[str, ...] = ("BUY", "SELL", "HOLD")
+    entry_reference: float | None = None
+    invalidation_reference: float | None = None
+    suggested_stop_reference: float | None = None
     settings_version: str = "meta_strategy_settings_v1"
     effective_settings_hash: str = "meta_strategy_settings_unresolved"
     family: str = "UNKNOWN"

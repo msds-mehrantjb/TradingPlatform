@@ -32,6 +32,7 @@ class MetaStrategyPhase6JobsTest(unittest.TestCase):
                 "order_reconciliation",
                 "stale_order_handling",
                 "inventory_reconciliation",
+                "position_management",
                 "training",
                 "backtesting",
                 "replay",
@@ -159,6 +160,20 @@ class MetaStrategyPhase6JobsTest(unittest.TestCase):
         self.assertEqual(repository.read_job(completed.job_id).status, MetaStrategyJobStatus.SUCCEEDED)
         self.assertIsNone(replay_claim)
         self.assertEqual(repository.read_job(cancelled.job_id).status, MetaStrategyJobStatus.CANCELLED)
+
+    def test_generic_worker_without_handler_fails_closed_and_never_records_noop_success(self) -> None:
+        repository = MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}")
+        queued = repository.enqueue_job(job_type="reporting", idempotency_key="report-no-handler", payload={}, max_attempts=1, now=NOW)
+        worker = MetaStrategyWorker(repository=repository, queue_name="reporting", worker_id="generic-worker")
+
+        result = worker.run_once(now=NOW)
+        failed = repository.read_job(queued.job_id)
+
+        self.assertEqual(result.job_id, queued.job_id)
+        self.assertEqual(failed.status, MetaStrategyJobStatus.DEAD_LETTER)
+        self.assertEqual(failed.error_category, "RuntimeError")
+        self.assertEqual(failed.error_details, "meta_strategy.worker.handler_required")
+        self.assertIsNone(failed.result_reference)
 
     def test_heavy_service_operation_enqueues_job_without_inline_execution(self) -> None:
         repository = MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}")

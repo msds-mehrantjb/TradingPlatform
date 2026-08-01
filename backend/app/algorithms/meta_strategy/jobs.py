@@ -16,6 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from backend.app.algorithms.meta_strategy.identity import ALGORITHM_ID
+from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
+from backend.app.algorithms.meta_strategy.versions import (
+    META_STRATEGY_FEATURE_SCHEMA_VERSION,
+    META_STRATEGY_MODEL_VERSION,
+    META_STRATEGY_STRATEGY_CATALOG_VERSION,
+)
 from backend.app.database import _sqlite_path
 
 
@@ -29,6 +35,7 @@ META_STRATEGY_JOB_QUEUES: frozenset[str] = frozenset(
         "order_reconciliation",
         "stale_order_handling",
         "inventory_reconciliation",
+        "position_management",
         "training",
         "backtesting",
         "replay",
@@ -43,6 +50,7 @@ META_STRATEGY_JOB_TYPE_TO_QUEUE: dict[str, str] = {
     "order_reconciliation": "order_reconciliation",
     "stale_order_handling": "stale_order_handling",
     "inventory_reconciliation": "inventory_reconciliation",
+    "position_management": "position_management",
     "training": "training",
     "backtesting": "backtesting",
     "replay": "replay",
@@ -64,6 +72,7 @@ META_STRATEGY_DEFAULT_QUEUE_CONCURRENCY_LIMITS: dict[str, int] = {
     "order_reconciliation": 1,
     "stale_order_handling": 1,
     "inventory_reconciliation": 1,
+    "position_management": 1,
     "training": 1,
     "backtesting": 1,
     "replay": 1,
@@ -275,16 +284,29 @@ class MetaStrategyJobRepository:
         timeframe: str,
         bar_end: datetime,
         settings_version: str,
+        capital_partition_id: str = META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
         payload: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> MetaStrategyJobRecord:
         event_payload = {
+            **dict(payload or {}),
+            "algorithm_id": ALGORITHM_ID,
+            "algorithmId": ALGORITHM_ID,
+            "capital_partition_id": capital_partition_id,
+            "capitalPartitionId": capital_partition_id,
             "mode": mode,
             "symbol": symbol.upper(),
             "timeframe": timeframe,
             "barEnd": _dt(bar_end),
+            "bar_end": _dt(bar_end),
             "settingsVersion": settings_version,
-            **dict(payload or {}),
+            "settings_version": settings_version,
+            "strategy_catalog_version": META_STRATEGY_STRATEGY_CATALOG_VERSION,
+            "strategyCatalogVersion": META_STRATEGY_STRATEGY_CATALOG_VERSION,
+            "feature_schema_version": META_STRATEGY_FEATURE_SCHEMA_VERSION,
+            "featureSchemaVersion": META_STRATEGY_FEATURE_SCHEMA_VERSION,
+            "model_version": META_STRATEGY_MODEL_VERSION,
+            "modelVersion": META_STRATEGY_MODEL_VERSION,
         }
         key = finalised_bar_idempotency_key(
             mode=mode,
@@ -292,6 +314,7 @@ class MetaStrategyJobRepository:
             timeframe=timeframe,
             bar_end=bar_end,
             settings_version=settings_version,
+            capital_partition_id=capital_partition_id,
         )
         event = self.record_event(
             event_type="finalised_one_minute_bar",
@@ -300,12 +323,18 @@ class MetaStrategyJobRepository:
             payload=event_payload,
             now=now,
         )
-        return self.enqueue_job(
+        job = self.enqueue_job(
             job_type="finalised_bar_decision",
             idempotency_key=key,
             payload={"eventId": event.event_id},
             now=now,
         )
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE meta_strategy_job_events SET job_id = ? WHERE algorithm_id = ? AND event_id = ? AND job_id IS NULL",
+                (job.job_id, ALGORITHM_ID, event.event_id),
+            )
+        return job
 
     def read_payload(self, payload_reference: str) -> dict[str, Any]:
         with self.connect() as conn:
@@ -428,6 +457,53 @@ class MetaStrategyJobRepository:
                     ),
                 )
         return {"decisionId": decision_id, "outboxId": outbox_id}
+
+    def enqueue_position_exit_outbox(
+        self,
+        *,
+        job: MetaStrategyJobRecord,
+        order_intent: Mapping[str, Any],
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        timestamp = _dt(now or _utc_now())
+        normalized = _position_exit_outbox_payload(order_intent, job=job, processing_timestamp=timestamp)
+        outbox_id = f"meta_strategy.execution_outbox.{normalized['orderIntentId']}"
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO meta_strategy_execution_outbox (
+                    outbox_id, algorithm_id, event_id, job_id, decision_id,
+                    order_intent_id, idempotency_key, schema_version, settings_version,
+                    model_version, event_timestamp, processing_timestamp,
+                    causal_ids_json, status, payload_json,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    outbox_id,
+                    ALGORITHM_ID,
+                    normalized["eventId"],
+                    job.job_id,
+                    normalized["decisionId"],
+                    normalized["orderIntentId"],
+                    normalized["idempotencyKey"],
+                    normalized["schemaVersion"],
+                    normalized["settingsVersion"],
+                    normalized["modelVersion"],
+                    normalized["eventTimestamp"],
+                    normalized["processingTimestamp"],
+                    _json(normalized["causalIds"]),
+                    "PENDING",
+                    _json(normalized),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = conn.execute("SELECT * FROM meta_strategy_execution_outbox WHERE outbox_id = ?", (outbox_id,)).fetchone()
+        outbox = _outbox_from_row(row)
+        return {**outbox, "duplicate": str(outbox["createdAt"]) != timestamp}
 
     def claim_next_job(self, *, queue_name: str, worker_id: str, lease_seconds: int = 300, now: datetime | None = None) -> MetaStrategyJobRecord | None:
         _validate_queue(queue_name)
@@ -874,7 +950,7 @@ class MetaStrategyJobRepository:
                 """
                 SELECT *
                 FROM meta_strategy_execution_outbox
-                WHERE algorithm_id = ? AND status IN ('SUBMITTING', 'SUBMITTED', 'ACKNOWLEDGED', 'OPEN', 'PARTIALLY_FILLED', 'RECONCILIATION_REQUIRED')
+                WHERE algorithm_id = ? AND status IN ('SUBMITTING', 'SUBMITTED', 'ACKNOWLEDGED', 'OPEN', 'PARTIALLY_FILLED', 'REPLACED', 'RECONCILIATION_REQUIRED')
                 ORDER BY created_at ASC, outbox_id ASC
                 """,
                 (ALGORITHM_ID,),
@@ -1531,15 +1607,35 @@ class MetaStrategyJobRepository:
         decision_data_ages: list[float] = []
         decision_latencies: list[float] = []
         blocked_reasons: dict[str, int] = {}
+        decision_counts = {"BUY": 0, "SELL": 0, "HOLD": 0, "BLOCKED": 0}
+        no_trade_reasons: dict[str, int] = {}
+        strategy_signal_counts: dict[str, dict[str, int]] = {}
+        strategy_abstention_counts: dict[str, int] = {}
+        family_conflicts: dict[str, int] = {}
+        ml_inference_failures = 0
+        ood_decisions = 0
         for row in decisions:
             payload = json.loads(str(row["payload_json"]))
             if payload.get("dataAgeSeconds") is not None:
                 decision_data_ages.append(float(payload["dataAgeSeconds"]))
-            if payload.get("processingLatencyMs") is not None:
-                decision_latencies.append(float(payload["processingLatencyMs"]))
-            if payload.get("finalValid") is False:
-                for code in tuple(payload.get("reasonCodes") or payload.get("reason_codes") or ()):
+            latency = payload.get("processingLatencyMs", payload.get("latencyMs"))
+            if latency is not None:
+                decision_latencies.append(float(latency))
+            reason_codes = tuple(str(code) for code in tuple(payload.get("reasonCodes") or payload.get("reason_codes") or ()))
+            decision_action = _decision_metric_action(payload, reason_codes)
+            decision_counts[decision_action] = decision_counts.get(decision_action, 0) + 1
+            if decision_action in {"HOLD", "BLOCKED"}:
+                for code in reason_codes:
+                    no_trade_reasons[code] = no_trade_reasons.get(code, 0) + 1
+            if decision_action == "BLOCKED" or payload.get("finalValid") is False:
+                for code in reason_codes:
                     blocked_reasons[str(code)] = blocked_reasons.get(str(code), 0) + 1
+            _accumulate_strategy_metrics(payload, strategy_signal_counts, strategy_abstention_counts)
+            _accumulate_family_conflicts(payload, family_conflicts)
+            if _has_ml_failure(reason_codes, payload):
+                ml_inference_failures += 1
+            if any("ood" in code.lower() or "out_of_distribution" in code.lower() for code in reason_codes):
+                ood_decisions += 1
         outbox = {
             str(row["status"]): {
                 "count": int(row["count"]),
@@ -1567,7 +1663,14 @@ class MetaStrategyJobRepository:
             "jobDeadLetterCount": sum(counts.get("dead_letter", 0) for counts in queue_counts.values()),
             "snapshotDataAgeSeconds": _summary(decision_data_ages),
             "decisionLatencyMs": _summary(decision_latencies),
+            "decisionCountsByAction": decision_counts,
             "blockedDecisionReasonCounts": blocked_reasons,
+            "noTradeReasonCounts": no_trade_reasons,
+            "strategySignalCounts": strategy_signal_counts,
+            "strategyAbstentionCounts": strategy_abstention_counts,
+            "familyConflictCounts": family_conflicts,
+            "mlInferenceFailureCount": ml_inference_failures,
+            "oodRate": round(ood_decisions / len(decisions), 6) if decisions else 0.0,
             "orderOutbox": outbox,
             "orderOutboxOldestAgeSeconds": max((item["oldestAgeSeconds"] for item in outbox.values()), default=0),
             "brokerSubmissionLatencySeconds": _summary(broker_latencies),
@@ -1702,7 +1805,9 @@ class MetaStrategyWorker:
             self.repository.record_worker_heartbeat(worker_id=self.worker_id, queue_name=self.queue_name, now=current)
             return None
         try:
-            result = handler(job) if handler is not None else {"status": "noop"}
+            if handler is None:
+                raise RuntimeError("meta_strategy.worker.handler_required")
+            result = handler(job)
         except Exception as exc:  # pragma: no cover - defensive worker boundary
             self.repository.fail_job(job.job_id, worker_id=self.worker_id, error_category=type(exc).__name__, error_details=str(exc), now=current)
             return job
@@ -2162,11 +2267,23 @@ def _decision_artifact_payload(
     model_version = str(normalized.get("modelVersion") or normalized.get("model_version") or "none")
     normalized["schemaVersion"] = str(normalized.get("schemaVersion") or META_STRATEGY_WORKER_DECISION_SCHEMA_VERSION)
     normalized["algorithmId"] = ALGORITHM_ID
+    normalized["algorithm_id"] = ALGORITHM_ID
+    normalized["capitalPartitionId"] = str(normalized.get("capitalPartitionId") or normalized.get("capital_partition_id") or event_payload.get("capitalPartitionId") or event_payload.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+    normalized["capital_partition_id"] = normalized["capitalPartitionId"]
     normalized["decisionId"] = str(normalized.get("decisionId") or decision_id)
+    normalized["decision_id"] = normalized["decisionId"]
     normalized["eventId"] = event.event_id
+    normalized["event_id"] = event.event_id
     normalized["jobId"] = job.job_id
+    normalized["job_id"] = job.job_id
     normalized["settingsVersion"] = str(normalized.get("settingsVersion") or event_payload.get("settingsVersion") or "")
+    normalized["settings_version"] = normalized["settingsVersion"]
+    normalized["strategyCatalogVersion"] = str(normalized.get("strategyCatalogVersion") or normalized.get("strategy_catalog_version") or event_payload.get("strategyCatalogVersion") or event_payload.get("strategy_catalog_version") or META_STRATEGY_STRATEGY_CATALOG_VERSION)
+    normalized["strategy_catalog_version"] = normalized["strategyCatalogVersion"]
+    normalized["featureSchemaVersion"] = str(normalized.get("featureSchemaVersion") or normalized.get("feature_schema_version") or event_payload.get("featureSchemaVersion") or event_payload.get("feature_schema_version") or META_STRATEGY_FEATURE_SCHEMA_VERSION)
+    normalized["feature_schema_version"] = normalized["featureSchemaVersion"]
     normalized["modelVersion"] = model_version
+    normalized["model_version"] = model_version
     normalized["eventTimestamp"] = event_timestamp
     normalized["processingTimestamp"] = str(normalized.get("processingTimestamp") or processing_timestamp)
     normalized["causalIds"] = _causal_ids(
@@ -2177,6 +2294,8 @@ def _decision_artifact_payload(
         idempotency_key=job.idempotency_key,
         order_intent_id=str(normalized.get("orderIntentId") or ""),
     )
+    normalized["correlationId"] = str(normalized.get("correlationId") or normalized.get("correlation_id") or normalized["causalIds"]["correlationId"])
+    normalized["correlation_id"] = normalized["correlationId"]
     return normalized
 
 
@@ -2193,11 +2312,23 @@ def _outbox_artifact_payload(
     order_intent_id = str(normalized.get("orderIntentId") or normalized.get("order_intent_id") or "")
     normalized["schemaVersion"] = str(normalized.get("schemaVersion") or META_STRATEGY_EXECUTION_OUTBOX_SCHEMA_VERSION)
     normalized["algorithmId"] = ALGORITHM_ID
+    normalized["algorithm_id"] = ALGORITHM_ID
+    normalized["capitalPartitionId"] = str(normalized.get("capitalPartitionId") or normalized.get("capital_partition_id") or decision_payload.get("capitalPartitionId") or decision_payload.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+    normalized["capital_partition_id"] = normalized["capitalPartitionId"]
     normalized["decisionId"] = decision_id
+    normalized["decision_id"] = decision_id
     normalized["eventId"] = event.event_id
+    normalized["event_id"] = event.event_id
     normalized["jobId"] = job.job_id
+    normalized["job_id"] = job.job_id
     normalized["settingsVersion"] = str(normalized.get("settingsVersion") or decision_payload.get("settingsVersion") or "")
+    normalized["settings_version"] = normalized["settingsVersion"]
+    normalized["strategyCatalogVersion"] = str(normalized.get("strategyCatalogVersion") or normalized.get("strategy_catalog_version") or decision_payload.get("strategyCatalogVersion") or decision_payload.get("strategy_catalog_version") or META_STRATEGY_STRATEGY_CATALOG_VERSION)
+    normalized["strategy_catalog_version"] = normalized["strategyCatalogVersion"]
+    normalized["featureSchemaVersion"] = str(normalized.get("featureSchemaVersion") or normalized.get("feature_schema_version") or decision_payload.get("featureSchemaVersion") or decision_payload.get("feature_schema_version") or META_STRATEGY_FEATURE_SCHEMA_VERSION)
+    normalized["feature_schema_version"] = normalized["featureSchemaVersion"]
     normalized["modelVersion"] = str(normalized.get("modelVersion") or decision_payload.get("modelVersion") or "none")
+    normalized["model_version"] = normalized["modelVersion"]
     normalized["eventTimestamp"] = str(normalized.get("eventTimestamp") or decision_payload.get("eventTimestamp") or event.created_at)
     normalized["processingTimestamp"] = str(normalized.get("processingTimestamp") or decision_payload.get("processingTimestamp") or processing_timestamp)
     normalized["causalIds"] = _causal_ids(
@@ -2208,6 +2339,59 @@ def _outbox_artifact_payload(
         idempotency_key=f"{job.idempotency_key}:order_intent",
         order_intent_id=order_intent_id,
     )
+    normalized["correlationId"] = str(normalized.get("correlationId") or normalized.get("correlation_id") or normalized["causalIds"]["correlationId"])
+    normalized["correlation_id"] = normalized["correlationId"]
+    return normalized
+
+
+def _position_exit_outbox_payload(
+    payload: Mapping[str, Any],
+    *,
+    job: MetaStrategyJobRecord,
+    processing_timestamp: str,
+) -> dict[str, Any]:
+    normalized = dict(payload)
+    order_intent_id = str(normalized.get("orderIntentId") or normalized.get("order_intent_id") or "")
+    if not order_intent_id:
+        raise ValueError("meta_strategy.position_management.exit_order_intent_id_required")
+    decision_id = str(normalized.get("decisionId") or normalized.get("decision_id") or f"meta_strategy.position_management.{order_intent_id}")
+    event_id = str(normalized.get("eventId") or normalized.get("event_id") or job.job_id)
+    idempotency_key = str(normalized.get("idempotencyKey") or normalized.get("idempotency_key") or f"{job.idempotency_key}:exit:{order_intent_id}")
+    normalized["schemaVersion"] = str(normalized.get("schemaVersion") or META_STRATEGY_EXECUTION_OUTBOX_SCHEMA_VERSION)
+    normalized["algorithmId"] = ALGORITHM_ID
+    normalized["algorithm_id"] = ALGORITHM_ID
+    normalized["capitalPartitionId"] = str(normalized.get("capitalPartitionId") or normalized.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+    normalized["capital_partition_id"] = normalized["capitalPartitionId"]
+    normalized["decisionId"] = decision_id
+    normalized["decision_id"] = decision_id
+    normalized["eventId"] = event_id
+    normalized["event_id"] = event_id
+    normalized["jobId"] = job.job_id
+    normalized["job_id"] = job.job_id
+    normalized["settingsVersion"] = str(normalized.get("settingsVersion") or normalized.get("settings_version") or "")
+    normalized["settings_version"] = normalized["settingsVersion"]
+    normalized["strategyCatalogVersion"] = str(normalized.get("strategyCatalogVersion") or normalized.get("strategy_catalog_version") or META_STRATEGY_STRATEGY_CATALOG_VERSION)
+    normalized["strategy_catalog_version"] = normalized["strategyCatalogVersion"]
+    normalized["featureSchemaVersion"] = str(normalized.get("featureSchemaVersion") or normalized.get("feature_schema_version") or META_STRATEGY_FEATURE_SCHEMA_VERSION)
+    normalized["feature_schema_version"] = normalized["featureSchemaVersion"]
+    normalized["modelVersion"] = str(normalized.get("modelVersion") or normalized.get("model_version") or META_STRATEGY_MODEL_VERSION)
+    normalized["model_version"] = normalized["modelVersion"]
+    normalized["eventTimestamp"] = str(normalized.get("eventTimestamp") or normalized.get("event_timestamp") or processing_timestamp)
+    normalized["processingTimestamp"] = processing_timestamp
+    normalized["orderIntentId"] = order_intent_id
+    normalized["order_intent_id"] = order_intent_id
+    normalized["idempotencyKey"] = idempotency_key
+    normalized["idempotency_key"] = idempotency_key
+    normalized["causalIds"] = _causal_ids(
+        normalized.get("causalIds"),
+        event_id=event_id,
+        job_id=job.job_id,
+        decision_id=decision_id,
+        idempotency_key=idempotency_key,
+        order_intent_id=order_intent_id,
+    )
+    normalized["correlationId"] = str(normalized.get("correlationId") or normalized.get("correlation_id") or normalized["causalIds"]["correlationId"])
+    normalized["correlation_id"] = normalized["correlationId"]
     return normalized
 
 
@@ -2227,6 +2411,7 @@ def _causal_ids(
     causal["idempotencyKey"] = str(causal.get("idempotencyKey") or idempotency_key)
     if order_intent_id:
         causal["orderIntentId"] = str(causal.get("orderIntentId") or order_intent_id)
+    causal["correlationId"] = str(causal.get("correlationId") or causal.get("correlation_id") or order_intent_id or decision_id or job_id or event_id)
     return causal
 
 
@@ -2238,22 +2423,37 @@ def _payload_inner_json_safe(payload: Mapping[str, Any]) -> dict[str, Any]:
 def _decision_from_row(row: sqlite3.Row) -> dict[str, Any]:
     if str(row["algorithm_id"]) != ALGORITHM_ID:
         raise ValueError(f"Meta-Strategy decision repository refused foreign algorithm decision {row['decision_id']}")
+    payload = json.loads(str(row["payload_json"]))
     return {
         "decisionId": str(row["decision_id"]),
+        "decision_id": str(row["decision_id"]),
         "algorithmId": str(row["algorithm_id"]),
+        "algorithm_id": str(row["algorithm_id"]),
+        "capitalPartitionId": str(payload.get("capitalPartitionId") or payload.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),
+        "capital_partition_id": str(payload.get("capital_partition_id") or payload.get("capitalPartitionId") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),
         "eventId": str(row["event_id"]),
+        "event_id": str(row["event_id"]),
         "jobId": str(row["job_id"]),
+        "job_id": str(row["job_id"]),
         "idempotencyKey": str(row["idempotency_key"]),
         "symbol": str(row["symbol"]),
         "barEnd": str(row["bar_end"]),
         "settingsVersion": str(row["settings_version"]),
+        "settings_version": str(row["settings_version"]),
+        "strategyCatalogVersion": str(payload.get("strategyCatalogVersion") or payload.get("strategy_catalog_version") or META_STRATEGY_STRATEGY_CATALOG_VERSION),
+        "strategy_catalog_version": str(payload.get("strategy_catalog_version") or payload.get("strategyCatalogVersion") or META_STRATEGY_STRATEGY_CATALOG_VERSION),
+        "featureSchemaVersion": str(payload.get("featureSchemaVersion") or payload.get("feature_schema_version") or META_STRATEGY_FEATURE_SCHEMA_VERSION),
+        "feature_schema_version": str(payload.get("feature_schema_version") or payload.get("featureSchemaVersion") or META_STRATEGY_FEATURE_SCHEMA_VERSION),
         "schemaVersion": str(row["schema_version"]),
         "modelVersion": str(row["model_version"]),
+        "model_version": str(row["model_version"]),
+        "correlationId": str(payload.get("correlationId") or payload.get("correlation_id") or row["decision_id"]),
+        "correlation_id": str(payload.get("correlation_id") or payload.get("correlationId") or row["decision_id"]),
         "eventTimestamp": str(row["event_timestamp"]),
         "processingTimestamp": str(row["processing_timestamp"]),
         "causalIds": json.loads(str(row["causal_ids_json"])),
         "status": str(row["status"]),
-        "payload": json.loads(str(row["payload_json"])),
+        "payload": payload,
         "createdAt": str(row["created_at"]),
         "updatedAt": str(row["updated_at"]),
         "clientOrderId": row["client_order_id"],
@@ -2273,22 +2473,37 @@ def _decision_from_row(row: sqlite3.Row) -> dict[str, Any]:
 def _outbox_from_row(row: sqlite3.Row) -> dict[str, Any]:
     if str(row["algorithm_id"]) != ALGORITHM_ID:
         raise ValueError(f"Meta-Strategy outbox repository refused foreign algorithm outbox {row['outbox_id']}")
+    payload = json.loads(str(row["payload_json"]))
     return {
         "outboxId": str(row["outbox_id"]),
         "algorithmId": str(row["algorithm_id"]),
+        "algorithm_id": str(row["algorithm_id"]),
+        "capitalPartitionId": str(payload.get("capitalPartitionId") or payload.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),
+        "capital_partition_id": str(payload.get("capital_partition_id") or payload.get("capitalPartitionId") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),
         "eventId": str(row["event_id"]),
+        "event_id": str(row["event_id"]),
         "jobId": str(row["job_id"]),
+        "job_id": str(row["job_id"]),
         "decisionId": str(row["decision_id"]),
+        "decision_id": str(row["decision_id"]),
         "orderIntentId": str(row["order_intent_id"]),
         "idempotencyKey": str(row["idempotency_key"]),
         "schemaVersion": str(row["schema_version"]),
         "settingsVersion": str(row["settings_version"]),
+        "settings_version": str(row["settings_version"]),
+        "strategyCatalogVersion": str(payload.get("strategyCatalogVersion") or payload.get("strategy_catalog_version") or META_STRATEGY_STRATEGY_CATALOG_VERSION),
+        "strategy_catalog_version": str(payload.get("strategy_catalog_version") or payload.get("strategyCatalogVersion") or META_STRATEGY_STRATEGY_CATALOG_VERSION),
+        "featureSchemaVersion": str(payload.get("featureSchemaVersion") or payload.get("feature_schema_version") or META_STRATEGY_FEATURE_SCHEMA_VERSION),
+        "feature_schema_version": str(payload.get("feature_schema_version") or payload.get("featureSchemaVersion") or META_STRATEGY_FEATURE_SCHEMA_VERSION),
         "modelVersion": str(row["model_version"]),
+        "model_version": str(row["model_version"]),
+        "correlationId": str(payload.get("correlationId") or payload.get("correlation_id") or row["order_intent_id"] or row["decision_id"]),
+        "correlation_id": str(payload.get("correlation_id") or payload.get("correlationId") or row["order_intent_id"] or row["decision_id"]),
         "eventTimestamp": str(row["event_timestamp"]),
         "processingTimestamp": str(row["processing_timestamp"]),
         "causalIds": json.loads(str(row["causal_ids_json"])),
         "status": str(row["status"]),
-        "payload": json.loads(str(row["payload_json"])),
+        "payload": payload,
         "createdAt": str(row["created_at"]),
         "updatedAt": str(row["updated_at"]),
         "clientOrderId": row["client_order_id"],
@@ -2321,8 +2536,16 @@ def _workflow_artifact_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def finalised_bar_idempotency_key(*, mode: str, symbol: str, timeframe: str, bar_end: datetime, settings_version: str) -> str:
-    return f"meta_strategy:{mode.upper()}:{symbol.upper()}:{timeframe}:{_dt(bar_end)}:{settings_version}"
+def finalised_bar_idempotency_key(
+    *,
+    mode: str | None = None,
+    symbol: str,
+    timeframe: str,
+    bar_end: datetime,
+    settings_version: str,
+    capital_partition_id: str = META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+) -> str:
+    return f"meta_strategy:{capital_partition_id}:{symbol.upper()}:{timeframe}:{_dt(bar_end)}:{settings_version}"
 
 
 def _retry_delay(*, attempts: int, job_id: str) -> timedelta:
@@ -2378,6 +2601,82 @@ def _summary(values: Sequence[float]) -> dict[str, float | int | None]:
         "max": max(values),
         "avg": sum(values) / len(values),
     }
+
+
+def _decision_metric_action(payload: Mapping[str, Any], reason_codes: Sequence[str]) -> str:
+    stages = payload.get("stages") if isinstance(payload.get("stages"), Mapping) else {}
+    policy = stages.get("decisionPolicy") if isinstance(stages.get("decisionPolicy"), Mapping) else {}
+    candidate = stages.get("aggregateCandidate") if isinstance(stages.get("aggregateCandidate"), Mapping) else {}
+    action = str(
+        payload.get("finalSignal")
+        or payload.get("signal")
+        or policy.get("finalSignal")
+        or policy.get("signal")
+        or candidate.get("direction")
+        or candidate.get("signal")
+        or ""
+    ).upper()
+    if action in {"BUY", "SELL"} and str(payload.get("decisionStatus") or "").upper() == "ORDER_PROPOSED":
+        return action
+    if payload.get("finalValid") is False or any(_blocked_reason(code) for code in reason_codes):
+        return "BLOCKED"
+    return "HOLD"
+
+
+def _accumulate_strategy_metrics(payload: Mapping[str, Any], signal_counts: dict[str, dict[str, int]], abstentions: dict[str, int]) -> None:
+    stages = payload.get("stages") if isinstance(payload.get("stages"), Mapping) else {}
+    containers = (
+        stages.get("strategyEvidence") if isinstance(stages.get("strategyEvidence"), Mapping) else {},
+        stages.get("aggregateCandidate") if isinstance(stages.get("aggregateCandidate"), Mapping) else {},
+    )
+    directional: Mapping[str, Any] = {}
+    for container in containers:
+        candidate = container.get("directionalOutputs") if isinstance(container.get("directionalOutputs"), Mapping) else None
+        if candidate:
+            directional = candidate
+            break
+    for strategy_id, raw in directional.items():
+        output = raw if isinstance(raw, Mapping) else {}
+        signal = str(output.get("signal") or output.get("direction") or "HOLD").upper()
+        if signal not in {"BUY", "SELL", "HOLD"}:
+            signal = "HOLD"
+        bucket = signal_counts.setdefault(str(strategy_id), {"BUY": 0, "SELL": 0, "HOLD": 0})
+        bucket[signal] = bucket.get(signal, 0) + 1
+        if signal == "HOLD" or output.get("eligible") is False:
+            abstentions[str(strategy_id)] = abstentions.get(str(strategy_id), 0) + 1
+
+
+def _accumulate_family_conflicts(payload: Mapping[str, Any], family_conflicts: dict[str, int]) -> None:
+    stages = payload.get("stages") if isinstance(payload.get("stages"), Mapping) else {}
+    containers = (
+        stages.get("aggregateCandidate") if isinstance(stages.get("aggregateCandidate"), Mapping) else {},
+        stages.get("decisionPolicy") if isinstance(stages.get("decisionPolicy"), Mapping) else {},
+    )
+    for container in containers:
+        conflicts = container.get("conflictingFamilies") or container.get("familyConflicts") or ()
+        if isinstance(conflicts, Mapping):
+            for family, count in conflicts.items():
+                family_conflicts[str(family)] = family_conflicts.get(str(family), 0) + int(count or 1)
+        elif isinstance(conflicts, Sequence) and not isinstance(conflicts, (str, bytes)):
+            for family in conflicts:
+                family_conflicts[str(family)] = family_conflicts.get(str(family), 0) + 1
+
+
+def _blocked_reason(code: str) -> bool:
+    lowered = code.lower()
+    return any(fragment in lowered for fragment in ("blocked", "reject", "missing_data", "local_gate", "safety"))
+
+
+def _has_ml_failure(reason_codes: Sequence[str], payload: Mapping[str, Any]) -> bool:
+    if any(
+        "inference" in code.lower() and any(fragment in code.lower() for fragment in ("fail", "unavailable", "mismatch", "missing", "stale", "fallback"))
+        for code in reason_codes
+    ):
+        return True
+    stages = payload.get("stages") if isinstance(payload.get("stages"), Mapping) else {}
+    model = stages.get("modelPrediction") if isinstance(stages.get("modelPrediction"), Mapping) else {}
+    status = str(model.get("status") or model.get("modelStatus") or "").upper()
+    return status in {"FAILED", "UNAVAILABLE", "INCOMPATIBLE", "STALE"}
 
 
 def _utc_now() -> datetime:

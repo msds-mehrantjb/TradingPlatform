@@ -11,6 +11,8 @@ from backend.app.algorithms.meta_strategy.inference import (
     apply_meta_strategy_inference,
     validate_inference_result,
 )
+from backend.app.algorithms.meta_strategy.execution_pipeline import MetaStrategyExecutionPipelineConfig
+from backend.app.algorithms.meta_strategy.settings import MetaStrategyMLInferenceSettings
 
 
 SCHEMA_HASH = "meta-strategy-inference-schema"
@@ -57,6 +59,15 @@ def artifact(probabilities: dict[str, float], *, schema_hash: str = SCHEMA_HASH,
 
 
 class MetaStrategyStep24InferenceEngineTest(unittest.TestCase):
+    def test_first_paper_rollout_defaults_to_shadow_no_trade_fallback(self) -> None:
+        settings = MetaStrategyMLInferenceSettings()
+        pipeline = MetaStrategyExecutionPipelineConfig()
+
+        self.assertEqual(settings.mode, "SHADOW")
+        self.assertEqual(settings.fallback_behavior, "NO_TRADE")
+        self.assertEqual(pipeline.inference_config.mode, "SHADOW")
+        self.assertEqual(pipeline.inference_config.fallbackBehavior, "NO_TRADE")
+
     def test_supported_modes_are_explicit_and_conservative(self) -> None:
         configs = {
             "OFF": MetaStrategyInferenceConfig(mode="OFF"),

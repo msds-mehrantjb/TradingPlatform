@@ -15,11 +15,16 @@ class MetaStrategySimulationConfig:
     spread_bps: float = 1.0
     slippage_bps: float = 2.0
     fee_per_share: float = 0.005
+    regulatory_fee_per_share: float = 0.0
+    order_delay_seconds: float = 1.0
+    limit_order_fill_probability: float = 1.0
     partial_fill_ratio: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.spread_bps < 0 or self.slippage_bps < 0 or self.fee_per_share < 0:
-            raise ValueError("spread, slippage, and fees must be non-negative")
+        if self.spread_bps < 0 or self.slippage_bps < 0 or self.fee_per_share < 0 or self.regulatory_fee_per_share < 0 or self.order_delay_seconds < 0:
+            raise ValueError("spread, slippage, fees, and delay must be non-negative")
+        if not 0.0 <= self.limit_order_fill_probability <= 1.0:
+            raise ValueError("limit_order_fill_probability must be between 0 and 1")
         if not 0.0 <= self.partial_fill_ratio <= 1.0:
             raise ValueError("partial_fill_ratio must be between 0 and 1")
 
@@ -72,7 +77,8 @@ class MetaStrategySimulatedBrokerAdapter:
                 "idempotencyRecord": record.as_dict(),
                 "reasonCodes": ("meta_strategy.backtest.duplicate_suppressed",),
             }
-        filled = max(0, min(int(order_intent.quantity), int(int(order_intent.quantity) * self.config.partial_fill_ratio)))
+        fillable = self.config.limit_order_fill_probability > 0.0
+        filled = 0 if not fillable else max(0, min(int(order_intent.quantity), int(int(order_intent.quantity) * self.config.partial_fill_ratio)))
         submitted = self.idempotency_store.mark_submitted(key, broker_order_id=f"meta_strategy.backtest.order.{order_intent.order_intent_id}")
         payload = {
             "algorithmId": ALGORITHM_ID,
@@ -84,9 +90,16 @@ class MetaStrategySimulatedBrokerAdapter:
             "spreadBps": self.config.spread_bps,
             "slippageBps": self.config.slippage_bps,
             "feePerShare": self.config.fee_per_share,
+            "regulatoryFeePerShare": self.config.regulatory_fee_per_share,
+            "orderDelaySeconds": self.config.order_delay_seconds,
+            "limitOrderFillProbability": self.config.limit_order_fill_probability,
             "idempotencyKey": key,
             "idempotencyRecord": submitted.as_dict(),
-            "reasonCodes": ("meta_strategy.backtest.simulated_execution",),
+            "reasonCodes": (
+                "meta_strategy.backtest.simulated_execution",
+                "meta_strategy.backtest.limit_order_non_fill_modeled" if filled == 0 else "meta_strategy.backtest.fill_modeled",
+                "meta_strategy.backtest.order_delay_modeled",
+            ),
         }
         self.submissions.append(payload)
         return payload

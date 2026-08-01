@@ -20,6 +20,9 @@ class MetaStrategyInputProducer:
 META_STRATEGY_INPUT_PRODUCERS: tuple[MetaStrategyInputProducer, ...] = (
     MetaStrategyInputProducer("candles", "market_snapshot.candles", "market_snapshot_builder"),
     MetaStrategyInputProducer("moving_averages", "market_snapshot.moving_averages", "market_snapshot_builder"),
+    MetaStrategyInputProducer("moving_average_slope", "market_snapshot.features.movingAverageSlope", "market_snapshot_builder"),
+    MetaStrategyInputProducer("market_structure", "market_snapshot.features.marketStructureState", "market_snapshot_builder"),
+    MetaStrategyInputProducer("reward_to_risk", "strategy.evidence.rewardToRisk", "directional_strategy"),
     MetaStrategyInputProducer("vwap", "market_snapshot.vwap", "market_snapshot_builder"),
     MetaStrategyInputProducer("vwap_relationship", "market_snapshot.features.vwapRelationship", "market_snapshot_builder"),
     MetaStrategyInputProducer("vwap_slope", "market_snapshot.features.vwapSlope", "market_snapshot_builder"),
@@ -45,6 +48,12 @@ META_STRATEGY_INPUT_PRODUCERS: tuple[MetaStrategyInputProducer, ...] = (
     MetaStrategyInputProducer("rejectionWickRatio", "market_snapshot.features.rejectionWickRatio", "market_snapshot_builder"),
     MetaStrategyInputProducer("openingRangeHigh", "market_snapshot.features.openingRangeHigh", "market_snapshot_builder"),
     MetaStrategyInputProducer("openingRangeLow", "market_snapshot.features.openingRangeLow", "market_snapshot_builder"),
+    MetaStrategyInputProducer("opening_range", "market_snapshot.features.openingRangeHighLow", "market_snapshot_builder"),
+    MetaStrategyInputProducer("previous_day_levels", "market_snapshot.features.previousDayHighLow", "market_snapshot_builder", critical=False),
+    MetaStrategyInputProducer("premarket_levels", "market_snapshot.features.premarketHighLow", "market_snapshot_builder", critical=False),
+    MetaStrategyInputProducer("recent_swing_levels", "market_snapshot.features.recentSwingLevels", "market_snapshot_builder"),
+    MetaStrategyInputProducer("session_levels", "market_snapshot.features.sessionHighLow", "market_snapshot_builder"),
+    MetaStrategyInputProducer("microstructure_evidence", "market_snapshot.features.microstructureEvidence", "quote_trade_depth_reader", critical=False),
     MetaStrategyInputProducer("cash_available", "evaluation_context.account_snapshot.cash_available", "account_data_reader"),
     MetaStrategyInputProducer("avoid_trading", "evaluation_context.operational_health_snapshot.trading_allowed", "operational_health_reader"),
     MetaStrategyInputProducer("critical_data", "market_snapshot", "market_snapshot_builder"),
@@ -96,6 +105,8 @@ def has_required_input(snapshot: MetaStrategyMarketSnapshot, name: str) -> bool:
         return bool(snapshot.candles.get("1m"))
     if name == "moving_averages":
         return bool(snapshot.moving_averages.get("1m"))
+    if name in {"moving_average_slope", "market_structure", "reward_to_risk"}:
+        return bool(snapshot.candles.get("1m")) and bool(snapshot.moving_averages.get("1m"))
     if name == "vwap":
         return snapshot.vwap is not None
     if name in {"vwap_relationship", "vwap_slope"}:
@@ -132,6 +143,19 @@ def has_required_input(snapshot: MetaStrategyMarketSnapshot, name: str) -> bool:
         return bool(snapshot.economic_event_state)
     if name == "source_cutoff_timestamp":
         return snapshot.source_cutoff_timestamp is not None
+    if name == "opening_range":
+        return _present(snapshot.features, "openingRangeHigh") and _present(snapshot.features, "openingRangeLow")
+    if name == "previous_day_levels":
+        return _present(snapshot.features, "previousDayHigh") and _present(snapshot.features, "previousDayLow")
+    if name == "premarket_levels":
+        return _present(snapshot.features, "premarketHigh") and _present(snapshot.features, "premarketLow")
+    if name == "recent_swing_levels":
+        return bool(snapshot.candles.get("1m")) or (_present(snapshot.features, "recentSwingHigh") and _present(snapshot.features, "recentSwingLow"))
+    if name == "session_levels":
+        return bool(snapshot.candles.get("1m"))
+    if name == "microstructure_evidence":
+        evidence = snapshot.features.get("microstructureEvidence")
+        return isinstance(evidence, Mapping) and bool(evidence.get("reliable"))
     if name == "critical_data":
         return bool(
             snapshot.point_in_time

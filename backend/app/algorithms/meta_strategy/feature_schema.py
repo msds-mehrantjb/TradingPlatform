@@ -29,8 +29,20 @@ def meta_strategy_feature_schema() -> tuple[MetaStrategyFeatureSpec, ...]:
     specs: list[MetaStrategyFeatureSpec] = []
     for entry in DIRECTIONAL_STRATEGIES:
         prefix = f"strategy_{entry.strategy_id}"
-        for name in ("direction", "confidence", "eligible", "active", "data_ready", "regime_fit", "reliability", "setup_detected"):
+        for name in (
+            "direction",
+            "confidence",
+            "eligible",
+            "active",
+            "data_ready",
+            "regime_fit",
+            "reliability",
+            "setup_detected",
+            "evidence_quality",
+            "correlation_adjusted_contribution",
+        ):
             specs.append(MetaStrategyFeatureSpec(name=f"{prefix}_{name}", group="directional_strategy", valueType="numeric"))
+        specs.append(MetaStrategyFeatureSpec(name=f"{prefix}_family", group="directional_strategy", valueType="categorical"))
 
     for family in META_STRATEGY_FAMILY_ORDER:
         specs.append(MetaStrategyFeatureSpec(name=f"family_{family.lower()}_score", group="family", valueType="numeric"))
@@ -97,6 +109,7 @@ def meta_strategy_feature_schema() -> tuple[MetaStrategyFeatureSpec, ...]:
         ("deterministic_score", "numeric"),
         ("signal_margin", "numeric"),
         ("expected_transaction_cost", "numeric"),
+        ("current_meta_strategy_virtual_exposure", "numeric"),
     ):
         specs.append(MetaStrategyFeatureSpec(name=name, group="candidate", valueType=value_type))  # type: ignore[arg-type]
     for name, value_type in (

@@ -7,8 +7,11 @@ from datetime import UTC, datetime, timedelta
 from pydantic import ValidationError
 
 from backend.app.algorithms.meta_strategy import (
+    ACTIVE_DIRECTIONAL_STRATEGIES,
     ALL_META_STRATEGY_STRATEGIES,
+    CONTEXT_STRATEGIES,
     META_STRATEGY_STARTUP_FEATURE_CONTRACT_VALIDATION,
+    REGIME_STRATEGIES,
     SAFETY_STRATEGIES,
     MetaStrategyAccountSnapshot,
     MetaStrategyEconomicEventSnapshot,
@@ -51,8 +54,9 @@ class MetaStrategyPhase2FeatureSessionContractsTest(unittest.TestCase):
 
     def test_every_active_strategy_receives_required_inputs_from_runtime_snapshot(self) -> None:
         context = context_for(build_meta_strategy_market_snapshot(request_with()))
+        runtime_entries = (*ACTIVE_DIRECTIONAL_STRATEGIES, *CONTEXT_STRATEGIES, *REGIME_STRATEGIES, *SAFETY_STRATEGIES)
 
-        for entry in ALL_META_STRATEGY_STRATEGIES:
+        for entry in runtime_entries:
             strategy = strategy_for(entry)
             result = strategy.evaluate(context)
             with self.subTest(strategy=entry.strategy_id):

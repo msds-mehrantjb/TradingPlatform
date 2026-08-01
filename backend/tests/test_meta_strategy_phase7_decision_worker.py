@@ -42,10 +42,10 @@ class MetaStrategyPhase7DecisionWorkerTest(unittest.TestCase):
         self.assertIsNotNone(decision)
         self.assertEqual(repository.queue_status(queue_name="finalised_bar_decisions", now=NOW)["queues"]["finalised_bar_decisions"]["succeeded"], 1)
 
-    def test_idempotency_key_includes_mode_symbol_timeframe_bar_end_and_settings_version(self) -> None:
+    def test_idempotency_key_includes_capital_partition_symbol_timeframe_bar_end_and_settings_version(self) -> None:
         key = finalised_bar_idempotency_key(mode="paper", symbol="spy", timeframe="1m", bar_end=NOW, settings_version="settings-v1")
 
-        self.assertEqual(key, "meta_strategy:PAPER:SPY:1m:2026-01-05T15:45:00+00:00:settings-v1")
+        self.assertEqual(key, "meta_strategy:meta_strategy.paper.default:SPY:1m:2026-01-05T15:45:00+00:00:settings-v1")
 
     def test_finalised_bar_api_boundary_enqueues_without_inline_decision(self) -> None:
         repository = MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}")

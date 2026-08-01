@@ -23,10 +23,10 @@ class MetaStrategyStep16FeatureBuilderTest(unittest.TestCase):
     def test_feature_schema_hash_is_deterministic_and_matches_characterization(self) -> None:
         payload = fixture_payload()
 
-        self.assertEqual(meta_strategy_feature_schema_hash(), "04c43017715a2e83")
+        self.assertEqual(meta_strategy_feature_schema_hash(), "ac023e3135feb4ca")
         self.assertEqual(meta_strategy_feature_schema_hash(), meta_strategy_feature_schema_hash())
         self.assertEqual(meta_strategy_feature_schema_hash(), payload["featureSchemaHash"])
-        self.assertEqual(len(meta_strategy_feature_schema()), 149)
+        self.assertEqual(len(meta_strategy_feature_schema()), 186)
 
     def test_feature_vectors_match_characterization_fixtures(self) -> None:
         for fixture in fixture_payload()["fixtures"]:
@@ -47,6 +47,9 @@ class MetaStrategyStep16FeatureBuilderTest(unittest.TestCase):
         required = {
             "strategy_multi_timeframe_trend_alignment_confidence",
             "strategy_multi_timeframe_trend_alignment_eligible",
+            "strategy_multi_timeframe_trend_alignment_family",
+            "strategy_multi_timeframe_trend_alignment_evidence_quality",
+            "strategy_multi_timeframe_trend_alignment_correlation_adjusted_contribution",
             "family_trend_score",
             "family_agreement",
             "economic_event_state",
@@ -60,6 +63,7 @@ class MetaStrategyStep16FeatureBuilderTest(unittest.TestCase):
             "relative_volume",
             "time_of_day_minutes",
             "expected_transaction_cost",
+            "current_meta_strategy_virtual_exposure",
             "forecast_status",
             "forecast_probability_buy_success",
             "candidate_side__missing",

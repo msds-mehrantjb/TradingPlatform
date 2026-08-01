@@ -5,16 +5,19 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import Any, Protocol
 
 from pydantic import BaseModel
 
+from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 from backend.app.algorithms.meta_strategy.execution_pipeline import (
     MetaStrategyExecutionPipelineConfig,
     MetaStrategyExecutionPipelineRequest,
     MetaStrategyExecutionPipelineResult,
     run_meta_strategy_execution_pipeline,
 )
+from backend.app.algorithms.meta_strategy.global_risk_adapter import ReadOnlyMetaStrategyGlobalRiskAdapter
 from backend.app.algorithms.meta_strategy.jobs import MetaStrategyEventRecord, MetaStrategyJobRecord, MetaStrategyJobRepository, MetaStrategyWorker
 from backend.app.algorithms.meta_strategy.market_snapshot import MetaStrategyMarketSnapshotRequest
 from backend.app.algorithms.meta_strategy.settings import MetaStrategySettings
@@ -30,6 +33,7 @@ class MetaStrategyFinalisedBarDecisionEvent:
     bar_end: datetime
     settings_version: str
     idempotency_key: str
+    capital_partition_id: str = META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 
 
 @dataclass(frozen=True)
@@ -91,25 +95,45 @@ class MetaStrategyFinalisedBarDecisionWorker(MetaStrategyWorker):
                     mode=_pipeline_mode(event.mode),
                     snapshot_request=context.market_snapshot_request,
                     model_artifact=dict(context.active_model_artifact) if context.active_model_artifact else None,
+                    account_equity=_optional_float(context.account_snapshot, "accountEquity", "account_equity", "equity"),
+                    available_buying_power=_optional_float(context.account_snapshot, "buyingPower", "buying_power"),
+                    remaining_algorithm_risk=_remaining_algorithm_risk(context.inventory_snapshot),
+                    global_available_risk=_optional_float(context.global_risk_snapshot, "availableRiskDollars", "available_risk_dollars"),
+                    global_quantity_cap=_optional_int(context.global_risk_snapshot, "maxQuantity", "max_quantity", "globalQuantityCap", "global_quantity_cap"),
+                    realized_daily_pnl=_optional_float(context.inventory_snapshot, "realizedPnl", "realisedPnl", "realized_pnl", "realised_pnl") or 0.0,
+                    daily_trade_count=_optional_int(context.inventory_snapshot, "dailyTradeCount", "daily_trade_count") or 0,
+                    last_trade_at=_last_trade_at(context.inventory_snapshot),
+                    paper_trading_permission=_paper_trading_allowed(context),
+                    event_blackout=_event_blackout(context),
+                    session_allowed=_session_allowed(context),
+                    duplicate_order_intent_ids=_duplicate_order_intent_ids(context.inventory_snapshot),
+                    existing_position_symbols=_existing_position_symbols(context.inventory_snapshot),
+                    max_quote_age_seconds=_optional_int(context.operational_health, "maxQuoteAgeSeconds", "max_quote_age_seconds") or 60,
                 ),
                 context.settings,
                 context.global_risk_snapshot,
             )
             latency_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
             data_age_seconds = int(max(0.0, (context.market_snapshot_request.decision_timestamp - event.bar_end).total_seconds()))
+            queue_delay_ms = int(max(0.0, (current - _parse_dt(event_record.created_at)).total_seconds()) * 1000)
+            persistence_started = perf_counter()
+            decision_payload = _decision_payload(
+                context=context,
+                result=result,
+                latency_ms=latency_ms,
+                data_age_seconds=data_age_seconds,
+                queue_delay_ms=queue_delay_ms,
+                decision_persistence_time_ms=0,
+            )
             persisted = self.repository.persist_decision_atomic(
                 job=job,
                 event=event_record,
                 decision_id=result.snapshot.decision_id,
-                payload=_decision_payload(
-                    context=context,
-                    result=result,
-                    latency_ms=latency_ms,
-                    data_age_seconds=data_age_seconds,
-                ),
+                payload=decision_payload,
                 order_intent=_order_payload(result),
                 now=current,
             )
+            decision_payload["latencyMeasurements"]["decisionPersistenceTimeMs"] = int((perf_counter() - persistence_started) * 1000)
             self.repository.complete_job(job.job_id, worker_id=self.worker_id, result=persisted, now=current)
             return job
         except Exception as exc:
@@ -141,6 +165,11 @@ class MetaStrategyFinalisedBarDecisionWorker(MetaStrategyWorker):
             bar_end=_parse_dt(str(payload["barEnd"])),
             settings_version=str(payload["settingsVersion"]),
             idempotency_key=job.idempotency_key,
+            capital_partition_id=str(
+                payload.get("capitalPartitionId")
+                or payload.get("capital_partition_id")
+                or META_STRATEGY_DEFAULT_CAPITAL_PARTITION
+            ),
         )
 
 
@@ -153,7 +182,17 @@ def _run_pipeline_without_broker(
         request,
         config=MetaStrategyExecutionPipelineConfig(submit_to_broker=False),
         config_settings=settings,
-        global_risk_adapter=None,
+        global_risk_adapter=_global_risk_adapter_from_snapshot(global_risk_snapshot),
+    )
+
+
+def _global_risk_adapter_from_snapshot(global_risk_snapshot: Mapping[str, Any] | None) -> ReadOnlyMetaStrategyGlobalRiskAdapter:
+    snapshot = dict(global_risk_snapshot or {})
+    return ReadOnlyMetaStrategyGlobalRiskAdapter(
+        reject=bool(snapshot.get("reject") or snapshot.get("rejected") or snapshot.get("tradingHalt") or snapshot.get("trading_halt")),
+        max_quantity=_optional_int(snapshot, "maxQuantity", "max_quantity", "approvedQuantity", "approved_quantity", "globalQuantityCap", "global_quantity_cap"),
+        available_risk_dollars=_optional_float(snapshot, "availableRiskDollars", "available_risk_dollars", "globalAvailableRisk", "global_available_risk"),
+        stop_distance=_optional_float(snapshot, "stopDistance", "stop_distance"),
     )
 
 
@@ -162,27 +201,59 @@ def _pipeline_mode(mode: str) -> str:
     return normalized if normalized in {"PAPER", "SHADOW", "BACKTEST", "DAILY_REPLAY", "DIAGNOSTICS", "EVALUATION"} else "PAPER"
 
 
+def _optional_int(payload: Mapping[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        if payload.get(key) is not None:
+            return int(payload[key])
+    return None
+
+
+def _optional_float(payload: Mapping[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        if payload.get(key) is not None:
+            return float(payload[key])
+    return None
+
+
 def _decision_payload(
     *,
     context: MetaStrategyDecisionWorkerContext,
     result: MetaStrategyExecutionPipelineResult,
     latency_ms: int,
     data_age_seconds: int,
+    queue_delay_ms: int,
+    decision_persistence_time_ms: int,
 ) -> dict[str, Any]:
+    stage_durations = _stage_durations(result.stage_results)
     return {
         "algorithmId": "meta_strategy",
+        "capitalPartitionId": context.event.capital_partition_id,
         "decisionId": result.snapshot.decision_id,
         "eventId": context.event.event_id,
         "jobId": context.event.job_id,
+        "correlationId": context.event.idempotency_key,
         "symbol": context.event.symbol,
         "barEnd": context.event.bar_end.isoformat(),
         "settingsVersion": result.settings_version,
+        "strategyCatalogVersion": context.market_snapshot_request.strategy_catalog_version,
+        "featureSchemaVersion": str((context.event_state or {}).get("featureSchemaVersion") or "meta_strategy_feature_schema_v1"),
         "effectiveSettingsHash": result.effective_settings_hash,
         "modelVersion": str((context.active_model_artifact or {}).get("modelVersion") or (context.active_model_artifact or {}).get("model_version") or "none"),
         "decisionStatus": "ORDER_PROPOSED" if result.order_intent is not None and result.final_valid else "HOLD_OR_BLOCKED",
         "reasonCodes": result.reason_codes,
         "latencyMs": latency_ms,
         "dataAgeSeconds": data_age_seconds,
+        "latencyMeasurements": {
+            "queueDelayMs": queue_delay_ms,
+            "snapshotBuildingTimeMs": stage_durations.get("market_snapshot", 0),
+            "strategyEvaluationTimeMs": sum(
+                stage_durations.get(stage, 0)
+                for stage in ("strategies", "context_and_regime", "family_aggregation", "deterministic_candidate")
+            ),
+            "inferenceTimeMs": stage_durations.get("model_inference", 0),
+            "decisionPersistenceTimeMs": decision_persistence_time_ms,
+            "orderSubmissionTimeMs": None,
+        },
         "authoritativeState": {
             "inventorySnapshot": dict(context.inventory_snapshot),
             "accountSnapshot": dict(context.account_snapshot),
@@ -206,6 +277,14 @@ def _decision_payload(
     }
 
 
+def _stage_durations(stage_results: Mapping[str, Any]) -> dict[str, int]:
+    durations: dict[str, int] = {}
+    for stage, payload in stage_results.items():
+        if isinstance(payload, Mapping):
+            durations[str(stage)] = int(payload.get("durationMs") or 0)
+    return durations
+
+
 def _order_payload(result: MetaStrategyExecutionPipelineResult) -> dict[str, Any] | None:
     if result.order_intent is None or not result.final_valid:
         return None
@@ -214,6 +293,69 @@ def _order_payload(result: MetaStrategyExecutionPipelineResult) -> dict[str, Any
     payload["settingsVersion"] = result.settings_version
     payload["effectiveSettingsHash"] = result.effective_settings_hash
     return payload
+
+
+def _remaining_algorithm_risk(inventory_snapshot: Mapping[str, Any]) -> float | None:
+    value = _optional_float(inventory_snapshot, "remainingRiskDollars", "remaining_risk_dollars")
+    if value is not None:
+        return value
+    reserved = _optional_float(inventory_snapshot, "reservedRiskDollars", "reserved_risk_dollars")
+    if reserved is not None:
+        return max(0.0, 1_000.0 - reserved)
+    return None
+
+
+def _last_trade_at(inventory_snapshot: Mapping[str, Any]) -> datetime | None:
+    fills = inventory_snapshot.get("fills")
+    if not isinstance(fills, tuple | list) or not fills:
+        return None
+    timestamps = []
+    for fill in fills:
+        if isinstance(fill, Mapping) and fill.get("timestamp"):
+            try:
+                timestamps.append(_parse_dt(str(fill["timestamp"])))
+            except ValueError:
+                continue
+    return max(timestamps) if timestamps else None
+
+
+def _paper_trading_allowed(context: MetaStrategyDecisionWorkerContext) -> bool:
+    health = context.operational_health
+    settings_allowed = bool(getattr(context.settings.paper_execution, "enabled", False))
+    health_allowed = bool(health.get("tradingAllowed", health.get("trading_allowed", True)))
+    global_allowed = not bool(context.global_risk_snapshot.get("reject") or context.global_risk_snapshot.get("tradingHalt"))
+    return settings_allowed and health_allowed and global_allowed
+
+
+def _event_blackout(context: MetaStrategyDecisionWorkerContext) -> bool:
+    event_state = context.event_state
+    return bool(
+        event_state.get("active")
+        or event_state.get("blackout")
+        or event_state.get("eventBlackout")
+        or str(event_state.get("dataQualityState") or "").upper() == "BLOCKED"
+    )
+
+
+def _session_allowed(context: MetaStrategyDecisionWorkerContext) -> bool:
+    market_calendar = context.operational_health.get("marketCalendar")
+    if isinstance(market_calendar, Mapping):
+        return bool(market_calendar.get("isOpen", True))
+    return True
+
+
+def _duplicate_order_intent_ids(inventory_snapshot: Mapping[str, Any]) -> tuple[str, ...]:
+    rows = inventory_snapshot.get("pendingOrderIntents")
+    if not isinstance(rows, tuple | list):
+        return ()
+    return tuple(str(row.get("orderIntentId") or row.get("order_intent_id")) for row in rows if isinstance(row, Mapping) and (row.get("orderIntentId") or row.get("order_intent_id")))
+
+
+def _existing_position_symbols(inventory_snapshot: Mapping[str, Any]) -> tuple[str, ...]:
+    rows = inventory_snapshot.get("positions") or inventory_snapshot.get("currentVirtualPositions")
+    if not isinstance(rows, tuple | list):
+        return ()
+    return tuple(sorted({str(row.get("symbol") or "").upper() for row in rows if isinstance(row, Mapping) and row.get("symbol")}))
 
 
 def _plain(value: Any) -> Any:

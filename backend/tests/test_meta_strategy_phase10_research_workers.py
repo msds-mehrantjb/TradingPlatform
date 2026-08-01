@@ -106,7 +106,7 @@ class MetaStrategyPhase10ResearchWorkersTest(unittest.TestCase):
     def test_promotion_requires_paper_stability_and_cannot_promote_itself(self) -> None:
         repository = MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}")
         no_evidence = repository.enqueue_job(job_type="model_promotion", idempotency_key="promotion-reject", payload={"candidateArtifact": {"artifactId": "candidate-1"}, "evidence": {"validated": True}}, now=NOW)
-        self_promoting = repository.enqueue_job(job_type="model_promotion", idempotency_key="promotion-self", payload={"candidateArtifact": {"artifactId": "candidate-2", "generatedByJobId": "self"}, "evidence": {"validated": True, "paperStability": {"stable": True}}}, now=NOW)
+        self_promoting = repository.enqueue_job(job_type="model_promotion", idempotency_key="promotion-self", payload={"candidateArtifact": {"artifactId": "candidate-2", "generatedByJobId": "self"}, "evidence": complete_promotion_evidence()}, now=NOW)
         worker = MetaStrategyPromotionWorker(repository=repository, runner=recording_runner("model_promotion"))
 
         worker.run_once(now=NOW)
@@ -122,7 +122,7 @@ class MetaStrategyPhase10ResearchWorkersTest(unittest.TestCase):
         job = repository.enqueue_job(
             job_type="model_promotion",
             idempotency_key="promotion-ok",
-            payload={"candidateArtifact": {"artifactId": "candidate-3"}, "evidence": {"validated": True, "paperStability": {"stable": True}}},
+            payload={"candidateArtifact": {"artifactId": "candidate-3"}, "evidence": complete_promotion_evidence()},
             now=NOW,
         )
 
@@ -134,6 +134,20 @@ class MetaStrategyPhase10ResearchWorkersTest(unittest.TestCase):
         self.assertEqual(active["promotionJobId"], job.job_id)
         self.assertTrue(artifact["payload"]["promotion"]["reversible"])
         self.assertEqual(artifact["payload"]["promotion"]["previousModelArtifactId"], "shadow-only")
+
+    def test_model_promotion_rejects_reinforcement_learning_for_paper_execution(self) -> None:
+        repository = MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}")
+        job = repository.enqueue_job(
+            job_type="model_promotion",
+            idempotency_key="promotion-rl-reject",
+            payload={"candidateArtifact": {"artifactId": "candidate-rl", "modelKind": "reinforcement_learning"}, "evidence": complete_promotion_evidence()},
+            now=NOW,
+        )
+
+        result = MetaStrategyPromotionWorker(repository=repository, runner=recording_runner("model_promotion")).run_once(now=NOW)
+
+        self.assertEqual(repository.read_job(job.job_id).status, MetaStrategyJobStatus.DEAD_LETTER)
+        self.assertEqual(result["reasonCodes"], ("meta_strategy.promotion.reinforcement_learning_not_allowed_for_paper_execution",))
 
     def test_research_queues_do_not_use_decision_worker_queue(self) -> None:
         repository = MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}")
@@ -157,6 +171,22 @@ def recording_runner(expected: str):
         return {"workflowType": workflow_type, "payloadKeys": sorted(payload.keys())}
 
     return runner
+
+
+def complete_promotion_evidence() -> dict:
+    return {
+        "minimumSampleSize": {"passed": True, "rows": 500},
+        "chronologicalHoldout": {"passed": True},
+        "walkForward": {"passed": True},
+        "probabilityCalibration": {"passed": True},
+        "costAdjustedPerformance": {"passed": True},
+        "regimeStability": {"passed": True},
+        "missingDataBehavior": {"passed": True},
+        "outOfDistributionHandling": {"passed": True},
+        "deterministicReplay": {"passed": True},
+        "paperStability": {"stable": True},
+        "rollbackTesting": {"passed": True},
+    }
 
 
 def temp_db_path() -> Path:

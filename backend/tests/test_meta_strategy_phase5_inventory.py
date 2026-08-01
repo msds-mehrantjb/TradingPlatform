@@ -11,6 +11,7 @@ from backend.app.algorithms.meta_strategy import (
     MetaStrategyApplicationService,
     MetaStrategyRepositoryAttributionError,
     MetaStrategySqliteRepository,
+    deterministic_meta_strategy_client_order_id,
 )
 from backend.tests.test_meta_strategy_step7_market_snapshot import request_with
 
@@ -75,8 +76,19 @@ class MetaStrategyPhase5InventoryTest(unittest.TestCase):
 
         with self.assertRaises(MetaStrategyRepositoryAttributionError):
             repository.ingest_broker_fill(fill_payload(algorithm_id="weighted_voting", broker_fill_id="foreign-fill", quantity=10))
+        with self.assertRaises(MetaStrategyRepositoryAttributionError):
+            repository.ingest_broker_fill(fill_payload(broker_fill_id="foreign-partition-fill", quantity=10, capital_partition_id="meta_strategy.paper.other"))
 
         self.assertEqual(repository.current_inventory_snapshot().open_positions, ())
+
+    def test_database_constraints_reject_foreign_algorithm_and_partition_rows(self) -> None:
+        repository = MetaStrategySqliteRepository(f"sqlite:///{temp_db_path()}")
+
+        with sqlite3.connect(repository.path) as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                insert_raw_inventory_row(conn, table="meta_strategy_inventory_fills", algorithm_id="weighted_voting", capital_partition_id="meta_strategy.paper.default")
+            with self.assertRaises(sqlite3.IntegrityError):
+                insert_raw_inventory_row(conn, table="meta_strategy_inventory_fills", algorithm_id="meta_strategy", capital_partition_id="meta_strategy.paper.other")
 
     def test_meta_strategy_and_sibling_algorithm_same_symbol_remain_separate(self) -> None:
         repository = MetaStrategySqliteRepository(f"sqlite:///{temp_db_path()}")
@@ -108,6 +120,20 @@ class MetaStrategyPhase5InventoryTest(unittest.TestCase):
         self.assertEqual(snapshot.unrealised_pnl, 14.0)
         self.assertEqual(snapshot.reserved_risk_dollars, 0.0)
 
+    def test_fees_slippage_allocated_capital_and_exposures_are_rebuilt_from_ledger(self) -> None:
+        repository = MetaStrategySqliteRepository(f"sqlite:///{temp_db_path()}")
+        repository.record_order_intent(order_intent_payload(quantity=10, reserved_risk=100.0, strategy_id="trend_alignment", family="TREND"))
+        repository.ingest_broker_fill(fill_payload(broker_fill_id="fill-fee-1", quantity=5, price=100.0, commission=0.25, slippage=0.10, strategy_id="trend_alignment", family="TREND"))
+        repository.ingest_broker_fill(fill_payload(broker_fill_id="fill-fee-2", quantity=5, price=101.0, commission=0.25, slippage=0.10, strategy_id="trend_alignment", family="TREND"))
+
+        snapshot = repository.rebuild_inventory_from_ledger(mark_prices={"SPY": 102.0})
+
+        self.assertEqual(snapshot.fees_and_slippage, 0.7)
+        self.assertEqual(snapshot.allocated_capital, 1020.0)
+        self.assertEqual(snapshot.strategy_exposure["trend_alignment"], 1020.0)
+        self.assertEqual(snapshot.family_exposure["TREND"], 1020.0)
+        self.assertEqual(snapshot.symbol_exposure["SPY"], 1020.0)
+
     def test_exits_realise_pnl_fifo_and_release_lots(self) -> None:
         repository = MetaStrategySqliteRepository(f"sqlite:///{temp_db_path()}")
         repository.record_order_intent(order_intent_payload(quantity=10))
@@ -136,6 +162,18 @@ class MetaStrategyPhase5InventoryTest(unittest.TestCase):
         self.assertEqual(snapshot.open_positions[0].quantity, 8.0)
         self.assertEqual(snapshot.realised_pnl, 0.0)
 
+    def test_timeout_unknown_status_is_quarantined_without_releasing_risk(self) -> None:
+        repository = MetaStrategySqliteRepository(f"sqlite:///{temp_db_path()}")
+        repository.record_order_intent(order_intent_payload(quantity=10, reserved_risk=100.0))
+        repository.record_order_status(order_status_payload(status="TIMEOUT"))
+
+        snapshot = repository.current_inventory_snapshot()
+        quarantine = repository.inventory_records("quarantine")
+
+        self.assertEqual(snapshot.reserved_risk_dollars, 100.0)
+        self.assertEqual(quarantine[0]["status"], "QUARANTINED")
+        self.assertEqual(quarantine[0]["payload"]["quarantineReason"], "ORDER_TIMEOUT")
+
     def test_restart_replay_reproduces_inventory_and_consistency_check_passes(self) -> None:
         path = temp_db_path()
         repository = MetaStrategySqliteRepository(f"sqlite:///{path}")
@@ -154,8 +192,13 @@ class MetaStrategyPhase5InventoryTest(unittest.TestCase):
         self.assertEqual(replayed.realised_pnl, 15.0)
         self.assertEqual(replayed.unrealised_pnl, 28.0)
 
+    def test_client_order_id_contains_meta_strategy_prefix_and_partition_identity(self) -> None:
+        client_order_id = deterministic_meta_strategy_client_order_id(order_intent_payload(quantity=10))
 
-def order_intent_payload(*, quantity: float, reserved_risk: float = 0.0) -> dict:
+        self.assertTrue(client_order_id.startswith("meta-strategy-meta-strategy-paper-def"))
+
+
+def order_intent_payload(*, quantity: float, reserved_risk: float = 0.0, strategy_id: str = "meta_strategy", family: str = "UNKNOWN") -> dict:
     return {
         "algorithmId": "meta_strategy",
         "capitalPartitionId": "meta_strategy.paper.default",
@@ -170,6 +213,8 @@ def order_intent_payload(*, quantity: float, reserved_risk: float = 0.0) -> dict
         "side": "BUY",
         "quantity": quantity,
         "reservedRiskDollars": reserved_risk,
+        "strategyId": strategy_id,
+        "family": family,
         "timestamp": NOW.isoformat(),
     }
 
@@ -199,22 +244,64 @@ def fill_payload(
     quantity: float,
     price: float = 100.0,
     correction_of: str | None = None,
+    capital_partition_id: str = "meta_strategy.paper.default",
+    commission: float = 0.0,
+    slippage: float = 0.0,
+    strategy_id: str = "meta_strategy",
+    family: str = "UNKNOWN",
 ) -> dict:
     payload = {
-        **order_intent_payload(quantity=10),
+        **order_intent_payload(quantity=10, strategy_id=strategy_id, family=family),
         "algorithmId": algorithm_id,
+        "capitalPartitionId": capital_partition_id,
         "eventId": f"event-{broker_fill_id}",
         "brokerOrderId": "broker-client-1",
         "brokerFillId": broker_fill_id,
         "side": side,
         "filledQuantity": quantity,
         "fillPrice": price,
-        "commission": 0.0,
+        "commission": commission,
+        "estimatedSlippage": slippage,
         "timestamp": NOW.isoformat(),
     }
     if correction_of:
         payload["correctionOfBrokerFillId"] = correction_of
     return payload
+
+
+def insert_raw_inventory_row(conn: sqlite3.Connection, *, table: str, algorithm_id: str, capital_partition_id: str) -> None:
+    conn.execute(
+        f"""
+        INSERT INTO {table} (
+            record_id, algorithm_id, capital_partition_id, settings_version, correlation_id,
+            decision_id, job_id, event_id, order_intent_id, client_order_id, broker_order_id,
+            broker_fill_id, symbol, side, quantity, price, status, realised_pnl, timestamp, payload_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"raw-{algorithm_id}-{capital_partition_id}",
+            algorithm_id,
+            capital_partition_id,
+            "settings-v1",
+            "corr-raw",
+            "decision-raw",
+            "job-raw",
+            "event-raw",
+            "intent-raw",
+            "client-raw",
+            "broker-raw",
+            "fill-raw",
+            "SPY",
+            "BUY",
+            1.0,
+            100.0,
+            "FILLED",
+            0.0,
+            NOW.isoformat(),
+            "{}",
+        ),
+    )
 
 
 def temp_db_path() -> Path:

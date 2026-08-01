@@ -33,7 +33,8 @@ from .algorithms.session.models import SessionClassification
 from .algorithms.session.persistence import SESSION_PERSISTENCE_ROOT, SessionDecisionJsonlStore, build_session_decision_record
 from .algorithms.session.router import resolve_session_profile
 from .algorithms.session.transition import SessionTransitionManager
-from .algorithms.meta_strategy.api import router as meta_strategy_router
+from .algorithms.meta_strategy.api import META_STRATEGY_SERVICE, router as meta_strategy_router
+from .algorithms.meta_strategy.runtime_supervisor import get_meta_strategy_runtime_supervisor
 from .algorithms.voting_ensemble.api import router as voting_ensemble_router
 from .algorithms.wca.api import WCA_API_SERVICE, router as wca_router
 from .algorithms.wca.contracts import BacktestRunConfiguration
@@ -82,6 +83,8 @@ settings = get_settings()
 store = CandleStore(settings)
 alpaca = AlpacaClient(settings)
 session_decision_store = SessionDecisionJsonlStore(root=SESSION_PERSISTENCE_ROOT)
+meta_strategy_runtime_supervisor = get_meta_strategy_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
+META_STRATEGY_SERVICE.set_runtime_readiness_provider(meta_strategy_runtime_supervisor.readiness_status)
 
 app = FastAPI(title="Trading Dashboard API", version="0.1.0")
 app.add_middleware(
@@ -157,10 +160,12 @@ async def start_daily_backtest_refresh_scheduler() -> None:
     asyncio.create_task(market_forecast_ledger_scheduler())
     await get_weighted_voting_runtime_supervisor().start()
     await get_regime_runtime_supervisor().start()
+    await meta_strategy_runtime_supervisor.start()
 
 
 @app.on_event("shutdown")
 async def stop_weighted_voting_runtime_supervisor() -> None:
+    await meta_strategy_runtime_supervisor.shutdown()
     await get_regime_runtime_supervisor().shutdown()
     await get_weighted_voting_runtime_supervisor().shutdown()
 

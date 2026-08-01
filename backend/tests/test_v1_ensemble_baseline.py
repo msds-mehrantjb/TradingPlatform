@@ -74,6 +74,8 @@ class V1EnsembleBaselineTest(unittest.TestCase):
             {
                 "strategyEngineV2Enabled": True,
                 "familyEnsembleV2Enabled": True,
+                "metaStrategyRuntimeEnabled": False,
+                "metaStrategyRuntimeMode": "shadow",
                 "metaModelV2Enabled": False,
                 "dynamicTradingPolicyEnabled": False,
                 "globalGateEngineEnabled": True,

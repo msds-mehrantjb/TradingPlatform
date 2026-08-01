@@ -116,6 +116,7 @@ class MetaStrategyPhase4InventoryAggregationTest(unittest.TestCase):
                 "minimum_active_strategies": 1,
                 "minimum_independent_families": 1,
                 "maximum_abstention_rate": 1.0,
+                "independent_family_exception": {"validated": True, "settingsVersion": "meta_strategy_settings_v1", "evidenceId": "shadow-only-test-exception"},
             },
         )
         result = generate_deterministic_candidate(snapshot, settings=settings)

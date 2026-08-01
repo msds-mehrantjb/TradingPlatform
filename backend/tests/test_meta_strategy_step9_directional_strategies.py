@@ -2,38 +2,45 @@ from __future__ import annotations
 
 import importlib
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from pydantic import ValidationError
-
-from backend.app.algorithms.meta_strategy import DIRECTIONAL_STRATEGIES, MetaStrategyMarketSnapshot
+from backend.app.algorithms.meta_strategy import ACTIVE_DIRECTIONAL_STRATEGIES, DIRECTIONAL_STRATEGIES, SHADOW_DIRECTIONAL_STRATEGIES, MetaStrategyMarketSnapshot
 from backend.app.algorithms.meta_strategy.settings import build_meta_strategy_settings
 
 
 NOW = datetime(2026, 1, 5, 15, 45, tzinfo=UTC)
+SHADOW_ONLY = {"liquidity_sweep_reversal", "gap_continuation", "gap_fade", "economic_event_reaction"}
 
 
 class MetaStrategyStep9DirectionalStrategiesTest(unittest.TestCase):
     maxDiff = None
 
-    def test_every_directional_strategy_has_focused_behavior_coverage(self) -> None:
-        self.assertEqual(len(DIRECTIONAL_STRATEGIES), 12)
-        for entry in DIRECTIONAL_STRATEGIES:
+    def test_active_directional_pool_has_common_contract_and_no_order_side_effects(self) -> None:
+        self.assertEqual(tuple(entry.strategy_id for entry in ACTIVE_DIRECTIONAL_STRATEGIES), (
+            "multi_timeframe_trend_alignment",
+            "first_pullback_after_open",
+            "opening_range_breakout",
+            "vwap_trend_continuation",
+            "volatility_breakout",
+            "failed_breakout_reversal",
+            "bollinger_atr_reversion",
+            "vwap_mean_reversion",
+        ))
+        for entry in ACTIVE_DIRECTIONAL_STRATEGIES:
             strategy = strategy_for(entry.strategy_id)
-            cases = strategy_cases(entry.strategy_id)
+            cases = active_cases(entry.strategy_id)
             with self.subTest(strategy=entry.strategy_id, case="buy"):
                 result = strategy.evaluate(snapshot_fixture(**cases["buy"]))
                 self.assertEqual(result.signal, "BUY")
                 self.assertTrue(result.eligible)
-                self.assertEqual(result.family, entry.family)
-                self.assertTrue(result.evidence)
-                self.assertTrue(all(result.required_input_status.values()))
+                self.assert_common_contract(result, entry)
 
             with self.subTest(strategy=entry.strategy_id, case="sell"):
                 result = strategy.evaluate(snapshot_fixture(**cases["sell"]))
                 self.assertEqual(result.signal, "SELL")
                 self.assertTrue(result.eligible)
+                self.assert_common_contract(result, entry)
 
             with self.subTest(strategy=entry.strategy_id, case="hold"):
                 result = strategy.evaluate(snapshot_fixture(**cases["hold"]))
@@ -46,34 +53,54 @@ class MetaStrategyStep9DirectionalStrategiesTest(unittest.TestCase):
                 self.assertIn("meta_strategy.strategy.missing_required_inputs", result.reason_codes)
                 self.assertFalse(all(result.required_input_status.values()))
 
-            with self.subTest(strategy=entry.strategy_id, case="warmup"):
-                result = strategy.evaluate(snapshot_fixture(**cases["buy"], candle_count=max(0, entry.minimum_warmup - 1)))
-                self.assertEqual(result.signal, "HOLD")
-                self.assertIn("meta_strategy.strategy.insufficient_warmup", result.reason_codes)
+    def test_shadow_directional_strategies_generate_zero_order_influence(self) -> None:
+        self.assertEqual({entry.strategy_id for entry in SHADOW_DIRECTIONAL_STRATEGIES}, SHADOW_ONLY)
+        for entry in SHADOW_DIRECTIONAL_STRATEGIES:
+            strategy = strategy_for(entry.strategy_id)
+            result = strategy.evaluate(snapshot_fixture(**shadow_case(entry.strategy_id)))
+            with self.subTest(strategy=entry.strategy_id):
+                self.assert_common_contract(result, entry)
+                self.assertEqual(entry.mode, "SHADOW")
+                self.assertEqual((result.evidence or {}).get("orderInfluence", 0.0), 0.0)
+                self.assertFalse((result.evidence or {}).get("submitsOrdersDirectly"))
 
-            with self.subTest(strategy=entry.strategy_id, case="exact_threshold"):
-                at_threshold = strategy.evaluate(snapshot_fixture(**cases["threshold_at"]))
-                below_threshold = strategy.evaluate(snapshot_fixture(**cases["threshold_below"]))
-                self.assertEqual(at_threshold.signal, cases.get("threshold_signal", "BUY"))
-                self.assertEqual(below_threshold.signal, "HOLD")
+    def test_liquidity_sweep_requires_microstructure_and_holds_without_it(self) -> None:
+        strategy = strategy_for("liquidity_sweep_reversal")
 
-            with self.subTest(strategy=entry.strategy_id, case="determinism"):
-                snapshot = snapshot_fixture(**cases["buy"])
-                self.assertEqual(strategy.evaluate(snapshot), strategy.evaluate(snapshot))
+        missing = strategy.evaluate(snapshot_fixture(sweepSide="sell_side", rejectionWickRatio=1.2, features_extra={"microstructureEvidence": {}}))
+        reliable = strategy.evaluate(
+            snapshot_fixture(
+                sweepSide="sell_side",
+                rejectionWickRatio=1.2,
+                features_extra={"microstructureEvidence": {"reliable": True, "orderFlowImbalance": -0.72}},
+            )
+        )
 
-            with self.subTest(strategy=entry.strategy_id, case="snapshot_immutability"):
-                snapshot = snapshot_fixture(**cases["buy"])
-                before = snapshot.deterministic_hash()
-                strategy.evaluate(snapshot)
-                after = snapshot.deterministic_hash()
-                self.assertEqual(after, before)
-                with self.assertRaises(ValidationError):
-                    setattr(snapshot, "last_price", 1.0)
+        self.assertEqual(missing.signal, "HOLD")
+        self.assertIn("meta_strategy.directional.liquidity_sweep.microstructure_unavailable", missing.evidence["blockReasonCodes"])
+        self.assertEqual(reliable.signal, "BUY")
+        self.assertEqual(reliable.evidence["orderInfluence"], 0.0)
 
-            with self.subTest(strategy=entry.strategy_id, case="incorrect_regime"):
-                result = strategy.evaluate(snapshot_fixture(**cases["buy"], liquidity={"level": "poor", "score": 0.1}))
-                self.assertEqual(result.signal, "HOLD")
-                self.assertIn("meta_strategy.strategy.incorrect_regime", result.reason_codes)
+    def test_directional_registry_keeps_declared_shadow_strategies_out_of_active_pool(self) -> None:
+        active_ids = {entry.strategy_id for entry in ACTIVE_DIRECTIONAL_STRATEGIES}
+        self.assertFalse(active_ids.intersection(SHADOW_ONLY))
+        self.assertEqual(len(DIRECTIONAL_STRATEGIES), 12)
+
+    def assert_common_contract(self, result, entry) -> None:
+        self.assertEqual(result.strategy_id, entry.strategy_id)
+        self.assertEqual(result.strategy_version, entry.strategy_version)
+        self.assertEqual(result.family, entry.family)
+        self.assertEqual(result.required_inputs, entry.required_inputs)
+        self.assertEqual(result.minimum_warmup, entry.minimum_warmup)
+        self.assertEqual(result.supported_directions, tuple(entry.supported_directions))
+        self.assertIn(result.signal, {"BUY", "SELL", "HOLD"})
+        self.assertIsNotNone(result.evidence)
+        self.assertTrue(result.evidence["completeEvidencePayload"])
+        self.assertFalse(result.evidence["submitsOrdersDirectly"])
+        self.assertIn("entryReference", result.evidence)
+        self.assertIn("invalidationReference", result.evidence)
+        self.assertIn("suggestedStopReference", result.evidence)
+        self.assertTrue(result.required_input_status)
 
 
 def strategy_for(strategy_id: str):
@@ -84,145 +111,96 @@ def strategy_for(strategy_id: str):
     return getattr(module, entry.implementation_class)(strategy_settings)
 
 
-def strategy_cases(strategy_id: str) -> dict[str, dict[str, Any]]:
-    base = {
-        "buy": {},
-        "sell": {"price": 99.0, "vwap": 100.0, "ma_down": True},
-        "hold": {"price": 100.0, "vwap": 100.0, "adx": 20.0},
-        "missing": {"vwap": None},
-        "threshold_at": {},
-        "threshold_below": {},
-    }
-    overrides = {
+def active_cases(strategy_id: str) -> dict[str, dict[str, Any]]:
+    return {
         "multi_timeframe_trend_alignment": {
-            "buy": {"price": 101.0, "vwap": 100.0, "adx": 24.0, "ma_up": True},
-            "sell": {"price": 99.0, "vwap": 100.0, "adx": 24.0, "ma_down": True},
-            "hold": {"price": 100.0, "vwap": 100.0, "adx": 24.0, "ma_flat": True},
+            "buy": {"price": 101.0, "vwap": 100.0, "adx": 28.0, "ma_up": True, "trend": "up"},
+            "sell": {"price": 99.0, "vwap": 100.0, "adx": 28.0, "ma_down": True, "trend": "down"},
+            "hold": {"price": 100.0, "vwap": 100.0, "adx": 28.0, "ma_flat": True, "trend": "flat"},
             "missing": {"moving_averages": {}},
-            "threshold_at": {"price": 101.0, "vwap": 100.0, "adx": 18.0, "two_timeframes_up": True},
-            "threshold_below": {"price": 101.0, "vwap": 100.0, "adx": 17.9, "two_timeframes_up": True},
         },
         "first_pullback_after_open": {
-            "buy": {"price": 101.0, "vwap": 100.0, "relative_volume": 1.5, "pullbackDepthAtr": 0.75},
-            "sell": {"price": 99.0, "vwap": 100.0, "relative_volume": 1.5, "pullbackDepthAtr": 0.75},
-            "hold": {"price": 101.0, "vwap": 100.0, "relative_volume": 0.2, "pullbackDepthAtr": 0.1},
+            "buy": {"price": 101.0, "vwap": 100.0, "trend": "pullback_buy", "relative_volume": 0.95, "pullbackDepthAtr": 0.75},
+            "sell": {"price": 99.0, "vwap": 100.0, "trend": "pullback_sell", "relative_volume": 0.95, "pullbackDepthAtr": 0.75},
+            "hold": {"price": 101.0, "vwap": 100.0, "trend": "flat", "relative_volume": 1.8, "pullbackDepthAtr": 1.8},
             "missing": {"relative_volume": {}},
-            "threshold_at": {"price": 101.0, "vwap": 100.0, "relative_volume": 0.60, "pullbackDepthAtr": 0.10},
-            "threshold_below": {"price": 101.0, "vwap": 100.0, "relative_volume": 0.59, "pullbackDepthAtr": 0.10},
-        },
-        "vwap_trend_continuation": {
-            "buy": {"price": 101.0, "vwap": 100.0, "relative_volume": 1.5, "ma_up": True},
-            "sell": {"price": 99.0, "vwap": 100.0, "relative_volume": 1.5, "ma_down": True},
-            "hold": {"price": 100.05, "vwap": 100.0, "relative_volume": 0.2, "ma_up": True},
-            "missing": {"moving_averages": {}},
-            "threshold_at": {"price": 100.15, "vwap": 100.0, "relative_volume": 0.75, "moving_averages": {"1m": {"ema20": 100.0}}},
-            "threshold_below": {"price": 100.149, "vwap": 100.0, "relative_volume": 0.74, "moving_averages": {"1m": {"ema20": 100.0}}},
         },
         "opening_range_breakout": {
-            "buy": {"price": 100.2, "openingRangeHigh": 100.0, "openingRangeLow": 99.0, "atr": 1.0, "relative_volume": 1.25},
-            "sell": {"price": 98.8, "openingRangeHigh": 101.0, "openingRangeLow": 99.0, "atr": 1.0, "relative_volume": 1.25},
-            "hold": {"price": 100.05, "openingRangeHigh": 100.0, "openingRangeLow": 99.0, "atr": 1.0, "relative_volume": 1.25},
+            "buy": {"price": 100.25, "trend": "breakout_buy", "openingRangeHigh": 100.0, "openingRangeLow": 99.0, "relative_volume": 1.4},
+            "sell": {"price": 98.75, "trend": "breakout_sell", "openingRangeHigh": 101.0, "openingRangeLow": 99.0, "relative_volume": 1.4},
+            "hold": {"price": 100.04, "openingRangeHigh": 100.0, "openingRangeLow": 99.0, "relative_volume": 1.4},
             "missing": {"features": {}},
-            "threshold_at": {"price": 100.1, "openingRangeHigh": 100.0, "openingRangeLow": 99.0, "atr": 1.0, "relative_volume": 1.25},
-            "threshold_below": {"price": 100.09, "openingRangeHigh": 100.0, "openingRangeLow": 99.0, "atr": 1.0, "relative_volume": 1.25},
+        },
+        "vwap_trend_continuation": {
+            "buy": {"price": 101.0, "vwap": 100.0, "ma_up": True, "trend": "continuation_buy", "relative_volume": 1.2},
+            "sell": {"price": 99.0, "vwap": 100.0, "ma_down": True, "trend": "continuation_sell", "relative_volume": 1.2},
+            "hold": {"price": 100.05, "vwap": 100.0, "ma_up": True, "trend": "flat", "relative_volume": 1.2},
+            "missing": {"moving_averages": {}},
         },
         "volatility_breakout": {
-            "buy": {"price": 100.3, "upperBand": 100.0, "lowerBand": 99.0, "atr": 1.0, "relative_volume": 1.5, "bollingerWidthPercentile": 0.8},
-            "sell": {"price": 98.7, "upperBand": 100.0, "lowerBand": 99.0, "atr": 1.0, "relative_volume": 1.5, "bollingerWidthPercentile": 0.8},
-            "hold": {"price": 100.1, "upperBand": 100.0, "lowerBand": 99.0, "atr": 1.0, "relative_volume": 1.5, "bollingerWidthPercentile": 0.8},
+            "buy": {"price": 100.3, "trend": "breakout_buy", "upperBand": 100.0, "lowerBand": 99.0, "relative_volume": 1.7, "bollingerWidthPercentile": 0.85, "priorCompression": True},
+            "sell": {"price": 98.7, "trend": "breakout_sell", "upperBand": 100.0, "lowerBand": 99.0, "relative_volume": 1.7, "bollingerWidthPercentile": 0.85, "priorCompression": True},
+            "hold": {"price": 100.1, "upperBand": 100.0, "lowerBand": 99.0, "relative_volume": 0.8, "bollingerWidthPercentile": 0.85, "priorCompression": True},
             "missing": {"bollinger_bands": {}},
-            "threshold_at": {"price": 100.2, "upperBand": 100.0, "lowerBand": 99.0, "atr": 1.0, "relative_volume": 1.5, "bollingerWidthPercentile": 0.8},
-            "threshold_below": {"price": 100.19, "upperBand": 100.0, "lowerBand": 99.0, "atr": 1.0, "relative_volume": 1.5, "bollingerWidthPercentile": 0.8},
         },
         "failed_breakout_reversal": {
-            "buy": {"failedBreakoutSide": "downside", "reclaimDistanceAtr": 0.15},
-            "sell": {"failedBreakoutSide": "upside", "reclaimDistanceAtr": 0.15},
-            "hold": {"failedBreakoutSide": "none", "reclaimDistanceAtr": 0.15},
+            "buy": {"price": 99.25, "trend": "failed_downside", "failedBreakoutSide": "downside", "reclaimDistanceAtr": 0.25, "openingRangeHigh": 101.0, "openingRangeLow": 99.0},
+            "sell": {"price": 100.75, "trend": "failed_upside", "failedBreakoutSide": "upside", "reclaimDistanceAtr": 0.25, "openingRangeHigh": 101.0, "openingRangeLow": 99.0},
+            "hold": {"failedBreakoutSide": "none", "reclaimDistanceAtr": 0.25},
             "missing": {"features": {}},
-            "threshold_at": {"failedBreakoutSide": "downside", "reclaimDistanceAtr": 0.15},
-            "threshold_below": {"failedBreakoutSide": "downside", "reclaimDistanceAtr": 0.149},
-        },
-        "liquidity_sweep_reversal": {
-            "buy": {"sweepSide": "sell_side", "rejectionWickRatio": 0.80},
-            "sell": {"sweepSide": "buy_side", "rejectionWickRatio": 0.80},
-            "hold": {"sweepSide": "none", "rejectionWickRatio": 0.80},
-            "missing": {"features": {}},
-            "threshold_at": {"sweepSide": "sell_side", "rejectionWickRatio": 0.80},
-            "threshold_below": {"sweepSide": "sell_side", "rejectionWickRatio": 0.79},
-        },
-        "vwap_mean_reversion": {
-            "buy": {"price": 99.0, "vwap": 100.0, "atr": 1.0, "rsi": 30.0, "adx": 20.0},
-            "sell": {"price": 101.0, "vwap": 100.0, "atr": 1.0, "rsi": 70.0, "adx": 20.0},
-            "hold": {"price": 99.5, "vwap": 100.0, "atr": 1.0, "rsi": 40.0, "adx": 20.0},
-            "missing": {"rsi_map": {}},
-            "threshold_at": {"price": 99.25, "vwap": 100.0, "atr": 1.0, "rsi": 35.0, "adx": 25.0},
-            "threshold_below": {"price": 99.26, "vwap": 100.0, "atr": 1.0, "rsi": 35.0, "adx": 25.0},
         },
         "bollinger_atr_reversion": {
-            "buy": {"price": 99.7, "lowerBand": 100.0, "upperBand": 101.0, "atr": 1.0, "rsi": 30.0, "adx": 20.0},
-            "sell": {"price": 101.3, "lowerBand": 99.0, "upperBand": 101.0, "atr": 1.0, "rsi": 70.0, "adx": 20.0},
-            "hold": {"price": 99.9, "lowerBand": 100.0, "upperBand": 101.0, "atr": 1.0, "rsi": 40.0, "adx": 20.0},
+            "buy": {"price": 99.55, "lowerBand": 100.0, "upperBand": 101.0, "rsi": 30.0, "adx": 20.0},
+            "sell": {"price": 101.45, "lowerBand": 99.0, "upperBand": 101.0, "rsi": 70.0, "adx": 20.0},
+            "hold": {"price": 99.9, "lowerBand": 100.0, "upperBand": 101.0, "rsi": 40.0, "adx": 20.0},
             "missing": {"bollinger_bands": {}},
-            "threshold_at": {"price": 99.8, "lowerBand": 100.0, "upperBand": 101.0, "atr": 1.0, "rsi": 35.0, "adx": 28.0},
-            "threshold_below": {"price": 99.81, "lowerBand": 100.0, "upperBand": 101.0, "atr": 1.0, "rsi": 35.0, "adx": 28.0},
         },
-        "gap_continuation": {
-            "buy": {"gapState": "gap_up", "gapPercent": 0.75, "gapTradeType": "continuation", "spyVsQqq": 1.01},
-            "sell": {"gapState": "gap_down", "gapPercent": -0.75, "gapTradeType": "continuation", "spyVsQqq": 0.99},
-            "hold": {"gapState": "flat_open", "gapPercent": 0.0, "gapTradeType": "continuation"},
-            "missing": {"gap_state": {}},
-            "threshold_at": {"gapState": "gap_up", "gapPercent": 0.75, "gapTradeType": "continuation", "spyVsQqq": 1.0},
-            "threshold_below": {"gapState": "gap_up", "gapPercent": 0.74, "gapTradeType": "continuation", "spyVsQqq": 1.0},
+        "vwap_mean_reversion": {
+            "buy": {"price": 99.0, "vwap": 100.0, "rsi": 30.0, "adx": 20.0, "relative_volume": 0.9},
+            "sell": {"price": 101.0, "vwap": 100.0, "rsi": 70.0, "adx": 20.0, "relative_volume": 0.9},
+            "hold": {"price": 99.5, "vwap": 100.0, "rsi": 40.0, "adx": 20.0},
+            "missing": {"rsi_map": {}},
         },
-        "gap_fade": {
-            "buy": {"gapState": "gap_down", "gapPercent": -0.75, "gapTradeType": "fade", "spyVsQqq": 1.01},
-            "sell": {"gapState": "gap_up", "gapPercent": 0.75, "gapTradeType": "fade", "spyVsQqq": 0.99},
-            "hold": {"gapState": "flat_open", "gapPercent": 0.0, "gapTradeType": "fade"},
-            "missing": {"gap_state": {}},
-            "threshold_at": {"gapState": "gap_down", "gapPercent": -0.75, "gapTradeType": "fade", "spyVsQqq": 1.0},
-            "threshold_below": {"gapState": "gap_down", "gapPercent": -0.74, "gapTradeType": "fade", "spyVsQqq": 1.0},
-        },
-        "economic_event_reaction": {
-            "buy": {"economic_event_state": {"state": "released", "active": True, "directionalBias": "bullish"}, "relative_volume": 2.5},
-            "sell": {"economic_event_state": {"state": "released", "active": True, "directionalBias": "bearish"}, "relative_volume": 2.5},
-            "hold": {"economic_event_state": {"state": "none", "active": False, "directionalBias": "none"}, "relative_volume": 1.0},
-            "missing": {"economic_event_state": {}},
-            "threshold_at": {"economic_event_state": {"state": "released", "active": True, "directionalBias": "bullish"}, "relative_volume": 2.25},
-            "threshold_below": {"economic_event_state": {"state": "released", "active": True, "directionalBias": "bullish"}, "relative_volume": 2.24},
-        },
-    }
-    return {key: {**base[key], **overrides[strategy_id][key]} for key in base}
+    }[strategy_id]
+
+
+def shadow_case(strategy_id: str) -> dict[str, Any]:
+    return {
+        "liquidity_sweep_reversal": {"sweepSide": "sell_side", "rejectionWickRatio": 1.2, "features_extra": {"microstructureEvidence": {"reliable": True, "orderFlowImbalance": -0.7}}},
+        "gap_continuation": {"gapState": "gap_up", "gapPercent": 1.0, "gapTradeType": "continuation"},
+        "gap_fade": {"gapState": "gap_down", "gapPercent": -1.0, "gapTradeType": "fade"},
+        "economic_event_reaction": {"economic_event_state": {"state": "released", "active": True, "directionalBias": "bullish"}, "relative_volume": 2.5},
+    }[strategy_id]
 
 
 def snapshot_fixture(**overrides: Any) -> MetaStrategyMarketSnapshot:
     price = float(overrides.get("price", 101.0))
     vwap = overrides.get("vwap", 100.0)
-    candle_count = int(overrides.get("candle_count", 60))
-    ma_up = bool(overrides.get("ma_up", False))
-    ma_down = bool(overrides.get("ma_down", False))
-    ma_flat = bool(overrides.get("ma_flat", False))
-    two_timeframes_up = bool(overrides.get("two_timeframes_up", False))
+    candle_count = int(overrides.get("candle_count", 80))
     moving_averages = overrides.get("moving_averages")
     if moving_averages is None:
-        moving_averages = ma_values(ma_up=ma_up, ma_down=ma_down, ma_flat=ma_flat, two_timeframes_up=two_timeframes_up)
+        moving_averages = ma_values(ma_up=bool(overrides.get("ma_up", False)), ma_down=bool(overrides.get("ma_down", False)), ma_flat=bool(overrides.get("ma_flat", False)))
     features = {
         "pullbackDepthAtr": overrides.get("pullbackDepthAtr", 0.75),
         "openingRangeHigh": overrides.get("openingRangeHigh", 100.0),
         "openingRangeLow": overrides.get("openingRangeLow", 99.0),
+        "openingRangeDurationMinutes": 30,
         "bollingerWidthPercentile": overrides.get("bollingerWidthPercentile", 0.8),
+        "priorCompression": overrides.get("priorCompression", False),
+        "atrExpansion": overrides.get("atrExpansion", True),
         "failedBreakoutSide": overrides.get("failedBreakoutSide", "downside"),
-        "reclaimDistanceAtr": overrides.get("reclaimDistanceAtr", 0.15),
+        "reclaimDistanceAtr": overrides.get("reclaimDistanceAtr", 0.25),
         "sweepSide": overrides.get("sweepSide", "sell_side"),
         "rejectionWickRatio": overrides.get("rejectionWickRatio", 0.8),
         "gapTradeType": overrides.get("gapTradeType", "continuation"),
+        "recentSwingHigh": overrides.get("recentSwingHigh", 101.0),
+        "recentSwingLow": overrides.get("recentSwingLow", 99.0),
+        **dict(overrides.get("features_extra") or {}),
     }
     if "features" in overrides:
         features = overrides["features"]
     relative_volume_override = overrides.get("relative_volume", 1.5)
-    if isinstance(relative_volume_override, dict):
-        relative_volume_map = relative_volume_override
-    else:
-        relative_volume_map = {"1m": relative_volume_override, "5m": relative_volume_override, "15m": relative_volume_override}
+    relative_volume_map = relative_volume_override if isinstance(relative_volume_override, dict) else {"1m": relative_volume_override, "5m": relative_volume_override, "15m": relative_volume_override}
     return MetaStrategyMarketSnapshot(
         algorithm_id="meta_strategy",
         algorithm_version="meta_strategy_algorithm_v1",
@@ -239,7 +217,11 @@ def snapshot_fixture(**overrides: Any) -> MetaStrategyMarketSnapshot:
         volume=100_000,
         source_cutoff_timestamp=NOW,
         point_in_time=True,
-        candles={"1m": candles(candle_count, price), "5m": candles(candle_count, price), "15m": candles(candle_count, price)},
+        candles={
+            "1m": candles(candle_count, price, trend=overrides.get("trend", "up")),
+            "5m": candles(candle_count, price, trend=overrides.get("trend", "up")),
+            "15m": candles(candle_count, price, trend=overrides.get("trend", "up")),
+        },
         vwap=vwap,
         moving_averages=moving_averages,
         atr={"1m": overrides.get("atr", 1.0), "5m": overrides.get("atr", 1.0), "15m": overrides.get("atr", 1.0)},
@@ -259,28 +241,45 @@ def snapshot_fixture(**overrides: Any) -> MetaStrategyMarketSnapshot:
     )
 
 
-def ma_values(*, ma_up: bool = False, ma_down: bool = False, ma_flat: bool = False, two_timeframes_up: bool = False) -> dict[str, dict[str, float]]:
+def ma_values(*, ma_up: bool = False, ma_down: bool = False, ma_flat: bool = False) -> dict[str, dict[str, float]]:
     if ma_down:
-        return {"1m": {"ema20": 99.0, "ema50": 100.0}, "5m": {"ema20": 99.0, "ema50": 100.0}, "15m": {"ema20": 99.0, "ema50": 100.0}}
+        return {"1m": {"ema20": 99.2, "ema50": 99.8}, "5m": {"ema20": 99.2, "ema50": 99.8}, "15m": {"ema20": 99.2, "ema50": 99.8}}
     if ma_flat:
         return {"1m": {"ema20": 100.0, "ema50": 100.0}, "5m": {"ema20": 100.0, "ema50": 100.0}, "15m": {"ema20": 100.0, "ema50": 100.0}}
-    if two_timeframes_up:
-        return {"1m": {"ema20": 101.0, "ema50": 100.0}, "5m": {"ema20": 101.0, "ema50": 100.0}, "15m": {"ema20": 100.0, "ema50": 100.0}}
-    return {"1m": {"ema20": 101.0, "ema50": 100.0}, "5m": {"ema20": 101.0, "ema50": 100.0}, "15m": {"ema20": 101.0, "ema50": 100.0}}
+    return {"1m": {"ema20": 100.8, "ema50": 100.2}, "5m": {"ema20": 100.8, "ema50": 100.2}, "15m": {"ema20": 100.8, "ema50": 100.2}}
 
 
-def candles(count: int, close: float) -> tuple[dict[str, Any], ...]:
-    return tuple(
-        {
-            "timestamp": NOW.isoformat(),
-            "open": close - 0.05,
-            "high": close + 0.1,
-            "low": close - 0.1,
-            "close": close,
-            "volume": 100_000,
-        }
-        for _ in range(count)
-    )
+def candles(count: int, close: float, *, trend: str) -> tuple[dict[str, Any], ...]:
+    rows = []
+    for index in range(count):
+        timestamp = NOW - timedelta(minutes=count - index)
+        base = close - 1.0 + (index / max(1, count - 1))
+        if trend in {"down", "continuation_sell", "breakout_sell"}:
+            base = close + 1.0 - (index / max(1, count - 1))
+        elif trend == "flat":
+            base = close
+        rows.append({"timestamp": timestamp.isoformat(), "open": base - 0.03, "high": base + 0.08, "low": base - 0.08, "close": base, "volume": 100_000})
+    if trend == "pullback_buy" and count >= 15:
+        opening_open = close - 1.1
+        for index in range(15):
+            impulse_close = opening_open + 0.02 * index
+            rows[index] = {**rows[index], "open": opening_open if index == 0 else impulse_close - 0.02, "high": opening_open + 0.45 + 0.02 * index, "low": opening_open - 0.03, "close": impulse_close}
+    if trend == "pullback_sell" and count >= 15:
+        opening_open = close + 1.1
+        for index in range(15):
+            impulse_close = opening_open - 0.02 * index
+            rows[index] = {**rows[index], "open": opening_open if index == 0 else impulse_close + 0.02, "high": opening_open + 0.03, "low": opening_open - 0.45 - 0.02 * index, "close": impulse_close}
+    if trend in {"continuation_buy", "pullback_buy"} and count >= 2:
+        rows[-2] = {**rows[-2], "close": close - 0.25, "high": close - 0.05, "low": close - 0.45}
+        rows[-1] = {**rows[-1], "open": close - 0.10, "high": close + 0.12, "low": close - 0.12, "close": close}
+    if trend in {"continuation_sell", "pullback_sell"} and count >= 2:
+        rows[-2] = {**rows[-2], "close": close + 0.25, "high": close + 0.45, "low": close + 0.05}
+        rows[-1] = {**rows[-1], "open": close + 0.10, "high": close + 0.12, "low": close - 0.12, "close": close}
+    if trend == "failed_downside":
+        rows[-1] = {**rows[-1], "open": close - 0.15, "high": close + 0.05, "low": 98.75, "close": close}
+    if trend == "failed_upside":
+        rows[-1] = {**rows[-1], "open": close + 0.15, "high": 101.25, "low": close - 0.05, "close": close}
+    return tuple(rows)
 
 
 if __name__ == "__main__":

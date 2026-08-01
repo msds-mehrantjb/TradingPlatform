@@ -17,6 +17,8 @@ load_dotenv(ROOT / ".env")
 class FeatureFlags:
     strategyEngineV2Enabled: bool = True
     familyEnsembleV2Enabled: bool = True
+    metaStrategyRuntimeEnabled: bool = False
+    metaStrategyRuntimeMode: str = "shadow"
     metaModelV2Enabled: bool = False
     dynamicTradingPolicyEnabled: bool = False
     globalGateEngineEnabled: bool = True
@@ -74,6 +76,9 @@ def get_settings() -> Settings:
             for origin in (f"http://localhost:{port}", f"http://127.0.0.1:{port}")
         ),
     )
+    meta_strategy_runtime_mode = os.getenv("META_STRATEGY_RUNTIME_MODE", "shadow").strip().lower()
+    if meta_strategy_runtime_mode not in {"shadow", "paper"}:
+        meta_strategy_runtime_mode = "shadow"
     return Settings(
         alpaca_key_id=os.getenv("APCA_API_KEY_ID", ""),
         alpaca_secret_key=os.getenv("APCA_API_SECRET_KEY", ""),
@@ -89,5 +94,17 @@ def get_settings() -> Settings:
         ollama_model=os.getenv("OLLAMA_MODEL", "llama3"),
         database_url=os.getenv("DATABASE_URL", "sqlite:///./data/trading.db"),
         allowed_origins=[origin.strip() for origin in origins.split(",") if origin.strip()],
-        application_config=ApplicationConfig(),
+        application_config=ApplicationConfig(
+            featureFlags=FeatureFlags(
+                metaStrategyRuntimeEnabled=_env_bool("META_STRATEGY_RUNTIME_ENABLED", False),
+                metaStrategyRuntimeMode=meta_strategy_runtime_mode,
+            )
+        ),
     )
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}

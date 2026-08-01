@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
+from time import perf_counter
 from typing import Any, Callable, Literal, Protocol
 
 from backend.app.algorithms.meta_strategy.broker_adapter import MetaStrategyBrokerAdapter, NoopMetaStrategyBrokerAdapter
@@ -20,6 +21,7 @@ from backend.app.algorithms.meta_strategy.feature_builder import MetaStrategyFea
 from backend.app.algorithms.meta_strategy.global_risk_adapter import MetaStrategyGlobalRiskAdapter, ReadOnlyMetaStrategyGlobalRiskAdapter
 from backend.app.algorithms.meta_strategy.inference import MetaStrategyInferenceConfig, MetaStrategyInferenceResult, apply_meta_strategy_inference
 from backend.app.algorithms.meta_strategy.local_gates import (
+    MetaStrategyLocalGateConfig,
     MetaStrategyLocalGateContext,
     MetaStrategyLocalGateEvaluation,
     evaluate_meta_strategy_local_gates,
@@ -74,7 +76,7 @@ class MetaStrategyPersistenceAdapter(Protocol):
 @dataclass(frozen=True)
 class MetaStrategyExecutionPipelineConfig:
     settings: MetaStrategySettings = field(default_factory=lambda: build_meta_strategy_settings(status="ACTIVE"))
-    inference_config: MetaStrategyInferenceConfig = field(default_factory=lambda: MetaStrategyInferenceConfig(mode="FILTER", fallbackBehavior="NO_TRADE"))
+    inference_config: MetaStrategyInferenceConfig = field(default_factory=lambda: MetaStrategyInferenceConfig(mode="SHADOW", fallbackBehavior="NO_TRADE"))
     baseline_settings: MetaStrategyBaselineSettings = field(default_factory=meta_strategy_baseline_settings)
     live_trading_enabled: bool = False
     default_account_equity: float = 100_000.0
@@ -196,7 +198,9 @@ def run_meta_strategy_execution_pipeline(
         global_risk_adapter=global_risk_adapter or ReadOnlyMetaStrategyGlobalRiskAdapter(),
     )
     for stage in META_STRATEGY_EXECUTION_PIPELINE_STAGES:
+        started = perf_counter()
         _STAGE_HANDLERS[stage](state)
+        state.stage_results.setdefault(stage, {})["durationMs"] = int((perf_counter() - started) * 1000)
     return _build_result(state)
 
 
@@ -262,22 +266,34 @@ def _stage_feature_builder(state: _PipelineState) -> None:
             "timestamp": snapshot.timestamp.isoformat(),
             "deterministicCandidate": {
                 "direction": candidate.direction,
+                "signal": candidate.direction,
                 "confidence": candidate.deterministic_confidence,
+                "finalScore": candidate.deterministic_confidence,
+                "buyConfidence": candidate.winning_score if candidate.direction == "BUY" else candidate.opposing_score,
+                "sellConfidence": candidate.winning_score if candidate.direction == "SELL" else candidate.opposing_score,
                 "edge": candidate.edge,
                 "supportingFamilies": candidate.supporting_families,
                 "opposingFamilies": candidate.opposing_families,
             },
-            "familyScores": candidate.evidence.get("familyAggregation", {}).get("familyScores", ()),
+            "familyScores": _family_feature_scores(candidate),
+            "directionalStrategyOutputs": _directional_feature_outputs(candidate),
+            "contextOutputs": _context_feature_outputs(candidate),
+            "regimeOutput": _regime_feature_output(candidate),
             "selectedValues": {
                 "candidate_direction": candidate.direction,
                 "candidate_edge": candidate.edge,
                 "candidate_confidence": candidate.deterministic_confidence,
                 "expected_net_reward_risk": geometry.expected_net_reward_risk or 0.0,
+                "reward_risk_ratio": geometry.geometry.risk_reward,
+                "spread_dollars": (snapshot.spread or {}).get("dollars"),
                 "spread_bps": snapshot.spread_bps or 0.0,
                 "liquidity": (snapshot.liquidity or {}).get("dollarVolume", snapshot.volume),
+                "relative_volume": (snapshot.relative_volume or {}).get("1m"),
+                "estimated_slippage": (geometry.evidence or {}).get("estimatedSlippage", 0.0),
                 "target_distance": geometry.target_distance,
                 "stop_distance": geometry.stop_distance,
                 "expected_transaction_cost": geometry.estimated_cost,
+                "current_meta_strategy_virtual_exposure": (snapshot.features or {}).get("metaStrategyVirtualExposure", 0.0),
             },
         }
     )
@@ -343,7 +359,23 @@ def _stage_local_gates(state: _PipelineState) -> None:
             execution_mode="LIVE" if request.mode == "LIVE" else "PAPER",
             paper_trading_permission=request.paper_trading_permission,
             live_trading_permission=request.live_trading_permission and state.config.live_trading_enabled,
-        )
+        ),
+        config=MetaStrategyLocalGateConfig(
+            minimum_active_strategies=state.config.settings.candidate_aggregation.minimum_active_strategies,
+            minimum_independent_families=state.config.settings.candidate_aggregation.minimum_independent_families,
+            minimum_deterministic_score=state.config.settings.entry_exit_management.entry_threshold,
+            minimum_deterministic_edge=state.config.settings.candidate_aggregation.minimum_conflict_edge,
+            minimum_calibrated_success_probability=state.config.settings.ml_inference.model_probability_threshold,
+            minimum_reward_risk_after_costs=state.config.settings.local_risk.minimum_reward_to_risk,
+            maximum_spread_bps=state.config.settings.local_risk.spread_limit_bps,
+            minimum_liquidity=state.config.settings.local_risk.liquidity_requirement,
+            maximum_daily_loss=state.config.settings.local_risk.maximum_daily_loss,
+            maximum_daily_trades=state.config.settings.local_risk.trade_count_limit,
+            minimum_model_health=0.0 if state.config.settings.ml_inference.mode == "DISABLED" else 0.70,
+            allowed_session_phases=state.config.settings.sessions.allowed_sessions,
+            paper_trading_allowed=state.config.settings.paper_execution.enabled and state.config.settings.paper_execution.execution_mode == "PAPER",
+            live_trading_allowed=False,
+        ),
     )
     state.reason_codes.extend(state.local_gates.reason_codes)
     _record(state, "local_gates", {"passed": state.local_gates.passed, "approvedQuantity": state.local_gates.approved_quantity})
@@ -412,6 +444,8 @@ def _stage_order_intent(state: _PipelineState) -> None:
         side=inference.finalSignal,
         quantity=sizing.quantity,
         stop_price=geometry.geometry.stop_price,
+        limit_price=_configured_limit_price(state, inference.finalSignal, geometry),
+        time_in_force=state.config.settings.order_construction.time_in_force,
     )
     state.order_intent = result.intent
     state.reason_codes.extend(result.reason_codes)
@@ -456,7 +490,7 @@ def _stage_final_validation(state: _PipelineState) -> None:
             max_spread_bps=state.dynamic_profile.effective_settings.spread_limit_bps if state.dynamic_profile else 15.0,
             minimum_liquidity=state.dynamic_profile.effective_settings.liquidity_requirement if state.dynamic_profile else 0.0,
             duplicate_intent_ids=state.request.duplicate_order_intent_ids,
-            existing_position_symbols=state.request.existing_position_symbols,
+            existing_position_symbols=state.request.existing_position_symbols if state.config.settings.position_management.one_position_per_symbol else (),
         )
     )
     if state.request.mode == "LIVE" and not state.config.live_trading_enabled:
@@ -578,13 +612,123 @@ def _require(value: Any, name: str) -> Any:
 
 
 def _inference_config_for_mode(state: _PipelineState) -> MetaStrategyInferenceConfig:
+    configured = _settings_inference_config(state)
     if state.request.mode == "SHADOW":
-        return MetaStrategyInferenceConfig(**{**state.config.inference_config.__dict__, "mode": "SHADOW"})
-    if state.request.mode in {"EVALUATION", "BACKTEST", "DAILY_REPLAY", "DIAGNOSTICS"}:
-        return MetaStrategyInferenceConfig(**{**state.config.inference_config.__dict__, "mode": "FILTER"})
+        return MetaStrategyInferenceConfig(**{**configured.__dict__, "mode": "SHADOW"})
     if state.request.mode == "LIVE" and not state.config.live_trading_enabled:
-        return MetaStrategyInferenceConfig(**{**state.config.inference_config.__dict__, "mode": "DISABLED"})
-    return state.config.inference_config
+        return MetaStrategyInferenceConfig(**{**configured.__dict__, "mode": "DISABLED"})
+    return configured
+
+
+def _settings_inference_config(state: _PipelineState) -> MetaStrategyInferenceConfig:
+    mode_map = {
+        "DISABLED": "DISABLED",
+        "SHADOW": "SHADOW",
+        "FILTER": "FILTER",
+        "ACTIVE": "FILTER",
+    }
+    settings = state.config.settings.ml_inference
+    return MetaStrategyInferenceConfig(
+        **{
+            **state.config.inference_config.__dict__,
+            "mode": mode_map[settings.mode],
+            "minSuccessProbability": settings.model_probability_threshold,
+            "minCalibratedProbability": settings.model_probability_threshold,
+            "fallbackBehavior": settings.fallback_behavior,
+        }
+    )
+
+
+def _directional_feature_outputs(candidate: GeneratedDeterministicCandidate) -> dict[str, dict[str, Any]]:
+    outputs = candidate.evidence.get("directionalOutputs") or {}
+    audit = (candidate.evidence.get("familyAggregation") or {}).get("contributionAudit") or {}
+    if not isinstance(outputs, dict):
+        return {}
+    enriched: dict[str, dict[str, Any]] = {}
+    for strategy_id, output in outputs.items():
+        if not isinstance(output, dict):
+            continue
+        contribution = audit.get(strategy_id) if isinstance(audit, dict) else {}
+        evidence = output.get("evidence") if isinstance(output.get("evidence"), dict) else {}
+        enriched[strategy_id] = {
+            "signal": output.get("signal"),
+            "confidence": output.get("confidence"),
+            "eligible": output.get("eligible"),
+            "family": output.get("family"),
+            "direction": output.get("signal"),
+            "active": bool(output.get("eligible")) and str(output.get("signal")) != "HOLD",
+            "dataReady": not bool(evidence.get("dataQualityBlocked")),
+            "regimeFit": evidence.get("regimeFit") or evidence.get("regimeCompatibility"),
+            "reliability": evidence.get("reliability") or evidence.get("evidenceQuality"),
+            "strategyFamily": output.get("family"),
+            "evidenceQuality": evidence.get("evidenceQuality") or contribution.get("confidence") if isinstance(contribution, dict) else evidence.get("evidenceQuality"),
+            "correlationAdjustedContribution": contribution.get("cappedContribution") if isinstance(contribution, dict) else None,
+        }
+    return enriched
+
+
+def _family_feature_scores(candidate: GeneratedDeterministicCandidate) -> tuple[dict[str, Any], ...]:
+    scores = (candidate.evidence.get("familyAggregation") or {}).get("familyScores") or {}
+    if isinstance(scores, dict):
+        return tuple({"family": family, **payload} for family, payload in scores.items() if isinstance(payload, dict))
+    if isinstance(scores, (tuple, list)):
+        return tuple(item for item in scores if isinstance(item, dict))
+    return ()
+
+
+def _context_feature_outputs(candidate: GeneratedDeterministicCandidate) -> tuple[dict[str, Any], ...]:
+    outputs = candidate.evidence.get("contextOutputs") or {}
+    if not isinstance(outputs, dict):
+        return ()
+    return tuple(
+        {
+            "contextId": strategy_id,
+            "confidence": payload.get("confidence"),
+            "eligible": payload.get("eligible"),
+            "features": _scalar_feature_subset(payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}),
+        }
+        for strategy_id, payload in outputs.items()
+        if isinstance(payload, dict)
+    )
+
+
+def _regime_feature_output(candidate: GeneratedDeterministicCandidate) -> dict[str, Any]:
+    outputs = candidate.evidence.get("regimeOutputs") or {}
+    if not isinstance(outputs, dict) or not outputs:
+        return {}
+    first_id, first_payload = next(iter(outputs.items()))
+    if not isinstance(first_payload, dict):
+        return {}
+    return {
+        "label": first_payload.get("signal") or first_id,
+        "features": _scalar_feature_subset(first_payload.get("evidence") if isinstance(first_payload.get("evidence"), dict) else {}),
+    }
+
+
+def _scalar_feature_subset(values: dict[str, Any]) -> dict[str, Any]:
+    forbidden_fragments = ("future", "outcome", "label", "fill", "pnl", "result", "payload")
+    return {
+        str(key): value
+        for key, value in values.items()
+        if not isinstance(value, (dict, list, tuple))
+        and not any(fragment in str(key).replace("-", "_").lower() for fragment in forbidden_fragments)
+    }
+
+
+def _configured_limit_price(state: _PipelineState, side: str, geometry: CandidateGeometryResult) -> float | None:
+    order_settings = state.config.settings.order_construction
+    entry_settings = state.config.settings.entry_construction
+    style = str(order_settings.order_type or entry_settings.entry_order_style).upper()
+    if style == "MARKET":
+        return None
+    entry = geometry.entry_reference
+    if entry is None or side not in {"BUY", "SELL"}:
+        return None
+    offset_bps = order_settings.limit_offset_bps or entry_settings.marketable_limit_offset_bps
+    offset = float(entry) * float(offset_bps) / 10_000.0
+    if style == "MARKETABLE_LIMIT":
+        return round(float(entry) + offset if side == "BUY" else float(entry) - offset, 6)
+    return round(float(entry), 6)
 
 
 def _volatility_level(snapshot: MetaStrategyMarketSnapshot) -> Literal["LOW", "NORMAL", "HIGH", "EXTREME"]:
