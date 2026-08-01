@@ -451,6 +451,18 @@ function shouldRefreshVotingTradingRag() {
   return state.algoBacktestTimeframe === "1Min" || state.algoBacktestTimeframe === "5Min" || state.algoBacktestTimeframe === "Trading";
 }
 
+function emptyVotingEnsemblePaperInventory(): VotingEnsemblePaperInventory {
+  return {
+    orders: [],
+    fills: [],
+    positions: [],
+    protectiveOrders: [],
+    outbox: [],
+    results: [],
+    reconciliations: [],
+  };
+}
+
 type AlgoVote = {
   strategy: string;
   signal: AlgoSignal;
@@ -538,6 +550,58 @@ type VotingEnsembleEvaluationJob = {
   resultUrl?: string;
   result?: VotingEnsembleBackendResult;
   error?: string | null;
+};
+
+type VotingEnsembleRuntimeControl = {
+  algorithmId?: "voting_ensemble";
+  algorithm_id?: "voting_ensemble";
+  requestedPaperTradingEnabled: boolean;
+  effectivePaperTradingEnabled: boolean;
+  liveTradingEnabled: boolean;
+  newEntriesEnabled: boolean;
+  killSwitchActive?: boolean;
+  updatedAt?: string | null;
+  updatedBy?: string;
+  reasonCodes?: string[];
+};
+
+type VotingEnsembleRuntimeStatus = VotingEnsembleRuntimeControl & {
+  paperReady: boolean;
+  paperReadyBlockingReasonCodes: string[];
+  supervisorRunning: boolean;
+  evaluationWorkerHealthy: boolean;
+  executionWorkerHealthy: boolean;
+  reconciliationHealthy: boolean;
+  paperBrokerVerified: boolean;
+  marketOpen: boolean;
+  marketDataReady: boolean;
+  inventoryReconciled: boolean;
+  newEntriesAllowed: boolean;
+  activeEntryBlocks: string[];
+  lastFinalizedBar: Record<string, unknown> | null;
+  lastEvaluation: Record<string, unknown> | null;
+  lastDecision: Record<string, unknown> | null;
+  lastExecutionIntent: Record<string, unknown> | null;
+  lastBrokerOrder: Record<string, unknown> | null;
+  openVotingEnsembleOrders: Record<string, unknown>[];
+  openVotingEnsemblePositions: Record<string, unknown>[];
+  lastReconciliation: Record<string, unknown> | null;
+  lastError: string | null;
+  settingsHash: string | null;
+};
+
+type VotingEnsemblePaperInventory = {
+  algorithmId?: "voting_ensemble";
+  algorithm_id?: "voting_ensemble";
+  orders: Record<string, unknown>[];
+  fills: Record<string, unknown>[];
+  positions: Record<string, unknown>[];
+  protectiveOrders: Record<string, unknown>[];
+  outbox: Record<string, unknown>[];
+  results: Record<string, unknown>[];
+  reconciliations: Record<string, unknown>[];
+  generatedAt?: string;
+  reasonCodes?: string[];
 };
 
 type ConfidenceStrategyKey = string;
@@ -3096,6 +3160,13 @@ const state = {
   votingEnsembleInventory: emptyVotingEnsembleInventory(),
   votingEnsembleInventoryStatus: "idle" as "idle" | "loading" | "ready" | "error",
   votingEnsembleInventoryWarning: "",
+  votingEnsembleRuntimeControl: null as VotingEnsembleRuntimeControl | null,
+  votingEnsembleRuntimeStatus: null as VotingEnsembleRuntimeStatus | null,
+  votingEnsembleRuntimeControlStatus: "idle" as "idle" | "loading" | "ready" | "blocked" | "error",
+  votingEnsembleRuntimeControlWarning: "",
+  votingEnsemblePaperInventory: emptyVotingEnsemblePaperInventory(),
+  votingEnsemblePaperInventoryStatus: "idle" as "idle" | "loading" | "ready" | "error",
+  votingEnsemblePaperInventoryWarning: "",
   algoIntradayTradesExpanded:
     persistedUiState.algoIntradayTradesExpanded ?? ["1Min", "5Min"].includes(visibleAlgoBacktestTimeframe(persistedUiState.algoBacktestTimeframe)),
   algoVotesExpanded: false,
@@ -3167,8 +3238,8 @@ const state = {
   currentRegimeTargetOrder: null as ManualOrderRecommendation | null,
   currentMetaTargetOrder: null as ManualOrderRecommendation | null,
   autoSubmittedOrderKeys: loadAutoSubmittedOrderKeys(),
-  globalPaperTradingEnabled: persistedUiState.globalPaperTradingEnabled ?? persistedUiState.tradingEnabled ?? false,
-  tradingEnabled: persistedUiState.globalPaperTradingEnabled ?? persistedUiState.tradingEnabled ?? false,
+  globalPaperTradingEnabled: false,
+  tradingEnabled: false,
   tradingWindowMode: persistedUiState.tradingWindowMode ?? "ensemble" as TradingWindowMode,
   selectedSellSetupByMode: {
     ensemble: persistedUiState.selectedSellSetupByMode?.ensemble ?? "",
@@ -4500,15 +4571,7 @@ document.querySelector("#latestButton")!.addEventListener("click", () => {
 });
 
 tradeToggleButton.addEventListener("click", () => {
-  setGlobalPaperTradingEnabled(!globalPaperTradingEnabled());
-  saveUiState();
-  updateTradeToggleButton();
-  updateQuoteCard(currentCandle());
-  void syncWeightedVotingAutomaticPaperControl(globalPaperTradingEnabled());
-  void syncRegimeAutomaticPaperControl(globalPaperTradingEnabled());
-  if (globalPaperTradingEnabled()) {
-    maybeAutoSubmitAllAlgorithms();
-  }
+  void handlePaperToggleClick();
 });
 
 buyOrderButton.addEventListener("click", () => {
@@ -4594,6 +4657,10 @@ openOrderControls.addEventListener("click", (event) => {
 
 closePositionButton.addEventListener("click", () => {
   const mode = state.tradingWindowMode;
+  if (mode === "ensemble") {
+    void refreshVotingEnsemblePaperInventory();
+    return;
+  }
   const latest = latestExecutionCandleForMode(mode);
   if (!latest || !canSubmitManualTrades()) {
     return;
@@ -4608,9 +4675,6 @@ closePositionButton.addEventListener("click", () => {
       trigger: "Close Position button",
     });
   });
-  if (mode === "ensemble") {
-    clearRecommendedTargetOverrides();
-  }
   updateAlgorithmPanel(visibleCandles());
   updateQuoteCard(latest);
 });
@@ -8489,6 +8553,18 @@ function setGlobalPaperTradingEnabled(enabled: boolean) {
   state.tradingEnabled = enabled;
 }
 
+function votingEnsemblePaperRequested() {
+  return Boolean(state.votingEnsembleRuntimeStatus?.requestedPaperTradingEnabled ?? state.votingEnsembleRuntimeControl?.requestedPaperTradingEnabled);
+}
+
+function votingEnsemblePaperEffective() {
+  return Boolean(state.votingEnsembleRuntimeStatus?.effectivePaperTradingEnabled ?? state.votingEnsembleRuntimeControl?.effectivePaperTradingEnabled);
+}
+
+function votingEnsemblePaperBlocked() {
+  return votingEnsemblePaperRequested() && !votingEnsemblePaperEffective();
+}
+
 function canSubmitManualTrades() {
   return isMarketOpenForOrders();
 }
@@ -8498,7 +8574,7 @@ function canSubmitAutomaticTrades() {
 }
 
 function canSubmitVotingEnsembleAutomaticPaperTrades() {
-  return canSubmitAutomaticTrades();
+  return false;
 }
 
 function tradeSubmissionBlockedTitle(submitMode: SubmitOrderMode | "Manual" | "Automatic" = "Manual") {
@@ -8509,13 +8585,63 @@ function tradeSubmissionBlockedTitle(submitMode: SubmitOrderMode | "Manual" | "A
 }
 
 function updateTradeToggleButton() {
-  const enabled = globalPaperTradingEnabled();
-  tradeToggleButton.textContent = enabled ? "Paper On" : "Paper Off";
-  tradeToggleButton.setAttribute("aria-pressed", String(enabled));
-  tradeToggleButton.dataset.enabled = String(enabled);
-  tradeToggleButton.title = enabled
-    ? "Automatic paper trading requested for Voting Ensemble, Regime, and other dashboard algorithms"
-    : "Automatic paper trading disabled for Voting Ensemble, Regime, and other dashboard algorithms; manual orders remain available while the market is open";
+  const requested = votingEnsemblePaperRequested();
+  const effective = votingEnsemblePaperEffective();
+  const blocked = requested && !effective;
+  const loading = state.votingEnsembleRuntimeControlStatus === "loading";
+  const error = state.votingEnsembleRuntimeControlStatus === "error";
+  tradeToggleButton.textContent = loading ? "Paper Syncing" : error ? "Paper Error" : blocked ? "Paper Blocked" : effective ? "Paper On" : "Paper Off";
+  tradeToggleButton.setAttribute("aria-pressed", String(effective));
+  tradeToggleButton.dataset.enabled = String(effective);
+  tradeToggleButton.dataset.requested = String(requested);
+  tradeToggleButton.dataset.effective = String(effective);
+  tradeToggleButton.dataset.status = loading ? "loading" : error ? "error" : blocked ? "blocked" : effective ? "on" : "off";
+  const runtime = state.votingEnsembleRuntimeStatus;
+  const activeBlocks = runtime?.activeEntryBlocks?.length ? runtime.activeEntryBlocks.join(", ") : "";
+  const paperReadyBlocks = runtime?.paperReadyBlockingReasonCodes?.length ? runtime.paperReadyBlockingReasonCodes.join(", ") : "";
+  const reason = activeBlocks || state.votingEnsembleRuntimeControl?.reasonCodes?.join(", ") || state.votingEnsembleRuntimeControlWarning;
+  const controlLabel = [
+    `Voting Ensemble requested: ${requested ? "ON" : "OFF"}`,
+    `Voting Ensemble effective: ${effective ? "ON" : "OFF"}`,
+    runtime ? `Paper ready: ${runtime.paperReady ? "true" : "false"}` : "",
+    runtime ? `Market: ${runtime.marketOpen ? "open" : "closed"}` : "",
+    runtime ? `Workers: eval ${runtime.evaluationWorkerHealthy ? "healthy" : "blocked"}, exec ${runtime.executionWorkerHealthy ? "healthy" : "blocked"}, recon ${runtime.reconciliationHealthy ? "healthy" : "blocked"}` : "",
+    runtime ? `Broker: ${runtime.paperBrokerVerified ? "paper verified" : "not ready"}` : "",
+    runtime ? `Inventory: ${runtime.inventoryReconciled ? "reconciled" : "reconciliation required"}` : "",
+    runtime ? `Last bar: ${describeVotingEnsembleRuntimeRecord(runtime.lastFinalizedBar, ["barEndTimestamp", "barEnd", "finalizedAt", "receivedAt"])}` : "",
+    runtime ? `Last decision: ${describeVotingEnsembleRuntimeRecord(runtime.lastDecision, ["decisionId", "signal", "side", "status"])}` : "",
+    runtime ? `Last order: ${describeVotingEnsembleRuntimeRecord(runtime.lastBrokerOrder ?? runtime.lastExecutionIntent, ["clientOrderId", "status", "entryOrderStatus", "brokerOrderId"])}` : "",
+    blocked ? "Backend blocked new entries." : "",
+    paperReadyBlocks,
+    reason,
+  ].filter(Boolean).join(" ");
+  tradeToggleButton.title = controlLabel;
+  tradeToggleButton.setAttribute("aria-label", controlLabel);
+}
+
+function describeVotingEnsembleRuntimeRecord(record: Record<string, unknown> | null | undefined, preferredFields: string[]) {
+  if (!record) {
+    return "none";
+  }
+  for (const field of preferredFields) {
+    const value = record[field];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+  }
+  const nestedTimestamps = isRecord(record.timestamps) ? record.timestamps : null;
+  if (nestedTimestamps) {
+    for (const field of preferredFields) {
+      const value = nestedTimestamps[field];
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+    }
+  }
+  return "recorded";
 }
 
 function updateOrderButtonStates(position: PositionSummary) {
@@ -8616,7 +8742,6 @@ function setTradingLedger(mode: TradingWindowMode, rows: TradeHistoryRow[]) {
     return;
   }
   state.tradeHistory = rows;
-  saveTradeHistory();
 }
 
 function isTradeHistoryRowFromToday(row: TradeHistoryRow) {
@@ -8624,6 +8749,10 @@ function isTradeHistoryRowFromToday(row: TradeHistoryRow) {
 }
 
 function clearTodaysTradeHistoryForMode(mode: TradingWindowMode) {
+  if (mode === "ensemble") {
+    void refreshVotingEnsemblePaperInventory();
+    return;
+  }
   const protectedRows = new Set(openPositionTradeRowsForMode(mode).map((row) => row.id));
   const remainingRows = normalizedTradeHistoryForMode(mode).filter((row) => !isTradeHistoryRowFromToday(row) || protectedRows.has(row.id));
   const remainingBuyLotIds = new Set(remainingRows.filter((row) => row.side === "Buy").map((row) => row.id));
@@ -9041,6 +9170,10 @@ function recordTradeHistory(side: TradeHistoryRow["side"], mode: TradingWindowMo
   if (state.tradingWindowMode !== mode) {
     setTradingWindowMode(mode);
   }
+  if (mode === "ensemble") {
+    void refreshVotingEnsemblePaperInventory();
+    return;
+  }
   const latest = latestExecutionCandleForMode(mode);
   if (!latest) {
     return;
@@ -9082,9 +9215,6 @@ function recordTradeHistory(side: TradeHistoryRow["side"], mode: TradingWindowMo
     submitMode: "Manual",
     trigger: `${side} Order button`,
   });
-  if (mode === "ensemble") {
-    clearRecommendedTargetOverrides();
-  }
   updateAlgorithmPanel(visibleCandles());
   updateQuoteCard(latest);
 }
@@ -9478,46 +9608,7 @@ function confirmTargetOrderMismatch(
 }
 
 function maybeAutoSubmitTargetOrder() {
-  if (automaticSubmitInFlight) {
-    return;
-  }
-  const latest = latestExecutionCandleForMode("ensemble");
-  const order = state.currentTargetOrder;
-  const backtestQuality = currentVotingBacktestQuality();
-  if (!latest || !order || order.submitMode !== "Automatic" || !canSubmitVotingEnsembleAutomaticPaperTrades() || backtestQuality?.paperReady !== true) {
-    return;
-  }
-  if (order.side === "Sell") {
-    return;
-  }
-  if (automaticTradeAlreadySubmittedForCandle("ensemble", latest)) {
-    return;
-  }
-  const executionPrice = targetOrderExecutionPrice(order, latest.close);
-  const position = summarizePositionFromTradeHistory(latest.close, latest.close, "ensemble");
-  const quantity = automaticOrderQuantity(order, position, "ensemble");
-  const rejection = automaticOrderRejectionReason(order, position, quantity, executionPrice, "ensemble");
-  if (rejection) {
-    return;
-  }
-  const key = automaticOrderKeyForMode("ensemble", order, quantity, executionPrice);
-  if (state.autoSubmittedOrderKeys.includes(key)) {
-    return;
-  }
-
-  automaticSubmitInFlight = true;
-  try {
-    appendTradeHistory(order.side as TradeHistoryRow["side"], quantity, executionPrice, undefined, "ensemble", {
-      submitMode: "Automatic",
-      trigger: "Voting Ensemble target order",
-    });
-    rememberAutoSubmittedOrderKey(key);
-    clearRecommendedTargetOverrides();
-    updateAlgorithmPanel(visibleCandles());
-    updateQuoteCard(latest);
-  } finally {
-    automaticSubmitInFlight = false;
-  }
+  void refreshVotingEnsemblePaperInventory();
 }
 
 function maybeAutoSubmitConfidenceTargetOrder() {
@@ -9962,9 +10053,8 @@ function maybeAutoSubmitOpenOrderControls() {
   if (automaticSubmitInFlight || !canSubmitAutomaticTrades()) {
     return;
   }
-  const ensembleBacktestQuality = currentVotingBacktestQuality();
   for (const mode of ["ensemble", "weighted", "confidence", "regime", "meta"] as TradingWindowMode[]) {
-    if (mode === "ensemble" && (!canSubmitVotingEnsembleAutomaticPaperTrades() || ensembleBacktestQuality?.paperReady !== true)) {
+    if (mode === "ensemble") {
       continue;
     }
     const latest = latestExecutionCandleForMode(mode);
@@ -10019,11 +10109,12 @@ function submitSelectedOpenOrderSell(mode: TradingWindowMode = activeTradingMode
 }
 
 function submitOpenOrderLot(lotId: string, automatic: boolean, mode: TradingWindowMode = state.tradingWindowMode) {
-  const latest = latestExecutionCandleForMode(mode);
-  if (!latest || !(automatic ? canSubmitAutomaticTrades() : canSubmitManualTrades())) {
+  if (mode === "ensemble") {
+    void refreshVotingEnsemblePaperInventory();
     return;
   }
-  if (automatic && mode === "ensemble" && !canSubmitVotingEnsembleAutomaticPaperTrades()) {
+  const latest = latestExecutionCandleForMode(mode);
+  if (!latest || !(automatic ? canSubmitAutomaticTrades() : canSubmitManualTrades())) {
     return;
   }
   const lot = openOrderLots(mode).find((item) => item.id === lotId);
@@ -10068,9 +10159,6 @@ function submitOpenOrderLot(lotId: string, automatic: boolean, mode: TradingWind
       trigger: automatic ? "Automatic sell setup" : "Selected sell setup",
     });
     rememberAutoSubmittedOrderKey(key);
-    if (mode === "ensemble") {
-      clearRecommendedTargetOverrides();
-    }
     updateAlgorithmPanel(visibleCandles());
     updateQuoteCard(latest);
   } finally {
@@ -10615,6 +10703,10 @@ function appendTradeHistory(
   mode: TradingWindowMode = state.tradingWindowMode,
   options: { submitMode?: OrderEvidenceSnapshot["submitMode"]; trigger?: string } = {},
 ) {
+  if (mode === "ensemble") {
+    void refreshVotingEnsemblePaperInventory();
+    return;
+  }
   if (options.submitMode === "Automatic" ? !canSubmitAutomaticTrades() : !canSubmitManualTrades()) {
     return;
   }
@@ -10711,9 +10803,15 @@ function renderTradeHistory(mode: TradingWindowMode = state.tradingWindowMode) {
   const history = normalizedTradeHistoryForMode(mode);
   renderTradeHistoryBalance(history);
   if (!history.length) {
+    const ensembleMessage =
+      mode === "ensemble" && state.votingEnsemblePaperInventoryStatus === "loading"
+        ? "Loading backend paper inventory"
+        : mode === "ensemble" && state.votingEnsemblePaperInventoryStatus === "error"
+          ? state.votingEnsemblePaperInventoryWarning || "Backend paper inventory unavailable"
+          : "No trades today";
     tradeHistoryBody.innerHTML = `
       <tr class="trade-history-empty">
-        <td colspan="5">No trades today</td>
+        <td colspan="5">${escapeHtml(ensembleMessage)}</td>
       </tr>
     `;
     return;
@@ -15227,11 +15325,12 @@ function votingEnsembleEvaluatePayload() {
 }
 
 function votingEnsemblePermissionContext(dataTimestamp: string) {
-  const automaticPaperEnabled = canSubmitVotingEnsembleAutomaticPaperTrades();
-  const marketOpen = isMarketOpenForOrders();
+  const requestedPaperEnabled = votingEnsemblePaperRequested();
+  const effectivePaperEnabled = votingEnsemblePaperEffective();
+  const marketOpen = Boolean(state.votingEnsembleRuntimeStatus?.marketOpen ?? isMarketOpenForOrders());
   const latest = latestRegularSessionCandles().at(-1) ?? currentCandle();
   const sessionPhase = latest && isRegularSession(latest.timestamp) ? "regular" : marketOpen ? "regular" : "closed";
-  const globalGateDecision = votingEnsembleGlobalGateDecision(dataTimestamp, automaticPaperEnabled, marketOpen);
+  const globalGateDecision = votingEnsembleGlobalGateDecision(dataTimestamp, effectivePaperEnabled, marketOpen);
   return {
     sessionState: {
       phase: sessionPhase,
@@ -15240,8 +15339,10 @@ function votingEnsemblePermissionContext(dataTimestamp: string) {
     },
     operationalHealthSnapshot: {
       status: "ready",
-      tradingEnabled: automaticPaperEnabled,
-      automaticPaperTradingEnabled: globalPaperTradingEnabled(),
+      tradingEnabled: effectivePaperEnabled,
+      automaticPaperTradingEnabled: effectivePaperEnabled,
+      requestedPaperTradingEnabled: requestedPaperEnabled,
+      effectivePaperTradingEnabled: effectivePaperEnabled,
       paperTradingMode: true,
       liveTradingEnabled: false,
       marketOpen,
@@ -15252,30 +15353,36 @@ function votingEnsemblePermissionContext(dataTimestamp: string) {
       executionFailureCooldownActive: false,
       globalGateDecision,
       upstreamGlobalGateDecision: globalGateDecision,
-      permissionContractVersion: "voting_ensemble_dashboard_permission_contract_v1",
+      backendRuntimeControl: state.votingEnsembleRuntimeControl,
+      backendRuntimeStatus: state.votingEnsembleRuntimeStatus,
+      authority: "dashboard_display_only_backend_runtime_control_is_authoritative",
+      permissionContractVersion: "voting_ensemble_dashboard_display_permission_contract_v2",
     },
   };
 }
 
 function votingEnsembleGlobalGateDecision(dataTimestamp: string, automaticPaperEnabled: boolean, marketOpen: boolean) {
   const eligible = automaticPaperEnabled && marketOpen;
+  const backendReasonCodes = state.votingEnsembleRuntimeControl?.reasonCodes ?? [];
   return {
     status: eligible ? "PASS" : "FAIL",
     eligible,
     dataReady: true,
     gateResults: [],
     reasonCodes: eligible
-      ? ["dashboard.global_gate.automatic_paper_trading_allowed"]
+      ? ["dashboard.display_gate.backend_effective_paper_trading_allowed"]
       : [
-          !globalPaperTradingEnabled() ? "dashboard.global_gate.automatic_paper_trading_disabled" : "",
-          !marketOpen ? "dashboard.global_gate.market_closed" : "",
+          ...backendReasonCodes,
+          !automaticPaperEnabled ? "dashboard.display_gate.backend_effective_paper_trading_disabled" : "",
+          !marketOpen ? "dashboard.display_gate.market_closed" : "",
         ].filter(Boolean),
     explanation: eligible
-      ? "Dashboard upstream global gate allows automatic paper evaluation for Voting Ensemble."
-      : "Dashboard upstream global gate blocks automatic paper entries.",
+      ? "Backend-confirmed Voting Ensemble effective paper state is displayed as enabled."
+      : "Backend-confirmed Voting Ensemble effective paper state is displayed as blocked.",
     checkedAt: dataTimestamp,
     sessionDate: easternDateString(dataTimestamp),
-    configurationHash: `dashboard-global-gate:${eligible ? "pass" : "fail"}:${state.marketStatus}:${globalPaperTradingEnabled() ? "paper-on" : "paper-off"}`,
+    authority: "display_only",
+    configurationHash: `dashboard-display-gate:${eligible ? "pass" : "fail"}:${state.marketStatus}:${automaticPaperEnabled ? "backend-effective-on" : "backend-effective-off"}`,
   };
 }
 
@@ -15507,6 +15614,344 @@ async function fetchWeightedVotingJson(path: string, init: RequestInit = {}) {
     }
   }
   throw new Error(lastMessage);
+}
+
+function latestWeightedCalculationCandles() {
+  const weightedOneMinute = state.weightedMarketData.timeframeCandles["1Min"] ?? [];
+  const weightedSessionCandles = weightedOneMinute.length ? latestRegularSessionCandlesFrom(weightedOneMinute) : [];
+  const chartSessionCandles = latestRegularSessionCandles();
+  const base = weightedSessionCandles.length ? weightedSessionCandles : chartSessionCandles;
+  const chartLatest = chartSessionCandles.at(-1);
+  const baseLatest = base.at(-1);
+  if (
+    chartLatest &&
+    (!baseLatest || (
+      easternDateString(chartLatest.timestamp) === easternDateString(baseLatest.timestamp) &&
+      new Date(chartLatest.timestamp).getTime() > new Date(baseLatest.timestamp).getTime()
+    ))
+  ) {
+    return [...base.filter((candle) => candle.timestamp !== chartLatest.timestamp), chartLatest]
+      .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
+  }
+  return base;
+}
+
+async function fetchVotingEnsembleRuntimeJson(path: string, init: RequestInit = {}) {
+  let lastMessage = "Voting Ensemble runtime route unavailable";
+  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+    try {
+      const response = await fetchWithTimeout(`${baseUrl}/api/voting-ensemble${path}`, 15000, {
+        ...init,
+        headers: {
+          "Content-Type": "application/json",
+          ...(init.headers ?? {}),
+        },
+      });
+      if (response.ok) {
+        return (await response.json()) as Record<string, unknown>;
+      }
+      lastMessage =
+        response.status === 404
+          ? `Voting Ensemble runtime route not loaded on ${baseUrl}; restart the FastAPI backend.`
+          : await readableResponseError(response);
+      if (response.status !== 404) {
+        throw new Error(lastMessage);
+      }
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : lastMessage;
+    }
+  }
+  throw new Error(lastMessage);
+}
+
+async function handlePaperToggleClick() {
+  if (state.votingEnsembleRuntimeControlStatus === "loading") {
+    return;
+  }
+  const requested = !votingEnsemblePaperRequested();
+  state.votingEnsembleRuntimeControlStatus = "loading";
+  state.votingEnsembleRuntimeControlWarning = "";
+  updateTradeToggleButton();
+  try {
+    const control = await syncVotingEnsembleAutomaticPaperControl(requested);
+    setGlobalPaperTradingEnabled(Boolean(control.requestedPaperTradingEnabled));
+    saveUiState();
+    updateTradeToggleButton();
+    updateQuoteCard(currentCandle());
+    await Promise.allSettled([
+      syncWeightedVotingAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
+      syncRegimeAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
+    ]);
+    await Promise.allSettled([loadVotingEnsembleRuntimeStatus(), refreshVotingEnsemblePaperInventory()]);
+  } catch (error) {
+    setGlobalPaperTradingEnabled(false);
+    state.votingEnsembleRuntimeControlStatus = "error";
+    state.votingEnsembleRuntimeControlWarning = error instanceof Error ? error.message : "Voting Ensemble paper control sync failed";
+    saveUiState();
+    updateTradeToggleButton();
+    updateQuoteCard(currentCandle());
+  }
+}
+
+async function loadVotingEnsembleRuntimeControl() {
+  state.votingEnsembleRuntimeControlStatus = "loading";
+  updateTradeToggleButton();
+  try {
+    const control = normalizeVotingEnsembleRuntimeControl(await fetchVotingEnsembleRuntimeJson("/runtime/control"));
+    state.votingEnsembleRuntimeControl = control;
+    state.votingEnsembleRuntimeControlStatus = control.requestedPaperTradingEnabled && !control.effectivePaperTradingEnabled ? "blocked" : "ready";
+    state.votingEnsembleRuntimeControlWarning = "";
+    setGlobalPaperTradingEnabled(control.requestedPaperTradingEnabled);
+    await loadVotingEnsembleRuntimeStatus();
+  } catch (error) {
+    setGlobalPaperTradingEnabled(false);
+    state.votingEnsembleRuntimeControl = null;
+    state.votingEnsembleRuntimeStatus = null;
+    state.votingEnsembleRuntimeControlStatus = "error";
+    state.votingEnsembleRuntimeControlWarning = error instanceof Error ? error.message : "Voting Ensemble paper control unavailable";
+  }
+  updateTradeToggleButton();
+}
+
+async function syncVotingEnsembleAutomaticPaperControl(enabled: boolean) {
+  const control = normalizeVotingEnsembleRuntimeControl(
+    await fetchVotingEnsembleRuntimeJson("/runtime/control", {
+      method: "PUT",
+      body: JSON.stringify({ requestedPaperTradingEnabled: enabled }),
+    }),
+  );
+  state.votingEnsembleRuntimeControl = control;
+  state.votingEnsembleRuntimeControlStatus = control.requestedPaperTradingEnabled && !control.effectivePaperTradingEnabled ? "blocked" : "ready";
+  state.votingEnsembleRuntimeControlWarning = "";
+  await loadVotingEnsembleRuntimeStatus();
+  return control;
+}
+
+async function loadVotingEnsembleRuntimeStatus() {
+  const status = normalizeVotingEnsembleRuntimeStatus(await fetchVotingEnsembleRuntimeJson("/runtime/status"));
+  state.votingEnsembleRuntimeStatus = status;
+  state.votingEnsembleRuntimeControl = votingEnsembleRuntimeControlFromStatus(status);
+  state.votingEnsembleRuntimeControlStatus = status.requestedPaperTradingEnabled && !status.effectivePaperTradingEnabled ? "blocked" : "ready";
+  state.votingEnsembleRuntimeControlWarning = status.lastError ?? "";
+  updateTradeToggleButton();
+  return status;
+}
+
+function normalizeVotingEnsembleRuntimeControl(raw: unknown): VotingEnsembleRuntimeControl {
+  const record = isRecord(raw) ? raw : {};
+  if (record.algorithmId && record.algorithmId !== "voting_ensemble") {
+    throw new Error("Voting Ensemble control response used the wrong algorithm id.");
+  }
+  return {
+    algorithmId: "voting_ensemble",
+    algorithm_id: "voting_ensemble",
+    requestedPaperTradingEnabled: weightedTruthFromUnknown(record.requestedPaperTradingEnabled, false),
+    effectivePaperTradingEnabled: weightedTruthFromUnknown(record.effectivePaperTradingEnabled, false),
+    liveTradingEnabled: false,
+    newEntriesEnabled: weightedTruthFromUnknown(record.newEntriesEnabled, false),
+    killSwitchActive: weightedTruthFromUnknown(record.killSwitchActive, false),
+    updatedAt: stringFromUnknown(record.updatedAt, ""),
+    updatedBy: stringFromUnknown(record.updatedBy, ""),
+    reasonCodes: arrayFromUnknown(record.reasonCodes).map((value) => String(value)),
+  };
+}
+
+function normalizeVotingEnsembleRuntimeStatus(raw: unknown): VotingEnsembleRuntimeStatus {
+  const record = isRecord(raw) ? raw : {};
+  if (record.algorithmId && record.algorithmId !== "voting_ensemble") {
+    throw new Error("Voting Ensemble runtime status response used the wrong algorithm id.");
+  }
+  const reasonCodes = arrayFromUnknown(record.reasonCodes).map((value) => String(value));
+  return {
+    algorithmId: "voting_ensemble",
+    algorithm_id: "voting_ensemble",
+    requestedPaperTradingEnabled: weightedTruthFromUnknown(record.requestedPaperTradingEnabled, false),
+    effectivePaperTradingEnabled: weightedTruthFromUnknown(record.effectivePaperTradingEnabled, false),
+    liveTradingEnabled: false,
+    newEntriesEnabled: weightedTruthFromUnknown(record.newEntriesEnabled, false),
+    killSwitchActive: weightedTruthFromUnknown(record.killSwitchActive, false),
+    updatedAt: stringFromUnknown(record.updatedAt, ""),
+    updatedBy: stringFromUnknown(record.updatedBy, ""),
+    reasonCodes,
+    paperReady: weightedTruthFromUnknown(record.paperReady, false),
+    paperReadyBlockingReasonCodes: arrayFromUnknown(record.paperReadyBlockingReasonCodes).map((value) => String(value)),
+    supervisorRunning: weightedTruthFromUnknown(record.supervisorRunning, false),
+    evaluationWorkerHealthy: weightedTruthFromUnknown(record.evaluationWorkerHealthy, false),
+    executionWorkerHealthy: weightedTruthFromUnknown(record.executionWorkerHealthy, false),
+    reconciliationHealthy: weightedTruthFromUnknown(record.reconciliationHealthy, false),
+    paperBrokerVerified: weightedTruthFromUnknown(record.paperBrokerVerified, false),
+    marketOpen: weightedTruthFromUnknown(record.marketOpen, false),
+    marketDataReady: weightedTruthFromUnknown(record.marketDataReady, false),
+    inventoryReconciled: weightedTruthFromUnknown(record.inventoryReconciled, false),
+    newEntriesAllowed: weightedTruthFromUnknown(record.newEntriesAllowed, false),
+    activeEntryBlocks: arrayFromUnknown(record.activeEntryBlocks).map((value) => String(value)),
+    lastFinalizedBar: isRecord(record.lastFinalizedBar) ? record.lastFinalizedBar : null,
+    lastEvaluation: isRecord(record.lastEvaluation) ? record.lastEvaluation : null,
+    lastDecision: isRecord(record.lastDecision) ? record.lastDecision : null,
+    lastExecutionIntent: isRecord(record.lastExecutionIntent) ? record.lastExecutionIntent : null,
+    lastBrokerOrder: isRecord(record.lastBrokerOrder) ? record.lastBrokerOrder : null,
+    openVotingEnsembleOrders: arrayFromUnknown(record.openVotingEnsembleOrders).filter(isRecord),
+    openVotingEnsemblePositions: arrayFromUnknown(record.openVotingEnsemblePositions).filter(isRecord),
+    lastReconciliation: isRecord(record.lastReconciliation) ? record.lastReconciliation : null,
+    lastError: stringFromUnknown(record.lastError, "") || null,
+    settingsHash: stringFromUnknown(record.settingsHash, "") || null,
+  };
+}
+
+function votingEnsembleRuntimeControlFromStatus(status: VotingEnsembleRuntimeStatus): VotingEnsembleRuntimeControl {
+  return {
+    algorithmId: "voting_ensemble",
+    algorithm_id: "voting_ensemble",
+    requestedPaperTradingEnabled: status.requestedPaperTradingEnabled,
+    effectivePaperTradingEnabled: status.effectivePaperTradingEnabled,
+    liveTradingEnabled: false,
+    newEntriesEnabled: status.newEntriesAllowed,
+    killSwitchActive: status.killSwitchActive,
+    updatedAt: status.updatedAt,
+    updatedBy: status.updatedBy,
+    reasonCodes: status.activeEntryBlocks.length ? status.activeEntryBlocks : status.reasonCodes,
+  };
+}
+
+async function refreshVotingEnsemblePaperInventory() {
+  if (state.votingEnsemblePaperInventoryStatus === "loading") {
+    return;
+  }
+  state.votingEnsemblePaperInventoryStatus = "loading";
+  try {
+    const inventory = normalizeVotingEnsemblePaperInventory(await fetchVotingEnsembleRuntimeJson("/runtime/paper-inventory"));
+    state.votingEnsemblePaperInventory = inventory;
+    state.votingEnsemblePaperInventoryStatus = "ready";
+    state.votingEnsemblePaperInventoryWarning = "";
+    state.tradeHistory = votingEnsembleTradeHistoryFromBackendInventory(inventory);
+    renderTradeHistory("ensemble");
+    updateQuoteCard(currentCandle());
+  } catch (error) {
+    state.votingEnsemblePaperInventoryStatus = "error";
+    state.votingEnsemblePaperInventoryWarning = error instanceof Error ? error.message : "Voting Ensemble paper inventory unavailable";
+    state.tradeHistory = [];
+    renderTradeHistory("ensemble");
+  }
+}
+
+function normalizeVotingEnsemblePaperInventory(raw: unknown): VotingEnsemblePaperInventory {
+  const record = isRecord(raw) ? raw : {};
+  if (record.algorithmId && record.algorithmId !== "voting_ensemble") {
+    throw new Error("Voting Ensemble paper inventory response used the wrong algorithm id.");
+  }
+  return {
+    algorithmId: "voting_ensemble",
+    algorithm_id: "voting_ensemble",
+    orders: arrayFromUnknown(record.orders).filter(isRecord),
+    fills: arrayFromUnknown(record.fills).filter(isRecord),
+    positions: arrayFromUnknown(record.positions).filter(isRecord),
+    protectiveOrders: arrayFromUnknown(record.protectiveOrders).filter(isRecord),
+    outbox: arrayFromUnknown(record.outbox).filter(isRecord),
+    results: arrayFromUnknown(record.results).filter(isRecord),
+    reconciliations: arrayFromUnknown(record.reconciliations).filter(isRecord),
+    generatedAt: stringFromUnknown(record.generatedAt, ""),
+    reasonCodes: arrayFromUnknown(record.reasonCodes).map((value) => String(value)),
+  };
+}
+
+function votingEnsembleTradeHistoryFromBackendInventory(inventory: VotingEnsemblePaperInventory): TradeHistoryRow[] {
+  const fillRows = inventory.fills.map(votingEnsembleTradeHistoryRowFromFill).filter((row): row is TradeHistoryRow => row !== null);
+  if (fillRows.length) {
+    return fillRows.sort((a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime()).slice(0, 50);
+  }
+  return inventory.orders
+    .map(votingEnsembleTradeHistoryRowFromOrder)
+    .filter((row): row is TradeHistoryRow => row !== null)
+    .sort((a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime())
+    .slice(0, 50);
+}
+
+function votingEnsembleTradeHistoryRowFromFill(fill: Record<string, unknown>): TradeHistoryRow | null {
+  const quantity = Math.max(0, Math.floor(numberFromUnknown(fill.filledQuantity, 0)));
+  const price = numberFromUnknown(fill.averageFillPrice, 0);
+  const side = normalizeTradeHistorySide(fill.side);
+  if (!side || quantity <= 0 || price <= 0) {
+    return null;
+  }
+  const id = stringFromUnknown(fill.clientOrderId, "") || stringFromUnknown(fill.orderIntentId, "") || `${stringFromUnknown(fill.filledAt, "")}-${side}`;
+  return {
+    id,
+    side,
+    symbol: stringFromUnknown(fill.symbol, state.symbol),
+    quantity,
+    price,
+    notional: quantity * price,
+    recordedAt: stringFromUnknown(fill.filledAt, new Date().toISOString()),
+    evidence: backendTradeEvidence("fill", fill),
+  };
+}
+
+function votingEnsembleTradeHistoryRowFromOrder(order: Record<string, unknown>): TradeHistoryRow | null {
+  const status = stringFromUnknown(order.status, "").toUpperCase();
+  if (!["ACCEPTED", "PARTIALLY_FILLED", "FILLED"].includes(status)) {
+    return null;
+  }
+  const quantity = Math.max(0, Math.floor(numberFromUnknown(order.submittedQuantity ?? order.globallyAllowedQuantity ?? order.proposedQuantity, 0)));
+  const price = numberFromUnknown(order.limitPrice ?? order.triggerPrice, 0);
+  const side = normalizeTradeHistorySide(order.side);
+  if (!side || quantity <= 0 || price <= 0) {
+    return null;
+  }
+  const id = stringFromUnknown(order.clientOrderId, "") || stringFromUnknown(order.orderIntentId, "") || `${stringFromUnknown(order.createdAt, "")}-${side}`;
+  return {
+    id,
+    side,
+    symbol: stringFromUnknown(order.symbol, state.symbol),
+    quantity,
+    price,
+    notional: quantity * price,
+    recordedAt: stringFromUnknown(order.createdAt ?? order.decisionTimestamp, new Date().toISOString()),
+    evidence: backendTradeEvidence("order", order),
+  };
+}
+
+function normalizeTradeHistorySide(value: unknown): TradeHistoryRow["side"] | null {
+  const side = stringFromUnknown(value, "").toLowerCase();
+  if (side === "buy") {
+    return "Buy";
+  }
+  if (side === "sell") {
+    return "Sell";
+  }
+  return null;
+}
+
+function backendTradeEvidence(source: "fill" | "order", payload: Record<string, unknown>): OrderEvidenceSnapshot {
+  return {
+    algorithm: "ensemble",
+    algorithmLabel: algorithmDisplayName("ensemble"),
+    submitMode: "Automatic",
+    trigger: `Backend Voting Ensemble ${source}`,
+    capturedAt: stringFromUnknown(payload.filledAt ?? payload.createdAt, new Date().toISOString()),
+    market: {
+      status: state.marketStatus,
+      symbol: stringFromUnknown(payload.symbol, state.symbol),
+      timeframe: state.timeframe,
+      feed: state.feed,
+      source: "backend_voting_ensemble_paper_inventory",
+    },
+    execution: {
+      side: normalizeTradeHistorySide(payload.side) ?? "Buy",
+      quantity: Math.max(0, Math.floor(numberFromUnknown(payload.filledQuantity ?? payload.submittedQuantity, 0))),
+      price: numberFromUnknown(payload.averageFillPrice ?? payload.limitPrice ?? payload.triggerPrice, 0),
+      notional: numberFromUnknown(payload.averageFillPrice ?? payload.limitPrice ?? payload.triggerPrice, 0) * Math.max(0, Math.floor(numberFromUnknown(payload.filledQuantity ?? payload.submittedQuantity, 0))),
+    },
+    positionBefore: null,
+    settings: {},
+    targetOrder: null,
+    sellSetup: null,
+    backtest: { label: "Backend inventory" },
+    mlArtifact: mlArtifactEvidence(),
+    decision: {
+      winner: normalizeTradeHistorySide(payload.side) ?? "Hold",
+      summary: arrayFromUnknown(payload.reasonCodes).map((value) => String(value)).join(", ") || "Loaded from backend paper inventory",
+    },
+  };
 }
 
 async function syncWeightedVotingAutomaticPaperControl(enabled: boolean) {
@@ -15936,26 +16381,6 @@ function updateWeightedVotingPanel(options: { refresh?: boolean } = {}) {
   if (options.refresh ?? true) {
     void refreshWeightedVotingBackendClient();
   }
-}
-
-function latestWeightedCalculationCandles() {
-  const weightedOneMinute = state.weightedMarketData.timeframeCandles["1Min"] ?? [];
-  const weightedSessionCandles = weightedOneMinute.length ? latestRegularSessionCandlesFrom(weightedOneMinute) : [];
-  const chartSessionCandles = latestRegularSessionCandles();
-  const base = weightedSessionCandles.length ? weightedSessionCandles : chartSessionCandles;
-  const chartLatest = chartSessionCandles.at(-1);
-  const baseLatest = base.at(-1);
-  if (
-    chartLatest &&
-    (!baseLatest || (
-      easternDateString(chartLatest.timestamp) === easternDateString(baseLatest.timestamp) &&
-      new Date(chartLatest.timestamp).getTime() > new Date(baseLatest.timestamp).getTime()
-    ))
-  ) {
-    return [...base.filter((candle) => candle.timestamp !== chartLatest.timestamp), chartLatest]
-      .sort((left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime());
-  }
-  return base;
 }
 
 function candleReturnOverLookback(candles: Candle[], lookback: number) {
@@ -21014,7 +21439,7 @@ function loadTradeHistoryRows(storageKey: string): TradeHistoryRow[] {
 }
 
 function loadTradeHistory(): TradeHistoryRow[] {
-  return loadTradeHistoryRows(TRADE_HISTORY_STORAGE_KEY);
+  return [];
 }
 
 function loadWeightedTradeHistory(): TradeHistoryRow[] {
@@ -21034,7 +21459,7 @@ function loadMetaTradeHistory(): TradeHistoryRow[] {
 }
 
 function saveTradeHistory() {
-  window.localStorage.setItem(TRADE_HISTORY_STORAGE_KEY, JSON.stringify(state.tradeHistory.slice(0, 50)));
+  return;
 }
 
 function saveWeightedTradeHistory() {
@@ -22501,6 +22926,8 @@ void loadVixRisk();
 void loadSpyNews();
 void loadEsSnapshot();
 void loadVotingEnsembleInventory();
+void loadVotingEnsembleRuntimeControl();
+void refreshVotingEnsemblePaperInventory();
 void fetchSessionCurrent();
 void loadMarketContext();
 void loadCandles();

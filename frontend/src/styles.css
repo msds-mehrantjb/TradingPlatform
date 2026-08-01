@@ -3504,6 +3504,19 @@ select {
   color: #047857;
 }
 
+.trade-toggle-button[data-status="blocked"],
+.trade-toggle-button[data-status="loading"] {
+  border-color: #fde68a;
+  background: #fffbeb;
+  color: #92400e;
+}
+
+.trade-toggle-button[data-status="error"] {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
+}
+
 .quote-price-row {
   display: flex;
   justify-content: space-between;

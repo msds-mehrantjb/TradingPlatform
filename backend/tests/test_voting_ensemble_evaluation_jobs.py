@@ -81,7 +81,7 @@ class VotingEnsembleEvaluationJobsTest(unittest.TestCase):
 
     def test_duplicate_finalized_bar_events_use_one_decision(self) -> None:
         service = CountingService()
-        runtime = VotingEnsembleRuntimeOrchestrator(service=service, auto_start=False)
+        runtime = VotingEnsembleRuntimeOrchestrator(service=service, automatic_payload_builder=PassthroughAutomaticPayloadBuilder(), auto_start=False)
         event = FinalizedOneMinuteBarEvent(
             symbol="SPY",
             barEndTimestamp=START + timedelta(minutes=44),
@@ -301,6 +301,11 @@ class BlockingService:
     def evaluate(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.release.wait(timeout=5)
         return decision(payload, service_version="blocking-test")
+
+
+class PassthroughAutomaticPayloadBuilder:
+    def build(self, command: Any) -> dict[str, Any]:
+        return dict(command.payload)
 
 
 class CountingService:

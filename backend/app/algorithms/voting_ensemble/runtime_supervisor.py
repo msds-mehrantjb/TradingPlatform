@@ -1,0 +1,1084 @@
+"""Voting Ensemble-owned backend runtime supervisor."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from threading import Lock
+from typing import Any
+
+from backend.app.config import Settings, get_settings
+from backend.app.algorithms.voting_ensemble.finalized_bar_producer import (
+    VotingEnsembleAutomaticEvaluationPayloadBuilder,
+    VotingEnsembleCandleStore,
+    VotingEnsembleFinalizedBarEventStore,
+    VotingEnsembleFinalizedBarMarketEvent,
+    VotingEnsembleFinalizedBarProducer,
+    VotingEnsembleFinalizedBarProducerConfig,
+    VotingEnsembleMarketDataClient,
+)
+from backend.app.algorithms.voting_ensemble.paper_execution import (
+    VOTING_ENSEMBLE_ALGORITHM_ID,
+    VOTING_ENSEMBLE_PAPER_EXECUTION_RUNTIME,
+    VotingEnsemblePaperExecutionRuntime,
+    is_approved_alpaca_paper_endpoint,
+)
+from backend.app.algorithms.voting_ensemble.runtime.events import FinalizedOneMinuteBarEvent
+from backend.app.algorithms.voting_ensemble.runtime.orchestrator import VOTING_ENSEMBLE_RUNTIME, VotingEnsembleRuntimeOrchestrator
+
+
+VOTING_ENSEMBLE_RUNTIME_SUPERVISOR_VERSION = "voting_ensemble_runtime_supervisor_v1"
+VOTING_ENSEMBLE_CONTROL_NAMESPACE = "voting_ensemble.runtime.controls"
+VOTING_ENSEMBLE_CONTROL_VERSION = "voting_ensemble_runtime_control_v1"
+VOTING_ENSEMBLE_SUPERVISOR_WORKERS = (
+    "finalized_bar_producer",
+    "finalized_bar_event_consumer",
+    "evaluation_worker",
+    "execution_worker",
+    "position_order_manager",
+    "reconciliation_loop",
+    "health_monitor",
+)
+
+
+@dataclass
+class VotingEnsembleRuntimeControl:
+    algorithmId: str = VOTING_ENSEMBLE_ALGORITHM_ID
+    requestedPaperTradingEnabled: bool = False
+    effectivePaperTradingEnabled: bool = False
+    liveTradingEnabled: bool = False
+    newEntriesEnabled: bool = False
+    killSwitchActive: bool = False
+    controlVersion: str = VOTING_ENSEMBLE_CONTROL_VERSION
+    updatedAt: str | None = None
+    updatedBy: str = "system"
+    reasonCodes: list[str] = field(default_factory=lambda: ["voting_ensemble.control.default_paper_off"])
+    localEntryBlockActive: bool = False
+    localEntryBlockReasonCodes: list[str] = field(default_factory=list)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "requestedPaperTradingEnabled": self.requestedPaperTradingEnabled,
+            "effectivePaperTradingEnabled": self.effectivePaperTradingEnabled,
+            "liveTradingEnabled": False,
+            "newEntriesEnabled": self.newEntriesEnabled,
+            "killSwitchActive": self.killSwitchActive,
+            "controlVersion": self.controlVersion,
+            "updatedAt": self.updatedAt,
+            "updatedBy": self.updatedBy,
+            "reasonCodes": list(self.reasonCodes),
+            "localEntryBlockActive": self.localEntryBlockActive,
+            "localEntryBlockReasonCodes": list(self.localEntryBlockReasonCodes),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "VotingEnsembleRuntimeControl":
+        if payload.get("algorithmId", payload.get("algorithm_id", VOTING_ENSEMBLE_ALGORITHM_ID)) != VOTING_ENSEMBLE_ALGORITHM_ID:
+            raise ValueError("Voting Ensemble control payload must use algorithmId=voting_ensemble")
+        return cls(
+            requestedPaperTradingEnabled=bool(payload.get("requestedPaperTradingEnabled", False)),
+            effectivePaperTradingEnabled=bool(payload.get("effectivePaperTradingEnabled", False)),
+            liveTradingEnabled=False,
+            newEntriesEnabled=bool(payload.get("newEntriesEnabled", False)),
+            killSwitchActive=bool(payload.get("killSwitchActive", False)),
+            controlVersion=str(payload.get("controlVersion") or VOTING_ENSEMBLE_CONTROL_VERSION),
+            updatedAt=str(payload["updatedAt"]) if payload.get("updatedAt") else None,
+            updatedBy=str(payload.get("updatedBy") or "system"),
+            reasonCodes=list(payload.get("reasonCodes") or ["voting_ensemble.control.loaded"]),
+            localEntryBlockActive=bool(payload.get("localEntryBlockActive", False)),
+            localEntryBlockReasonCodes=list(payload.get("localEntryBlockReasonCodes") or []),
+        )
+
+
+class VotingEnsembleRuntimeControlRepository:
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path).resolve() if path is not None else default_control_store_path()
+        self._lock = Lock()
+
+    def load(self) -> VotingEnsembleRuntimeControl:
+        with self._lock:
+            if not self.path.exists():
+                control = VotingEnsembleRuntimeControl(updatedAt=_now())
+                self._save_unlocked(control)
+                return control
+            try:
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+                control = VotingEnsembleRuntimeControl.from_payload(payload if isinstance(payload, dict) else {})
+            except Exception:
+                control = VotingEnsembleRuntimeControl(
+                    updatedAt=_now(),
+                    reasonCodes=["voting_ensemble.control.unrecoverable_startup_state_fail_closed"],
+                    localEntryBlockActive=True,
+                    localEntryBlockReasonCodes=["voting_ensemble.control.unrecoverable_startup_state_fail_closed"],
+                )
+                self._save_unlocked(control)
+            return control
+
+    def save(self, control: VotingEnsembleRuntimeControl) -> VotingEnsembleRuntimeControl:
+        with self._lock:
+            return self._save_unlocked(control)
+
+    def _save_unlocked(self, control: VotingEnsembleRuntimeControl) -> VotingEnsembleRuntimeControl:
+        control.liveTradingEnabled = False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        encoded = json.dumps(control.snapshot(), sort_keys=True, indent=2)
+        try:
+            temporary.write_text(encoded, encoding="utf-8")
+            temporary.replace(self.path)
+        except PermissionError:
+            self.path.write_text(encoded, encoding="utf-8")
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return control
+
+
+class VotingEnsembleRuntimeControlStore:
+    namespace: str = VOTING_ENSEMBLE_CONTROL_NAMESPACE
+
+    def __init__(self, repository: VotingEnsembleRuntimeControlRepository | None = None) -> None:
+        self.repository = repository or VotingEnsembleRuntimeControlRepository()
+        self.control = self.repository.load()
+
+    @property
+    def automaticPaperTradingEnabled(self) -> bool:
+        return self.control.effectivePaperTradingEnabled
+
+    @property
+    def entryCreationBlocked(self) -> bool:
+        return self.control.localEntryBlockActive
+
+    @property
+    def blockReasonCodes(self) -> list[str]:
+        return self.control.localEntryBlockReasonCodes
+
+    def update_requested_paper(self, requested: bool, *, updated_by: str, reason_codes: list[str]) -> VotingEnsembleRuntimeControl:
+        self.control.requestedPaperTradingEnabled = bool(requested)
+        if not requested:
+            self.control.effectivePaperTradingEnabled = False
+            self.control.newEntriesEnabled = False
+        self.control.liveTradingEnabled = False
+        self.control.updatedAt = _now()
+        self.control.updatedBy = updated_by
+        self.control.reasonCodes = reason_codes
+        return self.repository.save(self.control)
+
+    def save_effective(self, *, effective: bool, new_entries: bool, reason_codes: list[str]) -> VotingEnsembleRuntimeControl:
+        self.control.effectivePaperTradingEnabled = bool(effective)
+        self.control.newEntriesEnabled = bool(new_entries)
+        self.control.liveTradingEnabled = False
+        self.control.updatedAt = _now()
+        self.control.reasonCodes = reason_codes
+        return self.repository.save(self.control)
+
+    def block_new_entries(self, reason_code: str) -> None:
+        self.control.localEntryBlockActive = True
+        if reason_code not in self.control.localEntryBlockReasonCodes:
+            self.control.localEntryBlockReasonCodes.append(reason_code)
+        self.control.newEntriesEnabled = False
+        self.control.effectivePaperTradingEnabled = False
+        self.control.updatedAt = _now()
+        self.repository.save(self.control)
+
+    def clear_entry_block(self, reason_code: str) -> None:
+        self.control.localEntryBlockActive = False
+        self.control.localEntryBlockReasonCodes = []
+        self.control.reasonCodes = [reason_code]
+        self.control.updatedAt = _now()
+        self.repository.save(self.control)
+
+    def snapshot(self, *, reason_codes: list[str] | None = None) -> dict[str, Any]:
+        payload = self.control.snapshot()
+        payload["namespace"] = self.namespace
+        if reason_codes is not None:
+            payload["reasonCodes"] = reason_codes
+        return payload
+
+
+@dataclass
+class VotingEnsembleRuntimeSupervisorMetrics:
+    supervisorStarted: bool = False
+    readiness: str = "blocked"
+    finalizedBarsReceived: int = 0
+    finalizedBarsQueued: int = 0
+    finalizedBarsProduced: int = 0
+    duplicateFinalizedBarEvents: int = 0
+    staleFinalizedBarEvents: int = 0
+    rejectedEvents: int = 0
+    evaluationWorkerFailures: int = 0
+    executionWorkerFailures: int = 0
+    reconciliationFailures: int = 0
+    workerStatus: dict[str, str] = field(default_factory=lambda: {worker: "stopped" for worker in VOTING_ENSEMBLE_SUPERVISOR_WORKERS})
+    lastFinalizedBarEvent: dict[str, Any] | None = None
+    lastFinalizedBarProducerResult: dict[str, Any] | None = None
+    lastEvaluationJob: dict[str, Any] | None = None
+    lastExecutionResult: dict[str, Any] | None = None
+    lastReconciliation: dict[str, Any] | None = None
+    lastError: str | None = None
+    lastErrorAt: str | None = None
+
+
+@dataclass(frozen=True)
+class VotingEnsembleRuntimeSupervisorConfig:
+    event_queue_maxsize: int = 256
+    event_consumer_poll_seconds: float = 0.25
+    execution_worker_poll_seconds: float = 0.25
+    reconciliation_poll_seconds: float = 15.0
+    health_poll_seconds: float = 5.0
+    global_master_paper_enabled: bool = True
+    market_data_healthy_default: bool = True
+    finalized_bar_producer_enabled: bool = True
+
+
+class VotingEnsembleRuntimeSupervisor:
+    def __init__(
+        self,
+        *,
+        runtime: VotingEnsembleRuntimeOrchestrator | None = None,
+        paper_execution_runtime: VotingEnsemblePaperExecutionRuntime | None = None,
+        control_store: VotingEnsembleRuntimeControlStore | None = None,
+        config: VotingEnsembleRuntimeSupervisorConfig | None = None,
+        settings: Settings | None = None,
+        market_clock_provider: Callable[[], dict[str, Any]] | None = None,
+        market_data_client: VotingEnsembleMarketDataClient | None = None,
+        candle_store: VotingEnsembleCandleStore | None = None,
+        finalized_bar_event_store: VotingEnsembleFinalizedBarEventStore | None = None,
+        finalized_bar_producer_config: VotingEnsembleFinalizedBarProducerConfig | None = None,
+    ) -> None:
+        self.settings = settings or get_settings()
+        self.market_clock_provider = market_clock_provider or self._default_market_clock
+        self.runtime = runtime or VOTING_ENSEMBLE_RUNTIME
+        self.paper_execution_runtime = paper_execution_runtime or self.runtime.paper_execution_runtime or VOTING_ENSEMBLE_PAPER_EXECUTION_RUNTIME
+        self.runtime.autoManageWorker = True
+        self.control_store = control_store or VotingEnsembleRuntimeControlStore()
+        self.config = config or VotingEnsembleRuntimeSupervisorConfig()
+        self.paper_execution_runtime.entry_permission_provider = self.entry_permission_snapshot
+        self.finalized_bar_event_store = finalized_bar_event_store or VotingEnsembleFinalizedBarEventStore()
+        self.automatic_payload_builder = (
+            VotingEnsembleAutomaticEvaluationPayloadBuilder(
+                candle_store=candle_store,
+                control_snapshot_provider=self.entry_permission_snapshot,
+                paper_inventory_provider=self.paper_inventory,
+                market_status_provider=self.market_clock_provider,
+                account_snapshot_provider=self._default_account_snapshot,
+                quote_provider=self._latest_quote,
+                last_trade_provider=self._latest_trade,
+                feed=(finalized_bar_producer_config.feed if finalized_bar_producer_config else "iex"),
+                history_limit=(finalized_bar_producer_config.history_limit if finalized_bar_producer_config else 390),
+            )
+            if candle_store is not None
+            else None
+        )
+        self.runtime.set_automatic_payload_builder(self.automatic_payload_builder)
+        self.finalized_bar_producer = (
+            VotingEnsembleFinalizedBarProducer(
+                market_data_client=market_data_client,
+                candle_store=candle_store,
+                publish_event=self.publish_finalized_market_event,
+                event_store=self.finalized_bar_event_store,
+                config=finalized_bar_producer_config,
+            )
+            if market_data_client is not None and candle_store is not None and self.config.finalized_bar_producer_enabled
+            else None
+        )
+        self.event_queue: asyncio.Queue[FinalizedOneMinuteBarEvent] = asyncio.Queue(maxsize=self.config.event_queue_maxsize)
+        self.stop_event = asyncio.Event()
+        self.metrics = VotingEnsembleRuntimeSupervisorMetrics()
+        self._tasks: list[asyncio.Task] = []
+        self._started = False
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self.stop_event.clear()
+        self.metrics.supervisorStarted = True
+        self.runtime.autoManageWorker = True
+        self.runtime.recover_incomplete_jobs()
+        self.runtime.start()
+        self.paper_execution_runtime.autoManageWorker = True
+        self.paper_execution_runtime.start()
+        if self.finalized_bar_producer is not None:
+            self._start_loop("finalized_bar_producer", self._finalized_bar_producer_loop)
+        else:
+            self.metrics.workerStatus["finalized_bar_producer"] = "not_configured"
+        self._start_loop("finalized_bar_event_consumer", self._finalized_bar_event_consumer_loop)
+        self._start_loop("execution_worker", self._execution_worker_loop)
+        self._start_loop("position_order_manager", self._position_order_manager_loop)
+        self._start_loop("reconciliation_loop", self._reconciliation_loop)
+        self._start_loop("health_monitor", self._health_monitor_loop)
+        self.metrics.workerStatus["evaluation_worker"] = "running" if self.runtime.summary().get("workerAlive") else "blocked"
+        self._run_reconciliation_once()
+        self._refresh_readiness()
+
+    async def shutdown(self) -> None:
+        if not self._started and not self._tasks:
+            return
+        self.stop_event.set()
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+        self.runtime.autoManageWorker = False
+        self.paper_execution_runtime.autoManageWorker = False
+        self.runtime.stop()
+        self.paper_execution_runtime.stop()
+        broker = getattr(getattr(self.paper_execution_runtime, "paper_gateway", None), "broker", None)
+        close = getattr(broker, "close", None)
+        if callable(close):
+            close()
+        for worker in VOTING_ENSEMBLE_SUPERVISOR_WORKERS:
+            self.metrics.workerStatus[worker] = "stopped"
+        self.metrics.supervisorStarted = False
+        self.metrics.readiness = "blocked"
+        self._started = False
+
+    def enqueue_manual_evaluation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.runtime.enqueue_manual_evaluation(payload)
+
+    def enqueue_finalized_bar_event(self, event: FinalizedOneMinuteBarEvent) -> dict[str, Any]:
+        command = event.to_command()
+        permission = self.entry_permission_snapshot()
+        if not permission["newEntriesAllowed"]:
+            return {
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "commandKind": "finalized_bar_evaluation",
+                "status": "blocked",
+                "accepted": False,
+                "deduplicated": False,
+                "jobId": f"ve-blocked-{command.commandId}",
+                "commandId": command.commandId,
+                "error": "Voting Ensemble runtime readiness is blocked; new entries are disabled.",
+                "reasonCodes": ["voting_ensemble.runtime.supervisor.new_entries_blocked", *permission["blockers"]],
+            }
+        self.metrics.finalizedBarsReceived += 1
+        self.metrics.lastFinalizedBarEvent = {
+            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "symbol": event.symbol.upper(),
+            "barEndTimestamp": event.barEndTimestamp.isoformat(),
+            "finalized": event.finalized,
+        }
+        job = self.runtime.enqueue_command(command)
+        self.metrics.finalizedBarsQueued += 1 if job.get("accepted") else 0
+        self.metrics.lastEvaluationJob = job
+        return job
+
+    def publish_finalized_market_event(
+        self,
+        event: VotingEnsembleFinalizedBarMarketEvent,
+        settings_hash: str,
+        deadline_seconds: int,
+    ) -> dict[str, Any]:
+        self.metrics.finalizedBarsProduced += 1
+        runtime_event = FinalizedOneMinuteBarEvent.from_market_event(
+            event,
+            settings_hash=settings_hash,
+            deadline_seconds=deadline_seconds,
+        )
+        job = self.enqueue_finalized_bar_event(runtime_event)
+        self.metrics.lastFinalizedBarProducerResult = {
+            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "eventId": event.eventId,
+            "barEndTimestamp": event.barEndTimestamp.isoformat(),
+            "job": job,
+            "reasonCodes": ["voting_ensemble.runtime.supervisor.finalized_market_event_published"],
+        }
+        return job
+
+    def enqueue_backtest(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.runtime.enqueue_backtest(payload)
+
+    def enqueue_replay(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.runtime.enqueue_replay(payload)
+
+    def enqueue_settings_refresh(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.runtime.enqueue_settings_refresh(payload)
+
+    def enqueue_recovery_reconciliation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.runtime.enqueue_recovery_reconciliation(payload)
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        return self.runtime.get_job(job_id)
+
+    def get_result(self, job_id: str) -> dict[str, Any]:
+        return self.runtime.get_result(job_id)
+
+    def readiness_status(self) -> dict[str, Any]:
+        return self.status()["readiness"]
+
+    def control_status(self) -> dict[str, Any]:
+        self._refresh_readiness()
+        return self.control_store.snapshot()
+
+    def paper_inventory(self) -> dict[str, Any]:
+        return self.paper_execution_runtime.inventory_snapshot()
+
+    def update_control(self, *, requested_paper_trading_enabled: bool, updated_by: str = "api") -> dict[str, Any]:
+        reason_codes = [
+            "voting_ensemble.control.paper_requested_on"
+            if requested_paper_trading_enabled
+            else "voting_ensemble.control.paper_requested_off",
+        ]
+        self.control_store.update_requested_paper(
+            requested_paper_trading_enabled,
+            updated_by=updated_by,
+            reason_codes=reason_codes,
+        )
+        self._refresh_readiness()
+        return self.control_store.snapshot()
+
+    def entry_permission_snapshot(self) -> dict[str, Any]:
+        self._refresh_readiness()
+        control = self.control_store.control
+        return {
+            **control.snapshot(),
+            "newEntriesAllowed": control.newEntriesEnabled,
+            "blockers": _effective_blockers_from_reason_codes(control.reasonCodes),
+            "protectiveExitsEnabled": True,
+            "stopLossOrdersEnabled": True,
+            "profitTargetOrdersEnabled": True,
+            "positionReducingExitsEnabled": True,
+            "endOfDayLiquidationEnabled": True,
+            "fillProcessingEnabled": True,
+            "cancelReplaceProcessingEnabled": True,
+            "brokerReconciliationEnabled": True,
+        }
+
+    def status(self) -> dict[str, Any]:
+        runtime_summary = self.runtime.summary()
+        paper_summary = self.paper_execution_runtime.summary()
+        readiness = self._readiness_from_summaries(runtime_summary, paper_summary)
+        effective = self._effective_control(runtime_summary, paper_summary)
+        inventory = _paper_inventory_snapshot(self.paper_execution_runtime)
+        jobs = _runtime_jobs(self.runtime)
+        last_evaluation = _latest_record(jobs, "updatedAt", "completedAt", "startedAt", "createdAt")
+        last_decision = _last_decision_from_evaluation(last_evaluation)
+        last_execution_intent = _latest_record(inventory.get("outbox") or [], "updatedAt", "submittedAt", "createdAt", "evaluatedAt")
+        last_broker_order = _latest_record(
+            [*(inventory.get("brokerOrders") or []), *(inventory.get("orders") or [])],
+            "updatedAt",
+            "submittedAt",
+            "acceptedAt",
+            "createdAt",
+            "observedAt",
+            "persistedAt",
+        )
+        last_reconciliation = _latest_record(
+            [self.metrics.lastReconciliation, *(inventory.get("reconciliations") or [])],
+            "evaluatedAt",
+            "completedAt",
+            "updatedAt",
+            "createdAt",
+            "persistedAt",
+        )
+        active_entry_blocks = _active_entry_blocks(readiness, effective, inventory, paper_summary)
+        evaluation_worker_healthy = bool(runtime_summary.get("workerAlive")) and self.metrics.workerStatus.get("evaluation_worker") != "failed"
+        execution_worker_healthy = bool(paper_summary.get("workerAlive")) and self.metrics.workerStatus.get("execution_worker") != "failed"
+        checks = effective.get("checks", {})
+        reconciliation_healthy = (
+            self.metrics.workerStatus.get("reconciliation_loop") != "failed"
+            and bool(checks.get("inventoryReconciled"))
+            and not bool(inventory.get("reconciliationBlocks"))
+        )
+        broker_client_configured = getattr(self.paper_execution_runtime, "broker_client", None) is not None
+        paper_ready_blocking_reason_codes = _paper_ready_blocking_reason_codes(
+            supervisor_running=self.metrics.supervisorStarted,
+            finalized_bar_producer_configured=self.finalized_bar_producer is not None,
+            finalized_bar_event_consumer_healthy=self.metrics.workerStatus.get("finalized_bar_event_consumer") == "running",
+            evaluation_worker_healthy=evaluation_worker_healthy,
+            execution_worker_healthy=execution_worker_healthy,
+            reconciliation_healthy=reconciliation_healthy,
+            paper_broker_verified=bool(checks.get("alpacaPaperUrlVerified")) and bool(checks.get("paperCredentialsConfigured")),
+            alpaca_paper_broker_client_configured=broker_client_configured,
+            durable_execution_state_active=bool(paper_summary.get("durableExecutionStateActive")),
+            persistence_healthy=paper_summary.get("persistenceHealthy") is not False,
+            new_entries_allowed=bool(effective["newEntriesEnabled"]) and bool(readiness["ready"]),
+            active_entry_blocks=active_entry_blocks,
+        )
+        self.metrics.readiness = readiness["status"]
+        return {
+            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "supervisorVersion": VOTING_ENSEMBLE_RUNTIME_SUPERVISOR_VERSION,
+            "paperReady": not paper_ready_blocking_reason_codes,
+            "paperReadyBlockingReasonCodes": paper_ready_blocking_reason_codes,
+            "supervisorRunning": self.metrics.supervisorStarted,
+            "supervisorStarted": self.metrics.supervisorStarted,
+            "evaluationWorkerHealthy": evaluation_worker_healthy,
+            "executionWorkerHealthy": execution_worker_healthy,
+            "reconciliationHealthy": reconciliation_healthy,
+            "requestedPaperTradingEnabled": self.control_store.control.requestedPaperTradingEnabled,
+            "effectivePaperTradingEnabled": effective["effectivePaperTradingEnabled"],
+            "liveTradingEnabled": False,
+            "paperBrokerVerified": bool(checks.get("alpacaPaperUrlVerified")) and bool(checks.get("paperCredentialsConfigured")),
+            "marketOpen": bool(checks.get("backendBrokerClockOpen")),
+            "marketDataReady": bool(checks.get("marketDataHealthy")),
+            "inventoryReconciled": bool(checks.get("inventoryReconciled")) and not bool(inventory.get("reconciliationBlocks")),
+            "newEntriesAllowed": bool(effective["newEntriesEnabled"]) and bool(readiness["ready"]),
+            "activeEntryBlocks": active_entry_blocks,
+            "lastFinalizedBar": self.metrics.lastFinalizedBarEvent or self.metrics.lastFinalizedBarProducerResult,
+            "lastEvaluation": last_evaluation,
+            "lastDecision": last_decision,
+            "lastExecutionIntent": last_execution_intent,
+            "lastBrokerOrder": last_broker_order,
+            "openVotingEnsembleOrders": _open_order_records(inventory),
+            "openVotingEnsemblePositions": _open_position_records(inventory),
+            "lastReconciliation": last_reconciliation,
+            "lastError": self.metrics.lastError,
+            "settingsHash": _settings_hash(
+                last_evaluation=last_evaluation,
+                last_decision=last_decision,
+                last_execution_intent=last_execution_intent,
+                last_broker_order=last_broker_order,
+            ),
+            "controlStore": self.control_store.snapshot(),
+            "readiness": readiness,
+            "workerHealth": {
+                "workerStatus": dict(self.metrics.workerStatus),
+                "evaluationWorker": runtime_summary.get("workerThread", {}),
+                "executionWorker": paper_summary.get("workerThread", {}),
+                "failureCounts": {
+                    "evaluationWorkerFailures": self.metrics.evaluationWorkerFailures,
+                    "executionWorkerFailures": self.metrics.executionWorkerFailures,
+                    "reconciliationFailures": self.metrics.reconciliationFailures,
+                },
+            },
+            "eventConsumer": {
+                "queueDepth": self.event_queue.qsize(),
+                "finalizedBarsReceived": self.metrics.finalizedBarsReceived,
+                "finalizedBarsQueued": self.metrics.finalizedBarsQueued,
+                "finalizedBarsProduced": self.metrics.finalizedBarsProduced,
+                "duplicateFinalizedBarEvents": self.metrics.duplicateFinalizedBarEvents,
+                "staleFinalizedBarEvents": self.metrics.staleFinalizedBarEvents,
+                "rejectedEvents": self.metrics.rejectedEvents,
+                "lastFinalizedBarEvent": self.metrics.lastFinalizedBarEvent,
+                "lastFinalizedBarProducerResult": self.metrics.lastFinalizedBarProducerResult,
+                "eventStore": self.finalized_bar_event_store.summary(),
+            },
+            "runtime": runtime_summary,
+            "paperExecution": paper_summary,
+            "lastExecutionResult": self.metrics.lastExecutionResult,
+            "lastErrorAt": self.metrics.lastErrorAt,
+            "reasonCodes": ["voting_ensemble.runtime.supervisor.status_reported", *active_entry_blocks],
+        }
+
+    def summary(self) -> dict[str, Any]:
+        return self.runtime.summary()
+
+    def record_worker_failure(self, worker_id: str, exc: Exception | str) -> None:
+        reason_code = f"voting_ensemble.runtime.{worker_id}.failed"
+        if worker_id == "evaluation_worker":
+            self.metrics.evaluationWorkerFailures += 1
+        elif worker_id == "execution_worker":
+            self.metrics.executionWorkerFailures += 1
+        elif worker_id == "reconciliation_loop":
+            self.metrics.reconciliationFailures += 1
+        self.metrics.workerStatus[worker_id] = "failed"
+        self.metrics.lastError = str(exc)
+        self.metrics.lastErrorAt = _now()
+        self.control_store.block_new_entries(reason_code)
+        self._refresh_readiness()
+
+    def _start_loop(self, worker_id: str, coroutine_factory: Callable[[], Awaitable[None]]) -> None:
+        self.metrics.workerStatus[worker_id] = "starting"
+        self._tasks.append(asyncio.create_task(self._run_loop(worker_id, coroutine_factory), name=f"voting-ensemble-{worker_id}"))
+
+    async def _run_loop(self, worker_id: str, coroutine_factory: Callable[[], Awaitable[None]]) -> None:
+        self.metrics.workerStatus[worker_id] = "running"
+        try:
+            await coroutine_factory()
+        except asyncio.CancelledError:
+            self.metrics.workerStatus[worker_id] = "stopped"
+            raise
+        except Exception as exc:
+            self.record_worker_failure(worker_id, exc)
+
+    async def _finalized_bar_event_consumer_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                event = await asyncio.wait_for(self.event_queue.get(), timeout=self.config.event_consumer_poll_seconds)
+            except asyncio.TimeoutError:
+                continue
+            self.enqueue_finalized_bar_event(event)
+
+    async def _finalized_bar_producer_loop(self) -> None:
+        assert self.finalized_bar_producer is not None
+        while not self.stop_event.is_set():
+            results = await self.finalized_bar_producer.poll_once()
+            for result in results:
+                if result.get("duplicate"):
+                    self.metrics.duplicateFinalizedBarEvents += 1
+                if result.get("stale"):
+                    self.metrics.staleFinalizedBarEvents += 1
+                self.metrics.lastFinalizedBarProducerResult = result
+            await asyncio.sleep(self.finalized_bar_producer.config.poll_seconds)
+
+    async def _execution_worker_loop(self) -> None:
+        while not self.stop_event.is_set():
+            if not self.paper_execution_runtime.summary().get("workerAlive"):
+                self.record_worker_failure("execution_worker", "Voting Ensemble paper execution worker is not alive")
+                return
+            await asyncio.sleep(self.config.execution_worker_poll_seconds)
+
+    async def _position_order_manager_loop(self) -> None:
+        while not self.stop_event.is_set():
+            gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
+            if gateway is not None:
+                await asyncio.to_thread(gateway.cancel_stale_orders, evaluated_at=datetime.now(UTC))
+            await asyncio.sleep(self.config.reconciliation_poll_seconds)
+
+    async def _reconciliation_loop(self) -> None:
+        while not self.stop_event.is_set():
+            broker_reconcile = getattr(self.paper_execution_runtime, "reconcile_broker_state", None)
+            if callable(broker_reconcile):
+                self.metrics.lastReconciliation = await asyncio.to_thread(broker_reconcile, evaluated_at=datetime.now(UTC))
+            else:
+                gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
+                if gateway is not None:
+                    self.metrics.lastReconciliation = await asyncio.to_thread(gateway.recover_from_restart, evaluated_at=datetime.now(UTC))
+            await asyncio.sleep(self.config.reconciliation_poll_seconds)
+
+    async def _legacy_reconciliation_loop(self) -> None:
+        while not self.stop_event.is_set():
+            gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
+            if gateway is not None:
+                self.metrics.lastReconciliation = await asyncio.to_thread(gateway.recover_from_restart, evaluated_at=datetime.now(UTC))
+            await asyncio.sleep(self.config.reconciliation_poll_seconds)
+
+    async def _health_monitor_loop(self) -> None:
+        while not self.stop_event.is_set():
+            self._refresh_readiness()
+            await asyncio.sleep(self.config.health_poll_seconds)
+
+    def _refresh_readiness(self) -> None:
+        runtime_summary = self.runtime.summary()
+        paper_summary = self.paper_execution_runtime.summary()
+        readiness = self._readiness_from_summaries(runtime_summary, paper_summary)
+        self.metrics.readiness = readiness["status"]
+        self.metrics.workerStatus["evaluation_worker"] = "running" if runtime_summary.get("workerAlive") else "blocked"
+        self.metrics.workerStatus["execution_worker"] = "running" if paper_summary.get("workerAlive") else self.metrics.workerStatus.get("execution_worker", "blocked")
+        effective = self._effective_control(runtime_summary, paper_summary)
+        self.control_store.save_effective(
+            effective=effective["effectivePaperTradingEnabled"],
+            new_entries=effective["newEntriesEnabled"],
+            reason_codes=effective["reasonCodes"],
+        )
+
+    def _readiness_from_summaries(self, runtime_summary: dict[str, Any], paper_summary: dict[str, Any]) -> dict[str, Any]:
+        blockers: list[str] = []
+        if not self.metrics.supervisorStarted:
+            blockers.append("voting_ensemble.runtime.supervisor.not_started")
+        if not runtime_summary.get("workerAlive"):
+            blockers.append("voting_ensemble.runtime.evaluation_worker_not_alive")
+        if not paper_summary.get("workerAlive"):
+            blockers.append("voting_ensemble.runtime.execution_worker_not_alive")
+        if paper_summary.get("persistenceHealthy") is False:
+            blockers.append("voting_ensemble.paper_execution.persistence_failure_blocks_new_entries")
+        if self.metrics.lastError:
+            blockers.append("voting_ensemble.runtime.worker_failure_recorded")
+        if self.control_store.entryCreationBlocked and self.control_store.blockReasonCodes:
+            blockers.extend(self.control_store.blockReasonCodes)
+        status = "blocked" if blockers else "ready"
+        return {
+            "status": status,
+            "ready": status == "ready",
+            "newEntriesAllowed": status == "ready" and self.control_store.control.newEntriesEnabled,
+            "paperOnly": True,
+            "liveTradingEnabled": False,
+            "blockers": sorted(set(blockers)),
+            "reasonCodes": ["voting_ensemble.runtime.supervisor.ready" if status == "ready" else "voting_ensemble.runtime.supervisor.blocked"],
+        }
+
+    def _effective_control(self, runtime_summary: dict[str, Any], paper_summary: dict[str, Any]) -> dict[str, Any]:
+        control = self.control_store.control
+        clock = self.market_clock_provider()
+        checks = {
+            "globalMasterPaperEnabled": self.config.global_master_paper_enabled,
+            "requestedPaperTradingEnabled": control.requestedPaperTradingEnabled,
+            "liveTradingDisabled": not control.liveTradingEnabled,
+            "alpacaPaperUrlVerified": is_approved_alpaca_paper_endpoint(self.settings.alpaca_trading_base_url),
+            "paperCredentialsConfigured": bool(self.settings.has_alpaca_credentials),
+            "backendBrokerClockOpen": bool(clock.get("isOpen")),
+            "workerHealthy": bool(runtime_summary.get("workerAlive")) and bool(paper_summary.get("workerAlive")) and not bool(self.metrics.lastError),
+            "marketDataHealthy": self.config.market_data_healthy_default,
+            "inventoryReconciled": self.metrics.lastReconciliation is not None and paper_summary.get("persistenceHealthy") is not False,
+            "globalKillSwitchInactive": not control.killSwitchActive,
+            "localEntryBlockInactive": not control.localEntryBlockActive,
+            "executionPersistenceHealthy": paper_summary.get("persistenceHealthy") is not False,
+        }
+        blockers = [f"voting_ensemble.control.{key}" for key, passed in checks.items() if not passed]
+        effective = not blockers
+        if not control.requestedPaperTradingEnabled:
+            blockers.append("voting_ensemble.control.paper_requested_off")
+        blockers.extend(control.localEntryBlockReasonCodes)
+        blockers = sorted(set(blockers))
+        reason_codes = ["voting_ensemble.control.effective_paper_on"] if effective else ["voting_ensemble.control.effective_paper_off", *blockers]
+        return {
+            "effectivePaperTradingEnabled": effective,
+            "newEntriesEnabled": effective,
+            "reasonCodes": reason_codes,
+            "checks": checks,
+            "brokerClock": clock,
+        }
+
+    def _run_reconciliation_once(self) -> None:
+        try:
+            broker_reconcile = getattr(self.paper_execution_runtime, "reconcile_broker_state", None)
+            if callable(broker_reconcile):
+                self.metrics.lastReconciliation = broker_reconcile(evaluated_at=datetime.now(UTC))
+                return
+            gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
+            if gateway is None:
+                return
+            self.metrics.lastReconciliation = gateway.recover_from_restart(evaluated_at=datetime.now(UTC))
+        except Exception as exc:
+            self.record_worker_failure("reconciliation_loop", exc)
+
+    def _default_market_clock(self) -> dict[str, Any]:
+        if not self.settings.has_alpaca_credentials:
+            return {"isOpen": False, "status": "unconfigured", "reasonCodes": ["voting_ensemble.control.paper_credentials_missing"]}
+        try:
+            import httpx
+
+            with httpx.Client(timeout=httpx.Timeout(4.0, connect=2.0), trust_env=False) as client:
+                response = client.get(
+                    f"{self.settings.alpaca_trading_base_url}/clock",
+                    headers={
+                        "APCA-API-KEY-ID": self.settings.alpaca_key_id,
+                        "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            return {"isOpen": False, "status": "unavailable", "warning": str(exc), "reasonCodes": ["voting_ensemble.control.broker_clock_unavailable"]}
+        return {
+            "isOpen": bool(payload.get("is_open")),
+            "status": "open" if payload.get("is_open") else "closed",
+            "timestamp": payload.get("timestamp"),
+            "nextOpen": payload.get("next_open"),
+            "nextClose": payload.get("next_close"),
+            "reasonCodes": ["voting_ensemble.control.broker_clock_reported"],
+        }
+
+    def _default_account_snapshot(self) -> dict[str, Any] | None:
+        if not self.settings.has_alpaca_credentials:
+            return None
+        try:
+            import httpx
+
+            with httpx.Client(timeout=httpx.Timeout(4.0, connect=2.0), trust_env=False) as client:
+                response = client.get(
+                    f"{self.settings.alpaca_trading_base_url}/account",
+                    headers={
+                        "APCA-API-KEY-ID": self.settings.alpaca_key_id,
+                        "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return {
+            **payload,
+            "accountId": str(payload.get("id") or payload.get("account_number") or "alpaca-paper-account"),
+            "equity": float(payload.get("equity") or payload.get("portfolio_value") or 0.0),
+            "buyingPower": float(payload.get("buying_power") or 0.0),
+            "observedAt": _now(),
+            "sourceAuthority": "broker",
+            "paperAccount": True,
+            "liveTradingEnabled": False,
+        }
+
+    def _latest_quote(self, *, symbol: str, feed: str) -> dict[str, Any] | None:
+        client = getattr(self.finalized_bar_producer, "market_data_client", None) if self.finalized_bar_producer is not None else None
+        reader = getattr(client, "get_latest_quote_sync", None)
+        if not callable(reader):
+            return None
+        return reader(symbol=symbol, feed=feed)
+
+    def _latest_trade(self, *, symbol: str, feed: str) -> dict[str, Any] | None:
+        client = getattr(self.finalized_bar_producer, "market_data_client", None) if self.finalized_bar_producer is not None else None
+        reader = getattr(client, "get_latest_trade_sync", None)
+        if not callable(reader):
+            return None
+        return reader(symbol=symbol, feed=feed)
+
+
+_VOTING_ENSEMBLE_RUNTIME_SUPERVISOR: VotingEnsembleRuntimeSupervisor | None = None
+
+
+def get_voting_ensemble_runtime_supervisor(
+    *,
+    settings: Settings | None = None,
+    market_data_client: VotingEnsembleMarketDataClient | None = None,
+    candle_store: VotingEnsembleCandleStore | None = None,
+) -> VotingEnsembleRuntimeSupervisor:
+    global _VOTING_ENSEMBLE_RUNTIME_SUPERVISOR
+    if _VOTING_ENSEMBLE_RUNTIME_SUPERVISOR is None:
+        _VOTING_ENSEMBLE_RUNTIME_SUPERVISOR = VotingEnsembleRuntimeSupervisor(
+            settings=settings,
+            market_data_client=market_data_client,
+            candle_store=candle_store,
+        )
+    return _VOTING_ENSEMBLE_RUNTIME_SUPERVISOR
+
+
+def default_control_store_path() -> Path:
+    return Path(__file__).resolve().parents[3] / "data" / "algorithms" / "voting_ensemble" / "runtime" / "control.json"
+
+
+def _effective_blockers_from_reason_codes(reason_codes: list[str]) -> list[str]:
+    return [
+        code
+        for code in reason_codes
+        if code not in {"voting_ensemble.control.effective_paper_on", "voting_ensemble.control.effective_paper_off"}
+    ]
+
+
+def _paper_inventory_snapshot(paper_execution_runtime: Any) -> dict[str, Any]:
+    try:
+        snapshot = paper_execution_runtime.inventory_snapshot()
+    except Exception as exc:
+        return {
+            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "orders": [],
+            "fills": [],
+            "positions": [],
+            "brokerOrders": [],
+            "brokerPositions": [],
+            "outbox": [],
+            "reconciliationBlocks": [
+                {
+                    "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                    "reconciliationStatus": "RECONCILIATION_REQUIRED",
+                    "error": str(exc),
+                    "reasonCodes": ["voting_ensemble.runtime.status.inventory_snapshot_unavailable"],
+                    "createdAt": _now(),
+                }
+            ],
+            "reasonCodes": ["voting_ensemble.runtime.status.inventory_snapshot_unavailable"],
+        }
+    return snapshot if isinstance(snapshot, dict) else {}
+
+
+def _runtime_jobs(runtime: Any) -> list[dict[str, Any]]:
+    status_store = getattr(runtime, "status_store", None)
+    list_jobs = getattr(status_store, "list_jobs", None)
+    if not callable(list_jobs):
+        return []
+    try:
+        return [dict(job) for job in list_jobs() if isinstance(job, dict)]
+    except Exception:
+        return []
+
+
+def _latest_record(records: Any, *time_fields: str) -> dict[str, Any] | None:
+    candidates = [dict(record) for record in records if isinstance(record, dict)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda record: _record_sort_key(record, time_fields))
+
+
+def _record_sort_key(record: dict[str, Any], time_fields: tuple[str, ...]) -> tuple[datetime, str]:
+    for field_name in time_fields:
+        parsed = _parse_status_time(record.get(field_name))
+        if parsed is not None:
+            return parsed, str(record.get("id") or record.get("jobId") or record.get("orderIntentId") or record.get("clientOrderId") or "")
+    nested_timestamps = record.get("timestamps")
+    if isinstance(nested_timestamps, dict):
+        for field_name in time_fields:
+            parsed = _parse_status_time(nested_timestamps.get(field_name))
+            if parsed is not None:
+                return parsed, str(record.get("id") or record.get("jobId") or record.get("orderIntentId") or record.get("clientOrderId") or "")
+    return datetime.min.replace(tzinfo=UTC), str(record.get("id") or record.get("jobId") or record.get("orderIntentId") or record.get("clientOrderId") or "")
+
+
+def _parse_status_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _last_decision_from_evaluation(last_evaluation: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(last_evaluation, dict):
+        return None
+    result = last_evaluation.get("result")
+    if not isinstance(result, dict):
+        return None
+    decision = result.get("decision")
+    if isinstance(decision, dict):
+        return dict(decision)
+    if any(key in result for key in ("signal", "side", "quantity", "decisionId", "orderPlan")):
+        return {
+            key: result[key]
+            for key in ("decisionId", "signal", "side", "quantity", "confidence", "orderPlan", "settingsHash", "reasonCodes")
+            if key in result
+        }
+    return None
+
+
+def _active_entry_blocks(
+    readiness: dict[str, Any],
+    effective: dict[str, Any],
+    inventory: dict[str, Any],
+    paper_summary: dict[str, Any],
+) -> list[str]:
+    blocks: list[str] = []
+    blocks.extend(str(code) for code in readiness.get("blockers") or [])
+    blocks.extend(_effective_blockers_from_reason_codes([str(code) for code in effective.get("reasonCodes") or []]))
+    for block in inventory.get("reconciliationBlocks") or []:
+        if isinstance(block, dict):
+            blocks.extend(str(code) for code in block.get("reasonCodes") or ["voting_ensemble.paper_execution.reconciliation_required"])
+    if paper_summary.get("persistenceHealthy") is False:
+        blocks.append("voting_ensemble.paper_execution.persistence_failure_blocks_new_entries")
+    for warning in paper_summary.get("highSeverityRuntimeWarnings") or []:
+        if isinstance(warning, dict):
+            blocks.extend(str(code) for code in warning.get("reasonCodes") or [])
+            if warning.get("code"):
+                blocks.append(str(warning["code"]))
+    return sorted(set(code for code in blocks if code))
+
+
+def _open_order_records(inventory: dict[str, Any]) -> list[dict[str, Any]]:
+    records = [*(inventory.get("brokerOrders") or []), *(inventory.get("orders") or [])]
+    return [dict(record) for record in records if isinstance(record, dict) and _order_is_open(record)]
+
+
+def _order_is_open(record: dict[str, Any]) -> bool:
+    status = str(
+        record.get("status")
+        or record.get("entryOrderStatus")
+        or record.get("brokerStatus")
+        or record.get("state")
+        or ""
+    ).upper()
+    if not status:
+        return True
+    return status in {
+        "PENDING",
+        "CLAIMED",
+        "SUBMITTING",
+        "SUBMITTED",
+        "ACCEPTED",
+        "NEW",
+        "OPEN",
+        "PARTIALLY_FILLED",
+        "PENDING_NEW",
+        "PENDING_REPLACE",
+        "PENDING_CANCEL",
+        "HELD",
+    }
+
+
+def _open_position_records(inventory: dict[str, Any]) -> list[dict[str, Any]]:
+    records = inventory.get("brokerPositions") or inventory.get("positions") or []
+    open_positions: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        quantity = _position_quantity(record)
+        if quantity is None or quantity != 0:
+            open_positions.append(dict(record))
+    return open_positions
+
+
+def _position_quantity(record: dict[str, Any]) -> float | None:
+    for key in ("quantity", "qty", "netQuantity", "netQty", "shares", "positionQuantity"):
+        if key not in record:
+            continue
+        try:
+            return float(record[key])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _settings_hash(
+    *,
+    last_evaluation: dict[str, Any] | None,
+    last_decision: dict[str, Any] | None,
+    last_execution_intent: dict[str, Any] | None,
+    last_broker_order: dict[str, Any] | None,
+) -> str | None:
+    for record in (last_execution_intent, last_decision, last_evaluation, last_broker_order):
+        if not isinstance(record, dict):
+            continue
+        for key in ("settingsHash", "settings_hash", "approvedDecisionSettingsHash", "configurationHash"):
+            value = record.get(key)
+            if value:
+                return str(value)
+        command = record.get("command")
+        if isinstance(command, dict):
+            value = command.get("settingsHash")
+            if value:
+                return str(value)
+        order_plan = record.get("orderPlan")
+        if isinstance(order_plan, dict):
+            value = order_plan.get("configurationHash")
+            if value:
+                return str(value)
+    return None
+
+
+def _paper_ready_blocking_reason_codes(
+    *,
+    supervisor_running: bool,
+    finalized_bar_producer_configured: bool,
+    finalized_bar_event_consumer_healthy: bool,
+    evaluation_worker_healthy: bool,
+    execution_worker_healthy: bool,
+    reconciliation_healthy: bool,
+    paper_broker_verified: bool,
+    alpaca_paper_broker_client_configured: bool,
+    durable_execution_state_active: bool,
+    persistence_healthy: bool,
+    new_entries_allowed: bool,
+    active_entry_blocks: list[str],
+) -> list[str]:
+    blockers: list[str] = []
+    if not supervisor_running:
+        blockers.append("voting_ensemble.paper_ready.runtime_supervisor_not_running")
+    if not finalized_bar_producer_configured:
+        blockers.append("voting_ensemble.paper_ready.backend_finalized_bar_producer_not_configured")
+    if not finalized_bar_event_consumer_healthy:
+        blockers.append("voting_ensemble.paper_ready.finalized_bar_event_consumer_not_healthy")
+    if not evaluation_worker_healthy:
+        blockers.append("voting_ensemble.paper_ready.evaluation_worker_not_healthy")
+    if not execution_worker_healthy:
+        blockers.append("voting_ensemble.paper_ready.execution_worker_not_healthy")
+    if not reconciliation_healthy:
+        blockers.append("voting_ensemble.paper_ready.reconciliation_not_healthy")
+    if not paper_broker_verified:
+        blockers.append("voting_ensemble.paper_ready.alpaca_paper_broker_not_verified")
+    if not alpaca_paper_broker_client_configured:
+        blockers.append("voting_ensemble.paper_ready.alpaca_paper_client_not_configured")
+    if not durable_execution_state_active:
+        blockers.append("voting_ensemble.paper_ready.execution_state_not_durable")
+    if not persistence_healthy:
+        blockers.append("voting_ensemble.paper_ready.persistence_unhealthy")
+    if not new_entries_allowed:
+        blockers.append("voting_ensemble.paper_ready.new_entries_not_allowed")
+    if active_entry_blocks:
+        blockers.extend(active_entry_blocks)
+    return sorted(set(blockers))
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")

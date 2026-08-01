@@ -76,7 +76,6 @@ def _fail_closed_response(snapshot: VotingEnsembleEvaluationSnapshot, service_ve
         *snapshot.dataReadiness.malformedInputs,
     )
     votes = _fail_closed_votes(StrategyCollection.DIRECTIONAL, reason_codes)
-    context_signals = _fail_closed_votes(StrategyCollection.CONTEXT, reason_codes)
     response = VotingEnsembleEvaluateResponse(
         service_version=service_version,
         symbol=snapshot.symbol,
@@ -84,7 +83,7 @@ def _fail_closed_response(snapshot: VotingEnsembleEvaluationSnapshot, service_ve
         data_timestamp=snapshot.evaluationTimestamp,
         final_signal="Hold",
         votes=votes,
-        context_signals=context_signals,
+        context_signals=(),
         context_confirmation=VotingContextConfirmation(
             outcome="not_applicable",
             detail="Voting Ensemble failed closed because mandatory point-in-time market data was missing, stale, malformed, or future-dated.",

@@ -14,7 +14,7 @@ from backend.app.algorithms.voting_ensemble.intelligence_capture import VotingEn
 from backend.app.algorithms.voting_ensemble.ml_contracts import SafeMLInferenceResult
 from backend.app.domain.models import DomainModel, EffectiveTradePolicy, GateStatus, GlobalGateDecision, OperatingMode, OrderPlan, Signal, TradeCandidate, _require_utc
 from backend.app.execution.broker_reconciliation import BrokerFillUpdate, BrokerOrderAck, PaperBrokerClient, ProtectiveOrderPlan, protective_order_for_fill
-from backend.app.gates import BrokerOrderState, BrokerPositionState
+from backend.app.gates import BrokerOrderState, BrokerPositionState, aggregate_global_account_risk
 
 
 VOTING_ENSEMBLE_EXECUTION_ADAPTER_VERSION = "voting_ensemble_execution_adapter_v1"
@@ -25,19 +25,35 @@ VOTING_ENSEMBLE_CLIENT_ORDER_PREFIX = "ve"
 class VotingEnsembleExecutionState(DomainModel):
     namespace: Literal["voting_ensemble.execution_state"] = VOTING_ENSEMBLE_EXECUTION_STATE_NAMESPACE
     clientOrderId: str = Field(min_length=1)
+    brokerOrderId: str | None = None
     idempotencyKey: str = Field(min_length=1)
+    parentDecisionId: str | None = None
+    parentEventId: str | None = None
+    settingsHash: str | None = None
     symbol: str = Field(min_length=1)
     side: Signal
     status: Literal["PLANNED", "SUBMITTED", "ACCEPTED", "REJECTED", "PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED", "RECONCILIATION_REQUIRED", "BLOCKED"]
     orderPlan: dict[str, Any]
+    requestedQuantity: int = Field(default=0, ge=0)
     filledQuantity: int = Field(ge=0)
+    averageFillPrice: float | None = None
+    entryOrderStatus: str | None = None
     protectiveOrder: dict[str, Any] | None = None
+    protectiveOrderIds: list[str] = Field(default_factory=list)
+    stopPrice: float | None = None
+    targetPrice: float | None = None
+    rejectionReason: str | None = None
+    reconciliationStatus: str | None = None
     cooldownUntil: datetime | None = None
     createdAt: datetime
     updatedAt: datetime
+    submittedAt: datetime | None = None
+    acceptedAt: datetime | None = None
+    filledAt: datetime | None = None
     reasonCodes: list[str] = Field(default_factory=list)
+    completeReasonCodes: list[str] = Field(default_factory=list)
 
-    @field_validator("createdAt", "updatedAt", "cooldownUntil")
+    @field_validator("createdAt", "updatedAt", "cooldownUntil", "submittedAt", "acceptedAt", "filledAt")
     @classmethod
     def timestamps_must_be_utc(cls, value: datetime | None) -> datetime | None:
         return _require_utc(value) if value else None
@@ -168,6 +184,9 @@ class VotingEnsembleExecutionAdapter:
         broker: PaperBrokerClient,
         idempotencyKey: str | None = None,
         evaluatedAt: datetime,
+        approvedSettingsHash: str | None = None,
+        parentDecisionId: str | None = None,
+        parentEventId: str | None = None,
     ) -> VotingEnsembleExecutionAdapterResult:
         evaluated_at = _utc(evaluatedAt)
         key = idempotencyKey or orderPlan.orderPlanId
@@ -179,28 +198,63 @@ class VotingEnsembleExecutionAdapter:
             return self._blocked(orderPlan, client_order_id, key, evaluated_at, ["voting_ensemble.execution_adapter.entries_blocked_by_unknown_state_or_cooldown"])
         validation = _submission_validation_errors(orderPlan)
         if validation:
-            return self._blocked(orderPlan, client_order_id, key, evaluated_at, validation)
-        if not broker.verify_symbol_tradable(orderPlan.symbol) or not broker.verify_buying_power(orderPlan):
-            return self._blocked(orderPlan, client_order_id, key, evaluated_at, ["voting_ensemble.execution_adapter.broker_precheck_failed"])
+            return self._blocked(orderPlan, client_order_id, key, evaluated_at, validation, parentDecisionId=parentDecisionId, parentEventId=parentEventId, settingsHash=approvedSettingsHash)
+        final_precheck_errors = self._final_submission_precheck(
+            orderPlan=orderPlan,
+            broker=broker,
+            evaluatedAt=evaluated_at,
+            approvedSettingsHash=approvedSettingsHash,
+        )
+        if final_precheck_errors:
+            return self._blocked(orderPlan, client_order_id, key, evaluated_at, final_precheck_errors, parentDecisionId=parentDecisionId, parentEventId=parentEventId, settingsHash=approvedSettingsHash)
+        planned_state = self.state_store.put(
+            VotingEnsembleExecutionState(
+                clientOrderId=client_order_id,
+                idempotencyKey=key,
+                parentDecisionId=parentDecisionId,
+                parentEventId=parentEventId,
+                settingsHash=approvedSettingsHash or orderPlan.configurationHash,
+                symbol=orderPlan.symbol,
+                side=orderPlan.side,
+                status="PLANNED",
+                orderPlan=orderPlan.model_dump(mode="json"),
+                requestedQuantity=orderPlan.quantity,
+                filledQuantity=0,
+                entryOrderStatus="PLANNED",
+                stopPrice=orderPlan.stopPrice,
+                targetPrice=orderPlan.targetPrice,
+                createdAt=evaluated_at,
+                updatedAt=evaluated_at,
+                reasonCodes=["voting_ensemble.execution_adapter.execution_state_persisted_before_submission"],
+                completeReasonCodes=["voting_ensemble.execution_adapter.execution_state_persisted_before_submission"],
+            )
+        )
         ack = broker.submit_order(orderPlan, client_order_id)
         fill = broker.refresh_order(client_order_id)
         protective = protective_order_for_fill(orderPlan, client_order_id, fill) if fill and fill.filledQuantity > 0 else None
         cooldown_until = evaluated_at + timedelta(seconds=self.execution_cooldown_seconds) if ack.status == "REJECTED" else None
         status = _status_from_ack_and_fill(ack, fill)
+        reason_codes = _submission_reason_codes(ack, fill, protective)
         state = self.state_store.put(
-            VotingEnsembleExecutionState(
-                clientOrderId=client_order_id,
-                idempotencyKey=key,
-                symbol=orderPlan.symbol,
-                side=orderPlan.side,
-                status=status,
-                orderPlan=orderPlan.model_dump(mode="json"),
-                filledQuantity=fill.filledQuantity if fill else 0,
-                protectiveOrder=protective.model_dump(mode="json") if protective else None,
-                cooldownUntil=cooldown_until,
-                createdAt=evaluated_at,
-                updatedAt=evaluated_at,
-                reasonCodes=_submission_reason_codes(ack, fill, protective),
+            planned_state.model_copy(
+                update={
+                    "brokerOrderId": ack.brokerOrderId,
+                    "status": status,
+                    "filledQuantity": fill.filledQuantity if fill else 0,
+                    "averageFillPrice": fill.averageFillPrice if fill else None,
+                    "entryOrderStatus": ack.status,
+                    "protectiveOrder": protective.model_dump(mode="json") if protective else None,
+                    "protectiveOrderIds": [protective.clientOrderId] if protective else [],
+                    "rejectionReason": ack.rejectedReason,
+                    "reconciliationStatus": "RECONCILED" if status in {"ACCEPTED", "PARTIALLY_FILLED", "FILLED", "REJECTED"} else None,
+                    "cooldownUntil": cooldown_until,
+                    "updatedAt": evaluated_at,
+                    "submittedAt": evaluated_at,
+                    "acceptedAt": ack.acceptedAt,
+                    "filledAt": fill.updatedAt if fill else None,
+                    "reasonCodes": [*planned_state.reasonCodes, *reason_codes],
+                    "completeReasonCodes": [*planned_state.reasonCodes, *reason_codes],
+                }
             )
         )
         result = self._result_from_state(state, orderPlan, evaluated_at, broker_ack=ack, fill_update=fill, protective_order=protective)
@@ -208,6 +262,48 @@ class VotingEnsembleExecutionAdapter:
         if fill:
             self._capture_fill_event(fill, result)
         return result
+
+    def _final_submission_precheck(
+        self,
+        *,
+        orderPlan: OrderPlan,
+        broker: PaperBrokerClient,
+        evaluatedAt: datetime,
+        approvedSettingsHash: str | None,
+    ) -> list[str]:
+        errors: list[str] = []
+        if evaluatedAt - _utc(orderPlan.generatedAt) > timedelta(seconds=self.max_order_age_seconds):
+            errors.append("voting_ensemble.execution_adapter.order_plan_stale")
+        if approvedSettingsHash and approvedSettingsHash not in orderPlan.configurationHash:
+            errors.append("voting_ensemble.execution_adapter.settings_hash_mismatch")
+        market_clock_reader = getattr(broker, "refresh_market_clock", None)
+        if callable(market_clock_reader):
+            try:
+                clock = market_clock_reader()
+            except Exception:
+                clock = {}
+            if not isinstance(clock, dict) or not bool(clock.get("isOpen", clock.get("is_open", False))):
+                errors.append("voting_ensemble.execution_adapter.market_clock_closed_or_unavailable")
+        try:
+            account = broker.refresh_account_snapshot()
+            positions = broker.refresh_positions()
+            open_orders = broker.refresh_open_orders()
+        except Exception:
+            return [*errors, "voting_ensemble.execution_adapter.broker_state_refresh_failed"]
+        if not broker.verify_symbol_tradable(orderPlan.symbol):
+            errors.append("voting_ensemble.execution_adapter.symbol_not_tradable")
+        if not broker.verify_buying_power(orderPlan):
+            errors.append("voting_ensemble.execution_adapter.insufficient_buying_power")
+        try:
+            refreshed_account = account.model_copy(update={"positions": positions, "pendingOrders": open_orders})
+            risk = aggregate_global_account_risk(refreshed_account, candidateSymbol=orderPlan.symbol, candidateSide=orderPlan.side)
+            if risk.brokerState.get("accountNotRestricted") is not True:
+                errors.append("voting_ensemble.execution_adapter.account_restricted_or_invalid")
+            if risk.brokerState.get("positionsReconciled") is not True or risk.brokerState.get("openOrdersReconciled") is not True:
+                errors.append("voting_ensemble.execution_adapter.broker_inventory_not_reconciled")
+        except Exception:
+            errors.append("voting_ensemble.execution_adapter.global_risk_refresh_failed")
+        return list(dict.fromkeys(errors))
 
     def process_fill_event(
         self,
@@ -255,8 +351,11 @@ class VotingEnsembleExecutionAdapter:
                     state.model_copy(
                         update={
                             "status": "EXPIRED",
+                            "entryOrderStatus": "EXPIRED",
+                            "reconciliationStatus": "EXPIRED",
                             "updatedAt": evaluated_at,
                             "reasonCodes": [*state.reasonCodes, "voting_ensemble.execution_adapter.entry_order_expired"],
+                            "completeReasonCodes": [*state.reasonCodes, "voting_ensemble.execution_adapter.entry_order_expired"],
                         }
                     )
                 )
@@ -286,10 +385,15 @@ class VotingEnsembleExecutionAdapter:
                         side=order.side,
                         status="RECONCILIATION_REQUIRED",
                         orderPlan=order.model_dump(mode="json"),
+                        requestedQuantity=order.quantity,
                         filledQuantity=order.filledQuantity,
+                        entryOrderStatus=order.status,
+                        stopPrice=order.stopPrice,
+                        reconciliationStatus="UNKNOWN_BROKER_STATE",
                         createdAt=_utc(observedAt),
                         updatedAt=_utc(observedAt),
                         reasonCodes=["voting_ensemble.execution_adapter.unknown_order_state_reconciliation_required"],
+                        completeReasonCodes=["voting_ensemble.execution_adapter.unknown_order_state_reconciliation_required"],
                     )
                 )
             )
@@ -298,19 +402,40 @@ class VotingEnsembleExecutionAdapter:
                 self.state_store.mark_unknown_order_state(position.symbol)
         return tuple(reconciled)
 
-    def _blocked(self, order_plan: OrderPlan, client_order_id: str, key: str, evaluated_at: datetime, reason_codes: list[str]) -> VotingEnsembleExecutionAdapterResult:
+    def _blocked(
+        self,
+        order_plan: OrderPlan,
+        client_order_id: str,
+        key: str,
+        evaluated_at: datetime,
+        reason_codes: list[str],
+        *,
+        parentDecisionId: str | None = None,
+        parentEventId: str | None = None,
+        settingsHash: str | None = None,
+    ) -> VotingEnsembleExecutionAdapterResult:
         state = self.state_store.put(
             VotingEnsembleExecutionState(
                 clientOrderId=client_order_id,
                 idempotencyKey=key,
+                parentDecisionId=parentDecisionId,
+                parentEventId=parentEventId,
+                settingsHash=settingsHash or order_plan.configurationHash,
                 symbol=order_plan.symbol,
                 side=order_plan.side,
                 status="BLOCKED",
                 orderPlan=order_plan.model_dump(mode="json"),
+                requestedQuantity=order_plan.quantity,
                 filledQuantity=0,
+                entryOrderStatus="BLOCKED",
+                stopPrice=order_plan.stopPrice,
+                targetPrice=order_plan.targetPrice,
+                rejectionReason=";".join(reason_codes),
+                reconciliationStatus="NOT_SUBMITTED",
                 createdAt=evaluated_at,
                 updatedAt=evaluated_at,
                 reasonCodes=reason_codes,
+                completeReasonCodes=reason_codes,
             )
         )
         return self._result_from_state(state, order_plan, evaluated_at)

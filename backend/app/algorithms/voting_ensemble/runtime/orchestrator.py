@@ -24,10 +24,12 @@ from backend.app.algorithms.voting_ensemble.runtime.status_store import (
 )
 from backend.app.algorithms.voting_ensemble.runtime.worker import (
     InProcessVotingEnsembleWorkerAdapter,
+    VotingEnsembleAutomaticPayloadBuilder,
     VotingEnsembleEvaluator,
     VotingEnsembleWorker,
     VotingEnsembleWorkerThread,
 )
+from backend.app.algorithms.voting_ensemble.paper_execution import VotingEnsemblePaperExecutionRuntime
 
 
 VOTING_ENSEMBLE_RUNTIME_VERSION = "voting_ensemble_background_runtime_v1"
@@ -46,11 +48,20 @@ class VotingEnsembleRuntimeOrchestrator:
         high_watermark: int = 128,
         low_watermark: int = 32,
         status_store_path: str | None = None,
+        paper_execution_runtime: VotingEnsemblePaperExecutionRuntime | None = None,
+        automatic_payload_builder: VotingEnsembleAutomaticPayloadBuilder | None = None,
     ) -> None:
         persistence_path = status_store_path if status_store_path is not None else (default_status_store_path() if auto_start else None)
         self.status_store = status_store or VotingEnsembleStatusStore(persistence_path=persistence_path)
         self.queue = queue or VotingEnsemblePriorityQueue(high_watermark=high_watermark, low_watermark=low_watermark)
-        self.worker = VotingEnsembleWorker(queue=self.queue, status_store=self.status_store, service=service)
+        self.worker = VotingEnsembleWorker(
+            queue=self.queue,
+            status_store=self.status_store,
+            service=service,
+            paper_execution_runtime=paper_execution_runtime,
+            automatic_payload_builder=automatic_payload_builder,
+        )
+        self.paper_execution_runtime = self.worker.paper_execution_runtime
         self.in_process_adapter = InProcessVotingEnsembleWorkerAdapter(self.worker)
         self._thread: VotingEnsembleWorkerThread | None = None
         self.workerMode = "separable_worker_process_contract"
@@ -58,6 +69,9 @@ class VotingEnsembleRuntimeOrchestrator:
         if auto_start:
             self.recover_incomplete_jobs()
             self.start()
+
+    def set_automatic_payload_builder(self, builder: VotingEnsembleAutomaticPayloadBuilder | None) -> None:
+        self.worker.automatic_payload_builder = builder
 
     def start(self) -> None:
         if self._thread is None or not self._thread.is_alive():
@@ -186,6 +200,7 @@ class VotingEnsembleRuntimeOrchestrator:
             "singleLogicalWriter": self.status_store.writerNamespace,
             "queue": self.queue.snapshot(),
             "statusStore": self.status_store.summary(),
+            "paperExecution": self.paper_execution_runtime.summary(),
             "reasonCodes": ["voting_ensemble.runtime.ready"],
         }
 
@@ -198,4 +213,4 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
-VOTING_ENSEMBLE_RUNTIME = VotingEnsembleRuntimeOrchestrator(auto_start=True)
+VOTING_ENSEMBLE_RUNTIME = VotingEnsembleRuntimeOrchestrator(auto_start=False, status_store_path=str(default_status_store_path()))

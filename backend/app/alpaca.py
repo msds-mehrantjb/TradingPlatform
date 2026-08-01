@@ -237,6 +237,34 @@ class AlpacaClient:
             received_at=received_at,
         )
 
+    def get_latest_trade_sync(self, *, symbol: str, feed: str) -> dict | None:
+        if not self.settings.has_alpaca_credentials:
+            return None
+
+        params: dict[str, str] = {"feed": feed}
+        url = f"{self.settings.alpaca_data_base_url}/stocks/{symbol}/trades/latest"
+        headers = {
+            "APCA-API-KEY-ID": self.settings.alpaca_key_id,
+            "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+        }
+        received_at = datetime.now(UTC)
+
+        with httpx.Client(timeout=httpx.Timeout(4.0, connect=3.0), trust_env=False) as client:
+            response = client.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+
+        trade = payload.get("trade") if isinstance(payload, dict) else None
+        if not isinstance(trade, dict):
+            return None
+        return normalize_trade(
+            provider="alpaca",
+            feed=feed,
+            symbol=symbol,
+            trade=trade,
+            received_at=received_at,
+        )
+
 
 def normalize_bar(
     *,
@@ -259,6 +287,28 @@ def normalize_bar(
         "volume": int(bar.get("v", 0)),
         "trade_count": bar.get("n"),
         "vwap": bar.get("vw"),
+    }
+
+
+def normalize_trade(
+    *,
+    provider: str,
+    feed: str,
+    symbol: str,
+    trade: dict,
+    received_at: datetime,
+) -> dict:
+    trade_timestamp = normalized_utc_timestamp(trade.get("t") or trade.get("timestamp"), received_at)
+    return {
+        "provider": provider,
+        "feed": feed,
+        "symbol": symbol,
+        "price": float(trade.get("p") or trade.get("price") or 0),
+        "size": float(trade.get("s") or trade.get("size") or 0),
+        "tradeTimestamp": trade_timestamp,
+        "marketDataReceiptTimestamp": normalized_utc_timestamp(received_at, received_at),
+        "source": "alpaca_latest_trade",
+        "raw": trade,
     }
 
 

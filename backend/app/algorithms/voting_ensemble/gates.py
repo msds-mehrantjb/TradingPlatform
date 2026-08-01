@@ -15,6 +15,22 @@ from backend.app.gates import (
 
 
 VOTING_ENSEMBLE_LOCAL_GATE_VERSION = "voting_ensemble_local_gates_v2"
+STRATEGY_EVALUATION_BLOCKING_REASON_CODES = {
+    "voting_ensemble.local_gate.stale_or_missing_candle",
+    "voting_ensemble.local_gate.stale_or_missing_quote",
+    "voting_ensemble.local_gate.invalid_bid_ask",
+    "voting_ensemble.local_gate.clock_or_timestamp_disagreement",
+    "voting_ensemble.local_gate.timeframe_not_synchronized",
+    "voting_ensemble.local_gate.auxiliary_data_missing",
+    "voting_ensemble.local_gate.feature_schema_invalid",
+    "voting_ensemble.local_gate.feed_degradation",
+    "voting_ensemble.local_gate.clock_disagreement",
+    "voting_ensemble.local_gate.decision_deadline_expired",
+    "voting_ensemble.local_gate.market_halt",
+    "voting_ensemble.local_gate.event_blackout",
+    "voting_ensemble.local_gate.regime_state_missing",
+    "voting_ensemble.local_gate.regime_data_not_ready",
+}
 
 
 def voting_ensemble_local_gate_config() -> GlobalGateConfig:
@@ -75,7 +91,12 @@ class VotingEnsembleLocalGateEngine:
                     *self._order_planning_integrity(context),
                 ]
             )
-        hard = [result for result in results if result.blocksNewEntry and context.orderIntent == "new_entry"]
+        if context.orderIntent == "new_entry":
+            hard = [result for result in results if result.blocksNewEntry]
+        elif context.orderIntent == "strategy_evaluation":
+            hard = [result for result in results if result.blocksNewEntry and _blocks_strategy_evaluation(result)]
+        else:
+            hard = []
         cautions = [result for result in results if result.severity == "caution"]
         infos = [result for result in results if result.severity == "info"]
         account = context.accountRiskState
@@ -95,7 +116,7 @@ class VotingEnsembleLocalGateEngine:
                 "executionState": context.executionState,
             },
         )
-        allowed = context.orderIntent != "new_entry" or not hard
+        allowed = not hard
         return GlobalGateEngineDecision(
             allowed=allowed,
             hardBlockers=hard,
@@ -350,6 +371,10 @@ def _required_number(state: dict[str, Any], key: str, gate_id: str, group: str, 
     if value is None:
         return _fail(gate_id, group, [f"{reason_code}:unknown_mandatory_state"], f"{key} is mandatory and unavailable; automatic entries fail closed.")
     return value
+
+
+def _blocks_strategy_evaluation(result: GateCheckResult) -> bool:
+    return any(str(code).split(":", 1)[0] in STRATEGY_EVALUATION_BLOCKING_REASON_CODES for code in result.reasonCodes)
 
 
 def _number(state: dict[str, Any], key: str) -> float | None:
