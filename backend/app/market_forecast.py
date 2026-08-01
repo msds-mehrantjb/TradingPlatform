@@ -22,6 +22,8 @@ MIN_FEATURE_FORECAST_CANDLES = 2
 DEFAULT_SUCCESS_THRESHOLD = 0.6
 DEFAULT_MIN_EDGE_GAP = 0.1
 DEFAULT_MAX_MODEL_DISAGREEMENT = 0.1
+FORECAST_NEUTRAL_PRICE_MOVE_DOLLARS = 0.005
+FORECAST_NEUTRAL_PRICE_MOVE_PCT = 0.00005
 DEFAULT_MAX_SPREAD_ATR = 0.2
 DEFAULT_PROFIT_TARGET_DOLLARS = 1.0
 DEFAULT_MIN_TARGET_PCT = 0.0
@@ -417,23 +419,26 @@ def run_forecast_inference(artifact: ApprovedForecastArtifact, feature_snapshot:
     buy_expected_value = round((buy_gross_expected_value * execution_multiplier) - execution_adjusted_costs, 4)
     sell_expected_value = round((sell_gross_expected_value * execution_multiplier) - execution_adjusted_costs, 4)
     market_regime = market_regime_profile(features)
+    base_threshold = forecast_probability_threshold(artifact_payload)
+    minimum_edge_gap = DEFAULT_MIN_EDGE_GAP + (0.03 if market_regime.get("trend") == "sideways" else 0.0)
+    resolved_direction = resolve_horizon_direction(
+        buy_probability=buy_probability,
+        sell_probability=sell_probability,
+        timeout_probability=timeout_probability,
+        threshold=base_threshold,
+        minimum_edge_gap=minimum_edge_gap,
+        buy_expected_value=buy_expected_value,
+        sell_expected_value=sell_expected_value,
+    )
     future_price_prediction = forecast_future_price_prediction(
         features,
         latest["close"],
         probabilities=probabilities,
         barriers=barriers,
         market_regime=market_regime,
-    )
-    multi_horizon_forecast = build_multi_horizon_forecast(
-        artifact,
-        feature_snapshot,
-        execution_cost_inputs=execution_cost_inputs,
-        primary_probabilities=probabilities,
-        primary_barriers=barriers,
-        primary_market_regime=market_regime,
+        actionable_direction=resolved_direction,
     )
     regime_allows = regime_allows_forecast(features, market_regime)
-    base_threshold = forecast_probability_threshold(artifact_payload)
     decision = forecast_trade_decision(
         probabilities,
         buy_expected_value=buy_expected_value,
@@ -444,6 +449,15 @@ def run_forecast_inference(artifact: ApprovedForecastArtifact, feature_snapshot:
         features=features,
         base_threshold=base_threshold,
         execution_quality=execution_quality,
+    )
+    multi_horizon_forecast = build_multi_horizon_forecast(
+        artifact,
+        feature_snapshot,
+        execution_cost_inputs=execution_cost_inputs,
+        primary_probabilities=probabilities,
+        primary_barriers=barriers,
+        primary_market_regime=market_regime,
+        primary_decision=decision,
     )
     inference_ended_at = utc_now_iso()
 
@@ -536,6 +550,7 @@ def build_multi_horizon_forecast(
     primary_probabilities: dict[str, float],
     primary_barriers: dict[str, float],
     primary_market_regime: dict[str, Any],
+    primary_decision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     features = feature_snapshot["features"]
     latest = feature_snapshot["latest"]
@@ -553,6 +568,7 @@ def build_multi_horizon_forecast(
         for horizon in MARKET_FORECAST_POSITION_HORIZONS_MINUTES
     ]
     ready_count = sum(1 for row in horizons if row["status"] == "ready")
+    gated_horizons = apply_primary_decision_gate_to_horizons(horizons, primary_decision)
     return {
         "status": "ready" if ready_count else FORECAST_STATUS_MODEL_UNAVAILABLE,
         "forecastStatus": "ready" if ready_count else FORECAST_STATUS_MODEL_UNAVAILABLE,
@@ -561,13 +577,45 @@ def build_multi_horizon_forecast(
         "entryAuthorization": False,
         "forecastAppliedToOrder": False,
         "positionManagementAppliedToOrder": False,
-        "horizons": horizons,
-        "summary": multi_horizon_summary(horizons),
+        "horizons": gated_horizons,
+        "summary": multi_horizon_summary(gated_horizons),
         "latestPrice": round(float(latest["close"]), 4),
         "featureSchemaHash": forecast_feature_schema_hash(features),
         "artifactId": artifact_payload.get("artifactId"),
         "supportedHorizonsMinutes": list(MARKET_FORECAST_POSITION_HORIZONS_MINUTES),
     }
+
+
+def apply_primary_decision_gate_to_horizons(
+    horizons: list[dict[str, Any]],
+    primary_decision: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not primary_decision:
+        return horizons
+    action = str(primary_decision.get("action") or DECISION_NO_TRADE)
+    if action in {DECISION_BUY, DECISION_SELL}:
+        return horizons
+    gated: list[dict[str, Any]] = []
+    for row in horizons:
+        next_row = dict(row)
+        advice = dict(next_row.get("advice") or {})
+        reason_codes = list(advice.get("reasonCodes") or [])
+        if "primary_forecast_no_trade_blocks_new_entries" not in reason_codes:
+            reason_codes.append("primary_forecast_no_trade_blocks_new_entries")
+        if advice.get("newLongEntry") != "WAIT":
+            advice["directionalNewLongEntry"] = advice.get("newLongEntry")
+            advice["newLongEntry"] = "WAIT"
+        if advice.get("newShortEntry") != "WAIT":
+            advice["directionalNewShortEntry"] = advice.get("newShortEntry")
+            advice["newShortEntry"] = "WAIT"
+        advice["entryGate"] = "PRIMARY_FORECAST_NO_TRADE"
+        advice["reasonCodes"] = reason_codes
+        next_row["advice"] = advice
+        next_row["entryAuthorization"] = False
+        next_row["primaryDecisionAction"] = action
+        next_row["primaryDecisionGate"] = "PRIMARY_FORECAST_NO_TRADE"
+        gated.append(next_row)
+    return gated
 
 
 def horizon_forecast_row(
@@ -621,6 +669,15 @@ def horizon_forecast_row(
     threshold = forecast_probability_threshold(horizon_payload)
     edge_gap = abs(buy_probability - sell_probability)
     minimum_edge_gap = DEFAULT_MIN_EDGE_GAP + (0.03 if market_regime.get("trend") == "sideways" else 0.0)
+    resolved_direction = resolve_horizon_direction(
+        buy_probability=buy_probability,
+        sell_probability=sell_probability,
+        timeout_probability=timeout_probability,
+        threshold=threshold,
+        minimum_edge_gap=minimum_edge_gap,
+        buy_expected_value=buy_ev,
+        sell_expected_value=sell_ev,
+    )
     future_price_prediction = forecast_future_price_prediction(
         features,
         latest["close"],
@@ -628,6 +685,7 @@ def horizon_forecast_row(
         barriers=barriers,
         market_regime=market_regime,
         horizon_minutes=horizon_minutes,
+        actionable_direction=resolved_direction,
     )
     advice = multi_horizon_position_advice(
         buy_probability=buy_probability,
@@ -673,7 +731,7 @@ def horizon_forecast_row(
             "fixedStopDollars": barriers["fixedStopDollars"],
         },
         "futurePricePrediction": future_price_prediction,
-        "predictedDirection": future_price_prediction["direction"],
+        "predictedDirection": resolved_direction,
         "predictedPrice": future_price_prediction["predictedPrice"],
         "predictedChangeDollars": future_price_prediction["predictedChangeDollars"],
         "expectedExecutionCost": round(execution_cost, 4),
@@ -735,6 +793,25 @@ def multi_horizon_position_advice(
             sell_expected_value=sell_expected_value,
         ),
     }
+
+
+def resolve_horizon_direction(
+    *,
+    buy_probability: float,
+    sell_probability: float,
+    timeout_probability: float,
+    threshold: float,
+    minimum_edge_gap: float,
+    buy_expected_value: float,
+    sell_expected_value: float,
+) -> str:
+    if timeout_probability >= buy_probability and timeout_probability >= sell_probability:
+        return "flat"
+    if buy_probability >= threshold and (buy_probability - sell_probability) >= minimum_edge_gap and buy_expected_value > 0:
+        return "up"
+    if sell_probability >= threshold and (sell_probability - buy_probability) >= minimum_edge_gap and sell_expected_value > 0:
+        return "down"
+    return "flat"
 
 
 def multi_horizon_reason_codes(
@@ -876,6 +953,16 @@ def inference_not_run_forecast(
         4,
     )
     market_regime = market_regime_profile(features)
+    heuristic_minimum_edge_gap = DEFAULT_MIN_EDGE_GAP + (0.03 if market_regime.get("trend") == "sideways" else 0.0)
+    heuristic_resolved_direction = resolve_horizon_direction(
+        buy_probability=heuristic_buy_probability,
+        sell_probability=heuristic_sell_probability,
+        timeout_probability=heuristic_timeout_probability,
+        threshold=DEFAULT_SUCCESS_THRESHOLD,
+        minimum_edge_gap=heuristic_minimum_edge_gap,
+        buy_expected_value=heuristic_buy_expected_value,
+        sell_expected_value=heuristic_sell_expected_value,
+    )
     regime_allows = regime_allows_forecast(features, market_regime)
     heuristic_decision = forecast_trade_decision(
         heuristic_probabilities,
@@ -893,6 +980,7 @@ def inference_not_run_forecast(
         probabilities=heuristic_probabilities,
         barriers=heuristic_barriers,
         market_regime=market_regime,
+        actionable_direction=heuristic_resolved_direction,
     )
     unavailable_reason = "No explicitly approved market-forecast model is loaded; heuristic estimate is UI diagnostics only."
     return {
@@ -2043,6 +2131,18 @@ def price_direction(change: float | None) -> str | None:
     return "flat"
 
 
+def forecast_expected_price_direction(change: float | None, latest_close: float | None = None) -> str | None:
+    if change is None:
+        return None
+    neutral_band = max(
+        FORECAST_NEUTRAL_PRICE_MOVE_DOLLARS,
+        abs(numeric(latest_close)) * FORECAST_NEUTRAL_PRICE_MOVE_PCT if latest_close is not None else 0.0,
+    )
+    if abs(change) <= neutral_band:
+        return "flat"
+    return "up" if change > 0 else "down"
+
+
 def add_minutes_iso(timestamp: str, minutes: int) -> str | None:
     parsed = parse_timestamp(str(timestamp))
     if not parsed:
@@ -2541,6 +2641,7 @@ def market_forecast_algorithm_signal_contracts(
         "first_pullback_after_open": market_forecast_first_pullback_setup(candles, atr_value),
         "failed_breakout_reversal": market_forecast_failed_breakout_reversal_setup(candles, atr_value),
         "liquidity_sweep_reversal": market_forecast_liquidity_sweep_reversal_setup(candles, atr_value),
+        "bollinger_band_reversion": market_forecast_bollinger_atr_reversion_setup(candles, rsi_value),
         "bollinger_atr_reversion": market_forecast_bollinger_atr_reversion_setup(candles, rsi_value),
     }
     contracts: list[MarketForecastAlgorithmSignalContract] = []
@@ -3233,6 +3334,7 @@ def forecast_future_price_prediction(
     barriers: dict[str, float],
     market_regime: dict[str, Any],
     horizon_minutes: int = FORECAST_HORIZON_MINUTES,
+    actionable_direction: str | None = None,
 ) -> dict[str, Any]:
     algorithm = features.get("algorithm") or {}
     trend = features.get("trend") or {}
@@ -3300,12 +3402,15 @@ def forecast_future_price_prediction(
     move_scale = atr_5m * session_multiplier * volatility_multiplier * confidence_multiplier
     predicted_change = clamp(directional_score * move_scale, -atr_5m, atr_5m)
     predicted_price = max(0.01, latest_close + predicted_change)
+    expected_price_direction = forecast_expected_price_direction(predicted_change, latest_close)
     return {
         "horizonMinutes": horizon_minutes,
         "predictedPrice": round(predicted_price, 4),
+        "predictedChange": round(predicted_change, 4),
         "predictedChangeDollars": round(predicted_change, 4),
         "predictedReturnPct": round(safe_return(predicted_price, latest_close), 6),
-        "direction": price_direction(predicted_change),
+        "expectedPriceDirection": expected_price_direction,
+        "direction": actionable_direction or expected_price_direction,
         "directionalScore": round(directional_score, 4),
         "moveScale": round(move_scale, 4),
         "components": {
@@ -3333,8 +3438,10 @@ def no_edge_future_price_prediction(
     return {
         "horizonMinutes": horizon_minutes,
         "predictedPrice": round(latest_close, 4),
+        "predictedChange": 0.0,
         "predictedChangeDollars": 0.0,
         "predictedReturnPct": 0.0,
+        "expectedPriceDirection": "flat",
         "direction": "flat",
         "directionalScore": 0.0,
         "moveScale": 0.0,

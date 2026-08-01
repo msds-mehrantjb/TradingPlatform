@@ -91,7 +91,9 @@ type MarketForecastPrediction = {
   futurePricePrediction?: {
     horizonMinutes?: number;
     predictedPrice?: number | null;
+    predictedChange?: number | null;
     predictedChangeDollars?: number | null;
+    expectedPriceDirection?: string;
     direction?: string;
   };
   multiHorizonForecast?: {
@@ -124,12 +126,17 @@ type MarketForecastPrediction = {
       predictedChangeDollars: number | null;
       buyExpectedValue: number | null;
       sellExpectedValue: number | null;
+      primaryDecisionAction?: string;
+      primaryDecisionGate?: string;
       advice: {
         longPosition: "KEEP" | "CLOSE_REVIEW" | "MONITOR" | "NO_ML_ADVICE";
         shortPosition: "KEEP" | "CLOSE_REVIEW" | "MONITOR" | "NO_ML_ADVICE";
         newLongEntry: "CONSIDER_AFTER_STRATEGY_SIGNAL" | "WAIT" | "WAIT_FOR_VALIDATED_MODEL";
         newShortEntry: "CONSIDER_AFTER_STRATEGY_SIGNAL" | "WAIT" | "WAIT_FOR_VALIDATED_MODEL";
         flatMarket: string;
+        entryGate?: string;
+        directionalNewLongEntry?: string;
+        directionalNewShortEntry?: string;
         reasonCodes: string[];
       };
       activationPolicy: string;
@@ -22152,6 +22159,7 @@ function renderDecisionUnavailable(message: string) {
 }
 
 type MarketForecastImpact = "positive" | "negative" | "neutral";
+type MarketForecastHorizon = NonNullable<MarketForecastPrediction["multiHorizonForecast"]>["horizons"][number];
 
 function renderMarketForecastItem(label: string, value: string, impact: MarketForecastImpact = "neutral") {
   return `<span class="market-forecast-item" data-impact="${impact}"><b>${escapeHtml(label)}</b>${escapeHtml(value)}</span>`;
@@ -22161,7 +22169,42 @@ function formatNullableProbability(value: number | null | undefined) {
   return value == null ? "NA" : formatProbability(value);
 }
 
-function marketForecastHorizonRows(forecast: MarketForecastPrediction) {
+function marketForecastDirectionLabel(direction: string | null | undefined) {
+  const normalized = (direction ?? "flat").toLowerCase();
+  if (normalized === "up") {
+    return "Up";
+  }
+  if (normalized === "down") {
+    return "Down";
+  }
+  if (normalized === "unavailable" || normalized === "pending") {
+    return normalized.replaceAll("_", " ");
+  }
+  return "Flat / No edge";
+}
+
+function marketForecastDirectionImpact(direction: string | null | undefined, modelApplied: boolean): MarketForecastImpact {
+  if (!modelApplied) {
+    return "neutral";
+  }
+  const normalized = (direction ?? "flat").toLowerCase();
+  if (normalized === "up") {
+    return "positive";
+  }
+  if (normalized === "down") {
+    return "negative";
+  }
+  return "neutral";
+}
+
+function marketForecastHorizonImpact(horizon: MarketForecastHorizon): MarketForecastImpact {
+  if (horizon.primaryDecisionGate || horizon.advice.entryGate) {
+    return "neutral";
+  }
+  return marketForecastDirectionImpact(horizon.predictedDirection, horizon.modelApplied);
+}
+
+function marketForecastHorizonRows(forecast: MarketForecastPrediction): MarketForecastHorizon[] {
   const backendRows = forecast.multiHorizonForecast?.horizons ?? [];
   if (backendRows.length) {
     return backendRows;
@@ -22174,7 +22217,7 @@ function marketForecastHorizonRows(forecast: MarketForecastPrediction) {
     forecast.status !== "INFERENCE_NOT_RUN";
   return [5, 10, 15].map((horizonMinutes) => {
     const isPrimary = horizonMinutes === 5;
-    return {
+    const row: MarketForecastHorizon = {
       status: isPrimary ? forecast.status : "MODEL_UNAVAILABLE",
       horizonMinutes,
       modelApplied: isPrimary && modelApplied,
@@ -22184,7 +22227,7 @@ function marketForecastHorizonRows(forecast: MarketForecastPrediction) {
       probabilityBuySuccess: isPrimary ? forecast.probabilityBuySuccess ?? forecast.probabilitySuccess : null,
       probabilitySellSuccess: isPrimary ? forecast.probabilitySellSuccess ?? forecast.probabilityStop : null,
       probabilityTimeout: isPrimary ? forecast.probabilityTimeout : null,
-      predictedDirection: isPrimary ? forecast.futurePricePrediction?.direction ?? forecast.decision.candidateAction : "pending",
+      predictedDirection: isPrimary ? forecast.futurePricePrediction?.direction ?? "flat" : "pending",
       predictedPrice: isPrimary ? forecast.futurePricePrediction?.predictedPrice ?? null : null,
       predictedChangeDollars: isPrimary ? forecast.futurePricePrediction?.predictedChangeDollars ?? null : null,
       buyExpectedValue: isPrimary ? forecast.buyExpectedValue ?? forecast.expectedValue : null,
@@ -22205,6 +22248,7 @@ function marketForecastHorizonRows(forecast: MarketForecastPrediction) {
       activationPolicy: "advisory_only_until_live_paper_validation",
       reason: isPrimary ? "Primary 5-minute forecast shown; restart backend for authoritative multi-horizon response." : "Approved ML horizon head is not loaded.",
     };
+    return row;
   });
 }
 
@@ -22220,20 +22264,18 @@ function renderMultiHorizonForecastStrip(forecast: MarketForecastPrediction) {
             horizon.predictedChangeDollars == null
               ? "NA"
               : `${horizon.predictedChangeDollars >= 0 ? "+" : ""}${currency(horizon.predictedChangeDollars)}`;
-          const direction = horizon.modelApplied ? horizon.predictedDirection.replaceAll("_", " ") : "ML unavailable";
-          const impact: MarketForecastImpact =
-            horizon.advice.longPosition === "KEEP"
-              ? "positive"
-              : horizon.advice.longPosition === "CLOSE_REVIEW" || !horizon.modelApplied
-                ? "negative"
-                : "neutral";
+          const direction = horizon.modelApplied ? marketForecastDirectionLabel(horizon.predictedDirection) : "ML unavailable";
+          const impact = marketForecastHorizonImpact(horizon);
+          const newEntry = horizon.primaryDecisionGate || horizon.advice.entryGate
+            ? "WAIT"
+            : horizon.advice.newLongEntry.replaceAll("_", " ");
           return `
             <div class="market-forecast-horizon-card" data-impact="${impact}">
               <b>${horizon.horizonMinutes}m ML</b>
               <strong>${escapeHtml(direction)}</strong>
               <span>P up/down ${escapeHtml(`${formatNullableProbability(up)} / ${formatNullableProbability(down)}`)}</span>
               <span>Long ${escapeHtml(horizon.advice.longPosition.replaceAll("_", " "))}</span>
-              <span>New long ${escapeHtml(horizon.advice.newLongEntry.replaceAll("_", " "))}</span>
+              <span>New entry ${escapeHtml(newEntry)}</span>
               <span>Move ${escapeHtml(change)}</span>
             </div>
           `;

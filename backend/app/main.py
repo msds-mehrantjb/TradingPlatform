@@ -24,7 +24,7 @@ import httpx
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from .alpaca import AlpacaClient, demo_bars, local_market_status
+from .alpaca import AlpacaClient, demo_bars, local_market_status, nyse_holiday_name
 from .algorithms.regime.api import router as regime_router
 from .algorithms.regime.api import REGIME_REPOSITORY
 from .algorithms.regime.runtime_supervisor import get_regime_runtime_supervisor
@@ -174,6 +174,8 @@ DEFAULT_LOOKBACKS = {
     "1Hour": timedelta(days=180),
     "1Day": timedelta(days=900),
 }
+CANDLE_REFRESH_TIMEOUT_SECONDS = 8.0
+INTRADAY_CHART_TIMEFRAMES = {"1Min", "3Min", "5Min", "15Min", "1Hour"}
 
 TRADE_HALTS_RSS_URL = "https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 YAHOO_FINANCE_RSS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
@@ -1631,6 +1633,40 @@ async def candles(
 
     if cached and not refresh:
         return {"source": "cache", "candles": cached}
+    if (
+        not refresh
+        and not start
+        and not end
+        and timeframe in INTRADAY_CHART_TIMEFRAMES
+        and local_market_is_closed()
+    ):
+        try:
+            session_date, session_bars = await completed_session_bars(
+                symbol=normalized_symbol,
+                timeframe=timeframe,
+                feed=feed,
+                limit=limit,
+            )
+            if session_bars:
+                store.upsert_many(session_bars)
+                return {
+                    "source": session_bars[0]["provider"],
+                    "warning": f"Market is closed; showing latest completed market session {session_date}.",
+                    "candles": session_bars,
+                    "sessionDate": session_date,
+                }
+        except (TimeoutError, httpx.HTTPError) as exc:
+            return {
+                "source": "cache",
+                "warning": f"No cached candles are available and latest completed session fetch failed: {exc}",
+                "candles": [],
+            }
+    if not refresh:
+        return {
+            "source": "cache",
+            "warning": "No cached candles are available for this symbol/feed/timeframe. Use refresh=true to request Alpaca data.",
+            "candles": [],
+        }
 
     request_start = start
     request_end = end
@@ -1642,15 +1678,30 @@ async def candles(
         request_sort = "desc"
 
     try:
-        fresh = await alpaca.get_bars(
+        fresh = await asyncio.wait_for(
+            alpaca.get_bars(
+                symbol=normalized_symbol,
+                timeframe=timeframe,
+                feed=feed,
+                limit=limit,
+                start=request_start,
+                end=request_end,
+                sort=request_sort,
+            ),
+            timeout=CANDLE_REFRESH_TIMEOUT_SECONDS,
+        )
+    except TimeoutError as exc:
+        warning = f"Alpaca candle request timed out after {CANDLE_REFRESH_TIMEOUT_SECONDS:g}s"
+        if cached:
+            return {"source": "cache", "warning": warning, "candles": cached}
+        fallback = demo_bars(
             symbol=normalized_symbol,
             timeframe=timeframe,
             feed=feed,
             limit=limit,
-            start=request_start,
-            end=request_end,
-            sort=request_sort,
         )
+        store.upsert_many(fallback)
+        return {"source": "demo", "warning": warning, "candles": fallback}
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text
         if cached:
@@ -3238,7 +3289,7 @@ def previous_completed_market_session_date() -> str:
 
 def previous_weekday(value) -> object:
     candidate = value - timedelta(days=1)
-    while candidate.weekday() >= 5:
+    while candidate.weekday() >= 5 or nyse_holiday_name(candidate):
         candidate -= timedelta(days=1)
     return candidate
 
@@ -3249,6 +3300,34 @@ def session_date_window_utc(session_date: str) -> tuple[str, str]:
     start = datetime(parsed.year, parsed.month, parsed.day, 0, 0, 0, tzinfo=eastern).astimezone(UTC)
     end = datetime(parsed.year, parsed.month, parsed.day, 23, 59, 59, tzinfo=eastern).astimezone(UTC)
     return start.isoformat().replace("+00:00", "Z"), end.isoformat().replace("+00:00", "Z")
+
+
+def local_market_is_closed() -> bool:
+    return not bool(local_market_status().get("isOpen"))
+
+
+async def completed_session_bars(
+    *,
+    symbol: str,
+    feed: Literal["iex", "sip", "otc"],
+    timeframe: Literal["1Min", "3Min", "5Min", "15Min", "1Hour"],
+    limit: int,
+) -> tuple[str, list[dict]]:
+    session_date = previous_completed_market_session_date()
+    start, end = session_date_window_utc(session_date)
+    bars = await asyncio.wait_for(
+        alpaca.get_bars(
+            symbol=symbol,
+            timeframe=timeframe,
+            feed=feed,
+            limit=limit,
+            start=start,
+            end=end,
+            sort="asc",
+        ),
+        timeout=CANDLE_REFRESH_TIMEOUT_SECONDS,
+    )
+    return session_date, bars[-limit:]
 
 
 def export_backtest_dataset_from_store(
@@ -9173,20 +9252,42 @@ async def _context_bars(
     )
     if cached and not refresh:
         return cached
+    if (
+        not cached
+        and not refresh
+        and as_of is None
+        and timeframe == "1Min"
+        and local_market_is_closed()
+    ):
+        try:
+            _, session_bars = await completed_session_bars(
+                symbol=symbol,
+                timeframe="1Min",
+                feed=feed,
+                limit=limit,
+            )
+            if session_bars:
+                store.upsert_many(session_bars)
+                return session_bars
+        except (TimeoutError, httpx.HTTPError):
+            return []
 
     now = datetime.now(UTC)
     lookback = timedelta(days=900) if timeframe == "1Day" else timedelta(days=10)
     try:
-        fresh = await alpaca.get_bars(
-            symbol=symbol,
-            timeframe=timeframe,
-            feed=feed,
-            limit=limit,
-            start=(now - lookback).isoformat().replace("+00:00", "Z"),
-            end=now.isoformat().replace("+00:00", "Z"),
-            sort="asc",
+        fresh = await asyncio.wait_for(
+            alpaca.get_bars(
+                symbol=symbol,
+                timeframe=timeframe,
+                feed=feed,
+                limit=limit,
+                start=(now - lookback).isoformat().replace("+00:00", "Z"),
+                end=now.isoformat().replace("+00:00", "Z"),
+                sort="asc",
+            ),
+            timeout=CANDLE_REFRESH_TIMEOUT_SECONDS,
         )
-    except httpx.HTTPError:
+    except (TimeoutError, httpx.HTTPError):
         return cached or demo_bars(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit)
 
     store.upsert_many(fresh)

@@ -70,3 +70,23 @@ test("frontend does not own Economic Event trading decisions", () => {
   assert.match(main, /backendEventContextDisplayGate/);
   assert.match(main, /frontend displays backend context only/);
 });
+
+test("Market Forecast dashboard uses backend actionable direction labels", () => {
+  const main = read("frontend/src/main.ts");
+  const css = read("frontend/src/styles.css");
+
+  assert.match(main, /function marketForecastDirectionLabel/);
+  assert.match(main, /Flat \/ No edge/);
+  assert.match(main, /function marketForecastDirectionImpact/);
+  assert.match(main, /function marketForecastHorizonImpact/);
+  assert.match(main, /forecast\.futurePricePrediction\?\.direction \?\? "flat"/);
+  assert.match(main, /marketForecastDirectionLabel\(horizon\.predictedDirection\)/);
+  assert.match(main, /marketForecastHorizonImpact\(horizon\)/);
+  assert.match(main, /New entry/);
+  assert.match(main, /horizon\.primaryDecisionGate \|\| horizon\.advice\.entryGate/);
+  const renderStrip = main.slice(main.indexOf("function renderMultiHorizonForecastStrip"), main.indexOf("function thresholdImpact"));
+  assert.doesNotMatch(renderStrip, /marketForecastDirectionLabel\(horizon\.predictedChangeDollars/);
+  assert.doesNotMatch(renderStrip, /marketForecastDirectionImpact\(horizon\.predictedChangeDollars/);
+  assert.doesNotMatch(main, /predictedDirection:\s*isPrimary\s*\?[^;\n]*predictedChange/);
+  assert.match(css, /\.market-forecast-horizon-card\[data-impact="neutral"\]/);
+});

@@ -5537,6 +5537,12 @@ select {
   color: #be123c;
 }
 
+.market-forecast-horizon-card[data-impact="neutral"] {
+  border-color: #d1d5db;
+  background: #f9fafb;
+  color: #4b5563;
+}
+
 .market-forecast-horizon-card[data-impact="positive"] b,
 .market-forecast-horizon-card[data-impact="positive"] strong {
   color: #047857;
@@ -5545,6 +5551,11 @@ select {
 .market-forecast-horizon-card[data-impact="negative"] b,
 .market-forecast-horizon-card[data-impact="negative"] strong {
   color: #be123c;
+}
+
+.market-forecast-horizon-card[data-impact="neutral"] b,
+.market-forecast-horizon-card[data-impact="neutral"] strong {
+  color: #374151;
 }
 
 .market-forecast-item {

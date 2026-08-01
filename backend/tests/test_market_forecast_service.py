@@ -255,7 +255,7 @@ def test_market_forecast_algorithm_features_use_stable_contract_ids_not_old_disp
         "first_pullback_after_open",
         "failed_breakout_reversal",
         "liquidity_sweep_reversal",
-        "bollinger_atr_reversion",
+        "bollinger_band_reversion",
     }
 
     for strategy_id in expected_ids:
