@@ -43,7 +43,7 @@ class WeightedVotingRuntimeContextTest(unittest.TestCase):
             }
         )
 
-        result = service.evaluate(payload)
+        result = service.evaluate_research_shadow(payload)
 
         self.assertTrue(payload_contains_forbidden_authoritative_evaluation_inputs(payload))
         self.assertEqual(result["decision"]["signal"], "Hold")
@@ -55,10 +55,13 @@ class WeightedVotingRuntimeContextTest(unittest.TestCase):
         self.assertEqual(result["globalRiskResponse"]["action"], "REJECT")
         self.assertEqual(result["globalRiskResponse"]["maximum_quantity"], 0)
         self.assertEqual(result["globalGateApplication"]["globallyAllowedQuantity"], 0)
+        self.assertTrue(result["researchOnly"])
+        self.assertFalse(result["productionStateMutated"])
+        self.assertEqual(service.store.snapshots, {})
         self.assertFalse(any(snapshot.get("action") == "ALLOW" for snapshot in service.store.snapshots.values() if isinstance(snapshot, dict)))
 
     def test_production_missing_safety_inputs_use_explicit_unavailable_reason_codes(self) -> None:
-        result = WeightedVotingService(store=MemoryStore()).evaluate(evaluate_payload(include_session=True))
+        result = WeightedVotingService(store=MemoryStore()).evaluate_research_shadow(evaluate_payload(include_session=True))
 
         self.assertEqual(result["decision"]["signal"], "Hold")
         self.assertIn("weighted_voting.context.inventory_unavailable", result["runtimeContext"]["failureReasonCodes"])
@@ -102,6 +105,13 @@ class WeightedVotingRuntimeContextTest(unittest.TestCase):
 
         self.assertEqual(set(context.source_attribution), set(RUNTIME_CONTEXT_FIELD_NAMES))
         self.assertTrue(context.manifest_hash)
+        self.assertIs(context.market_snapshot, context.finalised_one_minute_market_snapshot)
+        self.assertEqual(context.paper_account_snapshot.account_equity, context.read_only_account_equity)
+        self.assertIs(context.session_state, context.exchange_session_state)
+        self.assertEqual(context.cost_estimate.slippage_per_share, context.estimated_slippage)
+        self.assertIs(context.settings, context.effective_settings)
+        self.assertIs(context.weight_state, context.active_weight_state)
+        self.assertIs(context.global_risk_capacity, context.global_risk_state)
         for field_name, source in context.source_attribution.items():
             with self.subTest(field=field_name):
                 self.assertEqual(source.field_name, field_name)
@@ -109,10 +119,16 @@ class WeightedVotingRuntimeContextTest(unittest.TestCase):
                 self.assertIsNotNone(source.observed_at)
                 self.assertIsNotNone(source.data_timestamp)
 
+    def test_execution_capable_evaluate_requires_authoritative_runtime_context(self) -> None:
+        service = WeightedVotingService(store=MemoryStore())
+
+        with self.assertRaisesRegex(TypeError, "WeightedVotingRuntimeContext"):
+            service.evaluate(evaluate_payload())
+
     def test_stale_absent_and_conflicting_context_fail_closed_with_reason_codes(self) -> None:
         service = WeightedVotingService(store=MemoryStore())
         stale = service.evaluate_replay_fixture(evaluate_payload(data_freshness_seconds=9999))
-        absent = service.evaluate(evaluate_payload(include_session=True))
+        absent = service.evaluate_research_shadow(evaluate_payload(include_session=True))
         conflicting = service.evaluate_context(valid_fixture_context(inventory_symbol="QQQ"))
 
         self.assertEqual(stale["decision"]["signal"], "Hold")
@@ -136,6 +152,21 @@ class WeightedVotingRuntimeContextTest(unittest.TestCase):
         snapshot = build_weighted_voting_market_snapshot(payload)
 
         self.assertTrue(snapshot.one_minute_candles[-1].finalized)
+
+    def test_missing_actual_quote_is_not_manufactured_and_blocks_entry(self) -> None:
+        payload = evaluate_payload(include_session=True)
+        payload.pop("bid")
+        payload.pop("ask")
+
+        snapshot = build_weighted_voting_market_snapshot(payload)
+        result = WeightedVotingService(store=MemoryStore()).evaluate_research_shadow(payload)
+
+        self.assertIsNone(snapshot.bid)
+        self.assertIsNone(snapshot.ask)
+        self.assertIsNone(snapshot.spread)
+        self.assertEqual(result["decision"]["signal"], "Hold")
+        self.assertIn("weighted_voting.runtime_context.missing_quote_state", result["runtimeContext"]["failureReasonCodes"])
+        self.assertIn("weighted_voting.decision_kernel.missing_actual_quote_blocks_trade", result["reasonCodes"])
 
 
 def valid_fixture_context(*, inventory_symbol: str = "SPY"):

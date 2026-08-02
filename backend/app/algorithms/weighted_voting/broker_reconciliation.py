@@ -43,6 +43,7 @@ class WeightedVotingBrokerOrderObservation:
     observed_at: datetime
     broker_order_id: str | None = None
     replaced_by_client_order_id: str | None = None
+    protective: bool = False
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,8 @@ class WeightedVotingBrokerPositionObservation:
     average_entry_price: float
     observed_at: datetime
     broker_position_id: str | None = None
+    unrealised_pnl: float | None = None
+    realised_pnl: float | None = None
 
 
 @dataclass(frozen=True)
@@ -137,27 +140,67 @@ def reconcile_weighted_voting_broker_observations(
     reconciled_at: datetime,
 ) -> WeightedVotingBrokerReconciliationResult:
     known_commands = _known_weighted_voting_client_orders(store)
+    local_intents = _local_weighted_voting_intents(store)
+    local_fills = _local_weighted_voting_fills(store)
     applied_fill_ids: list[str] = []
     duplicate_fill_ids: list[str] = []
     excluded_positions: list[str] = []
     discrepancies: list[WeightedVotingBrokerReconciliationDiscrepancy] = []
+    snapshot_before = inventory_repository.current_snapshot(now=reconciled_at)
+    local_order_by_client = {order.client_order_id: order for order in snapshot_before.pending_orders}
+    local_position_by_client = {position.client_order_id: position for position in snapshot_before.open_positions}
 
     for order in orders:
         if not _is_weighted_voting_attributed(order.algorithm_id):
             discrepancies.append(_discrepancy("broker_order_unattributed_or_foreign", order.client_order_id, order.observed_at, _json_ready(asdict(order)), severity=WeightedVotingReconciliationDiscrepancySeverity.CENTRAL_REVIEW))
             continue
         if order.client_order_id not in known_commands:
-            discrepancies.append(_discrepancy("broker_order_missing_locally", order.client_order_id, order.observed_at, _json_ready(asdict(order)), severity=WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES))
+            details = _json_ready(asdict(order))
+            discrepancies.append(_discrepancy("broker_order_missing_locally", order.client_order_id, order.observed_at, details, severity=WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES))
+            _quarantine_unknown_broker_order(store, order, reason="weighted_voting.broker_reconciliation.unknown_broker_order_quarantined")
             continue
         _persist_broker_order_lifecycle(store, order)
+        local_order = local_order_by_client.get(order.client_order_id)
+        if local_order and int(local_order.quantity) != int(order.quantity):
+            discrepancies.append(
+                _discrepancy(
+                    "broker_order_quantity_mismatch",
+                    order.client_order_id,
+                    order.observed_at,
+                    {"brokerQuantity": order.quantity, "localQuantity": local_order.quantity, "brokerFilledQuantity": order.filled_quantity, "localFilledQuantity": local_order.filled_quantity},
+                    severity=WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES,
+                )
+            )
+        if order.protective:
+            owned_quantity = abs(local_position_by_client.get(order.client_order_id).quantity) if order.client_order_id in local_position_by_client else 0
+            if owned_quantity <= 0 or int(order.quantity) > owned_quantity:
+                discrepancies.append(
+                    _discrepancy(
+                        "protective_order_quantity_mismatch",
+                        order.client_order_id,
+                        order.observed_at,
+                        {"brokerProtectiveQuantity": order.quantity, "ownedPositionQuantity": owned_quantity, "riskReductionPriority": True},
+                        severity=WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES,
+                    )
+                )
 
     for fill in sorted(fills, key=lambda item: item.filled_at):
         if not _is_weighted_voting_attributed(fill.algorithm_id):
-            discrepancies.append(_discrepancy("broker_fill_unattributed_or_foreign", fill.client_order_id, fill.filled_at, _json_ready(asdict(fill)), severity=WeightedVotingReconciliationDiscrepancySeverity.CENTRAL_REVIEW))
+            discrepancies.append(_discrepancy("broker_fill_unattributed_or_foreign", fill.client_order_id, fill.filled_at, _json_ready(asdict(fill)), severity=WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES))
             continue
         if fill.client_order_id not in known_commands:
             discrepancies.append(_discrepancy("broker_fill_missing_local_command", fill.client_order_id, fill.filled_at, _json_ready(asdict(fill)), severity=WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES))
             continue
+        if fill.fill_id not in local_fills:
+            store.write_snapshot(
+                f"{WEIGHTED_VOTING_BROKER_RECONCILIATION_NAMESPACE}.early_fills.{fill.fill_id}",
+                {
+                    **_json_ready(asdict(fill)),
+                    "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+                    "adoptableBecauseClientOrderIdIsWeightedVoting": True,
+                    "reasonCodes": ("weighted_voting.broker_reconciliation.fill_before_local_ack_adopted_by_client_order_id",),
+                },
+            )
         event_id = f"broker-fill-{fill.fill_id}"
         before = inventory_repository.current_snapshot(now=fill.filled_at)
         after = inventory_repository.append_event(
@@ -196,11 +239,39 @@ def reconcile_weighted_voting_broker_observations(
 
     broker_quantity_by_client = {str(position.client_order_id): int(position.quantity) for position in weighted_positions if position.client_order_id}
     local_quantity_by_client = {position.client_order_id: int(position.quantity) for position in snapshot.open_positions}
+    local_pnl_by_client = {position.client_order_id: float(position.unrealised_pnl) for position in snapshot.open_positions}
     for client_order_id, quantity in broker_quantity_by_client.items():
         if client_order_id not in known_commands:
             discrepancies.append(_discrepancy("broker_position_missing_local_command", client_order_id, reconciled_at, {"brokerQuantity": quantity}, severity=WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES))
         elif local_quantity_by_client.get(client_order_id, 0) != quantity:
             discrepancies.append(_discrepancy("broker_position_quantity_mismatch", client_order_id, reconciled_at, {"brokerQuantity": quantity, "localQuantity": local_quantity_by_client.get(client_order_id, 0)}, severity=WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES))
+    for position in weighted_positions:
+        if position.client_order_id and position.unrealised_pnl is not None and position.client_order_id in local_pnl_by_client:
+            difference = abs(float(position.unrealised_pnl) - local_pnl_by_client[position.client_order_id])
+            if difference > _pnl_tolerance(position):
+                discrepancies.append(
+                    _discrepancy(
+                        "broker_position_pnl_mismatch",
+                        position.client_order_id,
+                        reconciled_at,
+                        {"brokerUnrealisedPnl": position.unrealised_pnl, "localUnrealisedPnl": local_pnl_by_client[position.client_order_id], "difference": round(difference, 10), "tolerance": _pnl_tolerance(position)},
+                        severity=WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES,
+                    )
+                )
+    broker_protective_clients = {order.client_order_id for order in orders if order.protective and _is_weighted_voting_attributed(order.algorithm_id)}
+    local_protective_clients = {order.client_order_id for order in snapshot.protective_orders}
+    if orders or local_protective_clients:
+        for client_order_id, quantity in local_quantity_by_client.items():
+            if quantity and client_order_id not in broker_protective_clients and client_order_id not in local_protective_clients:
+                discrepancies.append(
+                    _discrepancy(
+                        "protective_order_missing_or_unlinked",
+                        client_order_id,
+                        reconciled_at,
+                        {"ownedPositionQuantity": abs(quantity), "riskReductionPriority": True},
+                        severity=WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES,
+                    )
+                )
     for pending in snapshot.pending_orders:
         if pending.client_order_id not in {order.client_order_id for order in orders} and pending.client_order_id not in broker_quantity_by_client:
             discrepancies.append(_discrepancy("local_pending_order_missing_at_broker", pending.client_order_id, reconciled_at, {"pendingQuantity": pending.quantity}, severity=WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES))
@@ -208,14 +279,33 @@ def reconcile_weighted_voting_broker_observations(
     for discrepancy in discrepancies:
         store.write_snapshot(f"{DISCREPANCY_PREFIX}{discrepancy.discrepancy_id}", discrepancy.as_dict())
 
+    entries_paused = any(_severity_value(item.severity) == WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES.value for item in discrepancies)
+    checkpoint_payload = {
+        "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+        "reconciled_at": reconciled_at.isoformat(),
+        "applied_fill_ids": applied_fill_ids,
+        "duplicate_fill_ids": duplicate_fill_ids,
+        "excluded_broker_position_ids": excluded_positions,
+        "discrepancy_ids": [item.discrepancy_id for item in discrepancies],
+        "discrepancy_count": len(discrepancies),
+        "local_intent_count": len(local_intents),
+        "local_order_count": len(snapshot.pending_orders),
+        "local_fill_count": len(local_fills),
+        "local_position_count": len(snapshot.open_positions),
+        "broker_order_count": len(orders),
+        "broker_fill_count": len(fills),
+        "broker_position_count": len(positions),
+        "risk_reduction_priority": any(bool(item.details.get("riskReductionPriority")) for item in discrepancies),
+        "entries_paused": entries_paused,
+        "inventory_reconciled": not entries_paused,
+    }
     snapshot = inventory_repository.append_event(
         event_id=f"broker-reconciled-{_hash_payload({'at': reconciled_at, 'fills': applied_fill_ids, 'discrepancies': [item.discrepancy_id for item in discrepancies]})}",
         event_type=WeightedVotingInventoryEventType.BROKER_RECONCILED,
-        payload={"algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID, "discrepancy_count": len(discrepancies)},
+        payload={"algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID, "checkpoint": checkpoint_payload},
         occurred_at=reconciled_at,
         expected_snapshot_version=inventory_repository.current_snapshot(now=reconciled_at).snapshot_version,
     )
-    entries_paused = any(_severity_value(item.severity) == WeightedVotingReconciliationDiscrepancySeverity.PAUSE_ENTRIES.value for item in discrepancies)
     result = WeightedVotingBrokerReconciliationResult(
         algorithm_id=WEIGHTED_VOTING_ALGORITHM_ID,
         reconciled_at=reconciled_at,
@@ -240,7 +330,7 @@ def reconciliation_status() -> dict[str, Any]:
         "namespace": WEIGHTED_VOTING_BROKER_RECONCILIATION_NAMESPACE,
         "matchesBy": ("client_order_id", "algorithm_id"),
         "dailyTradeCountDefinition": "Weighted Voting daily trade count increments when a Weighted Voting position is closed, not when entry partial fills arrive.",
-        "unattributedBrokerActivityPolicy": "central_operations_review_not_weighted_voting_assignment",
+        "unattributedBrokerActivityPolicy": "pause_entries_for_unknown_or_unattributed_fills_without_weighted_voting_assignment",
         "reasonCodes": ("weighted_voting.broker_reconciliation.status.ready",),
     }
 
@@ -256,6 +346,58 @@ def _known_weighted_voting_client_orders(store: WeightedVotingStateStore) -> dic
         if client_order_id:
             known[client_order_id] = payload
     return known
+
+
+def _local_weighted_voting_intents(store: WeightedVotingStateStore) -> dict[str, dict[str, Any]]:
+    intents: dict[str, dict[str, Any]] = {}
+    for key, payload in _store_items(store):
+        if not (
+            key.startswith("weighted_voting.runtime.order_intents.")
+            or key.startswith("weighted_voting.execution_gateway.order_intent_index.")
+            or key.startswith("paper_order_gateway.intent.")
+        ):
+            continue
+        if str(payload.get("algorithmId") or payload.get("algorithm_id") or WEIGHTED_VOTING_ALGORITHM_ID) != WEIGHTED_VOTING_ALGORITHM_ID:
+            continue
+        order_intent_id = str(payload.get("orderIntentId") or payload.get("order_intent_id") or payload.get("orderIntentIdempotencyKey") or "")
+        if order_intent_id:
+            intents[order_intent_id] = payload
+    return intents
+
+
+def _local_weighted_voting_fills(store: WeightedVotingStateStore) -> dict[str, dict[str, Any]]:
+    fills: dict[str, dict[str, Any]] = {}
+    for key, payload in _store_items(store):
+        if not (
+            key.startswith("weighted_voting.execution_gateway.fills.")
+            or key.startswith("weighted_voting.broker_reconciliation.fills.")
+            or key.startswith("paper_order_gateway.fill.")
+        ):
+            continue
+        if str(payload.get("algorithmId") or payload.get("algorithm_id") or WEIGHTED_VOTING_ALGORITHM_ID) != WEIGHTED_VOTING_ALGORITHM_ID:
+            continue
+        fill_id = str(payload.get("fillId") or payload.get("fill_id") or key.rsplit(".", 1)[-1])
+        fills[fill_id] = payload
+    return fills
+
+
+def _quarantine_unknown_broker_order(store: WeightedVotingStateStore, order: WeightedVotingBrokerOrderObservation, *, reason: str) -> None:
+    payload = {
+        **_json_ready(asdict(order)),
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "quarantined": True,
+        "entriesPaused": True,
+        "reasonCodes": (reason,),
+    }
+    store.write_snapshot(
+        f"{WEIGHTED_VOTING_BROKER_RECONCILIATION_NAMESPACE}.quarantine.orders.{order.client_order_id}.{_hash_payload(payload)}",
+        payload,
+    )
+
+
+def _pnl_tolerance(position: WeightedVotingBrokerPositionObservation) -> float:
+    notional = abs(float(position.quantity) * float(position.average_entry_price))
+    return max(1.0, round(notional * 0.001, 10))
 
 
 def _persist_broker_order_lifecycle(store: WeightedVotingStateStore, order: WeightedVotingBrokerOrderObservation) -> None:

@@ -41,6 +41,7 @@ from .algorithms.wca.api import WCA_API_SERVICE, router as wca_router
 from .algorithms.wca.contracts import BacktestRunConfiguration
 from .algorithms.wca.research_jobs import WcaResearchJobType
 from .algorithms.wca.strategy_registry import assert_wca_module_catalog_valid
+from .algorithms.weighted_voting.api import control_router as weighted_voting_control_router
 from .algorithms.weighted_voting.api import router as weighted_voting_router
 from .algorithms.weighted_voting.runtime_supervisor import get_weighted_voting_runtime_supervisor
 from .api.v2 import router as api_v2_router
@@ -99,6 +100,7 @@ app.add_middleware(
 app.include_router(api_v2_router)
 app.include_router(voting_ensemble_router)
 app.include_router(weighted_voting_router)
+app.include_router(weighted_voting_control_router)
 app.include_router(wca_router)
 app.include_router(regime_router)
 app.include_router(session_router)

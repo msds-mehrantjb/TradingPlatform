@@ -27,6 +27,7 @@ WEIGHTED_VOTING_WEIGHT_ENGINE_VERSION = "weighted_voting_weight_engine_v3"
 WEIGHTED_VOTING_STRATEGY_IDS = tuple(entry.strategy_id for entry in WEIGHTED_VOTING_STRATEGY_CATALOG)
 WEIGHTED_VOTING_ACTIVE_VOTER_IDS = WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS
 WEIGHTED_VOTING_STRATEGY_FAMILIES = {entry.strategy_id: entry.family for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
+WEIGHTED_VOTING_AUTOMATIC_TRADING_MAX_STRATEGY_WEIGHT = 0.25
 WEIGHTED_VOTING_BASELINE_WEIGHTS = {
     strategy_id: (1.0 / len(WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS) if strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS else 0.0)
     for strategy_id in WEIGHTED_VOTING_STRATEGY_IDS
@@ -367,7 +368,13 @@ def apply_weight_controls(
         raw_weights[signal.strategy_id] = max(0.0, raw)
         pre_family_weights[signal.strategy_id] = max(0.0, raw)
 
-    final_weights = _normalize_with_strategy_and_family_caps(raw_weights, signals, active_config, enabled_ids)
+    final_weights = _normalize_with_strategy_and_family_caps(
+        raw_weights,
+        signals,
+        active_config,
+        enabled_ids,
+        maximum_strategy_weight=WEIGHTED_VOTING_AUTOMATIC_TRADING_MAX_STRATEGY_WEIGHT,
+    )
     adjusted_signals = tuple(signal.model_copy(update={"final_weight": final_weights.get(signal.strategy_id, 0.0)}) for signal in signals)
     adjustments = tuple(
         _adjustment_for(signal, original_weights, correlation_penalties, pre_family_weights, final_weights)
@@ -1008,12 +1015,17 @@ def _normalize_with_strategy_and_family_caps(
     signals: list[WeightedVotingSignal],
     config: WeightedVotingConfig,
     enabled_ids: set[str],
+    *,
+    maximum_strategy_weight: float | None = None,
 ) -> dict[str, float]:
     if not enabled_ids:
         return {signal.strategy_id: 0.0 for signal in signals}
 
     feasible_strategy_floor = 1.0 / len(enabled_ids)
-    max_strategy = max(max(0.0, min(1.0, config.maximum_strategy_weight)), feasible_strategy_floor)
+    configured_max_strategy = config.maximum_strategy_weight
+    if maximum_strategy_weight is not None:
+        configured_max_strategy = min(configured_max_strategy, maximum_strategy_weight)
+    max_strategy = max(max(0.0, min(1.0, configured_max_strategy)), feasible_strategy_floor)
     families = {signal.strategy_id: signal.family for signal in signals}
     enabled_family_count = len({families[strategy_id] for strategy_id in enabled_ids})
     feasible_family_floor = 1.0 / enabled_family_count if enabled_family_count else 1.0

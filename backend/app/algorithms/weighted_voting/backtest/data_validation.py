@@ -9,6 +9,7 @@ import json
 from math import isfinite
 
 from backend.app.algorithms.weighted_voting.market_snapshot import WeightedVotingCandle
+from backend.app.domain.exchange_calendar import ExchangeCalendarService
 
 
 WEIGHTED_VOTING_BACKTEST_DATA_VALIDATION_VERSION = "weighted_voting_backtest_data_validation_v2"
@@ -156,7 +157,7 @@ def _validate_timeframe(
         if session_date in market_holidays:
             warnings.append(f"weighted_voting.backtest.{timeframe}.holiday_data_present.{session_date.isoformat()}")
             continue
-        expected = EXPECTED_ONE_MINUTE_BARS if timeframe == "1m" else max(1, EXPECTED_ONE_MINUTE_BARS // _timeframe_minutes(timeframe))
+        expected = _expected_session_bars(session_date, timeframe)
         if count < expected:
             missing += expected - count
             if count < expected * 0.80:
@@ -187,6 +188,17 @@ def _regular_session_counts(candles: tuple[WeightedVotingCandle, ...]) -> dict[d
         if REGULAR_OPEN <= local.time() < REGULAR_CLOSE:
             counts[local.date()] = counts.get(local.date(), 0) + 1
     return counts
+
+
+def _expected_session_bars(session_date: date, timeframe: str) -> int:
+    try:
+        session = ExchangeCalendarService().session_for_date(session_date)
+        if session.can_trade and session.openTimestamp and session.closeTimestamp:
+            minutes = int((session.closeTimestamp - session.openTimestamp).total_seconds() // 60)
+            return max(1, minutes // _timeframe_minutes(timeframe))
+    except Exception:
+        pass
+    return EXPECTED_ONE_MINUTE_BARS if timeframe == "1m" else max(1, EXPECTED_ONE_MINUTE_BARS // _timeframe_minutes(timeframe))
 
 
 def _validate_corporate_actions(

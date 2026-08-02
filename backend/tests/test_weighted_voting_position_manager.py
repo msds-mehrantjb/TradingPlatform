@@ -94,6 +94,74 @@ class WeightedVotingPositionManagerTest(unittest.TestCase):
         self.assertIsNotNone(trade)
         self.assertTrue(supervisor.health()["entryCreationPausedForReconciliation"])
 
+    def test_manage_positions_once_exits_even_after_paper_button_off(self) -> None:
+        store = MemoryStore()
+        inventory = seeded_inventory(store)
+        position = seeded_position(inventory)
+        broker = FakeProtectionBroker()
+        manager = WeightedVotingPositionManagerService(store=store, inventory_repository=inventory, broker=broker)
+        manager.protect_position_on_entry_fill(position=position, effective_settings=settings(), entry_order_id=position.client_order_id, protected_at=NOW)
+        supervisor = WeightedVotingRuntimeSupervisor(
+            service=WeightedVotingService(store=store),
+            store=store,
+            config=WeightedVotingRuntimeConfig(heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
+            event_bus=WeightedVotingEventBus(maxsize=8),
+            inventory_repository=inventory,
+            position_manager=manager,
+        )
+        supervisor.update_runtime_control(
+            paper_trading_enabled=False,
+            automatic_entries_enabled=False,
+            updated_by="weighted_voting.test",
+            reason="weighted_voting.test.paper_button_off",
+        )
+        supervisor.metrics.last_bar_processed = {"close": 99.0, "ohlcv": {"close": 99.0}}
+
+        record = supervisor.manage_positions_once(trigger="paper_button_off_exit_check")
+
+        self.assertEqual(record["closedTradeCount"], 1)
+        self.assertEqual(broker.exit_count, 1)
+        self.assertTrue(supervisor.health()["automaticOrderCreationPaused"])
+
+    def test_partial_fill_protection_replacement_never_exceeds_owned_quantity(self) -> None:
+        store = MemoryStore()
+        inventory = seeded_inventory(store)
+        position = seeded_position(inventory)
+        broker = FakeProtectionBroker()
+        manager = WeightedVotingPositionManagerService(store=store, inventory_repository=inventory, broker=broker)
+        store.write_snapshot(
+            "weighted_voting.position_manager.protection.client-1",
+            {
+                "algorithm_id": "weighted_voting",
+                "client_order_id": "client-1",
+                "position_id": position.position_id,
+                "trade_id": "weighted_voting.trade.client-1",
+                "symbol": "SPY",
+                "side": "SELL",
+                "quantity": 15,
+                "stop_price": 98.0,
+                "target_price": 102.0,
+                "settings_version": "settings-test",
+                "settings_hash": "hash",
+                "broker_held_preferred": True,
+                "created_at": NOW.isoformat(),
+                "supporting_strategy_ids": (),
+            },
+        )
+
+        result = manager.ensure_position_protection(
+            position=position,
+            effective_settings=settings(),
+            entry_order_id=position.client_order_id,
+            protected_at=NOW + timedelta(seconds=1),
+        )
+
+        self.assertEqual(result["action"], "replaced")
+        self.assertEqual(result["protection"]["quantity"], abs(position.quantity))
+        self.assertLessEqual(result["protection"]["quantity"], abs(position.quantity))
+        self.assertTrue(result["mismatch"]["riskReductionPriority"])
+        self.assertEqual(broker.protective_count, 1)
+
     def test_other_algorithms_cannot_modify_weighted_voting_position_manager(self) -> None:
         foreign = WeightedVotingPosition(
             algorithm_id="weighted_voting",

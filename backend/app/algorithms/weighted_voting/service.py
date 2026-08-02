@@ -117,7 +117,7 @@ class WeightedVotingService:
             "status": "ready",
             "mode": "backtesting_and_paper_trading_only",
             "isolated": True,
-            "rollout": rollout_status(),
+            "rollout": rollout_status(store=self.store),
             "finalAcceptance": build_weighted_voting_final_acceptance_report(),
             "systemAcceptance": build_weighted_voting_system_acceptance_report(),
             "reasonCodes": (weighted_voting_reason_code("api.ready"),),
@@ -179,6 +179,19 @@ class WeightedVotingService:
         state = create_unseeded_equal_weight_state(timestamp=_now())
         self.store.write_snapshot(ACTIVE_WEIGHT_STATE_KEY, state.model_dump(mode="json"))
         return state
+
+    def _active_weight_state_read_only(self, timestamp: datetime) -> WeightedWeightState:
+        snapshot = _read_optional(self.store, ACTIVE_WEIGHT_STATE_KEY)
+        if snapshot:
+            state = WeightedWeightState.model_validate(snapshot)
+            if _active_weight_state_matches_catalog(state):
+                return state
+        return create_unseeded_equal_weight_state(timestamp=timestamp)
+
+    def _effective_settings_read_only(self, timestamp: datetime) -> Any:
+        if _read_optional(self.store, WEIGHTED_VOTING_SETTINGS_KEY):
+            return load_effective_settings(self.store)
+        return resolve_effective_settings(timestamp=timestamp)
 
     def weights_active(self) -> dict[str, Any]:
         state = self.active_weight_state()
@@ -249,26 +262,60 @@ class WeightedVotingService:
             "reasonCodes": state.reason_codes,
         }
 
-    def evaluate(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Evaluate from public/API market data without accepting safety overrides."""
+    def evaluate(self, context: WeightedVotingRuntimeContext) -> dict[str, Any]:
+        """Evaluate an execution-capable decision from an authoritative runtime context."""
+
+        if not isinstance(context, WeightedVotingRuntimeContext):
+            raise TypeError("WeightedVotingService.evaluate requires a WeightedVotingRuntimeContext; use evaluate_research_shadow for HTTP candle payloads")
+        return self.evaluate_context(context)
+
+    def evaluate_research_shadow(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate public/API candles in an isolated research store.
+
+        This path is never execution-capable. It does not enqueue orders, update
+        production inventory, or update production weights, and any request
+        supplied safety authority is ignored and audited.
+        """
 
         snapshot = build_weighted_voting_market_snapshot(payload)
-        active_weight_state = self.active_weight_state()
-        effective = load_effective_settings(self.store) if _read_optional(self.store, WEIGHTED_VOTING_SETTINGS_KEY) else resolve_effective_settings(timestamp=snapshot.data_timestamp)
+        active_weight_state = self._active_weight_state_read_only(snapshot.data_timestamp)
+        effective = self._effective_settings_read_only(snapshot.data_timestamp)
+        research_store = _InMemoryWeightedVotingStateStore()
+        research_store.write_snapshot(ACTIVE_WEIGHT_STATE_KEY, active_weight_state.model_dump(mode="json"))
+        research_store.write_snapshot(WEIGHTED_VOTING_SETTINGS_KEY, effective.model_dump(mode="json"))
+        research_service = WeightedVotingService(
+            config=self.config,
+            store=research_store,
+            central_risk_service=WeightedVotingUnavailableCentralGlobalRiskService(),
+        )
         context = WeightedVotingRuntimeContextBuilder(
             market_data_port=WeightedVotingStaticMarketDataPort(snapshot),
-            inventory_repository=WeightedVotingInventoryRepository(self.store, symbol=snapshot.symbol),
-            account_port=WeightedVotingUnavailableAccountPort(),
-            global_risk_port=WeightedVotingUnavailableGlobalRiskPort(),
+            inventory_repository=WeightedVotingInventoryRepository(research_store, symbol=snapshot.symbol, allocated_capital=0.0),
+            account_port=WeightedVotingUnavailableAccountPort(source_id="weighted_voting.research_shadow.account_unavailable"),
+            global_risk_port=WeightedVotingUnavailableGlobalRiskPort(source_id="weighted_voting.research_shadow.global_risk_unavailable"),
             effective_settings=effective,
             active_weight_state=active_weight_state,
             observed_at=snapshot.data_timestamp,
-            mode="production",
+            mode="research_shadow",
         ).build()
-        result = self.evaluate_context(context)
-        if payload_contains_forbidden_authoritative_evaluation_inputs(payload):
-            result["deprecatedIgnoredInputs"] = sorted(key for key in payload if payload_contains_forbidden_authoritative_evaluation_inputs({key: payload[key]}))
-            result["reasonCodes"] = tuple(dict.fromkeys((*result["reasonCodes"], "weighted_voting.runtime_context.http_safety_inputs_ignored")))
+        result = research_service.evaluate_context(context)
+        ignored_inputs = sorted(key for key in payload if payload_contains_forbidden_authoritative_evaluation_inputs({key: payload[key]}))
+        result["researchOnly"] = True
+        result["shadowOnly"] = True
+        result["productionStateMutated"] = False
+        result["ordersEnqueued"] = False
+        result["deprecatedIgnoredInputs"] = ignored_inputs
+        result["runtimeContext"]["mode"] = "research_shadow"
+        result["runtimeContext"]["productionStateMutated"] = False
+        result["reasonCodes"] = tuple(
+            dict.fromkeys(
+                (
+                    *result["reasonCodes"],
+                    "weighted_voting.research_shadow.evaluation_completed",
+                    *(("weighted_voting.runtime_context.http_safety_inputs_ignored",) if ignored_inputs else ()),
+                )
+            )
+        )
         return result
 
     def evaluate_replay_fixture(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -382,6 +429,21 @@ class WeightedVotingService:
             }
         )
         decision_payload = decision.model_dump(mode="json")
+        no_trade_reason_codes = _decision_no_trade_reason_codes(
+            decision=decision_payload,
+            local_gate_result=gate_result,
+            sizing_result=sizing,
+            global_gate_application=global_application,
+            weighted_global_response=weighted_global_response,
+            context_failure_reasons=context_failure_reasons,
+            global_validation_reasons=global_validation_reasons,
+        )
+        decision_payload.update(
+            {
+                "noTrade": bool(no_trade_reason_codes),
+                "noTradeReasonCodes": no_trade_reason_codes,
+            }
+        )
         self.store.write_snapshot(f"weighted_voting.decisions.{decision.decision_id}", decision_payload)
         self.store.write_snapshot(
             f"weighted_voting.signals.{decision.decision_id}",
@@ -431,6 +493,8 @@ class WeightedVotingService:
                 "contextVersion": context.context_version,
                 "manifestHash": context.manifest_hash,
                 "mode": context.mode,
+                "inventorySnapshotVersion": context.inventory_snapshot.snapshot_version,
+                "inventoryVersion": context.inventory_snapshot.inventory_version,
                 "failureReasonCodes": context_failure_reasons,
                 "sourceAttribution": {key: _json_ready(value) for key, value in context.source_attribution.items()},
             },
@@ -736,6 +800,60 @@ def _account_level_risk_observations(context: WeightedVotingRuntimeContext) -> d
     }
 
 
+def _decision_no_trade_reason_codes(
+    *,
+    decision: dict[str, Any],
+    local_gate_result: Any,
+    sizing_result: Any,
+    global_gate_application: Any,
+    weighted_global_response: Any,
+    context_failure_reasons: tuple[str, ...],
+    global_validation_reasons: tuple[str, ...],
+) -> tuple[str, ...]:
+    codes: list[str] = []
+    signal = _enum_value(decision.get("signal") or decision.get("proposed_side") or decision.get("proposedSide")).upper()
+    proposed_quantity = _coerce_int(decision.get("proposed_quantity", decision.get("proposedQuantity")))
+    globally_allowed_quantity = _coerce_int(getattr(global_gate_application, "globallyAllowedQuantity", None))
+    global_action = _enum_value(getattr(global_gate_application, "action", "")).upper()
+    local_permission = bool(getattr(local_gate_result, "permission_granted", False))
+
+    if signal == WeightedSide.HOLD.value:
+        codes.append("weighted_voting.decision.no_trade.hold_signal")
+    if proposed_quantity <= 0:
+        codes.append("weighted_voting.decision.no_trade.zero_proposed_quantity")
+        codes.extend(str(code) for code in getattr(sizing_result, "reason_codes", ()) or ())
+    if not local_permission:
+        codes.append("weighted_voting.decision.no_trade.local_gate_failed")
+        codes.extend(str(code) for code in getattr(local_gate_result, "reason_codes", ()) or ())
+    if context_failure_reasons:
+        codes.append("weighted_voting.decision.no_trade.runtime_context_failed")
+        codes.extend(str(code) for code in context_failure_reasons)
+    if global_action == "REJECT" or globally_allowed_quantity <= 0:
+        codes.append("weighted_voting.decision.no_trade.global_risk_blocked")
+        codes.extend(str(code) for code in getattr(global_gate_application, "rejectionReasons", ()) or ())
+        codes.extend(str(code) for code in getattr(weighted_global_response, "reason_codes", ()) or ())
+    if global_validation_reasons:
+        codes.append("weighted_voting.decision.no_trade.global_risk_validation_failed")
+        codes.extend(str(code) for code in global_validation_reasons)
+
+    if not codes:
+        return ()
+    return tuple(dict.fromkeys(codes or ["weighted_voting.decision.no_trade.reason_unavailable_fail_closed"]))
+
+
+def _coerce_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _enum_value(value: Any) -> str:
+    if isinstance(value, Enum):
+        return str(value.value)
+    return str(value)
+
+
 def _backtest_summary(result: WeightedBacktestResult) -> dict[str, Any]:
     return {
         "run": result.run.model_dump(mode="json"),
@@ -757,6 +875,19 @@ def _backtest_payload(result: WeightedBacktestResult) -> dict[str, Any]:
         "strategyPerformance": {key: _json_ready(value) for key, value in result.strategy_results.items()},
         "historicalOutcomes": [_json_ready(outcome) for outcome in result.historical_outcomes],
     }
+
+
+class _InMemoryWeightedVotingStateStore:
+    def __init__(self) -> None:
+        self.snapshots: dict[str, dict] = {}
+
+    def read_snapshot(self, key: str) -> dict:
+        if key not in self.snapshots:
+            raise KeyError(key)
+        return self.snapshots[key]
+
+    def write_snapshot(self, key: str, snapshot: dict) -> None:
+        self.snapshots[key] = snapshot
 
 
 def _read_optional(store: WeightedVotingStateStore, key: str) -> dict | None:

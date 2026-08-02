@@ -87,6 +87,44 @@ class WeightedVotingInventoryTest(unittest.TestCase):
         self.assertEqual(second_id_same_position.realised_pnl, 0.0)
         self.assertEqual(first.as_dict(), repeated.as_dict())
 
+    def test_inventory_snapshot_exposes_authoritative_subledger_fields(self) -> None:
+        store = MemoryStore()
+        repo = initialized_repo(store)
+        snapshot = repo.current_snapshot()
+        snapshot = repo.append_event(
+            event_id="subledger-reserve",
+            event_type=WeightedVotingInventoryEventType.ORDER_RESERVED,
+            payload=pending_order_payload(reserved_buying_power=1_000.0),
+            occurred_at=NOW + timedelta(seconds=1),
+            expected_snapshot_version=snapshot.snapshot_version,
+        )
+        snapshot = repo.append_event(
+            event_id="subledger-partial-fill",
+            event_type=WeightedVotingInventoryEventType.FILL_RECORDED,
+            payload=position_payload(quantity=4, average_entry_price=100.0),
+            occurred_at=NOW + timedelta(seconds=2),
+            expected_snapshot_version=snapshot.snapshot_version,
+        )
+
+        self.assertEqual(snapshot.algorithm_id, "weighted_voting")
+        self.assertEqual(snapshot.allocated_capital, 25_000.0)
+        self.assertEqual(snapshot.reserved_buying_power, 600.0)
+        self.assertEqual(snapshot.consumed_capital, 400.0)
+        self.assertEqual(snapshot.remaining_capital_partition, 24_000.0)
+        self.assertEqual(snapshot.daily_loss, 0.0)
+        self.assertEqual(snapshot.gross_exposure, 400.0)
+        self.assertEqual(snapshot.net_exposure, 400.0)
+        self.assertEqual(len(snapshot.open_positions), 1)
+        self.assertEqual(snapshot.open_positions[0].average_entry_price, 100.0)
+        self.assertEqual(len(snapshot.individual_lots), 1)
+        self.assertEqual(snapshot.individual_lots[0].algorithm_id, "weighted_voting")
+        self.assertEqual(snapshot.individual_lots[0].remaining_quantity, 4)
+        self.assertEqual(len(snapshot.pending_orders), 1)
+        self.assertEqual(len(snapshot.working_orders), 1)
+        self.assertEqual(len(snapshot.partially_filled_orders), 1)
+        self.assertEqual(snapshot.partially_filled_orders[0].filled_quantity, 4)
+        self.assertEqual(snapshot.partially_filled_orders[0].status, "PARTIALLY_FILLED")
+
     def test_daily_trade_count_and_loss_are_calculated_from_weighted_records(self) -> None:
         store = MemoryStore()
         repo = initialized_repo(store)

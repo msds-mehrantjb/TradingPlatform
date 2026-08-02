@@ -8,6 +8,7 @@ from backend.app.algorithms.weighted_voting.rollout import (
     ROLLOUT_AUDIT_PREFIX,
     ROLLOUT_EVIDENCE_PREFIX,
     ROLLOUT_STATE_KEY,
+    ROLLOUT_VALIDATION_KEY,
     ROLLBACK_STATE_KEY,
     WEIGHTED_VOTING_AUTO_SUBMIT_ENABLED,
     WEIGHTED_VOTING_DYNAMIC_INCREASE_ENABLED,
@@ -25,6 +26,8 @@ from backend.app.algorithms.weighted_voting.rollout import (
     evaluate_controlled_rollout_promotion,
     evaluate_rollout_stage,
     evaluate_weighted_voting_rollout_control,
+    load_persisted_rollout_validation,
+    persist_rollout_validation_record,
     promote_controlled_rollout_stage,
     record_valid_rollout_state,
     rollback_controlled_rollout_stage,
@@ -87,7 +90,7 @@ class WeightedVotingRolloutTest(unittest.TestCase):
                 "emergency_disabled",
             ),
         )
-        validated_flags = WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=True, auto_submit_enabled=True)
+        validated_flags = WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=False, auto_submit_enabled=True)
         validated = fully_validated_rollout()
 
         disabled = evaluate_weighted_voting_rollout_control("disabled", flags=validated_flags, validation=validated)
@@ -110,7 +113,7 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertFalse(emergency.trading_allowed)
 
     def test_disabling_other_algorithm_does_not_disable_weighted_voting(self) -> None:
-        flags = WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=True, auto_submit_enabled=True)
+        flags = WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=False, auto_submit_enabled=True)
         validation = fully_validated_rollout()
 
         control = evaluate_weighted_voting_rollout_control(
@@ -144,7 +147,7 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertFalse(self_disabled.trading_allowed)
 
     def test_stages_require_prior_acceptance_metrics_before_enablement(self) -> None:
-        flags = WeightedVotingRolloutFlags(v2_enabled=True, shadow_mode=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=True, auto_submit_enabled=True)
+        flags = WeightedVotingRolloutFlags(v2_enabled=True, shadow_mode=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=False, auto_submit_enabled=True)
         validation = WeightedVotingRolloutValidation(backend_shadow_passed=True)
 
         shadow = evaluate_rollout_stage("shadow_comparison", flags=flags, validation=validation)
@@ -165,12 +168,12 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         )
         automatic_blocked = evaluate_rollout_stage(
             "automatic_paper_submission",
-            flags=WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=True, auto_submit_enabled=False),
+            flags=WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=False, auto_submit_enabled=False),
             validation=validation,
         )
         automatic_enabled = evaluate_rollout_stage(
             "automatic_paper_submission",
-            flags=WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=True, auto_submit_enabled=True),
+            flags=WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=False, auto_submit_enabled=True),
             validation=validation,
         )
 
@@ -180,7 +183,7 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertTrue(automatic_enabled.enabled)
 
     def test_live_trading_blocks_every_stage_even_when_flags_and_metrics_pass(self) -> None:
-        flags = WeightedVotingRolloutFlags(v2_enabled=True, shadow_mode=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=True, auto_submit_enabled=True)
+        flags = WeightedVotingRolloutFlags(v2_enabled=True, shadow_mode=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=False, auto_submit_enabled=True)
         validation = fully_validated_rollout(live_trading_enabled=True)
 
         for stage in ROLLOUT_STAGES:
@@ -191,7 +194,7 @@ class WeightedVotingRolloutTest(unittest.TestCase):
 
     def test_rollout_status_reports_all_stages_and_auto_permission(self) -> None:
         status = rollout_status(
-            flags=WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=True, auto_submit_enabled=True),
+            flags=WeightedVotingRolloutFlags(v2_enabled=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=False, auto_submit_enabled=True),
             validation=fully_validated_rollout(),
         )
 
@@ -199,6 +202,58 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertEqual(len(status["stages"]), len(ROLLOUT_STAGES))
         self.assertTrue(status["automatic_submission_allowed"])
         self.assertFalse(status["live_trading_allowed"])
+
+    def test_automatic_submission_requires_persisted_backend_validation_and_env_flag(self) -> None:
+        store = MemoryStore()
+        flags = WeightedVotingRolloutFlags(v2_enabled=True, shadow_mode=False, dynamic_reduction_enabled=True, dynamic_increase_enabled=False, auto_submit_enabled=True)
+        store.write_snapshot(
+            ROLLOUT_STATE_KEY,
+            {
+                "algorithm_id": "weighted_voting",
+                "rollout_version": "weighted_voting_rollout_v2",
+                "stage": "automatic_paper_small_allocation",
+                "status": "valid",
+                "automatic_paper_submission_allowed": True,
+            },
+        )
+
+        missing = automatic_submission_allowed(flags=flags, store=store)
+        record = persist_rollout_validation_record(
+            store,
+            fully_validated_rollout(),
+            source_authority="backend.weighted_voting.validation_worker",
+            approved_by="ops-user",
+            recorded_at=NOW,
+        )
+        allowed = automatic_submission_allowed(flags=flags, store=store)
+        env_blocked = automatic_submission_allowed(flags=WeightedVotingRolloutFlags(v2_enabled=True, auto_submit_enabled=False), store=store)
+
+        self.assertFalse(missing)
+        self.assertTrue(allowed)
+        self.assertFalse(env_blocked)
+        self.assertEqual(store.snapshots[ROLLOUT_VALIDATION_KEY]["validation_record_id"], record["validation_record_id"])
+        self.assertTrue(load_persisted_rollout_validation(store).persisted_operator_approval)
+
+    def test_dynamic_increase_validation_is_not_required_for_auto_paper(self) -> None:
+        validation = fully_validated_rollout()
+        validation = WeightedVotingRolloutValidation(**{**validation.model_dump(), "dynamic_increase_validated": False})
+        flags = WeightedVotingRolloutFlags(v2_enabled=True, shadow_mode=False, dynamic_reduction_enabled=True, dynamic_increase_enabled=False, auto_submit_enabled=True)
+
+        status = evaluate_rollout_stage("automatic_paper_submission", flags=flags, validation=validation)
+
+        self.assertTrue(status.enabled)
+
+    def test_frontend_cannot_mark_rollout_validation_passed(self) -> None:
+        store = MemoryStore()
+
+        with self.assertRaises(ValueError):
+            persist_rollout_validation_record(
+                store,
+                fully_validated_rollout(),
+                source_authority="frontend.react.button",
+                approved_by="ops-user",
+                recorded_at=NOW,
+            )
 
     def test_rollback_restores_previous_valid_rollout_state(self) -> None:
         store = MemoryStore()
@@ -396,6 +451,14 @@ def fully_validated_rollout(*, live_trading_enabled: bool = False) -> WeightedVo
         manual_paper_submission_validated=True,
         tests_passed=True,
         paper_validations_passed=True,
+        paper_broker_e2e_validated=True,
+        reconciliation_validated=True,
+        restart_recovery_validated=True,
+        persisted_operator_approval=True,
+        validation_record_id="weighted_voting.rollout.validation.test",
+        source_authority="backend.weighted_voting.test_validation_worker",
+        approved_by="ops-user",
+        recorded_at=NOW.isoformat(),
         live_trading_enabled=live_trading_enabled,
     )
 

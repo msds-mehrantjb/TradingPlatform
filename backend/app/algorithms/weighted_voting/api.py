@@ -18,11 +18,13 @@ from backend.app.algorithms.weighted_voting.runtime_supervisor import get_weight
 from backend.app.algorithms.weighted_voting.service import WeightedVotingService
 
 router = APIRouter(prefix=WEIGHTED_VOTING_API_NAMESPACE, tags=[WEIGHTED_VOTING_API_TAG])
+control_router = APIRouter(prefix="/api/algorithms/weighted-voting", tags=[WEIGHTED_VOTING_API_TAG])
 WEIGHTED_VOTING_API_SERVICE = WeightedVotingService()
 WEIGHTED_VOTING_API_INVENTORY = (
     ("GET", "/status"),
     ("GET", "/config"),
     ("PUT", "/config"),
+    ("POST", "/research/evaluate"),
     ("POST", "/evaluate"),
     ("GET", "/decisions/{decision_id}"),
     ("GET", "/signals/{decision_id}"),
@@ -45,6 +47,8 @@ WEIGHTED_VOTING_API_INVENTORY = (
     ("GET", "/trades"),
     ("GET", "/observability/{decision_id}"),
     ("GET", "/runtime/status"),
+    ("GET", "/runtime/control"),
+    ("PUT", "/runtime/control"),
     ("POST", "/runtime/pause"),
     ("POST", "/runtime/resume"),
     ("POST", "/runtime/pause-new-entries"),
@@ -160,6 +164,12 @@ class WeightedVotingRuntimeResumeEntriesRequest(WeightedVotingRuntimeAdminReques
     validation_passed: bool = True
 
 
+class WeightedVotingRuntimeControlRequest(WeightedVotingRuntimeAdminRequest):
+    paper_trading_enabled: bool
+    automatic_entries_enabled: bool | None = None
+    expected_version: int | None = Field(default=None, ge=1)
+
+
 class WeightedVotingRuntimeStrategyStateRequest(WeightedVotingRuntimeAdminRequest):
     runtime_state: str = Field(pattern=r"^(shadow|disabled)$")
 
@@ -194,13 +204,24 @@ def router_status() -> dict[str, Any]:
 
 
 @router.post(
+    "/research/evaluate",
+    responses={400: {"model": WeightedVotingErrorResponse}},
+    summary="Research/shadow evaluate Weighted Voting",
+    description="Research-only Weighted Voting evaluation from market candles. This endpoint never enqueues orders and never mutates production inventory, weights, or runtime decisions.",
+)
+def research_evaluate(payload: WeightedVotingEvaluateRequest) -> dict[str, Any]:
+    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.evaluate_research_shadow(payload.model_dump(mode="json")))
+
+
+@router.post(
     "/evaluate",
     responses={400: {"model": WeightedVotingErrorResponse}},
-    summary="Evaluate Weighted Voting",
-    description="Evaluate the backend-authoritative Weighted Voting algorithm from market candles only; inventory and safety state are loaded from backend runtime-context ports.",
+    summary="Deprecated research/shadow evaluate Weighted Voting",
+    description="Deprecated compatibility alias for /api/weighted-voting/research/evaluate. It is research-only, never enqueues orders, and never mutates production runtime state.",
+    deprecated=True,
 )
 def evaluate(payload: WeightedVotingEvaluateRequest) -> dict[str, Any]:
-    return _call(lambda: WEIGHTED_VOTING_API_SERVICE.evaluate(payload.model_dump(mode="json")))
+    return research_evaluate(payload)
 
 
 @router.get("/status", summary="Weighted Voting status", description="Return isolated Weighted Voting API and service status.")
@@ -216,8 +237,28 @@ def runtime_status() -> dict[str, Any]:
     return {
         "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
         "runtimeContract": runtime_supervisor_status(),
+        "control": supervisor.runtime_control(),
         "health": supervisor.health(),
     }
+
+
+@router.get("/runtime/control", summary="Weighted Voting runtime paper control", description="Return the backend-authoritative Weighted Voting paper control record.")
+def runtime_control() -> dict[str, Any]:
+    return get_weighted_voting_runtime_supervisor().runtime_control()
+
+
+@router.put("/runtime/control", summary="Update Weighted Voting runtime paper control", description="Persist and audit backend-authoritative Weighted Voting paper trading control.")
+def runtime_control_update(payload: WeightedVotingRuntimeControlRequest) -> dict[str, Any]:
+    result = get_weighted_voting_runtime_supervisor().update_runtime_control(
+        paper_trading_enabled=payload.paper_trading_enabled,
+        automatic_entries_enabled=payload.automatic_entries_enabled,
+        updated_by=payload.actor,
+        reason=payload.reason,
+        expected_version=payload.expected_version,
+    )
+    if result.get("status") == "version_conflict":
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 @router.post("/runtime/pause", summary="Pause Weighted Voting runtime", description="Administrative pause for automatic background processing controls.")
@@ -306,6 +347,31 @@ def runtime_emergency_flatten(payload: WeightedVotingRuntimeAdminRequest | None 
         "health": supervisor.health(),
         "reasonCodes": ("weighted_voting.runtime.api.emergency_flatten",),
     }
+
+
+@control_router.get("/runtime/status", summary="Weighted Voting runtime status")
+def algorithms_runtime_status() -> dict[str, Any]:
+    return runtime_status()
+
+
+@control_router.get("/runtime/control", summary="Weighted Voting runtime paper control")
+def algorithms_runtime_control() -> dict[str, Any]:
+    return runtime_control()
+
+
+@control_router.put("/runtime/control", summary="Update Weighted Voting runtime paper control")
+def algorithms_runtime_control_update(payload: WeightedVotingRuntimeControlRequest) -> dict[str, Any]:
+    return runtime_control_update(payload)
+
+
+@control_router.post("/runtime/reconcile", summary="Force Weighted Voting reconciliation")
+def algorithms_runtime_force_reconciliation(payload: WeightedVotingRuntimeAdminRequest | None = Body(default=None)) -> dict[str, Any]:
+    return runtime_force_reconciliation(payload)
+
+
+@control_router.post("/runtime/emergency-flatten", summary="Request Weighted Voting emergency flatten")
+def algorithms_runtime_emergency_flatten(payload: WeightedVotingRuntimeAdminRequest | None = Body(default=None)) -> dict[str, Any]:
+    return runtime_emergency_flatten(payload)
 
 
 @router.get("/config", summary="Get Weighted Voting config", description="Return backend-authoritative Weighted Voting settings/configuration.")

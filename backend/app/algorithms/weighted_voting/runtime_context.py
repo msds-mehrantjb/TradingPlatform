@@ -39,12 +39,27 @@ FORBIDDEN_AUTHORITATIVE_EVALUATION_INPUTS = frozenset(
     {
         "current_position",
         "currentPosition",
+        "position",
+        "open_position",
+        "openPosition",
         "daily_pnl",
         "dailyPnl",
+        "daily_loss",
+        "dailyLoss",
         "daily_trade_count",
         "dailyTradeCount",
+        "account_equity",
+        "accountEquity",
+        "buying_power",
+        "buyingPower",
+        "available_buying_power",
+        "availableBuyingPower",
+        "algorithm_capital_available",
+        "algorithmCapitalAvailable",
         "remaining_algorithm_risk",
         "remainingAlgorithmRisk",
+        "remaining_daily_risk",
+        "remainingDailyRisk",
         "remaining_weighted_daily_risk",
         "remainingWeightedDailyRisk",
         "remaining_weighted_capital_partition",
@@ -59,8 +74,24 @@ FORBIDDEN_AUTHORITATIVE_EVALUATION_INPUTS = frozenset(
         "globalMaxShares",
         "session_allowed",
         "sessionAllowed",
+        "exchange_session_open",
+        "exchangeSessionOpen",
+        "trading_session_allowed",
+        "tradingSessionAllowed",
+        "five_minute_alignment",
+        "fiveMinuteAlignment",
         "global_gate_response",
         "globalGateResponse",
+        "global_risk_approval",
+        "globalRiskApproval",
+        "global_gate_application",
+        "globalGateApplication",
+        "paper_trading_enabled",
+        "paperTradingEnabled",
+        "automatic_entries_enabled",
+        "automaticEntriesEnabled",
+        "paper_toggle_state",
+        "paperToggleState",
     }
 )
 
@@ -189,6 +220,12 @@ class WeightedVotingGlobalRiskState:
     reason_codes: tuple[str, ...] = ()
 
 
+PaperAccountSnapshot = WeightedVotingReadOnlyAccountObservation
+ExchangeSessionState = WeightedVotingExchangeSessionState
+ExecutionCostEstimate = WeightedVotingExecutionCostEstimate
+GlobalRiskCapacity = WeightedVotingGlobalRiskState
+
+
 @dataclass(frozen=True)
 class WeightedVotingRuntimeContext:
     finalised_one_minute_market_snapshot: WeightedMarketSnapshot
@@ -218,7 +255,7 @@ class WeightedVotingRuntimeContext:
     context_version: str = WEIGHTED_VOTING_RUNTIME_CONTEXT_VERSION
     manifest_hash: str = ""
     source_attribution: dict[str, WeightedVotingRuntimeFieldSource] = field(default_factory=dict)
-    mode: Literal["production", "replay_fixture", "test_fixture"] = "production"
+    mode: Literal["production", "research_shadow", "replay_fixture", "test_fixture"] = "production"
     previous_market_condition: WeightedMarketCondition | None = None
 
     def __post_init__(self) -> None:
@@ -242,6 +279,54 @@ class WeightedVotingRuntimeContext:
     @property
     def global_risk_service_availability(self) -> bool:
         return self.global_risk_state.service_available
+
+    @property
+    def market_snapshot(self) -> WeightedMarketSnapshot:
+        return self.finalised_one_minute_market_snapshot
+
+    @property
+    def paper_account_snapshot(self) -> PaperAccountSnapshot:
+        account_source = self.source_attribution.get("read_only_account_equity")
+        observed_at = account_source.observed_at if account_source is not None else self.finalised_one_minute_market_snapshot.data_timestamp
+        source_id = account_source.source_id if account_source is not None else "weighted_voting.runtime_context.account_source_unknown"
+        return WeightedVotingReadOnlyAccountObservation(
+            account_equity=self.read_only_account_equity,
+            broker_buying_power=self.read_only_broker_buying_power,
+            observed_at=observed_at,
+            source_id=source_id,
+            available=self.read_only_account_equity is not None and self.read_only_broker_buying_power is not None,
+            reason_codes=("weighted_voting.runtime_context.paper_account_snapshot_alias",),
+        )
+
+    @property
+    def session_state(self) -> ExchangeSessionState:
+        return self.exchange_session_state
+
+    @property
+    def cost_estimate(self) -> ExecutionCostEstimate:
+        cost_source = self.source_attribution.get("estimated_slippage")
+        observed_at = cost_source.observed_at if cost_source is not None else self.finalised_one_minute_market_snapshot.data_timestamp
+        source_id = cost_source.source_id if cost_source is not None else "weighted_voting.runtime_context.cost_source_unknown"
+        return WeightedVotingExecutionCostEstimate(
+            slippage_per_share=self.estimated_slippage,
+            fee_per_share=self.estimated_fees,
+            observed_at=observed_at,
+            source_id=source_id,
+            available=self.estimated_slippage is not None and self.estimated_fees is not None,
+            reason_codes=("weighted_voting.runtime_context.cost_estimate_alias",),
+        )
+
+    @property
+    def settings(self) -> WeightedEffectiveSettings:
+        return self.effective_settings
+
+    @property
+    def weight_state(self) -> WeightedWeightState:
+        return self.active_weight_state
+
+    @property
+    def global_risk_capacity(self) -> GlobalRiskCapacity:
+        return self.global_risk_state
 
     def context_failure_reason_codes(self, *, stale_after_seconds: int) -> tuple[str, ...]:
         reasons: list[str] = []
@@ -386,9 +471,10 @@ class WeightedVotingRuntimeContextBuilder:
     effective_settings: WeightedEffectiveSettings
     active_weight_state: WeightedWeightState
     observed_at: datetime
-    mode: Literal["production", "replay_fixture", "test_fixture"] = "production"
+    mode: Literal["production", "research_shadow", "replay_fixture", "test_fixture"] = "production"
     cost_estimate: WeightedVotingExecutionCostEstimate | None = None
     event_risk_state: WeightedVotingEventRiskState | None = None
+    exchange_session_state: WeightedVotingExchangeSessionState | None = None
     previous_market_condition: WeightedMarketCondition | None = None
     market_condition: WeightedMarketCondition | None = None
 
@@ -400,7 +486,7 @@ class WeightedVotingRuntimeContextBuilder:
         condition = self.market_condition or classify_market_condition(snapshot, previous_condition=self.previous_market_condition)
         data_quality = _data_quality_state(snapshot)
         completed_five_minute = _completed_explicit_five_minute_candles(snapshot)
-        session_state = WeightedVotingExchangeSessionState(
+        session_state = self.exchange_session_state or WeightedVotingExchangeSessionState(
             session_date=_session_date(snapshot),
             session_phase=snapshot.session_phase,
             session_allowed=_session_allowed(snapshot),
@@ -672,6 +758,10 @@ __all__ = [
     "WeightedVotingStaticMarketDataPort",
     "WeightedVotingUnavailableAccountPort",
     "WeightedVotingUnavailableGlobalRiskPort",
+    "PaperAccountSnapshot",
+    "ExchangeSessionState",
+    "ExecutionCostEstimate",
+    "GlobalRiskCapacity",
     "payload_contains_forbidden_authoritative_evaluation_inputs",
     "runtime_context_status",
 ]

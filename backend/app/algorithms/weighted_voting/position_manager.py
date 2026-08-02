@@ -207,6 +207,89 @@ class WeightedVotingPositionManagerService:
             restored.append(self.protect_position_on_entry_fill(position=position, effective_settings=settings, entry_order_id=position.client_order_id, protected_at=restored_at))
         return tuple(restored)
 
+    def ensure_position_protection(
+        self,
+        *,
+        position: WeightedVotingPosition,
+        effective_settings: WeightedEffectiveSettings,
+        entry_order_id: str,
+        protected_at: datetime,
+        supporting_strategy_ids: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        _require_weighted_voting(position.algorithm_id)
+        owned_quantity = abs(int(position.quantity))
+        if owned_quantity <= 0:
+            raise ValueError("Weighted Voting protective quantity requires an owned position")
+        payload = _read_optional(self.store, _protection_key(position.client_order_id))
+        if not payload:
+            instruction = self.protect_position_on_entry_fill(
+                position=position,
+                effective_settings=effective_settings,
+                entry_order_id=entry_order_id,
+                supporting_strategy_ids=supporting_strategy_ids,
+                protected_at=protected_at,
+            )
+            return {
+                "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+                "action": "created",
+                "protection": instruction.as_dict(),
+                "mismatch": None,
+                "reasonCodes": ("weighted_voting.position_manager.missing_protection_created",),
+            }
+        existing_quantity = int(_payload_get(payload, "quantity", "quantity") or 0)
+        existing_stop = float(_payload_get(payload, "stop_price", "stopPrice") or 0.0)
+        existing_target = float(_payload_get(payload, "target_price", "targetPrice") or 0.0)
+        desired_stop = _fallback_stop(position, effective_settings)
+        desired_target = position.average_entry_price + (position.average_entry_price - desired_stop) * effective_settings.target_r if position.quantity > 0 else position.average_entry_price - (desired_stop - position.average_entry_price) * effective_settings.target_r
+        replacement_required = (
+            existing_quantity != owned_quantity
+            or existing_quantity > owned_quantity
+            or existing_stop <= 0
+            or existing_target <= 0
+            or _protection_would_increase_risk(position, existing_stop, desired_stop)
+        )
+        if not replacement_required:
+            return {
+                "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+                "action": "unchanged",
+                "protection": payload,
+                "mismatch": None,
+                "reasonCodes": ("weighted_voting.position_manager.protection_current",),
+            }
+        replacement = self.protect_position_on_entry_fill(
+            position=position,
+            effective_settings=effective_settings,
+            entry_order_id=entry_order_id,
+            stop_price=desired_stop,
+            target_price=desired_target,
+            supporting_strategy_ids=supporting_strategy_ids,
+            protected_at=protected_at,
+        )
+        mismatch = {
+            "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+            "clientOrderId": position.client_order_id,
+            "positionId": position.position_id,
+            "existingQuantity": existing_quantity,
+            "ownedQuantity": owned_quantity,
+            "replacementQuantity": replacement.quantity,
+            "existingStop": existing_stop,
+            "replacementStop": replacement.stop_price,
+            "riskReductionPriority": existing_quantity > owned_quantity or existing_quantity <= 0,
+            "recordedAt": protected_at.isoformat(),
+            "reasonCodes": ("weighted_voting.position_manager.protective_order_replaced",),
+        }
+        self.store.write_snapshot(
+            f"{WEIGHTED_VOTING_POSITION_MANAGER_NAMESPACE}.protective_replacements.{position.client_order_id}.{_hash_payload(mismatch)}",
+            mismatch,
+        )
+        return {
+            "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+            "action": "replaced",
+            "protection": replacement.as_dict(),
+            "mismatch": mismatch,
+            "reasonCodes": ("weighted_voting.position_manager.protection_replaced",),
+        }
+
     def monitor_position(
         self,
         *,
@@ -343,6 +426,14 @@ def _fallback_stop(position: WeightedVotingPosition, settings: WeightedEffective
     return position.average_entry_price - distance if position.quantity > 0 else position.average_entry_price + distance
 
 
+def _protection_would_increase_risk(position: WeightedVotingPosition, existing_stop: float, desired_stop: float) -> bool:
+    if existing_stop <= 0:
+        return True
+    if position.quantity > 0:
+        return existing_stop < desired_stop
+    return existing_stop > desired_stop
+
+
 def _trade_id(client_order_id: str) -> str:
     return f"weighted_voting.trade.{client_order_id}"
 
@@ -395,6 +486,10 @@ def _datetime_value(value: Any) -> datetime:
 def _require_weighted_voting(algorithm_id: str) -> None:
     if algorithm_id != WEIGHTED_VOTING_ALGORITHM_ID:
         raise ValueError("Weighted Voting position manager rejects foreign position mutation")
+
+
+def _hash_payload(value: Any) -> str:
+    return hashlib.sha256(json.dumps(_json_ready(value), sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
 
 
 def _json_ready(value: Any) -> Any:

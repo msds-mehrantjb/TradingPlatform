@@ -30,6 +30,7 @@ from backend.app.algorithms.weighted_voting.strategies.common import average_tru
 
 
 WEIGHTED_VOTING_DECISION_KERNEL_VERSION = "weighted_voting_decision_kernel_v1"
+MISSING_RUNTIME_COST_RETURN = 1_000_000.0
 SignalEvaluator = Callable[[WeightedMarketSnapshot, WeightedVotingConfig | None, Any, WeightedMarketCondition | None], list[WeightedVotingSignal] | tuple[WeightedVotingSignal, ...]]
 
 
@@ -73,7 +74,14 @@ class WeightedVotingDecisionKernel:
         condition = classify_market_condition(snapshot, config=active_config, previous_condition=context.previous_market_condition)
         effective = settings_resolver.resolve(condition, timestamp=snapshot.data_timestamp) if settings_resolver is not None else context.effective_settings
         decision_config = _config_with_effective_settings(active_config, effective)
-        context_failure_reasons = context.context_failure_reason_codes(stale_after_seconds=effective.stale_data_threshold_seconds)
+        context_failure_reasons = tuple(
+            dict.fromkeys(
+                (
+                    *context.context_failure_reason_codes(stale_after_seconds=effective.stale_data_threshold_seconds),
+                    *_missing_authoritative_runtime_input_reason_codes(context),
+                )
+            )
+        )
         if settings_resolver is None and effective.expiration_timestamp is not None and effective.expiration_timestamp <= snapshot.data_timestamp:
             context_failure_reasons = tuple(
                 dict.fromkeys(
@@ -115,7 +123,7 @@ class WeightedVotingDecisionKernel:
                 market_snapshot=snapshot,
                 five_minute_alignment=alignment if decision.signal in (WeightedSide.BUY.value, WeightedSide.SELL.value) else WeightedFiveMinuteAlignment.UNAVAILABLE,
                 expected_value_after_costs=expected_value_after_costs,
-                spread_cost=_spread(snapshot),
+                spread_cost=_spread_cost(snapshot),
                 slippage_cost=_normalized_slippage_cost(snapshot, context),
                 fee_cost=_normalized_fee_cost(snapshot, context),
                 atr_percent=_atr_percent(snapshot),
@@ -123,7 +131,7 @@ class WeightedVotingDecisionKernel:
                 session_allowed=context.exchange_session_state.session_allowed is True,
                 weighted_daily_loss_percent=inventory.daily_loss_percent,
                 weighted_daily_trade_count=context.algorithm_daily_trade_count,
-                capital_available=float(context.remaining_algorithm_capital_partition or 0.0),
+                capital_available=_required_positive_float(context.remaining_algorithm_capital_partition),
                 current_position=context.current_position,
                 remaining_weighted_capital_partition=context.remaining_algorithm_capital_partition,
                 data_timestamp=snapshot.data_timestamp,
@@ -135,15 +143,15 @@ class WeightedVotingDecisionKernel:
                 decision=decision,
                 effective_settings=effective,
                 market_snapshot=snapshot,
-                account_equity=float(context.read_only_account_equity or 0.0),
-                available_buying_power=float(context.read_only_broker_buying_power or 0.0),
-                remaining_weighted_daily_risk=float(context.remaining_algorithm_daily_risk or 0.0),
-                remaining_weighted_capital_partition=float(context.remaining_algorithm_capital_partition or 0.0),
-                global_available_risk=float(context.global_risk_state.global_available_risk or 0.0),
-                global_max_shares=int(context.global_risk_state.global_max_shares or 0),
+                account_equity=_required_positive_float(context.read_only_account_equity),
+                available_buying_power=_required_positive_float(context.read_only_broker_buying_power),
+                remaining_weighted_daily_risk=_required_positive_float(context.remaining_algorithm_daily_risk),
+                remaining_weighted_capital_partition=_required_positive_float(context.remaining_algorithm_capital_partition),
+                global_available_risk=_required_positive_float(context.global_risk_state.global_available_risk),
+                global_max_shares=_required_positive_int(context.global_risk_state.global_max_shares),
                 structural_invalidation_price=_structural_invalidation(signals, decision.proposed_side),
                 atr=average_true_range(snapshot.one_minute_candles, 14),
-                slippage_per_share=float(context.estimated_slippage or 0.0),
+                slippage_per_share=_required_non_negative_float(context.estimated_slippage),
                 current_one_minute_volume=snapshot.one_minute_candles[-1].volume,
                 average_one_minute_volume=average_volume(snapshot.one_minute_candles, 20),
                 local_gate_result=gate_result,
@@ -367,23 +375,29 @@ def _expected_value_after_costs(
     directional = [signal.expected_return_after_costs for signal in signals if signal.signal == decision.proposed_side]
     gross = max(directional) if directional else 0.0
     latest = snapshot.one_minute_candles[-1]
-    cost = (_spread(snapshot) + float(context.estimated_slippage or 0.0) + float(context.estimated_fees or 0.0)) / latest.close if latest.close > 0 else float("inf")
+    if latest.close <= 0 or snapshot.spread is None or context.estimated_slippage is None or context.estimated_fees is None:
+        return -MISSING_RUNTIME_COST_RETURN
+    cost = (snapshot.spread + context.estimated_slippage + context.estimated_fees) / latest.close
     return gross - cost
 
 
 def _normalized_slippage_cost(snapshot: WeightedMarketSnapshot, context: WeightedVotingRuntimeContext) -> float:
     latest = snapshot.one_minute_candles[-1]
-    return float("inf") if latest.close <= 0 else float(context.estimated_slippage or 0.0) / latest.close
+    if latest.close <= 0 or context.estimated_slippage is None:
+        return MISSING_RUNTIME_COST_RETURN
+    return context.estimated_slippage / latest.close
 
 
 def _normalized_fee_cost(snapshot: WeightedMarketSnapshot, context: WeightedVotingRuntimeContext) -> float:
     latest = snapshot.one_minute_candles[-1]
-    return float("inf") if latest.close <= 0 else float(context.estimated_fees or 0.0) / latest.close
+    if latest.close <= 0 or context.estimated_fees is None:
+        return MISSING_RUNTIME_COST_RETURN
+    return context.estimated_fees / latest.close
 
 
-def _spread(snapshot: WeightedMarketSnapshot) -> float:
+def _spread_cost(snapshot: WeightedMarketSnapshot) -> float:
     if snapshot.bid is None or snapshot.ask is None:
-        return 0.0
+        return MISSING_RUNTIME_COST_RETURN
     return max(0.0, snapshot.ask - snapshot.bid)
 
 
@@ -399,6 +413,38 @@ def _structural_invalidation(signals: tuple[WeightedVotingSignal, ...], side: We
     if not levels:
         return None
     return max(levels) if side_value == WeightedSide.BUY.value else min(levels)
+
+
+def _missing_authoritative_runtime_input_reason_codes(context: WeightedVotingRuntimeContext) -> tuple[str, ...]:
+    reasons: list[str] = []
+    snapshot = context.finalised_one_minute_market_snapshot
+    if snapshot.bid is None or snapshot.ask is None or snapshot.spread is None:
+        reasons.append("weighted_voting.decision_kernel.missing_actual_quote_blocks_trade")
+    if context.estimated_slippage is None:
+        reasons.append("weighted_voting.decision_kernel.missing_actual_slippage_estimate_blocks_trade")
+    if context.estimated_fees is None:
+        reasons.append("weighted_voting.decision_kernel.missing_actual_fee_estimate_blocks_trade")
+    if context.read_only_account_equity is None or context.read_only_account_equity <= 0:
+        reasons.append("weighted_voting.decision_kernel.paper_account_equity_unavailable_blocks_trade")
+    if context.read_only_broker_buying_power is None or context.read_only_broker_buying_power < 0:
+        reasons.append("weighted_voting.decision_kernel.paper_buying_power_unavailable_blocks_trade")
+    if context.inventory_available is not True:
+        reasons.append("weighted_voting.decision_kernel.weighted_inventory_ledger_unavailable_blocks_trade")
+    if context.remaining_algorithm_daily_risk is None or context.remaining_algorithm_daily_risk <= 0:
+        reasons.append("weighted_voting.decision_kernel.remaining_daily_risk_unavailable_blocks_trade")
+    if context.remaining_algorithm_capital_partition is None or context.remaining_algorithm_capital_partition <= 0:
+        reasons.append("weighted_voting.decision_kernel.algorithm_capital_allocation_unavailable_blocks_trade")
+    if context.global_risk_state.service_available is not True:
+        reasons.append("weighted_voting.decision_kernel.central_global_risk_unavailable_blocks_trade")
+    if context.global_risk_state.global_available_risk is None or context.global_risk_state.global_available_risk <= 0:
+        reasons.append("weighted_voting.decision_kernel.central_global_risk_capacity_unavailable_blocks_trade")
+    if context.global_risk_state.global_max_shares is None or context.global_risk_state.global_max_shares <= 0:
+        reasons.append("weighted_voting.decision_kernel.central_global_share_capacity_unavailable_blocks_trade")
+    if context.exchange_session_state.session_allowed is not True or context.exchange_session_state.is_exchange_open is not True:
+        reasons.append("weighted_voting.decision_kernel.exchange_session_state_blocks_trade")
+    if _enum_value(context.five_minute_alignment) == WeightedFiveMinuteAlignment.UNAVAILABLE.value:
+        reasons.append("weighted_voting.decision_kernel.five_minute_confirmation_unavailable_blocks_trade")
+    return tuple(dict.fromkeys(reasons))
 
 
 def _final_trade_blocking_reason_codes(
@@ -441,6 +487,24 @@ def _final_trade_blocking_reason_codes(
     if sizing.buying_power_quantity <= 0 or sizing.capital_partition_quantity <= 0 or sizing.algorithm_maximum_quantity <= 0:
         reasons.append("weighted_voting.decision_kernel.capital_or_algorithm_position_limit_blocks_trade")
     return tuple(dict.fromkeys(reasons))
+
+
+def _required_positive_float(value: float | int | None) -> float:
+    if value is None or float(value) <= 0:
+        return 0.0
+    return float(value)
+
+
+def _required_non_negative_float(value: float | int | None) -> float:
+    if value is None or float(value) < 0:
+        return 0.0
+    return float(value)
+
+
+def _required_positive_int(value: int | None) -> int:
+    if value is None or int(value) <= 0:
+        return 0
+    return int(value)
 
 
 def _hold_decision(decision: WeightedDecision, reason_codes: tuple[str, ...]) -> WeightedDecision:
@@ -564,6 +628,10 @@ def _observability_record(
 
 def _side_value(side: WeightedSide | str) -> str:
     return str(getattr(side, "value", side))
+
+
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value))
 
 
 def _hash_payload(payload: Any) -> str:

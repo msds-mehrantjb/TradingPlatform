@@ -9,6 +9,7 @@ from backend.app.algorithms.weighted_voting.market_snapshot import WeightedVotin
 from backend.app.algorithms.weighted_voting.models import WeightedDataQualityStatus, WeightedSide, WeightedStrategyFamily, WeightedVotingSignal
 from backend.app.algorithms.weighted_voting.scheduler import (
     ACTIVE_WEIGHT_STATE_KEY,
+    CANDIDATE_WEIGHT_PREFIX,
     UPDATE_AUDIT_PREFIX,
     PUBLISHED_WEIGHT_PREFIX,
     UPDATE_STATUS_KEY,
@@ -16,6 +17,7 @@ from backend.app.algorithms.weighted_voting.scheduler import (
     WEIGHT_HISTORY_KEY,
     WEIGHTED_VOTING_AFTER_MARKET_UPDATE_EASTERN_MINUTES,
     WeightedVotingDailySchedulerConfig,
+    activate_published_weight_for_session,
     rollback_to_previous_weight_version,
     run_after_market_daily_weight_update,
     scheduler_status,
@@ -105,7 +107,57 @@ class WeightedVotingSchedulerTest(unittest.TestCase):
         self.assertEqual(result.status, "published")
         self.assertEqual(result.published_for_session_date, date(2026, 7, 15))
         self.assertIn(f"{PUBLISHED_WEIGHT_PREFIX}2026-07-15", store.snapshots)
+        self.assertIn(f"{CANDIDATE_WEIGHT_PREFIX}{result.candidate_weight_version}", store.snapshots)
+        self.assertEqual(result.active_weight_version, result.previous_weight_version)
+        self.assertEqual(store.read_snapshot(ACTIVE_WEIGHT_STATE_KEY)["weight_version"], result.previous_weight_version)
         self.assertLess(AFTER_MARKET, datetime(2026, 7, 15, 13, 30, tzinfo=timezone.utc))
+
+    def test_activation_only_applies_candidate_on_future_exchange_session(self) -> None:
+        store = MemoryStore()
+        provider = StaticDatasetProvider(make_session())
+
+        with patch("backend.app.algorithms.weighted_voting.backtest.engine.evaluate_signals", side_effect=synthetic_signals):
+            result = run_after_market_daily_weight_update(
+                session_date=SESSION_DATE,
+                store=store,
+                dataset_provider=provider,
+                completed_at=AFTER_MARKET,
+                config=WeightedVotingDailySchedulerConfig(symbol="SPY"),
+            )
+        pending = activate_published_weight_for_session(
+            store=store,
+            session_date=date(2026, 7, 15),
+            activated_at=AFTER_MARKET,
+        )
+        activated = activate_published_weight_for_session(
+            store=store,
+            session_date=date(2026, 7, 15),
+            activated_at=datetime(2026, 7, 15, 12, 45, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(pending["status"], "pending_future_session")
+        if result.holdout_validation_passed:
+            self.assertEqual(activated["status"], "activated_for_session")
+            self.assertEqual(store.read_snapshot(ACTIVE_WEIGHT_STATE_KEY)["weight_version"], result.candidate_weight_version)
+        else:
+            self.assertEqual(activated["status"], "blocked_unapproved_candidate")
+            self.assertEqual(store.read_snapshot(ACTIVE_WEIGHT_STATE_KEY)["weight_version"], result.previous_weight_version)
+
+    def test_next_activation_session_uses_exchange_calendar_holiday_logic(self) -> None:
+        store = MemoryStore()
+        provider = StaticDatasetProvider(make_session())
+
+        with patch("backend.app.algorithms.weighted_voting.backtest.engine.evaluate_signals", side_effect=synthetic_signals):
+            result = run_after_market_daily_weight_update(
+                session_date=date(2026, 7, 2),
+                store=store,
+                dataset_provider=provider,
+                completed_at=datetime(2026, 7, 2, 21, 10, tzinfo=timezone.utc),
+                config=WeightedVotingDailySchedulerConfig(symbol="SPY"),
+            )
+
+        self.assertEqual(result.published_for_session_date, date(2026, 7, 6))
+        self.assertIn(f"{PUBLISHED_WEIGHT_PREFIX}2026-07-06", store.snapshots)
 
     def test_scheduler_persists_status_audit_history_and_performance_window(self) -> None:
         store = MemoryStore()

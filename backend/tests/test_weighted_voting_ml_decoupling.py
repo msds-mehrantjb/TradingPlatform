@@ -40,14 +40,14 @@ class WeightedVotingMlDecouplingTest(unittest.TestCase):
             }
         )
 
-        baseline = service.evaluate(baseline_payload)
-        failed_ml = service.evaluate(failed_ml_payload)
+        baseline = service.evaluate_research_shadow(baseline_payload)
+        failed_ml = service.evaluate_research_shadow(failed_ml_payload)
 
         self.assertEqual(stable_json(failed_ml), stable_json(baseline))
 
     def test_backend_evaluation_has_no_ml_gate(self) -> None:
         service = WeightedVotingService(store=MemoryStore())
-        result = service.evaluate(evaluate_payload())
+        result = service.evaluate_research_shadow(evaluate_payload())
         serialized = stable_json(result)
 
         self.assertNotRegex(serialized, r"Meta Label|Weighted Forecast Safety|Trading RAG readiness")

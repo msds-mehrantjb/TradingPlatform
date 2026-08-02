@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 import backend.app.algorithms.weighted_voting.api as weighted_voting_api
+import backend.app.algorithms.weighted_voting.runtime_supervisor as weighted_runtime
+from backend.app.algorithms.weighted_voting.runtime_supervisor import WeightedVotingEventBus, WeightedVotingRuntimeConfig, WeightedVotingRuntimeSupervisor
 from backend.app.algorithms.weighted_voting.service import WeightedVotingService
 from backend.app.main import app
 
@@ -17,17 +19,26 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.store = MemoryStore()
         self.original_service = weighted_voting_api.WEIGHTED_VOTING_API_SERVICE
+        self.original_supervisor = weighted_runtime._DEFAULT_SUPERVISOR
         weighted_voting_api.WEIGHTED_VOTING_API_SERVICE = WeightedVotingService(store=self.store)
+        weighted_runtime._DEFAULT_SUPERVISOR = WeightedVotingRuntimeSupervisor(
+            service=WeightedVotingService(store=self.store),
+            store=self.store,
+            config=WeightedVotingRuntimeConfig(heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
+            event_bus=WeightedVotingEventBus(maxsize=8),
+        )
         self.client = TestClient(app)
 
     def tearDown(self) -> None:
         weighted_voting_api.WEIGHTED_VOTING_API_SERVICE = self.original_service
+        weighted_runtime._DEFAULT_SUPERVISOR = self.original_supervisor
 
     def test_requested_routes_are_algorithm_specific_and_registered(self) -> None:
         openapi = self.client.get("/openapi.json").json()
         paths = set(openapi["paths"])
         expected = {
             "/api/weighted-voting/evaluate",
+            "/api/weighted-voting/research/evaluate",
             "/api/weighted-voting/status",
             "/api/weighted-voting/config",
             "/api/weighted-voting/decisions/{decision_id}",
@@ -51,6 +62,7 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
             "/api/weighted-voting/trades",
             "/api/weighted-voting/observability/{decision_id}",
             "/api/weighted-voting/runtime/status",
+            "/api/weighted-voting/runtime/control",
             "/api/weighted-voting/runtime/pause",
             "/api/weighted-voting/runtime/resume",
             "/api/weighted-voting/runtime/pause-new-entries",
@@ -58,11 +70,67 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
             "/api/weighted-voting/runtime/reconcile",
             "/api/weighted-voting/runtime/strategies/{strategy_id}/state",
             "/api/weighted-voting/runtime/emergency-flatten",
+            "/api/algorithms/weighted-voting/runtime/status",
+            "/api/algorithms/weighted-voting/runtime/control",
+            "/api/algorithms/weighted-voting/runtime/reconcile",
+            "/api/algorithms/weighted-voting/runtime/emergency-flatten",
         }
 
         self.assertTrue(expected.issubset(paths))
-        self.assertTrue(all(path.startswith("/api/weighted-voting") for path in expected))
+        self.assertTrue(all(path.startswith(("/api/weighted-voting", "/api/algorithms/weighted-voting")) for path in expected))
         self.assertIn("WeightedVotingErrorResponse", openapi["components"]["schemas"])
+
+    def test_runtime_control_endpoints_persist_backend_record(self) -> None:
+        default_control = self.client.get("/api/algorithms/weighted-voting/runtime/control")
+        updated = self.client.put(
+            "/api/algorithms/weighted-voting/runtime/control",
+            json={
+                "paper_trading_enabled": True,
+                "automatic_entries_enabled": True,
+                "actor": "api-test",
+                "reason": "weighted_voting.test.api_control_on",
+            },
+        )
+        status = self.client.get("/api/algorithms/weighted-voting/runtime/status")
+
+        self.assertEqual(default_control.status_code, 200, default_control.text)
+        self.assertEqual(default_control.json()["algorithm_id"], "weighted_voting")
+        self.assertEqual(default_control.json()["mode"], "PAPER")
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertTrue(updated.json()["paper_trading_enabled"])
+        self.assertFalse(updated.json()["automatic_entries_enabled"])
+        self.assertIn("weighted_voting.runtime.control.paper_trading_requested_on", updated.json()["reason_codes"])
+        self.assertEqual(self.store.read_snapshot("weighted_voting.runtime.control")["updated_by"], "api-test")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json()["control"]["algorithm_id"], "weighted_voting")
+
+    def test_runtime_control_endpoint_rejects_stale_expected_version(self) -> None:
+        current = self.client.get("/api/algorithms/weighted-voting/runtime/control")
+        version = current.json()["record_version"]
+        first = self.client.put(
+            "/api/algorithms/weighted-voting/runtime/control",
+            json={
+                "paper_trading_enabled": False,
+                "automatic_entries_enabled": False,
+                "actor": "api-test",
+                "reason": "weighted_voting.test.api_control_version_first",
+                "expected_version": version,
+            },
+        )
+        stale = self.client.put(
+            "/api/algorithms/weighted-voting/runtime/control",
+            json={
+                "paper_trading_enabled": True,
+                "automatic_entries_enabled": False,
+                "actor": "api-test",
+                "reason": "weighted_voting.test.api_control_version_stale",
+                "expected_version": version,
+            },
+        )
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(stale.json()["detail"]["status"], "version_conflict")
 
     def test_status_config_and_weights_endpoints_use_backend_store(self) -> None:
         status = self.client.get("/api/weighted-voting/status")
@@ -73,7 +141,7 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertEqual(status.status_code, 200)
         self.assertEqual(status.json()["algorithmId"], "weighted_voting")
         self.assertEqual(status.json()["apiInventory"]["apiNamespace"], "/api/weighted-voting")
-        self.assertEqual(len(status.json()["apiInventory"]["endpoints"]), 32)
+        self.assertEqual(len(status.json()["apiInventory"]["endpoints"]), 35)
         self.assertEqual(status.json()["sharedServiceBoundary"]["algorithmId"], "weighted_voting")
         self.assertIn("raw_candle_and_quote_service", {item["serviceId"] for item in status.json()["sharedServiceBoundary"]["allowedSharedServices"]})
         self.assertIn("reverse_trade_direction", status.json()["sharedServiceBoundary"]["forbiddenSharedServiceActions"])
@@ -110,9 +178,9 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertNotIn("voting_ensemble", self.store.snapshots)
 
-    def test_put_config_and_evaluate_do_not_modify_other_algorithms(self) -> None:
+    def test_put_config_and_research_evaluate_do_not_modify_production_runtime_or_other_algorithms(self) -> None:
         update = self.client.put("/api/weighted-voting/config", json={"minimum_score": 0.6, "minimum_edge": 0.13})
-        evaluation = self.client.post("/api/weighted-voting/evaluate", json=evaluate_payload())
+        evaluation = self.client.post("/api/weighted-voting/research/evaluate", json=evaluate_payload())
 
         self.assertEqual(update.status_code, 200, update.text)
         self.assertEqual(evaluation.status_code, 200, evaluation.text)
@@ -121,18 +189,21 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         signals = self.client.get(f"/api/weighted-voting/signals/{decision_id}")
         observability = self.client.get(f"/api/weighted-voting/observability/{decision_id}")
         self.assertEqual(evaluation.json()["algorithmId"], "weighted_voting")
+        self.assertTrue(evaluation.json()["researchOnly"])
+        self.assertFalse(evaluation.json()["productionStateMutated"])
+        self.assertFalse(evaluation.json()["ordersEnqueued"])
         self.assertIn("decision", evaluation.json())
         self.assertIn("globalOrderProposal", evaluation.json())
         self.assertIn("globalGateApplication", evaluation.json())
-        self.assertEqual(decision.status_code, 200)
-        self.assertEqual(decision.json()["decision"]["decision_id"], decision_id)
-        self.assertEqual(signals.status_code, 200)
-        self.assertEqual(len(signals.json()["signals"]), 4)
-        self.assertEqual(observability.status_code, 200)
-        self.assertEqual(observability.json()["observability"]["decisionId"], decision_id)
+        self.assertEqual(decision.status_code, 404)
+        self.assertEqual(signals.status_code, 404)
+        self.assertEqual(observability.status_code, 404)
         self.assertEqual(evaluation.json()["globalGateApplication"]["proposedQuantity"], evaluation.json()["globalOrderProposal"]["quantity"])
         self.assertLessEqual(evaluation.json()["globalGateApplication"]["globallyAllowedQuantity"], evaluation.json()["globalGateApplication"]["proposedQuantity"])
         self.assertTrue(all(key.startswith("weighted_voting.") for key in self.store.snapshots))
+        self.assertFalse(any(key.startswith("weighted_voting.decisions.") for key in self.store.snapshots))
+        self.assertFalse(any(key.startswith("weighted_voting.signals.") for key in self.store.snapshots))
+        self.assertFalse(any(key.startswith("weighted_voting.observability.decisions.") for key in self.store.snapshots))
 
     def test_weight_recalculate_rollback_and_read_only_inventory_endpoints_are_dedicated(self) -> None:
         recalculate = self.client.post("/api/weighted-voting/weights/recalculate", json={"session_date": "2026-07-14"})

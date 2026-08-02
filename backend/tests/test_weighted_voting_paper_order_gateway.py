@@ -5,6 +5,7 @@ import shutil
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedGateEvaluationMode, WeightedVotingGatePipelineResult
 from backend.app.algorithms.weighted_voting.execution_gateway import (
@@ -18,10 +19,10 @@ from backend.app.algorithms.weighted_voting.execution_gateway import (
     submit_queued_weighted_voting_paper_order,
     submit_weighted_voting_paper_order,
 )
-from backend.app.algorithms.weighted_voting.inventory import WeightedVotingInventoryRepository
+from backend.app.algorithms.weighted_voting.inventory import WeightedVotingInventoryEventType, WeightedVotingInventoryRepository
 from backend.app.algorithms.weighted_voting.models import WeightedGateResult, WeightedGateStatus
-from backend.app.algorithms.weighted_voting.rollout import WeightedVotingRolloutFlags, WeightedVotingRolloutValidation
-from backend.app.algorithms.weighted_voting.rollout import ROLLOUT_STATE_KEY
+from backend.app.algorithms.weighted_voting.rollout import WEIGHTED_VOTING_AUTO_SUBMIT_ENABLED, WeightedVotingRolloutFlags, WeightedVotingRolloutValidation
+from backend.app.algorithms.weighted_voting.rollout import ROLLOUT_STATE_KEY, persist_rollout_validation_record
 from backend.app.domain.models import Signal
 from backend.app.execution import cost_model
 from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill, PaperOrderGateway, PaperOrderGatewayResult
@@ -197,6 +198,28 @@ class WeightedVotingPaperOrderGatewayTest(unittest.TestCase):
         self.assertFalse(result.submitted)
         self.assertEqual(broker.submit_count, 0)
         self.assertIn("paper_gateway.paper_account_unverified", result.reasonCodes)
+
+    def test_paper_endpoint_must_be_verified_before_submission(self) -> None:
+        broker = FakePaperBroker(base_url="https://api.alpaca.markets/v2")
+        store = MemoryStore()
+        gateway = PaperOrderGateway(broker, store)
+        proposal = global_proposal()
+
+        result = submit_weighted_voting_paper_order(
+            gateway=gateway,
+            proposal=proposal,
+            global_application=global_application(proposal),
+            local_gate_result=local_gate(True),
+            mode="automatic",
+            evaluated_at=NOW,
+            rollout_flags=validated_rollout_flags(),
+            rollout_validation=validated_rollout_validation(),
+        )
+
+        self.assertFalse(result.submitted)
+        self.assertEqual(broker.submit_count, 0)
+        self.assertIn("weighted_voting.execution.paper_endpoint_unverified", result.reasonCodes)
+        self.assertIn("paper_gateway.paper_endpoint_unverified", result.reasonCodes)
 
     def test_stale_order_cancellation_uses_cancel_replace_policy(self) -> None:
         broker = FakePaperBroker(fill_status=None)
@@ -406,6 +429,45 @@ class WeightedVotingPaperOrderGatewayTest(unittest.TestCase):
         self.assertEqual(len(snapshot.open_positions), 1)
         self.assertIn(f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.automatic_result.{item.command.client_order_id}", store.snapshots)
 
+    def test_stale_inventory_version_prevents_submission_before_reservation(self) -> None:
+        broker = FakePaperBroker()
+        store = MemoryStore()
+        gateway = PaperOrderGateway(broker, store)
+        inventory = seeded_inventory(store)
+        proposal = global_proposal()
+        gates = local_gate(True)
+        item = enqueue_weighted_voting_execution_order(
+            store=store,
+            proposal=proposal,
+            global_application=global_application(proposal),
+            local_gate_result=gates,
+            enqueued_at=NOW,
+            idempotency_key="weighted_voting.runtime.idempotency.stale-inventory",
+        )
+        before = inventory.current_snapshot(now=NOW)
+        inventory.append_event(
+            event_id="inventory-drift-before-submit",
+            event_type=WeightedVotingInventoryEventType.BROKER_RECONCILED,
+            payload={"algorithm_id": "weighted_voting", "checkpoint": {"algorithm_id": "weighted_voting", "reason": "test_inventory_drift"}},
+            occurred_at=NOW + timedelta(seconds=1),
+            expected_snapshot_version=before.snapshot_version,
+        )
+
+        result = submit_queued_weighted_voting_paper_order(
+            gateway=gateway,
+            queue_item=item,
+            inventory_repository=inventory,
+            evaluated_at=NOW + timedelta(seconds=2),
+            rollout_flags=validated_rollout_flags(),
+            rollout_validation=validated_rollout_validation(),
+        )
+
+        self.assertFalse(result.submitted)
+        self.assertEqual(result.status, "NOT_SUBMITTED")
+        self.assertIn("weighted_voting.execution.stale_inventory_version", result.reasonCodes)
+        self.assertEqual(broker.submit_count, 0)
+        self.assertEqual(inventory.current_snapshot(now=NOW).pending_orders, ())
+
     def test_rejected_automatic_proposal_is_not_enqueued_or_submitted(self) -> None:
         broker = FakePaperBroker()
         store = MemoryStore()
@@ -459,6 +521,50 @@ class WeightedVotingPaperOrderGatewayTest(unittest.TestCase):
         self.assertTrue(first.submitted)
         self.assertTrue(second.submitted)
         self.assertEqual(broker.submit_count, 1)
+
+    def test_order_intent_idempotency_uses_decision_and_revision_before_execution(self) -> None:
+        broker = FakePaperBroker()
+        store = MemoryStore()
+        gateway = PaperOrderGateway(broker, store)
+        inventory = seeded_inventory(store)
+        first_proposal = global_proposal(order_intent_id="wv-intent-1")
+        first_item = enqueue_weighted_voting_execution_order(
+            store=store,
+            proposal=first_proposal,
+            global_application=global_application(first_proposal),
+            local_gate_result=local_gate(True),
+            enqueued_at=NOW,
+            idempotency_key="weighted_voting.market_event.same-bar",
+        )
+        first = submit_queued_weighted_voting_paper_order(
+            gateway=gateway,
+            queue_item=first_item,
+            inventory_repository=inventory,
+            evaluated_at=NOW,
+            rollout_flags=validated_rollout_flags(),
+            rollout_validation=validated_rollout_validation(),
+        )
+        repeated_proposal = global_proposal(order_intent_id="wv-intent-2").model_copy(
+            update={
+                "decisionId": first_proposal.decisionId,
+                "settingsSnapshot": {"settings_version": "test", "intentRevision": 1},
+            }
+        )
+
+        second_item = enqueue_weighted_voting_execution_order(
+            store=store,
+            proposal=repeated_proposal,
+            global_application=global_application(repeated_proposal),
+            local_gate_result=local_gate(True),
+            enqueued_at=NOW + timedelta(seconds=1),
+            idempotency_key="weighted_voting.market_event.same-bar.redelivery",
+        )
+
+        self.assertTrue(first.submitted)
+        self.assertIsNone(second_item)
+        self.assertEqual(broker.submit_count, 1)
+        self.assertEqual(len([key for key in store.snapshots if key.startswith(f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.queue.")]), 1)
+        self.assertEqual(len([key for key in store.snapshots if key.startswith(f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.order_intent_index.")]), 1)
 
     def test_rejected_broker_response_releases_inventory_reservation(self) -> None:
         broker = FakePaperBroker(ack_status="REJECTED", fill_status=None)
@@ -532,6 +638,13 @@ class WeightedVotingPaperOrderGatewayTest(unittest.TestCase):
                 "evidence_hash": "approved-evidence",
             },
         )
+        persist_rollout_validation_record(
+            store,
+            validated_rollout_validation(),
+            source_authority="backend.weighted_voting.paper_gateway_test_validation",
+            approved_by="ops-user",
+            recorded_at=NOW,
+        )
         gateway = PaperOrderGateway(broker, store)
         inventory = seeded_inventory(store)
         proposal = global_proposal()
@@ -544,12 +657,13 @@ class WeightedVotingPaperOrderGatewayTest(unittest.TestCase):
             idempotency_key="weighted_voting.runtime.idempotency.persisted-small-rollout",
         )
 
-        result = submit_queued_weighted_voting_paper_order(
-            gateway=gateway,
-            queue_item=item,
-            inventory_repository=inventory,
-            evaluated_at=NOW,
-        )
+        with patch.dict("os.environ", {WEIGHTED_VOTING_AUTO_SUBMIT_ENABLED: "true"}):
+            result = submit_queued_weighted_voting_paper_order(
+                gateway=gateway,
+                queue_item=item,
+                inventory_repository=inventory,
+                evaluated_at=NOW,
+            )
 
         self.assertTrue(result.submitted)
         self.assertEqual(broker.submit_count, 1)
@@ -560,7 +674,7 @@ def validated_rollout_flags() -> WeightedVotingRolloutFlags:
         v2_enabled=True,
         shadow_mode=False,
         dynamic_reduction_enabled=True,
-        dynamic_increase_enabled=True,
+        dynamic_increase_enabled=False,
         auto_submit_enabled=True,
     )
 
@@ -577,6 +691,14 @@ def validated_rollout_validation() -> WeightedVotingRolloutValidation:
         manual_paper_submission_validated=True,
         tests_passed=True,
         paper_validations_passed=True,
+        paper_broker_e2e_validated=True,
+        reconciliation_validated=True,
+        restart_recovery_validated=True,
+        persisted_operator_approval=True,
+        validation_record_id="weighted_voting.rollout.validation.paper_gateway_test",
+        source_authority="backend.weighted_voting.paper_gateway_test_validation",
+        approved_by="ops-user",
+        recorded_at=NOW.isoformat(),
         live_trading_enabled=False,
     )
 
@@ -595,11 +717,20 @@ def seeded_inventory(store: "MemoryStore") -> WeightedVotingInventoryRepository:
 
 
 class FakePaperBroker:
-    def __init__(self, *, ack_status: str = "ACCEPTED", fill_status: str | None = "FILLED", filled_quantity: int = 10, paper_account_verified: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        ack_status: str = "ACCEPTED",
+        fill_status: str | None = "FILLED",
+        filled_quantity: int = 10,
+        paper_account_verified: bool = True,
+        base_url: str = "https://paper-api.alpaca.markets/v2",
+    ) -> None:
         self.ack_status = ack_status
         self.fill_status = fill_status
         self.filled_quantity = filled_quantity
         self.paper_account_verified = paper_account_verified
+        self.base_url = base_url
         self.submit_count = 0
         self.cancel_count = 0
         self.positions: list[dict] = []

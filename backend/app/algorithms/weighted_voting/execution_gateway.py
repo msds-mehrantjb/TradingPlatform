@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedVotingGatePipelineResult
 from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ALGORITHM_ID
-from backend.app.algorithms.weighted_voting.inventory import WeightedVotingInventoryEventType, WeightedVotingInventoryRepository
+from backend.app.algorithms.weighted_voting.inventory import CURRENT_SNAPSHOT_KEY, WeightedVotingInventoryEventType, WeightedVotingInventoryRepository
 from backend.app.algorithms.weighted_voting.observability import record_order_execution_observability
 from backend.app.algorithms.weighted_voting.order_proposal import WeightedVotingOrderProposal
 from backend.app.algorithms.weighted_voting.persistence import WeightedVotingStateStore
@@ -144,6 +144,7 @@ class WeightedVotingExecutionQueueItem:
     local_gate_passed: bool
     local_gate_reason_codes: tuple[str, ...]
     enqueued_at: datetime
+    inventory_snapshot_version: int
     status: WeightedVotingExecutionStatus = "PENDING"
     reason_codes: tuple[str, ...] = ("weighted_voting.execution_queue.enqueued",)
     queue_version: str = WEIGHTED_VOTING_EXECUTION_GATEWAY_VERSION
@@ -156,6 +157,8 @@ class WeightedVotingExecutionQueueItem:
         _validate_weighted_voting_global_application(self.global_application)
         if self.command.capital_partition_id != self.proposal.capitalPartitionId:
             raise ValueError("Weighted Voting execution queue requires a matching capital partition")
+        if self.inventory_snapshot_version < 0:
+            raise ValueError("Weighted Voting execution queue requires an authoritative inventory snapshot version")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -169,6 +172,7 @@ class WeightedVotingExecutionQueueItem:
             "localGatePassed": self.local_gate_passed,
             "localGateReasonCodes": list(self.local_gate_reason_codes),
             "enqueuedAt": self.enqueued_at.isoformat(),
+            "inventorySnapshotVersion": self.inventory_snapshot_version,
             "status": self.status,
             "reasonCodes": list(self.reason_codes),
         }
@@ -467,6 +471,19 @@ def deterministic_weighted_voting_client_order_id(
     return "wv-" + _hash_json(payload)[:24]
 
 
+def deterministic_weighted_voting_order_intent_idempotency_key(
+    *,
+    decision_id: str,
+    intent_revision: int | str = 1,
+) -> str:
+    payload = {
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "decisionId": decision_id,
+        "intentRevision": str(intent_revision),
+    }
+    return "weighted_voting.order_intent." + _hash_json(payload)[:24]
+
+
 def persist_weighted_voting_broker_command(store: WeightedVotingStateStore, command: WeightedVotingBrokerCommand) -> None:
     store.write_snapshot(_command_key(command.client_order_id), command.as_shared_broker_command())
     store.write_snapshot(
@@ -533,6 +550,7 @@ def enqueue_weighted_voting_execution_order(
     local_gate_result: WeightedVotingGatePipelineResult,
     enqueued_at: datetime,
     idempotency_key: str,
+    inventory_snapshot_version: int | None = None,
 ) -> WeightedVotingExecutionQueueItem | None:
     """Persist an accepted automatic paper order intent for the execution worker."""
 
@@ -540,6 +558,18 @@ def enqueue_weighted_voting_execution_order(
     _validate_weighted_voting_global_application(global_application)
     if not proposal.capitalPartitionId.startswith("weighted_voting."):
         raise ValueError("Weighted Voting automatic execution requires a Weighted Voting capital partition")
+    order_intent_idempotency_key = deterministic_weighted_voting_order_intent_idempotency_key(
+        decision_id=proposal.decisionId,
+        intent_revision=_proposal_intent_revision(proposal),
+    )
+    existing_intent = _read_optional(store, _order_intent_index_key(order_intent_idempotency_key))
+    if existing_intent:
+        client_order_id = str(existing_intent.get("clientOrderId") or "")
+        if client_order_id and _read_optional(store, _automatic_result_key(client_order_id)):
+            return None
+        if client_order_id and _read_optional(store, _queue_key(client_order_id)):
+            return _queue_item_from_payload(store.read_snapshot(_queue_key(client_order_id)))
+        return None
     command = build_weighted_voting_broker_command(
         proposal=proposal,
         global_application=global_application,
@@ -547,6 +577,19 @@ def enqueue_weighted_voting_execution_order(
         mode="automatic",
     )
     persist_weighted_voting_broker_command(store, command)
+    store.write_snapshot(
+        _order_intent_index_key(order_intent_idempotency_key),
+        {
+            "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+            "decisionId": command.decision_id,
+            "orderIntentId": command.order_intent_id,
+            "clientOrderId": command.client_order_id,
+            "intentRevision": _proposal_intent_revision(proposal),
+            "orderIntentIdempotencyKey": order_intent_idempotency_key,
+            "recordedAt": enqueued_at.isoformat(),
+            "reasonCodes": ("weighted_voting.execution_queue.order_intent_idempotency_claimed",),
+        },
+    )
     if _read_optional(store, _automatic_result_key(command.client_order_id)):
         _record_lifecycle(
             store=store,
@@ -586,9 +629,10 @@ def enqueue_weighted_voting_execution_order(
         local_gate_passed=local_gate_result.permission_granted,
         local_gate_reason_codes=local_gate_result.reason_codes,
         enqueued_at=enqueued_at,
+        inventory_snapshot_version=_inventory_snapshot_version_for_enqueue(store, proposal, explicit_version=inventory_snapshot_version),
     )
     store.write_snapshot(_queue_key(command.client_order_id), item.as_dict())
-    store.write_snapshot(_queue_index_key(idempotency_key), {"algorithmId": WEIGHTED_VOTING_ALGORITHM_ID, "clientOrderId": command.client_order_id, "queueId": queue_id})
+    store.write_snapshot(_queue_index_key(idempotency_key), {"algorithmId": WEIGHTED_VOTING_ALGORITHM_ID, "clientOrderId": command.client_order_id, "queueId": queue_id, "marketEventId": idempotency_key})
     _record_lifecycle(
         store=store,
         command=command,
@@ -651,7 +695,21 @@ def submit_queued_weighted_voting_paper_order(
         _persist_automatic_result(gateway.store, queue_item, result, status="REJECTED", recorded_at=evaluated_at)
         return result
 
-    _reserve_inventory_for_command(inventory_repository, command=command, occurred_at=evaluated_at)
+    current_inventory = inventory_repository.current_snapshot(now=evaluated_at)
+    if current_inventory.snapshot_version != queue_item.inventory_snapshot_version:
+        result = _not_submitted_result(
+            command=command,
+            proposal=queue_item.proposal,
+            mode="automatic",
+            status="NOT_SUBMITTED",
+            reason_codes=("weighted_voting.execution.stale_inventory_version",),
+            explanation="Queued Weighted Voting entry order was rejected because inventory changed after the decision was created.",
+            evaluated_at=evaluated_at,
+        )
+        _persist_automatic_result(gateway.store, queue_item, result, status="REJECTED", recorded_at=evaluated_at)
+        return result
+
+    _reserve_inventory_for_command(inventory_repository, command=command, occurred_at=evaluated_at, expected_snapshot_version=current_inventory.snapshot_version)
     _record_lifecycle(
         store=gateway.store,
         command=command,
@@ -863,6 +921,30 @@ def submit_weighted_voting_paper_order(
         accepted_at=evaluated_at,
         mode=mode,
     )
+    if not _verify_weighted_voting_paper_endpoint(gateway):
+        result = _not_submitted_result(
+            command=command,
+            proposal=proposal,
+            mode=mode,
+            status="NOT_SUBMITTED",
+            reason_codes=("weighted_voting.execution.paper_endpoint_unverified", "paper_gateway.paper_endpoint_unverified"),
+            explanation="Weighted Voting rejected broker submission because the configured endpoint is not verified as paper-only.",
+            evaluated_at=evaluated_at,
+        )
+        record_order_execution_observability(
+            store=gateway.store,
+            decision_id=proposal.decisionId,
+            order_intent_id=proposal.orderIntentId,
+            execution_result=result,
+            recorded_at=evaluated_at,
+        )
+        reconcile_weighted_voting_broker_result(
+            store=gateway.store,
+            command=command,
+            broker_result=result,
+            reconciled_at=evaluated_at,
+        )
+        return result
     result = gateway.submit(
         proposal=proposal,
         global_application=global_application,
@@ -925,13 +1007,49 @@ def _accepted_for_execution(
     )
 
 
+def _verify_weighted_voting_paper_endpoint(gateway: PaperOrderGateway) -> bool:
+    broker = gateway.broker
+    verifier = getattr(broker, "verify_paper_endpoint", None)
+    if callable(verifier):
+        return bool(verifier())
+    paper_endpoint = getattr(broker, "paper_endpoint", None)
+    if paper_endpoint is not None:
+        return bool(paper_endpoint)
+    base_url = (
+        getattr(broker, "alpaca_trading_base_url", None)
+        or getattr(broker, "trading_base_url", None)
+        or getattr(broker, "base_url", None)
+        or getattr(broker, "baseUrl", None)
+    )
+    if base_url:
+        return _is_weighted_voting_paper_endpoint(str(base_url))
+    return False
+
+
+def _is_weighted_voting_paper_endpoint(base_url: str) -> bool:
+    normalized = base_url.lower().strip().rstrip("/")
+    if not normalized:
+        return False
+    if "paper-api.alpaca.markets" in normalized:
+        return True
+    if "api.alpaca.markets" in normalized:
+        return False
+    if "live" in normalized:
+        return False
+    return "paper" in normalized
+
+
 def _reserve_inventory_for_command(
     inventory_repository: WeightedVotingInventoryRepository,
     *,
     command: WeightedVotingBrokerCommand,
     occurred_at: datetime,
+    expected_snapshot_version: int | None = None,
 ) -> None:
     snapshot = inventory_repository.current_snapshot(now=occurred_at)
+    version = snapshot.snapshot_version if expected_snapshot_version is None else expected_snapshot_version
+    if snapshot.snapshot_version != version:
+        raise RuntimeError("Weighted Voting inventory optimistic version check failed")
     inventory_repository.append_event(
         event_id=f"{command.client_order_id}.reserve",
         event_type=WeightedVotingInventoryEventType.ORDER_RESERVED,
@@ -946,10 +1064,11 @@ def _reserve_inventory_for_command(
             "decision_id": command.decision_id,
             "order_intent_id": command.order_intent_id,
             "client_order_id": command.client_order_id,
+            "status": "WORKING",
             "created_at": occurred_at.isoformat(),
         },
         occurred_at=occurred_at,
-        expected_snapshot_version=snapshot.snapshot_version,
+        expected_snapshot_version=version,
     )
 
 
@@ -1122,9 +1241,35 @@ def _queue_item_from_payload(payload: dict[str, Any]) -> WeightedVotingExecution
         local_gate_passed=bool(payload.get("localGatePassed")),
         local_gate_reason_codes=tuple(str(code) for code in payload.get("localGateReasonCodes", ())),
         enqueued_at=_datetime_from_payload(payload["enqueuedAt"], datetime.utcnow()),
+        inventory_snapshot_version=int(payload.get("inventorySnapshotVersion") if payload.get("inventorySnapshotVersion") is not None else payload.get("inventory_snapshot_version", -1)),
         status=str(payload.get("status") or "PENDING"),  # type: ignore[arg-type]
         reason_codes=tuple(str(code) for code in payload.get("reasonCodes", ())),
     )
+
+
+def weighted_voting_execution_queue_item_from_payload(payload: dict[str, Any]) -> WeightedVotingExecutionQueueItem:
+    """Restore a persisted Weighted Voting execution queue item for runtime recovery."""
+
+    return _queue_item_from_payload(payload)
+
+
+def _inventory_snapshot_version_for_enqueue(
+    store: WeightedVotingStateStore,
+    proposal: GlobalOrderProposal,
+    *,
+    explicit_version: int | None,
+) -> int:
+    if explicit_version is not None:
+        return int(explicit_version)
+    for key in ("inventorySnapshotVersion", "inventory_snapshot_version", "inventoryVersion", "inventory_version"):
+        value = proposal.settingsSnapshot.get(key)
+        if value is not None:
+            return int(value)
+    snapshot = _read_optional(store, CURRENT_SNAPSHOT_KEY) or {}
+    value = snapshot.get("snapshotVersion") if snapshot.get("snapshotVersion") is not None else snapshot.get("snapshot_version")
+    if value is None:
+        return -1
+    return int(value)
 
 
 def _local_gate_result_from_queue(queue_item: WeightedVotingExecutionQueueItem) -> WeightedVotingGatePipelineResult:
@@ -1199,6 +1344,18 @@ def _proposal_order_intent_id(proposal: GlobalOrderProposal | WeightedVotingOrde
     if isinstance(proposal, GlobalOrderProposal):
         return proposal.orderIntentId
     return fallback or proposal.proposal_id
+
+
+def _proposal_intent_revision(proposal: GlobalOrderProposal | WeightedVotingOrderProposal) -> int:
+    settings = getattr(proposal, "settingsSnapshot", None)
+    if isinstance(settings, dict):
+        for key in ("intentRevision", "intent_revision"):
+            if key in settings:
+                try:
+                    return int(settings[key])
+                except (TypeError, ValueError):
+                    return 1
+    return 1
 
 
 def _proposal_symbol(proposal: GlobalOrderProposal | WeightedVotingOrderProposal) -> str:
@@ -1363,6 +1520,10 @@ def _queue_key(client_order_id: str) -> str:
 
 def _queue_index_key(idempotency_key: str) -> str:
     return f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.queue_index.{idempotency_key}"
+
+
+def _order_intent_index_key(idempotency_key: str) -> str:
+    return f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.order_intent_index.{idempotency_key}"
 
 
 def _automatic_result_key(client_order_id: str) -> str:

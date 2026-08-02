@@ -170,7 +170,7 @@ def validated_rollout_flags() -> WeightedVotingRolloutFlags:
         v2_enabled=True,
         shadow_mode=False,
         dynamic_reduction_enabled=True,
-        dynamic_increase_enabled=True,
+        dynamic_increase_enabled=False,
         auto_submit_enabled=True,
     )
 
@@ -187,6 +187,14 @@ def validated_rollout_validation() -> WeightedVotingRolloutValidation:
         manual_paper_submission_validated=True,
         tests_passed=True,
         paper_validations_passed=True,
+        paper_broker_e2e_validated=True,
+        reconciliation_validated=True,
+        restart_recovery_validated=True,
+        persisted_operator_approval=True,
+        validation_record_id="weighted_voting.rollout.validation.observability_test",
+        source_authority="backend.weighted_voting.observability_test_validation",
+        approved_by="ops-user",
+        recorded_at=NOW.isoformat(),
         live_trading_enabled=False,
     )
 
@@ -205,6 +213,8 @@ class MemoryStore:
 
 
 class FakePaperBroker:
+    base_url = "https://paper-api.alpaca.markets/v2"
+
     def verify_paper_account(self) -> bool:
         return True
 

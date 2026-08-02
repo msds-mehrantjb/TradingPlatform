@@ -6,6 +6,7 @@ from datetime import UTC, date, datetime, timedelta
 from backend.app.algorithms.weighted_voting.broker_reconciliation import (
     CHECKPOINT_KEY,
     WeightedVotingBrokerFillObservation,
+    WeightedVotingBrokerOrderObservation,
     WeightedVotingBrokerPositionObservation,
     reconcile_weighted_voting_broker_observations,
     reconciliation_status,
@@ -150,6 +151,114 @@ class WeightedVotingBrokerReconciliationTest(unittest.TestCase):
         self.assertFalse(result.inventory_reconciled)
         self.assertTrue(result.entries_paused)
         self.assertTrue(result.risk_reducing_exits_allowed)
+
+    def test_unknown_or_unattributed_fills_pause_entries_without_adopting_position(self) -> None:
+        store = MemoryStore()
+        inventory = seeded_inventory(store)
+
+        result = reconcile_weighted_voting_broker_observations(
+            store=store,
+            inventory_repository=inventory,
+            fills=(
+                WeightedVotingBrokerFillObservation(
+                    fill_id="unknown-fill",
+                    client_order_id="unknown-client",
+                    algorithm_id=None,
+                    symbol="SPY",
+                    side="BUY",
+                    quantity=5,
+                    average_fill_price=100.0,
+                    filled_at=NOW,
+                ),
+            ),
+            reconciled_at=NOW + timedelta(seconds=1),
+        )
+
+        snapshot = inventory.current_snapshot(now=NOW)
+        self.assertFalse(result.inventory_reconciled)
+        self.assertTrue(result.entries_paused)
+        self.assertEqual(snapshot.open_positions, ())
+        self.assertEqual(snapshot.last_broker_reconciliation_checkpoint["entries_paused"], True)
+        self.assertTrue(any(item.reason_code == "weighted_voting.broker_reconciliation.broker_fill_unattributed_or_foreign" for item in result.discrepancies))
+
+    def test_unknown_broker_order_is_quarantined_and_pauses_entries(self) -> None:
+        store = MemoryStore()
+        inventory = seeded_inventory(store)
+
+        result = reconcile_weighted_voting_broker_observations(
+            store=store,
+            inventory_repository=inventory,
+            orders=(
+                WeightedVotingBrokerOrderObservation(
+                    client_order_id="wv-unknown-order",
+                    algorithm_id="weighted_voting",
+                    symbol="SPY",
+                    side="BUY",
+                    status="ACCEPTED",
+                    quantity=5,
+                    filled_quantity=0,
+                    average_fill_price=None,
+                    observed_at=NOW,
+                    broker_order_id="broker-unknown",
+                ),
+            ),
+            reconciled_at=NOW + timedelta(seconds=1),
+        )
+
+        self.assertFalse(result.inventory_reconciled)
+        self.assertTrue(result.entries_paused)
+        self.assertTrue(any(item.reason_code == "weighted_voting.broker_reconciliation.broker_order_missing_locally" for item in result.discrepancies))
+        self.assertTrue(any(key.startswith("weighted_voting.broker_reconciliation.quarantine.orders.wv-unknown-order") for key in store.snapshots))
+
+    def test_pnl_and_protective_mismatches_pause_entries_and_prioritize_risk_reduction(self) -> None:
+        store = MemoryStore()
+        inventory = seeded_inventory(store)
+        command = seeded_command(store, inventory)
+        reconcile_weighted_voting_broker_observations(
+            store=store,
+            inventory_repository=inventory,
+            fills=(fill("fill-protected", command.client_order_id, quantity=4, price=100.0, filled_at=NOW),),
+            positions=(position(command.client_order_id, quantity=4, price=100.0),),
+            reconciled_at=NOW + timedelta(seconds=1),
+        )
+
+        result = reconcile_weighted_voting_broker_observations(
+            store=store,
+            inventory_repository=inventory,
+            orders=(
+                WeightedVotingBrokerOrderObservation(
+                    client_order_id=command.client_order_id,
+                    algorithm_id="weighted_voting",
+                    symbol="SPY",
+                    side="SELL",
+                    status="ACCEPTED",
+                    quantity=5,
+                    filled_quantity=0,
+                    average_fill_price=None,
+                    observed_at=NOW + timedelta(seconds=2),
+                    protective=True,
+                ),
+            ),
+            positions=(
+                WeightedVotingBrokerPositionObservation(
+                    client_order_id=command.client_order_id,
+                    algorithm_id="weighted_voting",
+                    symbol="SPY",
+                    quantity=4,
+                    average_entry_price=100.0,
+                    observed_at=NOW + timedelta(seconds=2),
+                    unrealised_pnl=25.0,
+                ),
+            ),
+            reconciled_at=NOW + timedelta(seconds=2),
+        )
+
+        reason_codes = {item.reason_code for item in result.discrepancies}
+        self.assertTrue(result.entries_paused)
+        self.assertIn("weighted_voting.broker_reconciliation.protective_order_quantity_mismatch", reason_codes)
+        self.assertIn("weighted_voting.broker_reconciliation.broker_position_pnl_mismatch", reason_codes)
+        checkpoint = inventory.current_snapshot(now=NOW).last_broker_reconciliation_checkpoint
+        self.assertTrue(checkpoint["risk_reduction_priority"])
 
     def test_status_documents_daily_trade_count_definition(self) -> None:
         status = reconciliation_status()

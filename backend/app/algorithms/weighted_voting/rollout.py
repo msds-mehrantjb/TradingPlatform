@@ -22,8 +22,10 @@ WEIGHTED_VOTING_AUTO_SUBMIT_ENABLED = "WEIGHTED_VOTING_AUTO_SUBMIT_ENABLED"
 
 ROLLOUT_STATE_KEY = "weighted_voting.rollout.active"
 ROLLBACK_STATE_KEY = "weighted_voting.rollout.previous_valid"
+ROLLOUT_VALIDATION_KEY = "weighted_voting.rollout.validation.latest"
 ROLLOUT_AUDIT_PREFIX = "weighted_voting.rollout.audit."
 ROLLOUT_EVIDENCE_PREFIX = "weighted_voting.rollout.evidence."
+ROLLOUT_VALIDATION_AUDIT_PREFIX = "weighted_voting.rollout.validation.audit."
 
 WeightedVotingControlledRolloutStage = Literal[
     "disabled",
@@ -177,9 +179,17 @@ class WeightedVotingRolloutValidation:
     manual_paper_submission_validated: bool = False
     tests_passed: bool = False
     paper_validations_passed: bool = False
+    paper_broker_e2e_validated: bool = False
+    reconciliation_validated: bool = False
+    restart_recovery_validated: bool = False
+    persisted_operator_approval: bool = False
     live_trading_enabled: bool = False
+    validation_record_id: str = ""
+    source_authority: str = ""
+    approved_by: str = ""
+    recorded_at: str = ""
 
-    def model_dump(self) -> dict[str, bool]:
+    def model_dump(self) -> dict[str, Any]:
         return self.__dict__.copy()
 
 
@@ -313,6 +323,69 @@ def controlled_rollout_status(store: WeightedVotingRolloutStore | None = None) -
             "weighted_voting.rollout.successful_build_not_approval",
         ),
     }
+
+
+def persist_rollout_validation_record(
+    store: WeightedVotingRolloutStore,
+    validation: WeightedVotingRolloutValidation,
+    *,
+    source_authority: str,
+    approved_by: str,
+    recorded_at: datetime | None = None,
+    reason: str = "weighted_voting.rollout.validation.backend_record_persisted",
+) -> dict[str, Any]:
+    if _frontend_validation_source(source_authority):
+        raise ValueError("Weighted Voting rollout validation cannot be marked passed by frontend, browser, React state, or client API state")
+    timestamp = recorded_at or datetime.now(timezone.utc)
+    validation_payload = validation.model_dump()
+    persisted_operator_approval = bool(validation.persisted_operator_approval and approved_by)
+    record = {
+        **validation_payload,
+        "algorithm_id": "weighted_voting",
+        "rollout_version": WEIGHTED_VOTING_ROLLOUT_VERSION,
+        "source_authority": source_authority,
+        "approved_by": approved_by,
+        "recorded_at": timestamp.isoformat(),
+        "persisted_operator_approval": persisted_operator_approval,
+        "validation_record_id": f"weighted_voting.rollout.validation.{_hash_payload({**validation_payload, 'source': source_authority, 'approved_by': approved_by, 'at': timestamp.isoformat()})}",
+        "reason_codes": (reason, "weighted_voting.rollout.validation.frontend_cannot_mark_passed"),
+    }
+    store.write_snapshot(ROLLOUT_VALIDATION_KEY, record)
+    store.write_snapshot(f"{ROLLOUT_VALIDATION_AUDIT_PREFIX}{record['validation_record_id']}", record)
+    return record
+
+
+def load_persisted_rollout_validation(store: WeightedVotingRolloutStore | None) -> WeightedVotingRolloutValidation | None:
+    if store is None:
+        return None
+    record = _read_optional(store, ROLLOUT_VALIDATION_KEY)
+    if not record:
+        return None
+    if str(record.get("algorithm_id") or record.get("algorithmId")) != "weighted_voting":
+        return None
+    if _frontend_validation_source(str(record.get("source_authority") or "")):
+        return None
+    return WeightedVotingRolloutValidation(
+        backend_shadow_passed=bool(record.get("backend_shadow_passed")),
+        shadow_comparison_passed=bool(record.get("shadow_comparison_passed")),
+        static_equal_weights_passed=bool(record.get("static_equal_weights_passed")),
+        performance_weights_validated=bool(record.get("performance_weights_validated")),
+        dynamic_reduction_validated=bool(record.get("dynamic_reduction_validated")),
+        dynamic_entry_exit_validated=bool(record.get("dynamic_entry_exit_validated")),
+        dynamic_increase_validated=bool(record.get("dynamic_increase_validated")),
+        manual_paper_submission_validated=bool(record.get("manual_paper_submission_validated")),
+        tests_passed=bool(record.get("tests_passed")),
+        paper_validations_passed=bool(record.get("paper_validations_passed")),
+        paper_broker_e2e_validated=bool(record.get("paper_broker_e2e_validated")),
+        reconciliation_validated=bool(record.get("reconciliation_validated")),
+        restart_recovery_validated=bool(record.get("restart_recovery_validated")),
+        persisted_operator_approval=bool(record.get("persisted_operator_approval") and record.get("approved_by")),
+        live_trading_enabled=bool(record.get("live_trading_enabled")),
+        validation_record_id=str(record.get("validation_record_id") or ""),
+        source_authority=str(record.get("source_authority") or ""),
+        approved_by=str(record.get("approved_by") or ""),
+        recorded_at=str(record.get("recorded_at") or ""),
+    )
 
 
 def evaluate_controlled_rollout_promotion(
@@ -523,6 +596,7 @@ def evaluate_weighted_voting_rollout_control(
     disabled_algorithm_ids: tuple[str, ...] = (),
     flags: WeightedVotingRolloutFlags | None = None,
     validation: WeightedVotingRolloutValidation | None = None,
+    store: WeightedVotingRolloutStore | None = None,
 ) -> WeightedVotingRolloutControl:
     if requested_state not in WEIGHTED_VOTING_ROLLOUT_STATES:
         raise ValueError(f"unknown Weighted Voting rollout state: {requested_state}")
@@ -538,7 +612,7 @@ def evaluate_weighted_voting_rollout_control(
         effective_state = "disabled"
         reason_codes.append("weighted_voting.rollout.weighted_voting_disabled")
 
-    stage_auto_allowed = automatic_submission_allowed(flags=flags, validation=validation)
+    stage_auto_allowed = automatic_submission_allowed(flags=flags, validation=validation, store=store)
     paper_trading_allowed = effective_state in {"paper_trading", "limited_paper", "production_ready"}
     trading_allowed = paper_trading_allowed and effective_state != "paused"
     auto_allowed = stage_auto_allowed and effective_state in {"paper_trading", "production_ready"}
@@ -574,9 +648,18 @@ def evaluate_rollout_stage(
     validation: WeightedVotingRolloutValidation | None = None,
 ) -> WeightedVotingRolloutStageStatus:
     active_flags = flags or rollout_feature_flags()
-    active_validation = validation or WeightedVotingRolloutValidation()
+    active_validation = validation
     if stage not in ROLLOUT_STAGES:
         raise ValueError(f"unknown Weighted Voting rollout stage: {stage}")
+    if active_validation is None:
+        if stage == "automatic_paper_submission":
+            return WeightedVotingRolloutStageStatus(
+                stage=stage,
+                permission=RolloutPermission.BLOCKED.value,
+                reason_codes=("weighted_voting.rollout.persisted_validation_record_missing",),
+                explanation="Weighted Voting automatic paper submission is blocked until backend-owned persisted validation evidence is available.",
+            )
+        active_validation = WeightedVotingRolloutValidation(source_authority="weighted_voting.rollout.missing_status_projection")
     blockers = _stage_blockers(stage, active_flags, active_validation)
     if blockers:
         return WeightedVotingRolloutStageStatus(
@@ -600,9 +683,11 @@ def rollout_status(
     requested_state: WeightedVotingRolloutLifecycleState = "shadow",
     account_wide_emergency_shutdown: bool = False,
     disabled_algorithm_ids: tuple[str, ...] = (),
+    store: WeightedVotingRolloutStore | None = None,
 ) -> dict[str, object]:
     active_flags = flags or rollout_feature_flags()
-    active_validation = validation or WeightedVotingRolloutValidation()
+    persisted_validation = load_persisted_rollout_validation(store)
+    active_validation = validation or persisted_validation
     stages = tuple(evaluate_rollout_stage(stage, flags=active_flags, validation=active_validation).model_dump() for stage in ROLLOUT_STAGES)
     control = evaluate_weighted_voting_rollout_control(
         requested_state=requested_state,
@@ -610,6 +695,7 @@ def rollout_status(
         disabled_algorithm_ids=disabled_algorithm_ids,
         flags=active_flags,
         validation=active_validation,
+        store=store if validation is None else None,
     )
     return {
         "algorithm_id": "weighted_voting",
@@ -617,13 +703,14 @@ def rollout_status(
         "namespace": WEIGHTED_VOTING_ROLLOUT_NAMESPACE,
         "allowed_states": WEIGHTED_VOTING_ROLLOUT_STATES,
         "controlled_stages": CONTROLLED_ROLLOUT_STAGES,
-        "controlled_rollout": controlled_rollout_status(),
+        "controlled_rollout": controlled_rollout_status(store),
         "control": control.model_dump(),
         "effective_state": control.effective_state,
         "feature_flags": active_flags.model_dump(),
-        "validation": active_validation.model_dump(),
+        "validation": active_validation.model_dump() if active_validation else {"status": "missing", "reason_codes": ("weighted_voting.rollout.persisted_validation_record_missing",)},
+        "validation_source": "explicit_argument" if validation else ("persisted_backend_record" if persisted_validation else "missing"),
         "stages": stages,
-        "automatic_submission_allowed": automatic_submission_allowed(flags=active_flags, validation=active_validation),
+        "automatic_submission_allowed": automatic_submission_allowed(flags=active_flags, validation=active_validation, store=store if validation is None else None),
         "live_trading_allowed": False,
         "reason_codes": tuple(
             dict.fromkeys(
@@ -643,12 +730,20 @@ def automatic_submission_allowed(
     validation: WeightedVotingRolloutValidation | None = None,
     store: WeightedVotingRolloutStore | None = None,
 ) -> bool:
+    active_flags = flags or rollout_feature_flags()
+    active_validation = validation
     if store is not None:
-        return bool(controlled_rollout_status(store)["automatic_paper_submission_allowed"])
+        active_validation = active_validation or load_persisted_rollout_validation(store)
+        if active_validation is None:
+            return False
+        if not bool(controlled_rollout_status(store)["automatic_paper_submission_allowed"]):
+            return False
+    if active_validation is None:
+        return False
     status = evaluate_rollout_stage(
         "automatic_paper_submission",
-        flags=flags or rollout_feature_flags(),
-        validation=validation or WeightedVotingRolloutValidation(),
+        flags=active_flags,
+        validation=active_validation,
     )
     return status.enabled
 
@@ -697,6 +792,10 @@ def _stage_blockers(stage: WeightedVotingRolloutStage, flags: WeightedVotingRoll
     if stage in {"backend_shadow", "shadow_comparison"} and not flags.shadow_mode:
         blockers.append("weighted_voting.rollout.shadow_mode_required")
 
+    static_or_performance_validated = bool(validation.static_equal_weights_passed or validation.performance_weights_validated)
+    dynamic_reduction_requirement = (
+        (validation.dynamic_reduction_validated, "weighted_voting.rollout.dynamic_reduction_not_validated"),
+    ) if flags.dynamic_reduction_enabled else ()
     required_acceptance: dict[WeightedVotingRolloutStage, tuple[tuple[bool, str], ...]] = {
         "backend_shadow": (),
         "shadow_comparison": ((validation.backend_shadow_passed, "weighted_voting.rollout.backend_shadow_not_validated"),),
@@ -711,18 +810,26 @@ def _stage_blockers(stage: WeightedVotingRolloutStage, flags: WeightedVotingRoll
             (validation.performance_weights_validated, "weighted_voting.rollout.performance_weights_not_validated"),
         ),
         "dynamic_entry_exit": (
-            (validation.dynamic_reduction_validated, "weighted_voting.rollout.dynamic_reduction_not_validated"),
+            *dynamic_reduction_requirement,
         ),
         "dynamic_increase": (
             (validation.dynamic_entry_exit_validated, "weighted_voting.rollout.dynamic_entry_exit_not_validated"),
         ),
         "manual_paper_submission": (
-            (validation.dynamic_increase_validated, "weighted_voting.rollout.dynamic_increase_not_validated"),
+            (validation.dynamic_entry_exit_validated, "weighted_voting.rollout.dynamic_entry_exit_not_validated"),
         ),
         "automatic_paper_submission": (
+            (validation.backend_shadow_passed, "weighted_voting.rollout.backend_shadow_not_validated"),
+            (validation.shadow_comparison_passed, "weighted_voting.rollout.shadow_comparison_not_validated"),
+            (static_or_performance_validated, "weighted_voting.rollout.static_or_performance_weights_not_validated"),
+            *dynamic_reduction_requirement,
+            (validation.dynamic_entry_exit_validated, "weighted_voting.rollout.dynamic_entry_exit_not_validated"),
             (validation.manual_paper_submission_validated, "weighted_voting.rollout.manual_paper_submission_not_validated"),
             (validation.tests_passed, "weighted_voting.rollout.tests_not_passed"),
-            (validation.paper_validations_passed, "weighted_voting.rollout.paper_validations_not_passed"),
+            (validation.paper_broker_e2e_validated, "weighted_voting.rollout.paper_broker_e2e_not_validated"),
+            (validation.reconciliation_validated, "weighted_voting.rollout.reconciliation_not_validated"),
+            (validation.restart_recovery_validated, "weighted_voting.rollout.restart_recovery_not_validated"),
+            (validation.persisted_operator_approval, "weighted_voting.rollout.persisted_operator_approval_missing"),
         ),
     }
     for passed, reason_code in required_acceptance[stage]:
@@ -793,6 +900,13 @@ def _env_bool(source: Mapping[str, str], key: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _frontend_validation_source(source: str) -> bool:
+    normalized = source.strip().lower()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in ("frontend", "browser", "react", "client_state", "local_storage", "session_storage", "window.", "ui_button"))
 
 
 def _read_optional(store: WeightedVotingRolloutStore, key: str) -> dict | None:

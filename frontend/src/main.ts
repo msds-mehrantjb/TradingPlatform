@@ -14809,6 +14809,18 @@ type WeightedVotingBackendSummary = {
   marketConditionLabel: string;
 };
 
+type WeightedVotingRuntimeControl = {
+  algorithmId: "weighted_voting";
+  paperTradingEnabled: boolean;
+  automaticEntriesEnabled: boolean;
+  liveTradingEnabled: boolean;
+  mode: "PAPER";
+  updatedAt: string;
+  updatedBy: string;
+  reason: string;
+  reasonCodes: string[];
+};
+
 const weightedVotingBackendState = {
   status: "idle" as WeightedVotingBackendStatus,
   warning: "",
@@ -14818,6 +14830,7 @@ const weightedVotingBackendState = {
   weightHistory: [] as unknown[],
   evaluation: null as Record<string, unknown> | null,
   dailyUpdate: null as Record<string, unknown> | null,
+  runtimeControl: null as WeightedVotingRuntimeControl | null,
   updatedAt: "",
   requestKey: "",
 };
@@ -15545,11 +15558,9 @@ function weightedVotingBackendSummary(): WeightedVotingBackendSummary {
 }
 
 async function refreshWeightedVotingBackendClient(options: { force?: boolean } = {}) {
-  const payload = weightedVotingEvaluatePayload();
   const requestKey = JSON.stringify({
     symbol: state.symbol,
-    latest: payload?.data_timestamp ?? "no-candles",
-    count: payload?.candles.length ?? 0,
+    source: "backend-runtime-status",
   });
   if (
     weightedVotingBackendRequestInFlight ||
@@ -15563,21 +15574,23 @@ async function refreshWeightedVotingBackendClient(options: { force?: boolean } =
   weightedVotingBackendState.status = weightedVotingBackendState.status === "ready" ? "ready" : "loading";
   weightedVotingBackendState.requestKey = requestKey;
   try {
-    const [serviceStatus, config, activeWeights, weightsHistory, dailyUpdate] = await Promise.all([
+    const [serviceStatus, config, activeWeights, weightsHistory, dailyUpdate, runtimeControl] = await Promise.all([
       fetchWeightedVotingJson("/status"),
       fetchWeightedVotingJson("/config"),
       fetchWeightedVotingJson("/weights/active"),
       fetchWeightedVotingJson("/weights/history"),
       fetchWeightedVotingJson("/daily-update/status"),
+      fetchWeightedVotingRuntimeControlJson("/runtime/control").catch(() => null),
     ]);
     weightedVotingBackendState.serviceStatus = serviceStatus;
     weightedVotingBackendState.config = config;
     weightedVotingBackendState.activeWeights = activeWeights;
     weightedVotingBackendState.weightHistory = arrayFromUnknown(weightsHistory.history);
     weightedVotingBackendState.dailyUpdate = dailyUpdate;
-    weightedVotingBackendState.evaluation = payload ? await fetchWeightedVotingJson("/evaluate", { method: "POST", body: JSON.stringify(payload) }) : null;
+    weightedVotingBackendState.runtimeControl = runtimeControl ? normalizeWeightedVotingRuntimeControl(runtimeControl) : weightedVotingBackendState.runtimeControl;
+    weightedVotingBackendState.evaluation = null;
     weightedVotingBackendState.status = "ready";
-    weightedVotingBackendState.warning = payload ? "" : "Waiting for candles before requesting a backend Weighted Voting evaluation.";
+    weightedVotingBackendState.warning = "Weighted Voting decisions are produced only by backend finalized-bar ingestion.";
     weightedVotingBackendState.updatedAt = new Date().toISOString();
   } catch (error) {
     weightedVotingBackendState.status = "error";
@@ -15605,6 +15618,34 @@ async function fetchWeightedVotingJson(path: string, init: RequestInit = {}) {
       lastMessage =
         response.status === 404
           ? `Weighted Voting API route not loaded on ${baseUrl}; restart the FastAPI backend.`
+          : await readableResponseError(response);
+      if (response.status !== 404) {
+        throw new Error(lastMessage);
+      }
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : lastMessage;
+    }
+  }
+  throw new Error(lastMessage);
+}
+
+async function fetchWeightedVotingRuntimeControlJson(path: string, init: RequestInit = {}) {
+  let lastMessage = "Weighted Voting runtime control route unavailable";
+  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+    try {
+      const response = await fetchWithTimeout(`${baseUrl}/api/algorithms/weighted-voting${path}`, 15000, {
+        ...init,
+        headers: {
+          "Content-Type": "application/json",
+          ...(init.headers ?? {}),
+        },
+      });
+      if (response.ok) {
+        return (await response.json()) as Record<string, unknown>;
+      }
+      lastMessage =
+        response.status === 404
+          ? `Weighted Voting runtime control route not loaded on ${baseUrl}; restart the FastAPI backend.`
           : await readableResponseError(response);
       if (response.status !== 404) {
         throw new Error(lastMessage);
@@ -15956,35 +15997,59 @@ function backendTradeEvidence(source: "fill" | "order", payload: Record<string, 
 
 async function syncWeightedVotingAutomaticPaperControl(enabled: boolean) {
   try {
-    let validationPassed = false;
-    if (enabled) {
-      const runtime = await fetchWeightedVotingJson("/runtime/status");
-      validationPassed = weightedVotingRuntimeAllowsAutomaticPaper(runtime);
-    }
-    const endpoint = enabled ? "/runtime/resume-new-entries" : "/runtime/pause-new-entries";
-    const reason = enabled
-      ? "weighted_voting.runtime.dashboard.global_paper_toggle_on"
-      : "weighted_voting.runtime.dashboard.global_paper_toggle_off";
-    const result = await fetchWeightedVotingJson(endpoint, {
-      method: "POST",
-      body: JSON.stringify({
-        actor: "dashboard.global_paper_toggle",
-        reason,
-        ...(enabled ? { validation_passed: validationPassed } : {}),
+    const control = normalizeWeightedVotingRuntimeControl(
+      await fetchWeightedVotingRuntimeControlJson("/runtime/control", {
+        method: "PUT",
+        body: JSON.stringify({
+          paper_trading_enabled: enabled,
+          automatic_entries_enabled: enabled,
+          actor: "dashboard.global_paper_toggle",
+          reason: enabled
+            ? "weighted_voting.runtime.dashboard.global_paper_toggle_on"
+            : "weighted_voting.runtime.dashboard.global_paper_toggle_off",
+        }),
       }),
-    });
-    const health = childRecord(result, "health");
-    const paused = weightedTruthFromUnknown(health?.automaticOrderCreationPaused ?? health?.automatic_order_creation_paused, true);
-    weightedVotingBackendState.warning = enabled && paused
-      ? "Global paper is on; Weighted Voting automatic entries remain paused until rollout, reconciliation, and risk validation pass."
+    );
+    weightedVotingBackendState.runtimeControl = control;
+    weightedVotingBackendState.warning = enabled && !control.automaticEntriesEnabled
+      ? `Global paper is on; Weighted Voting automatic entries remain blocked by backend control: ${control.reasonCodes.join(", ")}`
       : !enabled
-        ? "Global paper is off; Weighted Voting automatic entries are paused."
-        : weightedVotingBackendState.warning;
+        ? "Global paper is off; Weighted Voting backend control is blocking new entries while preserving risk-reducing exits."
+        : "";
     updateWeightedVotingPanel({ refresh: false });
   } catch (error) {
     weightedVotingBackendState.warning = error instanceof Error ? error.message : "Weighted Voting automatic paper control sync failed";
     updateWeightedVotingPanel({ refresh: false });
   }
+}
+
+function normalizeWeightedVotingRuntimeControl(raw: unknown): WeightedVotingRuntimeControl {
+  const record = isRecord(raw) ? raw : {};
+  if (record.algorithmId && record.algorithmId !== "weighted_voting") {
+    throw new Error("Weighted Voting runtime control response used the wrong algorithm id.");
+  }
+  return {
+    algorithmId: "weighted_voting",
+    paperTradingEnabled: weightedTruthFromUnknown(record.paperTradingEnabled ?? record.paper_trading_enabled, false),
+    automaticEntriesEnabled: weightedTruthFromUnknown(record.automaticEntriesEnabled ?? record.automatic_entries_enabled, false),
+    liveTradingEnabled: false,
+    mode: "PAPER",
+    updatedAt: stringFromUnknown(record.updatedAt ?? record.updated_at, ""),
+    updatedBy: stringFromUnknown(record.updatedBy ?? record.updated_by, ""),
+    reason: stringFromUnknown(record.reason, ""),
+    reasonCodes: arrayFromUnknown(record.reasonCodes ?? record.reason_codes).map((value) => String(value)),
+  };
+}
+
+async function loadWeightedVotingRuntimeControl() {
+  try {
+    weightedVotingBackendState.runtimeControl = normalizeWeightedVotingRuntimeControl(
+      await fetchWeightedVotingRuntimeControlJson("/runtime/control"),
+    );
+  } catch (error) {
+    weightedVotingBackendState.warning = error instanceof Error ? error.message : "Weighted Voting runtime control unavailable";
+  }
+  updateWeightedVotingPanel({ refresh: false });
 }
 
 async function syncRegimeAutomaticPaperControl(enabled: boolean) {
@@ -16057,9 +16122,6 @@ function weightedVotingEvaluatePayload() {
       close: candle.close,
       volume: candle.volume,
     })),
-    account_equity: state.weightedTradingSettings.startingCapital,
-    available_buying_power: state.weightedTradingSettings.startingCapital * (state.weightedTradingSettings.dailyAllocationPercent / 100),
-    capital_available: state.weightedTradingSettings.startingCapital * (state.weightedTradingSettings.orderAllocationPercent / 100),
   };
 }
 
@@ -16123,7 +16185,12 @@ function renderWeightedBackendDataGrid() {
   const effectiveSettings = childRecord(config, "effective_settings") ?? config;
   const sizing = childRecord(weightedVotingBackendState.evaluation, "sizingResult");
   const globalApplication = childRecord(weightedVotingBackendState.evaluation, "globalGateApplication");
+  const control = weightedVotingBackendState.runtimeControl;
   const rows = [
+    ["Backend paper control", control ? (control.paperTradingEnabled ? "PAPER on" : "PAPER off") : "Unavailable"],
+    ["Automatic entries", control ? (control.automaticEntriesEnabled ? "Armed by backend" : "Blocked by backend") : "Unavailable"],
+    ["Control updated", control ? `${control.updatedBy || "backend"} ${control.updatedAt || ""}`.trim() : "NA"],
+    ["Control reason", control?.reasonCodes?.join(", ") || control?.reason || "NA"],
     ["Internal condition", weightedVotingMarketConditionLabel()],
     ["Trend", weightedRecordString(condition, "NA", "trend_direction", "trendDirection", "trend")],
     ["Volatility", weightedRecordString(condition, "NA", "volatility_level", "volatilityLevel", "volatility")],
@@ -16168,7 +16235,7 @@ function renderWeightedBackendControlRules() {
   const activeWeights = childRecord(weightedVotingBackendState.activeWeights, "weightState");
   const dailyUpdate = childRecord(weightedVotingBackendState.dailyUpdate, "dailyUpdate");
   return `
-    <span>Authoritative calculations are served by /api/weighted-voting/evaluate.</span>
+    <span>Authoritative decisions are produced by backend finalized-bar runtime ingestion.</span>
     <span>Config edits are persisted through /api/weighted-voting/config; browser storage is display-only.</span>
     <span>Active weights: ${escapeHtml(weightedVotingActiveWeightsLabel(activeWeights))}</span>
     <span>Weight history rows: ${weightedVotingBackendState.weightHistory.length}</span>
@@ -22927,6 +22994,7 @@ void loadSpyNews();
 void loadEsSnapshot();
 void loadVotingEnsembleInventory();
 void loadVotingEnsembleRuntimeControl();
+void loadWeightedVotingRuntimeControl();
 void refreshVotingEnsemblePaperInventory();
 void fetchSessionCurrent();
 void loadMarketContext();

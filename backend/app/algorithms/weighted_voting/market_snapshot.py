@@ -68,11 +68,7 @@ def build_weighted_voting_market_snapshot(payload: dict[str, Any]) -> WeightedVo
     timestamp = _parse_datetime(payload.get("data_timestamp") or payload.get("dataTimestamp") or payload.get("decision_timestamp") or payload.get("decisionTimestamp") or candles[-1].timestamp)
     bid = _optional_float(payload.get("bid"))
     ask = _optional_float(payload.get("ask"))
-    if bid is None:
-        bid = max(0.01, candles[-1].close - 0.01)
-    if ask is None:
-        ask = candles[-1].close + 0.01
-    spread = max(0.0, ask - bid)
+    spread = max(0.0, ask - bid) if bid is not None and ask is not None else None
     session_info = _object_value(payload.get("session") or payload.get("session_information") or payload.get("sessionInformation"))
     snapshot_values = {
         "symbol": str(payload.get("symbol") or "SPY"),

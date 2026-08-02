@@ -51,6 +51,37 @@ class WeightedVotingCapitalPartition:
 
 
 @dataclass(frozen=True)
+class WeightedVotingLot:
+    algorithm_id: Literal["weighted_voting"]
+    lot_id: str
+    position_id: str
+    symbol: str
+    side: str
+    quantity: int
+    remaining_quantity: int
+    entry_price: float
+    opened_at: datetime
+    decision_id: str
+    order_intent_id: str
+    client_order_id: str
+    source: str = "weighted_voting.inventory"
+    inventory_version: str = WEIGHTED_VOTING_INVENTORY_VERSION
+
+    def __post_init__(self) -> None:
+        _require_weighted_voting(self.algorithm_id)
+        if not all((self.lot_id, self.position_id, self.symbol, self.side, self.decision_id, self.order_intent_id, self.client_order_id)):
+            raise ValueError("Weighted Voting lot requires full algorithm attribution")
+        if self.quantity == 0 or self.remaining_quantity == 0:
+            raise ValueError("Weighted Voting lot quantity cannot be zero")
+        if (self.quantity > 0) != (self.remaining_quantity > 0):
+            raise ValueError("Weighted Voting lot remaining quantity must preserve side")
+        if abs(self.remaining_quantity) > abs(self.quantity):
+            raise ValueError("Weighted Voting lot remaining quantity cannot exceed original quantity")
+        if self.entry_price <= 0:
+            raise ValueError("Weighted Voting lot entry price must be positive")
+
+
+@dataclass(frozen=True)
 class WeightedVotingPosition:
     algorithm_id: Literal["weighted_voting"]
     position_id: str
@@ -62,6 +93,7 @@ class WeightedVotingPosition:
     decision_id: str
     order_intent_id: str
     client_order_id: str
+    lots: tuple[WeightedVotingLot, ...] = ()
     owning_strategy_ids: tuple[str, ...] = ()
     realised_pnl: float = 0.0
     unrealised_pnl: float = 0.0
@@ -81,6 +113,10 @@ class WeightedVotingPosition:
             raise ValueError("Weighted Voting position quantity cannot be zero")
         if self.average_entry_price <= 0:
             raise ValueError("Weighted Voting position average entry price must be positive")
+        for lot in self.lots:
+            _require_weighted_voting(lot.algorithm_id)
+            if lot.position_id != self.position_id or lot.client_order_id != self.client_order_id:
+                raise ValueError("Weighted Voting position lots must remain attributed to the same position")
 
 
 @dataclass(frozen=True)
@@ -96,13 +132,16 @@ class WeightedVotingPendingOrder:
     order_intent_id: str
     client_order_id: str
     created_at: datetime
+    filled_quantity: int = 0
+    status: str = "WORKING"
+    protective: bool = False
     inventory_version: str = WEIGHTED_VOTING_INVENTORY_VERSION
 
     def __post_init__(self) -> None:
         _require_weighted_voting(self.algorithm_id)
         if not all((self.order_id, self.symbol, self.side, self.decision_id, self.order_intent_id, self.client_order_id)):
             raise ValueError("Weighted Voting pending order requires full algorithm attribution")
-        if self.quantity < 0 or self.reserved_buying_power < 0 or self.planned_risk_dollars < 0:
+        if self.quantity < 0 or self.filled_quantity < 0 or self.reserved_buying_power < 0 or self.planned_risk_dollars < 0:
             raise ValueError("Weighted Voting pending order values must be non-negative")
 
 
@@ -170,6 +209,13 @@ class WeightedVotingInventorySnapshot:
     session_date: date
     created_at: datetime
     updated_at: datetime
+    consumed_capital: float = 0.0
+    individual_lots: tuple[WeightedVotingLot, ...] = ()
+    working_orders: tuple[WeightedVotingPendingOrder, ...] = ()
+    partially_filled_orders: tuple[WeightedVotingPendingOrder, ...] = ()
+    protective_orders: tuple[WeightedVotingPendingOrder, ...] = ()
+    daily_loss: float = 0.0
+    last_broker_reconciliation_checkpoint: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _require_weighted_voting(self.algorithm_id)
@@ -177,6 +223,16 @@ class WeightedVotingInventorySnapshot:
             raise ValueError("Weighted Voting snapshot requires a weighted_voting capital partition")
         if self.snapshot_version < 0 or self.last_event_sequence < 0:
             raise ValueError("Weighted Voting inventory versions must be non-negative")
+        for collection in (
+            self.open_positions,
+            self.pending_orders,
+            self.individual_lots,
+            self.working_orders,
+            self.partially_filled_orders,
+            self.protective_orders,
+        ):
+            for item in collection:
+                _require_weighted_voting(item.algorithm_id)
 
     @staticmethod
     def empty(
@@ -496,7 +552,17 @@ def _apply_event(snapshot: WeightedVotingInventorySnapshot, event: WeightedVotin
             )
         )
     if event_type == WeightedVotingInventoryEventType.BROKER_RECONCILED.value:
-        return _recalculate(replace(snapshot, last_broker_reconciliation_at=event.occurred_at, snapshot_version=snapshot.snapshot_version + 1, last_event_sequence=event.event_sequence, updated_at=event.occurred_at))
+        checkpoint = payload.get("checkpoint") if isinstance(payload.get("checkpoint"), dict) else payload
+        return _recalculate(
+            replace(
+                snapshot,
+                last_broker_reconciliation_at=event.occurred_at,
+                last_broker_reconciliation_checkpoint=_json_ready(dict(checkpoint)),
+                snapshot_version=snapshot.snapshot_version + 1,
+                last_event_sequence=event.event_sequence,
+                updated_at=event.occurred_at,
+            )
+        )
     raise ValueError(f"unsupported Weighted Voting inventory event type: {event_type}")
 
 
@@ -510,18 +576,29 @@ def _recalculate(snapshot: WeightedVotingInventorySnapshot) -> WeightedVotingInv
     daily_loss_percent = round(daily_loss / snapshot.allocated_capital * 100.0, 10) if snapshot.allocated_capital > 0 else 0.0
     remaining_daily_risk = round(max(0.0, snapshot.allocated_capital - daily_loss), 10)
     cash = round(max(0.0, snapshot.allocated_capital + snapshot.realised_pnl - reserved), 10)
+    lots = tuple(lot for position in snapshot.open_positions for lot in position.lots)
+    working_statuses = {"PENDING", "WORKING", "SUBMITTED", "ACKNOWLEDGED", "PARTIALLY_FILLED"}
+    working_orders = tuple(order for order in snapshot.pending_orders if order.status.upper() in working_statuses)
+    partially_filled_orders = tuple(order for order in snapshot.pending_orders if order.status.upper() == "PARTIALLY_FILLED" or order.filled_quantity > 0)
+    protective_orders = tuple(order for order in snapshot.pending_orders if order.protective)
     return replace(
         snapshot,
         cash_available=cash,
         reserved_buying_power=reserved,
+        consumed_capital=gross,
         unrealised_pnl=unrealised,
         daily_unrealised_pnl=unrealised,
+        daily_loss=round(daily_loss, 10),
         daily_loss_percent=daily_loss_percent,
         daily_risk_used=round(daily_loss, 10),
         remaining_daily_risk=remaining_daily_risk,
         remaining_capital_partition=remaining_partition,
         gross_exposure=gross,
         net_exposure=net,
+        individual_lots=lots,
+        working_orders=working_orders,
+        partially_filled_orders=partially_filled_orders,
+        protective_orders=protective_orders,
     )
 
 
@@ -566,6 +643,7 @@ def _merge_filled_position(open_positions: tuple[WeightedVotingPosition, ...], f
                 position,
                 quantity=new_quantity,
                 average_entry_price=round(average, 10),
+                lots=position.lots + fill_position.lots,
                 opened_at=min(position.opened_at, fill_position.opened_at),
                 mark_price=fill_position.mark_price if fill_position.mark_price is not None else position.mark_price,
             )
@@ -582,12 +660,25 @@ def _pending_after_fill(pending_orders: tuple[WeightedVotingPendingOrder, ...], 
         if order.client_order_id != client_order_id:
             updated.append(order)
             continue
+        if remaining_fill <= 0:
+            updated.append(order)
+            continue
         if remaining_fill >= order.quantity:
             remaining_fill -= order.quantity
             continue
         remaining_quantity = order.quantity - remaining_fill
         ratio = remaining_quantity / order.quantity if order.quantity > 0 else 0.0
-        updated.append(replace(order, quantity=remaining_quantity, reserved_buying_power=round(order.reserved_buying_power * ratio, 10), planned_risk_dollars=round(order.planned_risk_dollars * ratio, 10)))
+        filled_delta = remaining_fill
+        updated.append(
+            replace(
+                order,
+                quantity=remaining_quantity,
+                reserved_buying_power=round(order.reserved_buying_power * ratio, 10),
+                planned_risk_dollars=round(order.planned_risk_dollars * ratio, 10),
+                filled_quantity=order.filled_quantity + filled_delta,
+                status="PARTIALLY_FILLED",
+            )
+        )
         remaining_fill = 0
     return tuple(updated)
 
@@ -636,10 +727,17 @@ def _snapshot_from_payload(payload: dict[str, Any]) -> WeightedVotingInventorySn
     values = _snake_dict(payload)
     values["open_positions"] = tuple(_position_from_payload(item) for item in values.get("open_positions", ()))
     values["pending_orders"] = tuple(_pending_order_from_payload(item) for item in values.get("pending_orders", ()))
+    values["individual_lots"] = tuple(_lot_from_payload(item) for item in values.get("individual_lots", ()))
+    values["working_orders"] = tuple(_pending_order_from_payload(item) for item in values.get("working_orders", ()))
+    values["partially_filled_orders"] = tuple(_pending_order_from_payload(item) for item in values.get("partially_filled_orders", ()))
+    values["protective_orders"] = tuple(_pending_order_from_payload(item) for item in values.get("protective_orders", ()))
     values["created_at"] = _datetime_value(values["created_at"])
     values["updated_at"] = _datetime_value(values["updated_at"])
     values["last_broker_reconciliation_at"] = _datetime_optional(values.get("last_broker_reconciliation_at"))
     values["session_date"] = _date_value(values["session_date"], values["updated_at"].date())
+    values["last_broker_reconciliation_checkpoint"] = dict(values.get("last_broker_reconciliation_checkpoint") or {})
+    allowed = {field.name for field in WeightedVotingInventorySnapshot.__dataclass_fields__.values()}
+    values = {key: value for key, value in values.items() if key in allowed}
     return WeightedVotingInventorySnapshot(**values)
 
 
@@ -663,14 +761,54 @@ def _position_from_payload(payload: dict[str, Any]) -> WeightedVotingPosition:
     values["decision_id"] = str(values.get("decision_id") or values.get("owning_decision_id") or "")
     values["order_intent_id"] = str(values.get("order_intent_id") or "")
     values["client_order_id"] = str(values.get("client_order_id") or "")
+    values["lots"] = tuple(_lot_from_payload(item) for item in values.get("lots", ()))
     values["owning_strategy_ids"] = tuple(values.get("owning_strategy_ids", ()))
     values["realised_pnl"] = float(values.get("realised_pnl", values.get("realized_pnl", 0.0)) or 0.0)
     values["unrealised_pnl"] = float(values.get("unrealised_pnl", values.get("unrealized_pnl", 0.0)) or 0.0)
     values["mark_price"] = None if values.get("mark_price") is None else float(values.get("mark_price"))
     values["closed_at"] = _datetime_optional(values.get("closed_at") or values.get("exit_time"))
     values["exit_reason"] = values.get("exit_reason")
+    if not values["lots"] and values["quantity"] != 0:
+        values["lots"] = (_lot_from_position_values(values),)
     allowed = {field.name for field in WeightedVotingPosition.__dataclass_fields__.values()}
     return WeightedVotingPosition(**{key: value for key, value in values.items() if key in allowed})
+
+
+def _lot_from_payload(payload: dict[str, Any]) -> WeightedVotingLot:
+    values = _snake_dict(payload)
+    values["algorithm_id"] = str(values.get("algorithm_id") or WEIGHTED_VOTING_ALGORITHM_ID)
+    values["lot_id"] = str(values.get("lot_id") or values.get("fill_id") or f"weighted_voting.lot.{values.get('client_order_id')}")
+    values["position_id"] = str(values.get("position_id") or f"weighted_voting.position.{values.get('client_order_id')}")
+    values["symbol"] = str(values.get("symbol") or "").upper()
+    values["side"] = str(values.get("side") or ("SHORT" if int(values.get("quantity", 0)) < 0 else "LONG")).upper()
+    values["quantity"] = int(values.get("quantity") or 0)
+    values["remaining_quantity"] = int(values.get("remaining_quantity") or values["quantity"])
+    values["entry_price"] = float(values.get("entry_price") or values.get("average_entry_price") or values.get("average_fill_price") or 0.0)
+    values["opened_at"] = _datetime_value(values.get("opened_at") or values.get("filled_at") or values.get("created_at"))
+    values["decision_id"] = str(values.get("decision_id") or "")
+    values["order_intent_id"] = str(values.get("order_intent_id") or "")
+    values["client_order_id"] = str(values.get("client_order_id") or "")
+    allowed = {field.name for field in WeightedVotingLot.__dataclass_fields__.values()}
+    return WeightedVotingLot(**{key: value for key, value in values.items() if key in allowed})
+
+
+def _lot_from_position_values(values: dict[str, Any]) -> WeightedVotingLot:
+    lot_seed = {
+        "algorithm_id": values["algorithm_id"],
+        "lot_id": str(values.get("fill_id") or f"{values['position_id']}.lot.{values['opened_at'].isoformat()}.{abs(values['quantity'])}"),
+        "position_id": values["position_id"],
+        "symbol": values["symbol"],
+        "side": values["side"],
+        "quantity": values["quantity"],
+        "remaining_quantity": values["quantity"],
+        "entry_price": values["average_entry_price"],
+        "opened_at": values["opened_at"],
+        "decision_id": values["decision_id"],
+        "order_intent_id": values["order_intent_id"],
+        "client_order_id": values["client_order_id"],
+        "source": values.get("source") or "weighted_voting.inventory.fill",
+    }
+    return WeightedVotingLot(**lot_seed)
 
 
 def _pending_order_from_payload(payload: dict[str, Any]) -> WeightedVotingPendingOrder:
@@ -686,6 +824,9 @@ def _pending_order_from_payload(payload: dict[str, Any]) -> WeightedVotingPendin
     values["order_intent_id"] = str(values.get("order_intent_id") or "")
     values["client_order_id"] = str(values.get("client_order_id") or "")
     values["created_at"] = _datetime_value(values.get("created_at"))
+    values["filled_quantity"] = int(values.get("filled_quantity") or 0)
+    values["status"] = str(values.get("status") or "WORKING").upper()
+    values["protective"] = bool(values.get("protective") or values.get("is_protective") or False)
     allowed = {field.name for field in WeightedVotingPendingOrder.__dataclass_fields__.values()}
     return WeightedVotingPendingOrder(**{key: value for key, value in values.items() if key in allowed})
 
@@ -789,6 +930,28 @@ def inventory_status() -> dict[str, Any]:
             "weighted_voting.positions.*",
         ),
         "brokerAccountRole": "read_only_reconciliation_source",
+        "authoritativeFields": (
+            "allocated_capital",
+            "available_algorithm_cash",
+            "capital_reserved_by_pending_orders",
+            "consumed_capital",
+            "remaining_daily_risk",
+            "open_positions",
+            "individual_lots",
+            "average_entry_price",
+            "pending_orders",
+            "working_orders",
+            "partially_filled_orders",
+            "protective_orders",
+            "realized_pnl",
+            "unrealized_pnl",
+            "daily_loss",
+            "daily_trade_count",
+            "gross_exposure",
+            "net_exposure",
+            "last_broker_reconciliation_checkpoint",
+            "inventory_version",
+        ),
         "reasonCodes": ("weighted_voting.inventory.status.ready",),
     }
 
@@ -802,6 +965,7 @@ __all__ = [
     "WeightedVotingInventoryEventType",
     "WeightedVotingInventoryRepository",
     "WeightedVotingInventorySnapshot",
+    "WeightedVotingLot",
     "WeightedVotingPendingOrder",
     "WeightedVotingPosition",
     "WeightedVotingRiskUsage",

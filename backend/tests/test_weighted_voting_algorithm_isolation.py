@@ -11,6 +11,7 @@ from backend.app.algorithms.weighted_voting.market_snapshot import (
     build_weighted_voting_market_snapshot,
     payload_contains_foreign_algorithm_fields,
 )
+from backend.app.algorithms.weighted_voting.inventory import WeightedVotingInventoryEventType, WeightedVotingInventoryRepository
 from backend.app.algorithms.weighted_voting.service import WeightedVotingService
 
 
@@ -67,8 +68,8 @@ class WeightedVotingAlgorithmIsolationTest(unittest.TestCase):
             }
         )
 
-        baseline = service.evaluate(baseline_payload)
-        changed = service.evaluate(changed_other_algorithms_payload)
+        baseline = service.evaluate_research_shadow(baseline_payload)
+        changed = service.evaluate_research_shadow(changed_other_algorithms_payload)
 
         self.assertEqual(stable_json(changed), stable_json(baseline))
 
@@ -111,7 +112,7 @@ class WeightedVotingAlgorithmIsolationTest(unittest.TestCase):
         payload.update(copy.deepcopy(other_algorithm_state))
 
         before = stable_json({key: payload[key] for key in other_algorithm_state})
-        service.evaluate(payload)
+        service.evaluate_research_shadow(payload)
         after = stable_json({key: payload[key] for key in other_algorithm_state})
 
         self.assertEqual(after, before)
@@ -158,6 +159,59 @@ class WeightedVotingAlgorithmIsolationTest(unittest.TestCase):
         self.assertLess(weighted_start, voting_start)
         self.assertLess(weighted_start, confidence_start)
         self.assertIn("weightedRefreshResultPromise", daily_refresh_slice)
+
+    def test_spy_runtime_state_isolated_from_another_algorithm_namespace(self) -> None:
+        store = MemoryStore()
+        inventory = WeightedVotingInventoryRepository(store, symbol="SPY", allocated_capital=25_000.0)
+        snapshot = inventory.initialize_session(
+            session_date=SESSION_OPEN.date(),
+            allocated_capital=25_000.0,
+            cash_available=25_000.0,
+            occurred_at=SESSION_OPEN,
+            expected_snapshot_version=0,
+            event_id="isolation-session-start",
+        )
+        inventory.append_event(
+            event_id="isolation-fill",
+            event_type=WeightedVotingInventoryEventType.FILL_RECORDED,
+            payload={
+                "algorithm_id": "weighted_voting",
+                "position_id": "weighted_voting.position.SPY.isolation",
+                "symbol": "SPY",
+                "side": "LONG",
+                "quantity": 2,
+                "average_entry_price": 100.0,
+                "opened_at": SESSION_OPEN.isoformat(),
+                "decision_id": "weighted-decision",
+                "order_intent_id": "weighted-intent",
+                "client_order_id": "weighted-client",
+            },
+            occurred_at=SESSION_OPEN + timedelta(seconds=1),
+            expected_snapshot_version=snapshot.snapshot_version,
+        )
+        foreign_state = {
+            "other_algorithm.inventory.SPY": {"algorithmId": "other_algorithm", "symbol": "SPY", "quantity": 99, "pnl": 123.0, "tradeCount": 7},
+            "other_algorithm.orders.SPY": {"clientOrderId": "other-client", "algorithmId": "other_algorithm"},
+            "other_algorithm.fills.SPY": {"fillId": "other-fill", "algorithmId": "other_algorithm"},
+            "other_algorithm.settings": {"enabled": True, "threshold": 0.99},
+            "other_algorithm.weights.active": {"weightVersion": "other-weight-v1"},
+            "other_algorithm.decisions.latest": {"decisionId": "other-decision", "side": "SELL", "quantity": 99},
+        }
+        for key, value in foreign_state.items():
+            store.write_snapshot(key, dict(value))
+        before = stable_json({key: store.read_snapshot(key) for key in foreign_state})
+
+        service = WeightedVotingService(store=store)
+        service.evaluate_research_shadow(evaluate_payload())
+        weighted_snapshot = inventory.current_snapshot(now=SESSION_OPEN + timedelta(minutes=1))
+        after = stable_json({key: store.read_snapshot(key) for key in foreign_state})
+
+        self.assertEqual(after, before)
+        self.assertEqual(weighted_snapshot.algorithm_id, "weighted_voting")
+        self.assertEqual(weighted_snapshot.open_positions[0].algorithm_id, "weighted_voting")
+        self.assertNotIn("other_algorithm", stable_json(weighted_snapshot.as_dict()))
+        self.assertIn("weighted_voting.settings", stable_json(service.get_config()))
+        self.assertEqual(service.active_weight_state().algorithm_id, "weighted_voting")
 
 
 def stable_json(value: object) -> str:
