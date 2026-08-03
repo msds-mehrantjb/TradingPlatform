@@ -30,6 +30,7 @@ from backend.app.algorithms.wca.paper_broker import (
     build_wca_paper_broker_request,
 )
 from backend.app.algorithms.wca.runtime_commands import WcaRuntimeCommandType, runtime_command
+from backend.app.algorithms.wca.runtime_control import WcaRuntimeControl
 from backend.app.algorithms.wca.runtime_repository import WcaRuntimeRepository
 from backend.app.algorithms.wca.runtime_supervisor import WcaRuntimeSettings, WcaRuntimeSupervisor
 from backend.app.algorithms.wca.repository import WcaSqliteRepository
@@ -104,6 +105,32 @@ def test_alpaca_paper_endpoint_and_account_identity_are_enforced() -> None:
 
     assert verified is False
     assert reason_codes == ("wca.alpaca_paper.account_id_mismatch",)
+
+
+def test_alpaca_paper_clock_is_read_from_authoritative_paper_endpoint() -> None:
+    broker = WcaAlpacaPaperBroker(
+        account_id=ACCOUNT_ID,
+        key_id="wca-key",
+        secret_key="wca-secret",
+        http_client=FakeAlpacaClient(
+            {
+                ("GET", "/v2/clock"): FakeAlpacaResponse(
+                    payload={
+                        "timestamp": "2026-01-06T17:00:00Z",
+                        "is_open": True,
+                        "next_open": "2026-01-07T14:30:00Z",
+                        "next_close": "2026-01-06T21:00:00Z",
+                    }
+                )
+            }
+        ),
+    )
+
+    clock = broker.read_clock()
+
+    assert clock.is_open is True
+    assert clock.timestamp == datetime(2026, 1, 6, 17, 0, tzinfo=timezone.utc)
+    assert clock.next_close == datetime(2026, 1, 6, 21, 0, tzinfo=timezone.utc)
 
 
 def test_order_submission_payload_mapping_redacts_response_and_preserves_wca_identity() -> None:
@@ -321,6 +348,42 @@ def test_runtime_blocks_automatic_paper_when_alpaca_adapter_is_unavailable_witho
         owner_id="phase6-runtime",
     )
     decision = decision_with_order("phase6-runtime-decision", "phase6-runtime-intent", "phase6-runtime-key")
+    control = WcaRuntimeControl(
+        broker_account_id=ACCOUNT_ID,
+        paper_trading_requested=True,
+        automatic_entries_requested=True,
+        pause_new_entries=False,
+        effective_paper_trading_enabled=True,
+        effective_automatic_entries_enabled=True,
+        rollout_stage="AUTOMATIC_PAPER",
+        rollout_evidence_revision="wca_evidence_rollout_v2:phase6",
+        rollout_evidence_hash="phase6-rollout-evidence-hash",
+        reason="phase6.valid_control",
+        reason_codes=("phase6.valid_control",),
+    ).with_hash()
+    repository.write_runtime_control(control)
+    assert decision.proposed_order is not None
+    proposed = decision.proposed_order.model_copy(
+        update={
+            "account_id": ACCOUNT_ID,
+                "runtime_control_revision": control.control_revision,
+                "runtime_control_hash": control.control_hash,
+                "rollout_stage": control.rollout_stage,
+                "rollout_evidence_revision": control.rollout_evidence_revision,
+                "rollout_evidence_hash": control.rollout_evidence_hash,
+                "weight_version": decision.weight_version,
+            }
+        )
+    decision = decision.model_copy(
+        update={
+            "proposed_order": proposed,
+            "runtime_control_revision": control.control_revision,
+            "runtime_control_hash": control.control_hash,
+            "rollout_stage": control.rollout_stage,
+            "rollout_evidence_revision": control.rollout_evidence_revision,
+            "rollout_evidence_hash": control.rollout_evidence_hash,
+        }
+    )
     command = runtime_command(
         WcaRuntimeCommandType.EXECUTION_OUTBOX,
         account_id=ACCOUNT_ID,
@@ -334,6 +397,9 @@ def test_runtime_blocks_automatic_paper_when_alpaca_adapter_is_unavailable_witho
         repository,
         "reserve_decision_order_and_outbox",
         return_value=SimpleNamespace(outbox_id="phase6-outbox"),
+    ), patch(
+        "backend.app.algorithms.wca.runtime_supervisor._global_risk_submission_block_reasons",
+        return_value=((), None),
     ), patch(
         "backend.app.algorithms.wca.runtime_supervisor.WcaAlpacaPaperBroker.from_env",
         side_effect=WcaAlpacaPaperBrokerConfigurationError("wca.alpaca_paper.account_id_mismatch"),

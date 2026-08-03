@@ -4,6 +4,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 from backend.app.algorithms.wca.contracts import WcaOrderStatus, WcaOrderValidationContext, WcaRuntimeMode, WcaSide
@@ -11,11 +12,13 @@ from backend.app.algorithms.wca.paper_broker import (
     WcaDeterministicPaperBroker,
     WcaPaperBrokerFill,
     WcaPaperBrokerOutboxAdapter,
+    WcaPaperBrokerAck,
     build_wca_paper_broker_request,
     cancel_wca_paper_order,
 )
 from backend.app.algorithms.wca.position_management import WcaPositionManagementSettings, manage_wca_position
 from backend.app.algorithms.wca.repository import WcaSqliteRepository
+from backend.app.algorithms.wca.runtime_supervisor import _process_observed_fills
 from backend.tests.test_wca_step6_inventory_persistence import decision_with_order
 
 
@@ -59,13 +62,134 @@ def test_partial_entry_fill_records_protection_and_duplicate_fill_is_idempotent(
 
     events = ledger_events(repository)
     protective = [event for event in events if event["event_type"] == "PROTECTIVE_ORDER_CREATED"]
+    actual_protective = [event for event in protective if event["payload"].get("actual_broker_protective_order")]
+    local_protective = [event for event in protective if not event["payload"].get("actual_broker_protective_order")]
     partials = [event for event in events if event["event_type"] == "PARTIAL_FILL_RECEIVED"]
     assert result.state == WcaOrderStatus.PARTIALLY_FILLED
     assert duplicate is False
     assert len(partials) == 1
-    assert len(protective) == 1
-    assert protective[0]["payload"]["source_fill_id"] == fill.fill_id
-    assert protective[0]["payload"]["protected_quantity"] == 2
+    assert len(local_protective) == 1
+    assert len(actual_protective) == 2
+    assert local_protective[0]["payload"]["source_fill_id"] == fill.fill_id
+    assert all(event["payload"]["protected_quantity"] == 2 for event in protective)
+
+
+def test_entry_fill_submits_actual_alpaca_stop_and_target_protective_orders() -> None:
+    repository = phase9_repository()
+    _, request = reserve(repository, "actual-protection")
+    fill = WcaPaperBrokerFill(
+        fill_id="phase9-actual-fill",
+        client_order_id=request.client_order_id,
+        broker_order_id=f"alpaca-{request.client_order_id}",
+        filled_quantity=request.quantity,
+        remaining_quantity=0,
+        average_fill_price=request.limit_price,
+        filled_at=NOW,
+    )
+    broker = ProtectiveBroker(entry_fill=fill)
+
+    result = WcaPaperBrokerOutboxAdapter().process_next_outbox(repository, broker, owner_id="phase9-actual")
+
+    protective_submits = [request for request in broker.submitted_requests if request.client_order_id.startswith("wca-protection-")]
+    events = [event for event in ledger_events(repository) if event["event_type"] == "PROTECTIVE_ORDER_CREATED" and event["payload"].get("actual_broker_protective_order")]
+    assert result.state == WcaOrderStatus.FILLED
+    assert "wca.paper_broker.protective_orders_submitted" in result.reason_codes
+    assert len(protective_submits) == 2
+    assert {request.order_type for request in protective_submits} == {"STOP_LIMIT", "LIMIT"}
+    assert all(request.quantity == fill.filled_quantity for request in protective_submits)
+    assert all(request.client_order_id.startswith("wca-protection-") for request in protective_submits)
+    assert len(events) == 2
+
+
+def test_additional_partial_fill_replaces_stale_protective_siblings_for_total_open_quantity() -> None:
+    repository = phase9_repository()
+    _, request = reserve(repository, "resize-protection")
+    first_fill = WcaPaperBrokerFill(
+        fill_id="phase9-resize-fill-a",
+        client_order_id=request.client_order_id,
+        broker_order_id=f"alpaca-{request.client_order_id}",
+        filled_quantity=2,
+        remaining_quantity=3,
+        average_fill_price=request.limit_price,
+        filled_at=NOW,
+    )
+    second_fill = WcaPaperBrokerFill(
+        fill_id="phase9-resize-fill-b",
+        client_order_id=request.client_order_id,
+        broker_order_id=f"alpaca-{request.client_order_id}",
+        filled_quantity=3,
+        remaining_quantity=0,
+        average_fill_price=request.limit_price,
+        filled_at=NOW + timedelta(seconds=5),
+    )
+    broker = ProtectiveBroker(entry_fill=first_fill)
+
+    first = WcaPaperBrokerOutboxAdapter().process_next_outbox(repository, broker, owner_id="phase9-resize-a")
+    second = WcaPaperBrokerOutboxAdapter().apply_delayed_fill(repository, first.outbox_record, second_fill, broker=broker)
+
+    active_protective = [order for order in broker.orders.values() if order["client_order_id"].startswith("wca-protection-") and order["status"] != "canceled"]
+    assert second.state == WcaOrderStatus.FILLED
+    assert len(broker.cancelled_broker_order_ids) == 2
+    assert len(active_protective) == 2
+    assert all(int(float(order["qty"])) == 5 for order in active_protective)
+
+
+def test_protective_broker_rejection_opens_wca_circuit_breaker() -> None:
+    repository = phase9_repository()
+    _, request = reserve(repository, "rejected-broker-protection")
+    fill = WcaPaperBrokerFill(
+        fill_id="phase9-protection-rejected-fill",
+        client_order_id=request.client_order_id,
+        broker_order_id=f"alpaca-{request.client_order_id}",
+        filled_quantity=request.quantity,
+        remaining_quantity=0,
+        average_fill_price=request.limit_price,
+        filled_at=NOW,
+    )
+    broker = ProtectiveBroker(entry_fill=fill, reject_protection=True)
+
+    result = WcaPaperBrokerOutboxAdapter().process_next_outbox(repository, broker, owner_id="phase9-protection-rejected")
+
+    critical = [event for event in ledger_events(repository) if event["event_type"] == "RECONCILIATION_CORRECTION" and event["payload"].get("critical")]
+    assert result.state == WcaOrderStatus.FILLED
+    assert "wca.paper_broker.protective_order_failed" in result.reason_codes
+    assert repository.wca_position_circuit_breaker_open(account_id=ACCOUNT_ID, symbol="SPY") is True
+    assert critical
+    assert any("wca.protection.broker_rejected" in event["payload"].get("reason_codes", ()) for event in critical)
+
+
+def test_target_execution_closes_wca_lots_and_cancels_stop_sibling() -> None:
+    repository = phase9_repository()
+    _, request = reserve(repository, "target-exec")
+    entry_fill = WcaPaperBrokerFill(
+        fill_id="phase9-target-entry-fill",
+        client_order_id=request.client_order_id,
+        broker_order_id=f"alpaca-{request.client_order_id}",
+        filled_quantity=request.quantity,
+        remaining_quantity=0,
+        average_fill_price=request.limit_price,
+        filled_at=NOW,
+    )
+    broker = ProtectiveBroker(entry_fill=entry_fill)
+    WcaPaperBrokerOutboxAdapter().process_next_outbox(repository, broker, owner_id="phase9-target-entry")
+    target_client_id = next(request.client_order_id for request in broker.submitted_requests if request.client_order_id.startswith("wca-protection-") and request.order_type == "LIMIT")
+    broker.activity_fills = (
+        WcaPaperBrokerFill(
+            fill_id="phase9-target-fill",
+            client_order_id=target_client_id,
+            broker_order_id=f"alpaca-{target_client_id}",
+            filled_quantity=request.quantity,
+            remaining_quantity=0,
+            average_fill_price=102,
+            filled_at=NOW + timedelta(seconds=30),
+        ),
+    )
+
+    processed = _process_observed_fills(repository, broker)
+
+    assert processed == 1
+    assert repository.open_wca_position_quantity(account_id=ACCOUNT_ID, symbol="SPY") == 0
+    assert broker.cancelled_broker_order_ids
 
 
 def test_rejected_protection_opens_circuit_breaker_and_persists_critical_event() -> None:
@@ -306,3 +430,62 @@ def phase9_repository() -> WcaSqliteRepository:
     root = Path.cwd() / "data" / "test_tmp"
     root.mkdir(exist_ok=True)
     return WcaSqliteRepository(f"sqlite:///{root / f'wca-phase9-{uuid4().hex}.sqlite'}")
+
+
+class ProtectiveBroker:
+    def __init__(self, *, entry_fill: WcaPaperBrokerFill, reject_protection: bool = False) -> None:
+        self.entry_fill = entry_fill
+        self.reject_protection = reject_protection
+        self.submitted_requests = []
+        self.orders: dict[str, dict[str, object]] = {}
+        self.cancelled_broker_order_ids: list[str] = []
+        self.activity_fills = ()
+
+    def submit_order(self, request):
+        self.submitted_requests.append(request)
+        broker_order_id = f"alpaca-{request.client_order_id}"
+        status = "rejected" if request.client_order_id.startswith("wca-protection-") and self.reject_protection else "accepted"
+        self.orders[request.client_order_id] = {
+            "id": broker_order_id,
+            "client_order_id": request.client_order_id,
+            "status": status,
+            "qty": str(request.quantity),
+            "filled_qty": "0",
+            "limit_price": str(request.limit_price),
+        }
+        if not request.client_order_id.startswith("wca-protection-"):
+            return WcaPaperBrokerAck(
+                status="ACKNOWLEDGED",
+                client_order_id=request.client_order_id,
+                broker_order_id=broker_order_id,
+                accepted_quantity=request.quantity,
+                fill=self.entry_fill,
+            )
+        return WcaPaperBrokerAck(
+            status="REJECTED" if status == "rejected" else "ACKNOWLEDGED",
+            client_order_id=request.client_order_id,
+            broker_order_id=broker_order_id,
+            accepted_quantity=0 if status == "rejected" else request.quantity,
+            response_payload=self.orders[request.client_order_id],
+        )
+
+    def refresh_order(self, client_order_id: str):
+        return None
+
+    def find_order_by_client_order_id(self, client_order_id: str):
+        order = self.orders.get(client_order_id)
+        return None if order is None else dict(order)
+
+    def read_open_orders(self):
+        return tuple(SimpleNamespace(clientOrderId=order["client_order_id"]) for order in self.orders.values() if order["status"] == "accepted")
+
+    def cancel_order(self, broker_order_id: str):
+        self.cancelled_broker_order_ids.append(broker_order_id)
+        for order in self.orders.values():
+            if order["id"] == broker_order_id:
+                order["status"] = "canceled"
+                return {"id": broker_order_id, "status": "canceled"}
+        return {"id": broker_order_id, "status": "missing"}
+
+    def read_fills_and_activities(self, *, after=None):
+        return self.activity_fills

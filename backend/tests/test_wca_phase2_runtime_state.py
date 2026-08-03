@@ -33,8 +33,30 @@ class WcaPhase2RuntimeStateTests(unittest.TestCase):
 
         self.assertEqual(state.current_quantity, 5)
         self.assertIsNotNone(state.to_open_position())
+        self.assertEqual(state.to_open_position().stop_price, 98.5)
+        self.assertEqual(state.to_open_position().target_price, 103.0)
+        self.assertEqual(state.to_open_position().decision_id, "phase2-entry-decision")
         self.assertEqual(decision.aggregation.post_local_gate_decision, "HOLD")
         self.assertIn("wca.local_gate.pyramiding_restrictions", gate_reasons(decision))
+
+    def test_open_position_without_reconstructable_protection_fails_closed(self) -> None:
+        repository, snapshot = seeded_repository(open_quantity=5)
+        with sqlite3.connect(repository.path) as conn:
+            row = conn.execute("SELECT lot_id, payload_json FROM wca_owned_lots WHERE account_id = 'paper' AND symbol = 'SPY'").fetchone()
+            payload = json.loads(row[1])
+            payload.pop("stop_price", None)
+            payload.pop("target_price", None)
+            conn.execute("UPDATE wca_owned_lots SET payload_json = ? WHERE lot_id = ?", (json.dumps(payload), row[0]))
+
+        state = load_state(repository, snapshot)
+        result = run_worker(repository, snapshot, "phase2-unprotected")
+
+        self.assertFalse(state.fresh)
+        self.assertTrue(state.position_unprotected)
+        self.assertIsNone(state.to_open_position())
+        self.assertIn("wca.runtime_state.position_protection_missing", state.reason_codes)
+        self.assertEqual(result["workers"]["decision_worker"]["status"], "blocked")
+        self.assertIn("wca.runtime_state.position_protection_missing", result["workers"]["decision_worker"]["reasonCodes"])
 
     def test_daily_trade_limits_use_persisted_wca_state(self) -> None:
         repository, snapshot = seeded_repository(trades_completed_today=5)
@@ -178,22 +200,66 @@ def seed_authoritative_state(
         )
     )
     if open_quantity:
+        fill_id = f"phase2-fill-{uuid4().hex}"
+        order_intent_id = f"phase2-intent-{uuid4().hex}"
+        opened_at = (timestamp - timedelta(seconds=5)).isoformat()
         repository.record_inventory_event(
             WcaInventoryLedgerEvent(
                 inventory_event_id=f"phase2-open-{uuid4().hex}",
                 event_type="FILL_RECEIVED",
                 broker_account_id="paper",
                 symbol="SPY",
-                event_timestamp=(timestamp - timedelta(seconds=5)).isoformat(),
+                event_timestamp=opened_at,
                 trade_date=timestamp.date().isoformat(),
-                fill_id=f"phase2-fill-{uuid4().hex}",
+                order_intent_id=order_intent_id,
+                fill_id=fill_id,
                 side="BUY",
                 quantity=open_quantity,
                 filled_quantity=open_quantity,
                 fill_price=100.0,
                 reconciliation_watermark="phase2-reconciled",
+                configuration_version=default_wca_configuration().configuration_version,
+                decision_id="phase2-entry-decision",
+                run_id="phase2-entry-run",
+                payload={
+                    "order_intent_id": order_intent_id,
+                    "decision_id": "phase2-entry-decision",
+                    "entry_price": 100.0,
+                    "stop_price": 98.5,
+                    "target_price": 103.0,
+                    "opened_at": opened_at,
+                    "position_effect": "entry",
+                },
             )
         )
+        with sqlite3.connect(repository.path) as conn:
+            conn.execute(
+                """
+                INSERT INTO wca_owned_lots (
+                    lot_id, algorithm_id, account_id, symbol, timestamp, configuration_version,
+                    engine_version, market_snapshot_id, decision_id, run_id, position_id,
+                    side, quantity, status, payload_json
+                )
+                VALUES (?, 'wca', 'paper', 'SPY', ?, ?, 'phase2-test', 'phase2-snapshot',
+                        'phase2-entry-decision', 'phase2-entry-run', 'phase2-position', 'BUY', ?, 'open', ?)
+                """,
+                (
+                    f"wca-lot-{fill_id}",
+                    opened_at,
+                    default_wca_configuration().configuration_version,
+                    open_quantity,
+                    json.dumps(
+                        {
+                            "order_intent_id": order_intent_id,
+                            "decision_id": "phase2-entry-decision",
+                            "entry_price": 100.0,
+                            "stop_price": 98.5,
+                            "target_price": 103.0,
+                            "opened_at": opened_at,
+                        }
+                    ),
+                ),
+            )
     with sqlite3.connect(repository.path) as conn:
         conn.execute(
             """

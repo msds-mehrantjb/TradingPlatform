@@ -162,6 +162,9 @@ def test_limited_paper_pipeline_applies_configured_strategy_and_risk_controls() 
             configuration=configuration,
             runtime_mode=WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER,
             weight_snapshot=baseline_weight_snapshot(),
+            account_equity=100_000,
+            available_buying_power=100_000,
+            authoritative_account_values=True,
         ),
         voters=(_AlwaysBuy("C1"), _AlwaysBuy("C2"), _AlwaysBuy("C4"), _AlwaysBuy("C7")),
     )

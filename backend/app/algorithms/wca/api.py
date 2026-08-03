@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 
 from backend.app.algorithms.wca.contracts import (
     WcaBacktestRequest,
@@ -147,6 +147,27 @@ def runtime_health() -> dict[str, Any]:
     return WCA_API_SERVICE.status().get("runtimeHealth", {})
 
 
+@router.get("/runtime/control", summary="Read backend-authoritative WCA runtime control")
+def runtime_control() -> dict[str, Any]:
+    return WCA_API_SERVICE.runtime_control()
+
+
+@router.put("/runtime/control", status_code=202, summary="Enqueue WCA runtime-control update")
+def put_runtime_control(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    return {
+        **WCA_API_SERVICE.enqueue_runtime_control_update(payload),
+        "jobKind": "runtime_control_update",
+        "paperOnly": True,
+        "liveTradingEnabled": False,
+        "apiHandlersExecuteAuthoritativeTradingLogic": False,
+    }
+
+
+@router.patch("/runtime/control", status_code=202, summary="Enqueue partial WCA runtime-control update")
+def patch_runtime_control(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    return put_runtime_control(payload)
+
+
 @router.get("/commands/{command_id}", summary="Read WCA runtime command progress")
 def command_status(command_id: str) -> dict[str, Any]:
     status = WCA_API_SERVICE.command_status(command_id)
@@ -165,6 +186,30 @@ def resume_new_entries(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     return WCA_API_SERVICE.enqueue_resume_new_entries(reason=str((payload or {}).get("reason") or "api_request"))
 
 
+@router.post("/runtime/automatic-paper", status_code=202, summary="Toggle WCA automatic paper trading from the global paper control")
+def set_wca_automatic_paper_trading(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    if "enabled" not in payload or not isinstance(payload.get("enabled"), bool):
+        raise HTTPException(status_code=422, detail="wca.api.automatic_paper_requires_boolean_enabled")
+    if not str(payload.get("actor") or "") or not str(payload.get("reason") or ""):
+        raise HTTPException(status_code=422, detail="wca.api.automatic_paper_requires_audit_metadata")
+    receipt = WCA_API_SERVICE.enqueue_automatic_paper_control(
+        enabled=bool(payload["enabled"]),
+        actor=str(payload["actor"]),
+        reason=str(payload["reason"]),
+        account_id=str(payload.get("accountId") or payload.get("account_id") or "paper"),
+        symbol=str(payload.get("symbol") or "SPY"),
+    )
+    return {
+        **receipt,
+        "jobKind": "automatic_paper_control",
+        "globalPaperControl": True,
+        "manualPaperTradingUnaffected": True,
+        "paperOnly": True,
+        "liveTradingEnabled": False,
+        "apiHandlersExecuteAuthoritativeTradingLogic": False,
+    }
+
+
 @router.post("/reconciliation/request", status_code=202, summary="Enqueue WCA broker reconciliation")
 def request_reconciliation(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     body = payload or {}
@@ -175,6 +220,11 @@ def request_reconciliation(payload: dict[str, Any] | None = None) -> dict[str, A
 def request_emergency_risk_reduction(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     body = payload or {}
     return WCA_API_SERVICE.enqueue_emergency_risk_reduction(account_id=str(body.get("accountId") or body.get("account_id") or "paper"), symbol=str(body.get("symbol") or "SPY"), reason=str(body.get("reason") or "api_request"))
+
+
+@router.post("/runtime/emergency-risk-reduction", status_code=202, summary="Enqueue WCA emergency risk reduction")
+def request_runtime_emergency_risk_reduction(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return request_emergency_risk_reduction(payload)
 
 
 @router.get("/decisions", summary="Read recent WCA decisions")

@@ -25,6 +25,7 @@ from backend.app.algorithms.wca.paper_broker import (
     WcaPaperBrokerTimeout,
     redact_secret_payload,
 )
+from backend.app.algorithms.wca.session_validation import WcaBrokerClock
 from backend.app.domain.models import Signal
 from backend.app.gates import BrokerAccountSnapshot, BrokerOrderState, BrokerPositionState
 
@@ -138,6 +139,16 @@ class WcaAlpacaPaperBroker:
             raise WcaAlpacaPaperBrokerConfigurationError("wca.alpaca_paper.account_id_mismatch")
         return redact_secret_payload(account)
 
+    def read_clock(self) -> WcaBrokerClock:
+        clock = self._request("GET", "/v2/clock")
+        return WcaBrokerClock(
+            timestamp=_parse_dt(clock.get("timestamp")),
+            is_open=bool(clock.get("is_open") or clock.get("isOpen")),
+            next_open=_optional_datetime(clock.get("next_open") or clock.get("nextOpen")),
+            next_close=_optional_datetime(clock.get("next_close") or clock.get("nextClose")),
+            raw=redact_secret_payload(clock),
+        )
+
     def read_positions(self) -> list[BrokerPositionState]:
         rows = self._request("GET", "/v2/positions")
         return [_position(row) for row in rows if str(row.get("symbol", "")).upper() == "SPY"]
@@ -181,6 +192,15 @@ class WcaAlpacaPaperBroker:
         cancelled = []
         for order in self._request("GET", "/v2/orders", params={"status": "open", "nested": "false"}):
             if _is_wca_order(order) and _order_side(order) in {"BUY", "SELL"} and not _is_protective_order(order):
+                cancelled.append(self.cancel_order(str(order.get("id"))))
+        return tuple(cancelled)
+
+    def cancel_all_wca_protective_orders(self, *, symbol: str | None = None) -> tuple[dict[str, Any], ...]:
+        cancelled = []
+        for order in self._request("GET", "/v2/orders", params={"status": "open", "nested": "false"}):
+            if symbol is not None and str(order.get("symbol") or "").upper() != symbol.upper():
+                continue
+            if _is_wca_order(order) and _is_protective_order(order):
                 cancelled.append(self.cancel_order(str(order.get("id"))))
         return tuple(cancelled)
 
@@ -228,6 +248,7 @@ class WcaAlpacaPaperBroker:
             filled_quantity=filled,
             remaining_quantity=max(0, quantity - filled),
             average_fill_price=_optional_float(order.get("filled_avg_price") or order.get("limit_price")),
+            filled_at=_order_fill_timestamp(order),
             response_payload=redact_secret_payload(order),
         )
 
@@ -314,8 +335,13 @@ def _fill_from_order(order: dict[str, Any], request: WcaPaperBrokerOrderRequest)
         filled_quantity=filled,
         remaining_quantity=max(0, request.quantity - filled),
         average_fill_price=_optional_float(order.get("filled_avg_price") or order.get("limit_price")),
+        filled_at=_order_fill_timestamp(order),
         response_payload=redact_secret_payload(order),
     )
+
+
+def _order_fill_timestamp(order: dict[str, Any]) -> datetime:
+    return _parse_dt(order.get("filled_at") or order.get("updated_at") or order.get("submitted_at") or order.get("created_at"))
 
 
 def _fill_from_activity(row: dict[str, Any]) -> WcaPaperBrokerFill:
@@ -335,15 +361,19 @@ def _fill_from_activity(row: dict[str, Any]) -> WcaPaperBrokerFill:
 def _position(row: dict[str, Any]) -> BrokerPositionState:
     qty = int(abs(float(row.get("qty") or 0)))
     side = Signal.BUY if float(row.get("qty") or 0) >= 0 else Signal.SELL
+    average_entry_price = _required_positive_float(row.get("avg_entry_price"), "wca.alpaca_paper.position_entry_price_missing")
+    mark_price = _required_positive_float(row.get("current_price") or row.get("market_value") or row.get("avg_entry_price"), "wca.alpaca_paper.position_mark_price_missing")
     return BrokerPositionState(
         algorithmId="wca",
         capitalPartitionId="wca.alpaca_paper",
+        decisionId=_identity_hint(row, 1),
+        orderIntentId=_identity_hint(row, 2),
         positionOwner="wca",
         symbol=str(row.get("symbol") or "SPY").upper(),
         side=side,
         quantity=qty,
-        averageEntryPrice=max(0.000001, _float(row.get("avg_entry_price"))),
-        markPrice=max(0.000001, _float(row.get("current_price") or row.get("market_value") or row.get("avg_entry_price"))),
+        averageEntryPrice=average_entry_price,
+        markPrice=mark_price,
     )
 
 
@@ -362,7 +392,7 @@ def _order(row: dict[str, Any]) -> BrokerOrderState:
         status=_order_status(row),
         quantity=int(float(row.get("qty") or 0)),
         filledQuantity=int(float(row.get("filled_qty") or 0)),
-        entryPrice=max(0.000001, _float(row.get("limit_price") or row.get("filled_avg_price") or 0.01)),
+        entryPrice=_required_positive_float(row.get("limit_price") or row.get("filled_avg_price"), "wca.alpaca_paper.order_entry_price_missing"),
         submittedAt=submitted,
     )
 
@@ -389,6 +419,10 @@ def _order_status(row: dict[str, Any]) -> str:
 
 
 def _identity_hint(row: dict[str, Any], index: int) -> str | None:
+    if index == 1 and row.get("decision_id"):
+        return str(row.get("decision_id"))
+    if index == 2 and row.get("order_intent_id"):
+        return str(row.get("order_intent_id"))
     parts = str(row.get("client_order_id") or "").split("-")
     return parts[index] if len(parts) > index else None
 
@@ -422,6 +456,19 @@ def _float(value: Any) -> float:
 def _optional_float(value: Any) -> float | None:
     parsed = _float(value)
     return parsed if parsed > 0 else None
+
+
+def _required_positive_float(value: Any, reason_code: str) -> float:
+    parsed = _float(value)
+    if parsed <= 0:
+        raise WcaAlpacaPaperBrokerConfigurationError(reason_code)
+    return parsed
+
+
+def _optional_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    return _parse_dt(value)
 
 
 def _parse_dt(value: Any) -> datetime:

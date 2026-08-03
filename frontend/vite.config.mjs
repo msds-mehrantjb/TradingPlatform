@@ -4,4 +4,7 @@ import { defineConfig } from "vite";
 
 export default defineConfig({
   cacheDir: path.join(os.tmpdir(), "trading-dashboard-vite-cache"),
+  resolve: {
+    preserveSymlinks: true,
+  },
 });

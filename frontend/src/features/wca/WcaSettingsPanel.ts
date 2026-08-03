@@ -86,6 +86,7 @@ export function renderWcaSettingsPanel(
         ${renderWcaTargetOrder(decision, trading)}
         ${renderWcaDefaultSettings(decisionSettings, trading)}
         <div class="trading-settings-actions wca-trading-actions">
+          <span>Effective settings are read-only. Edits create a candidate configuration only.</span>
           <span>WCA settings and WCA inventory are isolated from every other algorithm.</span>
           <button class="primary-action" type="submit">Create Candidate Configuration</button>
         </div>

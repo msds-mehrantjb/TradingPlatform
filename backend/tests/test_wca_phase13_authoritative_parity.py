@@ -88,6 +88,24 @@ def test_golden_fixture_has_zero_unexplained_decision_mismatches_across_all_phas
     assert _golden_components(decisions["historical_backtest"]) == EXPECTED_GOLDEN_COMPONENTS
 
 
+def test_automatic_surfaces_require_authoritative_account_values() -> None:
+    fixture = phase13_golden_fixture()
+    command = replace(
+        fixture["command"],
+        runtime_mode=WcaRuntimeMode.AUTOMATIC_PAPER,
+        account_equity=None,
+        available_buying_power=None,
+        authoritative_account_values=False,
+    )
+
+    try:
+        run_wca_paper_pipeline_adapter(command, voters=fake_voters(WcaSide.BUY))
+    except ValueError as exc:
+        assert "authoritative broker equity and buying power" in str(exc)
+    else:
+        raise AssertionError("automatic WCA paper must fail closed without authoritative broker account values")
+
+
 def test_research_backtest_modes_preserve_integrity_and_production_engine_contracts() -> None:
     suite = run_wca_backtest_modes(
         backtest_request(candles=multi_session_candles(30)),
@@ -165,6 +183,7 @@ def phase13_golden_fixture() -> dict[str, object]:
         approved_risk_budget=1000,
         account_equity=100_000,
         available_buying_power=100_000,
+        authoritative_account_values=True,
         trades_today=inventory_snapshot["trades_today"],
         realized_daily_loss=inventory_snapshot["realized_daily_loss"],
         remaining_allocated_risk_budget=1000,

@@ -379,6 +379,65 @@ export type WcaConfigurationResponse = {
   active_versions?: Record<string, unknown>;
 };
 
+export type WcaRuntimeControl = Record<string, unknown> & {
+  algorithmId?: string;
+  algorithm_id?: string;
+  brokerAccountId?: string;
+  broker_account_id?: string;
+  symbol?: string;
+  paperTradingRequested?: boolean;
+  paper_trading_requested?: boolean;
+  automaticEntriesRequested?: boolean;
+  automatic_entries_requested?: boolean;
+  pauseNewEntries?: boolean;
+  pause_new_entries?: boolean;
+  killSwitchOpen?: boolean;
+  kill_switch_open?: boolean;
+  effectivePaperTradingEnabled?: boolean;
+  effective_paper_trading_enabled?: boolean;
+  effectiveAutomaticEntriesEnabled?: boolean;
+  effective_automatic_entries_enabled?: boolean;
+  paperAccountVerified?: boolean;
+  paper_account_verified?: boolean;
+  automaticPaperPermitted?: boolean;
+  automatic_paper_permitted?: boolean;
+  automaticEntryCurrentlyPermitted?: boolean;
+  automatic_entry_currently_permitted?: boolean;
+  rolloutStage?: string;
+  rollout_stage?: string;
+  rolloutEvidenceRevision?: string;
+  rollout_evidence_revision?: string;
+  rolloutEvidenceHash?: string;
+  rollout_evidence_hash?: string;
+  rolloutReasonCodes?: string[];
+  rollout_reason_codes?: string[];
+  limitedAutomaticPaperCaps?: Record<string, unknown>;
+  limited_automatic_paper_caps?: Record<string, unknown>;
+  dependencyHealth?: Record<string, { healthy?: boolean; reasonCodes?: string[]; reason_codes?: string[]; checkedAt?: string; checked_at?: string }>;
+  dependency_health?: Record<string, { healthy?: boolean; reasonCodes?: string[]; reason_codes?: string[]; checkedAt?: string; checked_at?: string }>;
+  controlRevision?: number;
+  control_revision?: number;
+  controlHash?: string;
+  control_hash?: string;
+  updatedAt?: string;
+  updated_at?: string;
+  updatedBy?: string;
+  updated_by?: string;
+  reason?: string;
+  reasonCodes?: string[];
+  reason_codes?: string[];
+};
+
+export type WcaRuntimeControlUpdate = {
+  paperTradingRequested?: boolean;
+  automaticEntriesRequested?: boolean;
+  pauseNewEntries?: boolean;
+  actor?: string;
+  reason: string;
+  accountId?: string;
+  symbol?: string;
+};
+
 export type WcaStatusResponse = {
   algorithmId?: string;
   algorithm_id?: string;
@@ -397,10 +456,15 @@ export type WcaStatusResponse = {
   persistence?: Record<string, unknown>;
   runtimeHealth?: Record<string, unknown>;
   runtime_health?: Record<string, unknown>;
+  runtimeControl?: WcaRuntimeControl;
+  runtime_control?: WcaRuntimeControl;
+  runtimeSupervisor?: Record<string, unknown>;
+  runtime_supervisor?: Record<string, unknown>;
   apiHealth?: Record<string, unknown>;
   api_health?: Record<string, unknown>;
   activeVersions?: Record<string, unknown>;
   active_versions?: Record<string, unknown>;
+  rollout?: Record<string, unknown>;
   observability?: Record<string, unknown>;
   virtualInventory?: Record<string, unknown>;
   virtual_inventory?: Record<string, unknown>;

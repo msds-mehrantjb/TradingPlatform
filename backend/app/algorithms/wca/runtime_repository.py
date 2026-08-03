@@ -15,6 +15,7 @@ from backend.app.algorithms.wca.repository import WcaSqliteRepository
 from backend.app.algorithms.wca.runtime_commands import WcaRuntimeCommand, WcaRuntimeCommandStatus, WcaRuntimeCommandType
 from backend.app.algorithms.wca.runtime_events import WCA_RUNTIME_EVENT_SCHEMA_VERSION, WcaFinalizedBarEvent
 from backend.app.algorithms.wca.runtime_health import WCA_RUNTIME_HEALTH_SCHEMA_VERSION, WcaRuntimeHealthSnapshot
+from backend.app.algorithms.wca.session_validation import validate_wca_entry_session
 
 
 WCA_RUNTIME_REPOSITORY_VERSION = "wca_runtime_repository_v1"
@@ -42,11 +43,26 @@ class WcaRuntimeRepository:
         account_id: str = "paper",
         max_queue_depth: int = 200,
         max_event_age_seconds: int = 300,
+        entry_cutoff_minutes: int = 15 * 60 + 30,
         now: datetime | None = None,
     ) -> WcaRuntimeQueueResult:
         current = now or _utc_now()
-        if (current - event.publication_timestamp.astimezone(timezone.utc)).total_seconds() > max_event_age_seconds:
+        publication_age = (current - event.publication_timestamp.astimezone(timezone.utc)).total_seconds()
+        candle_age = (current - event.finalized_candle_timestamp.astimezone(timezone.utc)).total_seconds()
+        if publication_age > max_event_age_seconds or candle_age > max_event_age_seconds:
             return WcaRuntimeQueueResult(False, "rejected", ("wca.runtime.event.stale",))
+        if not event.replay_or_recovery:
+            session = validate_wca_entry_session(
+                timestamp=current,
+                entry_cutoff_minutes=entry_cutoff_minutes,
+                require_broker_clock=False,
+            )
+            if not session.market_is_open or not session.calendar_session_exists or not session.before_entry_cutoff:
+                return WcaRuntimeQueueResult(
+                    False,
+                    "rejected",
+                    tuple(dict.fromkeys(("wca.runtime.event.market_session_blocked", *session.reason_codes))),
+                )
         with self.repository.connect() as conn:
             if conn.execute("SELECT 1 FROM wca_runtime_event_queue WHERE event_id = ?", (event.event_id,)).fetchone():
                 return WcaRuntimeQueueResult(False, "duplicate", ("wca.runtime.event.duplicate",))
@@ -280,8 +296,8 @@ class WcaRuntimeRepository:
     def acquire_symbol_lease(self, *, symbol: str, owner_id: str, ttl_seconds: int = 30, account_id: str = "paper") -> bool:
         now = _utc_now()
         expires = now + timedelta(seconds=ttl_seconds)
-        lease_key = f"wca.runtime.symbol.{symbol}"
-        payload = {"owner_id": owner_id, "symbol": symbol, "lease_expires_at": _dt(expires)}
+        lease_key = f"wca.runtime.symbol.{account_id}.{symbol}"
+        payload = {"owner_id": owner_id, "account_id": account_id, "symbol": symbol, "lease_expires_at": _dt(expires)}
         with self.repository.connect() as conn:
             row = conn.execute(
                 "SELECT owner_id, lease_expires_at, version FROM wca_runtime_symbol_leases WHERE lease_key = ?",
@@ -312,13 +328,33 @@ class WcaRuntimeRepository:
                 )
         return True
 
-    def release_symbol_lease(self, *, symbol: str, owner_id: str) -> None:
-        lease_key = f"wca.runtime.symbol.{symbol}"
+    def release_symbol_lease(self, *, symbol: str, owner_id: str, account_id: str = "paper") -> None:
+        lease_key = f"wca.runtime.symbol.{account_id}.{symbol}"
         with self.repository.connect() as conn:
             conn.execute(
                 "DELETE FROM wca_runtime_symbol_leases WHERE lease_key = ? AND owner_id = ?",
                 (lease_key, owner_id),
             )
+
+    def fail_unsupported_commands(self, supported_command_types: tuple[str, ...], *, now: datetime | None = None) -> int:
+        current = now or _utc_now()
+        placeholders = ", ".join("?" for _ in supported_command_types)
+        with self.repository.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE wca_runtime_command_queue
+                SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL,
+                    reason_codes_json = ?, updated_at = ?
+                WHERE status IN ('queued', 'running')
+                  AND command_type NOT IN ({placeholders})
+                """,
+                (
+                    _json(("wca.runtime.command.unsupported", "wca.runtime.command.failed")),
+                    _dt(current),
+                    *supported_command_types,
+                ),
+            )
+        return int(cursor.rowcount)
 
     def recover_expired_work(self, *, now: datetime | None = None) -> dict[str, int]:
         current = now or _utc_now()

@@ -14,6 +14,7 @@ WCA_ORDER_VALIDATION_FAILED = "wca.order_validation.failed"
 WCA_ORDER_VALIDATION_EXIT_CRITICAL_ALERT = "wca.order_validation.critical_exit_alert"
 WCA_FINAL_PRE_OUTBOX_VALIDATION_PASSED = "wca.order_validation.final_pre_outbox.passed"
 WCA_FINAL_PRE_OUTBOX_VALIDATION_FAILED = "wca.order_validation.final_pre_outbox.failed"
+WCA_AUTOMATIC_PAPER_ORDER_STAGES = {"LIMITED_AUTOMATIC_PAPER", "AUTOMATIC_PAPER"}
 
 
 def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationContext) -> WcaOrderValidationResult:
@@ -84,6 +85,18 @@ def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationC
             reasons.append("wca.order_validation.runtime_stage_not_executable_paper")
         if runtime_mode in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER} and not context.automatic_paper_enabled:
             reasons.append("wca.order_validation.automatic_paper_feature_flag_disabled")
+        rollout_policy_required = bool(
+            context.rollout_policy_required
+            or context.rollout_stage
+            or decision.rollout_stage
+            or (order.rollout_stage if order is not None else "")
+        )
+        if entry_order and rollout_policy_required and runtime_mode in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}:
+            rollout_stage = str(context.rollout_stage or "").upper()
+            if rollout_stage not in WCA_AUTOMATIC_PAPER_ORDER_STAGES:
+                reasons.append("wca.order_validation.rollout_stage_not_automatic_paper")
+            if not context.rollout_evidence_revision or not context.rollout_evidence_hash:
+                reasons.append("wca.order_validation.rollout_evidence_missing")
     if str(context.order_type).upper() not in {"LIMIT", "STOP_LIMIT"}:
         reasons.append("wca.order_validation.invalid_order_type")
     if str(context.time_in_force).upper() != "DAY":
@@ -117,6 +130,7 @@ def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationC
             if current_side and current_side != side and entry_order:
                 reasons.append("wca.order_validation.ownership_opposite_position")
     if entry_order:
+        reasons.extend(context.market_session_reason_codes)
         if not context.market_is_open:
             reasons.append("wca.order_validation.market_closed")
         if not context.allowed_session_window:
@@ -125,6 +139,12 @@ def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationC
             candle_age = abs((context.evaluation_timestamp - snapshot.data_timestamp).total_seconds())
             if candle_age > context.candle_freshness_seconds:
                 reasons.append("wca.order_validation.stale_finalized_candle")
+        if context.decision_expiration_seconds is not None:
+            decision_age = max(0.0, (context.evaluation_timestamp - decision.decision_timestamp).total_seconds())
+            if decision_age > context.decision_expiration_seconds:
+                reasons.append("wca.order_validation.decision_expired")
+        if context.command_deadline_at is not None and context.evaluation_timestamp > context.command_deadline_at:
+            reasons.append("wca.order_validation.runtime_command_deadline_expired")
         if not snapshot.data_ready or not context.data_ready:
             reasons.append("wca.order_validation.data_not_ready")
         if not context.inventory_consistent:
@@ -141,6 +161,8 @@ def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationC
             reasons.append("wca.order_validation.maximum_approved_quantity_exceeded")
         if not context.protective_exit_plan_present:
             reasons.append("wca.order_validation.missing_protective_exit_plan")
+        if str(context.rollout_stage or "").upper() == "LIMITED_AUTOMATIC_PAPER":
+            reasons.extend(_limited_automatic_paper_cap_reasons(decision, context))
 
     if sizing.stop_distance <= 0 or sizing.stop_risk_dollars <= 0:
         reasons.append("wca.order_validation.invalid_risk")
@@ -191,7 +213,7 @@ def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationC
     if context.expected_net_edge is not None and context.expected_net_edge <= context.minimum_net_edge and entry_order:
         reasons.append("wca.order_validation.expected_net_edge_not_met")
 
-    if len(reasons) == 1:
+    if not _blocking_validation_reasons(reasons):
         reasons.append(WCA_ORDER_VALIDATION_PASSED)
         return WcaOrderValidationResult(valid=True, reason_codes=tuple(reasons))
     if context.is_risk_reducing_exit:
@@ -218,6 +240,16 @@ def apply_wca_final_order_validation(decision: WcaDecision, context: WcaOrderVal
     return drop_wca_order(decision, validation.reason_codes)
 
 
+def _blocking_validation_reasons(reasons: list[str]) -> tuple[str, ...]:
+    non_blocking = {
+        WCA_ORDER_VALIDATION_VERSION,
+        "wca_session_validation_v1",
+        "wca.session.entry_window_open",
+        WCA_ORDER_VALIDATION_PASSED,
+    }
+    return tuple(reason for reason in reasons if reason not in non_blocking)
+
+
 def drop_wca_order(decision: WcaDecision, reason_codes: tuple[str, ...]) -> WcaDecision:
     reasons = _append_reasons(reason_codes, (WCA_ORDER_VALIDATION_FAILED,))
     sizing = decision.sizing.model_copy(
@@ -234,6 +266,64 @@ def drop_wca_order(decision: WcaDecision, reason_codes: tuple[str, ...]) -> WcaD
             "reason_codes": _append_reasons(decision.reason_codes, reasons),
         }
     )
+
+
+def _limited_automatic_paper_cap_reasons(decision: WcaDecision, context: WcaOrderValidationContext) -> tuple[str, ...]:
+    order = decision.proposed_order
+    if order is None:
+        return ()
+    reasons: list[str] = []
+    allowed_symbols = {symbol.upper() for symbol in context.rollout_allowed_symbols if symbol}
+    if allowed_symbols and order.symbol.upper() not in allowed_symbols:
+        reasons.append("wca.order_validation.rollout_limited_symbol_not_allowed")
+    if context.rollout_max_quantity is not None and order.quantity > context.rollout_max_quantity:
+        reasons.append("wca.order_validation.rollout_limited_quantity_exceeded")
+    if context.rollout_max_daily_trades is not None and context.trades_today is not None:
+        if context.trades_today >= context.rollout_max_daily_trades:
+            reasons.append("wca.order_validation.rollout_limited_daily_trade_cap_exceeded")
+    if context.rollout_max_daily_loss is not None and context.realized_daily_loss is not None:
+        if context.realized_daily_loss >= context.rollout_max_daily_loss - 1e-9:
+            reasons.append("wca.order_validation.rollout_limited_daily_loss_cap_exceeded")
+    if context.rollout_allowed_entry_windows and not _timestamp_in_windows(context.evaluation_timestamp, context.rollout_allowed_entry_windows):
+        reasons.append("wca.order_validation.rollout_limited_entry_window_closed")
+    allowed_strategy_ids = {strategy_id.upper() for strategy_id in context.rollout_allowed_strategy_ids if strategy_id}
+    active_strategy_ids = _directional_strategy_ids(decision)
+    if allowed_strategy_ids and not active_strategy_ids.issubset(allowed_strategy_ids):
+        reasons.append("wca.order_validation.rollout_limited_strategy_set_not_allowed")
+    return tuple(reasons)
+
+
+def _directional_strategy_ids(decision: WcaDecision) -> set[str]:
+    ids: set[str] = set()
+    for evaluation in decision.aggregation.strategy_evaluations:
+        if _side_value(evaluation.signal) != WcaSide.HOLD.value:
+            ids.add(evaluation.strategy_id.upper())
+    return ids
+
+
+def _timestamp_in_windows(timestamp, windows: tuple[str, ...]) -> bool:
+    minute = eastern_minutes(timestamp)
+    for raw_window in windows:
+        window = str(raw_window).strip()
+        if not window:
+            continue
+        time_range = window.split()[0]
+        if "-" not in time_range:
+            continue
+        start, end = time_range.split("-", 1)
+        start_minutes = _window_minutes(start)
+        end_minutes = _window_minutes(end)
+        if start_minutes is not None and end_minutes is not None and start_minutes <= minute <= end_minutes:
+            return True
+    return False
+
+
+def _window_minutes(value: str) -> int | None:
+    try:
+        hour, minute = value.split(":", 1)
+        return int(hour) * 60 + int(minute)
+    except (TypeError, ValueError):
+        return None
 
 
 def assert_wca_final_pre_outbox_validation(decision: WcaDecision, context: WcaOrderValidationContext) -> WcaDecision:

@@ -4,7 +4,9 @@ import sqlite3
 from pathlib import Path
 from uuid import uuid4
 
-from backend.app.algorithms.wca.contracts import WcaOrderStatus, WcaOrderValidationContext, WcaRuntimeMode
+from datetime import datetime, timedelta, timezone
+
+from backend.app.algorithms.wca.contracts import WCA_ALGORITHM_ID, WcaOrderStatus, WcaOrderValidationContext, WcaRuntimeMode
 from backend.app.algorithms.wca.paper_broker import (
     WCA_REAL_MONEY_ENDPOINTS_AVAILABLE,
     WcaDeterministicPaperBroker,
@@ -24,7 +26,7 @@ from backend.app.algorithms.wca.paper_account import (
     WCA_REQUIRED_ALPACA_PAPER_BASE_URL,
     validate_wca_automatic_paper_account,
 )
-from backend.app.algorithms.wca.repository import WcaSqliteRepository
+from backend.app.algorithms.wca.repository import WcaGlobalRiskApprovalRecord, WcaSqliteRepository
 from backend.tests.test_wca_paper_execution_pipeline import decision_with_order
 
 
@@ -114,6 +116,27 @@ def test_partial_and_delayed_fills_update_wca_owned_inventory_once() -> None:
     assert fill_count(delayed_repo, "delayed-fill") == 1
 
 
+def test_partial_fill_resizes_reserved_risk_for_remaining_quantity() -> None:
+    repository = repository_for_step10()
+    decision, request = reserve(repository, suffix="partial-risk")
+    before = repository.read_inventory_projection(algorithm_id=WCA_ALGORITHM_ID, broker_account_id=request.account_id, symbol=request.symbol)
+    partial_fill = WcaPaperBrokerFill(
+        fill_id="partial-risk-fill",
+        client_order_id=request.client_order_id,
+        broker_order_id=f"paper-{request.client_order_id}",
+        filled_quantity=2,
+        remaining_quantity=max(0, request.quantity - 2),
+        average_fill_price=request.limit_price,
+    )
+
+    result = WcaPaperBrokerOutboxAdapter().process_next_outbox(repository, WcaDeterministicPaperBroker(fill=partial_fill), owner_id="step10")
+    after = repository.read_inventory_projection(algorithm_id=WCA_ALGORITHM_ID, broker_account_id=request.account_id, symbol=request.symbol)
+
+    assert result.state == WcaOrderStatus.PARTIALLY_FILLED.value
+    assert after.reserved_risk < before.reserved_risk
+    assert after.reserved_risk > 0
+
+
 def test_idempotent_retry_never_generates_second_economic_order() -> None:
     repository = repository_for_step10()
     decision, request = reserve(repository)
@@ -134,6 +157,110 @@ def test_idempotent_retry_never_generates_second_economic_order() -> None:
     assert first.submitted is True
     assert second.submitted is False
     assert broker.submit_count == 1
+
+
+def test_existing_client_order_is_reconciled_before_duplicate_submit() -> None:
+    repository = repository_for_step10()
+    _, request = reserve(repository, suffix="duplicate-existing")
+    broker = LookupBroker(existing_order=alpaca_order_payload(request))
+
+    result = WcaPaperBrokerOutboxAdapter().process_next_outbox(repository, broker, owner_id="step10")
+
+    assert result.submitted is False
+    assert broker.submit_count == 0
+    assert result.state == WcaOrderStatus.RECONCILIATION_REQUIRED.value
+    assert "wca.paper_broker.duplicate_client_order_reconciled" in result.reason_codes
+
+
+def test_timeout_existing_client_order_is_reconciled_before_retry() -> None:
+    repository = repository_for_step10()
+    _, request = reserve(repository, suffix="timeout-existing")
+    broker = LookupBroker(existing_order=alpaca_order_payload(request), timeout=True, found_after_submit=True)
+
+    result = WcaPaperBrokerOutboxAdapter().process_next_outbox(repository, broker, owner_id="step10")
+
+    assert result.submitted is False
+    assert broker.submit_count == 1
+    assert result.state == WcaOrderStatus.RECONCILIATION_REQUIRED.value
+    assert "wca.paper_broker.timeout_existing_order_reconciled" in result.reason_codes
+
+
+def test_stale_outbox_is_cancelled_without_submission() -> None:
+    repository = repository_for_step10()
+    _, request = reserve(repository, suffix="stale")
+    broker = WcaDeterministicPaperBroker()
+
+    result = WcaPaperBrokerOutboxAdapter().process_next_outbox(
+        repository,
+        broker,
+        owner_id="step10",
+        pre_submit_check=lambda _record, _request: (False, ("wca.runtime.pre_submit.command_deadline_expired",)),
+    )
+
+    assert result.submitted is False
+    assert broker.submit_count == 0
+    assert result.state == WcaOrderStatus.CANCELLED.value
+    assert state_for(repository, request.idempotency_key) == WcaOrderStatus.CANCELLED.value
+
+
+def test_atomic_reservation_persists_phase8_control_global_risk_and_state_evidence() -> None:
+    repository = repository_for_step10()
+    decision = decision_with_order()
+    assert decision.proposed_order is not None
+    proposed = decision.proposed_order.model_copy(
+        update={
+            "idempotency_key": "step10-phase8-evidence",
+            "account_id": "paper-step10",
+            "runtime_control_revision": 7,
+            "runtime_control_hash": "control-hash-7",
+        }
+    )
+    decision = decision.model_copy(
+        update={
+            "proposed_order": proposed,
+            "runtime_control_revision": 7,
+            "runtime_control_hash": "control-hash-7",
+        }
+    )
+    request = build_wca_paper_broker_request(proposed)
+    approval = WcaGlobalRiskApprovalRecord(
+        decision_id=decision.decision_id,
+        account_id=proposed.account_id,
+        symbol=proposed.symbol,
+        status="PASS",
+        global_risk_decision_id="global-risk-phase8",
+        evaluated_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        entry_permitted=True,
+        risk_reducing_exit_permitted=True,
+        requested_quantity=proposed.quantity,
+        allowed_quantity=proposed.quantity,
+        approved_risk_dollars=12.34,
+        reason_codes=("wca.global_risk.durable_approval_persisted",),
+        global_state_hash="global-state-hash",
+        global_state_revision="global-state-revision",
+        payload={},
+    )
+
+    repository.reserve_decision_order_and_outbox(
+        decision,
+        run_id="step10-run",
+        account_id=proposed.account_id,
+        idempotency_key=proposed.idempotency_key,
+        client_order_id=request.client_order_id,
+        request_payload=request.model_dump(mode="json"),
+        final_validation_context=validation_context(decision, request),
+        global_risk_approval=approval,
+        authoritative_state_hash="authoritative-state-hash",
+    )
+    record = repository.list_execution_outbox_records(account_id=proposed.account_id)[0]
+
+    assert record.runtime_control_revision == 7
+    assert record.runtime_control_hash == "control-hash-7"
+    assert record.global_risk_decision_id == "global-risk-phase8"
+    assert record.global_risk_state_hash == "global-state-hash"
+    assert record.global_risk_state_revision == "global-state-revision"
+    assert record.authoritative_state_hash == "authoritative-state-hash"
 
 
 def test_cancel_replace_redaction_and_live_endpoint_guards() -> None:
@@ -182,6 +309,14 @@ def test_wca_automatic_paper_account_requires_dedicated_valid_env() -> None:
         account_id="other-paper",
         environ=valid_wca_paper_env(),
     )
+    default_account = validate_wca_automatic_paper_account(
+        account_id="paper",
+        environ=valid_wca_paper_env() | {WCA_ALPACA_PAPER_ACCOUNT_ID: "paper"},
+    )
+    shared_account_without_allocator = validate_wca_automatic_paper_account(
+        account_id="wca-paper-1",
+        environ=valid_wca_paper_env() | {"WCA_ALPACA_PAPER_ACCOUNT_SHARED": "true"},
+    )
     valid = validate_wca_automatic_paper_account(
         account_id="wca-paper-1",
         environ=valid_wca_paper_env(),
@@ -196,6 +331,10 @@ def test_wca_automatic_paper_account_requires_dedicated_valid_env() -> None:
     assert "wca.paper_account.shared_alpaca_credentials_rejected" in shared_credentials.reason_codes
     assert account_mismatch.verified is False
     assert "wca.paper_account.account_id_mismatch" in account_mismatch.reason_codes
+    assert default_account.verified is False
+    assert "wca.paper_account.dedicated_account_id_required" in default_account.reason_codes
+    assert shared_account_without_allocator.verified is False
+    assert "wca.paper_account.shared_physical_account_requires_allocator" in shared_account_without_allocator.reason_codes
     assert valid.verified is True
     assert valid.reason_codes[-1] == "wca.paper_account.verified"
 
@@ -271,4 +410,42 @@ def valid_wca_paper_env() -> dict[str, str]:
         WCA_ALPACA_PAPER_BASE_URL: WCA_REQUIRED_ALPACA_PAPER_BASE_URL,
         WCA_ALPACA_PAPER_ACCOUNT_ID: "wca-paper-1",
         WCA_AUTOMATIC_PAPER_ENABLED: "true",
+    }
+
+
+class LookupBroker:
+    def __init__(self, *, existing_order: dict, timeout: bool = False, found_after_submit: bool = False) -> None:
+        self.existing_order = existing_order
+        self.timeout = timeout
+        self.found_after_submit = found_after_submit
+        self.submit_count = 0
+        self.lookup_count = 0
+
+    def find_order_by_client_order_id(self, client_order_id: str):
+        self.lookup_count += 1
+        if self.found_after_submit and self.submit_count == 0:
+            return None
+        return self.existing_order if self.existing_order["client_order_id"] == client_order_id else None
+
+    def submit_order(self, request):
+        self.submit_count += 1
+        if self.timeout:
+            from backend.app.algorithms.wca.paper_broker import WcaPaperBrokerTimeout
+
+            raise WcaPaperBrokerTimeout("lookup after timeout")
+        raise AssertionError("duplicate existing order should not submit")
+
+    def refresh_order(self, client_order_id: str):
+        return None
+
+
+def alpaca_order_payload(request) -> dict:
+    return {
+        "id": f"alpaca-{request.client_order_id}",
+        "client_order_id": request.client_order_id,
+        "symbol": request.symbol,
+        "qty": str(request.quantity),
+        "filled_qty": "0",
+        "limit_price": str(request.limit_price),
+        "status": "new",
     }

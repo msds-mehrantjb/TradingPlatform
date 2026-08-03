@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -43,6 +45,17 @@ WCA_ROLLOUT_STAGES: tuple[WcaRolloutStage, ...] = (
 )
 WcaRolloutPhase = WcaRolloutStage
 WCA_ROLLOUT_PHASES = WCA_ROLLOUT_STAGES
+WCA_AUTOMATIC_PAPER_ROLLOUT_STAGES: tuple[WcaRolloutStage, ...] = (
+    "LIMITED_AUTOMATIC_PAPER",
+    "AUTOMATIC_PAPER",
+)
+WCA_NON_AUTOMATIC_PAPER_ROLLOUT_STAGES: tuple[WcaRolloutStage, ...] = (
+    "DISABLED",
+    "HISTORICAL_REPLAY",
+    "SHADOW",
+    "PAPER_RECOMMENDATION",
+    "MANUAL_PAPER",
+)
 
 WCA_ROLLOUT_STAGE_ALIASES = {
     "legacy_parity": "HISTORICAL_REPLAY",
@@ -324,6 +337,28 @@ class WcaRolloutPhaseStatus:
 
 
 @dataclass(frozen=True)
+class WcaAutomaticPaperRolloutDecision:
+    stage: WcaRolloutStage
+    permitted: bool
+    evidence_revision: str
+    evidence_hash: str
+    caps: WcaLimitedAutomaticPaperCaps
+    reason_codes: tuple[str, ...]
+    status: dict[str, object]
+
+    def model_dump(self) -> dict[str, object]:
+        return {
+            "stage": self.stage,
+            "permitted": self.permitted,
+            "evidence_revision": self.evidence_revision,
+            "evidence_hash": self.evidence_hash,
+            "caps": self.caps.model_dump(),
+            "reason_codes": self.reason_codes,
+            "status": self.status,
+        }
+
+
+@dataclass(frozen=True)
 class WcaCriticalFailureAction:
     failure_id: str
     stop_new_entries: bool = True
@@ -444,6 +479,49 @@ def wca_rollout_status(
         "rollback_plan": rollback_configuration(),
         "reason_codes": ("wca.rollout.paper_only", "wca.rollout.evidence_required"),
     }
+
+
+def evaluate_wca_automatic_paper_rollout(
+    *,
+    flags: WcaRolloutFlags | None = None,
+    evidence: WcaRolloutEvidence | None = None,
+    thresholds: WcaRolloutEvidenceThresholds | None = None,
+    caps: WcaLimitedAutomaticPaperCaps | None = None,
+    configured_stage: WcaRolloutStage | str | None = None,
+) -> WcaAutomaticPaperRolloutDecision:
+    """Resolve the highest evidenced WCA rollout stage for automatic paper entries."""
+
+    active_flags = flags or wca_rollout_feature_flags()
+    active_evidence = evidence or WcaRolloutEvidence()
+    active_thresholds = thresholds or WcaRolloutEvidenceThresholds()
+    active_caps = caps or WcaLimitedAutomaticPaperCaps()
+    stage = highest_wca_rollout_stage(flags=active_flags, evidence=active_evidence)
+    if configured_stage:
+        ceiling = _canonical_stage(str(configured_stage))
+        if WCA_ROLLOUT_STAGES.index(stage) > WCA_ROLLOUT_STAGES.index(ceiling):
+            stage = ceiling
+    status = evaluate_wca_rollout_stage(stage, flags=active_flags, evidence=active_evidence, thresholds=active_thresholds)
+    evidence_hash = _evidence_hash(active_evidence)
+    evidence_revision = f"{WCA_ROLLOUT_VERSION}:{evidence_hash[:16]}"
+    reasons = list(status.reason_codes)
+    if stage not in WCA_AUTOMATIC_PAPER_ROLLOUT_STAGES:
+        reasons.append(f"wca.rollout.automatic_paper.stage_not_permitted.{stage.lower()}")
+    if not active_flags.paper_execution_enabled:
+        reasons.append("wca.rollout.automatic_paper.env_flag_disabled")
+    permitted = stage in WCA_AUTOMATIC_PAPER_ROLLOUT_STAGES and status.enabled and active_flags.paper_execution_enabled
+    if permitted:
+        reasons.append("wca.rollout.automatic_paper.permitted")
+    else:
+        reasons.append("wca.rollout.automatic_paper.blocked")
+    return WcaAutomaticPaperRolloutDecision(
+        stage=stage,
+        permitted=permitted,
+        evidence_revision=evidence_revision,
+        evidence_hash=evidence_hash,
+        caps=active_caps,
+        reason_codes=tuple(dict.fromkeys(reasons)),
+        status=status.model_dump(),
+    )
 
 
 def compare_shadow_results(
@@ -826,6 +904,11 @@ def _canonical_stage(stage: str) -> WcaRolloutStage:
     return canonical  # type: ignore[return-value]
 
 
+def _evidence_hash(evidence: WcaRolloutEvidence) -> str:
+    canonical = json.dumps(evidence.model_dump(), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _values_match(left: object, right: object, tolerance: float) -> bool:
     if isinstance(left, Mapping) and isinstance(right, Mapping):
         keys = set(left) | set(right)
@@ -862,6 +945,8 @@ __all__ = [
     "WCA_DYNAMIC_PROFILE_ENABLED",
     "WCA_DYNAMIC_WEIGHTS_ENABLED",
     "WCA_PAPER_EXECUTION_ENABLED",
+    "WCA_AUTOMATIC_PAPER_ROLLOUT_STAGES",
+    "WCA_NON_AUTOMATIC_PAPER_ROLLOUT_STAGES",
     "WCA_ROLLBACK_STATE_KEY",
     "WCA_ROLLOUT_PHASES",
     "WCA_ROLLOUT_STAGES",
@@ -870,6 +955,7 @@ __all__ = [
     "WCA_ROLLOUT_EVIDENCE_ALIASES",
     "WCA_REQUIRED_ROLLOUT_EVIDENCE",
     "WCA_SHADOW_COMPARISON_FIELDS",
+    "WcaAutomaticPaperRolloutDecision",
     "WcaCriticalFailureAction",
     "WcaLimitedAutomaticPaperCaps",
     "WcaRolloutEvidence",
@@ -883,6 +969,7 @@ __all__ = [
     "WcaShadowComparisonResult",
     "compare_shadow_results",
     "critical_failure_action",
+    "evaluate_wca_automatic_paper_rollout",
     "evaluate_wca_rollout_phase",
     "evaluate_wca_rollout_stage",
     "highest_wca_rollout_stage",

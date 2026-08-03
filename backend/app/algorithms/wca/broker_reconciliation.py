@@ -79,10 +79,11 @@ def reconcile_wca_broker(
     intents = repository.list_order_intents(account_id=account)
     outbox_rows = repository.list_execution_outbox_records(account_id=account) if hasattr(repository, "list_execution_outbox_records") else ()
     broker_orders = tuple(order for order in (*snapshot.pendingOrders, *snapshot.partiallyFilledOrders) if _is_wca(order))
+    entry_broker_orders = tuple(order for order in broker_orders if not _is_protective_order(order))
     broker_positions = tuple(position for position in snapshot.positions if _is_wca(position))
     non_wca_spy_positions = tuple(position for position in snapshot.positions if position.symbol.upper() == "SPY" and not _is_wca(position))
-    order_by_intent = {order.orderIntentId: order for order in broker_orders if order.orderIntentId}
-    order_by_client = {order.clientOrderId: order for order in broker_orders if order.clientOrderId}
+    order_by_intent = {order.orderIntentId: order for order in entry_broker_orders if order.orderIntentId}
+    order_by_client = {order.clientOrderId: order for order in entry_broker_orders if order.clientOrderId}
     position_by_intent = {position.orderIntentId: position for position in broker_positions if position.orderIntentId}
     known_intents = {intent.order_intent_id for intent in intents}
     known_clients = {client for client in (_client_id_for_intent(intent) for intent in intents) if client}
@@ -197,7 +198,7 @@ def reconcile_wca_broker(
             discrepancies.append(_fill_discrepancy("broker_order_missing_locally", account, fill, reason="wca.broker_reconciliation.broker_fill_missing_locally"))
 
     for order in broker_orders:
-        if order.clientOrderId and str(order.clientOrderId).startswith("wca-") and order.clientOrderId not in known_clients:
+        if not _is_protective_order(order) and order.clientOrderId and str(order.clientOrderId).startswith("wca-") and order.clientOrderId not in known_clients:
             discrepancies.append(_broker_order_discrepancy("broker_order_missing_locally", account, order, reason="wca.broker_reconciliation.broker_order_missing_locally"))
         if _is_protective_order(order) and order.orderIntentId not in known_intents:
             discrepancies.append(_broker_order_discrepancy("orphan_protective_order", account, order, reason="wca.broker_reconciliation.orphan_protective_order"))
@@ -512,7 +513,13 @@ def _is_wca(value: BrokerOrderState | BrokerPositionState) -> bool:
 
 
 def _is_protective_order(order: BrokerOrderState) -> bool:
-    return order.exitOwner == WCA_ALGORITHM_ID or str(order.orderType).upper() in {"STOP", "STOP_LIMIT", "TRAILING_STOP"}
+    client_order_id = str(getattr(order, "clientOrderId", "") or "").lower()
+    return (
+        order.exitOwner == WCA_ALGORITHM_ID
+        or str(order.orderType).upper() in {"STOP", "STOP_LIMIT", "TRAILING_STOP"}
+        or "-protection-" in client_order_id
+        or client_order_id.startswith("wca-protection-")
+    )
 
 
 def _refresh_broker_order(broker: WcaPaperBrokerReconciliationClient, client_id: str) -> object | None:

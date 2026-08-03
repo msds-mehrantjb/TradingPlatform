@@ -21,6 +21,7 @@ class WcaRuntimeCommandType(str, Enum):
     MANUAL_PAPER_COMMAND = "manual_paper_command"
     PAUSE_NEW_ENTRIES = "pause_new_entries"
     RESUME_NEW_ENTRIES = "resume_new_entries"
+    SET_AUTOMATIC_PAPER = "set_automatic_paper"
     CONFIGURATION_ACTIVATION = "configuration_activation"
     CONFIGURATION_ROLLBACK = "configuration_rollback"
     POSITION_PROTECTIVE_EXIT = "position_protective_exit"
@@ -79,6 +80,7 @@ class WcaRuntimeCommand(WcaContractModel):
 def runtime_command(
     command_type: WcaRuntimeCommandType,
     *,
+    command_id: str | None = None,
     event_id: str | None = None,
     account_id: str = "paper",
     symbol: str = "SPY",
@@ -90,7 +92,7 @@ def runtime_command(
     reason_codes: tuple[str, ...] = (),
 ) -> WcaRuntimeCommand:
     return WcaRuntimeCommand(
-        command_id=f"wca-cmd-{command_type.value}-{uuid4().hex}",
+        command_id=command_id or f"wca-cmd-{command_type.value}-{uuid4().hex}",
         command_type=command_type,
         event_id=event_id,
         account_id=account_id,

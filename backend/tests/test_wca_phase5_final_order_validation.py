@@ -196,11 +196,21 @@ def exit_decision():
 
 
 def valid_context(decision, *, runtime_mode: WcaRuntimeMode = WcaRuntimeMode.MANUAL_PAPER) -> WcaOrderValidationContext:
+    rollout_fields = (
+        {
+            "rollout_stage": "AUTOMATIC_PAPER",
+            "rollout_evidence_revision": "wca_evidence_rollout_v2:test",
+            "rollout_evidence_hash": "test-rollout-evidence-hash",
+        }
+        if runtime_mode in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}
+        else {}
+    )
     return WcaOrderValidationContext(
         evaluation_timestamp=decision.decision_timestamp,
         account_id=decision.proposed_order.account_id,
         broker_endpoint="paper",
         runtime_mode=runtime_mode,
+        **rollout_fields,
         requires_executable_paper_stage=True,
         automatic_paper_enabled=True,
         market_is_open=True,

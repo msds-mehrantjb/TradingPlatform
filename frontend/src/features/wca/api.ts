@@ -6,6 +6,8 @@ import type {
   WcaConfigurationResponse,
   WcaDecision,
   WcaDecisionsResponse,
+  WcaRuntimeControl,
+  WcaRuntimeControlUpdate,
   WcaStatusResponse,
 } from "./types";
 
@@ -87,4 +89,82 @@ export function fetchWcaBacktest(runId: string, client?: ApiClient): Promise<Wca
 
 export function fetchWcaBacktestStatus(runId: string, client?: ApiClient): Promise<Record<string, unknown>> {
   return requestJson<Record<string, unknown>>(`/api/wca/backtests/${encodeURIComponent(runId)}/status`, {}, client);
+}
+
+export function fetchWcaRuntimeControl(client?: ApiClient): Promise<WcaRuntimeControl> {
+  return requestJson<WcaRuntimeControl>("/api/wca/runtime/control", {}, client);
+}
+
+export function updateWcaRuntimeControl(
+  payload: WcaRuntimeControlUpdate,
+  client?: ApiClient,
+): Promise<WcaCommandReceipt> {
+  return requestJson<WcaCommandReceipt>(
+    "/api/wca/runtime/control",
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+    client,
+  );
+}
+
+export function pauseWcaRuntimeEntries(
+  payload: { reason: string; accountId?: string; symbol?: string },
+  client?: ApiClient,
+): Promise<WcaCommandReceipt> {
+  return requestJson<WcaCommandReceipt>(
+    "/api/wca/runtime/pause",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    client,
+  );
+}
+
+export function resumeWcaRuntimeEntries(
+  payload: { reason: string; accountId?: string; symbol?: string },
+  client?: ApiClient,
+): Promise<WcaCommandReceipt> {
+  return requestJson<WcaCommandReceipt>(
+    "/api/wca/runtime/resume",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    client,
+  );
+}
+
+export function requestWcaEmergencyRiskReduction(
+  payload: { reason: string; accountId?: string; symbol?: string },
+  client?: ApiClient,
+): Promise<WcaCommandReceipt> {
+  return requestJson<WcaCommandReceipt>(
+    "/api/wca/runtime/emergency-risk-reduction",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    client,
+  );
+}
+
+export function setWcaAutomaticPaperTrading(
+  payload: { enabled: boolean; actor: string; reason: string; accountId?: string; symbol?: string },
+  client?: ApiClient,
+): Promise<WcaCommandReceipt & { globalPaperControl?: boolean }> {
+  return updateWcaRuntimeControl(
+    {
+      paperTradingRequested: payload.enabled,
+      automaticEntriesRequested: payload.enabled,
+      pauseNewEntries: !payload.enabled,
+      actor: payload.actor,
+      reason: payload.reason,
+      accountId: payload.accountId,
+      symbol: payload.symbol,
+    },
+    client,
+  ) as Promise<WcaCommandReceipt & { globalPaperControl?: boolean }>;
 }

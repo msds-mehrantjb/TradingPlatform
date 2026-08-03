@@ -93,6 +93,7 @@ def parity_command() -> WcaExecutionPipelineInput:
         approved_risk_budget=1000,
         account_equity=100_000,
         available_buying_power=100_000,
+        authoritative_account_values=True,
         trades_today=0,
         realized_daily_loss=0,
     )

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -48,7 +51,10 @@ from backend.app.algorithms.wca.research_jobs import WcaResearchJobReceipt, WcaR
 from backend.app.algorithms.wca.research_repository import WcaResearchRepository
 from backend.app.algorithms.wca.runtime_commands import WcaRuntimeCommandType, runtime_command
 from backend.app.algorithms.wca.runtime_repository import WcaRuntimeRepository
-from backend.app.algorithms.wca.rollout import paper_execution_allowed, wca_rollout_status
+from backend.app.algorithms.wca.runtime_supervisor import _load_persisted_rollout_evidence, get_wca_runtime_supervisor
+from backend.app.algorithms.wca.session_validation import validate_wca_entry_session
+from backend.app.algorithms.wca.rollout import wca_rollout_status
+from backend.app.algorithms.wca.paper_account import validate_wca_automatic_paper_account
 from backend.app.algorithms.wca.paper_stability import validate_wca_paper_stability
 from backend.app.algorithms.wca.paper_broker import build_wca_paper_broker_request
 from backend.app.algorithms.wca.shadow_comparison import WcaShadowComparisonTolerance, run_wca_shadow_comparison
@@ -114,30 +120,175 @@ class WcaService:
     def status(self) -> dict[str, Any]:
         persistence = self._repository.table_counts()
         active = self._load_active_configuration()
+        now = datetime.now(timezone.utc)
         runtime_health = self._runtime_repository.read_latest_runtime_health()
         queue_depths = self._runtime_repository.queue_depths()
-        weights = self._read_active_weights_as_of(datetime.now(timezone.utc))
-        calibrations = self._read_active_calibrations_as_of(symbol="SPY", as_of=datetime.now(timezone.utc))
+        queue_ages = self._runtime_repository.queue_ages(now=now)
+        weights = self._read_active_weights_as_of(now)
+        calibrations = self._read_active_calibrations_as_of(symbol="SPY", as_of=now)
         latest_decision = self.latest_decisions(limit=1)
         latest_payload = latest_decision[0] if latest_decision else {}
-        return {
+        runtime_supervisor = get_wca_runtime_supervisor()
+        runtime_control = runtime_supervisor.runtime_control()
+        account_id = str(runtime_control.get("brokerAccountId") or runtime_control.get("broker_account_id") or "paper")
+        symbol = str(runtime_control.get("symbol") or "SPY").upper()
+        position = self.current_wca_position(account_id=account_id, symbol=symbol)
+        latest_order_intent = self.latest_order_intent(account_id=account_id)
+        latest_outbox = self.latest_order()
+        latest_broker_order = self.latest_broker_order(account_id=account_id, symbol=symbol)
+        latest_fill = self.latest_fill()
+        latest_reconciliation = self.reconciliation_status(account_id=account_id, symbol=symbol)
+        latest_end_of_session = self.latest_end_of_session_result(account_id=account_id, symbol=symbol)
+        latest_global_risk = self.latest_global_risk_status(account_id=account_id, symbol=symbol)
+        broker_validation = validate_wca_automatic_paper_account(account_id=account_id)
+        session = validate_wca_entry_session(
+            timestamp=now,
+            entry_cutoff_minutes=active.execution.entry_cutoff_minutes if active is not None else 15 * 60 + 30,
+            require_broker_clock=False,
+        )
+        rollout = wca_rollout_status(evidence=_load_persisted_rollout_evidence(self._repository) if isinstance(self._repository, WcaSqliteRepository) else None)
+        rollout_stage = str(runtime_control.get("rolloutStage") or rollout.get("current_stage") or "DISABLED")
+        rollout_blockers = _rollout_blockers(rollout, rollout_stage)
+        active_circuit_breakers = _active_circuit_breakers(
+            runtime_control=runtime_control,
+            runtime_health=runtime_health.model_dump(mode="json") if runtime_health else {},
+            position=position,
+            daily_state=self._daily_state(account_id=account_id, symbol=symbol, now=now),
+        )
+        authoritative_state_hash = _authoritative_status_hash(
+            {
+                "runtime_control_revision": runtime_control.get("controlRevision"),
+                "runtime_control_hash": runtime_control.get("controlHash"),
+                "position": position,
+                "latest_reconciliation": latest_reconciliation,
+                "queue_depths": queue_depths,
+                "queue_ages": queue_ages,
+                "latest_decision_id": self._runtime_repository.last_decision_id(),
+            }
+        )
+        paper_ready = bool(runtime_control.get("effectiveAutomaticEntriesEnabled"))
+        paper_requested = bool(runtime_control.get("paperTradingRequested") or runtime_control.get("automaticEntriesRequested"))
+        heartbeat_at = runtime_health.heartbeat_at if runtime_health else None
+        heartbeat_age_seconds = (now - heartbeat_at).total_seconds() if heartbeat_at is not None else None
+        heartbeat_fresh = heartbeat_age_seconds is not None and heartbeat_age_seconds <= 90
+        runtime_process_status = "running" if heartbeat_fresh else "stale" if runtime_health is not None else "not_started"
+        active_entry_block_reasons = _active_entry_block_reasons(
+            runtime_control=runtime_control,
+            runtime_health=runtime_health.model_dump(mode="json") if runtime_health else {},
+            session_reason_codes=session.reason_codes,
+            broker_reason_codes=broker_validation.reason_codes,
+            rollout_blockers=rollout_blockers,
+            reconciliation=latest_reconciliation,
+            circuit_breakers=active_circuit_breakers,
+            paper_requested=paper_requested,
+            paper_ready=paper_ready,
+            runtime_process_status=runtime_process_status,
+        )
+        readiness_state = _wca_readiness_state(
+            paper_requested=paper_requested,
+            paper_ready=paper_ready,
+            rollout_stage=rollout_stage,
+            runtime_process_status=runtime_process_status,
+            runtime_health=runtime_health.model_dump(mode="json") if runtime_health else {},
+            active_block_reasons=active_entry_block_reasons,
+            active_circuit_breakers=active_circuit_breakers,
+            open_quantity=int(position.get("openQuantity") or 0),
+        )
+        mode = (
+            "automatic_paper_ready"
+            if paper_ready
+            else "paper_requested_blocked"
+            if paper_requested
+            else "paper_off"
+        )
+        status_reason_codes = tuple(
+            dict.fromkeys(
+                (
+                    "wca.backend_v2.active",
+                    "wca.api.transport_only",
+                    "wca.paper_ready" if paper_ready else "wca.paper_blocked",
+                    f"wca.readiness.{readiness_state.lower()}",
+                    *(runtime_control.get("reasonCodes") or ()),
+                    *active_entry_block_reasons,
+                )
+            )
+        )
+        payload = {
             "algorithmId": WCA_ALGORITHM_ID,
             "serviceVersion": self.version,
             "engineVersion": WCA_ENGINE_VERSION,
             "executionPipelineVersion": WCA_EXECUTION_PIPELINE_VERSION,
             "apiProcessRole": "transport_and_presentation_only",
             "runtimeProcessRequired": True,
+            "runtimeProcessStatus": runtime_process_status,
+            "runtimeReadinessState": readiness_state,
             "configurationVersion": active.configuration_version if active else self.configuration_version,
             "configurationHash": active.content_hash if active else "",
             "configurationStatus": active.lifecycle if active else "unavailable",
             "configurationError": self._configuration_error,
-            "status": "ready" if active is not None else "configuration_blocked",
-            "mode": "backend_v2_active_paper_recommendation_only",
+            "status": readiness_state,
+            "mode": mode,
             "strategyCount": len(WCA_STRATEGY_REGISTRY),
             "paperOnly": True,
-            "runtimeHealth": runtime_health.model_dump(mode="json") if runtime_health else {"status": "unknown", "apiHealthSeparate": True},
-            "apiHealth": {"status": "ready", "doesNotRunRuntime": True},
+            "requestedPaperState": "ON" if bool(runtime_control.get("paperTradingRequested")) else "OFF",
+            "requestedPaperTrading": bool(runtime_control.get("paperTradingRequested")),
+            "effectivePaperState": "ON" if bool(runtime_control.get("effectivePaperTradingEnabled")) else "OFF",
+            "effectivePaperTrading": bool(runtime_control.get("effectivePaperTradingEnabled")),
+            "automaticEntryPermission": {
+                "permitted": paper_ready,
+                "state": "PERMITTED" if paper_ready else "BLOCKED",
+                "requested": bool(runtime_control.get("automaticEntriesRequested")),
+                "reasonCodes": [] if paper_ready else list(active_entry_block_reasons),
+            },
+            "paperReady": paper_ready,
+            "paperReadyBlockingReasonCodes": [] if paper_ready else list(active_entry_block_reasons),
+            "rolloutStage": rollout_stage,
+            "rolloutBlockers": list(rollout_blockers),
+            "marketOpen": bool(session.market_is_open),
+            "entryWindowOpen": bool(session.allowed_session_window),
+            "marketSession": _status_dataclass_payload(session),
+            "paperBrokerVerified": bool(broker_validation.verified),
+            "paperBroker": {
+                "verified": bool(broker_validation.verified),
+                "brokerAccountId": broker_validation.account_id,
+                "baseUrl": broker_validation.base_url,
+                "automaticPaperEnvEnabled": bool(broker_validation.automatic_paper_enabled),
+                "reasonCodes": list(broker_validation.reason_codes),
+            },
+            "brokerAccountId": account_id,
+            "weightVersion": weights.weight_version if weights else "",
+            "calibrationVersion": ",".join(sorted({table.calibration_version for table in calibrations})),
+            "runtimeControlRevision": runtime_control.get("controlRevision"),
+            "runtimeControlHash": runtime_control.get("controlHash"),
+            "authoritativeStateHash": authoritative_state_hash,
+            "inventoryReconciliationState": {
+                "blocksNewEntries": self._reconciliation_blocks_new_entries(account_id=account_id, symbol=symbol),
+                "lastReconciliation": latest_reconciliation,
+                "reasonCodes": latest_reconciliation.get("reason_codes") or latest_reconciliation.get("reasonCodes") or [],
+            },
+            "wcaPosition": position,
+            "reservedRisk": float(position.get("reservedRisk") or 0),
+            "globalRiskApprovalStatus": latest_global_risk,
             "queueDepths": queue_depths,
+            "queueAges": queue_ages,
+            "workerHeartbeats": runtime_health.model_dump(mode="json").get("worker_heartbeats", {}) if runtime_health else {},
+            "lastFinalizedBar": {
+                "symbol": symbol,
+                "timestamp": runtime_health.last_processed_bar.isoformat(),
+            } if runtime_health and runtime_health.last_processed_bar else None,
+            "lastDecision": _redact_status_payload(latest_payload or None),
+            "lastOrderIntent": _redact_status_payload(latest_order_intent),
+            "lastOrder": _redact_status_payload(latest_outbox),
+            "lastBrokerOrder": _redact_status_payload(latest_broker_order),
+            "lastFill": _redact_status_payload(latest_fill),
+            "lastReconciliation": _redact_status_payload(latest_reconciliation),
+            "lastEndOfSessionResult": _redact_status_payload(latest_end_of_session),
+            "activeCircuitBreakers": active_circuit_breakers,
+            "activeEntryBlockReasonCodes": list(active_entry_block_reasons),
+            "runtimeHealth": runtime_health.model_dump(mode="json") if runtime_health else {"status": "unknown", "apiHealthSeparate": True},
+            "runtimeSupervisor": runtime_supervisor.status(),
+            "runtimeControl": runtime_control,
+            "apiHealth": {"status": "ready", "doesNotRunRuntime": True},
             "activeVersions": {
                 "configuration": active.configuration_version if active else "",
                 "configurationHash": active.content_hash if active else "",
@@ -147,21 +298,33 @@ class WcaService:
             "observability": {
                 "eventLagSeconds": runtime_health.lag_seconds if runtime_health else None,
                 "lastProcessedBar": runtime_health.last_processed_bar.isoformat() if runtime_health and runtime_health.last_processed_bar else None,
+                "lastFinalizedBar": {
+                    "symbol": symbol,
+                    "timestamp": runtime_health.last_processed_bar.isoformat(),
+                } if runtime_health and runtime_health.last_processed_bar else None,
                 "lastDecisionId": runtime_health.last_decision_id if runtime_health else self._runtime_repository.last_decision_id(),
+                "lastDecision": latest_payload or None,
+                "lastOrder": latest_outbox,
+                "lastFill": latest_fill,
                 "decisionLatencySeconds": (((latest_payload.get("latency") or {}).get("metrics") or {}).get("decision_latency_seconds") if latest_payload else None),
-                "brokerStatus": self.broker_status(),
-                "reconciliationStatus": self.reconciliation_status(),
+                "brokerStatus": latest_broker_order or {"status": "no_broker_orders"},
+                "reconciliationStatus": latest_reconciliation,
+                "currentWcaPosition": position,
             },
-            "virtualInventory": self.virtual_inventory(),
-            "rollout": wca_rollout_status(),
+            "virtualInventory": self.virtual_inventory(account_id=account_id, symbol=symbol),
+            "rollout": rollout,
             "finalAcceptance": build_wca_final_acceptance_report(),
             "persistence": {
                 "backendAuthoritative": True,
                 "migrationVersion": persistence.migration_version,
                 "tableCounts": persistence.table_counts,
             },
-            "reasonCodes": ("wca.backend_v2.active", "wca.api.transport_only", "wca.paper_execution.disabled"),
+            "reasonCodes": status_reason_codes,
         }
+        return _redact_status_payload(payload)
+
+    def runtime_control(self) -> dict[str, Any]:
+        return get_wca_runtime_supervisor().runtime_control()
 
     def baseline_settings(self) -> dict[str, Any]:
         return self._require_active_configuration().to_baseline_settings().model_dump(mode="json")
@@ -321,6 +484,61 @@ class WcaService:
             priority=20,
         )
 
+    def enqueue_automatic_paper_control(self, *, enabled: bool, actor: str, reason: str, account_id: str = "paper", symbol: str = "SPY") -> dict[str, Any]:
+        return self._enqueue_runtime_control(
+            WcaRuntimeCommandType.SET_AUTOMATIC_PAPER,
+            account_id=account_id,
+            symbol=symbol,
+            payload={"enabled": enabled, "actor": actor, "reason": reason, "global_paper_control": True},
+            reason_codes=("wca.api.automatic_paper_control.enqueued", "wca.api.no_inline_trading_logic"),
+            priority=3,
+        )
+
+    def enqueue_runtime_control_update(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        body = payload or {}
+        actor = str(body.get("actor") or body.get("updatedBy") or body.get("updated_by") or "api")
+        reason = str(body.get("reason") or "api_runtime_control_update")
+        account_id = str(body.get("accountId") or body.get("account_id") or body.get("brokerAccountId") or body.get("broker_account_id") or "paper")
+        symbol = str(body.get("symbol") or "SPY")
+        paper_requested = _optional_bool(body, "paperTradingRequested", "paper_trading_requested", "requestedPaperTradingEnabled")
+        automatic_requested = _optional_bool(body, "automaticEntriesRequested", "automatic_entries_requested", "automaticPaperTradingEnabled")
+        pause_requested = _optional_bool(body, "pauseNewEntries", "pause_new_entries")
+        if paper_requested is not None or automatic_requested is not None:
+            enabled = bool(paper_requested if paper_requested is not None else automatic_requested)
+            return self.enqueue_automatic_paper_control(
+                enabled=enabled,
+                actor=actor,
+                reason=reason,
+                account_id=account_id,
+                symbol=symbol,
+            )
+        if pause_requested is True:
+            return self._enqueue_runtime_control(
+                WcaRuntimeCommandType.PAUSE_NEW_ENTRIES,
+                account_id=account_id,
+                symbol=symbol,
+                payload={"reason": reason, "actor": actor},
+                reason_codes=("wca.api.runtime_control.pause_update.enqueued",),
+                priority=5,
+            )
+        if pause_requested is False:
+            return self._enqueue_runtime_control(
+                WcaRuntimeCommandType.RESUME_NEW_ENTRIES,
+                account_id=account_id,
+                symbol=symbol,
+                payload={"reason": reason, "actor": actor},
+                reason_codes=("wca.api.runtime_control.resume_update.enqueued",),
+                priority=20,
+            )
+        return self._enqueue_runtime_control(
+            WcaRuntimeCommandType.HEARTBEAT,
+            account_id=account_id,
+            symbol=symbol,
+            payload={"reason": reason, "actor": actor, "readiness_refresh": True},
+            reason_codes=("wca.api.runtime_control.refresh.enqueued",),
+            priority=30,
+        )
+
     def enqueue_reconciliation_request(self, *, account_id: str = "paper", symbol: str = "SPY") -> dict[str, Any]:
         return self._enqueue_runtime_control(
             WcaRuntimeCommandType.BROKER_RECONCILIATION,
@@ -377,6 +595,32 @@ class WcaService:
     def latest_trades(self, *, limit: int = 50) -> list[dict[str, Any]]:
         return self._read_payload_rows("wca_trade_ledger", "created_at", limit=limit)
 
+    def latest_order(self) -> dict[str, Any] | None:
+        return self._read_latest_payload_row("wca_execution_outbox", "updated_at")
+
+    def latest_fill(self) -> dict[str, Any] | None:
+        return self._read_latest_payload_row("wca_attributed_fills", "created_at")
+
+    def current_wca_position(self, *, account_id: str = "paper", symbol: str = "SPY") -> dict[str, Any]:
+        if not hasattr(self._repository, "read_inventory_projection"):
+            return {"accountId": account_id, "symbol": symbol, "openQuantity": 0, "source": "repository_unavailable"}
+        projection = self._repository.read_inventory_projection(algorithm_id=WCA_ALGORITHM_ID, broker_account_id=account_id, symbol=symbol)
+        return {
+            "algorithmId": WCA_ALGORITHM_ID,
+            "accountId": account_id,
+            "symbol": symbol,
+            "openQuantity": projection.open_quantity,
+            "averageEntryPrice": projection.average_entry_price,
+            "realizedPnl": projection.realized_pnl,
+            "unrealizedPnl": projection.unrealized_pnl,
+            "reservedRisk": projection.reserved_risk,
+            "configurationVersion": projection.configuration_version,
+            "decisionId": projection.decision_id,
+            "runId": projection.run_id,
+            "lastEventTimestamp": _status_timestamp(projection.last_event_timestamp),
+            "reconciliationWatermark": projection.reconciliation_watermark,
+        }
+
     def virtual_inventory(self, *, account_id: str = "paper", symbol: str = "SPY") -> dict[str, Any]:
         if not hasattr(self._repository, "connect"):
             return {"accountId": account_id, "symbol": symbol, "openQuantity": 0, "source": "repository_unavailable"}
@@ -403,14 +647,117 @@ class WcaService:
             return {"status": "unknown"}
         with self._repository.connect() as conn:
             row = conn.execute("SELECT * FROM wca_broker_orders WHERE algorithm_id = ? ORDER BY created_at DESC LIMIT 1", (WCA_ALGORITHM_ID,)).fetchone()
-        return dict(row) if row else {"status": "no_broker_orders"}
+        return _redact_status_payload(_row_payload(row)) if row else {"status": "no_broker_orders"}
 
-    def reconciliation_status(self) -> dict[str, Any]:
+    def reconciliation_status(self, *, account_id: str | None = None, symbol: str | None = None) -> dict[str, Any]:
+        if not hasattr(self._repository, "connect"):
+            return {"status": "unknown"}
+        sql = "SELECT payload_json FROM wca_broker_reconciliations WHERE algorithm_id = ?"
+        params: list[Any] = [WCA_ALGORITHM_ID]
+        if account_id:
+            sql += " AND account_id = ?"
+            params.append(account_id)
+        if symbol:
+            sql += " AND symbol = ?"
+            params.append(symbol)
+        sql += " ORDER BY created_at DESC LIMIT 1"
+        with self._repository.connect() as conn:
+            row = conn.execute(sql, tuple(params)).fetchone()
+        return _json_payload(row["payload_json"]) if row else {"status": "not_run"}
+
+    def latest_order_intent(self, *, account_id: str = "paper") -> dict[str, Any] | None:
+        if not hasattr(self._repository, "connect"):
+            return None
+        with self._repository.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM wca_order_intents
+                WHERE algorithm_id = ? AND account_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (WCA_ALGORITHM_ID, account_id),
+            ).fetchone()
+        return _row_payload(row) if row else None
+
+    def latest_broker_order(self, *, account_id: str = "paper", symbol: str = "SPY") -> dict[str, Any] | None:
+        if not hasattr(self._repository, "connect"):
+            return None
+        with self._repository.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM wca_broker_orders
+                WHERE algorithm_id = ? AND account_id = ? AND symbol = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (WCA_ALGORITHM_ID, account_id, symbol),
+            ).fetchone()
+        return _row_payload(row) if row else None
+
+    def latest_global_risk_status(self, *, account_id: str = "paper", symbol: str = "SPY") -> dict[str, Any]:
         if not hasattr(self._repository, "connect"):
             return {"status": "unknown"}
         with self._repository.connect() as conn:
-            row = conn.execute("SELECT payload_json FROM wca_broker_reconciliations WHERE algorithm_id = ? ORDER BY created_at DESC LIMIT 1", (WCA_ALGORITHM_ID,)).fetchone()
-        return _json_payload(row["payload_json"]) if row else {"status": "not_run"}
+            row = conn.execute(
+                """
+                SELECT *
+                FROM wca_global_risk_responses
+                WHERE algorithm_id = ? AND account_id = ? AND symbol = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (WCA_ALGORITHM_ID, account_id, symbol),
+            ).fetchone()
+        return _row_payload(row) if row else {"status": "not_requested"}
+
+    def latest_end_of_session_result(self, *, account_id: str = "paper", symbol: str = "SPY") -> dict[str, Any]:
+        if not hasattr(self._repository, "connect"):
+            return {"status": "unknown"}
+        with self._repository.connect() as conn:
+            command = conn.execute(
+                """
+                SELECT command_id, command_type, status, reason_codes_json, payload_json, updated_at, created_at
+                FROM wca_runtime_command_queue
+                WHERE algorithm_id = ? AND account_id = ? AND symbol = ? AND command_type = 'end_of_session'
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (WCA_ALGORITHM_ID, account_id, symbol),
+            ).fetchone()
+            event = conn.execute(
+                """
+                SELECT *
+                FROM wca_inventory_ledger
+                WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ? AND event_type = 'END_OF_SESSION_FLATTEN'
+                ORDER BY event_timestamp DESC, created_at DESC
+                LIMIT 1
+                """,
+                (WCA_ALGORITHM_ID, account_id, symbol),
+            ).fetchone()
+        return {
+            "status": command["status"] if command else "not_run",
+            "command": _row_payload(command) if command else None,
+            "flattenEvent": _row_payload(event) if event else None,
+        }
+
+    def _daily_state(self, *, account_id: str, symbol: str, now: datetime) -> dict[str, Any]:
+        if not hasattr(self._repository, "read_daily_state_projection"):
+            return {"status": "unknown"}
+        state = self._repository.read_daily_state_projection(
+            algorithm_id=WCA_ALGORITHM_ID,
+            broker_account_id=account_id,
+            symbol=symbol,
+            session_date=now.date().isoformat(),
+        )
+        return _status_dataclass_payload(state)
+
+    def _reconciliation_blocks_new_entries(self, *, account_id: str, symbol: str) -> bool:
+        if not hasattr(self._repository, "reconciliation_blocks_new_entries"):
+            return True
+        return bool(self._repository.reconciliation_blocks_new_entries(account_id=account_id, symbol=symbol))
 
     def command_status(self, command_id: str) -> dict[str, Any]:
         if not hasattr(self._repository, "connect"):
@@ -431,6 +778,16 @@ class WcaService:
                 (WCA_ALGORITHM_ID, safe_limit),
             ).fetchall()
         return [_json_payload(row["payload_json"]) for row in rows]
+
+    def _read_latest_payload_row(self, table: str, order_column: str) -> dict[str, Any] | None:
+        if not hasattr(self._repository, "connect"):
+            return None
+        with self._repository.connect() as conn:
+            row = conn.execute(
+                f"SELECT payload_json FROM {table} WHERE algorithm_id = ? ORDER BY {order_column} DESC, created_at DESC LIMIT 1",
+                (WCA_ALGORITHM_ID,),
+            ).fetchone()
+        return _json_payload(row["payload_json"]) if row else None
 
     def evaluate(self, request: WcaEvaluateRequest) -> WcaEvaluateResponse:
         configuration = self._require_active_configuration()
@@ -511,7 +868,9 @@ class WcaService:
             )
         )
         proposed = pipeline.decision.proposed_order
-        automatic_blocked = request.mode == "automatic" and not paper_execution_allowed()
+        runtime_control = get_wca_runtime_supervisor().runtime_control()
+        automatic_paper_enabled = bool(runtime_control.get("effectiveAutomaticEntriesEnabled"))
+        automatic_blocked = request.mode == "automatic" and not automatic_paper_enabled
         if proposed is None:
             status = "NO_ACTION"
             submitted = False
@@ -536,11 +895,22 @@ class WcaService:
                     "status": WcaOrderStatus.VALIDATED,
                     "idempotency_key": key,
                     "account_id": request.account_id,
+                    "rollout_stage": str(runtime_control.get("rolloutStage") or ""),
+                    "rollout_evidence_revision": str(runtime_control.get("rolloutEvidenceRevision") or ""),
+                    "rollout_evidence_hash": str(runtime_control.get("rolloutEvidenceHash") or ""),
                     "reason_codes": (*proposed.reason_codes, "wca.paper.idempotency_key_generated"),
                 }
             )
-            decision = pipeline.decision.model_copy(update={"proposed_order": proposed, "reason_codes": (*pipeline.decision.reason_codes, *reasons)})
-            decision = apply_wca_final_order_validation(decision, _paper_order_validation_context(request, snapshot))
+            decision = pipeline.decision.model_copy(
+                update={
+                    "proposed_order": proposed,
+                    "rollout_stage": str(runtime_control.get("rolloutStage") or ""),
+                    "rollout_evidence_revision": str(runtime_control.get("rolloutEvidenceRevision") or ""),
+                    "rollout_evidence_hash": str(runtime_control.get("rolloutEvidenceHash") or ""),
+                    "reason_codes": (*pipeline.decision.reason_codes, *reasons),
+                }
+            )
+            decision = apply_wca_final_order_validation(decision, _paper_order_validation_context(request, snapshot, runtime_control=runtime_control, automatic_paper_enabled=automatic_paper_enabled))
             if decision.proposed_order is None:
                 status = "NO_ACTION"
                 submitted = False
@@ -562,7 +932,8 @@ class WcaService:
                         snapshot,
                         order_type=broker_request.order_type,
                         time_in_force=broker_request.time_in_force,
-                        automatic_paper_enabled=paper_execution_allowed(),
+                        runtime_control=runtime_control,
+                        automatic_paper_enabled=automatic_paper_enabled,
                     ),
                 )
                 proposed = reservation.proposed_order
@@ -801,18 +1172,49 @@ def _paper_order_validation_context(
     *,
     order_type: str = "LIMIT",
     time_in_force: str = "DAY",
+    runtime_control: dict[str, Any] | None = None,
     automatic_paper_enabled: bool = True,
 ) -> WcaOrderValidationContext:
+    runtime_control = runtime_control or {}
+    rollout_stage = str(runtime_control.get("rolloutStage") or runtime_control.get("rollout_stage") or "")
+    automatic_mode = request.mode == "automatic"
+    evaluation_timestamp = datetime.now(timezone.utc) if automatic_mode else snapshot.decision_timestamp
+    session = (
+        validate_wca_entry_session(
+            timestamp=evaluation_timestamp,
+            entry_cutoff_minutes=15 * 60 + 30,
+            require_broker_clock=False,
+        )
+        if automatic_mode
+        else None
+    )
     return WcaOrderValidationContext(
-        evaluation_timestamp=snapshot.decision_timestamp,
+        evaluation_timestamp=evaluation_timestamp,
         paper_only_mode=True,
         account_id=request.account_id,
         broker_endpoint="paper",
         runtime_mode=WcaRuntimeMode.AUTOMATIC_PAPER if request.mode == "automatic" else WcaRuntimeMode.MANUAL_PAPER,
+        rollout_stage=rollout_stage,
+        rollout_evidence_revision=str(runtime_control.get("rolloutEvidenceRevision") or runtime_control.get("rollout_evidence_revision") or ""),
+        rollout_evidence_hash=str(runtime_control.get("rolloutEvidenceHash") or runtime_control.get("rollout_evidence_hash") or ""),
+        rollout_allowed_symbols=(request.symbol.upper(),) if rollout_stage == "LIMITED_AUTOMATIC_PAPER" else (),
+        rollout_allowed_strategy_ids=tuple(
+            str(strategy_id)
+            for strategy_id in ((runtime_control.get("limitedAutomaticPaperCaps") or {}).get("allowed_strategies") or ())
+        ),
+        rollout_allowed_entry_windows=tuple(
+            str(window)
+            for window in ((runtime_control.get("limitedAutomaticPaperCaps") or {}).get("session_windows") or ())
+        ),
+        rollout_max_quantity=(runtime_control.get("limitedAutomaticPaperCaps") or {}).get("max_quantity"),
+        rollout_max_daily_trades=(runtime_control.get("limitedAutomaticPaperCaps") or {}).get("max_daily_trades"),
+        rollout_max_daily_loss=(runtime_control.get("limitedAutomaticPaperCaps") or {}).get("max_daily_loss_dollars"),
+        rollout_policy_required=request.mode == "automatic",
         requires_executable_paper_stage=True,
         automatic_paper_enabled=automatic_paper_enabled,
-        market_is_open=True,
-        allowed_session_window=True,
+        market_is_open=session.market_is_open if session is not None else True,
+        allowed_session_window=session.allowed_session_window if session is not None else True,
+        market_session_reason_codes=session.reason_codes if session is not None else (),
         candle_freshness_seconds=120,
         data_ready=snapshot.data_ready,
         inventory_consistent=True,
@@ -824,6 +1226,7 @@ def _paper_order_validation_context(
         allow_position_increase=request.allow_position_increase,
         position_owned_by_wca=True,
         quote_freshness_seconds=None if request.emergency_exit else 15,
+        decision_expiration_seconds=120 if request.mode == "automatic" else None,
         available_buying_power=request.available_buying_power,
         account_equity=request.account_equity,
         max_position_value=request.account_equity,
@@ -1011,6 +1414,172 @@ def _json_payload(value: Any) -> Any:
         return json.loads(str(value))
     except Exception:
         return {}
+
+
+def _status_dataclass_payload(value: Any) -> dict[str, Any]:
+    payload = asdict(value) if hasattr(value, "__dataclass_fields__") else dict(value or {})
+    return _redact_status_payload(payload)
+
+
+def _status_timestamp(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _authoritative_status_hash(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(_json_safe(payload), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _rollout_blockers(rollout: dict[str, Any], rollout_stage: str) -> tuple[str, ...]:
+    phases = rollout.get("stages") or rollout.get("phases") or ()
+    for phase in phases:
+        if str(phase.get("phase") or "") != rollout_stage:
+            continue
+        if str(phase.get("permission") or "").lower() == "enabled":
+            return ()
+        return tuple(str(code) for code in (phase.get("reason_codes") or phase.get("reasonCodes") or ()))
+    return tuple(str(code) for code in (rollout.get("reason_codes") or rollout.get("reasonCodes") or ()))
+
+
+def _active_circuit_breakers(
+    *,
+    runtime_control: dict[str, Any],
+    runtime_health: dict[str, Any],
+    position: dict[str, Any],
+    daily_state: dict[str, Any],
+) -> dict[str, bool]:
+    return {
+        "runtimeKillSwitch": bool(runtime_control.get("killSwitchOpen")),
+        "wcaRuntimeHealthCircuitBreaker": bool(runtime_health.get("circuit_breaker_open") or runtime_health.get("circuitBreakerOpen")),
+        "wcaPositionCircuitBreaker": str(daily_state.get("circuit_breaker_state") or "").lower() in {"open", "tripped", "critical"},
+        "unprotectedPosition": bool(runtime_health.get("unprotected_position") or runtime_health.get("unprotectedPosition")),
+    }
+
+
+def _active_entry_block_reasons(
+    *,
+    runtime_control: dict[str, Any],
+    runtime_health: dict[str, Any],
+    session_reason_codes: tuple[str, ...],
+    broker_reason_codes: tuple[str, ...],
+    rollout_blockers: tuple[str, ...],
+    reconciliation: dict[str, Any],
+    circuit_breakers: dict[str, bool],
+    paper_requested: bool,
+    paper_ready: bool,
+    runtime_process_status: str,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if paper_ready:
+        return ()
+    if not paper_requested:
+        reasons.append("wca.status.paper_not_requested")
+    if runtime_process_status != "running":
+        reasons.append(f"wca.status.runtime_process_{runtime_process_status}")
+    reasons.extend(str(code) for code in runtime_control.get("reasonCodes") or runtime_control.get("reason_codes") or ())
+    reasons.extend(str(code) for code in runtime_health.get("reason_codes") or runtime_health.get("reasonCodes") or ())
+    reasons.extend(code for code in session_reason_codes if code != "wca.session.entry_window_open")
+    reasons.extend(code for code in broker_reason_codes if code != "wca.paper_account.verified")
+    reasons.extend(rollout_blockers)
+    if reconciliation.get("status") == "not_run":
+        reasons.append("wca.status.reconciliation_not_run")
+    for breaker_name, active in circuit_breakers.items():
+        if active:
+            reasons.append(f"wca.status.circuit_breaker.{breaker_name}")
+    return tuple(dict.fromkeys(reasons))
+
+
+def _wca_readiness_state(
+    *,
+    paper_requested: bool,
+    paper_ready: bool,
+    rollout_stage: str,
+    runtime_process_status: str,
+    runtime_health: dict[str, Any],
+    active_block_reasons: tuple[str, ...],
+    active_circuit_breakers: dict[str, bool],
+    open_quantity: int,
+) -> str:
+    critical_reasons = tuple(str(code) for code in runtime_health.get("reason_codes") or runtime_health.get("reasonCodes") or ())
+    if any(active_circuit_breakers.get(name) for name in ("runtimeKillSwitch", "wcaRuntimeHealthCircuitBreaker", "wcaPositionCircuitBreaker", "unprotectedPosition")):
+        return "CRITICAL"
+    if str(runtime_health.get("status") or "").lower() == "critical" or any("critical" in reason for reason in critical_reasons):
+        return "CRITICAL"
+    if not paper_requested:
+        return "OFF"
+    if runtime_process_status == "not_started":
+        return "STARTING"
+    if open_quantity or str(runtime_health.get("status") or "").lower() == "protective_only":
+        if active_block_reasons:
+            return "PROTECTIVE_ONLY"
+    if paper_ready and rollout_stage == "LIMITED_AUTOMATIC_PAPER":
+        return "LIMITED_AUTOMATIC_PAPER_READY"
+    if paper_ready and rollout_stage == "AUTOMATIC_PAPER":
+        return "AUTOMATIC_PAPER_READY"
+    return "BLOCKED"
+
+
+_SENSITIVE_STATUS_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "secret",
+    "token",
+    "authorization",
+    "password",
+    "credential",
+    "auth_header",
+    "key_id",
+)
+
+
+def _redact_status_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if any(part in lowered for part in _SENSITIVE_STATUS_KEY_PARTS):
+                redacted[str(key)] = "[REDACTED]"
+            else:
+                redacted[str(key)] = _redact_status_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_status_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_status_payload(item) for item in value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _optional_bool(payload: dict[str, Any], *keys: str) -> bool | None:
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "off"}:
+                return False
+        return bool(value)
+    return None
 
 
 def _row_payload(row: Any) -> dict[str, Any]:

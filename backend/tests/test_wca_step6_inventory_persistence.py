@@ -45,7 +45,8 @@ class WcaStep6InventoryPersistenceTests(unittest.TestCase):
 
             self.assertEqual(migration_count, 1)
             self.assertTrue(set(WCA_PERSISTENCE_TABLES).issubset(tables))
-            self.assertEqual(len(WCA_PERSISTENCE_RECORD_INVENTORY), 43)
+            self.assertEqual(len(WCA_PERSISTENCE_RECORD_INVENTORY), 44)
+            self.assertIn("wca_runtime_control", WCA_PERSISTENCE_TABLES)
             self.assert_primary_key(conn, "wca_finalized_bar_event_receipts", "event_id")
             self.assert_primary_key(conn, "wca_decisions", "decision_id")
             self.assert_primary_key(conn, "wca_broker_orders", "broker_order_id")

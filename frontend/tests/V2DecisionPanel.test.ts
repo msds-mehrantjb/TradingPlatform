@@ -90,3 +90,47 @@ test("Market Forecast dashboard uses backend actionable direction labels", () =>
   assert.doesNotMatch(main, /predictedDirection:\s*isPrimary\s*\?[^;\n]*predictedChange/);
   assert.match(css, /\.market-forecast-horizon-card\[data-impact="neutral"\]/);
 });
+
+test("WCA frontend displays backend runtime-control state and fails closed", () => {
+  const api = read("frontend/src/features/wca/api.ts");
+  const types = read("frontend/src/features/wca/types.ts");
+  const state = read("frontend/src/features/wca/state.ts");
+  const panel = read("frontend/src/features/wca/WcaPanel.ts");
+  const main = read("frontend/src/main.ts");
+  const wcaFeatureText = walk("frontend/src/features/wca").map(read).join("\n");
+
+  assert.match(api, /fetchWcaRuntimeControl/);
+  assert.match(api, /updateWcaRuntimeControl/);
+  assert.match(api, /pauseWcaRuntimeEntries/);
+  assert.match(api, /resumeWcaRuntimeEntries/);
+  assert.match(api, /requestWcaEmergencyRiskReduction/);
+  assert.match(api, /\/api\/wca\/runtime\/control/);
+  assert.match(api, /\/api\/wca\/runtime\/emergency-risk-reduction/);
+  assert.match(types, /paperTradingRequested/);
+  assert.match(types, /effectivePaperTradingEnabled/);
+  assert.match(types, /paperAccountVerified/);
+  assert.match(state, /failClosedWcaRuntimeControl/);
+  assert.match(state, /wca\.frontend\.backend_unreachable_fail_closed/);
+  assert.doesNotMatch(wcaFeatureText, /localStorage\.setItem/);
+  for (const label of [
+    "Requested Paper",
+    "Effective Paper",
+    "Automatic entries",
+    "Rollout stage",
+    "Broker paper verification",
+    "Reconciliation status",
+    "Runtime health",
+    "Last finalized bar",
+    "Last decision",
+    "Last order",
+    "Last fill",
+    "Current WCA position",
+    "Active blocking reasons",
+  ]) {
+    assert.match(panel, new RegExp(label));
+  }
+  assert.match(main, /syncWcaAutomaticPaperControl/);
+  assert.match(main, /Paper Effective/);
+  assert.match(main, /Paper Blocked/);
+  assert.doesNotMatch(main, /tradeToggleButton\.textContent[^;\n]*Paper On/);
+});

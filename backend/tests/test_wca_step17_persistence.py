@@ -77,6 +77,7 @@ class WcaStep17PersistenceTests(unittest.TestCase):
             "exit_state",
             "reconciliation_results",
             "runtime_health",
+            "runtime_control",
             "runtime_latency_observations",
             "runtime_latency_summaries",
             "background_jobs",

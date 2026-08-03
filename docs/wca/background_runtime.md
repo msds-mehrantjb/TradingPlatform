@@ -6,7 +6,17 @@ Step 7 introduces a standalone WCA runtime entry point:
 python -m backend.app.algorithms.wca.runtime_main
 ```
 
+For the full automatic-paper operating checklist, see `docs/wca/automatic_paper_runbook.md`.
+
 Normal deployment must run this as a separate operating-system process. FastAPI request handlers may enqueue or inspect durable state, but an in-process API task is not the authoritative WCA runtime.
+
+The repository root includes a process definition for supervisors that understand Procfiles:
+
+```procfile
+wca-runtime: python -m backend.app.algorithms.wca.runtime_main
+```
+
+Configure the process manager to start this process independently of the API and restart it after crashes. The durable queues are database-backed, so a restarted runtime resumes queued, leased, and expired work through recovery rather than losing state.
 
 ## Durable Queues
 
@@ -14,7 +24,7 @@ The runtime owns database-backed queues:
 
 - `wca_runtime_event_queue` for immutable completed one-minute SPY bar events.
 - `wca_runtime_command_queue` for worker commands.
-- `wca_runtime_symbol_leases` for per-symbol single-writer leases.
+- `wca_runtime_symbol_leases` for per-account and per-symbol single-writer leases.
 - `wca_runtime_checkpoints` for finalized-bar cursor state.
 - `wca_runtime_health` for heartbeat and fail-closed status.
 
@@ -24,6 +34,7 @@ The finalized-bar publisher must provide event ID, WCA subscription ID, symbol, 
 
 The supervisor declares these logical workers:
 
+- runtime scheduler worker
 - finalised-bar consumer
 - decision worker
 - position and protective-exit worker
@@ -33,6 +44,8 @@ The supervisor declares these logical workers:
 - recovery worker
 - heartbeat and health worker
 - end-of-session worker
+
+The runtime scheduler worker enqueues startup recovery, startup reconciliation, periodic broker order/fill polling plus reconciliation, runtime heartbeat, stale-work recovery, market-open readiness checks, entry-cutoff processing, and exchange-calendar end-of-session commands. End-of-session commands are generated from the WCA exchange calendar and do not require an API request, dashboard tab, or browser session.
 
 The decision worker persists the WCA decision before any execution outbox request is created. It writes the finalized-bar checkpoint only after the decision persistence transaction has committed.
 

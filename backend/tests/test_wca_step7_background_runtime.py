@@ -54,13 +54,19 @@ class WcaStep7BackgroundRuntimeTests(unittest.TestCase):
         self.assertEqual(
             WCA_RUNTIME_WORKERS,
             (
+                "runtime_scheduler_worker",
                 "finalised_bar_consumer",
                 "decision_worker",
+                "manual_paper_command_worker",
                 "position_and_protective_exit_worker",
                 "global_risk_request_worker",
                 "execution_outbox_worker",
                 "broker_reconciliation_worker",
                 "recovery_worker",
+                "configuration_activation_worker",
+                "runtime_control_worker",
+                "configuration_rollback_worker",
+                "emergency_risk_reduction_worker",
                 "heartbeat_and_health_worker",
                 "end_of_session_worker",
             ),
@@ -123,9 +129,14 @@ class WcaStep7BackgroundRuntimeTests(unittest.TestCase):
             second = supervisor.run_once()
 
         self.assertEqual(first["workers"]["decision_worker"]["status"], "completed")
+        self.assertEqual(first["workers"]["global_risk_request_worker"]["status"], "completed")
+        self.assertIn(
+            "wca.global_risk.durable_approval_persisted",
+            first["workers"]["global_risk_request_worker"]["reasonCodes"],
+        )
         self.assertEqual(first["workers"]["execution_outbox_worker"]["status"], "blocked")
         self.assertIn(
-            "wca.paper_account.automatic_paper_disabled",
+            "wca.runtime_control.effective_automatic_entries_disabled",
             first["workers"]["execution_outbox_worker"]["reasonCodes"],
         )
         self.assertEqual(second["workers"]["finalised_bar_consumer"]["status"], "idle")

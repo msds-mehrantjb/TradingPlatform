@@ -32,24 +32,26 @@ from backend.app.algorithms.wca.weights import baseline_weight_snapshot
 from backend.app.main import app
 
 
-def test_manual_and_automatic_paper_actions_use_shared_execution_pipeline() -> None:
+def test_manual_paper_action_uses_shared_execution_pipeline_and_inline_automatic_fails_closed() -> None:
     repository = MemoryWcaRepository()
     service = WcaService(repository=repository)
     request = WcaPaperExecutionRequest(candles=candles(), runId="paper-parity")
 
     manual = service.execute_manual_paper(request)
-    automatic = service.execute_automatic_paper(request)
 
-    for result in (manual, automatic):
-        assert result.called_production_modules == WCA_EXECUTION_PIPELINE_MODULES
-        assert result.decision.effective_settings is not None
-        assert result.decision.effective_settings.profile_version == "wca_dynamic_profile_v1"
-        assert "wca.paper.uses_execution_pipeline" in result.reason_codes
+    assert manual.called_production_modules == WCA_EXECUTION_PIPELINE_MODULES
+    assert manual.decision.effective_settings is not None
+    assert manual.decision.effective_settings.profile_version == "wca_dynamic_profile_v1"
+    assert "wca.paper.uses_execution_pipeline" in manual.reason_codes
 
     assert manual.mode == "manual"
-    assert automatic.mode == "automatic"
     assert repository.decisions[manual.decision.decision_id].effective_settings == manual.decision.effective_settings
-    assert repository.decisions[automatic.decision.decision_id].effective_settings == automatic.decision.effective_settings
+    try:
+        service.execute_automatic_paper(request)
+    except ValueError as exc:
+        assert "authoritative broker equity and buying power" in str(exc)
+    else:
+        raise AssertionError("inline automatic WCA paper must fail closed without authoritative runtime state")
 
 
 def test_wca_execution_pipeline_sequence_is_exact() -> None:

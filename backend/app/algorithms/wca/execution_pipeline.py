@@ -35,6 +35,7 @@ from backend.app.algorithms.wca.latency import WCA_LATENCY_OBSERVABILITY_VERSION
 from backend.app.algorithms.wca.local_gates import WcaLocalGateContext, apply_local_gates_to_decision, evaluate_wca_hard_filters, evaluate_wca_local_gates
 from backend.app.algorithms.wca.market_status import resolve_market_status
 from backend.app.algorithms.wca.order_validation import WcaOrderValidationContext, apply_wca_final_order_validation
+from backend.app.algorithms.wca.session_validation import validate_wca_entry_session
 from backend.app.algorithms.wca.sizing import WcaManualSizingOverride, WcaSizingContext, size_wca_order
 from backend.app.algorithms.wca.strategies.indicators import atr
 from backend.app.algorithms.wca.modifiers import evaluate_all_modifiers
@@ -102,12 +103,14 @@ class WcaExecutionPipelineInput:
     trades_today: int = 0
     open_position: WcaBacktestOpenPosition | None = None
     realized_daily_loss: float = 0.0
-    account_equity: float = 100_000.0
-    available_buying_power: float = 100_000.0
+    account_equity: float | None = None
+    available_buying_power: float | None = None
+    authoritative_account_values: bool = False
     allocated_daily_loss_budget: float | None = None
     remaining_allocated_risk_budget: float | None = None
     global_gate_quantity_cap: int | None = 2_147_483_647
     approved_risk_budget: float | None = None
+    defer_global_risk_approval: bool = False
     total_account_exposure_snapshot: dict[str, Any] = field(default_factory=dict)
     current_wca_attributed_exposure: float = 0.0
     expected_holding_period_seconds: int = 3600
@@ -191,7 +194,7 @@ def run_wca_execution_pipeline(
         market_status=market_status,
         calculation_timestamp=snapshot.decision_timestamp,
         previous_profile=pipeline_input.previous_dynamic_profile,
-        current_drawdown_percent=_drawdown_percent(pipeline_input.realized_daily_loss, pipeline_input.account_equity),
+        current_drawdown_percent=_drawdown_percent(pipeline_input.realized_daily_loss, _account_equity_for_pipeline(pipeline_input)),
         config=_dynamic_profile_config(configuration),
     )
     effective_settings = dynamic_profile.effective_settings
@@ -294,13 +297,13 @@ def run_wca_execution_pipeline(
             atr=max(_atr(snapshot.candles), 0.01),
             bid=bid,
             ask=ask,
-            account_equity=max(1.0, pipeline_input.account_equity),
-            available_buying_power=max(0.0, pipeline_input.available_buying_power),
+            account_equity=max(1.0, _account_equity_for_pipeline(pipeline_input)),
+            available_buying_power=max(0.0, _buying_power_for_pipeline(pipeline_input)),
             average_one_minute_volume=average_volume,
             confidence_size_multiplier=max(abs(aggregation.normalized_net_score), 0.01),
             edge_size_multiplier=max(aggregation.winner_edge, 0.01),
             global_gate_quantity_cap=None,
-            approved_risk_budget=_budget(None, pipeline_input.account_equity, baseline.base_risk_percent),
+            approved_risk_budget=_budget(None, _account_equity_for_pipeline(pipeline_input), baseline.base_risk_percent),
             current_position_quantity=pipeline_input.open_position.quantity if pipeline_input.open_position else 0,
             current_position_side=pipeline_input.open_position.side if pipeline_input.open_position else None,
             allow_position_increase=pipeline_input.allow_position_increase,
@@ -360,6 +363,17 @@ def run_wca_execution_pipeline(
     )
     decision = _apply_broker_rounding(decision, pipeline_input)
     exit_order = exit_evaluation is not None and exit_evaluation.should_exit
+    runtime_mode = coerce_wca_runtime_mode(pipeline_input.runtime_mode)
+    automatic_paper_mode = runtime_mode in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}
+    session = (
+        validate_wca_entry_session(
+            timestamp=snapshot.decision_timestamp,
+            entry_cutoff_minutes=effective_settings.final_entry_cutoff_minutes,
+            require_broker_clock=False,
+        )
+        if automatic_paper_mode
+        else None
+    )
     decision = apply_wca_final_order_validation(
         decision,
         WcaOrderValidationContext(
@@ -372,17 +386,19 @@ def run_wca_execution_pipeline(
             position_owned_by_wca=True,
             quote_freshness_seconds=None if pipeline_input.synthetic_quote_allowed or exit_order else 15,
             runtime_mode=pipeline_input.runtime_mode,
-            automatic_paper_enabled=True,
+            automatic_paper_enabled=automatic_paper_mode,
+            market_is_open=session.market_is_open if session is not None else True,
+            allowed_session_window=(session.allowed_session_window if session is not None else True) and _allowed_entry_window(snapshot.decision_timestamp, effective_settings),
+            market_session_reason_codes=session.reason_codes if session is not None else (),
             candle_freshness_seconds=None if pipeline_input.synthetic_quote_allowed or exit_order else 120,
             data_ready=snapshot.data_ready,
-            allowed_session_window=_allowed_entry_window(snapshot.decision_timestamp, effective_settings),
             max_approved_quantity=pipeline_input.global_gate_quantity_cap,
             order_type="LIMIT",
             time_in_force="DAY",
             protective_exit_plan_present=decision.proposed_order is None or (decision.proposed_order.stop_price is not None and decision.proposed_order.target_price is not None),
-            available_buying_power=pipeline_input.available_buying_power,
-            account_equity=pipeline_input.account_equity,
-            max_position_value=max(0.0, pipeline_input.account_equity * (effective_settings.final_max_position_percent / 100.0)),
+            available_buying_power=_buying_power_for_pipeline(pipeline_input),
+            account_equity=_account_equity_for_pipeline(pipeline_input),
+            max_position_value=max(0.0, _account_equity_for_pipeline(pipeline_input) * (effective_settings.final_max_position_percent / 100.0)),
             realized_daily_loss=pipeline_input.realized_daily_loss,
             max_daily_loss=_daily_loss_budget(pipeline_input, effective_settings),
             trades_today=pipeline_input.trades_today,
@@ -494,12 +510,12 @@ def _gate_context(pipeline_input: WcaExecutionPipelineInput, baseline: WcaBaseli
         realized_daily_loss=pipeline_input.realized_daily_loss,
         allocated_daily_loss_budget=_budget(
             pipeline_input.allocated_daily_loss_budget,
-            pipeline_input.account_equity,
+            _account_equity_for_pipeline(pipeline_input),
             baseline.max_daily_loss_percent,
         ),
         remaining_allocated_risk_budget=_budget(
             pipeline_input.remaining_allocated_risk_budget,
-            pipeline_input.account_equity,
+            _account_equity_for_pipeline(pipeline_input),
             baseline.base_risk_percent,
         ),
         is_risk_reducing_exit=pipeline_input.open_position is not None and pipeline_input.emergency_exit,
@@ -516,6 +532,13 @@ def _validate_command(pipeline_input: WcaExecutionPipelineInput, snapshot: WcaMa
         raise ValueError("WCA pipeline snapshot timestamp must match the latest completed bar")
     if snapshot.decision_timestamp < snapshot.data_timestamp:
         raise ValueError("WCA pipeline cannot decide before the completed bar timestamp")
+    automatic_modes = {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}
+    if coerce_wca_runtime_mode(pipeline_input.runtime_mode) in automatic_modes and not pipeline_input.authoritative_account_values:
+        raise ValueError("automatic WCA paper requires authoritative broker equity and buying power")
+    if coerce_wca_runtime_mode(pipeline_input.runtime_mode) in automatic_modes and (
+        pipeline_input.account_equity is None or pipeline_input.available_buying_power is None
+    ):
+        raise ValueError("automatic WCA paper requires broker equity and buying power")
     if snapshot.quote is None and pipeline_input.runtime_mode in {WcaRuntimeMode.PAPER_RECOMMENDATION, WcaRuntimeMode.MANUAL_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER} and not pipeline_input.synthetic_quote_allowed:
         return
     if snapshot.quote is None and not pipeline_input.synthetic_quote_allowed:
@@ -608,12 +631,33 @@ def _apply_global_risk_approval(decision: WcaDecision, pipeline_input: WcaExecut
         return decision.model_copy(update={"global_gate_result": gate, "reason_codes": (*decision.reason_codes, *gate.reason_codes)})
 
     idempotency_key = proposed.idempotency_key or _pipeline_idempotency_key(pipeline_input.account_id, decision, proposed.order_intent_id)
+    requested_risk = proposed_quantity * decision.sizing.stop_distance
+    if pipeline_input.defer_global_risk_approval:
+        gate = GlobalGateResult(
+            status=WcaGateStatus.INFO,
+            proposed_quantity=proposed_quantity,
+            allowed_quantity=proposed_quantity,
+            requested_risk=requested_risk,
+            approved_risk=requested_risk,
+            entry_permitted=True,
+            risk_reducing_exit_permitted=True,
+            idempotency_key=idempotency_key,
+            reason_codes=(WCA_GLOBAL_RISK_ADAPTER_VERSION, "wca.global_risk.pending_durable_worker"),
+            explanation="WCA preliminary decision is pending durable shared global-risk approval.",
+        )
+        order = proposed.model_copy(update={"account_id": pipeline_input.account_id, "idempotency_key": idempotency_key})
+        return decision.model_copy(
+            update={
+                "proposed_order": order,
+                "global_gate_result": gate,
+                "reason_codes": (*decision.reason_codes, *gate.reason_codes),
+            }
+        )
     exposure_snapshot = dict(pipeline_input.total_account_exposure_snapshot)
     if pipeline_input.global_gate_quantity_cap is not None:
         exposure_snapshot.setdefault("global_gate_quantity_cap", pipeline_input.global_gate_quantity_cap)
     if pipeline_input.approved_risk_budget is not None:
         exposure_snapshot.setdefault("approved_risk_budget", pipeline_input.approved_risk_budget)
-    requested_risk = proposed_quantity * decision.sizing.stop_distance
     proposal = build_wca_global_risk_proposal(
         account_id=pipeline_input.account_id,
         symbol=proposed.symbol,
@@ -758,7 +802,23 @@ def _daily_loss_budget(pipeline_input: WcaExecutionPipelineInput, effective_sett
         return pipeline_input.allocated_daily_loss_budget
     if effective_settings.final_max_daily_loss_dollars is not None:
         return effective_settings.final_max_daily_loss_dollars
-    return _budget(None, pipeline_input.account_equity, effective_settings.final_max_daily_loss_percent)
+    return _budget(None, _account_equity_for_pipeline(pipeline_input), effective_settings.final_max_daily_loss_percent)
+
+
+def _account_equity_for_pipeline(pipeline_input: WcaExecutionPipelineInput) -> float:
+    if pipeline_input.account_equity is not None:
+        return float(pipeline_input.account_equity)
+    if coerce_wca_runtime_mode(pipeline_input.runtime_mode) in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}:
+        raise ValueError("automatic WCA paper requires broker account equity")
+    return 100_000.0
+
+
+def _buying_power_for_pipeline(pipeline_input: WcaExecutionPipelineInput) -> float:
+    if pipeline_input.available_buying_power is not None:
+        return float(pipeline_input.available_buying_power)
+    if coerce_wca_runtime_mode(pipeline_input.runtime_mode) in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}:
+        raise ValueError("automatic WCA paper requires broker buying power")
+    return _account_equity_for_pipeline(pipeline_input)
 
 
 def _minutes(value: str) -> int:

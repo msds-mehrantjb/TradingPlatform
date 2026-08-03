@@ -8,7 +8,7 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc && vite build --configLoader native",
     "build:ci": "tsc && node scripts/vite-build-ci.mjs",
-    "test": "node --experimental-strip-types tests/V2DecisionPanel.test.ts",
+    "test": "node --experimental-strip-types tests/V2DecisionPanel.test.ts && node --experimental-strip-types tests/WcaRuntimeControl.test.ts",
     "preview": "vite preview --host 127.0.0.1 --configLoader native"
   },
   "devDependencies": {

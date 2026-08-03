@@ -38,7 +38,9 @@ from .algorithms.meta_strategy.runtime_supervisor import get_meta_strategy_runti
 from .algorithms.voting_ensemble.api import router as voting_ensemble_router
 from .algorithms.voting_ensemble.runtime_supervisor import get_voting_ensemble_runtime_supervisor
 from .algorithms.wca.api import WCA_API_SERVICE, router as wca_router
-from .algorithms.wca.contracts import BacktestRunConfiguration
+from .algorithms.wca.contracts import BacktestRunConfiguration, WcaCandle, WcaQuote
+from .algorithms.wca.runtime_publisher import WCA_REQUIRED_COMPLETED_HISTORY_BARS, WcaFinalizedOneMinuteEventPublisher, WcaFinalizedOneMinutePollConfig
+from .algorithms.wca.runtime_supervisor import get_wca_runtime_supervisor
 from .algorithms.wca.research_jobs import WcaResearchJobType
 from .algorithms.wca.strategy_registry import assert_wca_module_catalog_valid
 from .algorithms.weighted_voting.api import control_router as weighted_voting_control_router
@@ -143,6 +145,24 @@ MARKET_FORECAST_LEDGER_STATUS: dict = {
 }
 MARKET_FORECAST_LEDGER_TICK_LOCK = asyncio.Lock()
 
+WCA_FINALIZED_BAR_SYMBOL = "SPY"
+WCA_FINALIZED_BAR_FEED: Literal["iex", "sip", "otc"] = "iex"
+WCA_FINALIZED_BAR_POLL_SECONDS = 60
+WCA_FINALIZED_BAR_CLOSED_POLL_SECONDS = 5 * 60
+WCA_FINALIZED_BAR_STATUS: dict = {
+    "status": "idle",
+    "symbol": WCA_FINALIZED_BAR_SYMBOL,
+    "feed": WCA_FINALIZED_BAR_FEED,
+    "timeframe": "1Min",
+    "lastRunAt": None,
+    "lastPublishedBar": None,
+    "lastResult": None,
+    "nextRunAt": None,
+    "message": "WCA finalized-bar publisher has not started yet.",
+}
+WCA_FINALIZED_BAR_TICK_LOCK = asyncio.Lock()
+WCA_FINALIZED_BAR_TASK: asyncio.Task | None = None
+
 DEFAULT_TRADING_SETTINGS: dict = {
     "startingCapital": 25000,
     "orderAllocationPercent": 10,
@@ -159,9 +179,11 @@ DEFAULT_TRADING_SETTINGS: dict = {
 
 @app.on_event("startup")
 async def start_daily_backtest_refresh_scheduler() -> None:
+    global WCA_FINALIZED_BAR_TASK
     assert_wca_module_catalog_valid()
     asyncio.create_task(end_of_day_backtest_refresh_scheduler())
     asyncio.create_task(market_forecast_ledger_scheduler())
+    WCA_FINALIZED_BAR_TASK = asyncio.create_task(wca_finalized_bar_scheduler())
     await voting_ensemble_runtime_supervisor.start()
     await get_weighted_voting_runtime_supervisor().start()
     await get_regime_runtime_supervisor().start()
@@ -170,6 +192,11 @@ async def start_daily_backtest_refresh_scheduler() -> None:
 
 @app.on_event("shutdown")
 async def stop_weighted_voting_runtime_supervisor() -> None:
+    global WCA_FINALIZED_BAR_TASK
+    if WCA_FINALIZED_BAR_TASK is not None:
+        WCA_FINALIZED_BAR_TASK.cancel()
+        await asyncio.gather(WCA_FINALIZED_BAR_TASK, return_exceptions=True)
+        WCA_FINALIZED_BAR_TASK = None
     await meta_strategy_runtime_supervisor.shutdown()
     await get_regime_runtime_supervisor().shutdown()
     await get_weighted_voting_runtime_supervisor().shutdown()
@@ -2812,6 +2839,203 @@ async def run_market_forecast_ledger_tick(market_status: dict) -> float:
         }
     )
     return wait_seconds
+
+
+async def wca_finalized_bar_scheduler() -> None:
+    while True:
+        wait_seconds = WCA_FINALIZED_BAR_CLOSED_POLL_SECONDS
+        try:
+            market_status = await safe_market_status()
+            async with WCA_FINALIZED_BAR_TICK_LOCK:
+                wait_seconds = await run_wca_finalized_bar_tick(market_status)
+        except Exception as exc:  # pragma: no cover - defensive scheduler guard
+            now = datetime.now(UTC)
+            wait_seconds = WCA_FINALIZED_BAR_CLOSED_POLL_SECONDS
+            WCA_FINALIZED_BAR_STATUS.update(
+                {
+                    "status": "error",
+                    "lastRunAt": now.isoformat().replace("+00:00", "Z"),
+                    "nextRunAt": (now + timedelta(seconds=wait_seconds)).isoformat().replace("+00:00", "Z"),
+                    "message": f"WCA finalized-bar publisher failed: {exc}",
+                }
+            )
+        await asyncio.sleep(max(15, wait_seconds))
+
+
+async def run_wca_finalized_bar_tick(market_status: dict) -> float:
+    now = datetime.now(UTC)
+    is_open = bool(market_status.get("isOpen"))
+    if not settings.has_alpaca_credentials:
+        return _record_wca_publisher_wait(
+            now,
+            WCA_FINALIZED_BAR_CLOSED_POLL_SECONDS,
+            market_status,
+            status="waiting_for_credentials",
+            message="WCA finalized-bar publisher is waiting for real Alpaca market-data credentials.",
+        )
+    if not is_open:
+        return _record_wca_publisher_wait(
+            now,
+            seconds_until_next_market_open(market_status, fallback=WCA_FINALIZED_BAR_CLOSED_POLL_SECONDS),
+            market_status,
+            status="waiting_for_open",
+            message="Market is closed; WCA finalized-bar publisher is not creating events.",
+        )
+
+    poll = await WcaFinalizedOneMinuteEventPublisher(
+        get_wca_runtime_supervisor().runtime_repository,
+        market_data_client=alpaca,
+        candle_store=store,
+        config=WcaFinalizedOneMinutePollConfig(
+            symbol=WCA_FINALIZED_BAR_SYMBOL,
+            feed=WCA_FINALIZED_BAR_FEED,
+            fetch_limit=max(WCA_REQUIRED_COMPLETED_HISTORY_BARS + 30, 180),
+        ),
+    ).poll_once(now=now, market_is_open=is_open, triggered_by="background_publisher")
+    if poll.status == "blocked" and not poll.publications:
+        return _record_wca_publisher_wait(
+            now,
+            WCA_FINALIZED_BAR_POLL_SECONDS,
+            market_status,
+            status="waiting_for_finalized_bar",
+            message="No publishable finalized SPY one-minute bar is available for WCA.",
+        )
+    wait_seconds = _seconds_until_next_wca_poll(now)
+    accepted = [publication for publication in poll.publications if publication.accepted]
+    latest_event = accepted[-1].event if accepted and accepted[-1].event is not None else None
+    WCA_FINALIZED_BAR_STATUS.update(
+        {
+            "status": poll.status,
+            "lastRunAt": now.isoformat().replace("+00:00", "Z"),
+            "lastPublishedBar": latest_event.finalized_candle_timestamp.isoformat().replace("+00:00", "Z") if latest_event is not None else WCA_FINALIZED_BAR_STATUS.get("lastPublishedBar"),
+            "lastResult": {
+                "accepted": bool(accepted),
+                "acceptedCount": len(accepted),
+                "attemptedCount": len(poll.publications),
+                "eventId": latest_event.event_id if latest_event is not None else None,
+                "dataReadinessResult": latest_event.data_readiness_result if latest_event is not None else None,
+                "reasonCodes": list(poll.reason_codes),
+            },
+            "nextRunAt": (now + timedelta(seconds=wait_seconds)).isoformat().replace("+00:00", "Z"),
+            "marketStatus": market_status,
+            "message": "WCA finalized-bar events were published to the durable runtime queue." if accepted else "WCA finalized-bar event was not published.",
+        }
+    )
+    return wait_seconds
+
+
+async def _load_wca_runtime_candles(
+    *,
+    symbol: str,
+    feed: Literal["iex", "sip", "otc"],
+    finalized_timestamp: datetime | None = None,
+) -> tuple[WcaCandle, ...]:
+    end = finalized_timestamp.isoformat().replace("+00:00", "Z") if finalized_timestamp is not None else None
+    rows = await alpaca.get_bars(
+        symbol=symbol,
+        timeframe="1Min",
+        feed=feed,
+        limit=WCA_REQUIRED_COMPLETED_HISTORY_BARS,
+        start=None,
+        end=end,
+        sort="asc",
+    )
+    if rows:
+        store.upsert_many(rows)
+    cached = store.latest(
+        symbol=symbol,
+        timeframe="1Min",
+        feed=feed,
+        limit=WCA_REQUIRED_COMPLETED_HISTORY_BARS,
+    )
+    if finalized_timestamp is not None:
+        cached = [row for row in cached if _wca_row_timestamp(row) <= finalized_timestamp]
+    return tuple(_wca_candle_from_row(row) for row in cached[-WCA_REQUIRED_COMPLETED_HISTORY_BARS:])
+
+
+async def _load_wca_runtime_quote(
+    *,
+    symbol: str,
+    feed: Literal["iex", "sip", "otc"],
+    finalized_timestamp: datetime,
+) -> WcaQuote | None:
+    quote = await alpaca.get_latest_quote(symbol=symbol, feed=feed)
+    if not quote:
+        return None
+    quote_model = _wca_quote_from_row(quote)
+    if quote_model.timestamp > finalized_timestamp:
+        return None
+    return quote_model
+
+
+def _latest_wca_finalized_candle(candles: tuple[WcaCandle, ...], *, now: datetime) -> WcaCandle | None:
+    cutoff = now.astimezone(UTC).replace(second=0, microsecond=0) - timedelta(minutes=1)
+    finalized = [candle for candle in candles if candle.timestamp.astimezone(UTC) <= cutoff]
+    return finalized[-1] if finalized else None
+
+
+def _wca_market_breadth_inputs(*, qqq: tuple[WcaCandle, ...], iwm: tuple[WcaCandle, ...]) -> dict[str, float]:
+    payload: dict[str, float] = {}
+    if qqq and iwm and iwm[-1].close > 0:
+        payload["qqq_iwm_relative_strength"] = qqq[-1].close / iwm[-1].close
+    return payload
+
+
+def _wca_candle_from_row(row: dict) -> WcaCandle:
+    return WcaCandle(
+        timestamp=_wca_row_timestamp(row),
+        open=float(row["open"]),
+        high=float(row["high"]),
+        low=float(row["low"]),
+        close=float(row["close"]),
+        volume=float(row.get("volume") or 0),
+        vwap=float(row["vwap"]) if row.get("vwap") is not None else None,
+    )
+
+
+def _wca_quote_from_row(row: dict) -> WcaQuote:
+    return WcaQuote(
+        timestamp=_wca_timestamp(row.get("quoteTimestamp") or row.get("timestamp") or row.get("marketDataReceiptTimestamp")),
+        bid=float(row["bid"]),
+        ask=float(row["ask"]),
+    )
+
+
+def _wca_row_timestamp(row: dict) -> datetime:
+    return _wca_timestamp(row["timestamp"])
+
+
+def _wca_timestamp(value: object) -> datetime:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _record_wca_publisher_wait(
+    now: datetime,
+    wait_seconds: float,
+    market_status: dict,
+    *,
+    status: str,
+    message: str,
+) -> float:
+    WCA_FINALIZED_BAR_STATUS.update(
+        {
+            "status": status,
+            "lastRunAt": now.isoformat().replace("+00:00", "Z"),
+            "lastResult": None,
+            "nextRunAt": (now + timedelta(seconds=wait_seconds)).isoformat().replace("+00:00", "Z"),
+            "marketStatus": market_status,
+            "message": message,
+        }
+    )
+    return wait_seconds
+
+
+def _seconds_until_next_wca_poll(now: datetime) -> float:
+    next_poll = now.replace(second=15, microsecond=0) + timedelta(minutes=1)
+    return max(15.0, (next_poll - now).total_seconds())
 
 
 async def safe_market_status() -> dict:

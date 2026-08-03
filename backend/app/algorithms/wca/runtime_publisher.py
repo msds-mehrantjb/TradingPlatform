@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Protocol
 
 from backend.app.algorithms.wca.contracts import WcaCandle, WcaMarketSnapshot, WcaQuote
 from backend.app.algorithms.wca.runtime_events import (
@@ -20,6 +20,8 @@ from backend.app.algorithms.wca.runtime_repository import WcaRuntimeQueueResult,
 
 WCA_FINALIZED_ONE_MINUTE_PUBLISHER_VERSION = "wca_finalized_one_minute_event_publisher_v1"
 WCA_REQUIRED_COMPLETED_HISTORY_BARS = 70
+WCA_DEFAULT_PUBLISHER_FETCH_LIMIT = 180
+WCA_DEFAULT_FINALIZATION_DELAY_SECONDS = 2
 
 
 @dataclass(frozen=True)
@@ -30,9 +32,184 @@ class WcaFinalizedOneMinutePublicationResult:
     reason_codes: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class WcaFinalizedOneMinutePollConfig:
+    symbol: str = "SPY"
+    feed: str = "iex"
+    timeframe: str = WCA_RUNTIME_EVENT_TIMEFRAME
+    fetch_limit: int = WCA_DEFAULT_PUBLISHER_FETCH_LIMIT
+    warmup_bars: int = WCA_REQUIRED_COMPLETED_HISTORY_BARS
+    finalization_delay_seconds: int = WCA_DEFAULT_FINALIZATION_DELAY_SECONDS
+    max_queue_depth: int = 200
+    max_event_age_seconds: int = 300
+
+
+@dataclass(frozen=True)
+class WcaFinalizedOneMinutePollResult:
+    status: str
+    reason_codes: tuple[str, ...]
+    publications: tuple[WcaFinalizedOneMinutePublicationResult, ...] = ()
+    latest_finalized_candle: datetime | None = None
+
+    @property
+    def accepted_count(self) -> int:
+        return sum(1 for publication in self.publications if publication.accepted)
+
+
+class WcaMarketDataClient(Protocol):
+    async def get_bars(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        feed: str,
+        limit: int,
+        start: str | None,
+        end: str | None,
+        sort: str,
+    ) -> list[dict[str, Any]]:
+        ...
+
+    async def get_latest_quote(self, *, symbol: str, feed: str) -> dict[str, Any] | None:
+        ...
+
+
+class WcaCandleStore(Protocol):
+    def upsert_many(self, candles: list[dict[str, Any]]) -> None:
+        ...
+
+    def latest_until(self, *, symbol: str, timeframe: str, feed: str, limit: int, end: str) -> list[dict[str, Any]]:
+        ...
+
+    def latest(self, *, symbol: str, timeframe: str, feed: str, limit: int) -> list[dict[str, Any]]:
+        ...
+
+
 class WcaFinalizedOneMinuteEventPublisher:
-    def __init__(self, runtime_repository: WcaRuntimeRepository) -> None:
+    def __init__(
+        self,
+        runtime_repository: WcaRuntimeRepository,
+        *,
+        market_data_client: WcaMarketDataClient | None = None,
+        candle_store: WcaCandleStore | None = None,
+        config: WcaFinalizedOneMinutePollConfig | None = None,
+    ) -> None:
         self.runtime_repository = runtime_repository
+        self.market_data_client = market_data_client
+        self.candle_store = candle_store
+        self.config = config or WcaFinalizedOneMinutePollConfig()
+
+    async def poll_once(
+        self,
+        *,
+        now: datetime | None = None,
+        market_is_open: bool = True,
+        triggered_by: str = "background_publisher",
+    ) -> WcaFinalizedOneMinutePollResult:
+        if triggered_by != "background_publisher":
+            return WcaFinalizedOneMinutePollResult("rejected", ("wca.market_event.publisher.background_only",))
+        if self.market_data_client is None or self.candle_store is None:
+            return WcaFinalizedOneMinutePollResult("blocked", ("wca.market_event.publisher.market_data_client_missing",))
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        if not market_is_open:
+            return WcaFinalizedOneMinutePollResult("blocked", ("wca.market_event.publisher.market_closed",))
+        symbol = self.config.symbol.upper()
+        rows = await self.market_data_client.get_bars(
+            symbol=symbol,
+            timeframe=self.config.timeframe,
+            feed=self.config.feed,
+            limit=max(self.config.fetch_limit, self.config.warmup_bars + 20),
+            start=None,
+            end=current.isoformat(),
+            sort="asc",
+        )
+        if rows:
+            self.candle_store.upsert_many(rows)
+        cached_rows = self.candle_store.latest(
+            symbol=symbol,
+            timeframe=self.config.timeframe,
+            feed=self.config.feed,
+            limit=max(self.config.fetch_limit, self.config.warmup_bars + 20),
+        )
+        candles = tuple(sorted((_candle_from_row(row) for row in cached_rows), key=lambda candle: candle.timestamp))
+        cutoff = _finalized_candle_cutoff(current, finalization_delay_seconds=self.config.finalization_delay_seconds)
+        completed = tuple(candle for candle in candles if candle.timestamp.astimezone(timezone.utc) <= cutoff)
+        if not completed:
+            return WcaFinalizedOneMinutePollResult("blocked", ("wca.market_event.no_completed_candle",))
+
+        latest_published = _latest_published_finalized_candle(self.runtime_repository, symbol=symbol)
+        candidates = tuple(candle for candle in completed if latest_published is None or candle.timestamp.astimezone(timezone.utc) > latest_published)
+        if not candidates:
+            return WcaFinalizedOneMinutePollResult("idle", ("wca.market_event.no_new_finalized_candle",), latest_finalized_candle=completed[-1].timestamp)
+
+        quote = await self.market_data_client.get_latest_quote(symbol=symbol, feed=self.config.feed)
+        quote_model = _quote_from_row(quote) if quote else None
+        qqq_rows, iwm_rows = await self._load_context_rows(current)
+        qqq = tuple(sorted((_candle_from_row(row) for row in qqq_rows), key=lambda candle: candle.timestamp))
+        iwm = tuple(sorted((_candle_from_row(row) for row in iwm_rows), key=lambda candle: candle.timestamp))
+        publications: list[WcaFinalizedOneMinutePublicationResult] = []
+        for candle in candidates:
+            finalized_at = candle.timestamp.astimezone(timezone.utc)
+            if (current - finalized_at).total_seconds() > self.config.max_event_age_seconds:
+                publications.append(WcaFinalizedOneMinutePublicationResult(False, "rejected", None, ("wca.runtime.event.stale",)))
+                continue
+            history = tuple(row for row in completed if row.timestamp.astimezone(timezone.utc) <= finalized_at)
+            qqq_history = tuple(row for row in qqq if row.timestamp.astimezone(timezone.utc) <= finalized_at)
+            iwm_history = tuple(row for row in iwm if row.timestamp.astimezone(timezone.utc) <= finalized_at)
+            publications.append(
+                self.publish_completed_candle(
+                    candles=history,
+                    finalized_candle_timestamp=finalized_at,
+                    quote=quote_model,
+                    publication_timestamp=current,
+                    market_data_source=f"alpaca:{self.config.feed}",
+                    triggered_by=triggered_by,
+                    external_market_data={
+                        "QQQ": qqq_history,
+                        "IWM": iwm_history,
+                        "SPY_5Min": _derive_complete_bars(history, minutes=5, timestamp=finalized_at),
+                        "SPY_15Min": _derive_complete_bars(history, minutes=15, timestamp=finalized_at),
+                    },
+                    external_input_timestamps={
+                        **({"QQQ": qqq_history[-1].timestamp} if qqq_history else {}),
+                        **({"IWM": iwm_history[-1].timestamp} if iwm_history else {}),
+                        **({"market_breadth": finalized_at} if qqq_history and iwm_history else {}),
+                    },
+                    market_breadth_inputs=_market_breadth_inputs(qqq=qqq_history, iwm=iwm_history),
+                    max_queue_depth=self.config.max_queue_depth,
+                    max_event_age_seconds=self.config.max_event_age_seconds,
+                )
+            )
+        status = "published" if any(publication.accepted for publication in publications) else "blocked"
+        reason_codes = tuple(dict.fromkeys((WCA_FINALIZED_ONE_MINUTE_PUBLISHER_VERSION, *(code for publication in publications for code in publication.reason_codes))))
+        return WcaFinalizedOneMinutePollResult(status, reason_codes, tuple(publications), latest_finalized_candle=completed[-1].timestamp)
+
+    async def _load_context_rows(self, current: datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        context: list[list[dict[str, Any]]] = []
+        for symbol in ("QQQ", "IWM"):
+            try:
+                rows = await self.market_data_client.get_bars(
+                    symbol=symbol,
+                    timeframe=self.config.timeframe,
+                    feed=self.config.feed,
+                    limit=max(self.config.fetch_limit, self.config.warmup_bars + 20),
+                    start=None,
+                    end=current.isoformat(),
+                    sort="asc",
+                )
+            except Exception:
+                rows = []
+            if rows:
+                self.candle_store.upsert_many(rows)
+            context.append(
+                self.candle_store.latest(
+                    symbol=symbol,
+                    timeframe=self.config.timeframe,
+                    feed=self.config.feed,
+                    limit=max(self.config.fetch_limit, self.config.warmup_bars + 20),
+                )
+            )
+        return context[0], context[1]
 
     def publish_completed_candle(
         self,
@@ -70,7 +247,7 @@ class WcaFinalizedOneMinuteEventPublisher:
             if value.astimezone(timezone.utc) <= timestamp
         }
         reason_codes = [WCA_FINALIZED_ONE_MINUTE_PUBLISHER_VERSION, "wca.market_event.finalized_1m"]
-        missing = _missing_reason_codes(completed, quote, timestamp, filtered_external, external_input_timestamps or {}, market_breadth_inputs or {})
+        missing = _missing_reason_codes(completed, quote, timestamp, publication, filtered_external, external_input_timestamps or {}, market_breadth_inputs or {})
         reason_codes.extend(missing)
         reason_codes.extend(economic_event_reason_codes)
         data_ready = not any(
@@ -87,7 +264,7 @@ class WcaFinalizedOneMinuteEventPublisher:
         snapshot = WcaMarketSnapshot(
             symbol="SPY",
             data_timestamp=timestamp,
-            decision_timestamp=timestamp,
+            decision_timestamp=publication,
             candles=completed[-WCA_REQUIRED_COMPLETED_HISTORY_BARS:],
             quote=quote,
             external_market_data=filtered_external,
@@ -146,6 +323,7 @@ def _missing_reason_codes(
     completed: tuple[WcaCandle, ...],
     quote: WcaQuote | None,
     timestamp: datetime,
+    decision_timestamp: datetime,
     external_market_data: dict[str, tuple[WcaCandle, ...]],
     external_input_timestamps: dict[str, datetime],
     market_breadth_inputs: dict[str, float],
@@ -157,9 +335,9 @@ def _missing_reason_codes(
         reasons.append("wca.market_event.missing_minute_gap")
     if quote is None:
         reasons.append("wca.market_event.quote_missing")
-    elif quote.timestamp.astimezone(timezone.utc) > timestamp:
+    elif quote.timestamp.astimezone(timezone.utc) > decision_timestamp:
         reasons.append("wca.market_event.quote_from_future")
-    elif (timestamp - quote.timestamp.astimezone(timezone.utc)).total_seconds() > 60:
+    elif (decision_timestamp - quote.timestamp.astimezone(timezone.utc)).total_seconds() > 60:
         reasons.append("wca.market_event.quote_stale")
     for symbol in ("QQQ", "IWM"):
         if not external_market_data.get(symbol):
@@ -221,9 +399,93 @@ def _snapshot_hash(snapshot: WcaMarketSnapshot) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _latest_published_finalized_candle(runtime_repository: WcaRuntimeRepository, *, symbol: str) -> datetime | None:
+    with runtime_repository.repository.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT MAX(finalized_candle_timestamp)
+            FROM wca_runtime_event_queue
+            WHERE algorithm_id = ? AND symbol = ? AND status IN ('queued', 'processing', 'decision_queued', 'completed')
+            """,
+            ("wca", symbol.upper()),
+        ).fetchone()
+    value = row[0] if row is not None else None
+    return _timestamp(value) if value else None
+
+
+def _finalized_candle_cutoff(now: datetime, *, finalization_delay_seconds: int) -> datetime:
+    adjusted = now.astimezone(timezone.utc) - timedelta(seconds=max(0, finalization_delay_seconds))
+    return adjusted.replace(second=0, microsecond=0) - timedelta(minutes=1)
+
+
+def _derive_complete_bars(candles: tuple[WcaCandle, ...], *, minutes: int, timestamp: datetime) -> tuple[WcaCandle, ...]:
+    selected = tuple(candle for candle in candles if candle.timestamp.astimezone(timezone.utc) <= timestamp.astimezone(timezone.utc))
+    completed: list[WcaCandle] = []
+    bucket: list[WcaCandle] = []
+    for candle in selected:
+        bucket.append(candle)
+        if len(bucket) == minutes:
+            completed.append(
+                WcaCandle(
+                    timestamp=bucket[-1].timestamp,
+                    open=bucket[0].open,
+                    high=max(row.high for row in bucket),
+                    low=min(row.low for row in bucket),
+                    close=bucket[-1].close,
+                    volume=sum(row.volume for row in bucket),
+                    vwap=_bucket_vwap(tuple(bucket)),
+                )
+            )
+            bucket = []
+    return tuple(completed)
+
+
+def _bucket_vwap(candles: tuple[WcaCandle, ...]) -> float | None:
+    weighted = [(candle.vwap or candle.close, candle.volume) for candle in candles if candle.volume > 0]
+    volume = sum(row[1] for row in weighted)
+    if volume <= 0:
+        return None
+    return sum(price * qty for price, qty in weighted) / volume
+
+
+def _market_breadth_inputs(*, qqq: tuple[WcaCandle, ...], iwm: tuple[WcaCandle, ...]) -> dict[str, float]:
+    if not qqq or not iwm or iwm[-1].close <= 0:
+        return {}
+    return {"qqq_iwm_relative_strength": qqq[-1].close / iwm[-1].close}
+
+
+def _candle_from_row(row: dict[str, Any]) -> WcaCandle:
+    return WcaCandle(
+        timestamp=_timestamp(row["timestamp"]),
+        open=float(row["open"]),
+        high=float(row["high"]),
+        low=float(row["low"]),
+        close=float(row["close"]),
+        volume=float(row.get("volume") or 0),
+        vwap=float(row["vwap"]) if row.get("vwap") is not None else None,
+    )
+
+
+def _quote_from_row(row: dict[str, Any]) -> WcaQuote:
+    return WcaQuote(
+        timestamp=_timestamp(row.get("quoteTimestamp") or row.get("timestamp") or row.get("marketDataReceiptTimestamp")),
+        bid=float(row["bid"]),
+        ask=float(row["ask"]),
+    )
+
+
+def _timestamp(value: object) -> datetime:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 __all__ = [
     "WCA_FINALIZED_ONE_MINUTE_PUBLISHER_VERSION",
     "WCA_REQUIRED_COMPLETED_HISTORY_BARS",
+    "WcaFinalizedOneMinutePollConfig",
+    "WcaFinalizedOneMinutePollResult",
     "WcaFinalizedOneMinuteEventPublisher",
     "WcaFinalizedOneMinutePublicationResult",
 ]

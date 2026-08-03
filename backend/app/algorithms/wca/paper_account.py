@@ -12,6 +12,8 @@ WCA_ALPACA_PAPER_API_SECRET_KEY = "WCA_ALPACA_PAPER_API_SECRET_KEY"
 WCA_ALPACA_PAPER_BASE_URL = "WCA_ALPACA_PAPER_BASE_URL"
 WCA_ALPACA_PAPER_ACCOUNT_ID = "WCA_ALPACA_PAPER_ACCOUNT_ID"
 WCA_AUTOMATIC_PAPER_ENABLED = "WCA_AUTOMATIC_PAPER_ENABLED"
+WCA_ALPACA_PAPER_ACCOUNT_SHARED = "WCA_ALPACA_PAPER_ACCOUNT_SHARED"
+WCA_ACCOUNT_LEVEL_ALLOCATOR_ENABLED = "WCA_ACCOUNT_LEVEL_ALLOCATOR_ENABLED"
 WCA_REQUIRED_ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 
 _GENERIC_ALPACA_KEY_ID = "APCA_API_KEY_ID"
@@ -47,6 +49,8 @@ def validate_wca_automatic_paper_account(
     base_url = _clean(source.get(WCA_ALPACA_PAPER_BASE_URL))
     configured_account = _clean(source.get(WCA_ALPACA_PAPER_ACCOUNT_ID))
     automatic_enabled = _env_bool(source.get(WCA_AUTOMATIC_PAPER_ENABLED))
+    shared_account = _env_bool(source.get(WCA_ALPACA_PAPER_ACCOUNT_SHARED))
+    account_allocator_enabled = _env_bool(source.get(WCA_ACCOUNT_LEVEL_ALLOCATOR_ENABLED))
     reasons: list[str] = ["wca.paper_account.validation"]
 
     if not automatic_enabled:
@@ -59,10 +63,14 @@ def validate_wca_automatic_paper_account(
         reasons.append("wca.paper_account.account_id_missing")
     elif configured_account != account_id:
         reasons.append("wca.paper_account.account_id_mismatch")
+    elif configured_account.lower() in {"paper", "default", "shared", "alpaca-paper", "global-paper"}:
+        reasons.append("wca.paper_account.dedicated_account_id_required")
     if base_url != WCA_REQUIRED_ALPACA_PAPER_BASE_URL:
         reasons.append("wca.paper_account.paper_base_url_invalid")
     if _reuses_generic_alpaca_credentials(source, key_id=key_id, secret=secret):
         reasons.append("wca.paper_account.shared_alpaca_credentials_rejected")
+    if shared_account and not account_allocator_enabled:
+        reasons.append("wca.paper_account.shared_physical_account_requires_allocator")
 
     verified = reasons == ["wca.paper_account.validation"]
     if verified:
@@ -92,9 +100,11 @@ def _env_bool(value: str | None) -> bool:
 
 __all__ = [
     "WCA_ALPACA_PAPER_ACCOUNT_ID",
+    "WCA_ALPACA_PAPER_ACCOUNT_SHARED",
     "WCA_ALPACA_PAPER_API_KEY_ID",
     "WCA_ALPACA_PAPER_API_SECRET_KEY",
     "WCA_ALPACA_PAPER_BASE_URL",
+    "WCA_ACCOUNT_LEVEL_ALLOCATOR_ENABLED",
     "WCA_AUTOMATIC_PAPER_ENABLED",
     "WCA_REQUIRED_ALPACA_PAPER_BASE_URL",
     "WcaPaperAccountValidation",

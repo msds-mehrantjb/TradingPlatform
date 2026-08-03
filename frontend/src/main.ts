@@ -3,7 +3,7 @@ import { API_BASE, BACKTEST_API_CANDIDATES, TRADING_ALGORITHM_INVENTORY_ENDPOINT
 import { directionalSignal, isEligibleStrategyVote, winningVoteSignal } from "./domain/tradingSignals";
 import type { RegimeBacktestResult } from "./features/regime/types";
 import { readLatestRegimeDecisionFromBackend, runRegimeBacktestOnBackend, setRegimeAutomaticPaperTrading } from "./features/regime/api";
-import { fetchLatestWcaDecision, fetchWcaBacktest, fetchWcaBacktestStatus, fetchWcaBaselineSettings, fetchWcaConfiguration, fetchWcaStatus, runWcaPreparedBacktest, updateWcaConfiguration } from "./features/wca/api";
+import { fetchLatestWcaDecision, fetchWcaBacktest, fetchWcaBacktestStatus, fetchWcaBaselineSettings, fetchWcaConfiguration, fetchWcaRuntimeControl, fetchWcaStatus, runWcaPreparedBacktest, setWcaAutomaticPaperTrading, updateWcaConfiguration } from "./features/wca/api";
 import {
   createInitialWcaState,
   withWcaConfigurationSaved,
@@ -12,9 +12,12 @@ import {
   withWcaError,
   withWcaLoading,
   withWcaReady,
+  withWcaRuntimeControlError,
+  withWcaRuntimeControlLoading,
+  withWcaRuntimeControlReady,
 } from "./features/wca/state";
 import { renderWcaPanel } from "./features/wca/WcaPanel";
-import type { WcaBacktestResult, WcaDecision } from "./features/wca/types";
+import type { WcaBacktestResult, WcaDecision, WcaRuntimeControl } from "./features/wca/types";
 
 type Timeframe = "1Min" | "3Min" | "5Min" | "15Min" | "1Hour" | "1Day";
 
@@ -3164,6 +3167,9 @@ const state = {
   votingEnsembleRuntimeStatus: null as VotingEnsembleRuntimeStatus | null,
   votingEnsembleRuntimeControlStatus: "idle" as "idle" | "loading" | "ready" | "blocked" | "error",
   votingEnsembleRuntimeControlWarning: "",
+  wcaRuntimeControl: null as WcaRuntimeControl | null,
+  wcaRuntimeControlStatus: "idle" as "idle" | "loading" | "ready" | "blocked" | "error",
+  wcaRuntimeControlWarning: "",
   votingEnsemblePaperInventory: emptyVotingEnsemblePaperInventory(),
   votingEnsemblePaperInventoryStatus: "idle" as "idle" | "loading" | "ready" | "error",
   votingEnsemblePaperInventoryWarning: "",
@@ -8565,6 +8571,38 @@ function votingEnsemblePaperBlocked() {
   return votingEnsemblePaperRequested() && !votingEnsemblePaperEffective();
 }
 
+function wcaRuntimeControlRecord() {
+  return state.wcaRuntimeControl ?? wcaPresentationState.runtimeControl ?? wcaPresentationState.backendStatus?.runtimeControl ?? wcaPresentationState.backendStatus?.runtime_control ?? null;
+}
+
+function wcaPaperRequested() {
+  return wcaPaperRequestedFromControl(wcaRuntimeControlRecord());
+}
+
+function wcaPaperEffective() {
+  return wcaPaperEffectiveFromControl(wcaRuntimeControlRecord());
+}
+
+function wcaAutomaticEntriesEffective() {
+  return wcaAutomaticEntriesEffectiveFromControl(wcaRuntimeControlRecord());
+}
+
+function wcaPaperBlocked() {
+  return wcaPaperRequested() && (!wcaPaperEffective() || !wcaAutomaticEntriesEffective());
+}
+
+function wcaPaperRequestedFromControl(control: WcaRuntimeControl | null | undefined) {
+  return Boolean(control?.paperTradingRequested ?? control?.paper_trading_requested);
+}
+
+function wcaPaperEffectiveFromControl(control: WcaRuntimeControl | null | undefined) {
+  return Boolean(control?.effectivePaperTradingEnabled ?? control?.effective_paper_trading_enabled);
+}
+
+function wcaAutomaticEntriesEffectiveFromControl(control: WcaRuntimeControl | null | undefined) {
+  return Boolean(control?.effectiveAutomaticEntriesEnabled ?? control?.effective_automatic_entries_enabled);
+}
+
 function canSubmitManualTrades() {
   return isMarketOpenForOrders();
 }
@@ -8585,24 +8623,36 @@ function tradeSubmissionBlockedTitle(submitMode: SubmitOrderMode | "Manual" | "A
 }
 
 function updateTradeToggleButton() {
-  const requested = votingEnsemblePaperRequested();
-  const effective = votingEnsemblePaperEffective();
-  const blocked = requested && !effective;
-  const loading = state.votingEnsembleRuntimeControlStatus === "loading";
-  const error = state.votingEnsembleRuntimeControlStatus === "error";
-  tradeToggleButton.textContent = loading ? "Paper Syncing" : error ? "Paper Error" : blocked ? "Paper Blocked" : effective ? "Paper On" : "Paper Off";
+  const votingRequested = votingEnsemblePaperRequested();
+  const votingEffective = votingEnsemblePaperEffective();
+  const wcaRequested = wcaPaperRequested();
+  const wcaEffective = wcaPaperEffective();
+  const wcaEntriesEffective = wcaAutomaticEntriesEffective();
+  const requested = votingRequested || wcaRequested || globalPaperTradingEnabled();
+  const effective = votingEffective && (!wcaRequested || (wcaEffective && wcaEntriesEffective));
+  const blocked = votingEnsemblePaperBlocked() || wcaPaperBlocked();
+  const loading = state.votingEnsembleRuntimeControlStatus === "loading" || state.wcaRuntimeControlStatus === "loading";
+  const error = state.votingEnsembleRuntimeControlStatus === "error" || state.wcaRuntimeControlStatus === "error";
+  tradeToggleButton.textContent = loading ? "Paper Requested" : error ? "Paper Error" : blocked ? "Paper Blocked" : effective ? "Paper Effective" : requested ? "Paper Requested" : "Paper Off";
   tradeToggleButton.setAttribute("aria-pressed", String(effective));
   tradeToggleButton.dataset.enabled = String(effective);
   tradeToggleButton.dataset.requested = String(requested);
   tradeToggleButton.dataset.effective = String(effective);
-  tradeToggleButton.dataset.status = loading ? "loading" : error ? "error" : blocked ? "blocked" : effective ? "on" : "off";
+  tradeToggleButton.dataset.status = loading ? "requested" : error ? "error" : blocked ? "blocked" : effective ? "effective" : requested ? "requested" : "off";
   const runtime = state.votingEnsembleRuntimeStatus;
+  const wcaControl = wcaRuntimeControlRecord();
+  const wcaReasons = arrayFromUnknown(wcaControl?.reasonCodes ?? wcaControl?.reason_codes).map((value) => String(value)).join(", ");
   const activeBlocks = runtime?.activeEntryBlocks?.length ? runtime.activeEntryBlocks.join(", ") : "";
   const paperReadyBlocks = runtime?.paperReadyBlockingReasonCodes?.length ? runtime.paperReadyBlockingReasonCodes.join(", ") : "";
   const reason = activeBlocks || state.votingEnsembleRuntimeControl?.reasonCodes?.join(", ") || state.votingEnsembleRuntimeControlWarning;
   const controlLabel = [
-    `Voting Ensemble requested: ${requested ? "ON" : "OFF"}`,
-    `Voting Ensemble effective: ${effective ? "ON" : "OFF"}`,
+    `Paper Requested: ${requested ? "ON" : "OFF"}`,
+    `Paper Effective: ${effective ? "ON" : "OFF"}`,
+    `Voting Ensemble requested: ${votingRequested ? "ON" : "OFF"}`,
+    `Voting Ensemble effective: ${votingEffective ? "ON" : "OFF"}`,
+    `WCA requested: ${wcaRequested ? "ON" : "OFF"}`,
+    `WCA effective paper: ${wcaEffective ? "ON" : "OFF"}`,
+    `WCA automatic entries: ${wcaEntriesEffective ? "ARMED" : "BLOCKED"}`,
     runtime ? `Paper ready: ${runtime.paperReady ? "true" : "false"}` : "",
     runtime ? `Market: ${runtime.marketOpen ? "open" : "closed"}` : "",
     runtime ? `Workers: eval ${runtime.evaluationWorkerHealthy ? "healthy" : "blocked"}, exec ${runtime.executionWorkerHealthy ? "healthy" : "blocked"}, recon ${runtime.reconciliationHealthy ? "healthy" : "blocked"}` : "",
@@ -8614,6 +8664,8 @@ function updateTradeToggleButton() {
     blocked ? "Backend blocked new entries." : "",
     paperReadyBlocks,
     reason,
+    state.wcaRuntimeControlWarning,
+    wcaReasons,
   ].filter(Boolean).join(" ");
   tradeToggleButton.title = controlLabel;
   tradeToggleButton.setAttribute("aria-label", controlLabel);
@@ -12210,20 +12262,28 @@ async function refreshWcaPresentationPanel() {
   wcaPresentationState = withWcaLoading(wcaPresentationState);
   renderWcaPresentationMount();
   try {
-    const [backendStatus, configuration, baselineSettings, latestDecision] = await Promise.all([
+    const [backendStatus, runtimeControl, configuration, baselineSettings, latestDecision] = await Promise.all([
       fetchWcaStatus(),
+      fetchWcaRuntimeControl(),
       fetchWcaConfiguration(),
       fetchWcaBaselineSettings(),
       fetchLatestWcaDecision(),
     ]);
+    state.wcaRuntimeControl = runtimeControl;
+    state.wcaRuntimeControlStatus = wcaPaperRequestedFromControl(runtimeControl) && !wcaAutomaticEntriesEffectiveFromControl(runtimeControl) ? "blocked" : "ready";
+    state.wcaRuntimeControlWarning = "";
     wcaPresentationState = withWcaReady(wcaPresentationState, {
-      backendStatus,
+      backendStatus: { ...backendStatus, runtimeControl },
+      runtimeControl,
       configuration,
       baselineSettings,
       latestDecision,
       latestBacktest: latestWcaBackendBacktestResult,
     });
   } catch (error) {
+    state.wcaRuntimeControl = null;
+    state.wcaRuntimeControlStatus = "error";
+    state.wcaRuntimeControlWarning = error instanceof Error ? error.message : "WCA backend unavailable";
     wcaPresentationState = withWcaError(wcaPresentationState, error);
   } finally {
     wcaPresentationRefreshInFlight = false;
@@ -15722,6 +15782,7 @@ async function handlePaperToggleClick() {
     await Promise.allSettled([
       syncWeightedVotingAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
       syncRegimeAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
+      syncWcaAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
     ]);
     await Promise.allSettled([loadVotingEnsembleRuntimeStatus(), refreshVotingEnsemblePaperInventory()]);
   } catch (error) {
@@ -16070,6 +16131,62 @@ async function syncRegimeAutomaticPaperControl(enabled: boolean) {
   } catch (error) {
     console.warn(error instanceof Error ? error.message : "Regime automatic paper control sync failed");
   }
+}
+
+async function syncWcaAutomaticPaperControl(enabled: boolean) {
+  state.wcaRuntimeControlStatus = "loading";
+  state.wcaRuntimeControlWarning = "";
+  wcaPresentationState = withWcaRuntimeControlLoading(wcaPresentationState);
+  renderWcaPresentationMount();
+  updateTradeToggleButton();
+  try {
+    const reason = enabled
+      ? "wca.runtime.dashboard.global_paper_toggle_on"
+      : "wca.runtime.dashboard.global_paper_toggle_off";
+    await setWcaAutomaticPaperTrading({
+      enabled,
+      actor: "dashboard.global_paper_toggle",
+      reason,
+      accountId: "paper",
+      symbol: "SPY",
+    });
+    const control = await fetchWcaRuntimeControl();
+    state.wcaRuntimeControl = control;
+    state.wcaRuntimeControlStatus = wcaPaperRequestedFromControl(control) && !wcaAutomaticEntriesEffectiveFromControl(control) ? "blocked" : "ready";
+    state.wcaRuntimeControlWarning = "";
+    wcaPresentationState = withWcaRuntimeControlReady(wcaPresentationState, control);
+    if (enabled && !wcaAutomaticEntriesEffectiveFromControl(control)) {
+      console.info("WCA automatic paper remains gated by backend runtime control.", control);
+    }
+  } catch (error) {
+    state.wcaRuntimeControl = null;
+    state.wcaRuntimeControlStatus = "error";
+    state.wcaRuntimeControlWarning = error instanceof Error ? error.message : "WCA automatic paper control sync failed";
+    wcaPresentationState = withWcaRuntimeControlError(wcaPresentationState, error);
+    console.warn(state.wcaRuntimeControlWarning);
+  } finally {
+    renderWcaPresentationMount();
+    updateTradeToggleButton();
+  }
+}
+
+async function loadWcaRuntimeControl() {
+  state.wcaRuntimeControlStatus = "loading";
+  updateTradeToggleButton();
+  try {
+    const control = await fetchWcaRuntimeControl();
+    state.wcaRuntimeControl = control;
+    state.wcaRuntimeControlStatus = wcaPaperRequestedFromControl(control) && !wcaAutomaticEntriesEffectiveFromControl(control) ? "blocked" : "ready";
+    state.wcaRuntimeControlWarning = "";
+    wcaPresentationState = withWcaRuntimeControlReady(wcaPresentationState, control);
+  } catch (error) {
+    state.wcaRuntimeControl = null;
+    state.wcaRuntimeControlStatus = "error";
+    state.wcaRuntimeControlWarning = error instanceof Error ? error.message : "WCA runtime control unavailable";
+    wcaPresentationState = withWcaRuntimeControlError(wcaPresentationState, error);
+  }
+  renderWcaPresentationMount();
+  updateTradeToggleButton();
 }
 
 function weightedVotingRuntimeAllowsAutomaticPaper(runtime: Record<string, unknown>) {
@@ -22995,6 +23112,7 @@ void loadEsSnapshot();
 void loadVotingEnsembleInventory();
 void loadVotingEnsembleRuntimeControl();
 void loadWeightedVotingRuntimeControl();
+void loadWcaRuntimeControl();
 void refreshVotingEnsemblePaperInventory();
 void fetchSessionCurrent();
 void loadMarketContext();

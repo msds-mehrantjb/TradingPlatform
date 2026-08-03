@@ -123,18 +123,41 @@ def build_managed_position(
         return WcaManagedPosition(account_id=account_id, symbol=symbol, side=WcaSide.HOLD, open_quantity=0, average_entry_price=0, mark_price=mark_price, realized_pnl=round(realized_pnl, 10), reason_codes=(WCA_POSITION_MANAGER_VERSION, "wca.position.flat"))
     side = _side_value(lots[0]["side"])
     quantity = sum(int(lot["quantity"]) for lot in lots)
+    missing_entry_price = any(lot.get("entry_price") is None or float(lot.get("entry_price") or 0) <= 0 for lot in lots)
+    if missing_entry_price:
+        reason_codes = (
+            WCA_POSITION_MANAGER_VERSION,
+            "wca.position.open",
+            "wca.position.inventory_inconsistent",
+            "wca.position.entry_price_missing",
+            "wca.position.circuit_breaker.inventory_inconsistent",
+        )
+        pending = (_exit_order(account_id, symbol, side, quantity, mark_price, mark_price, mark_price, evaluated_at, list(reason_codes)),) if quantity > 0 else ()
+        return WcaManagedPosition(
+            account_id=account_id,
+            symbol=symbol,
+            side=side,
+            open_quantity=quantity,
+            average_entry_price=0,
+            mark_price=mark_price,
+            realized_pnl=round(realized_pnl, 10),
+            unrealized_pnl=0,
+            stop_price=None,
+            target_price=None,
+            opened_at=min((_dt(lot.get("opened_at") or lot.get("timestamp")) for lot in lots), default=evaluated_at),
+            emergency_exit_due=True,
+            circuit_breaker_open=True,
+            pending_exit_orders=pending,
+            reason_codes=reason_codes,
+        )
     average_entry = _weighted_average(lots)
     opened_at = min((_dt(lot.get("opened_at") or lot.get("timestamp")) for lot in lots), default=evaluated_at)
     stop_price = _protective_stop(lots)
     target_price = _target_price(lots)
-    if stop_price is None:
-        stop_price = average_entry - config.default_stop_distance if side == WcaSide.BUY.value else average_entry + config.default_stop_distance
-    if target_price is None:
-        target_price = average_entry + config.default_target_distance if side == WcaSide.BUY.value else average_entry - config.default_target_distance
     unrealized = _pnl(side, average_entry, mark_price, quantity)
     reason_codes = [WCA_POSITION_MANAGER_VERSION, "wca.position.open"]
     trailing_stop = None
-    if config.trailing_enabled:
+    if config.trailing_enabled and stop_price is not None:
         trailing_stop = mark_price - config.trailing_distance if side == WcaSide.BUY.value else mark_price + config.trailing_distance
         stop_price = max(stop_price, trailing_stop) if side == WcaSide.BUY.value else min(stop_price, trailing_stop)
         reason_codes.append("wca.position.trailing_stop_active")
@@ -142,9 +165,9 @@ def build_managed_position(
     time_exit_due = config.time_exit_minutes is not None and opened_at + timedelta(minutes=config.time_exit_minutes) <= evaluated_at
     eod_due = (calendar or WcaMarketCalendar()).should_flatten(evaluated_at, buffer_minutes=config.end_of_day_flatten_buffer_minutes)
     emergency_due = emergency_exit or global_emergency_risk_reduction
-    protective_triggered = (side == WcaSide.BUY.value and mark_price <= stop_price) or (side == WcaSide.SELL.value and mark_price >= stop_price)
-    target_triggered = (side == WcaSide.BUY.value and mark_price >= target_price) or (side == WcaSide.SELL.value and mark_price <= target_price)
-    unprotected = not any(lot.get("stop_price") for lot in lots)
+    protective_triggered = stop_price is not None and ((side == WcaSide.BUY.value and mark_price <= stop_price) or (side == WcaSide.SELL.value and mark_price >= stop_price))
+    target_triggered = target_price is not None and ((side == WcaSide.BUY.value and mark_price >= target_price) or (side == WcaSide.SELL.value and mark_price <= target_price))
+    unprotected = stop_price is None or target_price is None
     protection_age_seconds = max(0.0, (evaluated_at - opened_at).total_seconds())
     protection_overdue = unprotected and protection_age_seconds >= config.protective_order_tolerance_seconds
     short_disallowed = side == WcaSide.SELL.value and not config.short_positions_allowed
@@ -171,7 +194,9 @@ def build_managed_position(
         reason_codes.append("wca.position.global_emergency_risk_reduction")
     if eod_due:
         reason_codes.append("wca.position.end_of_day_flatten")
-    pending = (_exit_order(account_id, symbol, side, quantity, mark_price, stop_price, target_price, evaluated_at, reason_codes),) if exit_due and quantity > 0 else ()
+    pending_stop = stop_price if stop_price is not None else mark_price
+    pending_target = target_price if target_price is not None else mark_price
+    pending = (_exit_order(account_id, symbol, side, quantity, mark_price, pending_stop, pending_target, evaluated_at, reason_codes),) if exit_due and quantity > 0 else ()
     return WcaManagedPosition(
         account_id=account_id,
         symbol=symbol,
@@ -181,8 +206,8 @@ def build_managed_position(
         mark_price=mark_price,
         realized_pnl=round(realized_pnl, 10),
         unrealized_pnl=round(unrealized, 10),
-        stop_price=round(stop_price, 10),
-        target_price=round(target_price, 10),
+        stop_price=round(stop_price, 10) if stop_price is not None else None,
+        target_price=round(target_price, 10) if target_price is not None else None,
         trailing_enabled=config.trailing_enabled,
         trailing_stop_price=round(trailing_stop, 10) if trailing_stop else None,
         opened_at=opened_at,

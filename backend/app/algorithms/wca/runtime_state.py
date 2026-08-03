@@ -31,6 +31,14 @@ class WcaAuthoritativeRuntimeState(WcaContractModel):
     current_quantity: int | None = Field(default=None, ge=0)
     available_quantity: int | None = Field(default=None, ge=0)
     average_entry_price: float | None = Field(default=None, ge=0)
+    open_lots: tuple[dict[str, Any], ...] = ()
+    position_entry_timestamp: datetime | None = None
+    original_decision_id: str | None = None
+    entry_configuration_version: str | None = None
+    position_stop_price: float | None = Field(default=None, gt=0)
+    position_target_price: float | None = Field(default=None, gt=0)
+    position_unprotected: bool = False
+    position_inconsistent: bool = False
     realized_pnl: float | None = None
     unrealized_pnl: float | None = None
     pending_entry_orders: tuple[dict[str, Any], ...] = ()
@@ -81,18 +89,27 @@ class WcaAuthoritativeRuntimeState(WcaContractModel):
     def to_open_position(self) -> WcaBacktestOpenPosition | None:
         if not self.fresh or not self.current_quantity or self.current_quantity <= 0:
             return None
+        if self.position_inconsistent or self.position_unprotected:
+            return None
+        if (
+            self.average_entry_price is None
+            or self.average_entry_price <= 0
+            or self.position_stop_price is None
+            or self.position_target_price is None
+            or self.position_entry_timestamp is None
+        ):
+            return None
         side = WcaSide.BUY if self.current_position_direction == WcaSide.BUY.value else WcaSide.SELL
-        entry = self.average_entry_price or 0.01
         return WcaBacktestOpenPosition(
             trade_id=f"wca-runtime-position-{self.broker_account_id}-{self.symbol}-{self.inventory_state_version[:12]}",
-            decision_id=self.global_risk_decision_id,
+            decision_id=self.original_decision_id or self.global_risk_decision_id,
             symbol=self.symbol,
             side=side,
             quantity=self.current_quantity,
-            entry_at=self.broker_observation_timestamp or self.state_timestamp,
-            entry_price=entry,
-            stop_price=max(0.01, entry * 0.5),
-            target_price=max(0.01, entry * 10.0),
+            entry_at=self.position_entry_timestamp,
+            entry_price=self.average_entry_price,
+            stop_price=self.position_stop_price,
+            target_price=self.position_target_price,
         )
 
 
@@ -134,16 +151,16 @@ def load_wca_authoritative_runtime_state(
             """,
             (WCA_ALGORITHM_ID, broker_account_id),
         ).fetchone()
-        latest_lot = conn.execute(
+        lot_rows = conn.execute(
             """
-            SELECT side, payload_json, timestamp
+            SELECT lot_id, account_id, symbol, timestamp, configuration_version, engine_version,
+                   market_snapshot_id, decision_id, run_id, position_id, side, quantity, payload_json
             FROM wca_owned_lots
             WHERE algorithm_id = ? AND account_id = ? AND symbol = ? AND status = 'open' AND quantity > 0
-            ORDER BY created_at DESC
-            LIMIT 1
+            ORDER BY created_at, lot_id
             """,
             (WCA_ALGORITHM_ID, broker_account_id, symbol),
-        ).fetchone()
+        ).fetchall()
         pending_rows = conn.execute(
             """
             SELECT status, client_order_id, order_intent_id, payload_json
@@ -156,7 +173,7 @@ def load_wca_authoritative_runtime_state(
         ).fetchall()
         protective_rows = conn.execute(
             """
-            SELECT payload_json
+            SELECT event_timestamp, order_intent_id, client_order_id, broker_order_id, quantity, payload_json
             FROM wca_inventory_ledger
             WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ?
               AND event_type IN ('PROTECTIVE_ORDER_CREATED', 'PROTECTIVE_ORDER_REPLACED')
@@ -231,12 +248,23 @@ def load_wca_authoritative_runtime_state(
         reason_codes.append("wca.runtime_state.broker_not_reconciled")
 
     open_quantity = int(inventory["open_quantity"]) if inventory is not None else None
-    position_direction = _position_direction(latest_lot, open_quantity)
+    open_lots = tuple(_open_lot(row) for row in lot_rows)
+    position_direction = _position_direction(open_lots, open_quantity)
     available_quantity = open_quantity
     pending_entry_orders = tuple(_pending_order(row) for row in pending_rows if _is_entry_order(row, position_direction))
     pending_exit_orders = tuple(_pending_order(row) for row in pending_rows if not _is_entry_order(row, position_direction))
-    protective_orders = tuple(json.loads(row["payload_json"] or "{}") for row in protective_rows)
+    protective_orders = tuple(_protective_order(row) for row in protective_rows)
     partial_fills = tuple(json.loads(row["payload_json"] or "{}") for row in partial_fill_rows)
+    position_details = _position_details(
+        open_lots=open_lots,
+        protective_orders=protective_orders,
+        open_quantity=open_quantity,
+        position_direction=position_direction,
+    )
+    reason_codes.extend(position_details["reason_codes"])
+    if broker_snapshot is not None:
+        broker_isolation_reasons = _broker_snapshot_isolation_reason_codes(broker_snapshot, broker_account_id=broker_account_id, symbol=symbol)
+        reason_codes.extend(broker_isolation_reasons)
     daily_loss = float(daily["daily_loss"]) if daily is not None else None
     broker_positions = tuple(position.model_dump(mode="json") for position in broker_snapshot.positions) if broker_snapshot is not None else ()
     pending_broker_orders = tuple(order.model_dump(mode="json") for order in broker_snapshot.pendingOrders) if broker_snapshot is not None else ()
@@ -296,6 +324,14 @@ def load_wca_authoritative_runtime_state(
         current_quantity=open_quantity,
         available_quantity=available_quantity,
         average_entry_price=float(inventory["average_entry_price"]) if inventory is not None else None,
+        open_lots=open_lots,
+        position_entry_timestamp=position_details["entry_timestamp"],
+        original_decision_id=position_details["decision_id"],
+        entry_configuration_version=position_details["configuration_version"],
+        position_stop_price=position_details["stop_price"],
+        position_target_price=position_details["target_price"],
+        position_unprotected=bool(position_details["unprotected"]),
+        position_inconsistent=bool(position_details["inconsistent"]),
         realized_pnl=float(inventory["realized_pnl"]) if inventory is not None else None,
         unrealized_pnl=float(inventory["unrealized_pnl"]) if inventory is not None else None,
         pending_entry_orders=pending_entry_orders,
@@ -325,7 +361,7 @@ def load_wca_authoritative_runtime_state(
         remaining_portfolio_risk=remaining_portfolio_risk,
         current_aggregate_exposure=float(risk_state.get("positionNotionalDollars", 0.0)) if broker_snapshot is not None else None,
         concentration_restrictions=tuple(code for code in global_snapshot.reasonCodes if "exposure" in code) if global_snapshot is not None else (),
-        global_circuit_breaker_status="open" if freshness_result == "PASS" and account_entry_permission else "entries_blocked",
+        global_circuit_breaker_status="closed" if freshness_result == "PASS" and account_entry_permission else "entries_blocked",
         global_risk_decision_id=f"wca-runtime-risk-{state_hash[:16]}",
         global_risk_expiration=timestamp + timedelta(seconds=maximum_permitted_state_age_seconds),
         wca_configuration_version=config_row["configuration_version"] if config_row is not None else "",
@@ -342,13 +378,150 @@ def load_wca_authoritative_runtime_state(
     return state
 
 
-def _position_direction(latest_lot: sqlite3.Row | None, quantity: int | None) -> str | None:
+def _position_direction(open_lots: tuple[dict[str, Any], ...], quantity: int | None) -> str | None:
     if quantity is None or quantity <= 0:
         return None
-    if latest_lot is None:
-        return WcaSide.BUY.value
-    side = str(latest_lot["side"]).upper()
+    if not open_lots:
+        return None
+    side = str(open_lots[-1]["side"]).upper()
     return WcaSide.SELL.value if side == WcaSide.SELL.value else WcaSide.BUY.value
+
+
+def _open_lot(row: sqlite3.Row) -> dict[str, Any]:
+    payload = json.loads(row["payload_json"] or "{}")
+    fill = payload.get("fill") if isinstance(payload.get("fill"), dict) else {}
+    return {
+        "lot_id": row["lot_id"],
+        "account_id": row["account_id"],
+        "symbol": row["symbol"],
+        "timestamp": row["timestamp"],
+        "configuration_version": row["configuration_version"],
+        "engine_version": row["engine_version"],
+        "market_snapshot_id": row["market_snapshot_id"],
+        "decision_id": row["decision_id"],
+        "run_id": row["run_id"],
+        "position_id": row["position_id"],
+        "side": row["side"],
+        "quantity": int(row["quantity"]),
+        "entry_price": _positive_float(payload.get("entry_price") or fill.get("average_fill_price") or fill.get("averageFillPrice")),
+        "stop_price": _positive_float(payload.get("stop_price")),
+        "target_price": _positive_float(payload.get("target_price")),
+        "opened_at": payload.get("opened_at") or row["timestamp"],
+        "order_intent_id": str(payload.get("order_intent_id") or ""),
+        "protective_order_ids": tuple(payload.get("protective_order_ids") or ()),
+        "payload": payload,
+    }
+
+
+def _protective_order(row: sqlite3.Row) -> dict[str, Any]:
+    payload = json.loads(row["payload_json"] or "{}")
+    return {
+        "event_timestamp": row["event_timestamp"],
+        "order_intent_id": row["order_intent_id"],
+        "client_order_id": row["client_order_id"],
+        "broker_order_id": row["broker_order_id"],
+        "quantity": int(row["quantity"] or 0),
+        "protective_order_id": payload.get("protective_order_id"),
+        "protective_state": payload.get("protective_state") or payload.get("status") or "unknown",
+        "stop_price": _positive_float(payload.get("stop_price")),
+        "target_price": _positive_float(payload.get("target_price")),
+        "protected_quantity": int(payload.get("protected_quantity") or row["quantity"] or 0),
+        "payload": payload,
+    }
+
+
+def _position_details(
+    *,
+    open_lots: tuple[dict[str, Any], ...],
+    protective_orders: tuple[dict[str, Any], ...],
+    open_quantity: int | None,
+    position_direction: str | None,
+) -> dict[str, Any]:
+    if not open_quantity or open_quantity <= 0:
+        return {
+            "entry_timestamp": None,
+            "decision_id": None,
+            "configuration_version": None,
+            "stop_price": None,
+            "target_price": None,
+            "unprotected": False,
+            "inconsistent": False,
+            "reason_codes": (),
+        }
+    reasons: list[str] = []
+    inconsistent = False
+    unprotected = False
+    if not open_lots:
+        reasons.append("wca.runtime_state.open_lots_missing")
+        return {
+            "entry_timestamp": None,
+            "decision_id": None,
+            "configuration_version": None,
+            "stop_price": None,
+            "target_price": None,
+            "unprotected": True,
+            "inconsistent": True,
+            "reason_codes": tuple(reasons),
+        }
+
+    lot_quantity = sum(int(lot["quantity"]) for lot in open_lots)
+    if lot_quantity != open_quantity:
+        inconsistent = True
+        reasons.append("wca.runtime_state.open_lot_quantity_mismatch")
+    sides = {str(lot["side"]).upper() for lot in open_lots}
+    if len(sides) != 1 or (position_direction is not None and position_direction not in sides):
+        inconsistent = True
+        reasons.append("wca.runtime_state.open_lot_side_inconsistent")
+    if any(lot["entry_price"] is None or float(lot["entry_price"]) <= 0 for lot in open_lots):
+        inconsistent = True
+        reasons.append("wca.runtime_state.open_lot_entry_price_missing")
+    if any(not lot.get("decision_id") for lot in open_lots):
+        inconsistent = True
+        reasons.append("wca.runtime_state.open_lot_decision_id_missing")
+    if any(not lot.get("configuration_version") for lot in open_lots):
+        inconsistent = True
+        reasons.append("wca.runtime_state.open_lot_configuration_version_missing")
+    opened_at = _earliest_opened_at(open_lots)
+    if opened_at is None:
+        inconsistent = True
+        reasons.append("wca.runtime_state.open_lot_entry_timestamp_missing")
+
+    protections_by_intent = {
+        str(order.get("order_intent_id") or ""): order
+        for order in protective_orders
+        if order.get("order_intent_id")
+    }
+    stops: list[float] = []
+    targets: list[float] = []
+    for lot in open_lots:
+        order_intent_id = str(lot.get("order_intent_id") or "")
+        protection = protections_by_intent.get(order_intent_id, {})
+        stop_price = lot.get("stop_price") or protection.get("stop_price")
+        target_price = lot.get("target_price") or protection.get("target_price")
+        if stop_price is None or target_price is None:
+            unprotected = True
+            continue
+        stops.append(float(stop_price))
+        targets.append(float(target_price))
+    if unprotected or len(stops) != len(open_lots) or len(targets) != len(open_lots):
+        reasons.append("wca.runtime_state.position_protection_missing")
+    side = position_direction or str(open_lots[0]["side"]).upper()
+    stop_price = None
+    target_price = None
+    if stops:
+        stop_price = max(stops) if side == WcaSide.BUY.value else min(stops)
+    if targets:
+        target_price = min(targets) if side == WcaSide.BUY.value else max(targets)
+    return {
+        "entry_timestamp": opened_at,
+        "decision_id": str(open_lots[0].get("decision_id") or "") or None,
+        "configuration_version": str(open_lots[0].get("configuration_version") or "") or None,
+        "stop_price": stop_price,
+        "target_price": target_price,
+        "unprotected": unprotected,
+        "inconsistent": inconsistent,
+        "reason_codes": tuple(reasons),
+    }
 
 
 def _pending_order(row: sqlite3.Row) -> dict[str, Any]:
@@ -375,6 +548,53 @@ def _row_payload(row: sqlite3.Row | None) -> dict[str, Any]:
     if row is None:
         return {}
     return {key: row[key] for key in row.keys()}
+
+
+def _positive_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _earliest_opened_at(lots: tuple[dict[str, Any], ...]) -> datetime | None:
+    timestamps: list[datetime] = []
+    for lot in lots:
+        try:
+            timestamps.append(_parse_dt(str(lot.get("opened_at") or lot.get("timestamp"))))
+        except (TypeError, ValueError):
+            continue
+    return min(timestamps) if timestamps else None
+
+
+def _broker_snapshot_isolation_reason_codes(
+    snapshot: BrokerAccountSnapshot,
+    *,
+    broker_account_id: str,
+    symbol: str,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if snapshot.accountId != broker_account_id:
+        reasons.append("wca.runtime_state.broker_snapshot_account_mismatch")
+    symbol_upper = symbol.upper()
+    non_wca_positions = [
+        position
+        for position in snapshot.positions
+        if position.symbol.upper() == symbol_upper and position.algorithmId != WCA_ALGORITHM_ID
+    ]
+    non_wca_orders = [
+        order
+        for order in [*snapshot.pendingOrders, *snapshot.partiallyFilledOrders]
+        if order.symbol.upper() == symbol_upper and order.algorithmId != WCA_ALGORITHM_ID
+    ]
+    if non_wca_positions:
+        reasons.append("wca.runtime_state.shared_physical_account_position_conflict")
+    if non_wca_orders:
+        reasons.append("wca.runtime_state.shared_physical_account_order_conflict")
+    return tuple(reasons)
 
 
 def _dynamic_profile_version(row: sqlite3.Row | None) -> str:

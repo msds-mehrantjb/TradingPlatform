@@ -295,6 +295,7 @@ WCA_ORDER_STATE_TRANSITIONS: dict[str, frozenset[str]] = {
             WcaOrderStatus.REJECTED.value,
             WcaOrderStatus.UNKNOWN.value,
             WcaOrderStatus.RECONCILING.value,
+            WcaOrderStatus.CANCELLED.value,
             WcaOrderStatus.DEAD_LETTER.value,
         }
     ),
@@ -945,6 +946,12 @@ class ProposedOrder(WcaContractModel):
     decision_id: str = Field(min_length=1)
     configuration_version: str = ""
     configuration_hash: str = ""
+    weight_version: str = ""
+    runtime_control_revision: int | None = Field(default=None, ge=1)
+    runtime_control_hash: str = ""
+    rollout_stage: str = ""
+    rollout_evidence_revision: str = ""
+    rollout_evidence_hash: str = ""
     order_intent_id: str = Field(min_length=1)
     idempotency_key: str | None = Field(default=None, min_length=1)
     account_id: str = Field(default="paper", min_length=1)
@@ -968,6 +975,11 @@ class GlobalGateResult(WcaContractModel):
     entry_permitted: bool = True
     risk_reducing_exit_permitted: bool = True
     idempotency_key: str | None = Field(default=None, min_length=1)
+    global_risk_decision_id: str = ""
+    evaluated_at: datetime | None = None
+    expires_at: datetime | None = None
+    global_state_hash: str = ""
+    global_state_revision: str = ""
     reason_codes: tuple[str, ...] = ()
     explanation: str = ""
 
@@ -1087,6 +1099,13 @@ class WcaDecision(WcaContractModel):
     authoritative_state_version: str = ""
     authoritative_state_hash: str = ""
     authoritative_state_reason_codes: tuple[str, ...] = ()
+    runtime_control_revision: int | None = Field(default=None, ge=1)
+    runtime_control_hash: str = ""
+    runtime_control_reason_codes: tuple[str, ...] = ()
+    rollout_stage: str = ""
+    rollout_evidence_revision: str = ""
+    rollout_evidence_hash: str = ""
+    rollout_reason_codes: tuple[str, ...] = ()
     decision_hash: str = ""
     reason_codes: tuple[str, ...] = ()
 
@@ -1232,10 +1251,21 @@ class WcaOrderValidationContext:
     account_id: str = "paper"
     broker_endpoint: str = "paper"
     runtime_mode: WcaRuntimeMode | str = WcaRuntimeMode.MANUAL_PAPER
+    rollout_stage: str = ""
+    rollout_evidence_revision: str = ""
+    rollout_evidence_hash: str = ""
+    rollout_allowed_symbols: tuple[str, ...] = ()
+    rollout_allowed_strategy_ids: tuple[str, ...] = ()
+    rollout_allowed_entry_windows: tuple[str, ...] = ()
+    rollout_max_quantity: int | None = None
+    rollout_max_daily_trades: int | None = None
+    rollout_max_daily_loss: float | None = None
+    rollout_policy_required: bool = False
     requires_executable_paper_stage: bool = False
     automatic_paper_enabled: bool = True
     market_is_open: bool = True
     allowed_session_window: bool = True
+    market_session_reason_codes: tuple[str, ...] = ()
     candle_freshness_seconds: int | None = None
     data_ready: bool = True
     inventory_consistent: bool = True
@@ -1252,6 +1282,8 @@ class WcaOrderValidationContext:
     allow_position_increase: bool = False
     position_owned_by_wca: bool = True
     quote_freshness_seconds: int | None = None
+    decision_expiration_seconds: int | None = None
+    command_deadline_at: datetime | None = None
     available_buying_power: float | None = None
     account_equity: float | None = None
     max_position_value: float | None = None
