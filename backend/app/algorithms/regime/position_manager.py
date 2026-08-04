@@ -74,6 +74,7 @@ class RegimePositionManager:
     ) -> dict[str, Any]:
         if str(fill.get("algorithmId") or fill.get("algorithm_id") or "") != "regime":
             raise ValueError("Regime position manager rejects cross-algorithm fill observations")
+        _require_matching_identity(identity, fill)
         order_intent_id = str(fill.get("orderIntentId") or fill.get("order_intent_id") or "")
         decision_id = str(fill.get("decisionId") or fill.get("decision_id") or "")
         if not order_intent_id:
@@ -98,12 +99,14 @@ class RegimePositionManager:
         applied = list(existing.get("appliedFillIds") or [])
         if fill_id in applied:
             return {"updated": False, "duplicate": True, "position": existing, "reason": "regime.position.duplicate_fill_ignored"}
-        inventory_update = self.repository.apply_inventory_fill(identity, fill, settings_snapshot=settings_snapshot)
         previous_quantity = int(existing.get("filledQuantity") or 0)
         previous_average = float(existing.get("averageFillPrice") or fill.get("averageFillPrice") or fill.get("average_fill_price") or 0)
         fill_price = float(fill.get("averageFillPrice") or fill.get("average_fill_price") or previous_average or 0)
         existing_side = str(existing.get("side") or ("Short" if side == "Sell" and position_effect == "enter_short" else "Long"))
         closes_existing = (existing_side == "Long" and side == "Sell") or (existing_side == "Short" and side == "Buy")
+        if closes_existing and filled_quantity > previous_quantity:
+            raise ValueError("Regime exit fill quantity exceeds owned position quantity")
+        inventory_update = self.repository.apply_inventory_fill(identity, fill, settings_snapshot=settings_snapshot)
         new_quantity = max(0, previous_quantity - filled_quantity) if closes_existing else previous_quantity + filled_quantity
         average = previous_average if closes_existing and new_quantity >= 0 else ((previous_average * previous_quantity) + (fill_price * filled_quantity)) / max(1, new_quantity)
         requested_quantity = int(fill.get("submittedQuantity") or fill.get("requestedQuantity") or existing.get("requestedQuantity") or new_quantity)
@@ -329,7 +332,7 @@ def _exit_reason(
         return "time_stop", close
     if _maximum_holding_hit(position, settings_snapshot):
         return "maximum_holding_bars", close
-    if _flatten_time_reached(candle, settings_snapshot):
+    if _end_of_day_flatten_enabled(settings_snapshot) and _flatten_time_reached(candle, settings_snapshot):
         return "end_of_day_flatten", close
     if confirmed_regime in RISK_OFF_REGIMES:
         return "risk_off_transition", close
@@ -465,6 +468,34 @@ def _has_fill_level_regime_attribution(position: dict[str, Any]) -> bool:
     )
 
 
+def _require_matching_identity(identity: dict[str, Any], payload: dict[str, Any]) -> None:
+    aliases = {
+        "algorithmInstanceId": ("algorithmInstanceId", "algorithm_instance_id"),
+        "accountId": ("accountId", "account_id"),
+        "runtimeMode": ("runtimeMode", "runtime_mode"),
+        "symbol": ("symbol",),
+    }
+    mismatches: list[str] = []
+    for expected_key, candidate_keys in aliases.items():
+        expected = str(identity.get(expected_key) or "")
+        supplied = ""
+        for key in candidate_keys:
+            value = payload.get(key)
+            if value is not None and str(value) != "":
+                supplied = str(value)
+                break
+        if not supplied:
+            continue
+        if expected_key == "symbol":
+            mismatch = supplied.upper() != expected.upper()
+        else:
+            mismatch = supplied != expected
+        if mismatch:
+            mismatches.append(expected_key)
+    if mismatches:
+        raise ValueError(f"Regime position manager rejects cross-identity observation: {', '.join(mismatches)}")
+
+
 def _time_stop_hit(position: dict[str, Any], settings_snapshot: dict[str, Any]) -> bool:
     bars = int(position.get("holdingBars") or 0)
     exit_policy = settings_snapshot.get("exit_policy") if isinstance(settings_snapshot.get("exit_policy"), dict) else settings_snapshot.get("exitPolicy") if isinstance(settings_snapshot.get("exitPolicy"), dict) else {}
@@ -497,6 +528,18 @@ def _flatten_time_reached(candle: dict[str, Any], settings_snapshot: dict[str, A
         hour, minute = 15, 55
     et_timestamp = timestamp.astimezone(ZoneInfo("America/New_York"))
     return et_timestamp.time() >= time(hour, minute)
+
+
+def _end_of_day_flatten_enabled(settings_snapshot: dict[str, Any]) -> bool:
+    flattened = settings_snapshot.get("flatSettings") if isinstance(settings_snapshot.get("flatSettings"), dict) else settings_snapshot
+    exit_policy = settings_snapshot.get("exit_policy") if isinstance(settings_snapshot.get("exit_policy"), dict) else settings_snapshot.get("exitPolicy") if isinstance(settings_snapshot.get("exitPolicy"), dict) else {}
+    if "endOfDayFlattenEnabled" in flattened:
+        return bool(flattened.get("endOfDayFlattenEnabled"))
+    if "endOfDayFlattenEnabled" in exit_policy:
+        return bool(exit_policy.get("endOfDayFlattenEnabled"))
+    if "end_of_day_flatten_enabled" in exit_policy:
+        return bool(exit_policy.get("end_of_day_flatten_enabled"))
+    return True
 
 
 def _latest_by_id(positions: list[dict[str, Any]], position_id: str) -> dict[str, Any]:

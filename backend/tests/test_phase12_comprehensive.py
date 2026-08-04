@@ -124,9 +124,9 @@ class Phase12CoverageManifestTest(unittest.TestCase):
         self.assertIn("node --experimental-strip-types", package_json)
         self.assertIn("node:test", frontend_test)
         self.assertIn("--experimental-strip-types", package_json)
-        self.assertIn("Directional strategies", frontend_test)
-        self.assertIn("Not evaluated", frontend_test)
-        self.assertIn("hard-blocker", frontend_test)
+        self.assertIn("strategyOutputs", frontend_test)
+        self.assertIn("Paper ON but blocked", frontend_test)
+        self.assertIn("strategyWeights", frontend_test)
 
 
 class Phase12RiskInvariantPropertyStyleTest(unittest.TestCase):

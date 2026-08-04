@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta, time
 from typing import Any
 
+from backend.app.algorithms.regime.account_snapshot import authoritative_regime_account_snapshot_blockers
 from backend.app.algorithms.regime.execution_cost_adapter import estimate_regime_execution_cost, evaluate_regime_execution_cost_gate
 from backend.app.algorithms.regime.exchange_calendar import exchange_session, parse_exchange_timestamp
 
@@ -72,13 +73,54 @@ def evaluate_regime_local_risk(
     quantity = max(0, int(requested_quantity or 0))
     side = str(context.get("side") or aggregation.get("signal") or "Buy")
     position_effect = str(context.get("positionEffect") or context.get("position_effect") or ("enter_short" if side == "Sell" else "enter_long"))
+    for reason in context.get("operationalBlockers") or ():
+        blockers.append(str(reason))
 
     if not context.get("completedPrimaryCandle", context.get("completedBar", True)):
         blockers.append("regime.local_risk.completed_bar_required")
+    if context.get("runtimeMode") == "paper" and context.get("supervisorStarted") is False:
+        blockers.append("regime.local_risk.paper_runtime_not_running")
+    if context.get("runtimeMode") == "paper" and context.get("paperButtonRequested") is False:
+        blockers.append("regime.local_risk.paper_button_requested_off")
+    if context.get("runtimeMode") == "paper" and context.get("paperButtonEffective") is False:
+        blockers.append("regime.local_risk.paper_button_effective_off")
+    if context.get("runtimeMode") == "paper" and context.get("requireAutomaticPaperControlForEntry") and not context.get("automaticPaperTradingEnabled"):
+        blockers.append("regime.local_risk.automatic_paper_control_off")
+    if context.get("runtimeMode") == "paper" and context.get("requireRealPaperExecutionStage") and not context.get("rolloutStageAllowsRealPaperExecution"):
+        blockers.append("regime.local_risk.rollout_stage_blocks_real_paper")
+    if context.get("marketRegularSessionOpen") is False:
+        blockers.append("regime.local_risk.market_not_regular_session")
+    if context.get("finalizedBarCurrent") is False:
+        blockers.append("regime.local_risk.finalized_bar_not_current")
+    if context.get("publisherHealthy") is False:
+        blockers.append("regime.local_risk.publisher_unhealthy")
+    if context.get("accountSnapshotCurrent") is False:
+        blockers.append("regime.local_risk.account_snapshot_stale")
+    if context.get("brokerHealthy") is False:
+        blockers.append("regime.local_risk.paper_broker_unhealthy")
+    if context.get("databaseHealthy") is False:
+        blockers.append("regime.local_risk.database_unhealthy")
+    if context.get("marketDataCurrentAndComplete") is False:
+        blockers.append("regime.local_risk.market_data_not_current_complete")
+    if context.get("brokerReconciliationHealthy") is False:
+        blockers.append("regime.local_risk.broker_reconciliation_unhealthy")
+    if context.get("killSwitchActive"):
+        blockers.append("regime.local_risk.kill_switch_active")
     if context.get("requireAccountSnapshot", True) and (not account or str(account.get("sourceAuthority") or "").lower() in {"", "shared_backend_unavailable", "api", "frontend"}):
         blockers.append("regime.local_risk.account_snapshot_unavailable")
     if account.get("buyingPowerCurrent") is False or account.get("accountSnapshotFresh") is False:
         blockers.append("regime.local_risk.account_snapshot_stale")
+    if context.get("runtimeMode") == "paper" and context.get("requireAccountSnapshot", True):
+        blockers.extend(
+            authoritative_regime_account_snapshot_blockers(
+                account,
+                identity={
+                    "accountId": str(context.get("expectedAccountId") or account.get("accountId") or ""),
+                    "runtimeMode": "paper",
+                },
+                max_age_seconds=None,
+            )
+        )
     if context.get("requireInventory", True) and (not inventory or str(inventory.get("algorithmId") or "").lower() != "regime"):
         blockers.append("regime.local_risk.inventory_snapshot_unavailable")
     if inventory and str(inventory.get("symbol") or getattr(classification, "symbol", None) or settings.get("symbol") or "SPY").upper() != str(context.get("symbol") or getattr(classification, "symbol", None) or settings.get("symbol") or "SPY").upper():
@@ -116,6 +158,8 @@ def evaluate_regime_local_risk(
         blockers.append("regime.local_risk.recovery_incomplete")
     if context.get("inventoryReconciled") is False or context.get("reconciliationRequired"):
         blockers.append("regime.local_risk.reconciliation_incomplete")
+    if context.get("ordersReconciled") is False:
+        blockers.append("regime.local_risk.orders_not_reconciled")
     inventory_quantity = int(_number(inventory.get("quantity")) or 0)
     open_order_quantity = int(_number(inventory.get("openOrderQuantity") or inventory.get("open_order_quantity")) or 0)
     if open_order_quantity > 0 and position_effect in {"enter_long", "enter_short"}:

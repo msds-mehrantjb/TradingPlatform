@@ -168,7 +168,7 @@ def v2_snapshot(
 ) -> ReplayDecisionSnapshot:
     strategy_outputs = [
         strategy_output("multi_timeframe_trend_alignment", "Multi-Timeframe Trend Alignment", "TREND", signal, data_ready),
-        strategy_output("opening_range_breakout", "Opening Range Breakout", "BREAKOUT", Signal.HOLD, data_ready),
+        strategy_output("failed_breakout_reversal", "Failed Breakout Reversal", "REVERSAL", Signal.HOLD, data_ready),
     ]
     if extra_strategy:
         strategy_outputs.append(extra_strategy)

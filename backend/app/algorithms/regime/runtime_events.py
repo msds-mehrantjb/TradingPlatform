@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from backend.app.algorithms.regime.contracts import normalize_regime_runtime_mode
+from backend.app.algorithms.regime.contracts import default_regime_account_id, default_regime_algorithm_instance_id, normalize_regime_runtime_mode
 from backend.app.algorithms.regime.exchange_calendar import exchange_session
 from backend.app.algorithms.regime.runtime_idempotency import deterministic_regime_event_id
 
@@ -90,11 +90,12 @@ class RegimeFinalisedBarEvent:
             if candles:
                 timestamp = candles[-1].get("timestamp")
         completed = _completed_flag(payload)
+        runtime_mode = normalize_regime_runtime_mode(payload.get("runtimeMode") or payload.get("runtime_mode") or "shadow").value
         return cls(
             algorithm_id="regime",
-            algorithm_instance_id=str(payload.get("algorithmInstanceId") or payload.get("algorithm_instance_id") or "regime-default"),
-            account_id=str(payload.get("accountId") or payload.get("account_id") or "default"),
-            runtime_mode=normalize_regime_runtime_mode(payload.get("runtimeMode") or payload.get("runtime_mode") or "shadow").value,  # type: ignore[arg-type]
+            algorithm_instance_id=str(payload.get("algorithmInstanceId") or payload.get("algorithm_instance_id") or default_regime_algorithm_instance_id(runtime_mode)),
+            account_id=str(payload.get("accountId") or payload.get("account_id") or default_regime_account_id(runtime_mode)),
+            runtime_mode=runtime_mode,  # type: ignore[arg-type]
             symbol=str(payload.get("symbol") or market_payload.get("symbol") or "SPY").upper(),
             completed_bar_timestamp=_parse_datetime(timestamp),
             market_payload=market_payload,

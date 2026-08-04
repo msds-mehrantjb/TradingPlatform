@@ -212,6 +212,7 @@ def market_snapshot(**overrides) -> MarketSnapshot:
 class Phase12Broker:
     def __init__(self) -> None:
         self.submit_count = 0
+        self.paper_endpoint = True
 
     def verify_paper_account(self) -> bool:
         return True

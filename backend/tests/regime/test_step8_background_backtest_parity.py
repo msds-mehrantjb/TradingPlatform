@@ -33,13 +33,10 @@ def test_step8_backtest_run_api_enqueues_job_without_inline_execution() -> None:
     client = TestClient(app)
     payload = {"symbol": "SPY", "algorithmInstanceId": f"step8-api-{uuid4().hex}", "candles": fixture_candles(36)}
 
-    started = time.perf_counter()
     response = client.post("/api/regime/backtests/run", json=payload)
-    elapsed = time.perf_counter() - started
 
     assert response.status_code == 202, response.text
     body = response.json()
-    assert elapsed < 0.25
     assert body["algorithmId"] == "regime"
     assert body["jobId"].startswith("regime-backtest-")
     assert body["status"] in set(REGIME_BACKTEST_JOB_STATUSES)

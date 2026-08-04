@@ -7,7 +7,13 @@ from typing import Any
 from fastapi import APIRouter, Body, HTTPException, Query
 
 from backend.app.algorithms.regime.backtest.engine import REGIME_BACKTEST_ENGINE_VERSION
-from backend.app.algorithms.regime.contracts import REGIME_ALLOWED_RUNTIME_MODE_VALUES, RegimeRuntimeMode, normalize_regime_runtime_mode
+from backend.app.algorithms.regime.contracts import (
+    REGIME_ALLOWED_RUNTIME_MODE_VALUES,
+    RegimeRuntimeMode,
+    default_regime_account_id,
+    default_regime_algorithm_instance_id,
+    normalize_regime_runtime_mode,
+)
 from backend.app.algorithms.regime.execution_pipeline import REGIME_EXECUTION_PIPELINE_MODULES
 from backend.app.algorithms.regime.final_acceptance import build_regime_final_acceptance_report
 from backend.app.algorithms.regime.rollout import (
@@ -84,10 +90,17 @@ REGIME_FORBIDDEN_AUTHORITATIVE_PAYLOAD_KEYS = frozenset(
         "settingsSnapshot",
         "account",
         "accountSnapshot",
+        "accountState",
+        "buyingPowerState",
         "position",
         "currentPosition",
+        "positionState",
+        "positionSnapshot",
         "inventory",
         "inventorySnapshot",
+        "inventoryState",
+        "authoritativeInventory",
+        "ownedInventory",
         "globalRiskCapacityQuantity",
         "dailyPnl",
         "availableRisk",
@@ -96,6 +109,27 @@ REGIME_FORBIDDEN_AUTHORITATIVE_PAYLOAD_KEYS = frozenset(
         "fills",
         "positions",
         "trades",
+        "regimeClassification",
+        "classifierOutput",
+        "strategyOutputs",
+        "strategyEvaluation",
+        "strategyEvaluations",
+        "familyAggregation",
+        "weights",
+        "strategyWeights",
+        "calculatedWeights",
+        "finalDecision",
+        "finalTradeDecision",
+        "sizingResult",
+        "orderQuantity",
+        "quantity",
+        "brokerOrder",
+        "brokerRequest",
+        "brokerSubmissionResult",
+        "submittedOrder",
+        "orderSubmission",
+        "paperOrder",
+        "fill",
     }
 )
 REGIME_EVALUATE_FORBIDDEN_DIRECT_DATA_KEYS = frozenset(
@@ -268,8 +302,8 @@ def active_regime_settings(payload: dict[str, Any] = Body(default_factory=dict))
 
 @router.get("/settings/active-version", summary="Read active Regime settings version")
 def active_regime_settings_version(
-    algorithm_instance_id: str = Query("regime-default"),
-    account_id: str = Query("default"),
+    algorithm_instance_id: str | None = Query(None),
+    account_id: str | None = Query(None),
     runtime_mode: str = Query("paper"),
     symbol: str = Query("SPY"),
 ) -> dict[str, Any]:
@@ -437,8 +471,8 @@ def regime_strategies_inventory() -> dict[str, Any]:
 
 @router.get("/inventory/current", summary="Read Regime-owned current inventory")
 def regime_current_inventory(
-    algorithm_instance_id: str = Query("regime-default"),
-    account_id: str = Query("default"),
+    algorithm_instance_id: str | None = Query(None),
+    account_id: str | None = Query(None),
     runtime_mode: str = Query("paper"),
     symbol: str = Query("SPY"),
 ) -> dict[str, Any]:
@@ -448,8 +482,8 @@ def regime_current_inventory(
 
 @router.get("/orders/open", summary="Read open Regime-owned orders")
 def regime_open_orders(
-    algorithm_instance_id: str = Query("regime-default"),
-    account_id: str = Query("default"),
+    algorithm_instance_id: str | None = Query(None),
+    account_id: str | None = Query(None),
     runtime_mode: str = Query("paper"),
     symbol: str = Query("SPY"),
 ) -> dict[str, Any]:
@@ -470,8 +504,8 @@ def regime_open_orders(
 
 @router.get("/reconciliation/status", summary="Read Regime reconciliation status")
 def regime_reconciliation_status(
-    algorithm_instance_id: str = Query("regime-default"),
-    account_id: str = Query("default"),
+    algorithm_instance_id: str | None = Query(None),
+    account_id: str | None = Query(None),
     runtime_mode: str = Query("paper"),
     symbol: str = Query("SPY"),
 ) -> dict[str, Any]:
@@ -483,8 +517,8 @@ def regime_reconciliation_status(
 
 @router.get("/decisions/recent", summary="Read recent Regime decisions and blockers")
 def recent_regime_decisions(
-    algorithm_instance_id: str = Query("regime-default"),
-    account_id: str = Query("default"),
+    algorithm_instance_id: str | None = Query(None),
+    account_id: str | None = Query(None),
     runtime_mode: str = Query("paper"),
     symbol: str = Query("SPY"),
     limit: int = Query(20, ge=1, le=100),
@@ -497,8 +531,8 @@ def recent_regime_decisions(
 
 @router.get("/blockers/recent", summary="Read recent Regime blockers")
 def recent_regime_blockers(
-    algorithm_instance_id: str = Query("regime-default"),
-    account_id: str = Query("default"),
+    algorithm_instance_id: str | None = Query(None),
+    account_id: str | None = Query(None),
     runtime_mode: str = Query("paper"),
     symbol: str = Query("SPY"),
     limit: int = Query(20, ge=1, le=100),
@@ -691,6 +725,7 @@ def regime_rollout_stage() -> dict[str, Any]:
 @router.post("/rollout/stage", status_code=202, summary="Enqueue an audited Regime rollout-stage command")
 async def change_regime_rollout_stage(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     _reject_inline_rollout_evidence(payload)
+    _reject_authoritative_control_payload(payload, reason_code="regime.api.rollout_authoritative_payload_rejected")
     stage = str(payload.get("stage") or payload.get("rolloutStage") or "")
     if stage not in REGIME_OPERATIONAL_ROLLOUT_STAGES:
         raise _regime_bad_request("regime.api.rollout_stage_rejected", "Unknown Regime rollout stage.")
@@ -712,6 +747,7 @@ async def change_regime_rollout_stage(payload: dict[str, Any] = Body(default_fac
 @router.post("/rollout/automatic-paper", status_code=202, summary="Toggle Regime automatic paper trading from the global paper control")
 async def set_regime_automatic_paper_trading(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     _reject_inline_rollout_evidence(payload)
+    _reject_authoritative_control_payload(payload, reason_code="regime.api.automatic_paper_authoritative_payload_rejected")
     if "enabled" not in payload or not isinstance(payload.get("enabled"), bool):
         raise _regime_bad_request("regime.api.automatic_paper_requires_boolean_enabled", "Regime automatic paper control requires enabled=true or enabled=false.")
     if not str(payload.get("actor") or "") or not str(payload.get("reason") or ""):
@@ -735,6 +771,10 @@ async def set_regime_automatic_paper_trading(payload: dict[str, Any] = Body(defa
         "liveTradingEnabled": False,
         "apiHandlersExecuteAuthoritativeTradingLogic": False,
         "inlinePromotionEvidenceAccepted": False,
+        "paperRequestedOn": bool(control.get("paperRequestedOn") or control.get("requestedAutomaticPaperTradingEnabled")),
+        "paperEffectiveOn": bool(control.get("paperEffectiveOn") or control.get("automaticPaperTradingEnabled")),
+        "paperEffectiveBlockers": list(control.get("paperEffectiveBlockers") or ()),
+        "paperEffectiveBlockerReasonCodes": list(control.get("paperEffectiveBlockerReasonCodes") or ()),
         "automaticPaperTradingEnabled": bool(control.get("automaticPaperTradingEnabled")),
         "rolloutStage": control.get("rolloutStage"),
     }
@@ -790,7 +830,7 @@ def _validate_regime_transport_payload(
     forbidden = set(REGIME_FORBIDDEN_AUTHORITATIVE_PAYLOAD_KEYS)
     if allow_backtest_result:
         forbidden.discard("backtestResult")
-    present = sorted(key for key in forbidden if key in (payload or {}))
+    present = _forbidden_payload_paths(payload or {}, forbidden)
     if present:
         raise HTTPException(
             status_code=400,
@@ -801,7 +841,7 @@ def _validate_regime_transport_payload(
                 "message": "Regime API payloads may transport market data or commands only; backend workers own decisions.",
             },
         )
-    direct_data = sorted(key for key in REGIME_EVALUATE_FORBIDDEN_DIRECT_DATA_KEYS if forbid_direct_market_data and key in (payload or {}))
+    direct_data = _forbidden_payload_paths(payload or {}, REGIME_EVALUATE_FORBIDDEN_DIRECT_DATA_KEYS) if forbid_direct_market_data else []
     if direct_data:
         raise HTTPException(
             status_code=400,
@@ -812,6 +852,24 @@ def _validate_regime_transport_payload(
                 "message": "Regime evaluate cannot execute authoritative decisions from caller-supplied market data; submit a trusted finalized-bar reference instead.",
             },
         )
+
+
+def _forbidden_payload_paths(value: Any, forbidden: set[str] | frozenset[str], *, prefix: str = "") -> list[str]:
+    if isinstance(value, dict):
+        paths: list[str] = []
+        for key, item in value.items():
+            key_text = str(key)
+            current = f"{prefix}.{key_text}" if prefix else key_text
+            if key_text in forbidden:
+                paths.append(current)
+            paths.extend(_forbidden_payload_paths(item, forbidden, prefix=current))
+        return sorted(dict.fromkeys(paths))
+    if isinstance(value, list):
+        paths = []
+        for index, item in enumerate(value):
+            paths.extend(_forbidden_payload_paths(item, forbidden, prefix=f"{prefix}[{index}]"))
+        return sorted(dict.fromkeys(paths))
+    return []
 
 
 def _reject_inline_rollout_evidence(payload: dict[str, Any]) -> None:
@@ -835,6 +893,23 @@ def _reject_inline_rollout_evidence(payload: dict[str, Any]) -> None:
                 "reasonCodes": ["regime.api.rollout_inline_evidence_rejected"],
                 "forbiddenKeys": forbidden,
                 "message": "Regime rollout promotion uses backend-recorded evidence only; API callers cannot provide promotion evidence.",
+            },
+        )
+
+
+def _reject_authoritative_control_payload(payload: dict[str, Any], *, reason_code: str) -> None:
+    forbidden = set(REGIME_FORBIDDEN_AUTHORITATIVE_PAYLOAD_KEYS)
+    forbidden.update({"runtimeState", "runtimeSnapshot", "rolloutState", "rolloutSnapshot"})
+    forbidden.discard("signal")
+    present = _forbidden_payload_paths(payload or {}, forbidden)
+    if present:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "algorithmId": "regime",
+                "reasonCodes": [reason_code],
+                "forbiddenKeys": present,
+                "message": "Regime controls may submit audited commands only; backend runtime owns rollout and operational state.",
             },
         )
 
@@ -907,19 +982,19 @@ def _identity_from_payload(payload: dict[str, Any], *, default_mode: RegimeRunti
     mode = normalize_regime_runtime_mode(identity.get("runtimeMode") or identity.get("runtime_mode"), default=default_mode).value
     return {
         "algorithmId": "regime",
-        "algorithmInstanceId": str(identity.get("algorithmInstanceId") or identity.get("algorithm_instance_id") or "regime-default"),
-        "accountId": str(identity.get("accountId") or identity.get("account_id") or "default"),
+        "algorithmInstanceId": str(identity.get("algorithmInstanceId") or identity.get("algorithm_instance_id") or default_regime_algorithm_instance_id(mode)),
+        "accountId": str(identity.get("accountId") or identity.get("account_id") or default_regime_account_id(mode)),
         "runtimeMode": mode,
         "symbol": str(identity.get("symbol") or "SPY").upper(),
     }
 
 
-def _identity_from_query(algorithm_instance_id: str, account_id: str, runtime_mode: str, symbol: str) -> dict[str, str]:
+def _identity_from_query(algorithm_instance_id: str | None, account_id: str | None, runtime_mode: str, symbol: str) -> dict[str, str]:
     mode = normalize_regime_runtime_mode(runtime_mode, default=RegimeRuntimeMode.PAPER).value
     return {
         "algorithmId": "regime",
-        "algorithmInstanceId": algorithm_instance_id,
-        "accountId": account_id,
+        "algorithmInstanceId": str(algorithm_instance_id or default_regime_algorithm_instance_id(mode)),
+        "accountId": str(account_id or default_regime_account_id(mode)),
         "runtimeMode": mode,
         "symbol": symbol.upper(),
     }

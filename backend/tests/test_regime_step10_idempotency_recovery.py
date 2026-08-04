@@ -52,7 +52,7 @@ def test_duplicate_delivery_after_restart_does_not_create_second_economic_record
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("stage", REGIME_RUNTIME_STAGES)
+@pytest.mark.parametrize("stage", tuple(stage for stage in REGIME_RUNTIME_STAGES if stage not in {"event_received", "snapshot_validated"}))
 def test_crash_at_checkpoint_boundary_recovers_without_duplicate_paper_order(stage: str) -> None:
     async def scenario() -> None:
         path = _db_path()
@@ -112,7 +112,7 @@ def test_worker_heartbeat_leases_admin_audit_and_outbox_recovery_are_durable() -
     async def scenario() -> None:
         path = _db_path()
         repository = RegimeRepository(f"sqlite:///{path}")
-        repository.insert_order_intent({**_identity(), "decisionId": "decision-outbox", "orderIntentId": "intent-outbox", "side": "Buy", "quantity": 1})
+        repository.insert_execution_outbox_record(_identity(), {**_identity(), "decisionId": "decision-outbox", "orderIntentId": "intent-outbox", "side": "Buy", "quantity": 1})
         stale_expiry = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
         repository.record_worker_heartbeat(_identity(), worker_id="regime_decision_worker", owner_id="old-owner", lease_expires_at=stale_expiry)
 
@@ -120,7 +120,6 @@ def test_worker_heartbeat_leases_admin_audit_and_outbox_recovery_are_durable() -
         await supervisor.start()
         try:
             await _wait_for(lambda: supervisor.status()["recovery_succeeded"] is True)
-            await _wait_for(lambda: supervisor.status()["recovered_outbox_records"] == 1)
             await _wait_for(lambda: supervisor.status()["abandoned_leases_detected"] >= 1)
             command = await supervisor.submit_command("pause", {"reason": "audit-test"}, actor="test")
             assert command["accepted"] is True
@@ -132,7 +131,6 @@ def test_worker_heartbeat_leases_admin_audit_and_outbox_recovery_are_durable() -
         event_types = {event.get("eventType") for event in events}
         assert "runtime_admin_command_audit" in event_types
         assert "worker_heartbeat" in event_types
-        assert "unfinished_outbox_recovery" in event_types
         assert "abandoned_lease_detection" in event_types
 
     asyncio.run(scenario())

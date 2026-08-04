@@ -13,7 +13,6 @@ from fastapi.testclient import TestClient
 from backend.app.algorithms.regime import api as regime_api
 from backend.app.algorithms.regime.configuration import (
     DEFAULT_REGIME_SETTINGS,
-    REGIME_SETTINGS_AUTHORITATIVE_SOURCE,
     REGIME_STRATEGY_IDS,
     flatten_regime_trading_settings,
     validate_regime_trading_settings_snapshot,
@@ -43,7 +42,7 @@ class RegimeStep3VersionedSettingsTest(unittest.TestCase):
         self.assertEqual(flat["baseRiskPercent"], 0.10)
         self.assertEqual(flat["maxPositionPercent"], 10.0)
         self.assertEqual(flat["dailyAllocationPercent"], 20.0)
-        self.assertEqual(flat["maxTradesPerDay"], 5)
+        self.assertEqual(flat["maxTradesPerDay"], 3)
         self.assertEqual(flat["maxConsecutiveLosses"], 3)
         self.assertEqual(flat["maxDailyLossPercent"], 0.50)
         self.assertEqual(flat["maxParticipationPercent"], 0.02)
@@ -113,10 +112,10 @@ class RegimeStep3VersionedSettingsTest(unittest.TestCase):
         ).as_dict()
         self.assertEqual(valid["dynamic_profiles"]["overlays"]["weak_uptrend"]["baseRiskPercentCap"], 0.05)
 
-    def test_service_evaluation_ignores_caller_supplied_operational_settings(self) -> None:
+    def test_service_evaluation_rejects_caller_supplied_operational_settings(self) -> None:
         repository = temp_repository()
         service = RegimeApplicationService(repository=repository)
-        activated = repository.activate_settings_snapshot(
+        repository.activate_settings_snapshot(
             {
                 "actor": "risk-admin",
                 "settings": {
@@ -125,22 +124,15 @@ class RegimeStep3VersionedSettingsTest(unittest.TestCase):
                 },
             }
         )
-        result = service.evaluate(
-            {
-                "identity": IDENTITY,
-                "marketData": {"symbol": "SPY", "primaryCandles": fixture_candles()},
-                "settings": {"baseRiskPercent": 5.0, "maxPositionPercent": 100.0},
-                "account": {"availableBuyingPower": 25_000, "remainingAlgorithmRiskDollars": 500},
-            }
-        )
-
-        self.assertEqual(result["settingsSource"], REGIME_SETTINGS_AUTHORITATIVE_SOURCE)
-        self.assertEqual(result["settingsVersion"], activated["settingsVersion"])
-        self.assertEqual(result["settingsSnapshot"]["settingsVersion"], activated["settingsVersion"])
-        self.assertEqual(result["decision"]["settings_version"], activated["settingsVersion"])
-        self.assertEqual(result["settingsSnapshot"]["position_sizing"]["baseRiskPercent"], 0.05)
-        self.assertLessEqual(result["decision"]["effective_settings"]["baseRiskPercent"], 0.05)
-        self.assertNotEqual(result["decision"]["effective_settings"]["baseRiskPercent"], 5.0)
+        with self.assertRaisesRegex(ValueError, "Regime service rejects authoritative request fields"):
+            service.evaluate(
+                {
+                    "identity": IDENTITY,
+                    "marketData": {"symbol": "SPY", "primaryCandles": fixture_candles()},
+                    "settings": {"baseRiskPercent": 5.0, "maxPositionPercent": 100.0},
+                    "account": {"availableBuyingPower": 25_000, "remainingAlgorithmRiskDollars": 500},
+                }
+            )
 
     def test_decision_and_order_intent_records_persist_exact_settings_snapshot(self) -> None:
         repository = temp_repository()
@@ -149,7 +141,6 @@ class RegimeStep3VersionedSettingsTest(unittest.TestCase):
             {
                 "identity": IDENTITY,
                 "marketData": {"symbol": "SPY", "primaryCandles": fixture_candles()},
-                "account": {"availableBuyingPower": 25_000, "remainingAlgorithmRiskDollars": 500},
             }
         )
 

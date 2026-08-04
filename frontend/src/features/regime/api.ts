@@ -32,12 +32,18 @@ const AUTHORITATIVE_REGIME_PAYLOAD_KEYS = new Set([
   "settingsSnapshot",
   "account",
   "accountSnapshot",
+  "accountState",
+  "buyingPowerState",
   "position",
   "currentPosition",
   "positionState",
+  "positionSnapshot",
   "positions",
   "inventory",
   "inventorySnapshot",
+  "inventoryState",
+  "authoritativeInventory",
+  "ownedInventory",
   "availableBuyingPower",
   "availableRisk",
   "buyingPower",
@@ -47,17 +53,39 @@ const AUTHORITATIVE_REGIME_PAYLOAD_KEYS = new Set([
   "authoritativeDecision",
   "authoritativeRuntime",
   "authoritativeEngine",
+  "regimeClassification",
   "classification",
+  "classifierOutput",
   "hysteresis",
   "hysteresisState",
+  "strategyOutputs",
   "strategyRouting",
+  "strategyEvaluation",
+  "strategyEvaluations",
+  "familyAggregation",
+  "weights",
+  "strategyWeights",
+  "calculatedWeights",
   "finalSignal",
+  "finalDecision",
+  "finalTradeDecision",
   "signal",
   "sizing",
+  "sizingResult",
+  "orderQuantity",
+  "quantity",
   "orderIntent",
   "orderProposal",
   "exitDecision",
+  "brokerOrder",
+  "brokerRequest",
   "brokerSubmission",
+  "brokerSubmissionResult",
+  "submittedOrder",
+  "orderSubmission",
+  "paperOrder",
+  "fill",
+  "fills",
   "decisionResult",
   "backtestResult",
 ]);
@@ -120,6 +148,14 @@ export async function readLatestRegimeDecisionFromBackend<T>(client: ApiClient =
   return (await response.json()) as T;
 }
 
+export async function fetchRegimeRuntimeStatus<T>(client: ApiClient = defaultApiClient): Promise<T> {
+  const response = await client.fetch(`${client.baseUrl || API_BASE}/api/regime/runtime/status`);
+  if (!response.ok) {
+    throw new Error(`Backend Regime runtime status read failed: ${response.status}`);
+  }
+  return (await response.json()) as T;
+}
+
 export async function createRegimeSettingsVersion<T>(
   payload: RegimeSettingsCommand,
   client: ApiClient = defaultApiClient,
@@ -168,6 +204,7 @@ export async function readActiveRegimeSettings<T>(
   payload: Pick<RegimeSettingsCommand, "identity"> & Record<string, unknown>,
   client: ApiClient = defaultApiClient,
 ): Promise<T> {
+  assertRegimeReadPayload(payload, "active settings read");
   const response = await client.fetch(`${client.baseUrl || API_BASE}/api/regime/settings/active`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -196,31 +233,60 @@ async function submitRegimeSettingsCommand<T>(
 }
 
 function assertRegimeTransportOnlyPayload(payload: Record<string, unknown>, kind: "evaluation" | "backtest") {
-  for (const key of AUTHORITATIVE_REGIME_PAYLOAD_KEYS) {
-    if (Object.prototype.hasOwnProperty.call(payload, key)) {
-      throw new Error(`Regime ${kind} payload cannot submit authoritative ${key}; backend workers own decisions`);
-    }
+  const forbiddenPath = findRegimeForbiddenPayloadPath(payload, AUTHORITATIVE_REGIME_PAYLOAD_KEYS);
+  if (forbiddenPath) {
+    throw new Error(`Regime ${kind} payload cannot submit authoritative ${forbiddenPath}; backend workers own decisions`);
   }
   if (kind === "evaluation") {
-    for (const key of DIRECT_EVALUATION_DATA_KEYS) {
-      if (Object.prototype.hasOwnProperty.call(payload, key)) {
-        throw new Error(`Regime evaluation payload cannot submit ${key}; use a trusted finalized-bar reference`);
-      }
+    const directDataPath = findRegimeForbiddenPayloadPath(payload, DIRECT_EVALUATION_DATA_KEYS);
+    if (directDataPath) {
+      throw new Error(`Regime evaluation payload cannot submit ${directDataPath}; use a trusted finalized-bar reference`);
     }
   }
 }
 
 function assertRegimeControlPayload(payload: Record<string, unknown>, kind: string) {
-  for (const key of REGIME_PROMOTION_EVIDENCE_KEYS) {
-    if (Object.prototype.hasOwnProperty.call(payload, key)) {
-      throw new Error(`Regime ${kind} cannot submit promotion evidence; backend workers own rollout evidence`);
+  const evidencePath = findRegimeForbiddenPayloadPath(payload, REGIME_PROMOTION_EVIDENCE_KEYS);
+  if (evidencePath) {
+    throw new Error(`Regime ${kind} cannot submit promotion evidence at ${evidencePath}; backend workers own rollout evidence`);
+  }
+  const authoritativePath = findRegimeForbiddenPayloadPath(payload, AUTHORITATIVE_REGIME_PAYLOAD_KEYS);
+  if (authoritativePath) {
+    throw new Error(`Regime ${kind} cannot submit authoritative ${authoritativePath}; backend workers own decisions`);
+  }
+}
+
+function assertRegimeReadPayload(payload: Record<string, unknown>, kind: string) {
+  const authoritativePath = findRegimeForbiddenPayloadPath(payload, AUTHORITATIVE_REGIME_PAYLOAD_KEYS);
+  if (authoritativePath) {
+    throw new Error(`Regime ${kind} cannot submit authoritative ${authoritativePath}; backend workers own decisions`);
+  }
+}
+
+function findRegimeForbiddenPayloadPath(payload: unknown, forbidden: Set<string>, path = ""): string | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  if (Array.isArray(payload)) {
+    for (let index = 0; index < payload.length; index += 1) {
+      const nested = findRegimeForbiddenPayloadPath(payload[index], forbidden, `${path}[${index}]`);
+      if (nested) {
+        return nested;
+      }
+    }
+    return null;
+  }
+  for (const [key, value] of Object.entries(payload as Record<string, unknown>)) {
+    const currentPath = path ? `${path}.${key}` : key;
+    if (forbidden.has(key)) {
+      return currentPath;
+    }
+    const nested = findRegimeForbiddenPayloadPath(value, forbidden, currentPath);
+    if (nested) {
+      return nested;
     }
   }
-  for (const key of AUTHORITATIVE_REGIME_PAYLOAD_KEYS) {
-    if (Object.prototype.hasOwnProperty.call(payload, key)) {
-      throw new Error(`Regime ${kind} cannot submit authoritative ${key}; backend workers own decisions`);
-    }
-  }
+  return null;
 }
 
 async function unwrapRegimeJobResponse<T>(body: unknown, client: ApiClient): Promise<T> {

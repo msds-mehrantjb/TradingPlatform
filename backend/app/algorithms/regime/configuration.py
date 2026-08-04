@@ -16,6 +16,8 @@ from backend.app.algorithms.regime.contracts import (
     REGIME_PROFILE_VERSION,
     REGIME_SETTINGS_VERSION,
     REGIME_STRATEGY_CATALOG_VERSION,
+    default_regime_account_id,
+    default_regime_algorithm_instance_id,
     normalize_regime_runtime_mode,
 )
 
@@ -553,11 +555,12 @@ def regime_settings_identity_from_payload(payload: dict[str, Any] | None = None)
     identity = _identity_from_payload(source)
     if not identity.get("symbol") and market.get("symbol"):
         identity["symbol"] = str(market.get("symbol")).upper()
+    runtime_mode = normalize_regime_runtime_mode(identity.get("runtimeMode") or source.get("runtimeMode") or "shadow").value
     normalized = {
         "algorithmId": str(identity.get("algorithmId") or REGIME_ALGORITHM_ID),
-        "algorithmInstanceId": str(identity.get("algorithmInstanceId") or source.get("algorithmInstanceId") or "regime-default"),
-        "accountId": str(identity.get("accountId") or source.get("accountId") or _record(source.get("account")).get("accountId") or "default"),
-        "runtimeMode": normalize_regime_runtime_mode(identity.get("runtimeMode") or source.get("runtimeMode") or "shadow").value,
+        "algorithmInstanceId": str(identity.get("algorithmInstanceId") or source.get("algorithmInstanceId") or default_regime_algorithm_instance_id(runtime_mode)),
+        "accountId": str(identity.get("accountId") or source.get("accountId") or _record(source.get("account")).get("accountId") or default_regime_account_id(runtime_mode)),
+        "runtimeMode": runtime_mode,
         "symbol": str(identity.get("symbol") or source.get("symbol") or market.get("symbol") or "SPY").upper(),
     }
     _validate_identity(normalized)
@@ -790,11 +793,12 @@ def _extract_sections(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _identity_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     identity = _record(payload.get("identity"))
+    runtime_mode = normalize_regime_runtime_mode(identity.get("runtimeMode") or payload.get("runtimeMode") or payload.get("runtime_mode") or "shadow").value
     return {
         "algorithmId": identity.get("algorithmId") or payload.get("algorithmId") or payload.get("algorithm_id") or REGIME_ALGORITHM_ID,
-        "algorithmInstanceId": identity.get("algorithmInstanceId") or payload.get("algorithmInstanceId") or payload.get("algorithm_instance_id") or "regime-default",
-        "accountId": identity.get("accountId") or payload.get("accountId") or payload.get("account_id") or "default",
-        "runtimeMode": normalize_regime_runtime_mode(identity.get("runtimeMode") or payload.get("runtimeMode") or payload.get("runtime_mode") or "shadow").value,
+        "algorithmInstanceId": identity.get("algorithmInstanceId") or payload.get("algorithmInstanceId") or payload.get("algorithm_instance_id") or default_regime_algorithm_instance_id(runtime_mode),
+        "accountId": identity.get("accountId") or payload.get("accountId") or payload.get("account_id") or default_regime_account_id(runtime_mode),
+        "runtimeMode": runtime_mode,
         "symbol": str(identity.get("symbol") or payload.get("symbol") or "SPY").upper(),
     }
 

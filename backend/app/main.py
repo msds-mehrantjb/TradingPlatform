@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .alpaca import AlpacaClient, demo_bars, local_market_status, nyse_holiday_name
 from .algorithms.regime.api import router as regime_router
 from .algorithms.regime.api import REGIME_REPOSITORY
-from .algorithms.regime.runtime_supervisor import get_regime_runtime_supervisor
+from .algorithms.regime.runtime_factory import get_regime_runtime_supervisor
 from .algorithms.session.api import router as session_router
 from .algorithms.session.models import SessionClassification
 from .algorithms.session.persistence import SESSION_PERSISTENCE_ROOT, SessionDecisionJsonlStore, build_session_decision_record
@@ -89,6 +89,7 @@ alpaca = AlpacaClient(settings)
 session_decision_store = SessionDecisionJsonlStore(root=SESSION_PERSISTENCE_ROOT)
 meta_strategy_runtime_supervisor = get_meta_strategy_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
 voting_ensemble_runtime_supervisor = get_voting_ensemble_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
+regime_runtime_supervisor = get_regime_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
 META_STRATEGY_SERVICE.set_runtime_readiness_provider(meta_strategy_runtime_supervisor.readiness_status)
 
 app = FastAPI(title="Trading Dashboard API", version="0.1.0")
@@ -186,7 +187,7 @@ async def start_daily_backtest_refresh_scheduler() -> None:
     WCA_FINALIZED_BAR_TASK = asyncio.create_task(wca_finalized_bar_scheduler())
     await voting_ensemble_runtime_supervisor.start()
     await get_weighted_voting_runtime_supervisor().start()
-    await get_regime_runtime_supervisor().start()
+    await regime_runtime_supervisor.start()
     await meta_strategy_runtime_supervisor.start()
 
 
@@ -198,7 +199,7 @@ async def stop_weighted_voting_runtime_supervisor() -> None:
         await asyncio.gather(WCA_FINALIZED_BAR_TASK, return_exceptions=True)
         WCA_FINALIZED_BAR_TASK = None
     await meta_strategy_runtime_supervisor.shutdown()
-    await get_regime_runtime_supervisor().shutdown()
+    await regime_runtime_supervisor.shutdown()
     await get_weighted_voting_runtime_supervisor().shutdown()
     await voting_ensemble_runtime_supervisor.shutdown()
 

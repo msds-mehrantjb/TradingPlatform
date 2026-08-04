@@ -1,8 +1,10 @@
 ﻿import "./styles.css";
+import { evaluatePaperDecisionV2 } from "./api/v2";
 import { API_BASE, BACKTEST_API_CANDIDATES, TRADING_ALGORITHM_INVENTORY_ENDPOINTS } from "./api/client";
+import { renderV2DecisionPanel } from "./components";
 import { directionalSignal, isEligibleStrategyVote, winningVoteSignal } from "./domain/tradingSignals";
 import type { RegimeBacktestResult } from "./features/regime/types";
-import { readLatestRegimeDecisionFromBackend, runRegimeBacktestOnBackend, setRegimeAutomaticPaperTrading } from "./features/regime/api";
+import { evaluateRegimeOnBackend, fetchRegimeRuntimeStatus, readLatestRegimeDecisionFromBackend, runRegimeBacktestOnBackend, setRegimeAutomaticPaperTrading } from "./features/regime/api";
 import { fetchLatestWcaDecision, fetchWcaBacktest, fetchWcaBacktestStatus, fetchWcaBaselineSettings, fetchWcaConfiguration, fetchWcaRuntimeControl, fetchWcaStatus, runWcaPreparedBacktest, setWcaAutomaticPaperTrading, updateWcaConfiguration } from "./features/wca/api";
 import {
   createInitialWcaState,
@@ -445,6 +447,7 @@ type AlgoSignal = "Buy" | "Sell" | "Hold";
 type BacktestResultTimeframe = "1Min" | "5Min" | "1Hour" | "1Day" | "1Week" | "Event";
 type AlgoBacktestTimeframe = BacktestResultTimeframe | "Trading";
 const FAST_INTRADAY_ALGO_TIMEFRAMES = new Set<AlgoBacktestTimeframe>(["1Min", "5Min"]);
+const evaluateRegimeOnBackendTransport = evaluateRegimeOnBackend;
 
 function visibleAlgoBacktestTimeframe(timeframe: AlgoBacktestTimeframe | undefined): AlgoBacktestTimeframe {
   return timeframe && FAST_INTRADAY_ALGO_TIMEFRAMES.has(timeframe) ? timeframe : "1Min";
@@ -591,6 +594,19 @@ type VotingEnsembleRuntimeStatus = VotingEnsembleRuntimeControl & {
   lastReconciliation: Record<string, unknown> | null;
   lastError: string | null;
   settingsHash: string | null;
+};
+
+type RegimeRuntimeControl = {
+  algorithmId?: "regime";
+  algorithm_id?: "regime";
+  paperRequestedOn: boolean;
+  paperEffectiveOn: boolean;
+  automaticPaperTradingEnabled?: boolean;
+  liveTradingEnabled: boolean;
+  rolloutStage?: string | null;
+  paperEffectiveBlockers: string[];
+  paperEffectiveBlockerReasonCodes: string[];
+  updatedAt?: string | null;
 };
 
 type VotingEnsemblePaperInventory = {
@@ -3170,6 +3186,9 @@ const state = {
   wcaRuntimeControl: null as WcaRuntimeControl | null,
   wcaRuntimeControlStatus: "idle" as "idle" | "loading" | "ready" | "blocked" | "error",
   wcaRuntimeControlWarning: "",
+  regimeRuntimeControl: null as RegimeRuntimeControl | null,
+  regimeRuntimeControlStatus: "idle" as "idle" | "loading" | "ready" | "blocked" | "error",
+  regimeRuntimeControlWarning: "",
   votingEnsemblePaperInventory: emptyVotingEnsemblePaperInventory(),
   votingEnsemblePaperInventoryStatus: "idle" as "idle" | "loading" | "ready" | "error",
   votingEnsemblePaperInventoryWarning: "",
@@ -3640,6 +3659,7 @@ const dailyBacktestPopupClose = document.querySelector<HTMLButtonElement>("#dail
 const contextStackElement = document.querySelector<HTMLElement>(".context-stack")!;
 const strategyStripElement = document.querySelector<HTMLElement>(".strategy-strip")!;
 const decisionStripElement = document.querySelector<HTMLElement>(".decision-strip")!;
+const ensembleV2Shell = document.querySelector<HTMLElement>("#ensemble-v2-shell");
 const newsSectionElement = document.querySelector<HTMLElement>(".news-section")!;
 
 const layersShell = document.createElement("section");
@@ -5729,6 +5749,56 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
   void maybeRunDailyAlgorithmBacktests("candles");
   if (state.algoBacktestTimeframe !== "Trading") {
     scheduleVisibleContextUpdate(0);
+  }
+  void refreshEnsembleV2Decision();
+}
+
+async function refreshEnsembleV2Decision() {
+  if (!ensembleV2Shell || state.timeframe !== "1Min" || state.candles.length === 0) {
+    return;
+  }
+  const spyCandles = state.candles.map((candle) => ({
+    timestamp: candle.timestamp,
+    open: candle.open,
+    high: candle.high,
+    low: candle.low,
+    close: candle.close,
+    volume: candle.volume,
+    tradeCount: candle.trade_count,
+    symbol: candle.symbol,
+    timeframe: candle.timeframe,
+  }));
+  const latest = spyCandles[spyCandles.length - 1];
+  if (!latest) {
+    return;
+  }
+  ensembleV2Shell.innerHTML = renderV2DecisionPanel({ status: "loading", decision: null, updatedAt: latest.timestamp });
+  try {
+    const result = await evaluatePaperDecisionV2({
+      symbol: state.symbol,
+      sessionDate: latest.timestamp.slice(0, 10),
+      evaluationTimestamp: latest.timestamp,
+      spy1mCandles: spyCandles,
+      spy5mCandles: spyCandles,
+      spy15mCandles: spyCandles,
+      qqqCandles: spyCandles,
+      iwmCandles: spyCandles,
+      breadthComponents: {},
+      economicEventState: {},
+    });
+    ensembleV2Shell.innerHTML = renderV2DecisionPanel({
+      status: "ready",
+      decision: result.payload,
+      updatedAt: latest.timestamp,
+      configurationHash: result.configurationHash,
+    });
+  } catch (error) {
+    ensembleV2Shell.innerHTML = renderV2DecisionPanel({
+      status: "error",
+      decision: null,
+      updatedAt: latest.timestamp,
+      error: error instanceof Error ? error.message : "V2 backend decision unavailable",
+    });
   }
 }
 
@@ -8591,6 +8661,24 @@ function wcaPaperBlocked() {
   return wcaPaperRequested() && (!wcaPaperEffective() || !wcaAutomaticEntriesEffective());
 }
 
+function regimeRuntimeControlRecord() {
+  return state.regimeRuntimeControl;
+}
+
+function regimePaperRequested() {
+  const control = regimeRuntimeControlRecord();
+  return Boolean(control?.paperRequestedOn);
+}
+
+function regimePaperEffective() {
+  const control = regimeRuntimeControlRecord();
+  return Boolean(control?.paperEffectiveOn);
+}
+
+function regimePaperBlocked() {
+  return regimePaperRequested() && !regimePaperEffective();
+}
+
 function wcaPaperRequestedFromControl(control: WcaRuntimeControl | null | undefined) {
   return Boolean(control?.paperTradingRequested ?? control?.paper_trading_requested);
 }
@@ -8628,12 +8716,14 @@ function updateTradeToggleButton() {
   const wcaRequested = wcaPaperRequested();
   const wcaEffective = wcaPaperEffective();
   const wcaEntriesEffective = wcaAutomaticEntriesEffective();
-  const requested = votingRequested || wcaRequested || globalPaperTradingEnabled();
-  const effective = votingEffective && (!wcaRequested || (wcaEffective && wcaEntriesEffective));
-  const blocked = votingEnsemblePaperBlocked() || wcaPaperBlocked();
-  const loading = state.votingEnsembleRuntimeControlStatus === "loading" || state.wcaRuntimeControlStatus === "loading";
-  const error = state.votingEnsembleRuntimeControlStatus === "error" || state.wcaRuntimeControlStatus === "error";
-  tradeToggleButton.textContent = loading ? "Paper Requested" : error ? "Paper Error" : blocked ? "Paper Blocked" : effective ? "Paper Effective" : requested ? "Paper Requested" : "Paper Off";
+  const regimeRequested = regimePaperRequested();
+  const regimeEffective = regimePaperEffective();
+  const requested = votingRequested || wcaRequested || regimeRequested || globalPaperTradingEnabled();
+  const effective = requested && (!votingRequested || votingEffective) && (!wcaRequested || (wcaEffective && wcaEntriesEffective)) && (!regimeRequested || regimeEffective);
+  const blocked = votingEnsemblePaperBlocked() || wcaPaperBlocked() || regimePaperBlocked();
+  const loading = state.votingEnsembleRuntimeControlStatus === "loading" || state.wcaRuntimeControlStatus === "loading" || state.regimeRuntimeControlStatus === "loading";
+  const error = state.votingEnsembleRuntimeControlStatus === "error" || state.wcaRuntimeControlStatus === "error" || state.regimeRuntimeControlStatus === "error";
+  tradeToggleButton.textContent = loading ? "Paper Requested" : error ? "Paper Error" : blocked ? "Paper ON but blocked" : effective ? "Paper Effective" : requested ? "Paper Requested" : "Paper Off";
   tradeToggleButton.setAttribute("aria-pressed", String(effective));
   tradeToggleButton.dataset.enabled = String(effective);
   tradeToggleButton.dataset.requested = String(requested);
@@ -8642,6 +8732,9 @@ function updateTradeToggleButton() {
   const runtime = state.votingEnsembleRuntimeStatus;
   const wcaControl = wcaRuntimeControlRecord();
   const wcaReasons = arrayFromUnknown(wcaControl?.reasonCodes ?? wcaControl?.reason_codes).map((value) => String(value)).join(", ");
+  const regimeControl = regimeRuntimeControlRecord();
+  const regimeBlockers = arrayFromUnknown(regimeControl?.paperEffectiveBlockers).map((value) => String(value)).join(", ");
+  const regimeReasonCodes = arrayFromUnknown(regimeControl?.paperEffectiveBlockerReasonCodes).map((value) => String(value)).join(", ");
   const activeBlocks = runtime?.activeEntryBlocks?.length ? runtime.activeEntryBlocks.join(", ") : "";
   const paperReadyBlocks = runtime?.paperReadyBlockingReasonCodes?.length ? runtime.paperReadyBlockingReasonCodes.join(", ") : "";
   const reason = activeBlocks || state.votingEnsembleRuntimeControl?.reasonCodes?.join(", ") || state.votingEnsembleRuntimeControlWarning;
@@ -8653,6 +8746,10 @@ function updateTradeToggleButton() {
     `WCA requested: ${wcaRequested ? "ON" : "OFF"}`,
     `WCA effective paper: ${wcaEffective ? "ON" : "OFF"}`,
     `WCA automatic entries: ${wcaEntriesEffective ? "ARMED" : "BLOCKED"}`,
+    `Regime requested: ${regimeRequested ? "ON" : "OFF"}`,
+    `Regime effective: ${regimeEffective ? "ON" : "OFF"}`,
+    regimePaperBlocked() ? "Regime is ON but blocked." : "",
+    regimeBlockers ? `Regime blockers: ${regimeBlockers}` : "",
     runtime ? `Paper ready: ${runtime.paperReady ? "true" : "false"}` : "",
     runtime ? `Market: ${runtime.marketOpen ? "open" : "closed"}` : "",
     runtime ? `Workers: eval ${runtime.evaluationWorkerHealthy ? "healthy" : "blocked"}, exec ${runtime.executionWorkerHealthy ? "healthy" : "blocked"}, recon ${runtime.reconciliationHealthy ? "healthy" : "blocked"}` : "",
@@ -8666,6 +8763,8 @@ function updateTradeToggleButton() {
     reason,
     state.wcaRuntimeControlWarning,
     wcaReasons,
+    state.regimeRuntimeControlWarning,
+    regimeReasonCodes,
   ].filter(Boolean).join(" ");
   tradeToggleButton.title = controlLabel;
   tradeToggleButton.setAttribute("aria-label", controlLabel);
@@ -14380,7 +14479,7 @@ function renderConfidenceTargetOrderSettings(order: ManualOrderRecommendation, s
           : "confidence-target-setting";
   const generatedNote =
     mode === "regime"
-      ? "Generated from Regime sizing, Regime settings, and Regime isolated inventory"
+      ? "Displayed from backend Regime state only; order intents and paper execution are backend-controlled"
       : `Generated from ${escapeHtml(sourceLabel)} sizing and default settings`;
   return `
     <div class="target-settings-panel weighted-target-settings-panel" data-side="${escapeHtml(order.side.toLowerCase())}">
@@ -16114,6 +16213,9 @@ async function loadWeightedVotingRuntimeControl() {
 }
 
 async function syncRegimeAutomaticPaperControl(enabled: boolean) {
+  state.regimeRuntimeControlStatus = "loading";
+  state.regimeRuntimeControlWarning = "";
+  updateTradeToggleButton();
   try {
     const reason = enabled
       ? "regime.runtime.dashboard.global_paper_toggle_on"
@@ -16124,13 +16226,68 @@ async function syncRegimeAutomaticPaperControl(enabled: boolean) {
       reason,
     });
     const control = childRecord(result, "automaticPaperControl") ?? result;
-    const automaticEnabled = weightedTruthFromUnknown(control.automaticPaperTradingEnabled, false);
-    if (enabled && !automaticEnabled) {
-      console.info("Regime automatic paper remains gated by backend rollout evidence.", control);
+    state.regimeRuntimeControl = normalizeRegimeRuntimeControl(control);
+    state.regimeRuntimeControlStatus = state.regimeRuntimeControl.paperRequestedOn && !state.regimeRuntimeControl.paperEffectiveOn ? "blocked" : "ready";
+    await loadRegimeRuntimeStatus();
+    if (enabled && state.regimeRuntimeControl && !state.regimeRuntimeControl.paperEffectiveOn) {
+      console.info("Regime automatic paper is ON but blocked by backend gates.", state.regimeRuntimeControl);
     }
   } catch (error) {
-    console.warn(error instanceof Error ? error.message : "Regime automatic paper control sync failed");
+    state.regimeRuntimeControl = null;
+    state.regimeRuntimeControlStatus = "error";
+    state.regimeRuntimeControlWarning = error instanceof Error ? error.message : "Regime automatic paper control sync failed";
+    console.warn(state.regimeRuntimeControlWarning);
+  } finally {
+    updateTradeToggleButton();
   }
+}
+
+async function loadRegimeRuntimeStatus() {
+  state.regimeRuntimeControlStatus = "loading";
+  updateTradeToggleButton();
+  try {
+    const status = normalizeRegimeRuntimeControl(await fetchRegimeRuntimeStatus<Record<string, unknown>>());
+    state.regimeRuntimeControl = status;
+    state.regimeRuntimeControlStatus = status.paperRequestedOn && !status.paperEffectiveOn ? "blocked" : "ready";
+    state.regimeRuntimeControlWarning = "";
+  } catch (error) {
+    state.regimeRuntimeControl = null;
+    state.regimeRuntimeControlStatus = "error";
+    state.regimeRuntimeControlWarning = error instanceof Error ? error.message : "Regime runtime status unavailable";
+  }
+  updateTradeToggleButton();
+  return state.regimeRuntimeControl;
+}
+
+function normalizeRegimeRuntimeControl(raw: unknown): RegimeRuntimeControl {
+  const record = isRecord(raw) ? raw : {};
+  if (record.algorithmId && record.algorithmId !== "regime") {
+    throw new Error("Regime runtime status response used the wrong algorithm id.");
+  }
+  const nested = childRecord(record, "automaticPaperControl");
+  const source = nested ?? record;
+  const blockers = arrayFromUnknown(source.paperEffectiveBlockers ?? record.paperEffectiveBlockers).map((value) => String(value));
+  const reasonCodes = arrayFromUnknown(source.paperEffectiveBlockerReasonCodes ?? record.paperEffectiveBlockerReasonCodes ?? source.reasonCodes).map((value) => String(value));
+  const requested = weightedTruthFromUnknown(
+    source.paperRequestedOn ?? source.requestedAutomaticPaperTradingEnabled ?? source.paperButtonRequested,
+    false,
+  );
+  const effective = weightedTruthFromUnknown(
+    source.paperEffectiveOn ?? source.automaticPaperTradingEnabled ?? source.paperButtonEffective,
+    false,
+  );
+  return {
+    algorithmId: "regime",
+    algorithm_id: "regime",
+    paperRequestedOn: requested,
+    paperEffectiveOn: effective,
+    automaticPaperTradingEnabled: effective,
+    liveTradingEnabled: false,
+    rolloutStage: stringFromUnknown(source.rolloutStage ?? record.paperRolloutStage, "") || null,
+    paperEffectiveBlockers: blockers,
+    paperEffectiveBlockerReasonCodes: reasonCodes,
+    updatedAt: stringFromUnknown(source.effectiveAt ?? source.updatedAt ?? record.supervisorHeartbeat, "") || null,
+  };
 }
 
 async function syncWcaAutomaticPaperControl(enabled: boolean) {
@@ -23112,6 +23269,7 @@ void loadEsSnapshot();
 void loadVotingEnsembleInventory();
 void loadVotingEnsembleRuntimeControl();
 void loadWeightedVotingRuntimeControl();
+void loadRegimeRuntimeStatus();
 void loadWcaRuntimeControl();
 void refreshVotingEnsemblePaperInventory();
 void fetchSessionCurrent();

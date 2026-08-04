@@ -45,14 +45,75 @@ test("frontend no longer contains an executable Regime algorithm implementation"
 test("backend Regime paths are the only authoritative Regime runtime paths", () => {
   const backendApi = read("backend/app/algorithms/regime/api.py");
   const backendBacktest = read("backend/app/algorithms/regime/backtest/engine.py");
+  const backendPipeline = read("backend/app/algorithms/regime/execution_pipeline.py");
+  const backendStateful = read("backend/app/algorithms/regime/stateful_core.py");
+  const backendFamilyAggregation = read("backend/app/algorithms/regime/family_aggregation.py");
+  const backendSizing = read("backend/app/algorithms/regime/sizing.py");
+  const backendExecutionGateway = read("backend/app/algorithms/regime/execution_gateway.py");
+  const backendRepository = read("backend/app/algorithms/regime/repository.py");
+  const backendPersistence = read("backend/app/algorithms/regime/persistence.py");
   const frontendFiles = walk("frontend/src").filter((path) => path.endsWith(".ts") || path.endsWith(".tsx"));
   const frontendText = frontendFiles.map(read).join("\n");
 
   assert.match(backendApi, /backend\.app\.algorithms\.regime\.execution_pipeline/);
   assert.match(backendApi, /backend\.app\.algorithms\.regime\.backtest\.engine/);
   assert.match(backendBacktest, /execute_regime_pipeline/);
+  assert.match(backendPipeline, /execute_regime_pipeline/);
+  assert.match(backendStateful, /process_regime_bar/);
+  assert.match(backendFamilyAggregation, /aggregate_directional_strategies/);
+  assert.match(backendSizing, /calculate_regime_position_size/);
+  assert.match(backendExecutionGateway, /submit_regime_outbox_record/);
+  assert.match(backendRepository, /RegimeRepository/);
+  assert.match(backendPersistence, /RegimeSqliteRepository/);
   assert.doesNotMatch(frontendText, /frontend\/src\/algorithms\/regime\/backtest\/engine\.ts/);
   assert.doesNotMatch(frontendText, /runRegimeBacktest\(/);
+});
+
+test("Regime frontend API rejects authoritative runtime payloads recursively", () => {
+  const api = read("frontend/src/features/regime/api.ts");
+  const backendApi = read("backend/app/algorithms/regime/api.py");
+
+  for (const key of [
+    "regimeClassification",
+    "strategyOutputs",
+    "strategyWeights",
+    "familyAggregation",
+    "finalTradeDecision",
+    "sizingResult",
+    "orderQuantity",
+    "orderIntent",
+    "inventorySnapshot",
+    "brokerSubmission",
+    "submittedOrder",
+    "paperOrder",
+  ]) {
+    assert.match(api, new RegExp(`"${key}"`));
+    assert.match(backendApi, new RegExp(`"${key}"`));
+  }
+  assert.match(api, /findRegimeForbiddenPayloadPath/);
+  assert.match(api, /payload cannot submit authoritative \$\{forbiddenPath\}/);
+  assert.match(api, /cannot submit authoritative \$\{authoritativePath\}/);
+  assert.match(backendApi, /_forbidden_payload_paths/);
+});
+
+test("Regime frontend order surface is display-only and cannot submit paper orders", () => {
+  const main = read("frontend/src/main.ts");
+  const autoSubmitStart = main.indexOf("function maybeAutoSubmitRegimeTargetOrder");
+  const autoSubmitEnd = main.indexOf("function maybeAutoSubmitAllAlgorithms");
+  const buildStart = main.indexOf("function buildBackendRegimeOrderRecommendation");
+  const buildEnd = main.indexOf("function regimeTargetOrderFailedGates");
+  const renderStart = main.indexOf("function renderConfidenceTargetOrderSettings");
+  const renderEnd = main.indexOf("function renderConfidenceTargetSettingInput");
+  const autoSubmit = main.slice(autoSubmitStart, autoSubmitEnd);
+  const builder = main.slice(buildStart, buildEnd);
+  const renderer = main.slice(renderStart, renderEnd);
+
+  assert.match(autoSubmit, /return;/);
+  assert.match(builder, /const eligible = false/);
+  assert.match(builder, /const quantity = 0/);
+  assert.match(builder, /Regime UI is display-only; backend workers own order intents and paper execution/);
+  assert.match(builder, /Backend Regime order intent \$\{intent\.order_intent_id\} is displayed for diagnostics only/);
+  assert.match(renderer, /Displayed from backend Regime state only; order intents and paper execution are backend-controlled/);
 });
 
 test("frontend does not own Economic Event trading decisions", () => {
@@ -131,6 +192,6 @@ test("WCA frontend displays backend runtime-control state and fails closed", () 
   }
   assert.match(main, /syncWcaAutomaticPaperControl/);
   assert.match(main, /Paper Effective/);
-  assert.match(main, /Paper Blocked/);
+  assert.match(main, /Paper ON but blocked/);
   assert.doesNotMatch(main, /tradeToggleButton\.textContent[^;\n]*Paper On/);
 });

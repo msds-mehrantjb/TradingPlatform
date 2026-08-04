@@ -49,11 +49,20 @@ def test_worker_loads_shared_account_snapshot_inside_background_processing() -> 
         calls.append(dict(identity))
         return {
             "sourceAuthority": "shared_backend_service",
+            "accountId": "default",
+            "runtimeMode": "shadow",
+            "equity": 25_000.0,
+            "cash": 25_000.0,
             "availableBuyingPower": 12_345.0,
             "buyingPower": 12_345.0,
             "globalRiskCapacityQuantity": 7,
+            "dailyAccountPnl": 0.0,
+            "accountSnapshotFresh": True,
+            "buyingPowerCurrent": True,
             "positionsReconciled": True,
             "openOrdersReconciled": True,
+            "accountTradingBlocked": False,
+            "observedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 
     async def scenario() -> None:

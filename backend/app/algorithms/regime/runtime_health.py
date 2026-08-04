@@ -10,6 +10,7 @@ from typing import Any
 REGIME_RUNTIME_HEALTH_VERSION = "regime_runtime_health_v1"
 REGIME_HEALTH_COMPONENTS = (
     "runtime_supervisor",
+    "market_event_publisher",
     "market_event_ingestion",
     "settings_repository",
     "runtime_state",

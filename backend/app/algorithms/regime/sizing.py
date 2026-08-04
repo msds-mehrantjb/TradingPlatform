@@ -5,6 +5,7 @@ from __future__ import annotations
 from math import floor
 from typing import Any
 
+from backend.app.algorithms.regime.account_snapshot import authoritative_regime_account_snapshot_blockers
 from backend.app.algorithms.regime.contracts import RegimeDecision, RegimeMarketSnapshot, RegimeSizingResult
 
 
@@ -126,6 +127,8 @@ def _trusted_account_values(account: dict[str, Any]) -> dict[str, Any]:
         blockers.append("regime.sizing.account_snapshot_unavailable")
     if account.get("buyingPowerCurrent") is False or account.get("accountSnapshotFresh") is False:
         blockers.append("regime.sizing.account_snapshot_stale")
+    if str(account.get("runtimeMode") or "").lower() == "paper":
+        blockers.extend(authoritative_regime_account_snapshot_blockers(account, max_age_seconds=None))
     equity = _number(account.get("equity") or account.get("accountEquity") or account.get("portfolioValue"))
     buying_power = _number(account.get("availableBuyingPower") or account.get("buyingPower"))
     remaining_risk = _number(account.get("remainingRegimeRiskDollars") or account.get("remainingAlgorithmRiskDollars") or account.get("availableRiskDollars"))

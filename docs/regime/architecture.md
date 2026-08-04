@@ -175,3 +175,50 @@ Shared infrastructure may never rewrite Regime signals, stops, targets, strategy
 ## Trading Modes
 
 Regime is restricted to SPY one-minute backtesting, shadow operation, and paper trading. Live trading is not implemented or enabled. Regime ML remains disabled or shadow-only for production decisions and must not alter signals, sizing, or orders.
+
+## Automatic Paper Runtime
+
+Automatic paper trading is composed by `backend/app/algorithms/regime/runtime_factory.py`. Production startup must use this factory so the supervisor receives explicit dependencies instead of silently constructing a default shadow singleton.
+
+The paper runtime identity is fixed as:
+
+- `algorithm_id = regime`
+- `algorithm_instance_id = regime-paper-default`, unless overridden by `REGIME_PAPER_ALGORITHM_INSTANCE_ID`
+- `account_id = REGIME_ALPACA_PAPER_ACCOUNT_ID`, `REGIME_PAPER_ACCOUNT_ID`, or `ALPACA_PAPER_ACCOUNT_ID`
+- `runtime_mode = paper`
+- `symbol = SPY`
+
+The factory wires the authoritative `RegimeApplicationService`, authoritative account-snapshot provider, Alpaca Paper-only broker adapter, `PaperOrderGateway`, and `RegimeFinalizedOneMinutePublisher`. Missing dependencies fail closed by marking health blockers and blocking new entries; the runtime must not fall back to shadow identity, a live broker endpoint, or an unverified account.
+
+## Publisher And Execution Workers
+
+`backend/app/algorithms/regime/runtime_publisher.py` owns finalized one-minute event publication. It runs in the backend, reads the exchange clock and calendar, rejects closed-market and non-regular-session bars, waits for candle finalization, validates historical features and freshness, persists `RegimeFinalisedBarEvent`, and publishes each completed SPY minute exactly once.
+
+Runtime timing is separated by responsibility:
+
+- Publisher checks use `REGIME_RUNTIME_PUBLISHER_POLL_INTERVAL_SECONDS` and `REGIME_RUNTIME_CLOSED_MARKET_PUBLISHER_POLL_INTERVAL_SECONDS`.
+- Execution outbox polling uses `REGIME_RUNTIME_EXECUTION_POLL_INTERVAL_SECONDS`.
+- Broker/order reconciliation uses `REGIME_RUNTIME_RECONCILIATION_POLL_INTERVAL_SECONDS`.
+- Position management uses `REGIME_RUNTIME_POSITION_MANAGEMENT_INTERVAL_SECONDS`.
+- Runtime health uses `REGIME_RUNTIME_HEALTH_INTERVAL_SECONDS`.
+
+The execution worker processes explicit active Regime paper identities. `decision_shadow` produces no broker submission, `simulated_execution` uses the simulated paper broker, and `limited_paper` or `normal_paper` use the injected Alpaca Paper gateway only after promotion evidence and readiness gates pass.
+
+## Paper Controls
+
+The backend owns the Paper ON/OFF state through the audited `set_automatic_paper` runtime command. Status exposes:
+
+- `paperRequestedOn`: the operator request.
+- `paperEffectiveOn`: true only when the request is ON and all operational gates pass.
+
+When Paper is OFF, new entry intents and queued unsubmitted entry orders are blocked. The runtime identity, inventory, reconciliation, position monitoring, and risk-reducing exits continue. When ON is requested but blocked, status includes blockers such as `market_closed`, `rollout_not_promoted`, `broker_unhealthy`, `account_snapshot_stale`, `market_data_stale`, `inventory_not_reconciled`, `open_orders_not_reconciled`, `kill_switch_active`, `database_unhealthy`, `settings_unavailable`, `publisher_unhealthy`, and `runtime_identity_invalid`.
+
+The kill switch immediately blocks new entries and cancels pending entry orders where safe. It does not flatten positions unless an explicit emergency-flatten command is submitted. Deactivation is also audited and does not bypass other readiness gates.
+
+## Recovery And End Of Day
+
+Startup recovery must load active settings, restore the paper checkpoint, restore hysteresis and cooldown state, recover persisted finalized-bar events, recover unfinished outbox records, detect abandoned leases, retrieve attributed open orders and fills, rebuild Regime-owned inventory, reconcile global-risk reservations, and resume position management before new entries are unblocked.
+
+End-of-day behavior uses the exchange calendar, including early closes. The runtime stops new entries after the configured cutoff, cancels stale unfilled entry orders before the close, flattens only Regime-owned quantity when active settings require it, reconciles final fills, persists daily position/P&L/trade/risk summaries, and resets counters only at the correct exchange-session boundary.
+
+For operator procedures and test commands, see `docs/regime/auto-paper-readiness.md`.

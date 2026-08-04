@@ -7,7 +7,7 @@ from typing import Callable
 from pydantic import Field
 
 from backend.app.domain.models import DomainModel, StrategyRole
-from backend.app.strategies.registry import DIRECTIONAL_STRATEGIES
+from backend.app.strategies.registry import DIRECTIONAL_STRATEGIES, REGISTERED_DISABLED_DIRECTIONAL_STRATEGIES
 
 
 V2_READINESS_VERSION = "voting_ensemble_v2_completion_readiness_v1"
@@ -103,12 +103,13 @@ def _directional_strategy_catalog_check() -> tuple[bool, list[str], list[str]]:
         "Bollinger/ATR Reversion",
         "Gap Continuation / Gap Fade",
     }
-    actual_names = {entry.strategyName for entry in DIRECTIONAL_STRATEGIES}
-    directional_roles = all(entry.role == StrategyRole.DIRECTIONAL.value for entry in DIRECTIONAL_STRATEGIES)
+    catalog = (*DIRECTIONAL_STRATEGIES, *REGISTERED_DISABLED_DIRECTIONAL_STRATEGIES)
+    actual_names = {entry.strategyName for entry in catalog}
+    directional_roles = all(entry.role == StrategyRole.DIRECTIONAL.value for entry in catalog)
     missing = sorted(expected_names - actual_names)
     extras = sorted(actual_names - expected_names)
-    passed = len(DIRECTIONAL_STRATEGIES) == 10 and not missing and not extras and directional_roles
-    evidence = [f"directional:{entry.strategyId}:{entry.strategyName}" for entry in DIRECTIONAL_STRATEGIES]
+    passed = len(catalog) == 10 and not missing and not extras and directional_roles
+    evidence = [f"directional:{entry.strategyId}:{entry.strategyName}:enabled={entry.enabled}" for entry in catalog]
     return passed, evidence, [*missing, *extras] + ([] if directional_roles else ["non_directional_role_present"])
 
 
@@ -136,11 +137,11 @@ COMPLETION_CONDITIONS: tuple[ConditionSpec, ...] = (
     ConditionSpec("no_direction_proxy", "No directional strategy uses session/event direction as a fallback proxy.", ("backend/app/strategies/directional",), checker=_no_direction_proxy_fallback_check),
     ConditionSpec("relative_strength_actual_aux", "Relative strength uses actual aligned QQQ/IWM measurements.", ("backend/app/strategies/context/relative_strength_qqq_iwm.py", "backend/tests/test_relative_strength_qqq_iwm_context.py"), ("qqq", "iwm", "relative_return")),
     ConditionSpec("breadth_feed_or_proxy", "Breadth uses an actual feed or clearly labeled, sufficiently populated proxy.", ("backend/app/strategies/context/market_breadth_momentum.py", "backend/tests/test_market_breadth_momentum_context.py"), ("breadth_proxy", "minComponentCoverage", "dataReady=False")),
-    ConditionSpec("context_not_directional_votes", "Context modules do not cast full directional votes.", ("backend/app/ensemble/family_aware.py", "backend/tests/test_family_aware_ensemble.py"), ("context_adjustments", "context_cannot_cast_full_votes")),
-    ConditionSpec("regime_fit_not_direction", "Regime modules modify fit rather than duplicate direction.", ("backend/app/ensemble/family_aware.py", "backend/app/strategies/regime/adx_atr_regime.py"), ("REGIME_FIT_KEYS", "trendFit", "meanReversionFit")),
+    ConditionSpec("context_not_directional_votes", "Context modules do not cast full directional votes.", ("backend/app/ensemble/family_aware.py", "backend/tests/test_family_aware_ensemble.py"), ("contextAdjustments", "context_cannot_cast_full_votes")),
+    ConditionSpec("regime_fit_not_direction", "Regime modules modify fit rather than duplicate direction.", ("backend/app/ensemble/family_aware.py", "backend/app/strategies/regime/adx_atr_regime.py"), ("trendFit", "breakoutFit", "meanReversionFit")),
     ConditionSpec("cash_hard_safety", "Cash/Avoid Trading is a hard entry safety module.", ("backend/app/strategies/safety/cash_avoid_trading.py", "backend/tests/test_cash_avoid_trading_safety.py"), ("manualCashMode", "protective_exit", "blocks")),
     ConditionSpec("no_self_vote", "Ensemble Strategy Voting is not one of its own inputs.", ("backend/app/ensemble/family_aware.py", "backend/tests/test_family_aware_ensemble.py"), ("aggregator cannot vote for itself", "aggregator_cannot_vote_for_itself")),
-    ConditionSpec("family_average", "Strategies are averaged within independent families.", ("backend/app/ensemble/family_aware.py", "backend/tests/test_family_aware_ensemble.py"), ("weighted mean", "averaged_not_counted", "duplicating_strategy")),
+    ConditionSpec("family_average", "Strategies are averaged within independent families.", ("backend/app/ensemble/family_aware.py", "backend/tests/test_family_aware_ensemble.py"), ("groupValue", "averaged_not_counted", "duplicating_strategy")),
     ConditionSpec("deterministic_baseline", "The deterministic family-aware ensemble is the permanent baseline.", ("backend/app/backtesting/deterministic_activation.py", "backend/app/backtesting/dynamic_policy_activation.py", "backend/app/backtesting/ml_risk_modifier_experiment.py"), ("DETERMINISTIC_V2_BASELINE_VERSION", "deterministicPolicyFallback")),
     ConditionSpec("v1_v2_not_mixed", "V1 and V2 snapshots cannot be mixed.", ("backend/app/domain/snapshot_store.py", "backend/tests/test_decision_snapshot_v2_archive.py"), ("incompatible", "V1", "V2")),
     ConditionSpec("point_in_time_features", "Decision features are point-in-time and reproducible.", ("backend/app/domain/feature_engine.py", "backend/tests/test_point_in_time_feature_engine.py", "docs/point-in-time-feature-engine.md"), ("_completed_candles", "future", "replay")),
@@ -165,7 +166,7 @@ COMPLETION_CONDITIONS: tuple[ConditionSpec, ...] = (
     ConditionSpec("critical_entry_gates", "Entry cutoff, halt, LULD, data freshness, broker health, and duplicate-order protections are actually enforced.", ("backend/app/gates/engine.py", "backend/tests/test_global_gate_engine.py", "backend/tests/test_phase12_comprehensive.py"), ("entryWindowOpen", "symbolHalt", "luldPause", "freshQuote", "duplicateOrder")),
     ConditionSpec("protective_exits_allowed", "Protective exits remain available when new entries are blocked.", ("backend/app/gates/engine.py", "backend/tests/test_phase12_comprehensive.py"), ("protective_exit", "cautions")),
     ConditionSpec("event_not_direction", "Event context cannot replace ensemble direction.", ("backend/app/strategies/context/economic_event_context.py", "backend/app/gates/engine.py", "backend/tests/test_remaining_context_modules.py"), ("candidate_side_not_replaced", "event context cannot")),
-    ConditionSpec("ui_gate_display", "The UI never claims an unevaluated gate passed.", ("frontend/src/components/V2DecisionPanel.ts", "frontend/tests/V2DecisionPanel.test.ts"), ("Not evaluated", "distinguishes hard blockers")),
+    ConditionSpec("ui_gate_display", "The UI never claims an unevaluated gate passed.", ("frontend/src/components/V2DecisionPanel.ts", "frontend/tests/V2DecisionPanel.test.ts"), ("Not evaluated", "Paper ON but blocked")),
     ConditionSpec("broker_reconcile_before_submit", "Broker positions and orders are reconciled before submission.", ("backend/app/execution/broker_reconciliation.py", "backend/tests/test_broker_reconciliation.py"), ("refresh_positions", "refresh_open_orders", "refresh_account_snapshot")),
     ConditionSpec("idempotent_submission", "Order submission is idempotent.", ("backend/app/execution/broker_reconciliation.py", "backend/tests/test_broker_reconciliation.py"), ("deterministic_client_order_id", "idempotent_duplicate_request")),
     ConditionSpec("hard_risk_no_lookahead_tests", "All hard-risk and no-lookahead invariants have automated tests.", ("backend/tests/test_phase12_comprehensive.py", "backend/tests/test_point_in_time_feature_engine.py"), ("hard_risk_cap_is_never_exceeded", "no_lookahead")),

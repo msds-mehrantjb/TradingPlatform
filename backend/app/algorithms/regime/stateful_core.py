@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from dataclasses import replace
 from typing import Any
 
+from backend.app.algorithms.regime.account_snapshot import normalize_regime_account_snapshot
 from backend.app.algorithms.regime.broker_adapter import build_regime_broker_submission
 from backend.app.algorithms.regime.configuration import flatten_regime_trading_settings, regime_settings_identity_from_payload
 from backend.app.algorithms.regime.contracts import RegimeMarketSnapshot, to_dict
@@ -50,6 +51,8 @@ def process_regime_bar(
     inventory = inventory_snapshot or {}
     account = account_snapshot or {}
     identity = _identity(settings_snapshot, snapshot, inventory, account)
+    if identity["runtimeMode"] == "paper":
+        account = normalize_regime_account_snapshot(account, identity=identity, max_age_seconds=None)
     state = previous_state if isinstance(previous_state, RegimeRuntimeState) else migrate_regime_runtime_state(previous_state, identity, timestamp=snapshot.latest.timestamp)
     settings = flatten_regime_trading_settings(settings_snapshot)
     data_manifest_hash = deterministic_data_manifest_hash(snapshot, inventory)
@@ -122,10 +125,32 @@ def process_regime_bar(
                 "accountSnapshot": account,
                 "inventorySnapshot": inventory,
                 "openPosition": _open_position_summary(inventory, account),
+                "runtimeMode": identity["runtimeMode"],
+                "expectedAccountId": identity["accountId"],
+                "expectedRuntimeMode": identity["runtimeMode"],
+                "expectedAlgorithmInstanceId": identity["algorithmInstanceId"],
+                "supervisorStarted": account.get("supervisorStarted"),
+                "paperButtonRequested": account.get("paperButtonRequested"),
+                "paperButtonEffective": account.get("paperButtonEffective"),
+                "automaticPaperTradingEnabled": account.get("automaticPaperTradingEnabled"),
+                "requireAutomaticPaperControlForEntry": account.get("requireAutomaticPaperControlForEntry"),
+                "rolloutStageAllowsRealPaperExecution": account.get("rolloutStageAllowsRealPaperExecution"),
+                "requireRealPaperExecutionStage": account.get("requireRealPaperExecutionStage"),
+                "marketRegularSessionOpen": account.get("marketRegularSessionOpen"),
+                "finalizedBarCurrent": account.get("finalizedBarCurrent"),
+                "publisherHealthy": account.get("publisherHealthy"),
+                "accountSnapshotCurrent": account.get("accountSnapshotCurrent"),
+                "brokerHealthy": account.get("brokerHealthy"),
+                "databaseHealthy": account.get("databaseHealthy"),
+                "marketDataCurrentAndComplete": data_validation.passed and account.get("marketDataCurrentAndComplete", True) is not False,
+                "brokerReconciliationHealthy": account.get("brokerReconciliationHealthy"),
+                "operationalBlockers": account.get("operationalBlockers") or (),
+                "killSwitchActive": account.get("killSwitchActive"),
                 "runtimePaused": bool(account.get("runtimePaused") or account.get("paused")),
                 "entryCreationPausedForReconciliation": bool(account.get("entryCreationPausedForReconciliation")),
                 "recoverySucceeded": account.get("recoverySucceeded"),
                 "inventoryReconciled": account.get("inventoryReconciled"),
+                "ordersReconciled": account.get("ordersReconciled"),
                 "reconciliationRequired": account.get("reconciliationRequired"),
                 "quoteFreshness": _record(snapshot.context_feeds.get("quoteFreshness") or snapshot.context_feeds.get("quote")),
                 "dailyCounters": state.daily_counters,
@@ -180,25 +205,33 @@ def process_regime_bar(
         local_approved_quantity = int(order_proposal.get("quantity") or 0)
         final_approved_quantity = int(risk_approval.approved_quantity)
         final_risk_dollars = _scaled_risk(float(order_proposal.get("risk_dollars") or order_proposal.get("riskDollars") or intent.risk_dollars), local_approved_quantity, final_approved_quantity)
-        order_proposal["quantity"] = final_approved_quantity
-        order_proposal["risk_dollars"] = final_risk_dollars
-        order_proposal["riskDollars"] = final_risk_dollars
-        broker_submission = build_regime_broker_submission(
-            decision_id=intent.decision_id,
-            order_intent_id=intent.order_intent_id,
-            symbol=intent.symbol,
-            side=intent.side,
-            quantity=final_approved_quantity,
-            algorithm_version=intent.algorithm_version,
-            settings_version=intent.settings_version,
-            approved_by_global_risk=not risk_approval.rejected,
-        )
-        order_proposal["localApprovedQuantity"] = local_approved_quantity
-        order_proposal["globalApprovedQuantity"] = final_approved_quantity
-        order_proposal["finalApprovedQuantity"] = final_approved_quantity
-        order_proposal["globalRiskReasonCodes"] = list(risk_approval.reason_codes)
-        order_proposal["globalRiskReservationId"] = risk_approval.reservation_id
-        order_proposal["globalRiskAccountSnapshotVersion"] = risk_approval.account_risk_snapshot_version
+        if risk_approval.rejected or final_approved_quantity <= 0:
+            order_proposal = None
+        else:
+            order_proposal["quantity"] = final_approved_quantity
+            order_proposal["risk_dollars"] = final_risk_dollars
+            order_proposal["riskDollars"] = final_risk_dollars
+            broker_submission = build_regime_broker_submission(
+                decision_id=intent.decision_id,
+                order_intent_id=intent.order_intent_id,
+                symbol=intent.symbol,
+                side=intent.side,
+                quantity=final_approved_quantity,
+                algorithm_version=intent.algorithm_version,
+                settings_version=intent.settings_version,
+                approved_by_global_risk=True,
+            )
+            order_proposal["localApprovedQuantity"] = local_approved_quantity
+            order_proposal["globalApprovedQuantity"] = final_approved_quantity
+            order_proposal["finalApprovedQuantity"] = final_approved_quantity
+            order_proposal["globalRiskReasonCodes"] = list(risk_approval.reason_codes)
+            order_proposal["globalRiskReservationId"] = risk_approval.reservation_id
+            order_proposal["globalRiskAccountSnapshotVersion"] = risk_approval.account_risk_snapshot_version
+            order_proposal["marketDataValidation"] = data_validation.as_dict()
+            order_proposal["completedBarFinalized"] = True
+            order_proposal["runtimeMode"] = identity["runtimeMode"]
+            order_proposal["algorithmInstanceId"] = identity["algorithmInstanceId"]
+            order_proposal["accountId"] = identity["accountId"]
     complete_effective_settings = _complete_effective_settings_snapshot(
         decision.effective_settings,
         local_risk_result=local_risk_result,
@@ -466,7 +499,8 @@ def _identity(settings_snapshot: dict[str, Any], snapshot: RegimeMarketSnapshot,
 
 
 def _open_position_summary(inventory: dict[str, Any], account: dict[str, Any]) -> dict[str, Any]:
-    value = inventory.get("openPosition") or inventory.get("open_position") or account.get("position") or account.get("currentPosition") or {}
+    del account
+    value = inventory.get("openPosition") or inventory.get("open_position") or {}
     if isinstance(value, dict) and value:
         return value
     quantity = int(_number(inventory.get("quantity")) or 0)
@@ -536,8 +570,10 @@ def _portfolio_snapshot_for_global_risk(account: dict[str, Any]) -> dict[str, An
 
 def _market_snapshot_for_global_risk(snapshot: RegimeMarketSnapshot, account: dict[str, Any]) -> dict[str, Any]:
     quote = _record(snapshot.context_feeds.get("quoteFreshness") or snapshot.context_feeds.get("quote") or account.get("quoteSnapshot"))
+    timestamp = _parse_timestamp(snapshot.latest.timestamp)
+    timestamp_key = str(int(timestamp.timestamp())) if timestamp is not None else hashlib.sha256(str(snapshot.latest.timestamp).encode("utf-8")).hexdigest()[:16]
     return {
-        "marketSnapshotId": account.get("marketSnapshotId") or f"regime-market-{snapshot.symbol}-{int(snapshot.latest.timestamp.timestamp())}",
+        "marketSnapshotId": account.get("marketSnapshotId") or f"regime-market-{snapshot.symbol}-{timestamp_key}",
         "session": account.get("marketSession") or account.get("session") or "regular",
         "regularSessionAllowed": account.get("regularSessionAllowed", True),
         "extendedHoursAllowed": account.get("extendedHoursAllowed", False),

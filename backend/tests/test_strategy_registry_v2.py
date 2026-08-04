@@ -8,6 +8,7 @@ from backend.app.strategies.registry import (
     ALL_STRATEGIES,
     CONTEXT_STRATEGIES,
     DIRECTIONAL_STRATEGIES,
+    REGISTERED_DISABLED_DIRECTIONAL_STRATEGIES,
     REGIME_STRATEGIES,
     SAFETY_STRATEGIES,
     STRATEGY_ALIAS_MAP,
@@ -24,22 +25,27 @@ from backend.app.strategies.registry import (
 EXPECTED_DIRECTIONAL_NAMES = [
     "Multi-Timeframe Trend Alignment",
     "First Pullback After Open",
-    "VWAP Trend Continuation",
-    "Opening Range Breakout",
-    "Volatility Breakout",
     "Failed Breakout Reversal",
     "Liquidity Sweep Reversal",
-    "VWAP Mean Reversion",
     "Bollinger/ATR Reversion",
-    "Gap Continuation / Gap Fade",
 ]
 
 
 class StrategyRegistryV2Test(unittest.TestCase):
-    def test_registry_has_exactly_ten_initial_directional_strategies(self) -> None:
+    def test_registry_has_active_directional_strategies_and_registered_shadow_extensions(self) -> None:
         self.assertEqual([entry.strategyName for entry in directional_strategy_inputs()], EXPECTED_DIRECTIONAL_NAMES)
-        self.assertEqual(len(DIRECTIONAL_STRATEGIES), 10)
-        self.assertEqual(len(set(directional_strategy_input_ids())), 10)
+        self.assertEqual(len(DIRECTIONAL_STRATEGIES), 5)
+        self.assertEqual(len(set(directional_strategy_input_ids())), 5)
+        self.assertEqual(
+            [entry.strategyName for entry in REGISTERED_DISABLED_DIRECTIONAL_STRATEGIES],
+            [
+                "Opening Range Breakout",
+                "Volatility Breakout",
+                "VWAP Trend Continuation",
+                "VWAP Mean Reversion",
+                "Gap Continuation / Gap Fade",
+            ],
+        )
 
     def test_non_directional_modules_cannot_be_inserted_as_directional_voters(self) -> None:
         blocked_names = [

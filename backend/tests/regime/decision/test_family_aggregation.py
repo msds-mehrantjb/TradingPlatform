@@ -5,10 +5,9 @@ from backend.app.algorithms.regime.contracts import RegimeStrategyEvaluation
 class FamilyAggregationTest(unittest.TestCase):
     def test_preserves_sell_and_handles_conflicts(self):
         outputs = (
-            RegimeStrategyEvaluation("a", "A", "trend", "directional", "Sell", 0.9, 0.5, True, "sell"),
-            RegimeStrategyEvaluation("b", "B", "breakout", "directional", "Buy", 0.2, 0.1, True, "buy"),
+            RegimeStrategyEvaluation("a", "A", "trend", "directional", "Sell", 0.9, 0.5, True, "sell", expected_gross_edge_bps=20.0),
+            RegimeStrategyEvaluation("b", "B", "breakout", "directional", "Buy", 0.2, 0.1, True, "buy", expected_gross_edge_bps=5.0),
         )
         result = aggregate_family_scores(outputs)
         self.assertEqual(result["signal"], "Sell")
         self.assertGreater(result["scores"]["sell"], result["scores"]["buy"])
-

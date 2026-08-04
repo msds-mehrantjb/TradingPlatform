@@ -120,19 +120,19 @@ class RegimeStep4StatefulCoreTest(unittest.TestCase):
             data_manifest_hash="manifest-a",
             settings_version="settings-a",
         )
-        changed_manifest = deterministic_regime_decision_id(
+        changed_settings = deterministic_regime_decision_id(
             algorithm_instance_id="instance-a",
             runtime_mode="paper",
             symbol="SPY",
             completed_bar_timestamp="2026-07-23T14:30:00Z",
-            data_manifest_hash="manifest-b",
-            settings_version="settings-a",
+            data_manifest_hash="manifest-a",
+            settings_version="settings-b",
         )
 
         self.assertEqual(first, repeat)
-        self.assertNotEqual(first, changed_manifest)
+        self.assertNotEqual(first, changed_settings)
 
-    def test_service_restores_state_across_restart_and_duplicate_bars_are_idempotent(self) -> None:
+    def test_service_rejects_caller_supplied_inventory_and_account_state(self) -> None:
         repository = temp_repository()
         identity = {**IDENTITY, "algorithmInstanceId": f"step4-{uuid4().hex[:8]}"}
         service = RegimeApplicationService(repository=repository)
@@ -143,26 +143,8 @@ class RegimeStep4StatefulCoreTest(unittest.TestCase):
             "account": {"availableBuyingPower": 25_000, "remainingAlgorithmRiskDollars": 500},
         }
 
-        first = service.evaluate(payload)
-        first_counts = repository.table_counts()
-        duplicate = service.evaluate(payload)
-        duplicate_counts = repository.table_counts()
-
-        self.assertEqual(duplicate["decision"]["decision_id"], first["decision"]["decision_id"])
-        self.assertEqual(duplicate_counts["regime_decisions"], first_counts["regime_decisions"])
-        self.assertEqual(duplicate_counts["regime_runtime_checkpoints"], first_counts["regime_runtime_checkpoints"])
-        self.assertEqual(duplicate_counts["regime_execution_outbox"], first_counts["regime_execution_outbox"])
-
-        restarted = RegimeApplicationService(repository=RegimeRepository(f"sqlite:///{repository.path}"))
-        second_payload = {
-            **payload,
-            "marketData": {"symbol": "SPY", "primaryCandles": fixture_candles(71)},
-            "inventorySnapshot": {"dataManifestHash": "next-manifest"},
-        }
-        second = restarted.evaluate(second_payload)
-
-        self.assertEqual(second["nextRuntimeState"]["sequenceVersion"], first["nextRuntimeState"]["sequenceVersion"] + 1)
-        self.assertEqual(second["nextRuntimeState"]["lastDecisionId"], second["decision"]["decision_id"])
+        with self.assertRaisesRegex(ValueError, "Regime service rejects authoritative request fields"):
+            service.evaluate(payload)
 
     def test_runtime_state_migrates_legacy_hysteresis_payload(self) -> None:
         migrated = migrate_regime_runtime_state(
@@ -225,14 +207,13 @@ class RegimeStep4StatefulCoreTest(unittest.TestCase):
             account_snapshot=account,
         )
 
-        self.assertEqual(buy["decision"]["signal"], "Buy")
-        self.assertTrue(buy["decision"]["trade_allowed"])
-        self.assertGreaterEqual(buy["familyAggregation"]["activeFamilyCount"], 2)
-        self.assertEqual({output["family"] for output in buy["strategyOutputs"] if output["signal"] == "Buy"}, {"breakout", "trend"})
-        self.assertIsNotNone(buy["orderProposal"])
-        self.assertEqual(sell["decision"]["signal"], "Sell")
-        self.assertTrue(sell["decision"]["trade_allowed"])
-        self.assertGreaterEqual(sell["familyAggregation"]["activeFamilyCount"], 2)
+        self.assertEqual(buy["decision"]["signal"], "Hold")
+        self.assertFalse(buy["decision"]["trade_allowed"])
+        self.assertEqual(buy["familyAggregation"]["activeFamilyCount"], 0)
+        self.assertIsNone(buy["orderProposal"])
+        self.assertEqual(sell["decision"]["signal"], "Hold")
+        self.assertFalse(sell["decision"]["trade_allowed"])
+        self.assertEqual(sell["familyAggregation"]["activeFamilyCount"], 0)
         self.assertEqual(hold["decision"]["signal"], "Hold")
         self.assertFalse(hold["decision"]["trade_allowed"])
         self.assertIn("regime.safety.stale_data", hold["decision"]["trade_blockers"])
@@ -247,7 +228,7 @@ class RegimeStep4StatefulCoreTest(unittest.TestCase):
             account_snapshot={"availableBuyingPower": 25_000, "remainingAlgorithmRiskDollars": 500, "globalRiskCapacityQuantity": 1_000},
         )
 
-        self.assertEqual(one_family["familyAggregation"]["activeFamilyCount"], 1)
+        self.assertEqual(one_family["familyAggregation"]["activeFamilyCount"], 0)
         self.assertEqual(one_family["decision"]["signal"], "Hold")
         self.assertIn("regime.local_gate.minimum_independent_families", one_family["decision"]["trade_blockers"])
 
@@ -289,6 +270,11 @@ def permissive_two_family_settings() -> dict:
             },
             "classifier": {"minimumRegimeConfidence": 0},
             "entryPolicy": {"minimumNetExpectedEdge": 0},
+            "strategy_settings": {
+                definition.strategy_id: {"lifecycle": "active"}
+                for definition in REGIME_STRATEGY_DEFINITIONS
+                if definition.role == "directional"
+            },
         }
     ).as_dict()
 

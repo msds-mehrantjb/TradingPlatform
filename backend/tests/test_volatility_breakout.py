@@ -114,7 +114,7 @@ def auxiliary_candles(symbol: str, count: int = 90) -> list[MarketCandle]:
 
 
 def request_for(candles: list[MarketCandle]) -> PointInTimeFeatureRequest:
-    evaluation = candles[-1].timestamp
+    evaluation = candles[-1].timestamp + timedelta(seconds=61)
     return PointInTimeFeatureRequest(
         evaluationTimestamp=evaluation,
         sessionDate=SESSION_DATE,
@@ -138,7 +138,7 @@ def snapshot_for(candles: list[MarketCandle]):
 def evaluate_volatility(snapshot):
     strategy = VolatilityBreakoutStrategy()
     context = StrategyEvaluationContext(
-        registryEntry=resolve_strategy("volatility_breakout"),
+        registryEntry=resolve_strategy("volatility_breakout").model_copy(update={"enabled": True}),
         featureSnapshot=snapshot,
         configurationHash=strategy.config.configurationHash,
     )
@@ -148,7 +148,7 @@ def evaluate_volatility(snapshot):
 def evaluate_opening_range(snapshot):
     strategy = OpeningRangeBreakoutStrategy()
     context = StrategyEvaluationContext(
-        registryEntry=resolve_strategy("opening_range_breakout"),
+        registryEntry=resolve_strategy("opening_range_breakout").model_copy(update={"enabled": True}),
         featureSnapshot=snapshot,
         configurationHash=strategy.config.configurationHash,
     )

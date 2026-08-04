@@ -114,7 +114,7 @@ def auxiliary_candles(symbol: str, count: int = 90) -> list[MarketCandle]:
 
 
 def request_for(candles: list[MarketCandle]) -> PointInTimeFeatureRequest:
-    evaluation = candles[-1].timestamp
+    evaluation = candles[-1].timestamp + timedelta(seconds=61)
     return PointInTimeFeatureRequest(
         evaluationTimestamp=evaluation,
         sessionDate=SESSION_DATE,
@@ -139,7 +139,7 @@ def evaluate(candles: list[MarketCandle], config: OpeningRangeBreakoutConfig | N
 def evaluate_snapshot(snapshot, config: OpeningRangeBreakoutConfig | None = None):
     strategy = OpeningRangeBreakoutStrategy(config)
     context = StrategyEvaluationContext(
-        registryEntry=resolve_strategy("opening_range_breakout"),
+        registryEntry=resolve_strategy("opening_range_breakout").model_copy(update={"enabled": True}),
         featureSnapshot=snapshot,
         configurationHash=strategy.config.configurationHash,
     )

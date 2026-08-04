@@ -102,7 +102,7 @@ def timeframe_history(*, end: datetime, step_minutes: int, timeframe: str, count
 
 
 def request_for(candles: list[MarketCandle], *, event: dict | None = None) -> PointInTimeFeatureRequest:
-    evaluation = candles[-1].timestamp
+    evaluation = candles[-1].timestamp + timedelta(seconds=61)
     return PointInTimeFeatureRequest(
         evaluationTimestamp=evaluation,
         sessionDate=SESSION_DATE,

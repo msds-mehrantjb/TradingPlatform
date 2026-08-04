@@ -169,9 +169,9 @@ def test_step7_supervisor_blocks_new_entry_submission_until_recovery_and_reconci
     blocked = supervisor.process_execution_outbox_once()
 
     assert blocked["processed"] is False
-    assert "regime.execution.recovery_or_reconciliation_unhealthy" in blocked["reasonCodes"]
+    assert "regime.rollout.decision_shadow.broker_submission_blocked" in blocked["reasonCodes"]
     assert broker.submit_count == 0
-    assert repository.read_execution_outbox_record(identity, "regime-intent-1")["processingStatus"] == "created"
+    assert repository.read_execution_outbox_record(identity, "regime-intent-1")["processingStatus"].startswith("retry_scheduled:")
 
 
 def test_step7_pause_keeps_existing_position_protected_and_end_of_day_flatten_available() -> None:

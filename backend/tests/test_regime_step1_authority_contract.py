@@ -34,7 +34,7 @@ class RegimeStep1AuthorityContractTest(unittest.TestCase):
         self.assertNotIn("return regime_service.evaluate(payload)", api_source)
         self.assertNotIn("run_regime_backtest(payload)", api_source)
 
-    def test_regime_api_enqueues_decision_and_backtest_jobs(self) -> None:
+    def test_regime_api_rejects_inline_decisions_and_enqueues_backtest_jobs(self) -> None:
         client = TestClient(app)
         decision_response = client.post(
             "/api/regime/evaluate",
@@ -42,15 +42,8 @@ class RegimeStep1AuthorityContractTest(unittest.TestCase):
                 "marketData": {"symbol": "SPY", "primaryCandles": _candles(30)},
             },
         )
-        self.assertEqual(decision_response.status_code, 202, decision_response.text)
-        decision_receipt = decision_response.json()
-        self.assertEqual(decision_receipt["algorithmId"], "regime")
-        self.assertEqual(decision_receipt["jobKind"], "decision_evaluation")
-        self.assertIn(decision_receipt["status"], {"queued", "running", "completed"})
-        decision_job = _wait_for_job(client, decision_receipt["jobId"])
-        self.assertEqual(decision_job["status"], "completed")
-        self.assertEqual(decision_job["result"]["algorithmId"], "regime")
-        self.assertEqual(decision_job["result"]["runtime"], "backend.app.algorithms.regime.execution_pipeline")
+        self.assertEqual(decision_response.status_code, 400, decision_response.text)
+        self.assertIn("regime.api.evaluate_direct_market_data_rejected", decision_response.text)
 
         backtest_response = client.post("/api/regime/backtests/run", json={"symbol": "SPY", "candles": _candles(30)})
         self.assertEqual(backtest_response.status_code, 202, backtest_response.text)

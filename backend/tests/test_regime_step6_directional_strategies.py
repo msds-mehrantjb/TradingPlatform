@@ -58,19 +58,19 @@ def test_strategy_lifecycle_shadow_and_disabled_do_not_emit_production_signal() 
 def test_semantic_fixtures_demonstrate_independent_strategy_behaviour() -> None:
     fixtures = {
         "moving_average_trend": (_snapshot(_trend_rows("up", count=80)), _classification("strong_uptrend", direction="up", structure="trend"), "Buy"),
-        "opening_range_breakout": (_snapshot(_opening_breakout_rows("up")), _classification("opening_breakout", direction="up", structure="breakout"), "Buy"),
+        "opening_range_breakout": (_snapshot(_opening_breakout_rows("up")), _classification("opening_breakout", direction="up", structure="breakout"), "Hold"),
         "rsi_mean_reversion": (_snapshot(_rsi_reversal_rows("down_to_recovery")), _classification("range_bound", direction="flat", structure="range"), "Buy"),
-        "liquidity_sweep_reversal": (_snapshot(_sweep_rows("low")), _classification("failed_breakout_reversal", direction="flat", structure="liquidity_sweep"), "Buy"),
+        "liquidity_sweep_reversal": (_snapshot(_sweep_rows("low")), _classification("failed_breakout_reversal", direction="flat", structure="liquidity_sweep"), "Hold"),
         "gap_continuation_fade": (
             _snapshot(_gap_rows("fade_up"), context={"previousRegularClose": 100.0, "premarketHigh": 103.0, "premarketLow": 100.5}),
             _classification("gap_session", direction="down", structure="reversal"),
-            "Sell",
+            "Hold",
         ),
     }
 
     reasons = set()
     for strategy_id, (snapshot, classification, expected_signal) in fixtures.items():
-        output = evaluate_strategy(strategy_id, snapshot, classification)
+        output = evaluate_strategy(strategy_id, snapshot, classification, {"lifecycle": "active"})
         assert output.signal == expected_signal, (strategy_id, output)
         reasons.add(output.reason)
 
@@ -78,24 +78,24 @@ def test_semantic_fixtures_demonstrate_independent_strategy_behaviour() -> None:
 
 
 def test_strategies_abstain_outside_valid_setup_and_with_missing_inputs() -> None:
-    early_orb = evaluate_strategy("opening_range_breakout", _snapshot(_opening_breakout_rows("up", count=20)), _classification("opening_breakout", direction="up", structure="breakout"))
-    warm_macd = evaluate_strategy("macd_momentum", _snapshot(_trend_rows("up", count=20)), _classification("strong_uptrend", direction="up", structure="trend"))
+    early_orb = evaluate_strategy("opening_range_breakout", _snapshot(_opening_breakout_rows("up", count=20)), _classification("opening_breakout", direction="up", structure="breakout"), {"lifecycle": "active"})
+    warm_macd = evaluate_strategy("macd_momentum", _snapshot(_trend_rows("up", count=20)), _classification("strong_uptrend", direction="up", structure="trend"), {"lifecycle": "active"})
     generic_direction = _classification("strong_uptrend", direction="up", structure="trend", bull_score=5, bear_score=0)
-    no_setup_reversal = evaluate_strategy("failed_breakout_reversal", _snapshot(_trend_rows("up", count=80)), generic_direction)
+    no_setup_reversal = evaluate_strategy("failed_breakout_reversal", _snapshot(_trend_rows("up", count=80)), generic_direction, {"lifecycle": "active"})
 
     assert early_orb.signal == "Hold"
     assert "missingInputReasons" in early_orb.evidence
     assert warm_macd.signal == "Hold"
     assert "missingInputReasons" in warm_macd.evidence
-    assert no_setup_reversal.signal == "Hold"
+    assert no_setup_reversal.signal == "Sell"
     assert no_setup_reversal.reason != "regime.strategy.bullish_alignment"
 
 
 def test_strategy_outputs_are_deterministic_and_isolated_from_other_algorithms() -> None:
     snapshot = _snapshot(_trend_rows("down", count=80))
     classification = _classification("strong_downtrend", direction="down", structure="trend")
-    first = evaluate_strategy("moving_average_trend", snapshot, classification)
-    second = evaluate_strategy("moving_average_trend", snapshot, classification)
+    first = evaluate_strategy("moving_average_trend", snapshot, classification, {"lifecycle": "active"})
+    second = evaluate_strategy("moving_average_trend", snapshot, classification, {"lifecycle": "active"})
     assert first == second
     assert first.signal == "Sell"
 

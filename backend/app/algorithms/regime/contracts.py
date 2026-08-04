@@ -6,6 +6,7 @@ source of truth for Regime classification, decisions, orders, and backtests.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, fields, field
 from enum import Enum
 from typing import Any, Literal
@@ -16,6 +17,14 @@ REGIME_ALGORITHM_VERSION = "regime_algorithm_v3_backend_authoritative"
 REGIME_SETTINGS_VERSION = "regime_base_settings_v2"
 REGIME_STRATEGY_CATALOG_VERSION = "regime_strategy_catalog_v3_backend"
 REGIME_PROFILE_VERSION = "regime_profile_matrix_v3_backend"
+REGIME_DEFAULT_SHADOW_ALGORITHM_INSTANCE_ID = "regime-default"
+REGIME_DEFAULT_SHADOW_ACCOUNT_ID = "default"
+REGIME_DEFAULT_PAPER_ALGORITHM_INSTANCE_ID = "regime-paper-default"
+REGIME_UNCONFIGURED_PAPER_ACCOUNT_ID = "regime-paper-account-unconfigured"
+REGIME_PAPER_ALGORITHM_INSTANCE_ID_ENV = "REGIME_PAPER_ALGORITHM_INSTANCE_ID"
+REGIME_ALPACA_PAPER_ACCOUNT_ID_ENV = "REGIME_ALPACA_PAPER_ACCOUNT_ID"
+REGIME_PAPER_ACCOUNT_ID_ENV = "REGIME_PAPER_ACCOUNT_ID"
+GENERIC_ALPACA_PAPER_ACCOUNT_ID_ENV = "ALPACA_PAPER_ACCOUNT_ID"
 
 
 class RegimeRuntimeMode(str, Enum):
@@ -29,6 +38,8 @@ REGIME_ALLOWED_RUNTIME_MODE_VALUES: tuple[str, ...] = tuple(mode.value for mode 
 
 
 def normalize_regime_runtime_mode(value: Any | None, *, default: RegimeRuntimeMode = RegimeRuntimeMode.SHADOW) -> RegimeRuntimeMode:
+    if isinstance(value, RegimeRuntimeMode):
+        return value
     raw = str(value if value not in {None, ""} else default.value).strip().lower()
     if raw == "live":
         raise ValueError("Regime live runtime mode is disabled and must fail closed")
@@ -37,6 +48,37 @@ def normalize_regime_runtime_mode(value: Any | None, *, default: RegimeRuntimeMo
     except ValueError as exc:
         allowed = ", ".join(REGIME_ALLOWED_RUNTIME_MODE_VALUES)
         raise ValueError(f"Unsupported Regime runtime mode '{raw}'. Allowed modes: {allowed}") from exc
+
+
+def default_regime_algorithm_instance_id(runtime_mode: str | RegimeRuntimeMode | None = None) -> str:
+    mode = normalize_regime_runtime_mode(runtime_mode).value if runtime_mode not in {None, ""} else RegimeRuntimeMode.SHADOW.value
+    if mode == RegimeRuntimeMode.PAPER.value:
+        return _clean_env(REGIME_PAPER_ALGORITHM_INSTANCE_ID_ENV) or REGIME_DEFAULT_PAPER_ALGORITHM_INSTANCE_ID
+    return REGIME_DEFAULT_SHADOW_ALGORITHM_INSTANCE_ID
+
+
+def configured_regime_paper_account_id() -> str:
+    return (
+        _clean_env(REGIME_ALPACA_PAPER_ACCOUNT_ID_ENV)
+        or _clean_env(REGIME_PAPER_ACCOUNT_ID_ENV)
+        or _clean_env(GENERIC_ALPACA_PAPER_ACCOUNT_ID_ENV)
+        or REGIME_UNCONFIGURED_PAPER_ACCOUNT_ID
+    )
+
+
+def default_regime_account_id(runtime_mode: str | RegimeRuntimeMode | None = None) -> str:
+    mode = normalize_regime_runtime_mode(runtime_mode).value if runtime_mode not in {None, ""} else RegimeRuntimeMode.SHADOW.value
+    if mode == RegimeRuntimeMode.PAPER.value:
+        return configured_regime_paper_account_id()
+    return REGIME_DEFAULT_SHADOW_ACCOUNT_ID
+
+
+def _clean_env(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 RegimeSignal = Literal["Buy", "Sell", "Hold"]
 StrategyRole = Literal["directional", "confirmation", "regime_context", "safety_gate"]

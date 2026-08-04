@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from backend.app.algorithms.regime.configuration import validate_regime_trading_settings_snapshot
+from backend.app.algorithms.regime.configuration import regime_settings_identity_from_payload, validate_regime_trading_settings_snapshot
 from backend.app.algorithms.regime.contracts import RegimeRuntimeMode, normalize_regime_runtime_mode
 from backend.app.algorithms.regime.market_snapshot import build_regime_market_snapshot
 from backend.app.algorithms.regime.stateful_core import process_regime_bar
@@ -33,14 +33,10 @@ def execute_regime_pipeline(payload: dict[str, Any]) -> dict[str, Any]:
     runtime_mode = normalize_regime_runtime_mode(payload.get("runtimeMode") or payload.get("runtime_mode"), default=RegimeRuntimeMode.SHADOW).value
     settings_snapshot = payload.get("__regime_settings_snapshot") if isinstance(payload.get("__regime_settings_snapshot"), dict) else None
     if settings_snapshot is None:
+        identity = regime_settings_identity_from_payload({**payload, "symbol": snapshot.symbol, "runtimeMode": runtime_mode})
         settings_snapshot = validate_regime_trading_settings_snapshot(
             {
-                "identity": {
-                    "algorithmInstanceId": payload.get("algorithmInstanceId") or "regime-default",
-                    "accountId": payload.get("accountId") or "default",
-                    "runtimeMode": runtime_mode,
-                    "symbol": snapshot.symbol,
-                }
+                "identity": identity,
             }
         ).as_dict()
     stateful = process_regime_bar(

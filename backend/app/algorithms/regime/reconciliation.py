@@ -114,14 +114,18 @@ def run_regime_broker_reconciliation(
         outbox = context["latestOutbox"].get(order_intent_id, {})
         fill_payload = _fill_payload(identity, normalized, outbox, order_intent_id, observed_at)
         copied = repository.copy_broker_observation(fill_payload)
-        if copied.get("table") == "regime_fills" or not _fill_already_in_inventory(context, fill_payload):
+        update: dict[str, Any] = {}
+        if bool(copied.get("copied")) or not _fill_already_in_inventory(context, fill_payload):
             try:
                 update = RegimePositionManager(repository).apply_fill_observation(identity, fill_payload, settings_snapshot=dict(_order_intent_from_outbox(outbox).get("settingsSnapshot") or {}))
                 deterministic_recoveries.append({"orderIntentId": order_intent_id, "recoveryAction": "broker_fill_applied", "updated": bool(update.get("updated"))})
             except ValueError as exc:
                 discrepancies.append(f"regime.reconciliation.fill_recovery_rejected:{order_intent_id}:{exc}")
                 manual_review_required = True
-        terminal_status = "filled" if int(fill_payload.get("filledQuantity") or 0) >= int(_order_intent_from_outbox(outbox).get("quantity") or fill_payload.get("filledQuantity") or 0) else "partially_filled"
+        broker_fill_status = str(fill_payload.get("status") or "").lower()
+        cumulative_filled_quantity = _cumulative_filled_quantity_after_recovery(update, fill_payload)
+        requested_quantity = int(_order_intent_from_outbox(outbox).get("quantity") or fill_payload.get("submittedQuantity") or fill_payload.get("filledQuantity") or 0)
+        terminal_status = "filled" if broker_fill_status == "filled" or cumulative_filled_quantity >= requested_quantity else "partially_filled"
         repository.update_execution_outbox_status(
             identity,
             order_intent_id,
@@ -135,6 +139,7 @@ def run_regime_broker_reconciliation(
             },
         )
 
+    context = _reconciliation_context(repository, identity)
     position_discrepancies = _position_discrepancies(context, broker_positions)
     discrepancies.extend(position_discrepancies)
     if position_discrepancies:
@@ -391,6 +396,21 @@ def _fill_already_in_inventory(context: dict[str, Any], fill_payload: dict[str, 
     if not fill_id:
         return False
     return any(fill_id in str(event.get("fillId") or event.get("inventoryEventId") or "") for event in context["inventoryEvents"])
+
+
+def _cumulative_filled_quantity_after_recovery(update: dict[str, Any], fill_payload: dict[str, Any]) -> int:
+    position = update.get("position") if isinstance(update.get("position"), dict) else {}
+    for key in ("filledQuantity", "quantity"):
+        try:
+            quantity = int(position.get(key) or 0)
+        except (TypeError, ValueError):
+            quantity = 0
+        if quantity > 0:
+            return quantity
+    try:
+        return int(fill_payload.get("filledQuantity") or fill_payload.get("filled_quantity") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _order_intent_from_outbox(outbox: dict[str, Any]) -> dict[str, Any]:

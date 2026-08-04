@@ -160,8 +160,25 @@ def test_phase21_rollout_api_rejects_frontend_supplied_promotion_evidence() -> N
     assert "regime.api.rollout_inline_evidence_rejected" in response.json()["detail"]["reasonCodes"]
 
 
-def test_phase21_global_paper_off_keeps_manual_paper_unaffected_and_regime_in_shadow() -> None:
-    repository, _identity = _repository(runtime_mode="paper", instance_id="regime-default", account_id="default")
+def test_phase21_global_paper_off_keeps_manual_paper_unaffected_and_runtime_identity_intact() -> None:
+    repository, identity = _repository(runtime_mode="paper", instance_id="regime-default", account_id="default")
+    _record_stage_evidence(repository, identity, requirements=LIMITED_PAPER_PROMOTION_EVIDENCE)
+    activate_operational_rollout_stage(
+        _Store(repository, identity),
+        "simulated_execution",
+        actor="rollout-worker",
+        reason="prepare limited paper stage",
+        evidence=repository.read_regime_rollout_promotion_evidence(identity),
+        activated_at=NOW,
+    )
+    activate_operational_rollout_stage(
+        _Store(repository, identity),
+        "limited_paper",
+        actor="rollout-worker",
+        reason="prepare limited paper stage",
+        evidence=repository.read_regime_rollout_promotion_evidence(identity),
+        activated_at=NOW + timedelta(seconds=5),
+    )
     supervisor = RegimeRuntimeSupervisor(
         service=RegimeApplicationService(repository),
         config=RegimeRuntimeSupervisorConfig(default_runtime_mode="paper", maintenance_interval_seconds=60, heartbeat_interval_seconds=60),
@@ -177,8 +194,12 @@ def test_phase21_global_paper_off_keeps_manual_paper_unaffected_and_regime_in_sh
     control = result["automaticPaperControl"]
 
     assert result["immediate"] is True
-    assert control["rolloutStage"] == "decision_shadow"
+    assert control["rolloutStage"] == "limited_paper"
     assert control["automaticPaperTradingEnabled"] is False
+    assert control["paperButtonRequested"] is False
+    assert control["paperButtonEffective"] is False
+    assert control["keepsRuntimeIdentityUnchanged"] is True
+    assert "regime.runtime.automatic_paper_control_off" in supervisor.metrics.entry_block_reason_codes
     assert control["manualPaperTradingUnaffected"] is True
     assert control["manualPaperTradingWhenMarketOpen"] is True
     assert control["liveTradingEnabled"] is False
@@ -225,9 +246,12 @@ def test_phase21_global_paper_on_advances_to_limited_paper_when_backend_evidence
     )
     control = result["automaticPaperControl"]
 
-    assert control["automaticPaperTradingEnabled"] is True
+    assert control["requestedAutomaticPaperTradingEnabled"] is True
+    assert control["paperRequestedOn"] is True
+    assert control["paperEffectiveOn"] is False
     assert control["rolloutStage"] == "limited_paper"
     assert [activation["stage"] for activation in control["activations"] if activation.get("activated")] == ["simulated_execution", "limited_paper"]
+    assert control["paperEffectiveBlockers"]
     assert control["paperOnly"] is True
     assert control["liveTradingEnabled"] is False
 

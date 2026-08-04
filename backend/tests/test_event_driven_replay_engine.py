@@ -16,8 +16,8 @@ from backend.app.domain.models import (
 )
 from backend.app.ensemble import FamilyAwareDeterministicEnsemble, FamilyAwareEnsembleConfig
 from backend.app.algorithms.meta_strategy.inference.safe_inference import SafeMLInferenceConfig
-from backend.app.strategies.base import StrategyEvaluationContext, hold_signal, strategy_signal
-from backend.app.strategies.registry import directional_strategy_input_ids, resolve_strategy
+from backend.app.algorithms.voting_ensemble.strategies.base import StrategyEvaluationContext, hold_signal, strategy_signal
+from backend.app.algorithms.voting_ensemble.strategies.registry import directional_strategy_input_ids, resolve_strategy
 
 
 SESSION_DATE = date(2026, 1, 5)
@@ -195,7 +195,10 @@ class FakeDirectionalStrategy:
         self.registryEntry = resolve_strategy(strategy_id)
 
     def evaluate(self, context: StrategyEvaluationContext):
-        if self.registryEntry.family in {StrategyFamily.TREND.value, StrategyFamily.BREAKOUT.value}:
+        if self.registryEntry.family in {
+            StrategyFamily.TREND.value,
+            StrategyFamily.MEAN_REVERSION.value,
+        }:
             return strategy_signal(
                 context,
                 signal=Signal.BUY,
@@ -303,7 +306,7 @@ def candles_for_session(count: int) -> list[MarketCandle]:
                 timestamp=timestamp,
                 open=open_price,
                 high=close_price + 0.15,
-                low=open_price - 0.05,
+                low=open_price - 0.25,
                 close=close_price,
                 volume=1000 + index,
                 tradeCount=100 + index,

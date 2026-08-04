@@ -24,7 +24,7 @@ class DirectionalStrategyContractTest(unittest.TestCase):
     def setUp(self) -> None:
         snapshot = PointInTimeFeatureEngine().compute(request_with())
         self.context = StrategyEvaluationContext(
-            registryEntry=resolve_strategy("vwap_trend_continuation"),
+            registryEntry=resolve_strategy("vwap_trend_continuation").model_copy(update={"enabled": True}),
             featureSnapshot=snapshot,
             configurationHash="contract-test",
         )

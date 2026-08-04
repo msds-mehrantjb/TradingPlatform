@@ -132,7 +132,7 @@ def request_for(
     market_direction: str = "up",
     event_state: dict[str, Any] | None = None,
 ) -> PointInTimeFeatureRequest:
-    evaluation = candles[-1].timestamp
+    evaluation = candles[-1].timestamp + timedelta(seconds=61)
     return PointInTimeFeatureRequest(
         evaluationTimestamp=evaluation,
         sessionDate=session_date,
@@ -146,7 +146,7 @@ def request_for(
         priorDayOHLC=PriorDayOHLC(sessionDate=session_date - timedelta(days=3), open=99, high=101, low=98, close=prior_close),
         premarket=PremarketLevels(high=100.80, low=99.40, sourceTimestamp=open_utc - timedelta(minutes=1)),
         quote=BidAskQuote(bid=candles[-1].close - 0.01, ask=candles[-1].close + 0.01, timestamp=evaluation),
-        economicEventState=event_state or {"impact": "low", "riskScore": 0.1},
+        economicEventState=event_state or {"active": False, "importance": "low"},
         breadthComponents={"XLK": auxiliary_candles("XLK", open_utc, direction=market_direction)},
     )
 
@@ -181,13 +181,14 @@ def configured_snapshot(
     snapshot = with_feature(snapshot, "spy1mAtr14", 0.55)
     snapshot = with_feature(snapshot, "spy1mAdx14", 18.0)
     snapshot = with_feature(snapshot, "spy1mRelativeVolume", 1.15)
+    snapshot = with_feature(snapshot, "economicEventState", event_state or {"active": False, "importance": "low"})
     return snapshot
 
 
 def evaluate_snapshot(snapshot):
     strategy = GapContinuationFadeStrategy()
     context = StrategyEvaluationContext(
-        registryEntry=resolve_strategy("gap_continuation_gap_fade"),
+        registryEntry=resolve_strategy("gap_continuation_gap_fade").model_copy(update={"enabled": True}),
         featureSnapshot=snapshot,
         configurationHash=strategy.config.configurationHash,
     )

@@ -114,7 +114,7 @@ def auxiliary_candles(symbol: str, count: int = 90) -> list[MarketCandle]:
 
 
 def request_for(candles: list[MarketCandle], *, include_reference_levels: bool = True) -> PointInTimeFeatureRequest:
-    evaluation = candles[-1].timestamp
+    evaluation = candles[-1].timestamp + timedelta(seconds=61)
     return PointInTimeFeatureRequest(
         evaluationTimestamp=evaluation,
         sessionDate=SESSION_DATE,

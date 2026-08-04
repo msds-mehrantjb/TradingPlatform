@@ -47,7 +47,7 @@ def test_long_position_survives_restart_and_exits_idempotently_at_stop() -> None
 def test_short_position_target_and_stop_are_supported_while_short_entries_disabled_by_default() -> None:
     repository, identity, _ = _repository()
     manager = RegimePositionManager(repository)
-    short = manager.apply_fill_observation(identity, _fill(side="Sell", stop=101.0, target=96.0))["position"]
+    short = manager.apply_fill_observation(identity, _fill(side="Sell", stop=101.0, target=96.0, position_effect="enter_short"))["position"]
 
     target = manager.evaluate_position(
         identity,
@@ -160,7 +160,8 @@ def test_cross_algorithm_inventory_cannot_mutate_regime_trade_state() -> None:
         manager.apply_fill_observation(identity, {**_fill(), "algorithmId": "weighted_voting"})
 
     result = manager.reconcile_broker_observations(identity, [{"algorithmId": "weighted_voting", "positionId": "wv-pos", "quantity": 999}])
-    assert result["reconciled"] is True
+    assert result["reconciled"] is False
+    assert result["blockNewEntries"] is True
     assert repository.table_counts()["regime_positions"] == 0
     assert repository.table_counts()["regime_trades"] == 0
 
@@ -197,8 +198,9 @@ def _fill(
     stop: float = 99.0,
     target: float = 103.0,
     order_intent_id: str = "regime-intent-1",
+    position_effect: str | None = None,
 ) -> dict:
-    return {
+    payload = {
         "algorithmId": "regime",
         "decisionId": f"decision-{order_intent_id}",
         "orderIntentId": order_intent_id,
@@ -214,6 +216,9 @@ def _fill(
         "filledAt": "2026-07-23T14:30:00Z",
         "settingsVersion": "settings-v1",
     }
+    if position_effect is not None:
+        payload["positionEffect"] = position_effect
+    return payload
 
 
 def _candle(

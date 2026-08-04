@@ -13,6 +13,7 @@ from backend.app.domain.feature_engine import (
 from backend.app.domain.models import Direction, Signal
 from backend.app.strategies.base import StrategyEvaluationContext
 from backend.app.strategies.context.relative_strength_qqq_iwm import (
+    RelativeStrengthQqqIwmConfig,
     RelativeStrengthQqqIwmContext,
 )
 from backend.app.strategies.registry import StrategyCollection, resolve_strategy
@@ -75,7 +76,7 @@ def request_for(
     iwm: list[MarketCandle],
     max_auxiliary_age_seconds: int = 300,
 ) -> PointInTimeFeatureRequest:
-    evaluation = spy[-1].timestamp
+    evaluation = spy[-1].timestamp + timedelta(seconds=61)
     return PointInTimeFeatureRequest(
         evaluationTimestamp=evaluation,
         sessionDate=SESSION_DATE,
@@ -94,7 +95,7 @@ def request_for(
 
 
 def evaluate_snapshot(snapshot):
-    context_module = RelativeStrengthQqqIwmContext()
+    context_module = RelativeStrengthQqqIwmContext(RelativeStrengthQqqIwmConfig(maxAlignmentLagSeconds=120))
     context = StrategyEvaluationContext(
         registryEntry=resolve_strategy("relative_strength_qqq_iwm"),
         featureSnapshot=snapshot,

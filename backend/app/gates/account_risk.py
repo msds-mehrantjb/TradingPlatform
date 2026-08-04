@@ -16,6 +16,7 @@ AlgorithmId = Literal[
     "weighted_voting",
     "confidence_aggregation",
     "wca",
+    "regime",
     "regime_selector",
     "meta_strategy",
 ]

@@ -1312,6 +1312,145 @@ class RegimeSqliteRepository:
                 latest_by_intent[str(row["order_intent_id"])] = payload
         return [payload for payload in latest_by_intent.values() if payload.get("processingStatus") in set(statuses)]
 
+    def active_execution_outbox_identities(self, fallback_identity: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        terminal_statuses = {"filled", "cancelled", "canceled", "rejected", "expired", "dead_letter"}
+        identities: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        if fallback_identity:
+            fallback = regime_settings_identity_from_payload(fallback_identity)
+            if fallback["runtimeMode"] == "paper" and fallback["algorithmInstanceId"] != "regime-default":
+                identities[(fallback["algorithmInstanceId"], fallback["accountId"], fallback["runtimeMode"], fallback["symbol"])] = fallback
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT algorithm_instance_id, account_id, runtime_mode, symbol, processing_status, order_intent_id
+                FROM regime_execution_outbox
+                WHERE algorithm_id = 'regime'
+                  AND order_intent_id IS NOT NULL
+                  AND order_intent_id <> ''
+                ORDER BY rowid
+                """
+            ).fetchall()
+        latest: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            latest[str(row["order_intent_id"])] = row
+        for row in latest.values():
+            status = str(row["processing_status"] or "")
+            if status in terminal_statuses:
+                continue
+            runtime_mode = str(row["runtime_mode"] or "")
+            instance_id = str(row["algorithm_instance_id"] or "")
+            account_id = str(row["account_id"] or "")
+            symbol = str(row["symbol"] or "SPY").upper()
+            if runtime_mode != "paper" or instance_id == "regime-default":
+                continue
+            key = (instance_id, account_id, runtime_mode, symbol)
+            identities[key] = {
+                "algorithmId": REGIME_ALGORITHM_ID,
+                "algorithmInstanceId": instance_id,
+                "accountId": account_id,
+                "runtimeMode": runtime_mode,
+                "symbol": symbol,
+            }
+        return list(identities.values())
+
+    def claim_next_execution_outbox_record(
+        self,
+        identity: dict[str, Any],
+        *,
+        owner_id: str,
+        lease_seconds: int,
+        now: str | None = None,
+        statuses: tuple[str, ...] = ("created", "risk_approved", "queued", "retry_scheduled", "pending", "risk_reserved"),
+    ) -> dict[str, Any] | None:
+        common = _common_metadata({}, identity, identity)
+        _validate_common_metadata(common)
+        claimed_at = now or _utc_now()
+        try:
+            claimed_dt = datetime.fromisoformat(str(claimed_at).replace("Z", "+00:00"))
+        except ValueError:
+            claimed_dt = datetime.now(timezone.utc)
+        if claimed_dt.tzinfo is None:
+            claimed_dt = claimed_dt.replace(tzinfo=timezone.utc)
+        lease_expires_at = (claimed_dt.astimezone(timezone.utc) + timedelta(seconds=max(1, int(lease_seconds)))).isoformat().replace("+00:00", "Z")
+        status_placeholders = ",".join("?" for _ in statuses)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                f"""
+                SELECT latest.order_intent_id, latest.processing_status, latest.payload_json, latest.created_at
+                FROM regime_execution_outbox latest
+                WHERE latest.algorithm_id = 'regime'
+                  AND latest.algorithm_instance_id = ?
+                  AND latest.account_id = ?
+                  AND latest.runtime_mode = ?
+                  AND latest.symbol = ?
+                  AND latest.order_intent_id IS NOT NULL
+                  AND latest.order_intent_id <> ''
+                  AND latest.rowid IN (
+                      SELECT MAX(rowid)
+                      FROM regime_execution_outbox
+                      WHERE algorithm_id = 'regime'
+                        AND algorithm_instance_id = ?
+                        AND account_id = ?
+                        AND runtime_mode = ?
+                        AND symbol = ?
+                      GROUP BY order_intent_id
+                  )
+                  AND (
+                      latest.processing_status IN ({status_placeholders})
+                      OR latest.processing_status LIKE 'retry_scheduled:%'
+                      OR latest.processing_status LIKE 'blocked:%'
+                  )
+                ORDER BY latest.created_at, latest.rowid
+                LIMIT 1
+                """,
+                (
+                    common["algorithm_instance_id"],
+                    common["account_id"],
+                    common["runtime_mode"],
+                    common["symbol"],
+                    common["algorithm_instance_id"],
+                    common["account_id"],
+                    common["runtime_mode"],
+                    common["symbol"],
+                    *statuses,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            payload = json.loads(str(row["payload_json"]))
+            if not isinstance(payload, dict):
+                return None
+            order_intent_id = str(row["order_intent_id"])
+            previous_status = str(row["processing_status"])
+            lease_id = _stable_snapshot_key(f"{owner_id}:{order_intent_id}:{claimed_at}")
+            claimed_status = f"processing:{lease_id}"
+            claimed = {
+                **payload,
+                "algorithmId": REGIME_ALGORITHM_ID,
+                "algorithmInstanceId": common["algorithm_instance_id"],
+                "accountId": common["account_id"],
+                "runtimeMode": common["runtime_mode"],
+                "symbol": common["symbol"],
+                "orderIntentId": order_intent_id,
+                "processingStatus": claimed_status,
+                "previousProcessingStatus": previous_status,
+                "claimedBy": owner_id,
+                "claimedAt": claimed_at,
+                "leaseId": lease_id,
+                "leaseExpiresAt": lease_expires_at,
+                "reasonCodes": list(dict.fromkeys([*(_list(payload.get("reasonCodes"))), "regime.execution.outbox_claimed"])),
+            }
+            self._insert(
+                conn,
+                "regime_execution_outbox",
+                {**common, "order_intent_id": order_intent_id},
+                f"execution-outbox-{order_intent_id}-{claimed_status}",
+                claimed,
+                processing_status=claimed_status,
+            )
+        return claimed
+
     def read_execution_outbox_record(self, identity: dict[str, Any], order_intent_id: str) -> dict[str, Any] | None:
         common = _common_metadata({}, {**identity, "orderIntentId": order_intent_id}, {**identity, "orderIntentId": order_intent_id})
         _validate_common_metadata(common)
@@ -1443,7 +1582,38 @@ class RegimeSqliteRepository:
             ).fetchone()
             if duplicate_status and not payload.get("allowDuplicateStatusUpdate"):
                 return {"updated": False, "orderIntentId": order_intent_id, "status": status, "reason": "duplicate_execution_outbox_status"}
-            self._insert(conn, "regime_execution_outbox", common, f"execution-outbox-{order_intent_id}-{status}-{_stable_snapshot_key(_utc_now())}", merged, processing_status=status)
+            if duplicate_status and payload.get("allowDuplicateStatusUpdate"):
+                return {"updated": True, "orderIntentId": order_intent_id, "status": status, "duplicateStatusUpdate": True}
+            try:
+                self._insert(conn, "regime_execution_outbox", common, f"execution-outbox-{order_intent_id}-{status}-{_stable_snapshot_key(_utc_now())}", merged, processing_status=status)
+            except sqlite3.IntegrityError:
+                duplicate_status = conn.execute(
+                    """
+                    SELECT record_id
+                    FROM regime_execution_outbox
+                    WHERE algorithm_id = 'regime'
+                      AND algorithm_instance_id = ?
+                      AND account_id = ?
+                      AND runtime_mode = ?
+                      AND symbol = ?
+                      AND order_intent_id = ?
+                      AND processing_status = ?
+                    LIMIT 1
+                    """,
+                    (
+                        common["algorithm_instance_id"],
+                        common["account_id"],
+                        common["runtime_mode"],
+                        common["symbol"],
+                        order_intent_id,
+                        status,
+                    ),
+                ).fetchone()
+                if duplicate_status and payload.get("allowDuplicateStatusUpdate"):
+                    return {"updated": True, "orderIntentId": order_intent_id, "status": status, "duplicateStatusUpdate": True}
+                if duplicate_status:
+                    return {"updated": False, "orderIntentId": order_intent_id, "status": status, "reason": "duplicate_execution_outbox_status"}
+                raise
         return {"updated": True, "orderIntentId": order_intent_id, "status": status}
 
     def _insert_execution_outbox_in_transaction(self, conn: sqlite3.Connection, common: dict[str, str | None], payload: dict[str, Any]) -> str:
@@ -1467,6 +1637,14 @@ class RegimeSqliteRepository:
             "orderIntentId": order_intent_id,
             "processingStatus": str(payload.get("processingStatus") or payload.get("processing_status") or "created"),
             "orderIntent": _record(payload.get("orderIntent")) or payload,
+            "runtimeMode": payload.get("runtimeMode") or payload.get("runtime_mode") or common.get("runtime_mode"),
+            "algorithmInstanceId": payload.get("algorithmInstanceId") or payload.get("algorithm_instance_id") or common.get("algorithm_instance_id"),
+            "accountId": payload.get("accountId") or payload.get("account_id") or common.get("account_id"),
+            "symbol": payload.get("symbol") or common.get("symbol"),
+            "quantity": payload.get("quantity"),
+            "positionEffect": payload.get("positionEffect") or payload.get("position_effect"),
+            "completedBarFinalized": payload.get("completedBarFinalized"),
+            "marketDataValidation": _record(payload.get("marketDataValidation") or payload.get("market_data_validation")),
             "stateMachine": {
                 "version": "regime_execution_outbox_state_machine_v2",
                 "allowedStates": [
@@ -1577,15 +1755,17 @@ class RegimeSqliteRepository:
         return json.loads(str(row["payload_json"])) if row else None
 
     def copy_broker_observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        _require_full_ownership_identity(observation)
         common = _common_metadata({}, observation, observation)
         _validate_common_metadata(common)
+        target_table = _regime_ledger_table_for_observation(observation)
         with self.connect() as conn:
             inserted = self._copy_broker_observation_in_transaction(conn, observation, common)
         if inserted == "regime_orders":
             self.record_inventory_order_status(observation)
         elif inserted == "regime_reconciliation_events":
             self.record_reconciliation_run(observation, status=str(observation.get("processingStatus") or "observed"))
-        return {"copied": bool(inserted), "table": inserted}
+        return {"copied": bool(inserted), "table": inserted or target_table, "duplicate": target_table is not None and not inserted}
 
     def current_inventory_snapshot(self, identity: dict[str, Any]) -> dict[str, Any]:
         _require_full_ownership_identity(identity)
@@ -1605,6 +1785,7 @@ class RegimeSqliteRepository:
         if str(fill.get("algorithmId") or fill.get("algorithm_id") or "") != REGIME_ALGORITHM_ID:
             raise ValueError("Regime inventory rejects cross-algorithm fill observations")
         _require_full_ownership_identity(identity)
+        _require_matching_ownership_identity(identity, fill)
         common = _common_metadata({}, {**identity, **fill}, {**identity, **fill})
         _validate_common_metadata(common)
         event = _inventory_event_from_fill(identity, fill, settings_snapshot=settings_snapshot)
@@ -1620,11 +1801,23 @@ class RegimeSqliteRepository:
                     "snapshot": snapshot,
                 }
             previous = self._latest_inventory_snapshot(conn, identity, common)
+            fill_signed_quantity = _int(event.get("signedQuantity"))
+            previous_quantity = _int(previous.get("quantity"))
+            if (
+                previous_quantity != 0
+                and fill_signed_quantity != 0
+                and ((previous_quantity > 0 and fill_signed_quantity < 0) or (previous_quantity < 0 and fill_signed_quantity > 0))
+                and abs(fill_signed_quantity) > abs(previous_quantity)
+            ):
+                raise ValueError("Regime inventory exit quantity exceeds owned position quantity")
             next_snapshot = _apply_fill_to_inventory_snapshot(previous, event)
             self._insert_inventory_event_and_snapshot(conn, common, event, next_snapshot, processing_status="fill_applied")
         return {"updated": True, "inventoryEventId": event["inventoryEventId"], "snapshot": next_snapshot}
 
     def record_inventory_order_status(self, observation: dict[str, Any]) -> dict[str, Any]:
+        if str(observation.get("algorithmId") or observation.get("algorithm_id") or "") != REGIME_ALGORITHM_ID:
+            raise ValueError("Regime inventory rejects cross-algorithm order observations")
+        _require_full_ownership_identity(observation)
         common = _common_metadata({}, observation, observation)
         _validate_common_metadata(common)
         event = _inventory_event_from_order_status(observation)
@@ -1639,6 +1832,8 @@ class RegimeSqliteRepository:
 
     def record_inventory_broker_correction(self, identity: dict[str, Any], correction: dict[str, Any]) -> dict[str, Any]:
         payload = {"algorithmId": REGIME_ALGORITHM_ID, **correction, "type": "broker_correction"}
+        _require_full_ownership_identity(identity)
+        _require_matching_ownership_identity(identity, payload)
         common = _common_metadata({}, {**identity, **payload}, {**identity, **payload})
         _validate_common_metadata(common)
         event = _inventory_event_from_broker_correction(identity, payload)
@@ -1744,6 +1939,8 @@ class RegimeSqliteRepository:
 
     def record_position_state(self, identity: dict[str, Any], position: dict[str, Any]) -> dict[str, Any]:
         payload = {**position, "algorithmId": REGIME_ALGORITHM_ID}
+        _require_full_ownership_identity(identity)
+        _require_matching_ownership_identity(identity, payload)
         common = _common_metadata({}, {**identity, **payload}, {**identity, **payload})
         _validate_common_metadata(common)
         position_id = _string_or_none(payload.get("positionId") or payload.get("position_id")) or _stable_id("regime-position", common, payload)
@@ -1757,6 +1954,8 @@ class RegimeSqliteRepository:
 
     def record_trade_state(self, identity: dict[str, Any], trade: dict[str, Any]) -> dict[str, Any]:
         payload = {**trade, "algorithmId": REGIME_ALGORITHM_ID}
+        _require_full_ownership_identity(identity)
+        _require_matching_ownership_identity(identity, payload)
         common = _common_metadata({}, {**identity, **payload}, {**identity, **payload})
         _validate_common_metadata(common)
         trade_id = _string_or_none(payload.get("tradeId") or payload.get("trade_id")) or _stable_id("regime-trade", common, payload)
@@ -2304,7 +2503,15 @@ class RegimeSqliteRepository:
             self._insert(conn, "regime_reconciliation_events", common, "reconciliation-observation", observation, processing_status=str(observation.get("processingStatus") or "observed"))
             return "regime_reconciliation_events"
         enriched = _stable_regime_ledger_payload(table, observation, common)
-        self._insert(conn, table, common, str(enriched.get("stableId") or table), enriched, processing_status=str(observation.get("processingStatus") or "observed"))
+        processing_status = str(observation.get("processingStatus") or "observed")
+        if _broker_observation_duplicate_exists(conn, table, common, enriched, processing_status):
+            return None
+        try:
+            self._insert(conn, table, common, str(enriched.get("stableId") or table), enriched, processing_status=processing_status)
+        except sqlite3.IntegrityError:
+            if _broker_observation_duplicate_exists(conn, table, common, enriched, processing_status):
+                return None
+            raise
         return table
 
 
@@ -2452,6 +2659,34 @@ def _require_full_ownership_identity(identity: dict[str, Any] | None) -> None:
     missing = [canonical for canonical, aliases in required.items() if not any(identity.get(alias) for alias in aliases)]
     if missing:
         raise ValueError(f"Regime repository requires full ownership key: {', '.join(missing)}")
+
+
+def _require_matching_ownership_identity(identity: dict[str, Any], payload: dict[str, Any]) -> None:
+    aliases = {
+        "algorithmInstanceId": ("algorithmInstanceId", "algorithm_instance_id"),
+        "accountId": ("accountId", "account_id"),
+        "runtimeMode": ("runtimeMode", "runtime_mode"),
+        "symbol": ("symbol",),
+    }
+    mismatches: list[str] = []
+    for expected_key, candidate_keys in aliases.items():
+        expected = str(identity.get(expected_key) or "")
+        supplied = ""
+        for key in candidate_keys:
+            value = payload.get(key)
+            if value is not None and str(value) != "":
+                supplied = str(value)
+                break
+        if not supplied:
+            continue
+        if expected_key == "symbol":
+            mismatch = supplied.upper() != expected.upper()
+        else:
+            mismatch = supplied != expected
+        if mismatch:
+            mismatches.append(expected_key)
+    if mismatches:
+        raise ValueError(f"Regime repository rejects cross-identity inventory observation: {', '.join(mismatches)}")
 
 
 def _supplied_algorithm_ids(*records: dict[str, Any]) -> tuple[str, ...]:
@@ -2862,6 +3097,74 @@ def _regime_ledger_table_for_observation(observation: dict[str, Any]) -> str | N
     if "order" in kind:
         return "regime_orders"
     return None
+
+
+def _broker_observation_duplicate_exists(
+    conn: sqlite3.Connection,
+    table: str,
+    common: dict[str, str | None],
+    payload: dict[str, Any],
+    processing_status: str,
+) -> bool:
+    attribution = _attribution_metadata(common, payload)
+    if table == "regime_orders":
+        order_id = _string_or_none(payload.get("orderId") or payload.get("order_id") or common.get("order_id"))
+        if not order_id:
+            return False
+        row = conn.execute(
+            """
+            SELECT record_id
+            FROM regime_orders
+            WHERE algorithm_id = 'regime'
+              AND algorithm_instance_id = ?
+              AND account_id = ?
+              AND runtime_mode = ?
+              AND symbol = ?
+              AND order_id = ?
+              AND processing_status = ?
+            LIMIT 1
+            """,
+            (
+                common["algorithm_instance_id"],
+                common["account_id"],
+                common["runtime_mode"],
+                common["symbol"],
+                order_id,
+                processing_status,
+            ),
+        ).fetchone()
+        return row is not None
+    if table == "regime_fills":
+        broker_order_id = attribution["broker_order_id"]
+        trade_id = attribution["trade_id"]
+        if not broker_order_id or not trade_id:
+            return False
+        row = conn.execute(
+            """
+            SELECT record_id
+            FROM regime_fills
+            WHERE algorithm_id = 'regime'
+              AND algorithm_instance_id = ?
+              AND account_id = ?
+              AND runtime_mode = ?
+              AND symbol = ?
+              AND broker_order_id = ?
+              AND trade_id = ?
+              AND processing_status = ?
+            LIMIT 1
+            """,
+            (
+                common["algorithm_instance_id"],
+                common["account_id"],
+                common["runtime_mode"],
+                common["symbol"],
+                broker_order_id,
+                trade_id,
+                processing_status,
+            ),
+        ).fetchone()
+        return row is not None
+    return False
 
 
 def _stable_regime_ledger_payload(table: str, observation: dict[str, Any], common: dict[str, str | None]) -> dict[str, Any]:

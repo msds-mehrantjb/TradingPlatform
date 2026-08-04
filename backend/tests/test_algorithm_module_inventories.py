@@ -84,7 +84,7 @@ def meta_pairs(entries) -> tuple[tuple[str, str], ...]:
 
 
 def regime_pairs(role: str) -> tuple[tuple[str, str], ...]:
-    return tuple((entry.strategy_id, "active") for entry in REGIME_STRATEGY_DEFINITIONS if entry.role == role)
+    return tuple((entry.strategy_id, entry.lifecycle_status) for entry in REGIME_STRATEGY_DEFINITIONS if entry.role == role)
 
 
 def module_pairs(modules) -> tuple[tuple[str, str], ...]:

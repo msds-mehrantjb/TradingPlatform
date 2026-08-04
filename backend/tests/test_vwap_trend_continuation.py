@@ -132,7 +132,7 @@ def auxiliary_candles(symbol: str, count: int = 90) -> list[MarketCandle]:
 
 
 def request_for(candles: list[MarketCandle], *, session_vwap: float) -> PointInTimeFeatureRequest:
-    evaluation = candles[-1].timestamp
+    evaluation = candles[-1].timestamp + timedelta(seconds=61)
     return PointInTimeFeatureRequest(
         evaluationTimestamp=evaluation,
         sessionDate=SESSION_DATE,
@@ -157,7 +157,7 @@ def evaluate(candles: list[MarketCandle], *, session_vwap: float):
 def evaluate_snapshot(snapshot):
     strategy = VwapTrendContinuationStrategy()
     context = StrategyEvaluationContext(
-        registryEntry=resolve_strategy("vwap_trend_continuation"),
+        registryEntry=resolve_strategy("vwap_trend_continuation").model_copy(update={"enabled": True}),
         featureSnapshot=snapshot,
         configurationHash=strategy.config.configurationHash,
     )

@@ -16,7 +16,12 @@ from backend.app.backtesting import (
     ReplayEngineConfig,
     ReplayResult,
     V1ShadowDecision,
+    build_deterministic_v2_activation_report,
+    build_dynamic_policy_activation_report,
+    build_dynamic_policy_shadow_report,
     build_historical_shadow_comparison,
+    build_ml_filter_rollout_report,
+    build_ml_risk_modifier_experiment_report,
     build_paper_shadow_report,
 )
 from backend.app.backtesting.event_replay import ReplayDecisionSnapshot
@@ -37,6 +42,7 @@ from backend.app.domain.models import (
     GateResult,
     GateStatus,
     GlobalGateDecision,
+    OperatingMode,
     OrderPlan,
     RegimeState,
     Signal,
@@ -583,6 +589,112 @@ def evaluate_paper_shadow(request: PaperShadowEvaluateRequest) -> ApiV2Envelope:
     )
 
 
+@router.post("/activation/deterministic/evaluate")
+def evaluate_deterministic_v2_activation(request: dict[str, Any]) -> ApiV2Envelope:
+    snapshot = _snapshot_from_api_payload(request)
+    report = build_deterministic_v2_activation_report(
+        snapshot=snapshot,
+        rollbackMode=str(request.get("rollbackMode") or "NONE"),  # type: ignore[arg-type]
+    )
+    return envelope(
+        endpoint_version="deterministic_v2_activation_evaluate_v1",
+        payload={"report": report.model_dump(mode="json")},
+        configuration_hash=report.activationConfig.configurationHash,
+        explanation="Deterministic V2 activation posture was evaluated without enabling automatic paper submission.",
+    )
+
+
+@router.post("/ml-filter/rollout/evaluate")
+def evaluate_ml_filter_rollout(request: dict[str, Any]) -> ApiV2Envelope:
+    snapshot = _snapshot_from_api_payload(
+        request,
+        ml_config=SafeMLInferenceConfig(
+            mode=OperatingMode.FILTER,
+            fallbackBehavior=str(request.get("fallbackBehavior") or "DETERMINISTIC_BASELINE"),  # type: ignore[arg-type]
+        ),
+        ml_model_artifact=request.get("modelArtifact") if isinstance(request.get("modelArtifact"), dict) else None,
+    )
+    report = build_ml_filter_rollout_report(
+        snapshot=snapshot,
+        deterministicBaselineSnapshot=snapshot,
+        stage=str(request.get("stage") or "SHADOW"),  # type: ignore[arg-type]
+        shadowComparisonPassed=bool(request.get("shadowComparisonPassed")),
+        fallbackBehavior=str(request.get("fallbackBehavior") or "DETERMINISTIC_BASELINE"),  # type: ignore[arg-type]
+        shadowComparison=request.get("shadowComparison") if isinstance(request.get("shadowComparison"), dict) else None,
+    )
+    return envelope(
+        endpoint_version="ml_filter_rollout_evaluate_v1",
+        payload={"report": report.model_dump(mode="json")},
+        configuration_hash=report.rolloutConfig.configurationHash,
+        explanation="ML filter rollout was evaluated as a staged, paper-safe filter without changing deterministic sizing.",
+    )
+
+
+@router.post("/dynamic-policy/shadow/evaluate")
+def evaluate_dynamic_policy_shadow(request: dict[str, Any]) -> ApiV2Envelope:
+    snapshot = _snapshot_from_api_payload(request)
+    report = build_dynamic_policy_shadow_report(snapshot=snapshot)
+    return envelope(
+        endpoint_version="dynamic_policy_shadow_evaluate_v1",
+        payload={"report": report.model_dump(mode="json")},
+        configuration_hash=report.shadowConfig.configurationHash,
+        explanation="Dynamic policy shadow output was calculated side by side without changing the static execution path.",
+    )
+
+
+@router.post("/dynamic-policy/activation/evaluate")
+def evaluate_dynamic_policy_activation(request: dict[str, Any]) -> ApiV2Envelope:
+    snapshot = _snapshot_from_api_payload(request, ml_config=SafeMLInferenceConfig(mode=OperatingMode.FILTER))
+    report = build_dynamic_policy_activation_report(
+        snapshot=snapshot,
+        stageComparisons=list(request.get("stageComparisons") or ()),
+        requestedStages=list(request.get("requestedStages") or ()),
+        rollback=request.get("rollback") if isinstance(request.get("rollback"), dict) else {},
+    )
+    return envelope(
+        endpoint_version="dynamic_policy_activation_evaluate_v1",
+        payload={"report": report.model_dump(mode="json")},
+        configuration_hash=report.activationConfig.configurationHash,
+        explanation="Dynamic policy activation gates were evaluated with global-risk and broker-reconciliation guardrails.",
+    )
+
+
+@router.post("/ml-risk-modifier/experiment/evaluate")
+def evaluate_ml_risk_modifier_experiment(request: dict[str, Any]) -> ApiV2Envelope:
+    snapshot = _snapshot_from_api_payload(request, ml_config=SafeMLInferenceConfig(mode=OperatingMode.FILTER))
+    report = build_ml_risk_modifier_experiment_report(
+        snapshot=snapshot,
+        stageComparisons=list(request.get("stageComparisons") or ()),
+        requestedStages=list(request.get("requestedStages") or ()),
+        dynamicPolicyRollback=request.get("rollback") if isinstance(request.get("rollback"), dict) else {},
+        config=request.get("config") if isinstance(request.get("config"), dict) else {},
+    )
+    return envelope(
+        endpoint_version="ml_risk_modifier_experiment_evaluate_v1",
+        payload={"report": report.model_dump(mode="json")},
+        configuration_hash=report.config.configurationHash,
+        explanation="ML risk modifier experiment was evaluated in disabled-by-default mode without affecting paper orders.",
+    )
+
+
+@router.get("/models/status")
+def model_status() -> dict[str, Any]:
+    config = SafeMLInferenceConfig()
+    return {
+        "apiVersion": API_V2_VERSION,
+        "endpointVersion": "models_status_v1",
+        "configurationHash": config.configurationHash,
+        "payload": {
+            "metaModel": {
+                "mode": config.mode,
+                "configurationHash": config.configurationHash,
+                "appliedToExecution": False,
+            }
+        },
+        "explanation": "Safe ML status reports shadow/fallback configuration only; model output is not allowed to create or size paper orders here.",
+    }
+
+
 @router.post("/backtests/shadow-comparison")
 def run_historical_shadow_comparison(request: HistoricalShadowComparisonRequest) -> ApiV2Envelope:
     replay = build_replay_engine().replay_session(
@@ -705,6 +817,31 @@ def build_directional_strategies(strategy_ids: list[str] | None) -> list[Any]:
             raise HTTPException(status_code=400, detail=f"Strategy is not in the production Voting Ensemble inventory: {strategy_id}")
         strategies.append(factories[canonical_id]())
     return strategies
+
+
+def _snapshot_from_api_payload(
+    payload: dict[str, Any],
+    *,
+    ml_config: SafeMLInferenceConfig | None = None,
+    ml_model_artifact: dict[str, Any] | None = None,
+) -> ReplayDecisionSnapshot:
+    allowed = set(ReplayDecisionEvaluateRequest.model_fields)
+    request = ReplayDecisionEvaluateRequest.model_validate({key: value for key, value in payload.items() if key in allowed})
+    return build_replay_engine(ml_config=ml_config, ml_model_artifact=ml_model_artifact).decide_at(
+        symbol=request.symbol,
+        sessionDate=request.sessionDate,
+        evaluationTimestamp=request.evaluationTimestamp,
+        spy1mCandles=request.spy1mCandles,
+        spy5mCandles=request.spy5mCandles,
+        spy15mCandles=request.spy15mCandles,
+        qqqCandles=request.qqqCandles,
+        iwmCandles=request.iwmCandles,
+        priorDayOHLC=request.priorDayOHLC,
+        premarket=request.premarket,
+        openingRange=request.openingRange,
+        breadthComponents=request.breadthComponents,
+        economicEventState=request.economicEventState,
+    )
 
 
 def pass_gate_decision(checked_at: datetime, session_date: date) -> GlobalGateDecision:
@@ -1038,6 +1175,7 @@ def _meta_strategy_module_payload(entry: MetaStrategyRegistryEntry) -> dict[str,
 
 
 def _regime_module_payload(entry: Any, collection: str) -> dict[str, Any]:
+    status = str(getattr(entry, "lifecycle_status", "unavailable") or "unavailable")
     return {
         "id": entry.strategy_id,
         "name": entry.name,
@@ -1045,8 +1183,8 @@ def _regime_module_payload(entry: Any, collection: str) -> dict[str, Any]:
         "family": entry.family,
         "role": entry.role,
         "collection": collection,
-        "status": "active",
-        "enabled": True,
+        "status": status,
+        "enabled": status == "active",
         "requiredInputs": [],
         "minimumWarmup": entry.minimum_bars,
         "aliases": [_alias_metadata(alias, entry.strategy_id) for alias, canonical_id in REGIME_STRATEGY_ALIASES.items() if canonical_id == entry.strategy_id],

@@ -30,11 +30,21 @@ def test_step9_health_api_exposes_all_required_components() -> None:
 
 def test_step9_missing_paper_gateway_marks_broker_unhealthy_and_persists_failure() -> None:
     repository = _repository("paper-gateway-missing")
-    supervisor = _supervisor(repository)
+    identity = _paper_identity()
+    supervisor = RegimeRuntimeSupervisor(
+        service=RegimeApplicationService(repository),
+        config=RegimeRuntimeSupervisorConfig(
+            default_algorithm_instance_id=identity["algorithmInstanceId"],
+            default_account_id=identity["accountId"],
+            default_runtime_mode="paper",
+            maintenance_interval_seconds=60,
+            heartbeat_interval_seconds=60,
+        ),
+    )
 
     result = supervisor.process_execution_outbox_once()
     health = supervisor.health()
-    events = repository.read_owned_records("regime_runtime_events", _identity())
+    events = repository.read_owned_records("regime_runtime_events", identity)
 
     assert result["processed"] is False
     assert "regime.execution.paper_gateway_unavailable" in result["reasonCodes"]
@@ -133,6 +143,16 @@ def _identity() -> dict[str, str]:
         "algorithmInstanceId": "regime-default",
         "accountId": "default",
         "runtimeMode": "shadow",
+        "symbol": "SPY",
+    }
+
+
+def _paper_identity() -> dict[str, str]:
+    return {
+        "algorithmId": "regime",
+        "algorithmInstanceId": "regime-paper-default",
+        "accountId": "paper-account-123",
+        "runtimeMode": "paper",
         "symbol": "SPY",
     }
 

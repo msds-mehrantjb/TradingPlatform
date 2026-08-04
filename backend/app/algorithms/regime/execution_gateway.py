@@ -163,6 +163,31 @@ def submit_regime_outbox_record(
         return _terminal(repository, identity, order_intent_id, "expired", (reason_code,), details)
     broker_safety = validate_regime_paper_broker_safety(paper_gateway, mode=mode)
     if not broker_safety["passed"]:
+        if _broker_safety_failure_is_transient(broker_safety):
+            retry_count = int(outbox_record.get("retryCount") or outbox_record.get("retry_count") or 0)
+            retry_policy = dict(outbox_record.get("retryPolicy") or {})
+            next_retry_at = evaluated_at + timedelta(seconds=_backoff_seconds(retry_count, retry_policy))
+            repository.update_execution_outbox_status(
+                identity,
+                order_intent_id,
+                status="retry_scheduled",
+                payload={
+                    **outbox_record,
+                    "paperBrokerSafety": broker_safety,
+                    "retryCount": retry_count + 1,
+                    "nextRetryAt": next_retry_at.isoformat().replace("+00:00", "Z"),
+                    "reasonCodes": ["regime.execution.paper_broker_unavailable_retry_scheduled"],
+                },
+            )
+            return RegimeExecutionResult(
+                "regime",
+                order_intent_id,
+                "retry_scheduled",
+                False,
+                False,
+                ("regime.execution.paper_broker_unavailable_retry_scheduled",),
+                None,
+            )
         return _terminal(repository, identity, order_intent_id, "rejected", tuple(broker_safety["reasonCodes"]), {"paperBrokerSafety": broker_safety})
     order_type_failure = _entry_order_type_failure(order_intent)
     if order_type_failure is not None:
@@ -279,6 +304,8 @@ def submit_regime_outbox_record(
             "latency": timings,
         },
     )
+    if status in {"filled", "cancelled", "canceled", "rejected", "expired"}:
+        _release_outbox_reservation({**outbox_record, "reservationId": reservation_id})
     reconcile_regime_paper_gateway_result(repository=repository, identity=identity, proposal=proposal, result=result, reconciled_at=evaluated_at)
     return RegimeExecutionResult(
         algorithm_id="regime",
@@ -470,6 +497,17 @@ def validate_regime_paper_broker_safety(paper_gateway: PaperOrderGateway, *, mod
     broker = paper_gateway.broker
     reasons: list[str] = []
     details = _broker_safety_details(broker)
+    verifier = getattr(broker, "verify_paper_account", None)
+    broker_verified = False
+    if callable(verifier):
+        try:
+            broker_verified = bool(verifier())
+            details.update(_broker_safety_details(broker))
+        except Exception as exc:
+            details["verificationError"] = str(exc)
+            reasons.append("regime.execution.paper_broker.account_verification_failed")
+    else:
+        reasons.append("regime.execution.paper_broker.account_verifier_missing")
     if mode != RegimeRuntimeMode.PAPER.value:
         reasons.append("regime.execution.paper_broker.mode_not_paper")
     if details.get("liveTradingEnabled") is True:
@@ -479,6 +517,12 @@ def validate_regime_paper_broker_safety(paper_gateway: PaperOrderGateway, *, mod
     account_type = str(details.get("accountType") or "").lower()
     if account_type and account_type not in {"paper", "paper_trading", "simulated"}:
         reasons.append("regime.execution.paper_broker.account_type_not_paper")
+    if details.get("accountMatchesConfiguredIdentity") is False:
+        reasons.append("regime.execution.paper_broker.account_id_mismatch")
+    if details.get("accountAllowedToTrade") is False:
+        reasons.append("regime.execution.paper_broker.account_not_allowed_to_trade")
+    if details.get("marketDataCredentialsConfigured") is False:
+        reasons.append("regime.execution.paper_broker.market_data_credentials_missing")
     base_url = str(details.get("baseUrl") or details.get("tradingBaseUrl") or "").lower()
     if base_url:
         if "paper-api.alpaca.markets" not in base_url and "paper" not in base_url:
@@ -488,13 +532,17 @@ def validate_regime_paper_broker_safety(paper_gateway: PaperOrderGateway, *, mod
     credentials_verified = details.get("credentialsVerified")
     if credentials_verified is False:
         reasons.append("regime.execution.paper_broker.credentials_unverified")
+    if not broker_verified:
+        reasons.append("regime.execution.paper_broker.account_unverified")
     if not details:
         details = {"configurationSource": "broker_contract_unreported", "runtimePaperAccountCheckStillRequired": True}
+    passed = not reasons
     return {
         "algorithmId": "regime",
         "paperOnly": True,
         "mode": mode,
-        "passed": not reasons,
+        "passed": passed,
+        "verified": passed,
         "reasonCodes": reasons or ["regime.execution.paper_broker_safety_verified"],
         "details": details,
     }
@@ -603,6 +651,28 @@ def _retry_or_reconcile_after_failure(
     retry_policy = dict(outbox_record.get("retryPolicy") or {})
     max_attempts = int(retry_policy.get("maxAttempts") or 3)
     safe_to_retry = bool(getattr(exc, "safe_to_retry", False))
+    if bool(getattr(exc, "submission_uncertain", False)):
+        repository.update_execution_outbox_status(
+            identity,
+            order_intent_id,
+            status="reconciliation_required",
+            payload={
+                **base_payload,
+                "failureMessage": str(exc),
+                "retryCount": retry_count,
+                "reconciliationRequired": True,
+                "reasonCodes": ["regime.execution.submission_uncertain_reconciliation_required"],
+            },
+        )
+        return RegimeExecutionResult(
+            "regime",
+            order_intent_id,
+            "reconciliation_required",
+            False,
+            False,
+            ("regime.execution.submission_uncertain_reconciliation_required",),
+            None,
+        )
     if safe_to_retry and retry_count < max_attempts:
         next_retry_at = evaluated_at + timedelta(seconds=_backoff_seconds(retry_count, retry_policy))
         repository.update_execution_outbox_status(
@@ -644,6 +714,25 @@ def _backoff_seconds(retry_count: int, retry_policy: dict[str, Any]) -> int:
         except (TypeError, ValueError):
             return 5
     return min(60, 5 * (2 ** max(0, retry_count)))
+
+
+def _broker_safety_failure_is_transient(broker_safety: dict[str, Any]) -> bool:
+    reasons = set(str(code) for code in broker_safety.get("reasonCodes") or ())
+    hard_failures = {
+        "regime.execution.paper_broker.mode_not_paper",
+        "regime.execution.paper_broker.live_trading_enabled",
+        "regime.execution.paper_broker.paper_only_false",
+        "regime.execution.paper_broker.account_type_not_paper",
+        "regime.execution.paper_broker.account_id_mismatch",
+        "regime.execution.paper_broker.base_url_not_paper",
+        "regime.execution.paper_broker.live_base_url_rejected",
+    }
+    transient_failures = {
+        "regime.execution.paper_broker.account_verification_failed",
+        "regime.execution.paper_broker.account_unverified",
+        "regime.execution.paper_broker.credentials_unverified",
+    }
+    return bool(reasons & transient_failures) and not bool(reasons & hard_failures)
 
 
 def _release_outbox_reservation(outbox_record: dict[str, Any]) -> None:
@@ -718,6 +807,8 @@ def _terminal(
     reason_codes: tuple[str, ...],
     payload: dict[str, Any],
 ) -> RegimeExecutionResult:
+    if status in {"filled", "cancelled", "canceled", "rejected", "expired", "dead_letter"}:
+        _release_outbox_reservation(payload)
     repository.update_execution_outbox_status(identity, order_intent_id, status=status, payload={**payload, "reasonCodes": list(reason_codes)})
     return RegimeExecutionResult("regime", order_intent_id, status, False, False, reason_codes, None)
 
