@@ -37,19 +37,19 @@ def test_confirmed_bearish_forecast_direction_is_down() -> None:
     assert resolve(up=0.15, down=0.65, timeout=0.20, sell_ev=0.04) == "down"
 
 
-def test_highest_buy_probability_below_threshold_is_flat() -> None:
-    assert resolve(up=0.49, down=0.20, timeout=0.31, threshold=0.5) == "flat"
+def test_highest_buy_probability_below_threshold_still_predicts_up() -> None:
+    assert resolve(up=0.49, down=0.20, timeout=0.31, threshold=0.5) == "up"
 
 
-def test_required_edge_gap_not_met_is_flat() -> None:
-    assert resolve(up=0.58, down=0.51, timeout=0.01, threshold=0.5, edge_gap=0.1) == "flat"
+def test_required_edge_gap_not_met_still_predicts_probability_leader() -> None:
+    assert resolve(up=0.58, down=0.51, timeout=0.01, threshold=0.5, edge_gap=0.1) == "up"
 
 
-def test_non_positive_expected_value_is_flat() -> None:
-    assert resolve(up=0.65, down=0.15, timeout=0.20, buy_ev=0.0) == "flat"
-    assert resolve(up=0.65, down=0.15, timeout=0.20, buy_ev=-0.01) == "flat"
-    assert resolve(up=0.15, down=0.65, timeout=0.20, sell_ev=0.0) == "flat"
-    assert resolve(up=0.15, down=0.65, timeout=0.20, sell_ev=-0.01) == "flat"
+def test_non_positive_expected_value_does_not_change_market_behavior_direction() -> None:
+    assert resolve(up=0.65, down=0.15, timeout=0.20, buy_ev=0.0) == "up"
+    assert resolve(up=0.65, down=0.15, timeout=0.20, buy_ev=-0.01) == "up"
+    assert resolve(up=0.15, down=0.65, timeout=0.20, sell_ev=0.0) == "down"
+    assert resolve(up=0.15, down=0.65, timeout=0.20, sell_ev=-0.01) == "down"
 
 
 def test_tiny_expected_movement_uses_forecast_only_neutral_band() -> None:

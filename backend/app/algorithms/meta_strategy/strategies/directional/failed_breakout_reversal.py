@@ -14,7 +14,8 @@ class FailedBreakoutReversalStrategy(DirectionalSnapshotStrategy):
     def evidence(self, snapshot: MetaStrategyMarketSnapshot) -> dict[str, Any]:
         side = str(snapshot.features.get("failedBreakoutSide") or "none")
         reclaim_atr = float(snapshot.features.get("reclaimDistanceAtr") or 0.0)
-        spread = float(snapshot.spread.get("basisPoints") or 0.0)
+        spread_value = snapshot.spread.get("basisPoints")
+        spread = float(spread_value) if spread_value is not None else 0.0
         atr = float(snapshot.atr.get("1m") or 0.0)
         levels = _reference_levels(snapshot)
         upside_level = _selected_reference_level(snapshot, levels, "upside")

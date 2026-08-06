@@ -100,6 +100,69 @@ class MetaStrategyRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("inventory_reconciliation", health["scheduledJobs"])
         self.assertIn("position_management", health["scheduledJobs"])
 
+    async def test_local_ledger_candle_fetch_failure_keeps_worker_alive_but_data_blocked(self) -> None:
+        dependencies, gateway = runtime_dependencies(with_broker=True, broker=LocalLedgerBroker())
+        supervisor = MetaStrategyRuntimeSupervisor(
+            config=MetaStrategyRuntimeSupervisorConfig(
+                enabled=True,
+                mode=MetaStrategyRuntimeMode.PAPER,
+                worker_poll_seconds=0.05,
+                reconciliation_poll_seconds=0.05,
+                stale_order_poll_seconds=0.05,
+                inventory_poll_seconds=0.05,
+                position_poll_seconds=0.05,
+                maintenance_interval_seconds=0.05,
+                candle_poll_seconds=0.05,
+            ),
+            dependencies=dependencies,
+            paper_gateway=gateway,
+            global_risk_source=AllowRisk(),
+            market_data_client=FailingMarketDataClient(),
+            candle_store=CandleStore(SimpleNamespace(database_url=f"sqlite:///{dependencies.job_repository.path}")),
+        )
+
+        await supervisor.start()
+        await supervisor._sleep(0.10)
+        health = supervisor.readiness_status()
+        await supervisor.shutdown()
+
+        self.assertEqual(health["workers"]["finalized_candle_producer"], "healthy")
+        self.assertTrue(health["ready"])
+        self.assertEqual(
+            health["lastWorkerResult"]["finalized_candle_producer"][0]["reasonCodes"],
+            ("meta_strategy.candle.market_data_unavailable",),
+        )
+
+    async def test_non_local_candle_fetch_failure_still_blocks_paper_runtime(self) -> None:
+        dependencies, gateway = runtime_dependencies(with_broker=True)
+        supervisor = MetaStrategyRuntimeSupervisor(
+            config=MetaStrategyRuntimeSupervisorConfig(
+                enabled=True,
+                mode=MetaStrategyRuntimeMode.PAPER,
+                worker_poll_seconds=0.05,
+                reconciliation_poll_seconds=0.05,
+                stale_order_poll_seconds=0.05,
+                inventory_poll_seconds=0.05,
+                position_poll_seconds=0.05,
+                maintenance_interval_seconds=0.05,
+                candle_poll_seconds=0.05,
+            ),
+            dependencies=dependencies,
+            paper_gateway=gateway,
+            global_risk_source=AllowRisk(),
+            market_data_client=FailingMarketDataClient(),
+            candle_store=CandleStore(SimpleNamespace(database_url=f"sqlite:///{dependencies.job_repository.path}")),
+        )
+
+        await supervisor.start()
+        await supervisor._sleep(0.10)
+        health = supervisor.readiness_status()
+        await supervisor.shutdown()
+
+        self.assertEqual(health["workers"]["finalized_candle_producer"], "failed")
+        self.assertFalse(health["ready"])
+        self.assertIn("meta_strategy.runtime.candle_producer_failed", health["reasonCodes"])
+
     def test_service_blocks_paper_evaluate_when_supervisor_blocks_paper_orders(self) -> None:
         service = MetaStrategyApplicationService(
             job_repository=MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}"),
@@ -115,15 +178,77 @@ class MetaStrategyRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["payload"]["orderSubmissionAllowed"])
         self.assertIn("meta_strategy.runtime.startup_failed", result["reasonCodes"])
 
+    def test_paper_control_changes_are_durable_across_service_restarts(self) -> None:
+        database_url = f"sqlite:///{temp_db_path()}"
+        first = MetaStrategyApplicationService(job_repository=MetaStrategyJobRepository(database_url))
 
-def runtime_dependencies(*, with_broker: bool) -> tuple[MetaStrategyRuntimeDependencies, PaperOrderGateway | None]:
+        updated = first.update_paper_control(
+            {
+                "newPaperEntriesEnabled": True,
+                "actor": "dashboard",
+                "reason": "meta_strategy.test.enable_paper",
+                "expectedVersion": 0,
+            }
+        )
+        restarted = MetaStrategyApplicationService(job_repository=MetaStrategyJobRepository(database_url))
+        loaded = restarted.query_paper_control({})
+
+        self.assertEqual(updated["status"], "OK")
+        self.assertEqual(loaded["status"], "OK")
+        self.assertTrue(loaded["payload"]["newPaperEntriesEnabled"])
+        self.assertEqual(loaded["payload"]["version"], 1)
+
+    def test_concurrent_paper_control_updates_are_version_safe(self) -> None:
+        service = MetaStrategyApplicationService(job_repository=MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}"))
+        first = service.update_paper_control(
+            {
+                "newPaperEntriesEnabled": True,
+                "actor": "dashboard-a",
+                "reason": "meta_strategy.test.enable_paper",
+                "expectedVersion": 0,
+            }
+        )
+
+        conflict = service.update_paper_control(
+            {
+                "newPaperEntriesEnabled": False,
+                "actor": "dashboard-b",
+                "reason": "meta_strategy.test.disable_stale_version",
+                "expectedVersion": 0,
+            }
+        )
+        loaded = service.query_paper_control({})
+
+        self.assertEqual(first["status"], "OK")
+        self.assertEqual(conflict["status"], "REJECTED")
+        self.assertIn("meta_strategy.paper_control.version_conflict", conflict["reasonCodes"])
+        self.assertTrue(loaded["payload"]["newPaperEntriesEnabled"])
+        self.assertEqual(loaded["payload"]["version"], 1)
+
+    def test_one_algorithm_cannot_change_another_algorithm_paper_state(self) -> None:
+        service = MetaStrategyApplicationService(job_repository=MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}"))
+
+        result = service.update_paper_control(
+            {
+                "algorithmId": "weighted_voting",
+                "newPaperEntriesEnabled": True,
+                "actor": "foreign-test",
+                "reason": "foreign_algorithm_attempt",
+            }
+        )
+
+        self.assertEqual(result["status"], "REJECTED")
+        self.assertIn("meta_strategy.paper_control.foreign_algorithm_rejected", result["reasonCodes"])
+
+
+def runtime_dependencies(*, with_broker: bool, broker: object | None = None) -> tuple[MetaStrategyRuntimeDependencies, PaperOrderGateway | None]:
     database_url = f"sqlite:///{temp_db_path()}"
     jobs = MetaStrategyJobRepository(database_url)
     inventory = MetaStrategySqliteRepository(database_url)
     settings_store = MetaStrategySettingsStore(temp_db_path(prefix="meta-strategy-settings"))
     baseline = settings_store.create_baseline(build_meta_strategy_settings(settings_version=f"settings-{uuid4().hex}"), actor="test")
     settings_store.activate_settings(baseline.settings_version, actor="test")
-    broker = FakePaperBroker() if with_broker else None
+    broker = broker or (FakePaperBroker() if with_broker else None)
     gateway = PaperOrderGateway(broker, jobs.gateway_store()) if broker is not None else None
     dependencies = MetaStrategyRuntimeDependencies(
         mode=MetaStrategyRuntimeMode.PAPER,
@@ -165,6 +290,11 @@ class FakeMarketDataClient:
         return rows[-limit:]
 
 
+class FailingMarketDataClient:
+    async def get_bars(self, *, symbol: str, timeframe: str, feed: str, limit: int, start: str | None, end: str | None, sort: str):
+        raise TimeoutError("fixture market data timeout")
+
+
 class FakePaperBroker:
     broker_kind = "alpaca_paper"
     configured = True
@@ -172,6 +302,9 @@ class FakePaperBroker:
 
     def verify_paper_account(self) -> bool:
         return True
+
+    def get_clock(self):
+        return {"source": "test_alpaca_paper_clock", "capturedAt": datetime.now(UTC).isoformat(), "isOpen": True, "status": "open"}
 
     def submit_bracket_order(self, intent):
         raise AssertionError("supervisor startup should not submit orders")
@@ -192,6 +325,10 @@ class FakePaperBroker:
 class NonAlpacaBroker(FakePaperBroker):
     broker_kind = "fixture"
     paper_endpoint = False
+
+
+class LocalLedgerBroker(FakePaperBroker):
+    broker_kind = "local_paper_ledger"
 
 
 class AllowRisk:

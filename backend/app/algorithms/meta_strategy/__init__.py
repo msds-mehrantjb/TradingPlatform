@@ -209,6 +209,8 @@ from backend.app.algorithms.meta_strategy.idempotency import (
 )
 from backend.app.algorithms.meta_strategy.jobs import (
     META_STRATEGY_DEFAULT_QUEUE_CONCURRENCY_LIMITS,
+    META_STRATEGY_FINALIZED_CANDLE_OUTCOME_SCHEMA_VERSION,
+    META_STRATEGY_FINALIZED_CANDLE_TERMINAL_OUTCOMES,
     META_STRATEGY_JOB_MIGRATION_VERSION,
     META_STRATEGY_JOB_QUEUES,
     META_STRATEGY_JOB_TYPE_TO_QUEUE,
@@ -253,6 +255,7 @@ from backend.app.algorithms.meta_strategy.order_validation import (
     validate_meta_strategy_order,
 )
 from backend.app.algorithms.meta_strategy.observability import (
+    META_STRATEGY_AUTOMATIC_PAPER_CONTROL_KEY,
     META_STRATEGY_FINAL_DOD_IDS,
     META_STRATEGY_OBSERVABILITY_VERSION,
     META_STRATEGY_OPERATIONAL_CONTROLS,
@@ -264,10 +267,12 @@ from backend.app.algorithms.meta_strategy.observability import (
     record_meta_strategy_test_evidence,
 )
 from backend.app.algorithms.meta_strategy.paper_readiness import (
+    META_STRATEGY_PAPER_ENTRY_READINESS_VERSION,
     META_STRATEGY_PAPER_READINESS_ACCEPTANCE_VERSION,
     META_STRATEGY_PAPER_READINESS_CRITERIA,
     META_STRATEGY_PAPER_READINESS_TEST_IDS,
     MetaStrategyPaperReadinessCriterion,
+    build_meta_strategy_paper_entry_readiness_prerequisites,
     build_meta_strategy_paper_readiness_acceptance_report,
     meta_strategy_paper_readiness_is_complete,
 )
@@ -296,6 +301,7 @@ from backend.app.algorithms.meta_strategy.repository import (
     MetaStrategyPersistenceRecordDefinition,
     MetaStrategyPersistenceSummary,
     MetaStrategyInventoryLot,
+    MetaStrategyInventoryOwnershipConflict,
     MetaStrategyInventoryPosition,
     MetaStrategyInventorySnapshot as MetaStrategyInventoryLedgerSnapshot,
     MetaStrategyRepositoryAttributionError,
@@ -649,6 +655,7 @@ __all__ = [
     "META_STRATEGY_VERSION_IDENTIFIER_ITEMS",
     "META_STRATEGY_VERSION_COLUMNS",
     "META_STRATEGY_FINAL_DOD_IDS",
+    "META_STRATEGY_PAPER_ENTRY_READINESS_VERSION",
     "META_STRATEGY_PAPER_READINESS_ACCEPTANCE_VERSION",
     "META_STRATEGY_PAPER_READINESS_CRITERIA",
     "META_STRATEGY_PAPER_READINESS_TEST_IDS",
@@ -810,6 +817,7 @@ __all__ = [
     "MetaStrategyOperationalLimitsSettings",
     "MetaStrategyReconciliationRecord",
     "MetaStrategyResearchWorkflowWorker",
+    "MetaStrategyInventoryOwnershipConflict",
     "MetaStrategyRepositoryAttributionError",
     "MetaStrategyRepositoryPersistenceAdapter",
     "MetaStrategyRepositoryRecord",
@@ -884,6 +892,7 @@ __all__ = [
     "build_meta_strategy_settings",
     "build_meta_strategy_final_acceptance_report",
     "build_meta_strategy_evidence_acceptance_report",
+    "build_meta_strategy_paper_entry_readiness_prerequisites",
     "build_meta_strategy_paper_readiness_acceptance_report",
     "build_meta_strategy_features",
     "build_meta_strategy_features_from_characterization_fixture",
@@ -1005,11 +1014,14 @@ __all__ = [
     "validate_training_ends_before_prediction",
     "v2_training_compatibility_report",
     "META_STRATEGY_DEFAULT_QUEUE_CONCURRENCY_LIMITS",
+    "META_STRATEGY_FINALIZED_CANDLE_OUTCOME_SCHEMA_VERSION",
+    "META_STRATEGY_FINALIZED_CANDLE_TERMINAL_OUTCOMES",
     "META_STRATEGY_JOB_MIGRATION_VERSION",
     "META_STRATEGY_JOB_QUEUES",
     "META_STRATEGY_JOB_TYPE_TO_QUEUE",
     "META_STRATEGY_WORKER_CLASSES",
     "META_STRATEGY_ALPACA_PAPER_BROKER_VERSION",
+    "META_STRATEGY_AUTOMATIC_PAPER_CONTROL_KEY",
     "MetaStrategyAlpacaPaperBroker",
     "MetaStrategyAlpacaPaperBrokerConfigurationError",
     "MetaStrategyUnavailablePaperBroker",

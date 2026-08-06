@@ -17,7 +17,9 @@ from typing import Any
 
 from backend.app.algorithms.meta_strategy.identity import ALGORITHM_ID
 from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
+from backend.app.algorithms.meta_strategy.repository import apply_meta_strategy_persistence_migrations, persist_meta_strategy_projection_record
 from backend.app.algorithms.meta_strategy.versions import (
+    META_STRATEGY_ALGORITHM_VERSION,
     META_STRATEGY_FEATURE_SCHEMA_VERSION,
     META_STRATEGY_MODEL_VERSION,
     META_STRATEGY_STRATEGY_CATALOG_VERSION,
@@ -25,9 +27,21 @@ from backend.app.algorithms.meta_strategy.versions import (
 from backend.app.database import _sqlite_path
 
 
-META_STRATEGY_JOB_MIGRATION_VERSION = "meta_strategy_jobs_006"
+META_STRATEGY_JOB_MIGRATION_VERSION = "meta_strategy_jobs_007"
 META_STRATEGY_WORKER_DECISION_SCHEMA_VERSION = "meta_strategy_worker_decision_v1"
 META_STRATEGY_EXECUTION_OUTBOX_SCHEMA_VERSION = "meta_strategy_execution_outbox_v1"
+META_STRATEGY_FINALIZED_CANDLE_OUTCOME_SCHEMA_VERSION = "meta_strategy_finalized_candle_outcome_v1"
+META_STRATEGY_FINALIZED_CANDLE_TERMINAL_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "NO_DECISION",
+        "HOLD",
+        "BLOCKED",
+        "ORDER_PROPOSED",
+        "ORDER_SUBMITTED",
+        "ORDER_REJECTED",
+        "RECONCILIATION_REQUIRED",
+    }
+)
 META_STRATEGY_JOB_QUEUES: frozenset[str] = frozenset(
     {
         "finalised_bar_decisions",
@@ -132,6 +146,37 @@ class MetaStrategyEventRecord:
     status: str
     created_at: str
     duplicate: bool = False
+
+
+@dataclass(frozen=True)
+class MetaStrategyPaperTradingControlRecord:
+    algorithm_id: str
+    capital_partition_id: str
+    new_paper_entries_enabled: bool
+    updated_at: str
+    updated_by: str
+    reason: str
+    version: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "algorithmId": self.algorithm_id,
+            "capitalPartitionId": self.capital_partition_id,
+            "newPaperEntriesEnabled": self.new_paper_entries_enabled,
+            "automaticPaperTradingEnabled": self.new_paper_entries_enabled,
+            "paperEntriesAllowed": self.new_paper_entries_enabled,
+            "paperOnly": True,
+            "liveExecutionEnabled": False,
+            "updatedAt": self.updated_at,
+            "updatedBy": self.updated_by,
+            "reason": self.reason,
+            "version": self.version,
+            "reasonCodes": (
+                "meta_strategy.paper_control.new_entries_enabled"
+                if self.new_paper_entries_enabled
+                else "meta_strategy.paper_control.new_entries_disabled"
+            ),
+        }
 
 
 class MetaStrategyPaperGatewayStore:
@@ -374,7 +419,7 @@ class MetaStrategyJobRepository:
             decision_id=decision_id,
             processing_timestamp=timestamp,
         )
-        decision_payload = _json(normalized_payload)
+        decision_payload = _json(_redact_sensitive(normalized_payload))
         outbox_id: str | None = None
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -415,6 +460,12 @@ class MetaStrategyJobRepository:
                 )
             else:
                 decision_id = str(existing["decision_id"])
+            projection_records = _persist_runtime_decision_projection_records(
+                conn,
+                normalized_payload,
+                decision_id=decision_id,
+                timestamp=timestamp,
+            )
             if order_intent is not None:
                 normalized_order = _outbox_artifact_payload(
                     order_intent,
@@ -424,17 +475,21 @@ class MetaStrategyJobRepository:
                     decision_id=decision_id,
                     processing_timestamp=timestamp,
                 )
+                client_order_id = _deterministic_meta_strategy_client_order_id(normalized_order)
+                normalized_order["clientOrderId"] = str(normalized_order.get("clientOrderId") or client_order_id)
+                normalized_order["client_order_id"] = normalized_order["clientOrderId"]
+                normalized_order = _persist_atomic_inventory_order_intent(conn, normalized_order, decision_payload=normalized_payload, timestamp=timestamp)
                 outbox_id = f"meta_strategy.execution_outbox.{normalized_order.get('orderIntentId') or decision_id}"
-                conn.execute(
+                cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO meta_strategy_execution_outbox (
                         outbox_id, algorithm_id, event_id, job_id, decision_id,
                         order_intent_id, idempotency_key, schema_version, settings_version,
                         model_version, event_timestamp, processing_timestamp,
                         causal_ids_json, status, payload_json,
-                        created_at, updated_at
+                        created_at, updated_at, client_order_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         outbox_id,
@@ -451,12 +506,42 @@ class MetaStrategyJobRepository:
                         str(normalized_order["processingTimestamp"]),
                         _json(normalized_order["causalIds"]),
                         "PENDING",
-                        _json(normalized_order),
+                        _json(_redact_sensitive(normalized_order)),
                         timestamp,
                         timestamp,
+                        normalized_order["clientOrderId"],
                     ),
                 )
-        return {"decisionId": decision_id, "outboxId": outbox_id}
+                if cursor.rowcount == 1:
+                    _record_outbox_transition(
+                        conn,
+                        outbox_id=outbox_id,
+                        payload=normalized_order,
+                        previous_status=None,
+                        next_status="PENDING",
+                        reason_codes=("meta_strategy.outbox.pending_after_atomic_decision_commit",),
+                        transitioned_at=timestamp,
+                    )
+            _upsert_finalized_candle_outcome(
+                conn,
+                _finalized_candle_outcome_payload(
+                    event_id=event.event_id,
+                    outcome=_decision_terminal_outcome(normalized_payload, order_intent=order_intent),
+                    payload=_decision_outcome_audit_payload(
+                        normalized_payload,
+                        order_intent=normalized_order if order_intent is not None else None,
+                    ),
+                    job_id=job.job_id,
+                    decision_id=decision_id,
+                    order_intent_id=str((normalized_order if order_intent is not None else {}).get("orderIntentId") or ""),
+                    client_order_id=str((normalized_order if order_intent is not None else {}).get("clientOrderId") or ""),
+                    symbol=str(normalized_payload.get("symbol") or ""),
+                    bar_end=str(normalized_payload.get("barEnd") or ""),
+                    reason_codes=tuple(str(code) for code in normalized_payload.get("reasonCodes") or normalized_payload.get("reason_codes") or ()),
+                ),
+                timestamp=timestamp,
+            )
+        return {"decisionId": decision_id, "outboxId": outbox_id, "projectionRecords": projection_records}
 
     def enqueue_position_exit_outbox(
         self,
@@ -470,7 +555,7 @@ class MetaStrategyJobRepository:
         outbox_id = f"meta_strategy.execution_outbox.{normalized['orderIntentId']}"
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO meta_strategy_execution_outbox (
                     outbox_id, algorithm_id, event_id, job_id, decision_id,
@@ -501,6 +586,16 @@ class MetaStrategyJobRepository:
                     timestamp,
                 ),
             )
+            if cursor.rowcount == 1:
+                _record_outbox_transition(
+                    conn,
+                    outbox_id=outbox_id,
+                    payload=normalized,
+                    previous_status=None,
+                    next_status="PENDING",
+                    reason_codes=("meta_strategy.outbox.pending_position_exit",),
+                    transitioned_at=timestamp,
+                )
             row = conn.execute("SELECT * FROM meta_strategy_execution_outbox WHERE outbox_id = ?", (outbox_id,)).fetchone()
         outbox = _outbox_from_row(row)
         return {**outbox, "duplicate": str(outbox["createdAt"]) != timestamp}
@@ -726,7 +821,7 @@ class MetaStrategyJobRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (event_id, ALGORITHM_ID, event_type, status, correlation_id, _json(body), current),
+                (event_id, ALGORITHM_ID, event_type, status, correlation_id, _json(_redact_sensitive(body)), current),
             )
         return {"eventId": event_id, "algorithmId": ALGORITHM_ID, "eventType": event_type, "status": status, "createdAt": current}
 
@@ -814,11 +909,105 @@ class MetaStrategyJobRepository:
             )
         return {"algorithmId": ALGORITHM_ID, "cancelledJobs": cancelled, "queueName": queue_name}
 
+    def resolve_dead_letter_jobs(
+        self,
+        *,
+        queue_name: str | None = None,
+        reason: str = "meta_strategy.dead_letter.operator_recovered",
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current = _dt(now or _utc_now())
+        where_queue = ""
+        params: tuple[Any, ...] = (ALGORITHM_ID, MetaStrategyJobStatus.DEAD_LETTER.value)
+        if queue_name is not None:
+            _validate_queue(queue_name)
+            where_queue = "AND queue_name = ?"
+            params = (ALGORITHM_ID, MetaStrategyJobStatus.DEAD_LETTER.value, queue_name)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT job_id, queue_name, job_type, created_at, updated_at, attempt_count, max_attempts,
+                       error_category, error_details
+                FROM meta_strategy_jobs
+                WHERE algorithm_id = ? AND status = ? {where_queue}
+                ORDER BY created_at ASC, job_id ASC
+                """,
+                params,
+            ).fetchall()
+            job_ids = tuple(str(row["job_id"]) for row in rows)
+            resolved = 0
+            if job_ids:
+                placeholders = ",".join("?" for _ in job_ids)
+                cursor = conn.execute(
+                    f"""
+                    UPDATE meta_strategy_jobs
+                    SET status = ?, cancel_requested = 1, lease_owner = NULL, lease_expires_at = NULL,
+                        updated_at = ?, completed_at = COALESCE(completed_at, ?),
+                        error_details = COALESCE(error_details, '') || ?
+                    WHERE algorithm_id = ? AND status = ? AND job_id IN ({placeholders})
+                    """,
+                    (
+                        MetaStrategyJobStatus.CANCELLED.value,
+                        current,
+                        current,
+                        f"\nRecovered at {current}: {reason}",
+                        ALGORITHM_ID,
+                        MetaStrategyJobStatus.DEAD_LETTER.value,
+                        *job_ids,
+                    ),
+                )
+                resolved = int(cursor.rowcount)
+            evidence_payload = {
+                "queueName": queue_name,
+                "resolvedDeadLetters": resolved,
+                "reason": reason,
+                "jobs": tuple(dict(row) for row in rows),
+            }
+            conn.execute(
+                """
+                INSERT INTO meta_strategy_operational_events(
+                    event_id, algorithm_id, event_type, status, correlation_id, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"meta_strategy.operational.resolve_dead_letters.{_stable_hash({'queue': queue_name, 'time': current, 'resolved': resolved})}",
+                    ALGORITHM_ID,
+                    "resolve_dead_letters",
+                    "RECORDED",
+                    "",
+                    _json(evidence_payload),
+                    current,
+                ),
+            )
+        return {
+            "algorithmId": ALGORITHM_ID,
+            "resolvedDeadLetters": resolved,
+            "queueName": queue_name,
+            "jobIds": job_ids,
+        }
+
     def decision_for_event(self, event_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM meta_strategy_worker_decisions WHERE algorithm_id = ? AND event_id = ?",
                 (ALGORITHM_ID, event_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return _decision_from_row(row)
+
+    def latest_worker_decision(self) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM meta_strategy_worker_decisions
+                WHERE algorithm_id = ?
+                ORDER BY created_at DESC, decision_id DESC
+                LIMIT 1
+                """,
+                (ALGORITHM_ID,),
             ).fetchone()
         if row is None:
             return None
@@ -874,6 +1063,15 @@ class MetaStrategyJobRepository:
             )
             if cursor.rowcount != 1:
                 return None
+            _record_outbox_transition(
+                conn,
+                outbox_id=str(row["outbox_id"]),
+                payload=json.loads(str(row["payload_json"])),
+                previous_status=str(row["status"]),
+                next_status="SUBMITTING",
+                reason_codes=("meta_strategy.outbox.claimed_for_submission",),
+                transitioned_at=current_text,
+            )
             claimed = conn.execute("SELECT * FROM meta_strategy_execution_outbox WHERE outbox_id = ?", (row["outbox_id"],)).fetchone()
         return _outbox_from_row(claimed)
 
@@ -923,7 +1121,7 @@ class MetaStrategyJobRepository:
                 """,
                 (
                     final_status,
-                    _json(merged),
+                    _json(_redact_sensitive(merged)),
                     client_order_id,
                     broker_order_id,
                     final_status,
@@ -941,8 +1139,102 @@ class MetaStrategyJobRepository:
             )
             if cursor.rowcount != 1:
                 raise KeyError(outbox_id)
+            if str(row["status"]) != final_status:
+                _record_outbox_transition(
+                    conn,
+                    outbox_id=outbox_id,
+                    payload=merged,
+                    previous_status=str(row["status"]),
+                    next_status=final_status,
+                    reason_codes=tuple(str(code) for code in merged.get("reasonCodes") or merged.get("reason_codes") or ()),
+                    transitioned_at=current,
+                )
+            _record_outcome_for_outbox_status(conn, row=row, payload=merged, status=final_status, transitioned_at=current)
             updated = conn.execute("SELECT * FROM meta_strategy_execution_outbox WHERE outbox_id = ?", (outbox_id,)).fetchone()
         return _outbox_from_row(updated)
+
+    def record_finalized_candle_outcome(
+        self,
+        *,
+        event_id: str,
+        outcome: str,
+        payload: Mapping[str, Any],
+        job_id: str = "",
+        decision_id: str = "",
+        order_intent_id: str = "",
+        client_order_id: str = "",
+        symbol: str = "",
+        bar_end: str = "",
+        reason_codes: Sequence[str] = (),
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current = _dt(now or _utc_now())
+        normalized = _finalized_candle_outcome_payload(
+            event_id=event_id,
+            outcome=outcome,
+            payload=payload,
+            job_id=job_id,
+            decision_id=decision_id,
+            order_intent_id=order_intent_id,
+            client_order_id=client_order_id,
+            symbol=symbol,
+            bar_end=bar_end,
+            reason_codes=reason_codes,
+        )
+        with self.connect() as conn:
+            _upsert_finalized_candle_outcome(conn, normalized, timestamp=current)
+        return normalized
+
+    def finalized_candle_outcome(self, event_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM meta_strategy_finalized_candle_outcomes WHERE algorithm_id = ? AND event_id = ?",
+                (ALGORITHM_ID, event_id),
+            ).fetchone()
+        return _finalized_candle_outcome_from_row(row) if row is not None else None
+
+    def finalized_candle_outcomes(self, *, limit: int = 100) -> tuple[dict[str, Any], ...]:
+        bounded = max(1, min(int(limit), 1000))
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM meta_strategy_finalized_candle_outcomes
+                WHERE algorithm_id = ?
+                ORDER BY updated_at DESC, event_id DESC
+                LIMIT ?
+                """,
+                (ALGORITHM_ID, bounded),
+            ).fetchall()
+        return tuple(_finalized_candle_outcome_from_row(row) for row in rows)
+
+    def execution_outbox_transitions(self, outbox_id: str) -> tuple[dict[str, Any], ...]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM meta_strategy_execution_outbox_transitions
+                WHERE algorithm_id = ? AND outbox_id = ?
+                ORDER BY transitioned_at ASC, transition_id ASC
+                """,
+                (ALGORITHM_ID, outbox_id),
+            ).fetchall()
+        return tuple(
+            {
+                "transitionId": str(row["transition_id"]),
+                "outboxId": str(row["outbox_id"]),
+                "algorithmId": str(row["algorithm_id"]),
+                "capitalPartitionId": str(row["capital_partition_id"]),
+                "decisionId": str(row["decision_id"]),
+                "orderIntentId": str(row["order_intent_id"]),
+                "previousStatus": row["previous_status"],
+                "nextStatus": str(row["next_status"]),
+                "reasonCodes": tuple(json.loads(str(row["reason_codes_json"]))),
+                "payload": json.loads(str(row["payload_json"])),
+                "transitionedAt": str(row["transitioned_at"]),
+            }
+            for row in rows
+        )
 
     def submitted_execution_outbox_records(self) -> tuple[dict[str, Any], ...]:
         with self.connect() as conn:
@@ -950,7 +1242,7 @@ class MetaStrategyJobRepository:
                 """
                 SELECT *
                 FROM meta_strategy_execution_outbox
-                WHERE algorithm_id = ? AND status IN ('SUBMITTING', 'SUBMITTED', 'ACKNOWLEDGED', 'OPEN', 'PARTIALLY_FILLED', 'REPLACED', 'RECONCILIATION_REQUIRED')
+                WHERE algorithm_id = ? AND status IN ('SUBMITTING', 'SUBMITTED', 'ACKNOWLEDGED', 'OPEN', 'PARTIALLY_FILLED', 'CANCEL_PENDING', 'REPLACED', 'RECONCILIATION_REQUIRED')
                 ORDER BY created_at ASC, outbox_id ASC
                 """,
                 (ALGORITHM_ID,),
@@ -981,7 +1273,7 @@ class MetaStrategyJobRepository:
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(snapshot_key) DO UPDATE SET payload_json = excluded.payload_json, updated_at = excluded.updated_at
                 """,
-                (key, ALGORITHM_ID, _json(dict(snapshot)), current),
+                (key, ALGORITHM_ID, _json(_redact_sensitive(dict(snapshot))), current),
             )
 
     def read_gateway_snapshot(self, key: str) -> dict[str, Any]:
@@ -1004,6 +1296,114 @@ class MetaStrategyJobRepository:
 
     def gateway_store(self) -> MetaStrategyPaperGatewayStore:
         return MetaStrategyPaperGatewayStore(self)
+
+    def read_paper_trading_control(
+        self,
+        *,
+        algorithm_id: str = ALGORITHM_ID,
+        capital_partition_id: str = META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+    ) -> MetaStrategyPaperTradingControlRecord | None:
+        _validate_meta_strategy_control_owner(algorithm_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM meta_strategy_paper_trading_control
+                WHERE algorithm_id = ? AND capital_partition_id = ?
+                """,
+                (ALGORITHM_ID, capital_partition_id),
+            ).fetchone()
+        return _paper_control_from_row(row) if row is not None else None
+
+    def update_paper_trading_control(
+        self,
+        *,
+        new_paper_entries_enabled: bool,
+        updated_by: str,
+        reason: str,
+        expected_version: int | None = None,
+        algorithm_id: str = ALGORITHM_ID,
+        capital_partition_id: str = META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+        now: datetime | None = None,
+    ) -> MetaStrategyPaperTradingControlRecord:
+        _validate_meta_strategy_control_owner(algorithm_id)
+        current = _dt(now or _utc_now())
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT *
+                FROM meta_strategy_paper_trading_control
+                WHERE algorithm_id = ? AND capital_partition_id = ?
+                """,
+                (ALGORITHM_ID, capital_partition_id),
+            ).fetchone()
+            current_version = int(row["version"]) if row is not None else 0
+            if expected_version is not None and int(expected_version) != current_version:
+                raise ValueError("meta_strategy.paper_control.version_conflict")
+            next_version = current_version + 1
+            conn.execute(
+                """
+                INSERT INTO meta_strategy_paper_trading_control(
+                    algorithm_id, capital_partition_id, new_paper_entries_enabled,
+                    updated_at, updated_by, reason, version
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(algorithm_id, capital_partition_id) DO UPDATE SET
+                    new_paper_entries_enabled = excluded.new_paper_entries_enabled,
+                    updated_at = excluded.updated_at,
+                    updated_by = excluded.updated_by,
+                    reason = excluded.reason,
+                    version = excluded.version
+                """,
+                (
+                    ALGORITHM_ID,
+                    capital_partition_id,
+                    int(bool(new_paper_entries_enabled)),
+                    current,
+                    updated_by,
+                    reason,
+                    next_version,
+                ),
+            )
+            updated = conn.execute(
+                """
+                SELECT *
+                FROM meta_strategy_paper_trading_control
+                WHERE algorithm_id = ? AND capital_partition_id = ?
+                """,
+                (ALGORITHM_ID, capital_partition_id),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO meta_strategy_operational_events(
+                    event_id, algorithm_id, event_type, status, correlation_id, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"meta_strategy.operational.paper_control.state_transition.{_stable_hash({'partition': capital_partition_id, 'version': next_version})}",
+                    ALGORITHM_ID,
+                    "paper_control.state_transition",
+                    "RECORDED",
+                    capital_partition_id,
+                    _json(
+                        _redact_sensitive(
+                            {
+                                "algorithmId": ALGORITHM_ID,
+                                "capitalPartitionId": capital_partition_id,
+                                "newPaperEntriesEnabled": bool(new_paper_entries_enabled),
+                                "updatedAt": current,
+                                "updatedBy": updated_by,
+                                "reason": reason,
+                                "version": next_version,
+                            }
+                        )
+                    ),
+                    current,
+                ),
+            )
+        return _paper_control_from_row(updated)
 
     def record_broker_event(self, event: Mapping[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
         current = _dt(now or _utc_now())
@@ -1040,7 +1440,7 @@ class MetaStrategyJobRepository:
                     str(payload.get("orderIntentId") or ""),
                     str(payload.get("eventType") or payload.get("type") or "order"),
                     str(payload.get("status") or "").upper(),
-                    _json(payload),
+                    _json(_redact_sensitive(payload)),
                     current,
                 ),
             )
@@ -1073,7 +1473,7 @@ class MetaStrategyJobRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (record_id, ALGORITHM_ID, evidence_type, client_order_id, broker_order_id, order_intent_id, status, _json(dict(payload)), current),
+                (record_id, ALGORITHM_ID, evidence_type, client_order_id, broker_order_id, order_intent_id, status, _json(_redact_sensitive(dict(payload))), current),
             )
 
     def record_job_progress(
@@ -1095,7 +1495,7 @@ class MetaStrategyJobRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (job_id, ALGORITHM_ID, worker_id, status.upper(), float(progress_percent), _json(dict(payload or {})), current),
+                (job_id, ALGORITHM_ID, worker_id, status.upper(), float(progress_percent), _json(_redact_sensitive(dict(payload or {}))), current),
             )
 
     def job_progress(self, job_id: str) -> tuple[dict[str, Any], ...]:
@@ -1591,6 +1991,43 @@ class MetaStrategyJobRepository:
                 "SELECT COUNT(*) AS count, MAX(created_at) AS latest FROM meta_strategy_paper_broker_events WHERE algorithm_id = ?",
                 (ALGORITHM_ID,),
             ).fetchone()
+            outcome_rows = conn.execute(
+                """
+                SELECT outcome, COUNT(*) AS count
+                FROM meta_strategy_finalized_candle_outcomes
+                WHERE algorithm_id = ?
+                GROUP BY outcome
+                """,
+                (ALGORITHM_ID,),
+            ).fetchall()
+            outbox_payload_rows = conn.execute(
+                """
+                SELECT status, payload_json, created_at
+                FROM meta_strategy_execution_outbox
+                WHERE algorithm_id = ?
+                ORDER BY created_at DESC
+                LIMIT 500
+                """,
+                (ALGORITHM_ID,),
+            ).fetchall()
+            gateway_rows = conn.execute(
+                """
+                SELECT snapshot_key, payload_json, updated_at
+                FROM meta_strategy_paper_gateway_snapshots
+                WHERE algorithm_id = ?
+                """,
+                (ALGORITHM_ID,),
+            ).fetchall()
+            paper_control_rows = conn.execute(
+                """
+                SELECT payload_json, created_at
+                FROM meta_strategy_operational_events
+                WHERE algorithm_id = ? AND event_type = 'paper_control.state_transition'
+                ORDER BY created_at ASC, event_id ASC
+                LIMIT 250
+                """,
+                (ALGORITHM_ID,),
+            ).fetchall()
         queue_counts: dict[str, dict[str, int]] = {}
         for row in job_rows:
             queue = str(row["queue_name"])
@@ -1606,6 +2043,7 @@ class MetaStrategyJobRepository:
         }
         decision_data_ages: list[float] = []
         decision_latencies: list[float] = []
+        quote_ages: list[float] = []
         blocked_reasons: dict[str, int] = {}
         decision_counts = {"BUY": 0, "SELL": 0, "HOLD": 0, "BLOCKED": 0}
         no_trade_reasons: dict[str, int] = {}
@@ -1618,6 +2056,9 @@ class MetaStrategyJobRepository:
             payload = json.loads(str(row["payload_json"]))
             if payload.get("dataAgeSeconds") is not None:
                 decision_data_ages.append(float(payload["dataAgeSeconds"]))
+            quote_age = _decision_quote_age_seconds(payload, current)
+            if quote_age is not None:
+                quote_ages.append(quote_age)
             latency = payload.get("processingLatencyMs", payload.get("latencyMs"))
             if latency is not None:
                 decision_latencies.append(float(latency))
@@ -1651,6 +2092,16 @@ class MetaStrategyJobRepository:
         reconciliation_latest = reconciliation[0]["created_at"] if reconciliation else None
         inventory_mismatch_count = sum(1 for row in reconciliation if str(row["status"]).upper() == "QUARANTINED")
         lease_counts = {str(row["event_type"]): int(row["count"]) for row in lease_recoveries}
+        outcome_counts = {str(row["outcome"]): int(row["count"]) for row in outcome_rows}
+        outbox_payloads = tuple(json.loads(str(row["payload_json"])) for row in outbox_payload_rows)
+        rejected_entry_reasons = _rejected_entry_reasons(outbox_payload_rows)
+        duplicate_order_attempts = _duplicate_order_attempts(outbox_payloads)
+        unknown_broker_outcomes = sum(1 for row in outbox_payload_rows if str(row["status"]).upper() == "RECONCILIATION_REQUIRED")
+        broker_clock_ages = _broker_clock_ages(gateway_rows, current)
+        paper_toggle_transitions = tuple(
+            _paper_toggle_transition_from_metric_row(row)
+            for row in paper_control_rows
+        )
         return {
             "algorithmId": ALGORITHM_ID,
             "asOf": _dt(current),
@@ -1663,8 +2114,12 @@ class MetaStrategyJobRepository:
             "jobDeadLetterCount": sum(counts.get("dead_letter", 0) for counts in queue_counts.values()),
             "snapshotDataAgeSeconds": _summary(decision_data_ages),
             "decisionLatencyMs": _summary(decision_latencies),
+            "quoteAgeSeconds": _summary(quote_ages),
+            "brokerClockAgeSeconds": _summary(broker_clock_ages),
             "decisionCountsByAction": decision_counts,
+            "finalizedCandleOutcomeCounts": outcome_counts,
             "blockedDecisionReasonCounts": blocked_reasons,
+            "rejectedEntriesByReason": rejected_entry_reasons,
             "noTradeReasonCounts": no_trade_reasons,
             "strategySignalCounts": strategy_signal_counts,
             "strategyAbstentionCounts": strategy_abstention_counts,
@@ -1677,6 +2132,11 @@ class MetaStrategyJobRepository:
             "reconciliationLagSeconds": _age_seconds(reconciliation_latest, current) if reconciliation_latest else 0,
             "openOrderAgeSeconds": max((item["oldestAgeSeconds"] for status, item in outbox.items() if status in {"SUBMITTED", "OPEN", "ACKNOWLEDGED", "RECONCILIATION_REQUIRED"}), default=0),
             "inventoryMismatchCount": inventory_mismatch_count,
+            "inventoryDivergence": {"count": inventory_mismatch_count, "quarantinedReconciliationEvents": inventory_mismatch_count},
+            "duplicateOrderAttempts": duplicate_order_attempts,
+            "riskReservations": _risk_reservation_summary(outbox_payloads),
+            "unknownBrokerOutcomes": unknown_broker_outcomes,
+            "paperToggleStateTransitions": paper_toggle_transitions,
             "brokerEventCount": int(broker_events["count"]) if broker_events else 0,
             "latestBrokerEventAt": broker_events["latest"] if broker_events else None,
         }
@@ -1713,6 +2173,15 @@ class MetaStrategyJobRepository:
 
     def _recover_expired_outbox_leases(self, conn: sqlite3.Connection, *, now: datetime) -> None:
         current = _dt(now)
+        expired = conn.execute(
+            """
+            SELECT *
+            FROM meta_strategy_execution_outbox
+            WHERE algorithm_id = ? AND status = ? AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            """,
+            (ALGORITHM_ID, "SUBMITTING", current),
+        ).fetchall()
         cursor = conn.execute(
             """
             UPDATE meta_strategy_execution_outbox
@@ -1723,6 +2192,16 @@ class MetaStrategyJobRepository:
             ("RETRY", current, ALGORITHM_ID, "SUBMITTING", current),
         )
         if cursor.rowcount:
+            for row in expired:
+                _record_outbox_transition(
+                    conn,
+                    outbox_id=str(row["outbox_id"]),
+                    payload=json.loads(str(row["payload_json"])),
+                    previous_status="SUBMITTING",
+                    next_status="RETRY",
+                    reason_codes=("meta_strategy.outbox.expired_submission_lease_recovered",),
+                    transitioned_at=current,
+                )
             conn.execute(
                 """
                 INSERT INTO meta_strategy_operational_events(
@@ -1824,6 +2303,7 @@ def migrate_meta_strategy_job_database(path: str | Path) -> None:
 
 
 def apply_meta_strategy_job_migrations(conn: sqlite3.Connection) -> None:
+    apply_meta_strategy_persistence_migrations(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1965,6 +2445,43 @@ def apply_meta_strategy_job_migrations(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta_strategy_execution_outbox_transitions (
+            transition_id TEXT PRIMARY KEY,
+            outbox_id TEXT NOT NULL,
+            algorithm_id TEXT NOT NULL,
+            capital_partition_id TEXT NOT NULL,
+            decision_id TEXT NOT NULL,
+            order_intent_id TEXT NOT NULL,
+            previous_status TEXT,
+            next_status TEXT NOT NULL,
+            reason_codes_json TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            transitioned_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta_strategy_finalized_candle_outcomes (
+            event_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            decision_id TEXT NOT NULL,
+            order_intent_id TEXT NOT NULL,
+            client_order_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            bar_end TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            reason_codes_json TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     _ensure_columns(
         conn,
         "meta_strategy_worker_decisions",
@@ -1994,6 +2511,20 @@ def apply_meta_strategy_job_migrations(conn: sqlite3.Connection) -> None:
             algorithm_id TEXT NOT NULL,
             payload_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta_strategy_paper_trading_control (
+            algorithm_id TEXT NOT NULL,
+            capital_partition_id TEXT NOT NULL,
+            new_paper_entries_enabled INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            PRIMARY KEY (algorithm_id, capital_partition_id)
         )
         """
     )
@@ -2136,9 +2667,19 @@ def apply_meta_strategy_job_migrations(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_strategy_worker_decisions_event ON meta_strategy_worker_decisions(algorithm_id, event_id)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_strategy_worker_decisions_idempotency ON meta_strategy_worker_decisions(algorithm_id, idempotency_key)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_strategy_outbox_order_intent ON meta_strategy_execution_outbox(algorithm_id, order_intent_id)")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_strategy_outbox_client_order_id
+        ON meta_strategy_execution_outbox(algorithm_id, client_order_id)
+        WHERE client_order_id IS NOT NULL AND client_order_id <> ''
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_strategy_outbox_status ON meta_strategy_execution_outbox(algorithm_id, status, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_strategy_outbox_client_order ON meta_strategy_execution_outbox(algorithm_id, client_order_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_strategy_outbox_transitions_owned ON meta_strategy_execution_outbox_transitions(algorithm_id, outbox_id, transitioned_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_strategy_candle_outcomes_owned ON meta_strategy_finalized_candle_outcomes(algorithm_id, outcome, updated_at)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_strategy_gateway_snapshots_owned ON meta_strategy_paper_gateway_snapshots(algorithm_id, snapshot_key)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_strategy_paper_control_partition ON meta_strategy_paper_trading_control(algorithm_id, capital_partition_id)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_strategy_broker_events_owned ON meta_strategy_paper_broker_events(algorithm_id, broker_event_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_strategy_job_progress_job ON meta_strategy_job_progress(algorithm_id, job_id, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_strategy_workflow_artifacts_job ON meta_strategy_workflow_artifacts(algorithm_id, job_id, created_at)")
@@ -2161,6 +2702,23 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: Mapping[str, 
     for column, ddl in columns.items():
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def _validate_meta_strategy_control_owner(algorithm_id: str) -> None:
+    if algorithm_id != ALGORITHM_ID:
+        raise ValueError("meta_strategy.paper_control.foreign_algorithm_rejected")
+
+
+def _paper_control_from_row(row: sqlite3.Row) -> MetaStrategyPaperTradingControlRecord:
+    return MetaStrategyPaperTradingControlRecord(
+        algorithm_id=str(row["algorithm_id"]),
+        capital_partition_id=str(row["capital_partition_id"]),
+        new_paper_entries_enabled=bool(row["new_paper_entries_enabled"]),
+        updated_at=str(row["updated_at"]),
+        updated_by=str(row["updated_by"]),
+        reason=str(row["reason"]),
+        version=int(row["version"]),
+    )
 
 
 def _job_from_row(row: sqlite3.Row, *, duplicate: bool = False) -> MetaStrategyJobRecord:
@@ -2395,6 +2953,210 @@ def _position_exit_outbox_payload(
     return normalized
 
 
+def _persist_runtime_decision_projection_records(
+    conn: sqlite3.Connection,
+    decision_payload: Mapping[str, Any],
+    *,
+    decision_id: str,
+    timestamp: str,
+) -> dict[str, Any]:
+    records = _runtime_decision_projection_payloads(decision_payload, decision_id=decision_id, timestamp=timestamp)
+    persisted: dict[str, list[str]] = {}
+    for artifact_type, payloads in records.items():
+        artifact_records: list[str] = []
+        for payload in payloads:
+            record_id = _runtime_projection_record_id(artifact_type, payload)
+            record = persist_meta_strategy_projection_record(conn, artifact_type, payload, record_id=record_id)
+            artifact_records.append(record.record_id)
+        persisted[artifact_type] = artifact_records
+    return {
+        "status": "PERSISTED",
+        "reasonCodes": ("meta_strategy.runtime_projection.persisted",),
+        "recordCounts": {artifact_type: len(record_ids) for artifact_type, record_ids in persisted.items()},
+        "recordIds": persisted,
+    }
+
+
+def _runtime_decision_projection_payloads(
+    decision_payload: Mapping[str, Any],
+    *,
+    decision_id: str,
+    timestamp: str,
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    base = _runtime_projection_base(decision_payload, decision_id=decision_id, timestamp=timestamp)
+    stages = decision_payload.get("stages") if isinstance(decision_payload.get("stages"), Mapping) else {}
+    strategy_stage = dict(stages.get("strategyEvidence") or {}) if isinstance(stages, Mapping) else {}
+    strategy_evidence = strategy_stage.get("evidence") if isinstance(strategy_stage.get("evidence"), Mapping) else {}
+    strategy_outputs = tuple(
+        _runtime_projection_payload(
+            base,
+            artifact_type="strategy_outputs",
+            status=str(output.get("status") or strategy_stage.get("status") or "PERSISTED"),
+            payload={
+                "stage": "strategies",
+                "stageResult": strategy_stage,
+                "strategyOutput": dict(output),
+            },
+            artifact_id=str(output.get("strategyId") or output.get("strategy_id") or f"strategy-{index}"),
+        )
+        for index, output in enumerate(strategy_evidence.get("strategyOutputs") or strategy_evidence.get("strategy_outputs") or ())
+        if isinstance(output, Mapping)
+    )
+    aggregation_stage = dict(stages.get("aggregateCandidate") or {}) if isinstance(stages, Mapping) else {}
+    aggregation_evidence = aggregation_stage.get("evidence") if isinstance(aggregation_stage.get("evidence"), Mapping) else {}
+    family_score_payloads = _family_score_projection_payloads(base, aggregation_stage, aggregation_evidence)
+    return {
+        "decisions": (
+            _runtime_projection_payload(
+                base,
+                artifact_type="decisions",
+                status=str(decision_payload.get("decisionStatus") or decision_payload.get("decision_status") or "PERSISTED"),
+                payload={
+                    "runtimeDecision": dict(decision_payload),
+                    "stages": stages,
+                },
+            ),
+        ),
+        "market_snapshots": (
+            _runtime_projection_payload(
+                base,
+                artifact_type="market_snapshots",
+                status=str((stages.get("snapshot") or {}).get("status") or "PERSISTED"),
+                payload={
+                    "stage": "market_snapshot",
+                    "stageResult": stages.get("snapshot") if isinstance(stages, Mapping) else {},
+                    "authoritativeState": decision_payload.get("authoritativeState") or {},
+                    "sourceVersions": decision_payload.get("sourceVersions") or {},
+                    "sourceTimestamps": decision_payload.get("sourceTimestamps") or {},
+                },
+            ),
+        ),
+        "strategy_outputs": strategy_outputs
+        or (
+            _runtime_projection_payload(
+                base,
+                artifact_type="strategy_outputs",
+                status=str(strategy_stage.get("status") or "BLOCKED"),
+                payload={"stage": "strategies", "stageResult": strategy_stage},
+            ),
+        ),
+        "family_scores": family_score_payloads,
+    }
+
+
+def _runtime_projection_base(decision_payload: Mapping[str, Any], *, decision_id: str, timestamp: str) -> dict[str, Any]:
+    stages = decision_payload.get("stages") if isinstance(decision_payload.get("stages"), Mapping) else {}
+    snapshot_stage = stages.get("snapshot") if isinstance(stages, Mapping) and isinstance(stages.get("snapshot"), Mapping) else {}
+    snapshot_id = str(
+        decision_payload.get("snapshotId")
+        or decision_payload.get("snapshot_id")
+        or snapshot_stage.get("snapshotId")
+        or snapshot_stage.get("snapshot_id")
+        or decision_id
+    )
+    return {
+        "algorithmId": ALGORITHM_ID,
+        "capitalPartitionId": str(decision_payload.get("capitalPartitionId") or decision_payload.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),
+        "algorithmVersion": str(decision_payload.get("algorithmVersion") or decision_payload.get("algorithm_version") or META_STRATEGY_ALGORITHM_VERSION),
+        "settingsVersion": str(decision_payload.get("settingsVersion") or decision_payload.get("settings_version") or ""),
+        "strategyCatalogVersion": str(decision_payload.get("strategyCatalogVersion") or decision_payload.get("strategy_catalog_version") or META_STRATEGY_STRATEGY_CATALOG_VERSION),
+        "featureSchemaVersion": str(decision_payload.get("featureSchemaVersion") or decision_payload.get("feature_schema_version") or META_STRATEGY_FEATURE_SCHEMA_VERSION),
+        "modelVersion": str(decision_payload.get("modelVersion") or decision_payload.get("model_version") or META_STRATEGY_MODEL_VERSION),
+        "timestamp": str(decision_payload.get("barEnd") or decision_payload.get("bar_end") or timestamp),
+        "createdAt": timestamp,
+        "updatedAt": timestamp,
+        "symbol": str(decision_payload.get("symbol") or "UNKNOWN").upper(),
+        "barEnd": str(decision_payload.get("barEnd") or decision_payload.get("bar_end") or ""),
+        "decisionId": decision_id,
+        "idempotencyKey": str(decision_payload.get("idempotencyKey") or decision_payload.get("idempotency_key") or decision_payload.get("correlationId") or decision_id),
+        "jobId": str(decision_payload.get("jobId") or decision_payload.get("job_id") or ""),
+        "eventId": str(decision_payload.get("eventId") or decision_payload.get("event_id") or ""),
+        "snapshotId": snapshot_id,
+        "mode": str(decision_payload.get("mode") or decision_payload.get("runtimeMode") or decision_payload.get("runtime_mode") or ""),
+        "effectiveSettingsHash": decision_payload.get("effectiveSettingsHash"),
+    }
+
+
+def _runtime_projection_payload(
+    base: Mapping[str, Any],
+    *,
+    artifact_type: str,
+    status: str,
+    payload: Mapping[str, Any],
+    artifact_id: str = "",
+) -> dict[str, Any]:
+    return {
+        **dict(base),
+        "artifactType": artifact_type,
+        "artifactId": artifact_id,
+        "status": status,
+        "payload": dict(payload),
+    }
+
+
+def _family_score_projection_payloads(
+    base: Mapping[str, Any],
+    aggregation_stage: Mapping[str, Any],
+    aggregation_evidence: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    family_scores = aggregation_evidence.get("familyScores") or aggregation_evidence.get("family_scores") or {}
+    payloads: list[dict[str, Any]] = []
+    if isinstance(family_scores, Mapping):
+        for family, score in sorted(family_scores.items()):
+            payloads.append(
+                _runtime_projection_payload(
+                    base,
+                    artifact_type="family_scores",
+                    status=str(aggregation_stage.get("status") or "PERSISTED"),
+                    payload={
+                        "stage": "family_aggregation",
+                        "family": str(family),
+                        "score": score,
+                        "stageResult": aggregation_stage,
+                    },
+                    artifact_id=str(family),
+                )
+            )
+    elif isinstance(family_scores, list):
+        for index, score in enumerate(family_scores):
+            if isinstance(score, Mapping):
+                family = str(score.get("family") or score.get("familyId") or score.get("family_id") or f"family-{index}")
+                payloads.append(
+                    _runtime_projection_payload(
+                        base,
+                        artifact_type="family_scores",
+                        status=str(aggregation_stage.get("status") or "PERSISTED"),
+                        payload={"stage": "family_aggregation", "family": family, "score": dict(score), "stageResult": aggregation_stage},
+                        artifact_id=family,
+                    )
+                )
+    if payloads:
+        return tuple(payloads)
+    return (
+        _runtime_projection_payload(
+            base,
+            artifact_type="family_scores",
+            status=str(aggregation_stage.get("status") or "BLOCKED"),
+            payload={"stage": "family_aggregation", "stageResult": dict(aggregation_stage)},
+            artifact_id="aggregate",
+        ),
+    )
+
+
+def _runtime_projection_record_id(artifact_type: str, payload: Mapping[str, Any]) -> str:
+    artifact_id = str(payload.get("artifactId") or payload.get("artifact_id") or "aggregate")
+    digest = _stable_hash(
+        {
+            "artifactType": artifact_type,
+            "decisionId": payload.get("decisionId"),
+            "snapshotId": payload.get("snapshotId"),
+            "artifactId": artifact_id,
+            "payload": payload.get("payload"),
+        }
+    )
+    return f"meta_strategy.{artifact_type}.{payload.get('decisionId')}.{artifact_id}.{digest}"
+
+
 def _causal_ids(
     value: Any,
     *,
@@ -2415,9 +3177,435 @@ def _causal_ids(
     return causal
 
 
+def _persist_atomic_inventory_order_intent(
+    conn: sqlite3.Connection,
+    order_payload: Mapping[str, Any],
+    *,
+    decision_payload: Mapping[str, Any],
+    timestamp: str,
+) -> dict[str, Any]:
+    payload = _atomic_inventory_payload(order_payload, decision_payload=decision_payload, timestamp=timestamp)
+    if str(payload.get("capitalPartitionId") or payload.get("capital_partition_id") or "") != META_STRATEGY_DEFAULT_CAPITAL_PARTITION:
+        payload["atomicPersistence"] = {
+            "decisionRecordPersisted": True,
+            "orderIntentPersisted": False,
+            "riskReservationPersisted": False,
+            "outboxPersisted": True,
+            "persistedAt": timestamp,
+            "reasonCodes": ("meta_strategy.atomic_persistence.wrong_capital_partition_deferred_to_execution_guard",),
+        }
+        return payload
+    intent_type = _intent_type(payload)
+    reserved_risk = _float_value(payload, "reservedRiskDollars", "reserved_risk_dollars")
+    if intent_type == "new_entry" and reserved_risk <= 0.0:
+        raise ValueError("meta_strategy.atomic_persistence.new_entry_risk_reservation_required")
+    metadata = _inventory_metadata(payload)
+    order_record_id = f"meta_strategy_inventory_order_intents.{metadata['decision_id']}.{metadata['order_intent_id']}"
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO meta_strategy_inventory_order_intents (
+            record_id, algorithm_id, capital_partition_id, settings_version, correlation_id,
+            decision_id, job_id, event_id, order_intent_id, client_order_id, broker_order_id,
+            broker_fill_id, symbol, side, quantity, price, status, realised_pnl, timestamp, payload_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        _inventory_insert_values(order_record_id, metadata, payload),
+    )
+    if intent_type != "new_entry" or reserved_risk <= 0.0:
+        return payload
+    reservation_payload = {
+        **payload,
+        "reservedRiskDelta": reserved_risk,
+        "reservationStatus": "RESERVED",
+        "atomicPersistence": {
+            "decisionId": metadata["decision_id"],
+            "orderIntentId": metadata["order_intent_id"],
+            "persistedAt": timestamp,
+            "reasonCodes": ("meta_strategy.atomic_persistence.risk_reserved_with_decision",),
+        },
+    }
+    reservation_metadata = _inventory_metadata(reservation_payload)
+    reservation_record_id = f"meta_strategy_inventory_reserved_risk.{reservation_metadata['decision_id']}.{reservation_metadata['order_intent_id']}.reserved"
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO meta_strategy_inventory_reserved_risk (
+            record_id, algorithm_id, capital_partition_id, settings_version, correlation_id,
+            decision_id, job_id, event_id, order_intent_id, client_order_id, broker_order_id,
+            broker_fill_id, symbol, side, quantity, price, status, realised_pnl, timestamp, payload_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        _inventory_insert_values(reservation_record_id, reservation_metadata, reservation_payload),
+    )
+    return payload
+
+
+def _atomic_inventory_payload(order_payload: Mapping[str, Any], *, decision_payload: Mapping[str, Any], timestamp: str) -> dict[str, Any]:
+    payload = dict(order_payload)
+    stages = dict(decision_payload.get("stages") or {})
+    payload["algorithmId"] = ALGORITHM_ID
+    payload["algorithm_id"] = ALGORITHM_ID
+    payload["capitalPartitionId"] = str(payload.get("capitalPartitionId") or payload.get("capital_partition_id") or decision_payload.get("capitalPartitionId") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+    payload["capital_partition_id"] = payload["capitalPartitionId"]
+    payload["decisionId"] = str(payload.get("decisionId") or decision_payload.get("decisionId") or "")
+    payload["decision_id"] = payload["decisionId"]
+    payload["eventId"] = str(payload.get("eventId") or decision_payload.get("eventId") or "")
+    payload["event_id"] = payload["eventId"]
+    payload["jobId"] = str(payload.get("jobId") or decision_payload.get("jobId") or "")
+    payload["job_id"] = payload["jobId"]
+    payload["settingsVersion"] = str(payload.get("settingsVersion") or decision_payload.get("settingsVersion") or "")
+    payload["settings_version"] = payload["settingsVersion"]
+    payload["effectiveSettingsHash"] = str(payload.get("effectiveSettingsHash") or decision_payload.get("effectiveSettingsHash") or "")
+    payload["effective_settings_hash"] = payload["effectiveSettingsHash"]
+    payload["modelVersion"] = str(payload.get("modelVersion") or decision_payload.get("modelVersion") or "none")
+    payload["model_version"] = payload["modelVersion"]
+    payload["strategyEvidence"] = stages.get("strategyEvidence")
+    payload["hardSafetyResult"] = stages.get("safetyResult")
+    payload["localGateResult"] = stages.get("localRisk")
+    payload["sizingResult"] = stages.get("sizing")
+    payload["globalRiskResult"] = dict((decision_payload.get("authoritativeState") or {}).get("globalRiskSnapshot") or {})
+    payload["atomicPersistence"] = {
+        "decisionRecordPersisted": True,
+        "orderIntentPersisted": True,
+        "riskReservationPersisted": _intent_type(payload) != "new_entry" or _float_value(payload, "reservedRiskDollars", "reserved_risk_dollars") > 0.0,
+        "outboxPersisted": True,
+        "persistedAt": timestamp,
+        "reasonCodes": ("meta_strategy.atomic_persistence.decision_order_reservation_outbox_committed",),
+    }
+    payload["timestamp"] = str(payload.get("timestamp") or timestamp)
+    return payload
+
+
+def _inventory_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
+    algorithm_id = str(payload.get("algorithmId") or payload.get("algorithm_id") or "")
+    capital_partition_id = str(payload.get("capitalPartitionId") or payload.get("capital_partition_id") or "")
+    if algorithm_id != ALGORITHM_ID:
+        raise ValueError("meta_strategy.atomic_persistence.foreign_algorithm_rejected")
+    if capital_partition_id != META_STRATEGY_DEFAULT_CAPITAL_PARTITION:
+        raise ValueError("meta_strategy.atomic_persistence.wrong_capital_partition")
+    return {
+        "capital_partition_id": capital_partition_id,
+        "settings_version": str(payload.get("settingsVersion") or payload.get("settings_version") or ""),
+        "correlation_id": str(payload.get("correlationId") or payload.get("correlation_id") or payload.get("orderIntentId") or payload.get("decisionId") or ""),
+        "decision_id": str(payload.get("decisionId") or payload.get("decision_id") or ""),
+        "job_id": str(payload.get("jobId") or payload.get("job_id") or ""),
+        "event_id": str(payload.get("eventId") or payload.get("event_id") or ""),
+        "order_intent_id": str(payload.get("orderIntentId") or payload.get("order_intent_id") or ""),
+        "client_order_id": str(payload.get("clientOrderId") or payload.get("client_order_id") or ""),
+        "broker_order_id": str(payload.get("brokerOrderId") or payload.get("broker_order_id") or ""),
+        "broker_fill_id": str(payload.get("brokerFillId") or payload.get("broker_fill_id") or ""),
+        "symbol": str(payload.get("symbol") or "UNKNOWN").upper(),
+        "side": str(payload.get("side") or "").upper(),
+        "quantity": _float_value(payload, "filledQuantity", "filled_quantity", "quantity", "orderQuantity"),
+        "price": _float_value(payload, "fillPrice", "price", "averageFillPrice", "limitPrice"),
+        "status": str(payload.get("orderStatus") or payload.get("order_status") or payload.get("status") or "PENDING").upper(),
+        "realised_pnl": _float_value(payload, "realisedPnl", "realizedPnl"),
+        "timestamp": str(payload.get("timestamp") or payload.get("createdAt") or ""),
+    }
+
+
+def _inventory_insert_values(record_id: str, metadata: Mapping[str, Any], payload: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        record_id,
+        ALGORITHM_ID,
+        metadata["capital_partition_id"],
+        metadata["settings_version"],
+        metadata["correlation_id"],
+        metadata["decision_id"],
+        metadata["job_id"],
+        metadata["event_id"],
+        metadata["order_intent_id"],
+        metadata["client_order_id"],
+        metadata["broker_order_id"],
+        metadata["broker_fill_id"],
+        metadata["symbol"],
+        metadata["side"],
+        metadata["quantity"],
+        metadata["price"],
+        metadata["status"],
+        metadata["realised_pnl"],
+        metadata["timestamp"],
+        _json(payload),
+    )
+
+
+def _record_outbox_transition(
+    conn: sqlite3.Connection,
+    *,
+    outbox_id: str,
+    payload: Mapping[str, Any],
+    previous_status: str | None,
+    next_status: str,
+    reason_codes: Sequence[str],
+    transitioned_at: str,
+) -> None:
+    capital_partition_id = str(payload.get("capitalPartitionId") or payload.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+    decision_id = str(payload.get("decisionId") or payload.get("decision_id") or "")
+    order_intent_id = str(payload.get("orderIntentId") or payload.get("order_intent_id") or "")
+    stable = (outbox_id, previous_status or "", next_status, transitioned_at, tuple(reason_codes))
+    transition_id = f"meta_strategy.outbox_transition.{_stable_hash(stable)}"
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO meta_strategy_execution_outbox_transitions (
+            transition_id, outbox_id, algorithm_id, capital_partition_id, decision_id, order_intent_id,
+            previous_status, next_status, reason_codes_json, payload_json, transitioned_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            transition_id,
+            outbox_id,
+            ALGORITHM_ID,
+            capital_partition_id,
+            decision_id,
+            order_intent_id,
+            previous_status,
+            next_status,
+            _json(tuple(reason_codes)),
+            _json(_redact_sensitive(dict(payload))),
+            transitioned_at,
+        ),
+    )
+
+
+def _record_outcome_for_outbox_status(
+    conn: sqlite3.Connection,
+    *,
+    row: sqlite3.Row,
+    payload: Mapping[str, Any],
+    status: str,
+    transitioned_at: str,
+) -> None:
+    outcome = _outbox_status_terminal_outcome(status)
+    if outcome is None:
+        return
+    event_id = str(payload.get("eventId") or payload.get("event_id") or row["event_id"])
+    if not event_id:
+        return
+    _upsert_finalized_candle_outcome(
+        conn,
+        _finalized_candle_outcome_payload(
+            event_id=event_id,
+            outcome=outcome,
+            payload=_outbox_outcome_audit_payload(payload, status=status),
+            job_id=str(payload.get("jobId") or payload.get("job_id") or row["job_id"]),
+            decision_id=str(payload.get("decisionId") or payload.get("decision_id") or row["decision_id"]),
+            order_intent_id=str(payload.get("orderIntentId") or payload.get("order_intent_id") or row["order_intent_id"]),
+            client_order_id=str(payload.get("clientOrderId") or payload.get("client_order_id") or row["client_order_id"] or ""),
+            symbol=str(payload.get("symbol") or ""),
+            bar_end=str(payload.get("barEnd") or payload.get("bar_end") or payload.get("eventTimestamp") or row["event_timestamp"] or ""),
+            reason_codes=tuple(str(code) for code in payload.get("reasonCodes") or payload.get("reason_codes") or ()),
+        ),
+        timestamp=transitioned_at,
+    )
+
+
+def _upsert_finalized_candle_outcome(conn: sqlite3.Connection, payload: Mapping[str, Any], *, timestamp: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO meta_strategy_finalized_candle_outcomes(
+            event_id, algorithm_id, job_id, decision_id, order_intent_id, client_order_id,
+            symbol, bar_end, schema_version, outcome, reason_codes_json, payload_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+            job_id = excluded.job_id,
+            decision_id = excluded.decision_id,
+            order_intent_id = excluded.order_intent_id,
+            client_order_id = excluded.client_order_id,
+            symbol = excluded.symbol,
+            bar_end = excluded.bar_end,
+            schema_version = excluded.schema_version,
+            outcome = excluded.outcome,
+            reason_codes_json = excluded.reason_codes_json,
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            str(payload["eventId"]),
+            ALGORITHM_ID,
+            str(payload.get("jobId") or ""),
+            str(payload.get("decisionId") or ""),
+            str(payload.get("orderIntentId") or ""),
+            str(payload.get("clientOrderId") or ""),
+            str(payload.get("symbol") or ""),
+            str(payload.get("barEnd") or ""),
+            str(payload.get("schemaVersion") or META_STRATEGY_FINALIZED_CANDLE_OUTCOME_SCHEMA_VERSION),
+            str(payload["outcome"]),
+            _json(tuple(payload.get("reasonCodes") or ())),
+            _json(_redact_sensitive(payload.get("payload") if isinstance(payload.get("payload"), Mapping) else dict(payload))),
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
+def _finalized_candle_outcome_payload(
+    *,
+    event_id: str,
+    outcome: str,
+    payload: Mapping[str, Any],
+    job_id: str,
+    decision_id: str,
+    order_intent_id: str,
+    client_order_id: str,
+    symbol: str,
+    bar_end: str,
+    reason_codes: Sequence[str],
+) -> dict[str, Any]:
+    normalized_outcome = str(outcome).upper()
+    if normalized_outcome not in META_STRATEGY_FINALIZED_CANDLE_TERMINAL_OUTCOMES:
+        raise ValueError(f"unsupported Meta-Strategy finalized-candle outcome: {outcome}")
+    return {
+        "eventId": str(event_id),
+        "algorithmId": ALGORITHM_ID,
+        "jobId": str(job_id),
+        "decisionId": str(decision_id),
+        "orderIntentId": str(order_intent_id),
+        "clientOrderId": str(client_order_id),
+        "symbol": str(symbol or "UNKNOWN").upper(),
+        "barEnd": str(bar_end),
+        "schemaVersion": META_STRATEGY_FINALIZED_CANDLE_OUTCOME_SCHEMA_VERSION,
+        "outcome": normalized_outcome,
+        "reasonCodes": tuple(dict.fromkeys(str(code) for code in reason_codes)),
+        "payload": _redact_sensitive(dict(payload)),
+    }
+
+
+def _decision_terminal_outcome(payload: Mapping[str, Any], *, order_intent: Mapping[str, Any] | None) -> str:
+    if order_intent is not None:
+        return "ORDER_PROPOSED"
+    status = str(payload.get("decisionStatus") or payload.get("status") or "").upper()
+    reason_codes = tuple(str(code) for code in payload.get("reasonCodes") or payload.get("reason_codes") or ())
+    if payload.get("finalValid") is False or status in {"BLOCKED", "REJECTED"} or any(_blocked_reason(code) for code in reason_codes):
+        return "BLOCKED"
+    return "HOLD"
+
+
+def _outbox_status_terminal_outcome(status: str) -> str | None:
+    normalized = str(status).upper()
+    if normalized in {"SUBMITTED", "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "FILLED"}:
+        return "ORDER_SUBMITTED"
+    if normalized in {"REJECTED", "DEAD_LETTER"}:
+        return "ORDER_REJECTED"
+    if normalized == "RECONCILIATION_REQUIRED":
+        return "RECONCILIATION_REQUIRED"
+    return None
+
+
+def _decision_outcome_audit_payload(payload: Mapping[str, Any], *, order_intent: Mapping[str, Any] | None) -> dict[str, Any]:
+    stages = dict(payload.get("stages") or {})
+    return {
+        "eventId": payload.get("eventId"),
+        "jobId": payload.get("jobId"),
+        "decisionId": payload.get("decisionId"),
+        "orderIntentId": (order_intent or {}).get("orderIntentId"),
+        "clientOrderId": (order_intent or {}).get("clientOrderId"),
+        "symbol": payload.get("symbol"),
+        "barEnd": payload.get("barEnd"),
+        "dataAgeSeconds": payload.get("dataAgeSeconds"),
+        "settingsVersion": payload.get("settingsVersion"),
+        "modelVersion": payload.get("modelVersion"),
+        "strategyResults": stages.get("strategyEvidence"),
+        "regimeContext": stages.get("regime"),
+        "safetyResult": stages.get("safetyResult"),
+        "familyAggregation": stages.get("aggregateCandidate"),
+        "candidateScore": _candidate_score(stages),
+        "geometry": _stage_or_order(stages, order_intent, "geometry"),
+        "costEstimate": _stage_or_order(stages, order_intent, "costEstimate"),
+        "modelResult": stages.get("modelPrediction"),
+        "localGates": stages.get("localRisk"),
+        "sizingCaps": stages.get("sizing"),
+        "globalRisk": dict((payload.get("authoritativeState") or {}).get("globalRiskSnapshot") or {}),
+        "executionTimeGuard": None,
+        "brokerResult": None,
+        "inventoryResult": dict((payload.get("authoritativeState") or {}).get("inventorySnapshot") or {}),
+        "latencyPerStage": payload.get("latencyMeasurements"),
+        "reasonCodes": tuple(payload.get("reasonCodes") or ()),
+    }
+
+
+def _outbox_outcome_audit_payload(payload: Mapping[str, Any], *, status: str) -> dict[str, Any]:
+    return {
+        **_decision_outcome_audit_payload(payload, order_intent=payload),
+        "orderIntentId": payload.get("orderIntentId") or payload.get("order_intent_id"),
+        "clientOrderId": payload.get("clientOrderId") or payload.get("client_order_id"),
+        "outboxStatus": str(status).upper(),
+        "executionTimeGuard": payload.get("executionGuard"),
+        "brokerResult": payload.get("gatewayResult") or payload.get("brokerResult"),
+        "inventoryResult": payload.get("inventoryResult") or payload.get("inventory") or {},
+        "globalRisk": payload.get("globalApplication") or payload.get("globalRiskResult") or {},
+    }
+
+
+def _candidate_score(stages: Mapping[str, Any]) -> Any:
+    candidate = stages.get("aggregateCandidate") if isinstance(stages.get("aggregateCandidate"), Mapping) else {}
+    for key in ("candidateScore", "winningScore", "edge", "score"):
+        if candidate.get(key) is not None:
+            return candidate.get(key)
+    return None
+
+
+def _stage_or_order(stages: Mapping[str, Any], order_intent: Mapping[str, Any] | None, key: str) -> Any:
+    for stage_name in ("geometry", "orderProposal", "aggregateCandidate"):
+        stage = stages.get(stage_name)
+        if isinstance(stage, Mapping) and stage.get(key) is not None:
+            return stage.get(key)
+    return (order_intent or {}).get(key)
+
+
+def _deterministic_meta_strategy_client_order_id(payload: Mapping[str, Any]) -> str:
+    partition = str(payload.get("capitalPartitionId") or payload.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+    stable = {
+        "algorithmId": ALGORITHM_ID,
+        "capitalPartitionId": partition,
+        "decisionId": payload.get("decisionId"),
+        "orderIntentId": payload.get("orderIntentId") or payload.get("order_intent_id"),
+        "symbol": str(payload.get("symbol") or "").upper(),
+        "side": str(payload.get("side") or "").upper(),
+    }
+    partition_slug = "".join(ch if ch.isalnum() else "-" for ch in partition.lower()).strip("-")
+    return "meta-strategy-" + partition_slug[:24] + "-" + hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:18]
+
+
+def _intent_type(payload: Mapping[str, Any]) -> str:
+    raw = str(payload.get("intent") or payload.get("intentType") or payload.get("orderIntentType") or "new_entry").strip().lower()
+    if raw in {"protective_exit", "end_of_day_liquidation", "risk_reducing", "exit", "close"}:
+        return raw
+    return "new_entry"
+
+
+def _float_value(payload: Mapping[str, Any], *keys: str) -> float:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and value != "":
+            return float(value)
+    return 0.0
+
+
 def _payload_inner_json_safe(payload: Mapping[str, Any]) -> dict[str, Any]:
     nested = payload.get("payload")
     return dict(nested) if isinstance(nested, Mapping) else {}
+
+
+def _finalized_candle_outcome_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "eventId": str(row["event_id"]),
+        "algorithmId": str(row["algorithm_id"]),
+        "jobId": str(row["job_id"]),
+        "decisionId": str(row["decision_id"]),
+        "orderIntentId": str(row["order_intent_id"]),
+        "clientOrderId": str(row["client_order_id"]),
+        "symbol": str(row["symbol"]),
+        "barEnd": str(row["bar_end"]),
+        "schemaVersion": str(row["schema_version"]),
+        "outcome": str(row["outcome"]),
+        "reasonCodes": tuple(json.loads(str(row["reason_codes_json"]))),
+        "payload": json.loads(str(row["payload_json"])),
+        "createdAt": str(row["created_at"]),
+        "updatedAt": str(row["updated_at"]),
+    }
 
 
 def _decision_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -2577,6 +3765,21 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _redact_sensitive(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = str(key).lower().replace("_", "-")
+            if any(fragment in normalized for fragment in ("secret", "api-key", "apikey", "authorization", "auth-header", "password", "token")):
+                redacted[str(key)] = "[REDACTED]"
+            else:
+                redacted[str(key)] = _redact_sensitive(item)
+        return redacted
+    if isinstance(value, (list, tuple)):
+        return [_redact_sensitive(item) for item in value]
+    return value
+
+
 def _dt(value: datetime) -> str:
     return value.astimezone(UTC).isoformat()
 
@@ -2592,6 +3795,15 @@ def _age_seconds(value: str | None, now: datetime) -> int:
     return int(max(0.0, (now - _parse_dt(str(value))).total_seconds()))
 
 
+def _optional_age_seconds(value: Any, now: datetime) -> float | None:
+    if not value:
+        return None
+    try:
+        return float(max(0.0, (now - _parse_dt(str(value))).total_seconds()))
+    except Exception:
+        return None
+
+
 def _summary(values: Sequence[float]) -> dict[str, float | int | None]:
     if not values:
         return {"count": 0, "min": None, "max": None, "avg": None}
@@ -2601,6 +3813,73 @@ def _summary(values: Sequence[float]) -> dict[str, float | int | None]:
         "max": max(values),
         "avg": sum(values) / len(values),
     }
+
+
+def _decision_quote_age_seconds(payload: Mapping[str, Any], now: datetime) -> float | None:
+    if payload.get("quoteAgeSeconds") is not None:
+        return float(payload["quoteAgeSeconds"])
+    if payload.get("quoteTimestamp") is not None:
+        return _optional_age_seconds(payload.get("quoteTimestamp"), now)
+    stages = payload.get("stages") if isinstance(payload.get("stages"), Mapping) else {}
+    snapshot = stages.get("snapshot") if isinstance(stages.get("snapshot"), Mapping) else {}
+    quote = snapshot.get("quote") if isinstance(snapshot.get("quote"), Mapping) else {}
+    return _optional_age_seconds(quote.get("timestamp"), now)
+
+
+def _broker_clock_ages(gateway_rows: Sequence[sqlite3.Row], now: datetime) -> list[float]:
+    values: list[float] = []
+    for row in gateway_rows:
+        key = str(row["snapshot_key"]).lower()
+        payload = json.loads(str(row["payload_json"]))
+        if "clock" not in key and "market" not in key:
+            continue
+        timestamp = payload.get("capturedAt") or payload.get("dataSourceTimestamp") or payload.get("updatedAt") or row["updated_at"]
+        age = _optional_age_seconds(timestamp, now)
+        if age is not None:
+            values.append(age)
+    return values
+
+
+def _paper_toggle_transition_from_metric_row(row: sqlite3.Row) -> dict[str, Any]:
+    payload = json.loads(str(row["payload_json"]))
+    return {
+        "newPaperEntriesEnabled": bool(payload.get("newPaperEntriesEnabled")),
+        "updatedAt": str(payload.get("updatedAt") or row["created_at"]),
+        "updatedBy": str(payload.get("updatedBy") or ""),
+        "reason": str(payload.get("reason") or ""),
+        "version": int(payload.get("version") or 0),
+    }
+
+
+def _rejected_entry_reasons(outbox_rows: Sequence[sqlite3.Row]) -> dict[str, int]:
+    reasons: dict[str, int] = {}
+    for row in outbox_rows:
+        if str(row["status"]).upper() != "REJECTED":
+            continue
+        payload = json.loads(str(row["payload_json"]))
+        if _intent_type(payload) != "new_entry":
+            continue
+        for code in tuple(payload.get("reasonCodes") or payload.get("reason_codes") or ()):
+            reasons[str(code)] = reasons.get(str(code), 0) + 1
+    return reasons
+
+
+def _duplicate_order_attempts(outbox_payloads: Sequence[Mapping[str, Any]]) -> int:
+    return sum(
+        1
+        for payload in outbox_payloads
+        for code in tuple(payload.get("reasonCodes") or payload.get("reason_codes") or ())
+        if "duplicate" in str(code).lower()
+    )
+
+
+def _risk_reservation_summary(outbox_payloads: Sequence[Mapping[str, Any]]) -> dict[str, float | int]:
+    values = [
+        _float_value(payload, "reservedRiskDollars", "reserved_risk_dollars")
+        for payload in outbox_payloads
+        if _intent_type(payload) == "new_entry"
+    ]
+    return {"count": len(values), "totalReservedRiskDollars": round(sum(values), 10)}
 
 
 def _decision_metric_action(payload: Mapping[str, Any], reason_codes: Sequence[str]) -> str:

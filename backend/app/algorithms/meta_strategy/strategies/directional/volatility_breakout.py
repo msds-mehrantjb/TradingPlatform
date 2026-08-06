@@ -17,7 +17,8 @@ class VolatilityBreakoutStrategy(DirectionalSnapshotStrategy):
         lower = float(bands.get("lower") or 0.0)
         atr = float(snapshot.atr.get("1m") or 0.0)
         relvol = float(snapshot.relative_volume.get("1m") or 0.0)
-        spread = float(snapshot.spread.get("basisPoints") or 0.0)
+        spread_value = snapshot.spread.get("basisPoints")
+        spread = float(spread_value) if spread_value is not None else 0.0
         width_percentile = float(snapshot.features.get("bollingerWidthPercentile") or 0.0)
         buy_extension = (latest_close(snapshot) - upper) / atr if atr and upper else 0.0
         sell_extension = (lower - latest_close(snapshot)) / atr if atr and lower else 0.0

@@ -60,6 +60,21 @@ class MetaStrategyStep40ApplicationServiceTest(unittest.TestCase):
         self.assertEqual(response["payload"]["job"]["queueName"], "finalised_bar_decisions")
         self.assertTrue(response["payload"]["backgroundWorkerRequired"])
 
+    def test_api_supplied_authoritative_state_is_rejected_before_queueing(self) -> None:
+        service = MetaStrategyApplicationService()
+        cases = {
+            "inventory": {"inventory": {"positions": [{"symbol": "SPY", "quantity": 0}]}},
+            "buying_power": {"buyingPower": 999_999_999.0},
+            "position_state": {"positionState": {"symbol": "SPY", "quantity": 0}},
+        }
+
+        for name, extra in cases.items():
+            with self.subTest(name=name):
+                response = service.paper_evaluate({"snapshotRequest": request_with().model_dump(mode="python"), **extra})
+
+                self.assertEqual(response["status"], "REJECTED")
+                self.assertIn("meta_strategy.service.caller_supplied_trading_state_rejected", response["reasonCodes"])
+
     def test_service_requires_inputs_for_non_runnable_operations(self) -> None:
         service = MetaStrategyApplicationService()
 

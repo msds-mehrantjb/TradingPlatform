@@ -42,6 +42,33 @@ test("frontend no longer contains an executable Regime algorithm implementation"
   assert.deepEqual(files, []);
 });
 
+test("chart candle normalization dedupes equivalent timestamp formats by parsed time", () => {
+  const main = read("frontend/src/main.ts");
+  const normalizeStart = main.indexOf("function normalizeCandles");
+  const normalizeEnd = main.indexOf("function resetHoverState");
+  const normalize = main.slice(normalizeStart, normalizeEnd);
+
+  assert.match(normalize, /new Date\(candle\.timestamp\)\.getTime\(\)/);
+  assert.match(normalize, /byTimestamp\.set\(String\(time\)/);
+  assert.match(normalize, /canonicalCandleTimestamp/);
+  assert.doesNotMatch(normalize, /byTimestamp\.set\(candle\.timestamp/);
+});
+
+test("Meta-Strategy readiness sections are collapsed below trading settings", () => {
+  const main = read("frontend/src/main.ts");
+  const tradingSettingsIndex = main.indexOf('id="metaTradingSettingsMount"');
+  const runtimeToggleIndex = main.indexOf('id="metaRuntimeReadinessToggle"');
+  const mlToggleIndex = main.indexOf('id="metaMlReadinessToggle"');
+
+  assert.ok(tradingSettingsIndex > -1);
+  assert.ok(runtimeToggleIndex > tradingSettingsIndex);
+  assert.ok(mlToggleIndex > runtimeToggleIndex);
+  assert.match(main, /metaRuntimeReadinessExpanded: persistedUiState\.metaRuntimeReadinessExpanded \?\? false/);
+  assert.match(main, /metaMlReadinessExpanded: persistedUiState\.metaMlReadinessExpanded \?\? false/);
+  assert.match(main, /aria-expanded="false" aria-controls="metaRuntimeReadinessPanel"/);
+  assert.match(main, /aria-expanded="false" aria-controls="metaMlReadinessPanel"/);
+});
+
 test("backend Regime paths are the only authoritative Regime runtime paths", () => {
   const backendApi = read("backend/app/algorithms/regime/api.py");
   const backendBacktest = read("backend/app/algorithms/regime/backtest/engine.py");
@@ -143,11 +170,15 @@ test("Market Forecast dashboard uses backend actionable direction labels", () =>
   assert.match(main, /forecast\.futurePricePrediction\?\.direction \?\? "flat"/);
   assert.match(main, /marketForecastDirectionLabel\(horizon\.predictedDirection\)/);
   assert.match(main, /marketForecastHorizonImpact\(horizon\)/);
-  assert.match(main, /New entry/);
-  assert.match(main, /horizon\.primaryDecisionGate \|\| horizon\.advice\.entryGate/);
+  assert.match(main, /P\(flat\/no edge\)/);
+  assert.match(main, /Predicted move/);
+  assert.doesNotMatch(main, /P\(buy success\).*need/);
+  assert.doesNotMatch(main, /New entry/);
+  assert.doesNotMatch(main, /horizon\.primaryDecisionGate \|\| horizon\.advice\.entryGate/);
   const renderStrip = main.slice(main.indexOf("function renderMultiHorizonForecastStrip"), main.indexOf("function thresholdImpact"));
   assert.doesNotMatch(renderStrip, /marketForecastDirectionLabel\(horizon\.predictedChangeDollars/);
   assert.doesNotMatch(renderStrip, /marketForecastDirectionImpact\(horizon\.predictedChangeDollars/);
+  assert.doesNotMatch(renderStrip, /advice\.newLongEntry/);
   assert.doesNotMatch(main, /predictedDirection:\s*isPrimary\s*\?[^;\n]*predictedChange/);
   assert.match(css, /\.market-forecast-horizon-card\[data-impact="neutral"\]/);
 });

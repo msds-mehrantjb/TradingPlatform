@@ -200,7 +200,7 @@ def fake_order_runner(request, settings, global_risk_snapshot):
         snapshot=SimpleNamespace(decision_id="phase8-order-decision"),
         settings_version=settings.settings_version,
         effective_settings_hash=settings.effective_settings_hash,
-        order_intent={"orderIntentId": "intent-phase8", "symbol": "SPY", "side": "BUY", "quantity": 1},
+        order_intent={"orderIntentId": "intent-phase8", "symbol": "SPY", "side": "BUY", "quantity": 1, "limitPrice": 100.0, "reservedRiskDollars": 10.0},
         final_valid=True,
         reason_codes=("meta_strategy.test.order",),
         stage_results={
@@ -212,7 +212,7 @@ def fake_order_runner(request, settings, global_risk_snapshot):
             "model_inference": {"reasonCodes": ("model",)},
             "ml_decision_policy": {"reasonCodes": ("policy",)},
             "local_gates": {"reasonCodes": ("local",)},
-            "sizing": {"reasonCodes": ("sizing",)},
+            "sizing": {"reasonCodes": ("sizing",), "quantity": 1, "reservedRiskDollars": 10.0},
             "order_intent": {"status": "ORDER", "reasonCodes": ("order",)},
         },
     )

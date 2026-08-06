@@ -16,7 +16,8 @@ class OpeningRangeBreakoutStrategy(DirectionalSnapshotStrategy):
         low = float(snapshot.features.get("openingRangeLow") or 0.0)
         atr = float(snapshot.atr.get("1m") or 0.0)
         relvol = float(snapshot.relative_volume.get("1m") or 0.0)
-        spread = float(snapshot.spread.get("basisPoints") or 0.0)
+        spread_value = snapshot.spread.get("basisPoints")
+        spread = float(spread_value) if spread_value is not None else 0.0
         liquidity_score = float(snapshot.liquidity.get("score") or 0.0)
         range_duration = int(snapshot.features.get("openingRangeDurationMinutes") or 30)
         range_finalized = high > 0 and low > 0 and high > low and len(candles(snapshot, "1m")) >= range_duration

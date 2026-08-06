@@ -77,6 +77,10 @@ QUALITY_GATES = (
         ],
     ),
     QualityGate(
+        label="meta-strategy-paper-readiness",
+        command=[PYTHON, "scripts/meta_strategy_paper_readiness_gate.py"],
+    ),
+    QualityGate(
         label="session-dedicated-tests",
         command=[
             PYTHON,

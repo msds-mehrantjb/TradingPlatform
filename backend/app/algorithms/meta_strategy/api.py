@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from fastapi import APIRouter, Body, status
@@ -11,11 +14,30 @@ from backend.app.algorithms.meta_strategy.service import MetaStrategyApplication
 
 router = APIRouter(prefix="/api/meta-strategy", tags=["meta-strategy"])
 META_STRATEGY_SERVICE = MetaStrategyApplicationService()
+_META_STRATEGY_QUERY_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="meta-strategy-api-query")
+
+
+async def _meta_strategy_query(operation: str, fn: Callable[[], dict[str, Any]], *, timeout_seconds: float = 4.0) -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(_META_STRATEGY_QUERY_EXECUTOR, fn), timeout=timeout_seconds)
+    except TimeoutError:
+        return {
+            "algorithmId": "meta_strategy",
+            "operation": operation,
+            "status": "REJECTED",
+            "payload": {
+                "available": False,
+                "reasonCodes": ("meta_strategy.api.query_timeout",),
+                "summary": "Meta-Strategy query timed out; new entries remain blocked.",
+            },
+            "reasonCodes": ("meta_strategy.api.query_timeout",),
+        }
 
 
 @router.get("/status")
-def get_meta_strategy_status() -> dict[str, Any]:
-    return META_STRATEGY_SERVICE.status()
+async def get_meta_strategy_status() -> dict[str, Any]:
+    return await _meta_strategy_query("status", META_STRATEGY_SERVICE.status)
 
 
 @router.get("/configuration")
@@ -203,9 +225,19 @@ def get_meta_strategy_effective_profile() -> dict[str, Any]:
     return META_STRATEGY_SERVICE.query_effective_profile()
 
 
+@router.get("/trading-settings")
+async def get_meta_strategy_trading_settings() -> dict[str, Any]:
+    return await _meta_strategy_query("trading_settings_query", META_STRATEGY_SERVICE.query_trading_settings)
+
+
+@router.put("/trading-settings")
+def update_meta_strategy_trading_settings(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    return META_STRATEGY_SERVICE.update_trading_settings(payload)
+
+
 @router.get("/models/active")
-def get_meta_strategy_active_model() -> dict[str, Any]:
-    return META_STRATEGY_SERVICE.query_model_active()
+async def get_meta_strategy_active_model() -> dict[str, Any]:
+    return await _meta_strategy_query("model_active_query", META_STRATEGY_SERVICE.query_model_active)
 
 
 @router.get("/models/history")
@@ -249,23 +281,33 @@ def get_meta_strategy_risk_reservations() -> dict[str, Any]:
 
 
 @router.get("/workers/health")
-def get_meta_strategy_worker_health() -> dict[str, Any]:
-    return META_STRATEGY_SERVICE.worker_health()
+async def get_meta_strategy_worker_health() -> dict[str, Any]:
+    return await _meta_strategy_query("worker_health_query", META_STRATEGY_SERVICE.worker_health)
 
 
 @router.get("/queues/lag")
-def get_meta_strategy_queue_lag() -> dict[str, Any]:
-    return META_STRATEGY_SERVICE.queue_lag()
+async def get_meta_strategy_queue_lag() -> dict[str, Any]:
+    return await _meta_strategy_query("queue_lag_query", META_STRATEGY_SERVICE.queue_lag)
 
 
 @router.get("/observability")
-def get_meta_strategy_observability() -> dict[str, Any]:
-    return META_STRATEGY_SERVICE.observability()
+async def get_meta_strategy_observability() -> dict[str, Any]:
+    return await _meta_strategy_query("observability", META_STRATEGY_SERVICE.observability)
 
 
 @router.get("/readiness")
-def get_meta_strategy_readiness() -> dict[str, Any]:
-    return META_STRATEGY_SERVICE.readiness_report()
+async def get_meta_strategy_readiness() -> dict[str, Any]:
+    return await _meta_strategy_query("readiness_report", META_STRATEGY_SERVICE.readiness_report)
+
+
+@router.get("/paper-control")
+async def get_meta_strategy_paper_control() -> dict[str, Any]:
+    return await _meta_strategy_query("paper_control_query", lambda: META_STRATEGY_SERVICE.query_paper_control({}))
+
+
+@router.put("/paper-control")
+def update_meta_strategy_paper_control(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    return META_STRATEGY_SERVICE.update_paper_control(payload)
 
 
 @router.post("/controls/{control_name}", status_code=status.HTTP_202_ACCEPTED)
@@ -279,8 +321,13 @@ def record_meta_strategy_test_evidence(payload: dict[str, Any] = Body(default_fa
 
 
 @router.get("/decisions/blocked")
-def get_meta_strategy_blocked_decisions() -> dict[str, Any]:
-    return META_STRATEGY_SERVICE.blocked_decisions()
+async def get_meta_strategy_blocked_decisions() -> dict[str, Any]:
+    return await _meta_strategy_query("blocked_decisions_query", META_STRATEGY_SERVICE.blocked_decisions)
+
+
+@router.get("/latest-decision")
+async def get_meta_strategy_latest_decision() -> dict[str, Any]:
+    return await _meta_strategy_query("latest_decision_query", META_STRATEGY_SERVICE.latest_decision)
 
 
 @router.get("/api-docs")
@@ -289,13 +336,13 @@ def get_meta_strategy_api_documentation() -> dict[str, Any]:
 
 
 @router.get("/diagnostics")
-def get_meta_strategy_diagnostics() -> dict[str, Any]:
-    return META_STRATEGY_SERVICE.diagnostics()
+async def get_meta_strategy_diagnostics() -> dict[str, Any]:
+    return await _meta_strategy_query("diagnostics", META_STRATEGY_SERVICE.diagnostics)
 
 
 @router.get("/models/status")
-def get_meta_strategy_models_status() -> dict[str, Any]:
-    return META_STRATEGY_SERVICE.status()
+async def get_meta_strategy_models_status() -> dict[str, Any]:
+    return await _meta_strategy_query("models_status", META_STRATEGY_SERVICE.status)
 
 
 @router.get("/final-acceptance")

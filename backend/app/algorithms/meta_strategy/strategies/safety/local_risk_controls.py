@@ -96,7 +96,10 @@ class LocalRiskBudgetFilterStrategy(SafetySnapshotStrategy):
             if isinstance(value, MetaStrategyEvaluationContext)
             else context_market_snapshot(value).features.get("localRiskBudget") or {}
         )
-        remaining = float(state.get("remainingRiskDollars") or state.get("availableRiskDollars") or 0.0)
+        remaining_value = state.get("remainingRiskDollars")
+        if remaining_value is None:
+            remaining_value = state.get("availableRiskDollars")
+        remaining = float(remaining_value) if remaining_value is not None else 0.0
         if remaining <= 0.0:
             return block_evidence(reason_code="meta_strategy.safety.local_risk_budget_filter.block", observed=dict(state), threshold={"remainingRiskDollars": 0.0}, existing_position_action="REDUCE_ONLY")
         return pass_evidence(reason_code="meta_strategy.safety.local_risk_budget_filter.pass", observed=dict(state), threshold={"remainingRiskDollars": 0.0})

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import datetime, time
 from enum import Enum
-from zoneinfo import ZoneInfo
 
-
-EXCHANGE_TIMEZONE = ZoneInfo("America/New_York")
+from backend.app.algorithms.meta_strategy.market_clock import EXCHANGE_TIMEZONE, LOCAL_REPLAY_EARLY_CLOSES, LOCAL_REPLAY_MARKET_HOLIDAYS
 
 
 class MetaStrategySession(str, Enum):
@@ -37,21 +35,8 @@ META_STRATEGY_SESSION_ALIASES = {
     "closed": MetaStrategySession.CLOSED,
 }
 
-META_STRATEGY_MARKET_HOLIDAYS = frozenset(
-    {
-        date(2026, 1, 1),
-        date(2026, 1, 19),
-        date(2026, 2, 16),
-        date(2026, 4, 3),
-        date(2026, 5, 25),
-        date(2026, 6, 19),
-        date(2026, 7, 3),
-        date(2026, 9, 7),
-        date(2026, 11, 26),
-        date(2026, 12, 25),
-    }
-)
-META_STRATEGY_EARLY_CLOSES = {date(2026, 11, 27): time(13, 0)}
+META_STRATEGY_MARKET_HOLIDAYS = LOCAL_REPLAY_MARKET_HOLIDAYS
+META_STRATEGY_EARLY_CLOSES = LOCAL_REPLAY_EARLY_CLOSES
 
 
 def canonical_session(value: str | MetaStrategySession) -> MetaStrategySession:

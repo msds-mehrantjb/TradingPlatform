@@ -180,7 +180,8 @@ def _entry_reference(snapshot: MetaStrategyMarketSnapshot, side: Side) -> float:
 
 def _stop_distance(snapshot: MetaStrategyMarketSnapshot, entry: float, settings: CandidateGeometryConfig) -> float:
     atr = float(snapshot.atr.get("1m") or 0.0)
-    spread_dollars = float((snapshot.spread or {}).get("dollars") or 0.0)
+    spread_value = (snapshot.spread or {}).get("dollars")
+    spread_dollars = float(spread_value) if spread_value is not None else 0.0
     minimum_stop = entry * settings.minimum_stop_percent
     multiplier = settings.atr_stop_multiplier
     boundary = _boundary_state(snapshot)

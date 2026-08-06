@@ -98,6 +98,10 @@ class MetaStrategyCorrelationSettings(MetaStrategySettingsModel):
 
 class MetaStrategyLocalRiskSettings(MetaStrategySettingsModel):
     risk_percentage: float = Field(default=0.005, ge=0.0, le=1.0)
+    paper_order_allocation_percent: float = Field(default=0.10, ge=0.0, le=1.0)
+    paper_daily_allocation_percent: float = Field(default=0.50, ge=0.0, le=1.0)
+    paper_risk_budget_percent_of_order: float = Field(default=0.50, ge=0.0, le=1.0)
+    paper_stop_loss_percent: float = Field(default=0.0035, ge=0.0, le=1.0)
     spread_limit_bps: float = Field(default=15.0, ge=0.0)
     liquidity_requirement: float = Field(default=50_000.0, ge=0.0)
     trade_count_limit: int = Field(default=5, ge=0)

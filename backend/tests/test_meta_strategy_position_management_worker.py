@@ -73,10 +73,115 @@ class MetaStrategyPositionManagementWorkerTest(unittest.TestCase):
         self.assertEqual(outbox["payload"]["intent"], "end_of_day_liquidation")
         self.assertEqual(outbox["payload"]["exitReason"], "SESSION_END")
 
+    def test_profit_target_creates_risk_reducing_exit(self) -> None:
+        env = RuntimeEnv()
+        env.seed_long_position()
+        env.enqueue_position_job(candle={"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 104.25, "low": 99.5, "close": 104.0})
+
+        result = env.worker().run_once(now=NOW + timedelta(minutes=1))
+
+        outbox = env.jobs.outbox_for_order_intent("meta_strategy.exit.meta_strategy.position.meta_strategy.paper.default.SPY.PROFIT_TARGET")
+        self.assertEqual(result["createdExitIntentCount"], 1)
+        self.assertEqual(outbox["payload"]["exitReason"], "PROFIT_TARGET")
+        self.assertEqual(outbox["payload"]["side"], "SELL")
+        self.assertEqual(outbox["payload"]["quantity"], 10)
+
+    def test_signal_exit_creates_event_risk_exit(self) -> None:
+        env = RuntimeEnv()
+        env.seed_long_position()
+        env.enqueue_position_job(
+            candle={"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5},
+            extra={"signalInvalidation": {"SPY": True}},
+        )
+
+        result = env.worker().run_once(now=NOW + timedelta(minutes=1))
+
+        outbox = env.jobs.outbox_for_order_intent("meta_strategy.exit.meta_strategy.position.meta_strategy.paper.default.SPY.EVENT_RISK")
+        self.assertEqual(result["createdExitIntentCount"], 1)
+        self.assertEqual(outbox["payload"]["exitReason"], "EVENT_RISK")
+        self.assertEqual(outbox["payload"]["quantity"], 10)
+
+    def test_maximum_holding_time_creates_exit(self) -> None:
+        env = RuntimeEnv()
+        env.seed_long_position(maximum_holding_minutes=1)
+        env.enqueue_position_job(candle={"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=2)).isoformat(), "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5})
+
+        result = env.worker().run_once(now=NOW + timedelta(minutes=2))
+
+        outbox = env.jobs.outbox_for_order_intent("meta_strategy.exit.meta_strategy.position.meta_strategy.paper.default.SPY.MAXIMUM_HOLD")
+        self.assertEqual(result["createdExitIntentCount"], 1)
+        self.assertEqual(outbox["payload"]["exitReason"], "MAXIMUM_HOLD")
+        self.assertEqual(outbox["payload"]["quantity"], 10)
+
+    def test_partial_fill_exit_uses_open_meta_strategy_quantity_without_reversal(self) -> None:
+        env = RuntimeEnv()
+        env.seed_long_position(quantity=4)
+        env.enqueue_position_job(candle={"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 104.5, "low": 99.5, "close": 104.0})
+
+        result = env.worker().run_once(now=NOW + timedelta(minutes=1))
+
+        outbox = env.jobs.outbox_for_order_intent("meta_strategy.exit.meta_strategy.position.meta_strategy.paper.default.SPY.PROFIT_TARGET")
+        self.assertEqual(result["createdExitIntentCount"], 1)
+        self.assertEqual(outbox["payload"]["side"], "SELL")
+        self.assertEqual(outbox["payload"]["quantity"], 4)
+
+    def test_paper_button_off_does_not_block_position_exit(self) -> None:
+        env = RuntimeEnv()
+        env.seed_long_position()
+        env.jobs.update_paper_trading_control(
+            new_paper_entries_enabled=False,
+            updated_by="test",
+            reason="meta_strategy.test.paper_off_with_open_position",
+            now=NOW,
+        )
+        env.enqueue_position_job(candle={"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 100.5, "low": 97.5, "close": 98.0})
+
+        result = env.worker().run_once(now=NOW + timedelta(minutes=1))
+
+        outbox = env.jobs.outbox_for_order_intent("meta_strategy.exit.meta_strategy.position.meta_strategy.paper.default.SPY.PROTECTIVE_STOP")
+        self.assertEqual(result["createdExitIntentCount"], 1)
+        self.assertEqual(outbox["payload"]["intent"], "protective_exit")
+
+    def test_readiness_false_does_not_stop_existing_position_management(self) -> None:
+        env = RuntimeEnv()
+        env.seed_long_position()
+        env.jobs.write_gateway_snapshot(
+            "meta_strategy.readiness.report",
+            {
+                "algorithmId": "meta_strategy",
+                "status": "REJECTED",
+                "complete": False,
+                "paperReady": False,
+                "reasonCodes": ("meta_strategy.readiness.market_data_unhealthy",),
+            },
+            now=NOW,
+        )
+        env.enqueue_position_job(candle={"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 100.5, "low": 97.5, "close": 98.0})
+
+        result = env.worker().run_once(now=NOW + timedelta(minutes=1))
+
+        outbox = env.jobs.outbox_for_order_intent("meta_strategy.exit.meta_strategy.position.meta_strategy.paper.default.SPY.PROTECTIVE_STOP")
+        self.assertEqual(result["createdExitIntentCount"], 1)
+        self.assertEqual(outbox["payload"]["intent"], "protective_exit")
+        self.assertEqual(env.inventory.current_inventory_snapshot(mark_prices={"SPY": 98.0}).open_positions[0].quantity, 10)
+
+    def test_restart_with_open_position_manages_from_rebuilt_inventory(self) -> None:
+        database_url = f"sqlite:///{temp_db_path()}"
+        env = RuntimeEnv(database_url=database_url)
+        env.seed_long_position()
+        restarted = RuntimeEnv(database_url=database_url)
+        restarted.enqueue_position_job(candle={"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 104.25, "low": 99.5, "close": 104.0})
+
+        result = restarted.worker().run_once(now=NOW + timedelta(minutes=1))
+
+        outbox = restarted.jobs.outbox_for_order_intent("meta_strategy.exit.meta_strategy.position.meta_strategy.paper.default.SPY.PROFIT_TARGET")
+        self.assertEqual(result["createdExitIntentCount"], 1)
+        self.assertEqual(outbox["payload"]["quantity"], 10)
+
 
 class RuntimeEnv:
-    def __init__(self) -> None:
-        database_url = f"sqlite:///{temp_db_path()}"
+    def __init__(self, *, database_url: str | None = None) -> None:
+        database_url = database_url or f"sqlite:///{temp_db_path()}"
         self.jobs = MetaStrategyJobRepository(database_url)
         self.inventory = MetaStrategySqliteRepository(database_url)
 
@@ -102,7 +207,7 @@ class RuntimeEnv:
             now=NOW,
         )
 
-    def seed_long_position(self, *, with_order_intent: bool = True) -> None:
+    def seed_long_position(self, *, with_order_intent: bool = True, quantity: int = 10, maximum_holding_minutes: int = 30) -> None:
         if with_order_intent:
             self.inventory.record_order_intent(
                 {
@@ -110,12 +215,12 @@ class RuntimeEnv:
                     "orderIntentId": "entry-intent",
                     "symbol": "SPY",
                     "side": "BUY",
-                    "quantity": 10,
+                    "quantity": quantity,
                     "price": 100.0,
                     "limitPrice": 100.0,
                     "stopPrice": 98.0,
                     "targetPrice": 104.0,
-                    "maximumHoldingMinutes": 30,
+                    "maximumHoldingMinutes": maximum_holding_minutes,
                     "reservedRiskDollars": 20.0,
                     "timestamp": NOW.isoformat(),
                 }
@@ -129,7 +234,7 @@ class RuntimeEnv:
                 "brokerFillId": "entry-fill",
                 "symbol": "SPY",
                 "side": "BUY",
-                "filledQuantity": 10,
+                "filledQuantity": quantity,
                 "fillPrice": 100.0,
                 "timestamp": NOW.isoformat(),
             }

@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from time import perf_counter
 from typing import Any, Callable, Literal, Protocol
 
 from backend.app.algorithms.meta_strategy.broker_adapter import MetaStrategyBrokerAdapter, NoopMetaStrategyBrokerAdapter
-from backend.app.algorithms.meta_strategy.candidate_generator import GeneratedDeterministicCandidate, generate_deterministic_candidate
+from backend.app.algorithms.meta_strategy.candidate_generator import (
+    CandidateComponentEvaluation,
+    GeneratedDeterministicCandidate,
+    evaluate_candidate_components,
+    generate_deterministic_candidate,
+)
 from backend.app.algorithms.meta_strategy.candidate_geometry import CandidateGeometryResult, calculate_candidate_geometry
 from backend.app.algorithms.meta_strategy.configuration import MetaStrategyBaselineSettings, meta_strategy_baseline_settings
 from backend.app.algorithms.meta_strategy.contracts import MetaOrderIntent, MetaStrategyMarketSnapshot
@@ -20,6 +26,7 @@ from backend.app.algorithms.meta_strategy.dynamic_profile import (
 from backend.app.algorithms.meta_strategy.feature_builder import MetaStrategyFeatureSet, build_meta_strategy_features
 from backend.app.algorithms.meta_strategy.global_risk_adapter import MetaStrategyGlobalRiskAdapter, ReadOnlyMetaStrategyGlobalRiskAdapter
 from backend.app.algorithms.meta_strategy.inference import MetaStrategyInferenceConfig, MetaStrategyInferenceResult, apply_meta_strategy_inference
+from backend.app.algorithms.meta_strategy.inference.artifact_health import artifact_schema_compatible
 from backend.app.algorithms.meta_strategy.local_gates import (
     MetaStrategyLocalGateConfig,
     MetaStrategyLocalGateContext,
@@ -40,6 +47,14 @@ from backend.app.algorithms.meta_strategy.sizing import (
 )
 from backend.app.algorithms.meta_strategy.reconciliation import MetaStrategyReconciliationRecord, reconcile_meta_strategy_broker_fill
 from backend.app.algorithms.meta_strategy.settings import MetaStrategySettings, build_meta_strategy_settings
+from backend.app.algorithms.meta_strategy.strategies.base import SnapshotEvaluationResult
+from backend.app.algorithms.meta_strategy.strategy_registry import (
+    CONTEXT_STRATEGIES,
+    DIRECTIONAL_STRATEGIES,
+    REGIME_STRATEGIES,
+    SAFETY_STRATEGIES,
+    MetaStrategyRegistryEntry,
+)
 
 
 MetaStrategyPipelineMode = Literal["EVALUATION", "SHADOW", "PAPER", "BACKTEST", "DAILY_REPLAY", "DIAGNOSTICS", "LIVE"]
@@ -67,6 +82,11 @@ META_STRATEGY_EXECUTION_PIPELINE_STAGES: tuple[str, ...] = (
     "reconciliation",
 )
 
+META_STRATEGY_STRATEGIES_STAGE_VERSION = "meta_strategy_strategies_stage_v1"
+META_STRATEGY_CONTEXT_REGIME_STAGE_VERSION = "meta_strategy_context_regime_stage_v1"
+META_STRATEGY_SAFETY_STAGE_VERSION = "meta_strategy_safety_stage_v1"
+META_STRATEGY_FAMILY_AGGREGATION_STAGE_VERSION = "meta_strategy_family_aggregation_stage_v1"
+
 
 class MetaStrategyPersistenceAdapter(Protocol):
     def persist(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -93,6 +113,20 @@ class MetaStrategyExecutionPipelineRequest:
     mode: MetaStrategyPipelineMode
     snapshot_request: MetaStrategyMarketSnapshotRequest
     model_artifact: dict[str, Any] | None = None
+    settings_version: str | None = None
+    active_settings_version: str | None = None
+    inventory_snapshot: Mapping[str, Any] | None = None
+    reserved_risk_ledger: tuple[Mapping[str, Any], ...] = ()
+    account_snapshot: Mapping[str, Any] | None = None
+    global_risk_snapshot: Mapping[str, Any] | None = None
+    event_state: Mapping[str, Any] | None = None
+    operational_health: Mapping[str, Any] | None = None
+    operational_controls: Mapping[str, Any] | None = None
+    runtime_health: Mapping[str, Any] | None = None
+    market_clock_state: Mapping[str, Any] | None = None
+    paper_control_state: Mapping[str, Any] | None = None
+    state_source_versions: Mapping[str, Any] | None = None
+    state_source_timestamps: Mapping[str, Any] | None = None
     account_equity: float | None = None
     available_buying_power: float | None = None
     remaining_algorithm_risk: float | None = None
@@ -136,6 +170,62 @@ class MetaStrategyExecutionPipelineResult:
     reason_codes: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MetaStrategyStageContractResult:
+    status: str
+    eligible: bool
+    input_version: str
+    output_version: str
+    started_at: datetime
+    completed_at: datetime
+    duration_ms: int
+    reason_codes: tuple[str, ...]
+    evidence: dict[str, Any]
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "eligible": self.eligible,
+            "inputVersion": self.input_version,
+            "outputVersion": self.output_version,
+            "startedAt": self.started_at.isoformat(),
+            "completedAt": self.completed_at.isoformat(),
+            "durationMs": self.duration_ms,
+            "reasonCodes": self.reason_codes,
+            "evidence": _plain_pipeline_value(self.evidence),
+        }
+
+
+@dataclass(frozen=True)
+class MetaStrategyStrategyStageOutput:
+    strategy_id: str
+    strategy_version: str
+    family_id: str
+    signal: Literal["BUY", "SELL", "HOLD"]
+    confidence: float
+    eligible: bool
+    data_quality: str
+    evidence: dict[str, Any]
+    vetoes: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+    evaluated_at: datetime
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "strategyId": self.strategy_id,
+            "strategyVersion": self.strategy_version,
+            "familyId": self.family_id,
+            "signal": self.signal,
+            "confidence": self.confidence,
+            "eligible": self.eligible,
+            "dataQuality": self.data_quality,
+            "evidence": _plain_pipeline_value(self.evidence),
+            "vetoes": self.vetoes,
+            "reasonCodes": self.reason_codes,
+            "evaluatedAt": self.evaluated_at.isoformat(),
+        }
+
+
 @dataclass
 class _PipelineState:
     request: MetaStrategyExecutionPipelineRequest
@@ -146,6 +236,7 @@ class _PipelineState:
     stage_results: dict[str, Any] = field(default_factory=dict)
     reason_codes: list[str] = field(default_factory=list)
     snapshot: MetaStrategyMarketSnapshot | None = None
+    candidate_components: CandidateComponentEvaluation | None = None
     deterministic_candidate: GeneratedDeterministicCandidate | None = None
     geometry: CandidateGeometryResult | None = None
     features: MetaStrategyFeatureSet | None = None
@@ -200,7 +291,7 @@ def run_meta_strategy_execution_pipeline(
     for stage in META_STRATEGY_EXECUTION_PIPELINE_STAGES:
         started = perf_counter()
         _STAGE_HANDLERS[stage](state)
-        state.stage_results.setdefault(stage, {})["durationMs"] = int((perf_counter() - started) * 1000)
+        state.stage_results.setdefault(stage, {}).setdefault("durationMs", int((perf_counter() - started) * 1000))
     return _build_result(state)
 
 
@@ -219,18 +310,210 @@ def _stage_market_snapshot(state: _PipelineState) -> None:
             "effective_settings_hash": state.config.settings.effective_settings_hash,
         }
     )
-    _record(state, "market_snapshot", {"snapshotId": state.snapshot.snapshot_id, "symbol": state.snapshot.symbol})
+    _record(
+        state,
+        "market_snapshot",
+        {
+            "snapshotId": state.snapshot.snapshot_id,
+            "symbol": state.snapshot.symbol,
+            "decisionTimestamp": state.snapshot.timestamp.isoformat(),
+            "authoritativeState": _authoritative_state_evidence(state.request),
+            "sourceVersions": dict(state.request.state_source_versions or {}),
+            "sourceTimestamps": dict(state.request.state_source_timestamps or {}),
+        },
+    )
 
 
-def _stage_passive(name: str, payload: dict[str, Any] | None = None) -> Callable[[_PipelineState], None]:
-    def handler(state: _PipelineState) -> None:
-        _record(state, name, payload or {"status": "captured_by_deterministic_candidate_stage"})
+def _stage_strategies(state: _PipelineState) -> None:
+    components = _candidate_components(state)
+    snapshot = _require(state.snapshot, "snapshot")
+    outputs = tuple(
+        _strategy_stage_output(output, entry, snapshot)
+        for output, entry in zip(components.directional_outputs, DIRECTIONAL_STRATEGIES, strict=True)
+    )
+    active_outputs = tuple(
+        item
+        for item, entry in zip(outputs, DIRECTIONAL_STRATEGIES, strict=True)
+        if entry.enabled
+    )
+    eligible = bool(active_outputs) and any(item.eligible and item.data_quality == "OK" for item in active_outputs)
+    reason_codes = _stage_reason_codes(
+        *(item.reason_codes for item in outputs),
+        extra=() if eligible else ("meta_strategy.strategies.no_eligible_directional_strategy",),
+    )
+    _record_stage_contract(
+        state,
+        "strategies",
+        status="PASS" if eligible else "BLOCKED",
+        eligible=eligible,
+        input_version=_stage_input_version(snapshot),
+        output_version=META_STRATEGY_STRATEGIES_STAGE_VERSION,
+        reason_codes=reason_codes,
+        evidence={
+            "strategyOutputs": tuple(item.as_payload() for item in outputs),
+            "activeStrategyCount": sum(1 for item in active_outputs if item.eligible and item.signal in {"BUY", "SELL"}),
+            "configuredStrategyCount": len(outputs),
+            "activeConfiguredStrategyCount": len(active_outputs),
+            "catalogStrategyIds": tuple(entry.strategy_id for entry in DIRECTIONAL_STRATEGIES),
+            "genericSessionDirectionFallbackUsed": False,
+        },
+    )
 
-    return handler
+
+def _stage_context_and_regime(state: _PipelineState) -> None:
+    components = _candidate_components(state)
+    snapshot = _require(state.snapshot, "snapshot")
+    context_outputs = tuple(
+        _strategy_stage_output(output, entry, snapshot)
+        for output, entry in zip(components.context_outputs, CONTEXT_STRATEGIES, strict=True)
+    )
+    regime_outputs = tuple(
+        _strategy_stage_output(output, entry, snapshot)
+        for output, entry in zip(components.regime_outputs, REGIME_STRATEGIES, strict=True)
+    )
+    regime_evidence = tuple((output.evidence or {}) for output in components.regime_outputs)
+    trend_regime = _first_evidence_value(regime_evidence, "regimeLabel", default="UNKNOWN")
+    volatility_regime = _first_evidence_value(regime_evidence, "volatility", default=_volatility_level(snapshot))
+    event_state = str((snapshot.economic_event_state or {}).get("state") or "none").upper()
+    restricted = _restricted_families_from_regime(components.regime_outputs, components.safety_blocks)
+    allowed = tuple(family for family in ("TREND", "BREAKOUT", "REVERSAL", "MEAN_REVERSION", "GAP_SESSION", "EVENT_DRIVEN") if family not in restricted)
+    eligible = all(item.eligible for item in context_outputs) and all(item.eligible for item in regime_outputs)
+    reason_codes = _stage_reason_codes(
+        *(item.reason_codes for item in (*context_outputs, *regime_outputs)),
+        extra=() if eligible else ("meta_strategy.context_regime.ineligible",),
+    )
+    _record_stage_contract(
+        state,
+        "context_and_regime",
+        status="PASS" if eligible else "BLOCKED",
+        eligible=eligible,
+        input_version=_stage_input_version(snapshot),
+        output_version=META_STRATEGY_CONTEXT_REGIME_STAGE_VERSION,
+        reason_codes=reason_codes,
+        evidence={
+            "sessionPhase": snapshot.session_phase,
+            "trendRegime": trend_regime,
+            "volatilityRegime": volatility_regime,
+            "liquidityRegime": _liquidity_level(snapshot),
+            "eventRegime": event_state,
+            "dataQualityRegime": "OK" if eligible else "DEGRADED",
+            "allowedStrategyFamilies": allowed,
+            "restrictedStrategyFamilies": restricted,
+            "contextOutputs": tuple(item.as_payload() for item in context_outputs),
+            "regimeOutputs": tuple(item.as_payload() for item in regime_outputs),
+        },
+    )
+
+
+def _stage_safety(state: _PipelineState) -> None:
+    components = _candidate_components(state)
+    snapshot = _require(state.snapshot, "snapshot")
+    outputs = tuple(
+        _strategy_stage_output(output, entry, snapshot)
+        for output, entry in zip(components.safety_outputs, SAFETY_STRATEGIES, strict=True)
+    )
+    hard_vetoes = list(_explicit_safety_vetoes(state))
+    hard_vetoes.extend(code for output in components.safety_blockers for code in output.reason_codes)
+    eligible = not hard_vetoes
+    reason_codes = _stage_reason_codes(
+        *(item.reason_codes for item in outputs),
+        extra=tuple(hard_vetoes) if hard_vetoes else ("meta_strategy.safety.pass",),
+    )
+    _record_stage_contract(
+        state,
+        "safety",
+        status="PASS" if eligible else "BLOCKED",
+        eligible=eligible,
+        input_version=_stage_input_version(snapshot),
+        output_version=META_STRATEGY_SAFETY_STAGE_VERSION,
+        reason_codes=reason_codes,
+        evidence={
+            "hardVetoes": tuple(dict.fromkeys(hard_vetoes)),
+            "safetyOutputs": tuple(item.as_payload() for item in outputs),
+            "checks": {
+                "dataCompleteness": _required_market_data_complete(state),
+                "dataFreshness": _quote_fresh(state),
+                "marketSessionPermission": state.request.session_allowed,
+                "eventBlackout": state.request.event_blackout,
+                "spreadBps": snapshot.spread_bps,
+                "liquidity": float((snapshot.liquidity or {}).get("dollarVolume") or snapshot.volume),
+                "operationalHealth": dict(state.request.operational_health or {}),
+                "dailyLossState": state.request.realized_daily_pnl,
+                "emergencyControls": dict(state.request.operational_controls or {}) | dict(state.request.runtime_health or {}),
+                "unsupportedSymbol": not _symbol_supported(state),
+                "unsupportedTimeframe": not _timeframe_supported(state),
+                "conflictingPositionState": _has_conflicting_position_state(state),
+            },
+        },
+    )
+
+
+def _stage_family_aggregation(state: _PipelineState) -> None:
+    components = _candidate_components(state)
+    snapshot = _require(state.snapshot, "snapshot")
+    aggregation = components.aggregation
+    supporting, opposing = _family_alignment_from_aggregation(aggregation.signal, aggregation.family_scores)
+    winning_score, opposing_score = _winning_scores_from_aggregation(aggregation.signal, aggregation)
+    correlation_penalties = {
+        item.strategy_id: item.caps_applied
+        for item in aggregation.contribution_audit
+        if item.caps_applied
+    }
+    reason_codes = tuple(dict.fromkeys(aggregation.reason_codes))
+    _record_stage_contract(
+        state,
+        "family_aggregation",
+        status="PASS" if aggregation.eligible else "BLOCKED",
+        eligible=aggregation.eligible,
+        input_version=_stage_input_version(snapshot),
+        output_version=META_STRATEGY_FAMILY_AGGREGATION_STAGE_VERSION,
+        reason_codes=reason_codes,
+        evidence={
+            "familyScores": {
+                score.family: {
+                    "buyScore": score.buy_score,
+                    "sellScore": score.sell_score,
+                    "holdScore": score.hold_score,
+                    "activeStrategyCount": score.active_strategy_count,
+                    "capped": score.capped,
+                }
+                for score in aggregation.family_scores
+            },
+            "activeStrategyCount": aggregation.active_strategy_count,
+            "activeFamilyCount": aggregation.active_family_count,
+            "supportingFamilies": supporting,
+            "opposingFamilies": opposing,
+            "correlationPenalties": correlation_penalties,
+            "winningScore": winning_score,
+            "opposingScore": opposing_score,
+            "edge": round(max(0.0, winning_score - opposing_score), 6),
+            "eligible": aggregation.eligible,
+            "reasonCodes": reason_codes,
+            "contributionAudit": {
+                item.strategy_id: {
+                    "family": item.family,
+                    "signal": item.signal,
+                    "confidence": item.confidence,
+                    "rawContribution": item.raw_contribution,
+                    "cappedContribution": item.capped_contribution,
+                    "canonicalInfluenceId": item.canonical_influence_id,
+                    "correlationKey": item.correlation_key,
+                    "counted": item.counted,
+                    "capsApplied": item.caps_applied,
+                    "reasonCodes": item.reason_codes,
+                }
+                for item in aggregation.contribution_audit
+            },
+        },
+    )
 
 
 def _stage_deterministic_candidate(state: _PipelineState) -> None:
-    state.deterministic_candidate = generate_deterministic_candidate(_require(state.snapshot, "snapshot"), settings=state.config.settings)
+    state.deterministic_candidate = generate_deterministic_candidate(
+        _require(state.snapshot, "snapshot"),
+        settings=state.config.settings,
+        components=_candidate_components(state),
+    )
     state.reason_codes.extend(state.deterministic_candidate.reason_codes)
     _record(
         state,
@@ -283,10 +566,10 @@ def _stage_feature_builder(state: _PipelineState) -> None:
                 "candidate_direction": candidate.direction,
                 "candidate_edge": candidate.edge,
                 "candidate_confidence": candidate.deterministic_confidence,
-                "expected_net_reward_risk": geometry.expected_net_reward_risk or 0.0,
+                "expected_net_reward_risk": _number_or_default(geometry.expected_net_reward_risk, 0.0),
                 "reward_risk_ratio": geometry.geometry.risk_reward,
                 "spread_dollars": (snapshot.spread or {}).get("dollars"),
-                "spread_bps": snapshot.spread_bps or 0.0,
+                "spread_bps": _number_or_default(snapshot.spread_bps, 0.0),
                 "liquidity": (snapshot.liquidity or {}).get("dollarVolume", snapshot.volume),
                 "relative_volume": (snapshot.relative_volume or {}).get("1m"),
                 "estimated_slippage": (geometry.evidence or {}).get("estimatedSlippage", 0.0),
@@ -303,25 +586,79 @@ def _stage_feature_builder(state: _PipelineState) -> None:
 def _stage_artifact_validation(state: _PipelineState) -> None:
     artifact = state.request.model_artifact or {}
     expected = _require(state.features, "features").schemaHash
-    compatible = bool(artifact) and str(artifact.get("featureSchemaHash") or "") == expected
-    _record(state, "artifact_validation", {"compatible": compatible, "expectedFeatureSchemaHash": expected})
+    mode_config = _inference_config_for_mode(state)
+    compatible = artifact_schema_compatible(artifact, expected)
+    promoted = _artifact_promoted_for_application(artifact)
+    model_available = bool(artifact and (artifact.get("models") or {}))
+    model_application_allowed = bool(
+        compatible
+        and promoted
+        and model_available
+        and mode_config.mode in {"FILTER", "RISK_REDUCTION"}
+    )
+    shadow_diagnostics_only = bool(artifact and not model_application_allowed and mode_config.mode == "SHADOW")
+    deterministic_only = not model_application_allowed and mode_config.mode in {"OFF", "DISABLED"}
+    reason_codes = _artifact_validation_reasons(
+        artifact=artifact,
+        compatible=compatible,
+        promoted=promoted,
+        model_available=model_available,
+        shadow_diagnostics_only=shadow_diagnostics_only,
+        deterministic_only=deterministic_only,
+    )
+    _record(
+        state,
+        "artifact_validation",
+        {
+            "status": "PASS" if model_application_allowed else "SHADOW_ONLY" if shadow_diagnostics_only else "DETERMINISTIC_ONLY" if deterministic_only else "FAIL_CLOSED",
+            "compatible": compatible,
+            "promoted": promoted,
+            "modelAvailable": model_available,
+            "modelApplicationAllowed": model_application_allowed,
+            "shadowDiagnosticsOnly": shadow_diagnostics_only,
+            "deterministicOnly": deterministic_only,
+            "expectedFeatureSchemaHash": expected,
+            "artifactFeatureSchemaHash": str(artifact.get("featureSchemaHash") or ""),
+            "artifactId": str(artifact.get("artifactId") or artifact.get("artifact_id") or ""),
+            "configuredInferenceMode": mode_config.mode,
+            "fallbackBehavior": mode_config.fallbackBehavior,
+            "reasonCodes": reason_codes,
+        },
+    )
 
 
 def _stage_model_inference(state: _PipelineState) -> None:
     mode_config = _inference_config_for_mode(state)
+    hard_stages_passed = _required_entry_stages_passed(state)
+    artifact_payload, effective_mode_config = _artifact_for_model_inference(state, mode_config)
     state.inference = apply_meta_strategy_inference(
         deterministic_signal=_require(state.deterministic_candidate, "deterministic_candidate").direction,
         feature_set=_require(state.features, "features"),
-        model_artifact=state.request.model_artifact,
-        config=mode_config,
-        hard_gates_passed=True,
+        model_artifact=artifact_payload,
+        config=effective_mode_config,
+        hard_gates_passed=hard_stages_passed,
         candidate_eligible=_require(state.deterministic_candidate, "deterministic_candidate").deterministic_candidate.eligible,
         deterministic_risk_multiplier=1.0,
         session_date=state.request.snapshot_request.decision_timestamp.date(),
         predicted_at=state.request.snapshot_request.decision_timestamp,
     )
+    artifact_reasons = tuple((state.stage_results.get("artifact_validation") or {}).get("reasonCodes") or ())
+    if artifact_reasons:
+        state.reason_codes.extend(artifact_reasons)
     state.reason_codes.extend(state.inference.reasonCodes)
-    _record(state, "model_inference", {"finalSignal": state.inference.finalSignal, "decisionAction": state.inference.decisionAction})
+    _record(
+        state,
+        "model_inference",
+        {
+            "finalSignal": state.inference.finalSignal,
+            "decisionAction": state.inference.decisionAction,
+            "hardGatesPassed": state.inference.hardGatesPassed,
+            "modelAppliedToOrder": state.inference.appliedToOrder,
+            "effectiveMode": state.inference.effectiveMode,
+            "artifactValidationStatus": (state.stage_results.get("artifact_validation") or {}).get("status"),
+            "artifactReasonCodes": artifact_reasons,
+        },
+    )
 
 
 def _stage_ml_decision_policy(state: _PipelineState) -> None:
@@ -343,13 +680,16 @@ def _stage_local_gates(state: _PipelineState) -> None:
             independent_family_count=candidate.evidence.get("familyAggregation", {}).get("activeFamilyCount", 0),
             deterministic_score=candidate.deterministic_confidence,
             deterministic_edge=candidate.edge,
-            calibrated_success_probability=inference.calibratedProbability or inference.probabilityOfSuccess or 0.0,
-            uncertainty=inference.uncertainty or 1.0,
+            calibrated_success_probability=_number_or_default(
+                inference.calibratedProbability,
+                _number_or_default(inference.probabilityOfSuccess, 0.0),
+            ),
+            uncertainty=_number_or_default(inference.uncertainty, 1.0),
             missingness=inference.featureMissingness,
-            ood_score=inference.outOfDistributionScore or 0.0,
+            ood_score=_number_or_default(inference.outOfDistributionScore, 0.0),
             model_health_score=float((inference.modelHealth or {}).get("score", 0.0)),
-            reward_risk_after_costs=geometry.expected_net_reward_risk or 0.0,
-            spread_bps=snapshot.spread_bps or 0.0,
+            reward_risk_after_costs=_number_or_default(geometry.expected_net_reward_risk, 0.0),
+            spread_bps=_number_or_default(snapshot.spread_bps, 0.0),
             liquidity=float((snapshot.liquidity or {}).get("dollarVolume") or snapshot.volume),
             realized_daily_pnl=request.realized_daily_pnl,
             daily_trade_count=request.daily_trade_count,
@@ -390,12 +730,12 @@ def _stage_dynamic_profile(state: _PipelineState) -> None:
             timestamp=snapshot.timestamp,
             volatility_level=_volatility_level(snapshot),
             liquidity_level=_liquidity_level(snapshot),
-            spread_bps=snapshot.spread_bps or 0.0,
+            spread_bps=_number_or_default(snapshot.spread_bps, 0.0),
             event_blackout=state.request.event_blackout,
             session_allowed=state.request.session_allowed,
             model_health_score=float((inference.modelHealth or {}).get("score", 0.0)),
             missingness=inference.featureMissingness,
-            ood_score=inference.outOfDistributionScore or 0.0,
+            ood_score=_number_or_default(inference.outOfDistributionScore, 0.0),
         ),
     )
     state.reason_codes.extend(state.dynamic_profile.reason_codes)
@@ -412,26 +752,38 @@ def _stage_sizing(state: _PipelineState) -> None:
     local_gates = _require(state.local_gates, "local_gates")
     entry = geometry.entry_reference or snapshot.last_price
     stop_distance = geometry.stop_distance if geometry.stop_distance > 0 else max(0.0, abs(entry - (geometry.geometry.stop_price or entry)))
+    missing_reasons = _paper_sizing_missing_reasons(request) if request.mode == "PAPER" else ()
     state.sizing = calculate_meta_strategy_position_size(
         MetaStrategySizingContext(
             side=inference.finalSignal if inference.finalSignal in {"BUY", "SELL"} else "HOLD",
-            candidate_accepted=inference.candidateAccepted,
+            candidate_accepted=inference.candidateAccepted and _required_entry_stages_passed(state),
             local_gates_passed=local_gates.passed,
             baseline_settings=config.baseline_settings,
             effective_settings=profile.effective_settings,
             model_risk_multiplier=inference.recommendedRiskMultiplier,
-            account_equity=request.account_equity or config.default_account_equity,
-            available_buying_power=request.available_buying_power or config.default_buying_power,
+            account_equity=_pipeline_required_number(request.account_equity, config.default_account_equity, request.mode),
+            available_buying_power=_pipeline_required_number(request.available_buying_power, config.default_buying_power, request.mode),
             entry_price=entry,
             stop_distance=stop_distance,
             market_liquidity=float((snapshot.liquidity or {}).get("shareVolume") or snapshot.volume),
-            remaining_algorithm_risk=request.remaining_algorithm_risk or config.default_remaining_algorithm_risk,
-            global_available_risk=request.global_available_risk or config.default_global_available_risk,
-            global_quantity_cap=request.global_quantity_cap if request.global_quantity_cap is not None else config.default_global_quantity_cap,
+            remaining_algorithm_risk=_pipeline_required_number(request.remaining_algorithm_risk, config.default_remaining_algorithm_risk, request.mode),
+            global_available_risk=_pipeline_required_number(request.global_available_risk, config.default_global_available_risk, request.mode),
+            global_quantity_cap=_pipeline_required_int(request.global_quantity_cap, config.default_global_quantity_cap, request.mode),
         )
     )
+    if missing_reasons:
+        state.reason_codes.extend(missing_reasons)
     state.reason_codes.extend(state.sizing.reason_codes)
-    _record(state, "sizing", {"quantity": state.sizing.quantity, "limitingCap": state.sizing.limiting_cap})
+    _record(
+        state,
+        "sizing",
+        {
+            "quantity": state.sizing.quantity,
+            "limitingCap": state.sizing.limiting_cap,
+            "authoritativeInputsAvailable": not missing_reasons,
+            "missingReasonCodes": missing_reasons,
+        },
+    )
 
 
 def _stage_order_intent(state: _PipelineState) -> None:
@@ -439,6 +791,21 @@ def _stage_order_intent(state: _PipelineState) -> None:
     inference = _require(state.inference, "inference")
     geometry = _require(state.geometry, "geometry")
     snapshot = _require(state.snapshot, "snapshot")
+    if not _required_entry_stages_passed(state):
+        blocked = _required_entry_stage_block_reasons(state)
+        state.order_intent = None
+        state.reason_codes.extend(blocked)
+        _record(
+            state,
+            "order_intent",
+            {
+                "status": "NO_ORDER",
+                "quantity": 0,
+                "reasonCodes": (*blocked, "meta_strategy.order_intent.blocked_by_required_stage"),
+                "blockedByRequiredStage": True,
+            },
+        )
+        return
     result = build_meta_strategy_order_intent(
         snapshot=snapshot,
         side=inference.finalSignal,
@@ -466,7 +833,8 @@ def _stage_final_validation(state: _PipelineState) -> None:
     geometry = _require(state.geometry, "geometry")
     inference = _require(state.inference, "inference")
     global_risk = state.global_risk or {}
-    approved_quantity = int(global_risk.get("approvedQuantity") or 0)
+    approved_quantity_raw = global_risk.get("approvedQuantity")
+    approved_quantity = int(approved_quantity_raw) if approved_quantity_raw is not None else 0
     entry = geometry.entry_reference or snapshot.last_price
     stop_distance = geometry.stop_distance if geometry.stop_distance > 0 else abs(entry - (geometry.geometry.stop_price or entry))
     state.order_validation = validate_meta_strategy_order(
@@ -482,9 +850,9 @@ def _stage_final_validation(state: _PipelineState) -> None:
             stop_price=geometry.geometry.stop_price,
             target_price=geometry.geometry.target_price,
             reward_risk=geometry.geometry.risk_reward,
-            available_buying_power=state.request.available_buying_power or state.config.default_buying_power,
+            available_buying_power=_pipeline_required_number(state.request.available_buying_power, state.config.default_buying_power, state.request.mode),
             reserved_risk_dollars=approved_quantity * stop_distance,
-            maximum_reserved_risk_dollars=state.request.global_available_risk or state.config.default_global_available_risk,
+            maximum_reserved_risk_dollars=_pipeline_required_number(state.request.global_available_risk, state.config.default_global_available_risk, state.request.mode),
             session_allowed=state.request.session_allowed and not (state.request.mode == "LIVE" and not state.config.live_trading_enabled),
             max_quote_age_seconds=state.request.max_quote_age_seconds,
             max_spread_bps=state.dynamic_profile.effective_settings.spread_limit_bps if state.dynamic_profile else 15.0,
@@ -506,7 +874,8 @@ def _stage_final_validation(state: _PipelineState) -> None:
 def _stage_global_risk(state: _PipelineState) -> None:
     sizing = _require(state.sizing, "sizing")
     global_result = state.global_risk_adapter.apply(state.order_intent, requested_quantity=sizing.quantity)
-    approved = int(global_result.get("approvedQuantity") or 0)
+    approved_raw = global_result.get("approvedQuantity")
+    approved = int(approved_raw) if approved_raw is not None else 0
     if state.order_intent is not None and approved < int(state.order_intent.quantity):
         state.order_intent = _order_with_quantity(state.order_intent, approved) if approved > 0 else None
         state.reason_codes.append("meta_strategy.pipeline.global_risk_reduced_quantity")
@@ -553,7 +922,10 @@ def _stage_reconciliation(state: _PipelineState) -> None:
         state.reconciliation = None
         _record(state, "reconciliation", {"status": "NO_POSITION"})
         return
-    filled = int(state.broker_result.get("filledQuantity") or state.request.broker_quantity or 0) if state.broker_result else state.request.broker_quantity
+    if state.broker_result and state.broker_result.get("filledQuantity") is not None:
+        filled = int(state.broker_result["filledQuantity"])
+    else:
+        filled = state.request.broker_quantity
     geometry = _require(state.geometry, "geometry")
     state.reconciliation = reconcile_meta_strategy_broker_fill(
         planned_quantity=int(state.order_intent.quantity),
@@ -563,12 +935,278 @@ def _stage_reconciliation(state: _PipelineState) -> None:
         side=state.order_intent.side,
         average_fill_price=geometry.entry_reference or _require(state.snapshot, "snapshot").last_price,
         filled_at=_require(state.snapshot, "snapshot").timestamp,
-        protective_stop=geometry.geometry.stop_price or 0.0,
-        profit_target=geometry.geometry.target_price or 0.0,
-        maximum_holding_minutes=geometry.maximum_holding_minutes or 1,
+        protective_stop=geometry.geometry.stop_price if geometry.geometry.stop_price is not None else 0.0,
+        profit_target=geometry.geometry.target_price if geometry.geometry.target_price is not None else 0.0,
+        maximum_holding_minutes=geometry.maximum_holding_minutes if geometry.maximum_holding_minutes is not None else 1,
     )
     state.reason_codes.extend(state.reconciliation.reason_codes)
     _record(state, "reconciliation", state.reconciliation.as_pipeline_result())
+
+
+def _candidate_components(state: _PipelineState) -> CandidateComponentEvaluation:
+    if state.candidate_components is None:
+        state.candidate_components = evaluate_candidate_components(
+            _require(state.snapshot, "snapshot"),
+            settings=state.config.settings,
+        )
+    return state.candidate_components
+
+
+def _strategy_stage_output(
+    output: SnapshotEvaluationResult,
+    entry: MetaStrategyRegistryEntry,
+    snapshot: MetaStrategyMarketSnapshot,
+) -> MetaStrategyStrategyStageOutput:
+    evidence = dict(output.evidence or {})
+    required_status = dict(output.required_input_status or {})
+    missing_inputs = tuple(key for key, ready in required_status.items() if not ready)
+    data_quality = "OK"
+    if missing_inputs or evidence.get("dataQualityBlocked") or any("missing_data" in code for code in output.reason_codes):
+        data_quality = "BLOCKED"
+    elif not output.eligible:
+        data_quality = "DEGRADED"
+    signal = str(output.signal).upper()
+    if signal not in {"BUY", "SELL", "HOLD"}:
+        signal = "HOLD"
+    vetoes = tuple(
+        dict.fromkeys(
+            (
+                *(output.reason_codes if not output.eligible or data_quality == "BLOCKED" else ()),
+                "meta_strategy.strategy.blocks_new_entries" if evidence.get("blocksNewEntries") else "",
+            )
+        )
+    )
+    return MetaStrategyStrategyStageOutput(
+        strategy_id=output.strategy_id,
+        strategy_version=output.strategy_version or entry.strategy_version,
+        family_id=str(output.family if output.family != "UNKNOWN" else entry.family),
+        signal=signal,  # type: ignore[arg-type]
+        confidence=round(max(0.0, min(1.0, float(output.confidence))), 6),
+        eligible=bool(output.eligible),
+        data_quality=data_quality,
+        evidence={
+            **evidence,
+            "requiredInputs": entry.required_inputs,
+            "requiredInputStatus": required_status,
+            "minimumWarmup": entry.minimum_warmup,
+            "role": str(entry.role),
+            "mode": entry.mode,
+            "correlationGroup": entry.correlation_group,
+        },
+        vetoes=tuple(code for code in vetoes if code),
+        reason_codes=tuple(output.reason_codes),
+        evaluated_at=snapshot.timestamp,
+    )
+
+
+def _record_stage_contract(
+    state: _PipelineState,
+    stage: str,
+    *,
+    status: str,
+    eligible: bool,
+    input_version: str,
+    output_version: str,
+    reason_codes: tuple[str, ...],
+    evidence: dict[str, Any],
+) -> None:
+    snapshot = _require(state.snapshot, "snapshot")
+    result = MetaStrategyStageContractResult(
+        status=status,
+        eligible=eligible,
+        input_version=input_version,
+        output_version=output_version,
+        started_at=snapshot.timestamp,
+        completed_at=snapshot.timestamp,
+        duration_ms=0,
+        reason_codes=tuple(dict.fromkeys(reason_codes)),
+        evidence=evidence,
+    )
+    if not eligible:
+        state.reason_codes.extend(result.reason_codes)
+    _record(state, stage, result.as_payload())
+
+
+def _stage_input_version(snapshot: MetaStrategyMarketSnapshot) -> str:
+    return ":".join(
+        (
+            snapshot.algorithm_version,
+            snapshot.configuration_version,
+            snapshot.strategy_catalog_version,
+            snapshot.settings_version,
+            snapshot.snapshot_id,
+        )
+    )
+
+
+def _stage_reason_codes(*groups: tuple[str, ...], extra: tuple[str, ...] = ()) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(code for group in groups for code in group if code) | dict.fromkeys(code for code in extra if code))
+
+
+def _first_evidence_value(groups: tuple[dict[str, Any], ...], key: str, *, default: Any) -> Any:
+    for evidence in groups:
+        if evidence.get(key) is not None:
+            return evidence[key]
+    return default
+
+
+def _restricted_families_from_regime(outputs: tuple[SnapshotEvaluationResult, ...], safety_blocks: bool) -> tuple[str, ...]:
+    restricted: set[str] = set()
+    for output in outputs:
+        fit = (output.evidence or {}).get("strategyFit") or {}
+        if not isinstance(fit, Mapping):
+            continue
+        restricted.update(str(family) for family, value in fit.items() if _number_or_default(_coerce_float(value), 0.0) <= 0.0)
+    if safety_blocks:
+        restricted.update(("TREND", "BREAKOUT", "REVERSAL", "MEAN_REVERSION", "GAP_SESSION", "EVENT_DRIVEN"))
+    return tuple(sorted(restricted))
+
+
+def _explicit_safety_vetoes(state: _PipelineState) -> tuple[str, ...]:
+    request = state.request
+    snapshot = _require(state.snapshot, "snapshot")
+    vetoes: list[str] = []
+    if not _required_market_data_complete(state):
+        vetoes.append("meta_strategy.safety.data_completeness_failed")
+    if not _quote_fresh(state):
+        vetoes.append("meta_strategy.safety.data_freshness_failed")
+    if not request.session_allowed:
+        vetoes.append("meta_strategy.safety.market_session_not_allowed")
+    if request.event_blackout:
+        vetoes.append("meta_strategy.safety.event_blackout")
+    spread = snapshot.spread_bps
+    if spread is None or float(spread) > state.config.settings.local_risk.spread_limit_bps:
+        vetoes.append("meta_strategy.safety.spread_unacceptable")
+    liquidity = float((snapshot.liquidity or {}).get("dollarVolume") or snapshot.volume)
+    if liquidity < state.config.settings.local_risk.liquidity_requirement:
+        vetoes.append("meta_strategy.safety.liquidity_unacceptable")
+    if not _operationally_healthy(state):
+        vetoes.append("meta_strategy.safety.operational_health_failed")
+    if request.realized_daily_pnl <= -float(state.config.settings.local_risk.maximum_daily_loss):
+        vetoes.append("meta_strategy.safety.daily_loss_limit_reached")
+    if _emergency_or_entry_pause_active(state):
+        vetoes.append("meta_strategy.safety.emergency_or_entry_pause_active")
+    if not _symbol_supported(state):
+        vetoes.append("meta_strategy.safety.unsupported_symbol")
+    if not _timeframe_supported(state):
+        vetoes.append("meta_strategy.safety.unsupported_timeframe")
+    if _has_conflicting_position_state(state):
+        vetoes.append("meta_strategy.safety.conflicting_position_state")
+    return tuple(dict.fromkeys(vetoes))
+
+
+def _required_market_data_complete(state: _PipelineState) -> bool:
+    request = state.request.snapshot_request
+    return bool(request.quotes and request.one_minute_candles and request.five_minute_candles and request.fifteen_minute_candles)
+
+
+def _quote_fresh(state: _PipelineState) -> bool:
+    snapshot = _require(state.snapshot, "snapshot")
+    quote = snapshot.quote or {}
+    timestamp = quote.get("timestamp") if isinstance(quote, Mapping) else None
+    if timestamp is None:
+        return False
+    try:
+        quote_time = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if quote_time.tzinfo is None or quote_time.utcoffset() is None:
+        return False
+    return (snapshot.timestamp - quote_time).total_seconds() <= state.request.max_quote_age_seconds
+
+
+def _operationally_healthy(state: _PipelineState) -> bool:
+    health = dict(state.request.operational_health or {})
+    runtime = dict(state.request.runtime_health or {})
+    if not health and not runtime:
+        return True
+    blocked_values = {
+        "ready": False,
+        "tradingAllowed": False,
+        "paperOrdersBlocked": True,
+        "blocked": True,
+        "degraded": True,
+    }
+    for key, blocked in blocked_values.items():
+        if health.get(key) is blocked or runtime.get(key) is blocked:
+            return False
+    status = str(health.get("status") or runtime.get("status") or "OK").upper()
+    return status not in {"FAIL", "FAILED", "BLOCKED", "UNHEALTHY", "DOWN"}
+
+
+def _emergency_or_entry_pause_active(state: _PipelineState) -> bool:
+    controls = {**dict(state.request.operational_controls or {}), **dict(state.request.runtime_health or {})}
+    for key in ("emergencyStop", "emergency_stop", "exitOnly", "exit_only", "pauseNewEntries", "pause_new_entries", "paperOrdersBlocked"):
+        if controls.get(key) is True:
+            return True
+    return False
+
+
+def _symbol_supported(state: _PipelineState) -> bool:
+    symbol = _require(state.snapshot, "snapshot").symbol.upper()
+    explicit = (getattr(state.config.settings, "model_extra", None) or {}).get("allowed_symbols")
+    if explicit:
+        return symbol in {str(item).upper() for item in explicit}
+    return bool(symbol)
+
+
+def _timeframe_supported(state: _PipelineState) -> bool:
+    candles = _require(state.snapshot, "snapshot").candles
+    return bool(candles.get("1m") and candles.get("5m") and candles.get("15m"))
+
+
+def _has_conflicting_position_state(state: _PipelineState) -> bool:
+    snapshot = _require(state.snapshot, "snapshot")
+    existing = {symbol.upper() for symbol in state.request.existing_position_symbols}
+    if snapshot.symbol.upper() in existing and state.config.settings.position_management.one_position_per_symbol:
+        return True
+    position_state = (snapshot.features or {}).get("existingPositionState") or {}
+    return isinstance(position_state, Mapping) and not bool(position_state.get("policyAllowsEntry", True))
+
+
+def _family_alignment_from_aggregation(signal: str, family_scores: tuple[Any, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if signal == "BUY":
+        supporting = tuple(score.family for score in family_scores if score.buy_score > score.sell_score and score.buy_score > 0.0)
+        opposing = tuple(score.family for score in family_scores if score.sell_score > 0.0)
+    elif signal == "SELL":
+        supporting = tuple(score.family for score in family_scores if score.sell_score > score.buy_score and score.sell_score > 0.0)
+        opposing = tuple(score.family for score in family_scores if score.buy_score > 0.0)
+    else:
+        supporting = ()
+        opposing = tuple(score.family for score in family_scores if score.buy_score > 0.0 or score.sell_score > 0.0)
+    return supporting, opposing
+
+
+def _winning_scores_from_aggregation(signal: str, aggregation: Any) -> tuple[float, float]:
+    if signal == "BUY":
+        return float(aggregation.buy_score), float(aggregation.sell_score)
+    if signal == "SELL":
+        return float(aggregation.sell_score), float(aggregation.buy_score)
+    return max(float(aggregation.buy_score), float(aggregation.sell_score), float(aggregation.hold_score)), max(min(float(aggregation.buy_score), float(aggregation.sell_score)), 0.0)
+
+
+def _required_entry_stages_passed(state: _PipelineState) -> bool:
+    return all(bool((state.stage_results.get(stage) or {}).get("eligible")) for stage in ("strategies", "context_and_regime", "safety", "family_aggregation"))
+
+
+def _required_entry_stage_block_reasons(state: _PipelineState) -> tuple[str, ...]:
+    reasons: list[str] = []
+    for stage in ("strategies", "context_and_regime", "safety", "family_aggregation"):
+        payload = state.stage_results.get(stage) or {}
+        if payload.get("eligible"):
+            continue
+        reasons.extend(str(code) for code in payload.get("reasonCodes") or ())
+        reasons.append(f"meta_strategy.pipeline.required_stage_blocked.{stage}")
+    return tuple(dict.fromkeys(reasons))
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _build_result(state: _PipelineState) -> MetaStrategyExecutionPipelineResult:
@@ -595,6 +1233,85 @@ def _build_result(state: _PipelineState) -> MetaStrategyExecutionPipelineResult:
         effective_settings_hash=state.config.settings.effective_settings_hash,
         reason_codes=tuple(dict.fromkeys(state.reason_codes)),
     )
+
+
+def _authoritative_state_evidence(request: MetaStrategyExecutionPipelineRequest) -> dict[str, Any]:
+    inventory = dict(request.inventory_snapshot or {})
+    account = dict(request.account_snapshot or {})
+    global_risk = dict(request.global_risk_snapshot or {})
+    event_state = dict(request.event_state or {})
+    operational = dict(request.operational_health or {})
+    market_clock = dict(request.market_clock_state or {})
+    return _plain_pipeline_value(
+        {
+            "settings": {
+                "eventSettingsVersion": request.settings_version,
+                "activeSettingsVersion": request.active_settings_version,
+            },
+            "inventory": {
+                "snapshotId": inventory.get("snapshotId"),
+                "pointInTimeCutoff": inventory.get("pointInTimeCutoff"),
+                "rebuiltFromLedger": inventory.get("rebuiltFromLedger"),
+                "reservedRiskDollars": inventory.get("reservedRiskDollars"),
+                "remainingRiskDollars": inventory.get("remainingRiskDollars"),
+                "reservedRiskLedgerCount": len(request.reserved_risk_ledger),
+                "dailyTradeCount": inventory.get("dailyTradeCount"),
+                "lastTradeAt": inventory.get("lastTradeAt"),
+                "existingPositionSymbols": tuple(
+                    str(position.get("symbol") or "").upper()
+                    for position in inventory.get("positions", ())
+                    if isinstance(position, Mapping) and position.get("symbol")
+                ),
+                "openOrderCount": len(inventory.get("submittedAndOpenOrders", ()) or ()),
+            },
+            "account": {
+                "source": account.get("source"),
+                "capturedAt": account.get("capturedAt"),
+                "authoritativeReadOnly": account.get("authoritativeReadOnly"),
+                "accountEquity": account.get("accountEquity"),
+                "buyingPower": account.get("buyingPower"),
+            },
+            "globalRisk": {
+                "source": global_risk.get("source"),
+                "capturedAt": global_risk.get("capturedAt"),
+                "authoritativeReadOnly": global_risk.get("authoritativeReadOnly"),
+                "availableRiskDollars": global_risk.get("availableRiskDollars"),
+                "maxQuantity": global_risk.get("maxQuantity"),
+                "reject": global_risk.get("reject"),
+            },
+            "operational": {
+                "health": operational,
+                "controls": dict(request.operational_controls or {}),
+                "runtime": dict(request.runtime_health or {}),
+                "paperControl": dict(request.paper_control_state or {}),
+                "marketClock": market_clock,
+            },
+            "eventState": event_state,
+            "marketData": {
+                "quoteCount": len(request.snapshot_request.quotes),
+                "oneMinuteCount": len(request.snapshot_request.one_minute_candles),
+                "fiveMinuteCount": len(request.snapshot_request.five_minute_candles),
+                "fifteenMinuteCount": len(request.snapshot_request.fifteen_minute_candles),
+                "relativeStrengthCounts": {
+                    "qqq": len(request.snapshot_request.qqq_candles),
+                    "iwm": len(request.snapshot_request.iwm_candles),
+                },
+                "breadthComponentCount": len(request.snapshot_request.breadth_components),
+            },
+        }
+    )
+
+
+def _plain_pipeline_value(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, Mapping):
+        return {str(key): _plain_pipeline_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return tuple(_plain_pipeline_value(item) for item in value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 
 def _record(state: _PipelineState, stage: str, payload: dict[str, Any]) -> None:
@@ -724,11 +1441,102 @@ def _configured_limit_price(state: _PipelineState, side: str, geometry: Candidat
     entry = geometry.entry_reference
     if entry is None or side not in {"BUY", "SELL"}:
         return None
-    offset_bps = order_settings.limit_offset_bps or entry_settings.marketable_limit_offset_bps
+    offset_bps = order_settings.limit_offset_bps if order_settings.limit_offset_bps is not None else entry_settings.marketable_limit_offset_bps
     offset = float(entry) * float(offset_bps) / 10_000.0
     if style == "MARKETABLE_LIMIT":
         return round(float(entry) + offset if side == "BUY" else float(entry) - offset, 6)
     return round(float(entry), 6)
+
+
+def _artifact_for_model_inference(
+    state: _PipelineState,
+    mode_config: MetaStrategyInferenceConfig,
+) -> tuple[dict[str, Any] | None, MetaStrategyInferenceConfig]:
+    validation = state.stage_results.get("artifact_validation") or {}
+    artifact = dict(state.request.model_artifact or {})
+    if validation.get("modelApplicationAllowed") is True:
+        return artifact, mode_config
+    if artifact and validation.get("shadowDiagnosticsOnly") is True:
+        return artifact, MetaStrategyInferenceConfig(**{**mode_config.__dict__, "mode": "SHADOW"})
+    if artifact and validation.get("compatible") is False:
+        return artifact, mode_config
+    if artifact and validation.get("promoted") is not True and mode_config.mode in {"FILTER", "RISK_REDUCTION"}:
+        if mode_config.fallbackBehavior == "DETERMINISTIC_BASELINE":
+            return None, mode_config
+        return None, MetaStrategyInferenceConfig(**{**mode_config.__dict__, "fallbackBehavior": "NO_TRADE"})
+    return state.request.model_artifact, mode_config
+
+
+def _artifact_promoted_for_application(artifact: Mapping[str, Any]) -> bool:
+    if not artifact:
+        return False
+    for key in ("promoted", "paperPromoted", "promotedForPaper", "trusted"):
+        if artifact.get(key) is True:
+            return True
+    status = str(artifact.get("status") or artifact.get("lifecycleStatus") or artifact.get("promotionStatus") or "").upper()
+    return status in {"PROMOTED", "ACTIVE", "TRUSTED", "PAPER_PROMOTED"}
+
+
+def _artifact_validation_reasons(
+    *,
+    artifact: Mapping[str, Any],
+    compatible: bool,
+    promoted: bool,
+    model_available: bool,
+    shadow_diagnostics_only: bool,
+    deterministic_only: bool,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if not artifact:
+        reasons.append("meta_strategy.artifact_validation.model_unavailable")
+    if artifact and not compatible:
+        reasons.append("meta_strategy.artifact_validation.feature_schema_mismatch")
+    if artifact and compatible:
+        reasons.append("meta_strategy.artifact_validation.feature_schema_compatible")
+    if artifact and not promoted:
+        reasons.append("meta_strategy.artifact_validation.unpromoted_artifact_shadow_only")
+    if artifact and promoted:
+        reasons.append("meta_strategy.artifact_validation.promoted")
+    if artifact and not model_available:
+        reasons.append("meta_strategy.artifact_validation.champion_model_unavailable")
+    if shadow_diagnostics_only:
+        reasons.append("meta_strategy.artifact_validation.shadow_diagnostics_only")
+    if deterministic_only:
+        reasons.append("meta_strategy.artifact_validation.deterministic_only")
+    if artifact and compatible and promoted and model_available:
+        reasons.append("meta_strategy.artifact_validation.model_application_allowed")
+    return tuple(dict.fromkeys(reasons))
+
+
+def _number_or_default(value: float | None, default: float) -> float:
+    return float(value) if value is not None else float(default)
+
+
+def _pipeline_required_number(value: float | None, fixture_default: float, mode: str) -> float:
+    if value is not None:
+        return float(value)
+    return 0.0 if mode == "PAPER" else float(fixture_default)
+
+
+def _pipeline_required_int(value: int | None, fixture_default: int, mode: str) -> int:
+    if value is not None:
+        return int(value)
+    return 0 if mode == "PAPER" else int(fixture_default)
+
+
+def _paper_sizing_missing_reasons(request: MetaStrategyExecutionPipelineRequest) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if request.account_equity is None:
+        reasons.append("meta_strategy.sizing.account_equity_unavailable")
+    if request.available_buying_power is None:
+        reasons.append("meta_strategy.sizing.buying_power_unavailable")
+    if request.remaining_algorithm_risk is None:
+        reasons.append("meta_strategy.sizing.algorithm_risk_unavailable")
+    if request.global_available_risk is None:
+        reasons.append("meta_strategy.sizing.global_risk_unavailable")
+    if request.global_quantity_cap is None:
+        reasons.append("meta_strategy.sizing.global_quantity_cap_unavailable")
+    return tuple(reasons)
 
 
 def _volatility_level(snapshot: MetaStrategyMarketSnapshot) -> Literal["LOW", "NORMAL", "HIGH", "EXTREME"]:
@@ -757,10 +1565,10 @@ def _order_with_quantity(order: MetaOrderIntent, quantity: int) -> MetaOrderInte
 
 _STAGE_HANDLERS: dict[str, Callable[[_PipelineState], None]] = {
     "market_snapshot": _stage_market_snapshot,
-    "strategies": _stage_passive("strategies"),
-    "context_and_regime": _stage_passive("context_and_regime"),
-    "safety": _stage_passive("safety"),
-    "family_aggregation": _stage_passive("family_aggregation"),
+    "strategies": _stage_strategies,
+    "context_and_regime": _stage_context_and_regime,
+    "safety": _stage_safety,
+    "family_aggregation": _stage_family_aggregation,
     "deterministic_candidate": _stage_deterministic_candidate,
     "candidate_geometry": _stage_candidate_geometry,
     "feature_builder": _stage_feature_builder,

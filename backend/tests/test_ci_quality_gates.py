@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "quality-gates.yml"
 QUALITY_SCRIPT = ROOT / "scripts" / "ci_quality_gates.py"
+META_STRATEGY_PAPER_READINESS_SCRIPT = ROOT / "scripts" / "meta_strategy_paper_readiness_gate.py"
 STATIC_QUALITY_SCRIPT = ROOT / "scripts" / "python_static_quality.py"
 FRONTEND_PACKAGE = ROOT / "frontend" / "package.json"
 
@@ -31,6 +32,7 @@ class CIQualityGatesTest(unittest.TestCase):
             "pytest",
             "regime-focused-tests",
             "meta-strategy-dedicated-tests",
+            "meta-strategy-paper-readiness",
             "session-dedicated-tests",
             "typescript-type-check",
             "frontend-tests",
@@ -79,6 +81,53 @@ class CIQualityGatesTest(unittest.TestCase):
             "test_wca_step15_api_frontend_control_surface.py",
         ):
             self.assertIn(test_file, source)
+
+    def test_meta_strategy_paper_readiness_gate_covers_automatic_paper_failure_modes(self) -> None:
+        ci_source = QUALITY_SCRIPT.read_text(encoding="utf-8")
+        gate_source = META_STRATEGY_PAPER_READINESS_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("scripts/meta_strategy_paper_readiness_gate.py", ci_source)
+        for category in (
+            "architecture-and-ownership",
+            "state-provider",
+            "pipeline-stages",
+            "local-risk-and-sizing",
+            "paper-control-and-runtime-supervisor",
+            "market-clock",
+            "reconciliation-and-position-management",
+            "readiness-and-observability",
+            "automatic-paper-e2e",
+        ):
+            self.assertIn(category, gate_source)
+
+        for test_file in (
+            "test_meta_strategy_step6_architecture_isolation.py",
+            "test_meta_strategy_authoritative_state_provider.py",
+            "test_meta_strategy_step31_execution_pipeline.py",
+            "test_meta_strategy_step27_local_gates.py",
+            "test_meta_strategy_step29_position_sizing.py",
+            "test_meta_strategy_phase9_paper_execution.py",
+            "test_meta_strategy_market_clock.py",
+            "test_meta_strategy_runtime_supervisor.py",
+            "test_reconciliation.py",
+            "test_meta_strategy_position_management_worker.py",
+            "test_paper_readiness_acceptance.py",
+            "test_required_paper_e2e.py",
+        ):
+            self.assertIn(test_file, gate_source)
+
+        for criterion in (
+            "toggle_off_blocks_new_entry_broker_call",
+            "zero_financial_values_do_not_default",
+            "market_closed_blocks_broker_call",
+            "hard_gate_result_cannot_be_bypassed",
+            "sibling_inventory_isolation",
+            "duplicate_order_submission_blocked",
+            "live_trading_never_enabled",
+            "mandatory_pipeline_stages_are_concrete",
+            "readiness_cannot_be_bypassed",
+        ):
+            self.assertIn(criterion, gate_source)
 
     def test_static_quality_script_checks_formatting_and_lint_parseability(self) -> None:
         source = STATIC_QUALITY_SCRIPT.read_text(encoding="utf-8")

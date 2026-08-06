@@ -147,6 +147,10 @@ class MetaStrategyRepositoryAttributionError(ValueError):
     pass
 
 
+class MetaStrategyInventoryOwnershipConflict(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class MetaStrategyRepositoryRecord:
     table_name: str
@@ -252,6 +256,36 @@ def apply_meta_strategy_persistence_migrations(conn: sqlite3.Connection) -> None
         conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_inventory_correlation ON {table}(correlation_id)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_strategy_inventory_fills_broker_fill ON meta_strategy_inventory_fills(broker_fill_id)")
     conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_strategy_inventory_client_order_id
+        ON meta_strategy_inventory_submitted_orders(client_order_id)
+        WHERE algorithm_id = 'meta_strategy'
+          AND capital_partition_id = 'meta_strategy.paper.default'
+          AND client_order_id IS NOT NULL
+          AND client_order_id <> ''
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_strategy_inventory_order_intent_id
+        ON meta_strategy_inventory_order_intents(order_intent_id)
+        WHERE algorithm_id = 'meta_strategy'
+          AND capital_partition_id = 'meta_strategy.paper.default'
+          AND order_intent_id IS NOT NULL
+          AND order_intent_id <> ''
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_meta_strategy_inventory_fill_event_id
+        ON meta_strategy_inventory_fills(event_id)
+        WHERE algorithm_id = 'meta_strategy'
+          AND capital_partition_id = 'meta_strategy.paper.default'
+          AND event_id IS NOT NULL
+          AND event_id <> ''
+        """
+    )
+    conn.execute(
         "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
         (META_STRATEGY_PERSISTENCE_MIGRATION_VERSION,),
     )
@@ -275,72 +309,8 @@ class MetaStrategySqliteRepository:
             conn.close()
 
     def persist(self, artifact_type: str, payload: Any, *, record_id: str | None = None) -> MetaStrategyRepositoryRecord:
-        table = _table_for_artifact(artifact_type)
-        normalized = _normalize_payload(payload)
-        metadata = _metadata(normalized)
-        payload_json = _json_dumps(normalized)
-        persisted_record_id = record_id or _record_id(table, metadata, payload_json)
         with self.connect() as conn:
-            conn.execute(
-                f"""
-                INSERT OR REPLACE INTO {table} (
-                    record_id, artifact_type, algorithm_id, capital_partition_id, algorithm_version, configuration_version,
-                    settings_version,
-                    strategy_catalog_version, feature_schema_version, label_specification_version,
-                    model_version, model_artifact_version, dynamic_profile_version,
-                    position_sizing_version, exit_policy_version, backtest_engine_version,
-                    timestamp, symbol, bar_end, decision_id, idempotency_key, job_id, event_id, snapshot_id, order_intent_id,
-                    client_order_id, broker_order_id, trade_id, run_id, artifact_id, status, payload_json, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    persisted_record_id,
-                    artifact_type,
-                    ALGORITHM_ID,
-                    metadata["capital_partition_id"],
-                    metadata["algorithm_version"],
-                    metadata["configuration_version"],
-                    metadata["settings_version"],
-                    metadata["strategy_catalog_version"],
-                    metadata["feature_schema_version"],
-                    metadata["label_specification_version"],
-                    metadata["model_version"],
-                    metadata["model_artifact_version"],
-                    metadata["dynamic_profile_version"],
-                    metadata["position_sizing_version"],
-                    metadata["exit_policy_version"],
-                    metadata["backtest_engine_version"],
-                    metadata["timestamp"],
-                    metadata["symbol"],
-                    metadata["bar_end"],
-                    metadata["decision_id"],
-                    metadata["idempotency_key"],
-                    metadata["job_id"],
-                    metadata["event_id"],
-                    metadata["snapshot_id"],
-                    metadata["order_intent_id"],
-                    metadata["client_order_id"],
-                    metadata["broker_order_id"],
-                    metadata["trade_id"],
-                    metadata["run_id"],
-                    metadata["artifact_id"],
-                    metadata["status"],
-                    payload_json,
-                    metadata["created_at"],
-                    metadata["updated_at"],
-                ),
-            )
-        return MetaStrategyRepositoryRecord(
-            table_name=table,
-            record_id=persisted_record_id,
-            artifact_type=artifact_type,
-            algorithm_id=ALGORITHM_ID,
-            capital_partition_id=metadata["capital_partition_id"],
-            decision_id=metadata["decision_id"],
-            settings_version=metadata["settings_version"],
-            payload=normalized,
-        )
+            return persist_meta_strategy_projection_record(conn, artifact_type, payload, record_id=record_id)
 
     def persist_pipeline_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         record = self.persist("decisions", payload)
@@ -364,6 +334,15 @@ class MetaStrategySqliteRepository:
             row = conn.execute(
                 f"SELECT * FROM {table} WHERE decision_id = ? ORDER BY created_at DESC, record_id DESC LIMIT 1",
                 (decision_id,),
+            ).fetchone()
+        return _row_to_record(table, artifact_type, row)
+
+    def latest(self, artifact_type: str) -> MetaStrategyRepositoryRecord | None:
+        table = _table_for_artifact(artifact_type)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT * FROM {table} WHERE algorithm_id = ? ORDER BY created_at DESC, record_id DESC LIMIT 1",
+                (ALGORITHM_ID,),
             ).fetchone()
         return _row_to_record(table, artifact_type, row)
 
@@ -404,7 +383,8 @@ class MetaStrategySqliteRepository:
         with self.connect() as conn:
             self._insert_inventory_record(conn, "meta_strategy_inventory_order_intents", normalized)
             reserved = _float_value(normalized, "reservedRiskDollars", "reserved_risk_dollars")
-            if reserved > 0.0:
+            outstanding = self._reserved_risk_outstanding(conn, normalized)
+            if reserved > 0.0 and outstanding <= 0.0:
                 self._insert_inventory_record(
                     conn,
                     "meta_strategy_inventory_reserved_risk",
@@ -412,6 +392,26 @@ class MetaStrategySqliteRepository:
                 )
             self._store_inventory_projection(conn, mark_prices={})
         return {"algorithmId": ALGORITHM_ID, "status": "RECORDED", "reasonCodes": ("meta_strategy.inventory.order_intent_recorded",)}
+
+    def adjust_reserved_risk(self, payload: Mapping[str, Any], *, target_reserved_risk: float, reason: str) -> dict[str, Any]:
+        normalized = _normalize_inventory_payload(payload)
+        target = round(max(0.0, float(target_reserved_risk)), 10)
+        with self.connect() as conn:
+            outstanding = self._reserved_risk_outstanding(conn, normalized)
+            delta = round(target - outstanding, 10)
+            if abs(delta) > 1e-9:
+                self._insert_inventory_record(
+                    conn,
+                    "meta_strategy_inventory_reserved_risk",
+                    {**normalized, "reservedRiskDelta": delta, "reservationStatus": reason},
+                )
+            self._store_inventory_projection(conn, mark_prices={})
+        return {
+            "algorithmId": ALGORITHM_ID,
+            "status": "RECORDED",
+            "targetReservedRiskDollars": target,
+            "reasonCodes": ("meta_strategy.inventory.reserved_risk_adjusted",),
+        }
 
     def record_submitted_order(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         normalized = _normalize_inventory_payload(payload)
@@ -440,8 +440,12 @@ class MetaStrategySqliteRepository:
             raise ValueError("Meta-Strategy fill ingestion requires brokerFillId")
         with self.connect() as conn:
             existing = conn.execute(
-                "SELECT record_id FROM meta_strategy_inventory_fills WHERE broker_fill_id=?",
-                (broker_fill_id,),
+                """
+                SELECT record_id
+                FROM meta_strategy_inventory_fills
+                WHERE algorithm_id=? AND capital_partition_id=? AND broker_fill_id=?
+                """,
+                (ALGORITHM_ID, self.capital_partition_id, broker_fill_id),
             ).fetchone()
             if existing is not None:
                 return {"algorithmId": ALGORITHM_ID, "status": "DUPLICATE_IGNORED", "brokerFillId": broker_fill_id, "reasonCodes": ("meta_strategy.inventory.duplicate_fill_ignored",)}
@@ -471,8 +475,8 @@ class MetaStrategySqliteRepository:
         return {"algorithmId": ALGORITHM_ID, "status": "RECORDED", "reasonCodes": ("meta_strategy.inventory.position_lifecycle_recorded",)}
 
     def latest_position_lifecycle(self, *, position_id: str | None = None, symbol: str | None = None) -> dict[str, Any] | None:
-        clauses = ["algorithm_id = ?"]
-        params: list[Any] = [ALGORITHM_ID]
+        clauses = ["algorithm_id = ?", "capital_partition_id = ?"]
+        params: list[Any] = [ALGORITHM_ID, self.capital_partition_id]
         if position_id:
             clauses.append("json_extract(payload_json, '$.positionId') = ?")
             params.append(position_id)
@@ -502,6 +506,25 @@ class MetaStrategySqliteRepository:
             self._quarantine_inventory_record(conn, normalized, reason=reason)
         return {"algorithmId": ALGORITHM_ID, "status": "QUARANTINED", "reasonCodes": ("meta_strategy.inventory.quarantined",)}
 
+    def record_foreign_ownership_quarantine(self, payload: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
+        observed_algorithm_id = _string_value(payload, "", "algorithmId", "algorithm_id")
+        observed_capital_partition_id = _string_value(payload, "", "capitalPartitionId", "capital_partition_id")
+        normalized = {
+            **dict(payload),
+            "algorithmId": ALGORITHM_ID,
+            "algorithm_id": ALGORITHM_ID,
+            "capitalPartitionId": self.capital_partition_id,
+            "capital_partition_id": self.capital_partition_id,
+            "observedAlgorithmId": observed_algorithm_id,
+            "observedCapitalPartitionId": observed_capital_partition_id,
+            "quarantineReason": reason,
+            "status": "QUARANTINED",
+            "orderStatus": "QUARANTINED",
+        }
+        with self.connect() as conn:
+            self._quarantine_inventory_record(conn, normalized, reason=reason)
+        return {"algorithmId": ALGORITHM_ID, "status": "QUARANTINED", "reasonCodes": ("meta_strategy.inventory.ownership_conflict_quarantined",)}
+
     def current_inventory_snapshot(self, *, mark_prices: Mapping[str, float] | None = None) -> MetaStrategyInventorySnapshot:
         with self.connect() as conn:
             snapshot = self._rebuild_inventory_from_ledger(conn, mark_prices=mark_prices or {})
@@ -516,14 +539,22 @@ class MetaStrategySqliteRepository:
         with self.connect() as conn:
             derived = self._rebuild_inventory_from_ledger(conn, mark_prices=mark_prices or {})
             stored_row = conn.execute(
-                "SELECT payload_json FROM meta_strategy_inventory_snapshots ORDER BY created_at DESC, record_id DESC LIMIT 1"
+                """
+                SELECT payload_json
+                FROM meta_strategy_inventory_snapshots
+                WHERE algorithm_id=? AND capital_partition_id=?
+                ORDER BY created_at DESC, record_id DESC
+                LIMIT 1
+                """,
+                (ALGORITHM_ID, self.capital_partition_id),
             ).fetchone()
             if stored_row is None:
                 self._store_inventory_projection(conn, mark_prices=mark_prices or {}, snapshot=derived)
                 stored = derived
             else:
                 stored = _snapshot_from_payload(json.loads(str(stored_row["payload_json"])))
-            if stored != derived:
+            consistent = stored.snapshot_id == derived.snapshot_id
+            if not consistent:
                 self._quarantine_inventory_record(
                     conn,
                     _snapshot_payload(derived),
@@ -531,8 +562,8 @@ class MetaStrategySqliteRepository:
                 )
         return {
             "algorithmId": ALGORITHM_ID,
-            "consistent": stored == derived,
-            "reasonCodes": ("meta_strategy.inventory.consistent" if stored == derived else "meta_strategy.inventory.projection_mismatch",),
+            "consistent": consistent,
+            "reasonCodes": ("meta_strategy.inventory.consistent" if consistent else "meta_strategy.inventory.projection_mismatch",),
             "derivedSnapshotId": derived.snapshot_id,
             "storedSnapshotId": stored.snapshot_id,
         }
@@ -549,11 +580,11 @@ class MetaStrategySqliteRepository:
                        decision_id, order_intent_id, client_order_id, broker_order_id, broker_fill_id,
                        symbol, side, quantity, price, status, realised_pnl, timestamp, payload_json
                 FROM {table}
-                WHERE algorithm_id = ?
+                WHERE algorithm_id = ? AND capital_partition_id = ?
                 ORDER BY timestamp DESC, record_id DESC
                 LIMIT ?
                 """,
-                (ALGORITHM_ID, bounded),
+                (ALGORITHM_ID, self.capital_partition_id, bounded),
             ).fetchall()
         return tuple(
             {
@@ -588,6 +619,7 @@ class MetaStrategySqliteRepository:
             )
         payload_json = _json_dumps(normalized)
         persisted_record_id = record_id or _inventory_record_id(table, metadata, payload_json)
+        self._assert_inventory_unique_identity(conn, table, metadata, persisted_record_id)
         conn.execute(
             f"""
             INSERT OR REPLACE INTO {table} (
@@ -620,6 +652,43 @@ class MetaStrategySqliteRepository:
                 payload_json,
             ),
         )
+
+    def _assert_inventory_unique_identity(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        metadata: Mapping[str, Any],
+        record_id: str,
+    ) -> None:
+        checks: tuple[tuple[str, str, str], ...]
+        if table == "meta_strategy_inventory_order_intents":
+            checks = (("order_intent_id", "order_intent_id", "meta_strategy.inventory.duplicate_order_intent_id"),)
+        elif table == "meta_strategy_inventory_submitted_orders":
+            checks = (("client_order_id", "client_order_id", "meta_strategy.inventory.duplicate_client_order_id"),)
+        else:
+            checks = ()
+        for column, metadata_key, reason in checks:
+            value = str(metadata.get(metadata_key) or "")
+            if not value:
+                continue
+            row = conn.execute(
+                f"""
+                SELECT record_id, decision_id, order_intent_id
+                FROM {table}
+                WHERE algorithm_id=? AND capital_partition_id=? AND {column}=?
+                LIMIT 1
+                """,
+                (ALGORITHM_ID, self.capital_partition_id, value),
+            ).fetchone()
+            if row is None or str(row["record_id"]) == record_id:
+                continue
+            same_decision = str(row["decision_id"]) == str(metadata.get("decision_id") or "")
+            same_order_intent = str(row["order_intent_id"]) == str(metadata.get("order_intent_id") or "")
+            if table == "meta_strategy_inventory_order_intents" and same_decision:
+                continue
+            if table == "meta_strategy_inventory_submitted_orders" and same_decision and same_order_intent:
+                continue
+            raise MetaStrategyInventoryOwnershipConflict(reason)
 
     def _quarantine_inventory_record(self, conn: sqlite3.Connection, payload: Mapping[str, Any], *, reason: str) -> None:
         normalized = {**dict(payload), "quarantineReason": reason, "status": "QUARANTINED", "orderStatus": "QUARANTINED"}
@@ -661,9 +730,9 @@ class MetaStrategySqliteRepository:
             """
             SELECT COALESCE(SUM(CAST(json_extract(payload_json, '$.reservedRiskDelta') AS REAL)), 0.0)
             FROM meta_strategy_inventory_reserved_risk
-            WHERE capital_partition_id=? AND (order_intent_id=? OR client_order_id=?)
+            WHERE algorithm_id=? AND capital_partition_id=? AND (order_intent_id=? OR client_order_id=?)
             """,
-            (self.capital_partition_id, order_intent_id, client_order_id),
+            (ALGORITHM_ID, self.capital_partition_id, order_intent_id, client_order_id),
         ).fetchone()
         return round(float(row[0] or 0.0), 10)
 
@@ -674,9 +743,9 @@ class MetaStrategySqliteRepository:
             """
             SELECT COALESCE(SUM(MAX(CAST(json_extract(payload_json, '$.reservedRiskDelta') AS REAL), 0.0)), 0.0)
             FROM meta_strategy_inventory_reserved_risk
-            WHERE capital_partition_id=? AND (order_intent_id=? OR client_order_id=?)
+            WHERE algorithm_id=? AND capital_partition_id=? AND (order_intent_id=? OR client_order_id=?)
             """,
-            (self.capital_partition_id, order_intent_id, client_order_id),
+            (ALGORITHM_ID, self.capital_partition_id, order_intent_id, client_order_id),
         ).fetchone()
         return round(float(row[0] or 0.0), 10)
 
@@ -687,31 +756,31 @@ class MetaStrategySqliteRepository:
             """
             SELECT COALESCE(SUM(quantity), 0.0)
             FROM meta_strategy_inventory_fills
-            WHERE capital_partition_id=? AND (order_intent_id=? OR client_order_id=?)
+            WHERE algorithm_id=? AND capital_partition_id=? AND (order_intent_id=? OR client_order_id=?)
             """,
-            (self.capital_partition_id, order_intent_id, client_order_id),
+            (ALGORITHM_ID, self.capital_partition_id, order_intent_id, client_order_id),
         ).fetchone()
         return round(float(row[0] or 0.0), 10)
 
     def _order_intent_quantity(self, conn: sqlite3.Connection, payload: Mapping[str, Any]) -> float:
         order_intent_id = _string_value(payload, "", "orderIntentId", "order_intent_id")
         row = conn.execute(
-            "SELECT quantity FROM meta_strategy_inventory_order_intents WHERE capital_partition_id=? AND order_intent_id=? ORDER BY created_at DESC LIMIT 1",
-            (self.capital_partition_id, order_intent_id),
+            "SELECT quantity FROM meta_strategy_inventory_order_intents WHERE algorithm_id=? AND capital_partition_id=? AND order_intent_id=? ORDER BY created_at DESC LIMIT 1",
+            (ALGORITHM_ID, self.capital_partition_id, order_intent_id),
         ).fetchone()
         return float(row["quantity"]) if row is not None else 0.0
 
     def _reserved_risk_total(self, conn: sqlite3.Connection) -> float:
         row = conn.execute(
-            "SELECT COALESCE(SUM(CAST(json_extract(payload_json, '$.reservedRiskDelta') AS REAL)), 0.0) FROM meta_strategy_inventory_reserved_risk WHERE capital_partition_id=?",
-            (self.capital_partition_id,),
+            "SELECT COALESCE(SUM(CAST(json_extract(payload_json, '$.reservedRiskDelta') AS REAL)), 0.0) FROM meta_strategy_inventory_reserved_risk WHERE algorithm_id=? AND capital_partition_id=?",
+            (ALGORITHM_ID, self.capital_partition_id),
         ).fetchone()
         return round(max(0.0, float(row[0] or 0.0)), 10)
 
     def _allocated_capital(self, conn: sqlite3.Connection) -> float:
         row = conn.execute(
-            "SELECT payload_json FROM meta_strategy_inventory_allocated_capital WHERE capital_partition_id=? ORDER BY timestamp DESC, created_at DESC LIMIT 1",
-            (self.capital_partition_id,),
+            "SELECT payload_json FROM meta_strategy_inventory_allocated_capital WHERE algorithm_id=? AND capital_partition_id=? ORDER BY timestamp DESC, created_at DESC LIMIT 1",
+            (ALGORITHM_ID, self.capital_partition_id),
         ).fetchone()
         if row is None:
             return 0.0
@@ -720,15 +789,15 @@ class MetaStrategySqliteRepository:
 
     def _latest_reconciliation_checkpoint(self, conn: sqlite3.Connection) -> str | None:
         row = conn.execute(
-            "SELECT record_id FROM meta_strategy_inventory_reconciliation_checkpoints WHERE capital_partition_id=? ORDER BY timestamp DESC, created_at DESC LIMIT 1",
-            (self.capital_partition_id,),
+            "SELECT record_id FROM meta_strategy_inventory_reconciliation_checkpoints WHERE algorithm_id=? AND capital_partition_id=? ORDER BY timestamp DESC, created_at DESC LIMIT 1",
+            (ALGORITHM_ID, self.capital_partition_id),
         ).fetchone()
         return None if row is None else str(row["record_id"])
 
     def _rebuild_inventory_from_ledger(self, conn: sqlite3.Connection, *, mark_prices: Mapping[str, float]) -> MetaStrategyInventorySnapshot:
         fill_rows = conn.execute(
-            "SELECT rowid, * FROM meta_strategy_inventory_fills WHERE capital_partition_id=? ORDER BY timestamp ASC, rowid ASC",
-            (self.capital_partition_id,),
+            "SELECT rowid, * FROM meta_strategy_inventory_fills WHERE algorithm_id=? AND capital_partition_id=? ORDER BY timestamp ASC, rowid ASC",
+            (ALGORITHM_ID, self.capital_partition_id),
         ).fetchall()
         lots: list[dict[str, Any]] = []
         realised_pnl = 0.0
@@ -832,7 +901,7 @@ class MetaStrategySqliteRepository:
             "meta_strategy_inventory_family_exposure",
             "meta_strategy_inventory_snapshots",
         ):
-            conn.execute(f"DELETE FROM {table}")
+            conn.execute(f"DELETE FROM {table} WHERE algorithm_id=? AND capital_partition_id=?", (ALGORITHM_ID, self.capital_partition_id))
         for position in current.open_positions:
             self._insert_inventory_record(conn, "meta_strategy_inventory_positions", _projection_payload(current, asdict(position), symbol=position.symbol))
         for lot in current.open_lots:
@@ -976,6 +1045,80 @@ def _table_for_artifact(artifact_type: str) -> str:
         raise ValueError(f"Unknown Meta-Strategy artifact type: {artifact_type}") from exc
 
 
+def persist_meta_strategy_projection_record(
+    conn: sqlite3.Connection,
+    artifact_type: str,
+    payload: Any,
+    *,
+    record_id: str | None = None,
+) -> MetaStrategyRepositoryRecord:
+    table = _table_for_artifact(artifact_type)
+    normalized = _normalize_payload(payload)
+    metadata = _metadata(normalized)
+    payload_json = _json_dumps(normalized)
+    persisted_record_id = record_id or _record_id(table, metadata, payload_json)
+    conn.execute(
+        f"""
+        INSERT OR REPLACE INTO {table} (
+            record_id, artifact_type, algorithm_id, capital_partition_id, algorithm_version, configuration_version,
+            settings_version,
+            strategy_catalog_version, feature_schema_version, label_specification_version,
+            model_version, model_artifact_version, dynamic_profile_version,
+            position_sizing_version, exit_policy_version, backtest_engine_version,
+            timestamp, symbol, bar_end, decision_id, idempotency_key, job_id, event_id, snapshot_id, order_intent_id,
+            client_order_id, broker_order_id, trade_id, run_id, artifact_id, status, payload_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            persisted_record_id,
+            artifact_type,
+            ALGORITHM_ID,
+            metadata["capital_partition_id"],
+            metadata["algorithm_version"],
+            metadata["configuration_version"],
+            metadata["settings_version"],
+            metadata["strategy_catalog_version"],
+            metadata["feature_schema_version"],
+            metadata["label_specification_version"],
+            metadata["model_version"],
+            metadata["model_artifact_version"],
+            metadata["dynamic_profile_version"],
+            metadata["position_sizing_version"],
+            metadata["exit_policy_version"],
+            metadata["backtest_engine_version"],
+            metadata["timestamp"],
+            metadata["symbol"],
+            metadata["bar_end"],
+            metadata["decision_id"],
+            metadata["idempotency_key"],
+            metadata["job_id"],
+            metadata["event_id"],
+            metadata["snapshot_id"],
+            metadata["order_intent_id"],
+            metadata["client_order_id"],
+            metadata["broker_order_id"],
+            metadata["trade_id"],
+            metadata["run_id"],
+            metadata["artifact_id"],
+            metadata["status"],
+            payload_json,
+            metadata["created_at"],
+            metadata["updated_at"],
+        ),
+    )
+    return MetaStrategyRepositoryRecord(
+        table_name=table,
+        record_id=persisted_record_id,
+        artifact_type=artifact_type,
+        algorithm_id=ALGORITHM_ID,
+        capital_partition_id=metadata["capital_partition_id"],
+        decision_id=metadata["decision_id"],
+        settings_version=metadata["settings_version"],
+        payload=normalized,
+    )
+
+
 def _normalize_payload(payload: Any) -> dict[str, Any]:
     if hasattr(payload, "model_dump"):
         normalized = payload.model_dump(mode="json")
@@ -996,6 +1139,13 @@ def _normalize_inventory_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     algorithm_id = _first_value(normalized, "algorithmId", "algorithm_id")
     if algorithm_id != ALGORITHM_ID:
         raise MetaStrategyRepositoryAttributionError("Meta-Strategy inventory records must carry algorithm_id='meta_strategy'")
+    capital_partition_id = _first_value(normalized, "capitalPartitionId", "capital_partition_id")
+    if capital_partition_id in (None, ""):
+        raise MetaStrategyRepositoryAttributionError("Meta-Strategy inventory records must carry capital_partition_id")
+    if str(capital_partition_id) != META_STRATEGY_DEFAULT_CAPITAL_PARTITION:
+        raise MetaStrategyRepositoryAttributionError(
+            f"Meta-Strategy inventory records must carry capital_partition_id='{META_STRATEGY_DEFAULT_CAPITAL_PARTITION}'"
+        )
     return normalized
 
 
@@ -1249,6 +1399,10 @@ def _row_to_record(table: str, artifact_type: str, row: sqlite3.Row | None) -> M
         raise MetaStrategyRepositoryAttributionError(
             f"Meta-Strategy repository refused {artifact_type} record {row['record_id']} owned by {row['algorithm_id']}"
         )
+    if str(row["capital_partition_id"]) != META_STRATEGY_DEFAULT_CAPITAL_PARTITION:
+        raise MetaStrategyRepositoryAttributionError(
+            f"Meta-Strategy repository refused {artifact_type} record {row['record_id']} in partition {row['capital_partition_id']}"
+        )
     return MetaStrategyRepositoryRecord(
         table_name=table,
         record_id=str(row["record_id"]),
@@ -1291,6 +1445,7 @@ __all__ = [
     "MetaStrategyPersistenceRecordDefinition",
     "MetaStrategyPersistenceSummary",
     "MetaStrategyInventoryLot",
+    "MetaStrategyInventoryOwnershipConflict",
     "MetaStrategyInventoryPosition",
     "MetaStrategyInventorySnapshot",
     "MetaStrategyRepositoryAttributionError",
@@ -1299,4 +1454,5 @@ __all__ = [
     "MetaStrategySqliteRepository",
     "apply_meta_strategy_persistence_migrations",
     "migrate_meta_strategy_sqlite_database",
+    "persist_meta_strategy_projection_record",
 ]

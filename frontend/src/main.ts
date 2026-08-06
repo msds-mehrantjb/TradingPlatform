@@ -609,6 +609,23 @@ type RegimeRuntimeControl = {
   updatedAt?: string | null;
 };
 
+type MetaStrategyPaperControl = {
+  algorithmId?: "meta_strategy";
+  algorithm_id?: "meta_strategy";
+  capitalPartitionId: string;
+  newPaperEntriesEnabled: boolean;
+  automaticPaperTradingEnabled: boolean;
+  paperEntriesAllowed: boolean;
+  liveTradingEnabled: boolean;
+  updatedAt?: string | null;
+  updatedBy?: string;
+  reason?: string;
+  version: number;
+  reasonCodes: string[];
+};
+
+type MetaStrategyReadinessStatus = Record<string, unknown>;
+
 type VotingEnsemblePaperInventory = {
   algorithmId?: "voting_ensemble";
   algorithm_id?: "voting_ensemble";
@@ -2096,6 +2113,10 @@ type PersistedUiState = {
   regimeConditionExpanded?: boolean;
   regimeIndicatorsExpanded?: boolean;
   regimeStrategiesExpanded?: boolean;
+  metaTradingSettingsExpanded?: boolean;
+  metaDefaultSizingExpanded?: boolean;
+  metaRuntimeReadinessExpanded?: boolean;
+  metaMlReadinessExpanded?: boolean;
   metaStrategiesExpanded?: boolean;
   metaChecksExpanded?: boolean;
   tradingSettingsExpanded?: boolean;
@@ -2175,6 +2196,10 @@ function saveUiState() {
     regimeConditionExpanded: state.regimeConditionExpanded,
     regimeIndicatorsExpanded: state.regimeIndicatorsExpanded,
     regimeStrategiesExpanded: state.regimeStrategiesExpanded,
+    metaTradingSettingsExpanded: state.metaTradingSettingsExpanded,
+    metaDefaultSizingExpanded: state.metaDefaultSizingExpanded,
+    metaRuntimeReadinessExpanded: state.metaRuntimeReadinessExpanded,
+    metaMlReadinessExpanded: state.metaMlReadinessExpanded,
     metaStrategiesExpanded: state.metaStrategiesExpanded,
     metaChecksExpanded: state.metaChecksExpanded,
     tradingSettingsExpanded: state.tradingSettingsExpanded,
@@ -3189,6 +3214,15 @@ const state = {
   regimeRuntimeControl: null as RegimeRuntimeControl | null,
   regimeRuntimeControlStatus: "idle" as "idle" | "loading" | "ready" | "blocked" | "error",
   regimeRuntimeControlWarning: "",
+  metaStrategyPaperControl: null as MetaStrategyPaperControl | null,
+  metaStrategyPaperControlStatus: "idle" as "idle" | "loading" | "ready" | "blocked" | "error",
+  metaStrategyPaperControlWarning: "",
+  metaStrategyReadiness: null as MetaStrategyReadinessStatus | null,
+  metaStrategyReadinessStatus: "idle" as "idle" | "loading" | "ready" | "blocked" | "error",
+  metaStrategyReadinessWarning: "",
+  metaStrategyLatestDecision: null as Record<string, unknown> | null,
+  metaStrategyLatestDecisionStatus: "idle" as "idle" | "loading" | "ready" | "error",
+  metaStrategyLatestDecisionWarning: "",
   votingEnsemblePaperInventory: emptyVotingEnsemblePaperInventory(),
   votingEnsemblePaperInventoryStatus: "idle" as "idle" | "loading" | "ready" | "error",
   votingEnsemblePaperInventoryWarning: "",
@@ -3209,6 +3243,10 @@ const state = {
   regimeConditionExpanded: persistedUiState.regimeConditionExpanded ?? false,
   regimeIndicatorsExpanded: persistedUiState.regimeIndicatorsExpanded ?? false,
   regimeStrategiesExpanded: persistedUiState.regimeStrategiesExpanded ?? false,
+  metaTradingSettingsExpanded: persistedUiState.metaTradingSettingsExpanded ?? true,
+  metaDefaultSizingExpanded: persistedUiState.metaDefaultSizingExpanded ?? true,
+  metaRuntimeReadinessExpanded: persistedUiState.metaRuntimeReadinessExpanded ?? false,
+  metaMlReadinessExpanded: persistedUiState.metaMlReadinessExpanded ?? false,
   metaStrategiesExpanded: persistedUiState.metaStrategiesExpanded ?? false,
   metaChecksExpanded: persistedUiState.metaChecksExpanded ?? false,
   metaTrainingStatus: "idle" as "idle" | "loading" | "ready" | "error",
@@ -3218,6 +3256,11 @@ const state = {
   confidenceTradingSettings: loadConfidenceTradingSettings(),
   regimeTradingSettings: loadRegimeTradingSettings(),
   metaTradingSettings: loadMetaTradingSettings(),
+  metaTradingSettingsBackend: null as Record<string, unknown> | null,
+  metaTradingSettingsStatus: "idle" as "idle" | "loading" | "ready" | "saving" | "error",
+  metaTradingSettingsWarning: "",
+  metaTradingSettingsVersion: "",
+  metaTradingSettingsHash: "",
   weightedMarketData: {
     candlesBySymbol: {} as Record<string, Candle[]>,
     timeframeCandles: {} as Partial<Record<WeightedSpyContextTimeframe, Candle[]>>,
@@ -3367,6 +3410,7 @@ let pendingRegimeSelectionUpdateFrame: number | undefined;
 let lastMetaKey = "";
 let tradingSettingsMountKey = "";
 let weightedTradingSettingsMountKey = "";
+let metaTradingSettingsMountKey = "";
 let weightedMarketDataInFlight = false;
 let weightedInitialWeightsInFlight = false;
 let lastWeightedMarketDataNetworkRefreshAt = 0;
@@ -3881,7 +3925,23 @@ leftRail.innerHTML = `
         </div>
         <div id="metaScoreGrid" class="weighted-score-grid"></div>
         <div id="metaSummary" class="algo-rule-list weighted-summary" hidden></div>
-        <div id="metaMlReadinessBox" class="meta-ml-readiness-box" data-status="loading"></div>
+        <div id="metaTradingSettingsMount" class="algo-stable-settings"></div>
+        <button id="metaRuntimeReadinessToggle" class="algo-expand-toggle meta-runtime-readiness-toggle" type="button" aria-expanded="false" aria-controls="metaRuntimeReadinessPanel">
+          <span>Meta-Strategy Runtime</span>
+          <strong id="metaRuntimeReadinessToggleMeta">Loading</strong>
+          <b id="metaRuntimeReadinessToggleIcon">+</b>
+        </button>
+        <div id="metaRuntimeReadinessPanel" class="meta-readiness-panel" hidden>
+          <div id="metaRuntimeStatusBox" class="meta-ml-readiness-box" data-status="loading"></div>
+        </div>
+        <button id="metaMlReadinessToggle" class="algo-expand-toggle meta-ml-readiness-toggle" type="button" aria-expanded="false" aria-controls="metaMlReadinessPanel">
+          <span>ML Selector Readiness</span>
+          <strong id="metaMlReadinessToggleMeta">Loading</strong>
+          <b id="metaMlReadinessToggleIcon">+</b>
+        </button>
+        <div id="metaMlReadinessPanel" class="meta-readiness-panel" hidden>
+          <div id="metaMlReadinessBox" class="meta-ml-readiness-box" data-status="loading"></div>
+        </div>
         <div id="metaFamilyGrid" class="regime-feature-grid meta-family-grid expanded"></div>
         <button id="metaStrategiesToggle" class="algo-expand-toggle meta-strategies-toggle" type="button" aria-expanded="false" aria-controls="metaStrategiesPanel">
           <span>Strategies</span>
@@ -4349,7 +4409,17 @@ const metaStrategiesPanel = document.querySelector<HTMLDivElement>("#metaStrateg
 const metaChecksToggle = document.querySelector<HTMLButtonElement>("#metaChecksToggle")!;
 const metaChecksToggleMeta = document.querySelector<HTMLElement>("#metaChecksToggleMeta")!;
 const metaChecksToggleIcon = document.querySelector<HTMLElement>("#metaChecksToggleIcon")!;
+const metaRuntimeReadinessToggle = document.querySelector<HTMLButtonElement>("#metaRuntimeReadinessToggle")!;
+const metaRuntimeReadinessToggleMeta = document.querySelector<HTMLElement>("#metaRuntimeReadinessToggleMeta")!;
+const metaRuntimeReadinessToggleIcon = document.querySelector<HTMLElement>("#metaRuntimeReadinessToggleIcon")!;
+const metaRuntimeReadinessPanel = document.querySelector<HTMLDivElement>("#metaRuntimeReadinessPanel")!;
+const metaMlReadinessToggle = document.querySelector<HTMLButtonElement>("#metaMlReadinessToggle")!;
+const metaMlReadinessToggleMeta = document.querySelector<HTMLElement>("#metaMlReadinessToggleMeta")!;
+const metaMlReadinessToggleIcon = document.querySelector<HTMLElement>("#metaMlReadinessToggleIcon")!;
+const metaMlReadinessPanel = document.querySelector<HTMLDivElement>("#metaMlReadinessPanel")!;
+const metaRuntimeStatusBox = document.querySelector<HTMLDivElement>("#metaRuntimeStatusBox")!;
 const metaMlReadinessBox = document.querySelector<HTMLDivElement>("#metaMlReadinessBox")!;
+const metaTradingSettingsMount = document.querySelector<HTMLDivElement>("#metaTradingSettingsMount")!;
 const metaFamilyGrid = document.querySelector<HTMLDivElement>("#metaFamilyGrid")!;
 const metaStrategiesList = document.querySelector<HTMLDivElement>("#metaStrategiesList")!;
 const zoomLevel = document.querySelector<HTMLSpanElement>("#zoomLevel")!;
@@ -4867,12 +4937,32 @@ metaChecksToggle.addEventListener("click", () => {
   renderMetaChecksExpandedState();
 });
 
+metaRuntimeReadinessToggle.addEventListener("click", () => {
+  state.metaRuntimeReadinessExpanded = !state.metaRuntimeReadinessExpanded;
+  saveUiState();
+  renderMetaRuntimeReadinessExpandedState();
+});
+
+metaMlReadinessToggle.addEventListener("click", () => {
+  state.metaMlReadinessExpanded = !state.metaMlReadinessExpanded;
+  saveUiState();
+  renderMetaMlReadinessExpandedState();
+});
+
 metaMlReadinessBox.addEventListener("click", (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-meta-training-action]");
   if (!button) {
     return;
   }
   void loadMetaStrategyTrainingStatus();
+});
+
+metaRuntimeStatusBox.addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-meta-readiness-action]");
+  if (!button) {
+    return;
+  }
+  void loadMetaStrategyReadinessStatus();
 });
 
 weightedStrategiesToggle.addEventListener("click", () => {
@@ -5126,6 +5216,48 @@ function handleWeightedTradingSettingChange(event: Event) {
 document.addEventListener("input", handleWeightedTradingSettingChange);
 document.addEventListener("change", handleWeightedTradingSettingChange);
 
+function handleMetaTradingSettingChange(event: Event) {
+  const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-meta-trading-setting]");
+  if (!input) {
+    return;
+  }
+  const key = input.dataset.metaTradingSetting as keyof TradingSettings | undefined;
+  if (!key || key === "positionSizingMode") {
+    return;
+  }
+  const readOnly = new Set<keyof TradingSettings>();
+  if (readOnly.has(key)) {
+    updateMetaStrategyPanel();
+    return;
+  }
+  const shouldSave = event.type !== "input" || input.type === "checkbox";
+  if (key === "useDefaultSizingSettings" || key === "pyramidingEnabled") {
+    state.metaTradingSettings = sanitizeTradingSettings({ ...state.metaTradingSettings, [key]: input.checked }, REGIME_MAX_ORDER_ALLOCATION_PERCENT);
+    saveMetaTradingSettings(state.metaTradingSettings);
+    if (key === "pyramidingEnabled" && shouldSave) {
+      void saveMetaStrategyTradingSettingsToBackend({ [key]: input.checked });
+    }
+    updateMetaStrategyPanel();
+    return;
+  }
+  if (input.value.trim() === "") {
+    return;
+  }
+  const value = Number(input.value);
+  if (!Number.isFinite(value)) {
+    return;
+  }
+  state.metaTradingSettings = sanitizeTradingSettings({ ...state.metaTradingSettings, [key]: value }, REGIME_MAX_ORDER_ALLOCATION_PERCENT);
+  saveMetaTradingSettings(state.metaTradingSettings);
+  if (shouldSave) {
+    void saveMetaStrategyTradingSettingsToBackend({ [key]: value });
+  }
+  updateMetaStrategyPanel();
+}
+
+document.addEventListener("input", handleMetaTradingSettingChange);
+document.addEventListener("change", handleMetaTradingSettingChange);
+
 document.addEventListener("click", (event) => {
   const tradingSettingsToggle = (event.target as HTMLElement).closest<HTMLButtonElement>("#confidenceTradingSettingsToggle");
   if (tradingSettingsToggle) {
@@ -5139,6 +5271,23 @@ document.addEventListener("click", (event) => {
     state.regimeTradingSettingsExpanded = !state.regimeTradingSettingsExpanded;
     saveUiState();
     updateRegimeSelectionPanel();
+    return;
+  }
+  const metaTradingSettingsToggle = (event.target as HTMLElement).closest<HTMLButtonElement>("#metaTradingSettingsToggle");
+  if (metaTradingSettingsToggle) {
+    state.metaTradingSettingsExpanded = !state.metaTradingSettingsExpanded;
+    saveUiState();
+    updateMetaStrategyPanel();
+    return;
+  }
+  const metaTradingSettingsRefresh = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-meta-trading-settings-action='refresh']");
+  if (metaTradingSettingsRefresh) {
+    void loadMetaStrategyTradingSettings({ force: true });
+    return;
+  }
+  const metaTradingSettingsSave = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-meta-trading-settings-action='save']");
+  if (metaTradingSettingsSave) {
+    void saveMetaStrategyTradingSettingsToBackend(metaEditableTradingSettingsPayload(state.metaTradingSettings));
     return;
   }
   const regimeResetBaselineDefaults = (event.target as HTMLElement).closest<HTMLButtonElement>("#regimeResetBaselineDefaults");
@@ -5165,6 +5314,13 @@ document.addEventListener("click", (event) => {
     state.regimeDefaultSizingExpanded = !state.regimeDefaultSizingExpanded;
     saveUiState();
     updateRegimeSelectionPanel();
+    return;
+  }
+  const metaDefaultSizingToggle = (event.target as HTMLElement).closest<HTMLButtonElement>("#metaDefaultSizingToggle");
+  if (metaDefaultSizingToggle) {
+    state.metaDefaultSizingExpanded = !state.metaDefaultSizingExpanded;
+    saveUiState();
+    updateMetaStrategyPanel();
   }
 });
 
@@ -8679,6 +8835,23 @@ function regimePaperBlocked() {
   return regimePaperRequested() && !regimePaperEffective();
 }
 
+function metaStrategyPaperControlRecord() {
+  return state.metaStrategyPaperControl;
+}
+
+function metaStrategyPaperRequested() {
+  return Boolean(metaStrategyPaperControlRecord()?.newPaperEntriesEnabled);
+}
+
+function metaStrategyPaperEffective() {
+  const control = metaStrategyPaperControlRecord();
+  return Boolean(control?.newPaperEntriesEnabled && control.paperEntriesAllowed && !control.liveTradingEnabled);
+}
+
+function metaStrategyPaperBlocked() {
+  return metaStrategyPaperRequested() && !metaStrategyPaperEffective();
+}
+
 function wcaPaperRequestedFromControl(control: WcaRuntimeControl | null | undefined) {
   return Boolean(control?.paperTradingRequested ?? control?.paper_trading_requested);
 }
@@ -8718,11 +8891,17 @@ function updateTradeToggleButton() {
   const wcaEntriesEffective = wcaAutomaticEntriesEffective();
   const regimeRequested = regimePaperRequested();
   const regimeEffective = regimePaperEffective();
-  const requested = votingRequested || wcaRequested || regimeRequested || globalPaperTradingEnabled();
-  const effective = requested && (!votingRequested || votingEffective) && (!wcaRequested || (wcaEffective && wcaEntriesEffective)) && (!regimeRequested || regimeEffective);
-  const blocked = votingEnsemblePaperBlocked() || wcaPaperBlocked() || regimePaperBlocked();
-  const loading = state.votingEnsembleRuntimeControlStatus === "loading" || state.wcaRuntimeControlStatus === "loading" || state.regimeRuntimeControlStatus === "loading";
-  const error = state.votingEnsembleRuntimeControlStatus === "error" || state.wcaRuntimeControlStatus === "error" || state.regimeRuntimeControlStatus === "error";
+  const metaRequested = metaStrategyPaperRequested();
+  const metaEffective = metaStrategyPaperEffective();
+  const requested = votingRequested || wcaRequested || regimeRequested || metaRequested || globalPaperTradingEnabled();
+  const effective = requested && (!votingRequested || votingEffective) && (!wcaRequested || (wcaEffective && wcaEntriesEffective)) && (!regimeRequested || regimeEffective) && (!metaRequested || metaEffective);
+  const blocked = votingEnsemblePaperBlocked() || wcaPaperBlocked() || regimePaperBlocked() || metaStrategyPaperBlocked();
+  const loading = state.votingEnsembleRuntimeControlStatus === "loading" || state.wcaRuntimeControlStatus === "loading" || state.regimeRuntimeControlStatus === "loading" || state.metaStrategyPaperControlStatus === "loading";
+  const error =
+    (votingRequested && state.votingEnsembleRuntimeControlStatus === "error") ||
+    (wcaRequested && state.wcaRuntimeControlStatus === "error") ||
+    (regimeRequested && state.regimeRuntimeControlStatus === "error") ||
+    (metaRequested && state.metaStrategyPaperControlStatus === "error");
   tradeToggleButton.textContent = loading ? "Paper Requested" : error ? "Paper Error" : blocked ? "Paper ON but blocked" : effective ? "Paper Effective" : requested ? "Paper Requested" : "Paper Off";
   tradeToggleButton.setAttribute("aria-pressed", String(effective));
   tradeToggleButton.dataset.enabled = String(effective);
@@ -8735,6 +8914,8 @@ function updateTradeToggleButton() {
   const regimeControl = regimeRuntimeControlRecord();
   const regimeBlockers = arrayFromUnknown(regimeControl?.paperEffectiveBlockers).map((value) => String(value)).join(", ");
   const regimeReasonCodes = arrayFromUnknown(regimeControl?.paperEffectiveBlockerReasonCodes).map((value) => String(value)).join(", ");
+  const metaControl = metaStrategyPaperControlRecord();
+  const metaReasonCodes = arrayFromUnknown(metaControl?.reasonCodes).map((value) => String(value)).join(", ");
   const activeBlocks = runtime?.activeEntryBlocks?.length ? runtime.activeEntryBlocks.join(", ") : "";
   const paperReadyBlocks = runtime?.paperReadyBlockingReasonCodes?.length ? runtime.paperReadyBlockingReasonCodes.join(", ") : "";
   const reason = activeBlocks || state.votingEnsembleRuntimeControl?.reasonCodes?.join(", ") || state.votingEnsembleRuntimeControlWarning;
@@ -8748,7 +8929,10 @@ function updateTradeToggleButton() {
     `WCA automatic entries: ${wcaEntriesEffective ? "ARMED" : "BLOCKED"}`,
     `Regime requested: ${regimeRequested ? "ON" : "OFF"}`,
     `Regime effective: ${regimeEffective ? "ON" : "OFF"}`,
+    `Meta-Strategy entries: ${metaRequested ? "ON" : "OFF"}`,
+    metaControl ? `Meta-Strategy version: ${metaControl.version}` : "Meta-Strategy control unavailable",
     regimePaperBlocked() ? "Regime is ON but blocked." : "",
+    metaStrategyPaperBlocked() ? "Meta-Strategy is ON but blocked." : "",
     regimeBlockers ? `Regime blockers: ${regimeBlockers}` : "",
     runtime ? `Paper ready: ${runtime.paperReady ? "true" : "false"}` : "",
     runtime ? `Market: ${runtime.marketOpen ? "open" : "closed"}` : "",
@@ -8765,6 +8949,8 @@ function updateTradeToggleButton() {
     wcaReasons,
     state.regimeRuntimeControlWarning,
     regimeReasonCodes,
+    state.metaStrategyPaperControlWarning,
+    metaReasonCodes,
   ].filter(Boolean).join(" ");
   tradeToggleButton.title = controlLabel;
   tradeToggleButton.setAttribute("aria-label", controlLabel);
@@ -11074,12 +11260,17 @@ function normalizeCandles(candles: Candle[]) {
       Number.isFinite(candle.low) &&
       Number.isFinite(candle.close)
     ) {
-      byTimestamp.set(candle.timestamp, candle);
+      const timestamp = canonicalCandleTimestamp(time);
+      byTimestamp.set(String(time), { ...candle, timestamp });
     }
   });
   return Array.from(byTimestamp.values()).sort(
     (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
   );
+}
+
+function canonicalCandleTimestamp(time: number) {
+  return new Date(time).toISOString().replace(".000Z", "Z");
 }
 
 function resetHoverState() {
@@ -11352,6 +11543,174 @@ function renderMetaChecksExpandedState() {
   metaChecksToggleIcon.textContent = state.metaChecksExpanded ? "-" : "+";
 }
 
+function renderMetaRuntimeReadinessExpandedState() {
+  metaRuntimeReadinessToggle.setAttribute("aria-expanded", String(state.metaRuntimeReadinessExpanded));
+  metaRuntimeReadinessPanel.hidden = !state.metaRuntimeReadinessExpanded;
+  metaRuntimeReadinessPanel.classList.toggle("expanded", state.metaRuntimeReadinessExpanded);
+  metaRuntimeReadinessToggleIcon.textContent = state.metaRuntimeReadinessExpanded ? "-" : "+";
+}
+
+function renderMetaMlReadinessExpandedState() {
+  metaMlReadinessToggle.setAttribute("aria-expanded", String(state.metaMlReadinessExpanded));
+  metaMlReadinessPanel.hidden = !state.metaMlReadinessExpanded;
+  metaMlReadinessPanel.classList.toggle("expanded", state.metaMlReadinessExpanded);
+  metaMlReadinessToggleIcon.textContent = state.metaMlReadinessExpanded ? "-" : "+";
+}
+
+async function loadMetaStrategyTradingSettings(options: { force?: boolean } = {}) {
+  if (!options.force && state.metaTradingSettingsStatus === "loading") {
+    return;
+  }
+  state.metaTradingSettingsStatus = "loading";
+  state.metaTradingSettingsWarning = "";
+  updateMetaTradingSettingsMount();
+  try {
+    const envelope = await fetchMetaStrategyJson("/trading-settings");
+    applyMetaTradingSettingsEnvelope(envelope);
+    state.metaTradingSettingsStatus = "ready";
+  } catch (error) {
+    state.metaTradingSettingsStatus = "error";
+    state.metaTradingSettingsWarning = error instanceof Error ? error.message : "Meta-Strategy trading settings unavailable.";
+  }
+  updateMetaTradingSettingsMount();
+}
+
+async function saveMetaStrategyTradingSettingsToBackend(settingsPatch: Partial<TradingSettings>) {
+  state.metaTradingSettingsStatus = "saving";
+  state.metaTradingSettingsWarning = "";
+  updateMetaTradingSettingsMount();
+  try {
+    const envelope = await fetchMetaStrategyJson("/trading-settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        algorithmId: "meta_strategy",
+        tradingSettings: settingsPatch,
+        updatedBy: "dashboard",
+        reason: "meta_strategy.dashboard.trading_settings_update",
+      }),
+    });
+    applyMetaTradingSettingsEnvelope(envelope);
+    state.metaTradingSettingsStatus = "ready";
+  } catch (error) {
+    state.metaTradingSettingsStatus = "error";
+    state.metaTradingSettingsWarning = error instanceof Error ? error.message : "Meta-Strategy settings save failed.";
+  }
+  updateMetaTradingSettingsMount();
+}
+
+function applyMetaTradingSettingsEnvelope(envelope: Record<string, unknown>) {
+  const payload = childRecord(envelope, "payload") ?? envelope;
+  state.metaTradingSettingsBackend = payload;
+  state.metaTradingSettingsVersion = stringFromUnknown(payload.settingsVersion, "");
+  state.metaTradingSettingsHash = stringFromUnknown(payload.settingsHash, "");
+  const backendSettings = childRecord(payload, "tradingSettings");
+  if (backendSettings) {
+    state.metaTradingSettings = sanitizeTradingSettings({ ...state.metaTradingSettings, ...backendSettings }, REGIME_MAX_ORDER_ALLOCATION_PERCENT);
+    saveMetaTradingSettings(state.metaTradingSettings);
+  }
+}
+
+async function loadMetaStrategyReadinessStatus() {
+  state.metaStrategyReadinessStatus = "loading";
+  state.metaStrategyReadinessWarning = "";
+  renderMetaRuntimeStatus();
+  try {
+    const readiness = await fetchMetaStrategyJson("/readiness");
+    state.metaStrategyReadiness = readiness;
+    const payload = childRecord(readiness, "payload") ?? readiness;
+    const permission = childRecord(payload, "newEntryPermission");
+    state.metaStrategyReadinessStatus = weightedTruthFromUnknown(permission?.allowed, false) ? "ready" : "blocked";
+  } catch (error) {
+    state.metaStrategyReadiness = null;
+    state.metaStrategyReadinessStatus = "error";
+    state.metaStrategyReadinessWarning = error instanceof Error ? error.message : "Meta-Strategy readiness unavailable.";
+  }
+  renderMetaRuntimeStatus();
+}
+
+async function loadMetaStrategyLatestDecision() {
+  state.metaStrategyLatestDecisionStatus = "loading";
+  state.metaStrategyLatestDecisionWarning = "";
+  try {
+    const decision = await fetchMetaStrategyJson("/latest-decision");
+    state.metaStrategyLatestDecision = decision;
+    state.metaStrategyLatestDecisionStatus = "ready";
+  } catch (error) {
+    state.metaStrategyLatestDecision = null;
+    state.metaStrategyLatestDecisionStatus = "error";
+    state.metaStrategyLatestDecisionWarning = error instanceof Error ? error.message : "Meta-Strategy latest decision unavailable.";
+  }
+  updateMetaStrategyPanel();
+}
+
+function renderMetaRuntimeStatus() {
+  const status = state.metaStrategyReadinessStatus;
+  metaRuntimeStatusBox.dataset.status = status === "ready" ? "trusted" : status === "error" ? "error" : "untrusted";
+  metaRuntimeReadinessToggleMeta.textContent = status === "ready" ? "Entries allowed" : status === "error" ? "Error" : status === "loading" || status === "idle" ? "Loading" : "Entries blocked";
+  if (status === "loading" || status === "idle") {
+    metaRuntimeStatusBox.innerHTML = `
+      <div class="meta-ml-readiness-head">
+        <span>Meta-Strategy Runtime</span>
+        <strong>Loading</strong>
+      </div>
+      <small>Reading backend-owned readiness and paper controls.</small>
+    `;
+    return;
+  }
+  if (status === "error") {
+    metaRuntimeStatusBox.innerHTML = `
+      <div class="meta-ml-readiness-head">
+        <span>Meta-Strategy Runtime</span>
+        <strong>Error</strong>
+      </div>
+      <small>${escapeHtml(state.metaStrategyReadinessWarning || "Readiness endpoint unavailable.")}</small>
+      <div class="meta-ml-readiness-actions">
+        <button type="button" data-meta-readiness-action="refresh">Refresh</button>
+      </div>
+    `;
+    return;
+  }
+  const envelope = state.metaStrategyReadiness ?? {};
+  const payload = childRecord(envelope, "payload") ?? envelope;
+  const apiHealth = childRecord(payload, "apiHealth");
+  const runtimeHealth = childRecord(payload, "metaStrategyRuntimeHealth");
+  const paperReadiness = childRecord(payload, "paperReadiness");
+  const toggle = childRecord(payload, "paperToggleState") ?? (state.metaStrategyPaperControl as Record<string, unknown> | null);
+  const market = childRecord(payload, "marketOpenState");
+  const permission = childRecord(payload, "newEntryPermission");
+  const exits = childRecord(payload, "exitManagementHealth");
+  const reasonCodes = arrayFromUnknown(permission?.reasonCodes).map((value) => String(value));
+  metaRuntimeStatusBox.innerHTML = `
+    <div class="meta-ml-readiness-head">
+      <span>Meta-Strategy Runtime</span>
+      <strong>${weightedTruthFromUnknown(permission?.allowed, false) ? "Entries allowed" : "Entries blocked"}</strong>
+    </div>
+    <div class="meta-ml-readiness-grid">
+      ${renderMetaTrainingStatusTile("API", readinessStatusLabel(apiHealth?.healthy, apiHealth?.status), "API process health is displayed separately from strategy readiness.")}
+      ${renderMetaTrainingStatusTile("Runtime", readinessStatusLabel(runtimeHealth?.healthy, runtimeHealth?.status), arrayFromUnknown(runtimeHealth?.reasonCodes).join(", ") || "Runtime supervisor state.")}
+      ${renderMetaTrainingStatusTile("Paper Ready", readinessStatusLabel(paperReadiness?.entryReady, paperReadiness?.ready), "Backend readiness report gates new entries.")}
+      ${renderMetaTrainingStatusTile("Paper Toggle", readinessStatusLabel(toggle?.newPaperEntriesEnabled ?? toggle?.paperEntriesAllowed), `Version ${stringFromUnknown(toggle?.version, "unknown")}`)}
+      ${renderMetaTrainingStatusTile("Market", readinessStatusLabel(market?.healthy), "Authoritative market clock health for new entries.")}
+      ${renderMetaTrainingStatusTile("New Entries", readinessStatusLabel(permission?.allowed), reasonCodes.slice(0, 3).join(", ") || "Execution guard may submit only when all checks pass.")}
+      ${renderMetaTrainingStatusTile("Exit Mgmt", readinessStatusLabel(exits?.healthy), weightedTruthFromUnknown(exits?.riskReducingActivityContinuesWhenNewEntriesBlocked, false) ? "Risk-reducing workers remain active." : "Exit health unavailable.")}
+    </div>
+    <div class="meta-ml-readiness-actions">
+      <button type="button" data-meta-readiness-action="refresh">Refresh</button>
+    </div>
+  `;
+}
+
+function readinessStatusLabel(value: unknown, fallback?: unknown) {
+  if (value === true) {
+    return "OK";
+  }
+  if (value === false) {
+    return "Blocked";
+  }
+  const text = stringFromUnknown(fallback, "");
+  return text || "Unknown";
+}
+
 async function loadMetaStrategyTrainingStatus() {
   state.metaTrainingStatus = "loading";
   state.metaTrainingWarning = "";
@@ -11410,6 +11769,7 @@ function renderMetaMlReadiness() {
   const trusted = Boolean(metrics.trusted ?? result?.trusted);
   const status = state.metaTrainingStatus === "loading" ? "loading" : state.metaTrainingStatus === "error" ? "error" : trusted ? "trusted" : "untrusted";
   metaMlReadinessBox.dataset.status = status;
+  metaMlReadinessToggleMeta.textContent = status === "trusted" ? "Trusted" : status === "error" ? "Error" : status === "loading" ? "Loading" : "Not trusted";
 
   if (state.metaTrainingStatus === "loading") {
     metaMlReadinessBox.innerHTML = `
@@ -14690,17 +15050,231 @@ function renderConfidenceStrategies(strategies: ConfidenceStrategyResult[]) {
   `;
 }
 
+function updateMetaTradingSettingsMount() {
+  state.currentMetaTargetOrder = null;
+  const key = JSON.stringify({
+    expanded: state.metaTradingSettingsExpanded,
+    defaultExpanded: state.metaDefaultSizingExpanded,
+    settings: state.metaTradingSettings,
+    status: state.metaTradingSettingsStatus,
+    warning: state.metaTradingSettingsWarning,
+    version: state.metaTradingSettingsVersion,
+    hash: state.metaTradingSettingsHash,
+    backend: state.metaTradingSettingsBackend,
+  });
+  if (key === metaTradingSettingsMountKey || isEditingWithin(metaTradingSettingsMount)) {
+    return;
+  }
+  metaTradingSettingsMountKey = key;
+  metaTradingSettingsMount.innerHTML = renderMetaTradingSettingsPanel();
+}
+
+function renderMetaTradingSettingsPanel() {
+  const settings = state.metaTradingSettings;
+  const expanded = state.metaTradingSettingsExpanded;
+  return `
+    <div class="trading-settings-panel weighted-trading-settings-panel regime-trading-settings-panel" data-status="${escapeHtml(state.metaTradingSettingsStatus)}" data-expanded="${String(expanded)}">
+      <button id="metaTradingSettingsToggle" class="trading-settings-head" type="button" aria-expanded="${String(expanded)}" aria-controls="metaTradingSettingsBody">
+        <span class="trading-settings-title">
+          <b>${expanded ? "-" : "+"}</b>
+          <strong>Trading Settings</strong>
+        </span>
+        <span class="trading-settings-summary">${escapeHtml(metaTradingSettingsSummary())}</span>
+      </button>
+      <div id="metaTradingSettingsBody" class="trading-settings-body regime-trading-settings-body" ${expanded ? "" : "hidden"}>
+        ${renderMetaTradingSettingsGrid(settings)}
+        ${renderMetaDefaultSizingSection(settings)}
+        <div class="trading-settings-actions regime-trading-actions">
+          <span>
+            <button class="secondary-action" type="button" data-meta-trading-settings-action="refresh">Refresh Backend</button>
+            <button class="secondary-action" type="button" data-meta-trading-settings-action="save">Save Settings</button>
+          </span>
+        </div>
+        ${state.metaTradingSettingsWarning ? `<span class="trading-settings-warning">${escapeHtml(state.metaTradingSettingsWarning)}</span>` : ""}
+      </div>
+    </div>
+  `;
+}
+
+function metaTradingSettingsSummary() {
+  if (state.metaTradingSettingsStatus === "loading") {
+    return "Loading backend-owned Meta-Strategy settings.";
+  }
+  if (state.metaTradingSettingsStatus === "saving") {
+    return "Saving new Meta-Strategy settings version.";
+  }
+  if (state.metaTradingSettingsStatus === "error") {
+    return "Backend settings unavailable; cached display only.";
+  }
+  const version = state.metaTradingSettingsVersion || "backend version pending";
+  const hash = state.metaTradingSettingsHash ? state.metaTradingSettingsHash.slice(0, 12) : "hash pending";
+  return `${version} / ${hash}`;
+}
+
+function renderMetaTradingSettingsGrid(settings: TradingSettings) {
+  return `
+    <div class="trading-settings-grid regime-trading-settings-grid">
+      ${renderMetaTradingSettingInput("startingCapital", "Total balance", settings.startingCapital, 0, 10000000, 100)}
+      ${renderMetaTradingSettingInput("orderAllocationPercent", "Order limit %", settings.orderAllocationPercent, 0, REGIME_MAX_ORDER_ALLOCATION_PERCENT, 0.1)}
+      ${renderMetaTradingSettingInput("dailyAllocationPercent", "Daily max %", settings.dailyAllocationPercent, 0, 100, 0.1)}
+      ${renderMetaTradingSettingInput("riskBudgetPercentOfOrder", "Risk budget %", settings.riskBudgetPercentOfOrder, 0, 100, 0.01)}
+      ${renderMetaTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 0, 50, 1)}
+      ${renderMetaTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
+      ${renderMetaTradingSettingInput("stopLossPercent", "Stop %", settings.stopLossPercent, 0, 20, 0.01)}
+      ${renderMetaTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
+      ${renderMetaTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
+    </div>
+  `;
+}
+
+function renderMetaDefaultSizingSection(settings: TradingSettings) {
+  const expanded = state.metaDefaultSizingExpanded;
+  const ownership = childRecord(state.metaTradingSettingsBackend, "ownership");
+  const partition = stringFromUnknown(state.metaTradingSettingsBackend?.capitalPartitionId ?? ownership?.inventoryCapitalPartitionId, "meta_strategy.paper.default");
+  const inventorySource = stringFromUnknown(ownership?.inventorySource, "authoritative_meta_strategy_inventory_repository");
+  return `
+    <div class="trading-default-section weighted-default-section" data-expanded="${String(expanded)}">
+      <div class="trading-default-head">
+        <button id="metaDefaultSizingToggle" class="trading-default-expand" type="button" aria-expanded="${String(expanded)}" aria-controls="metaDefaultSizingBody">
+          <b>${expanded ? "-" : "+"}</b>
+          <strong>Default Settings</strong>
+        </button>
+        ${renderMetaTradingSettingToggle("useDefaultSizingSettings", "On / Off", settings.useDefaultSizingSettings)}
+      </div>
+      <div id="metaDefaultSizingBody" class="trading-default-body" ${expanded ? "" : "hidden"}>
+        <div class="trading-settings-grid trading-default-grid">
+          ${renderMetaTradingSettingInput("minimumBuyScore", "Minimum buy score", settings.minimumBuyScore, 0, 1, 0.01)}
+          ${renderMetaTradingSettingInput("minimumSignalEdge", "Minimum signal edge", settings.minimumSignalEdge, 0, 1, 0.01)}
+          ${renderMetaTradingSettingInput("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0, 100, 0.01)}
+          ${renderMetaTradingSettingInput("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0, 100, 0.1)}
+          ${renderMetaTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
+          ${renderMetaTradingSettingInput("atrStopMultiplier", "ATR stop multiplier", settings.atrStopMultiplier, 0.1, 10, 0.1)}
+          ${renderMetaTradingSettingInput("minimumStopDistancePercent", "Min stop distance %", settings.minimumStopDistancePercent, 0, 5, 0.001)}
+          ${renderMetaTradingSettingInput("maxParticipationPercent", "Max participation %", settings.maxParticipationPercent, 0, 100, 0.001)}
+          ${renderMetaTradingSettingInput("maxAllowedShares", "Max shares (0 auto)", settings.maxAllowedShares, 0, 1000000, 1)}
+          ${renderMetaTradingSettingInput("maxDailyLossPercent", "Max daily loss %", settings.maxDailyLossPercent, 0, 100, 0.1)}
+          ${renderMetaTradingSettingToggle("pyramidingEnabled", "Pyramiding", settings.pyramidingEnabled)}
+        </div>
+        <div class="confidence-sizing-preview">
+          <span><b>Inventory</b> ${escapeHtml(inventorySource)}</span>
+          <span><b>Partition</b> ${escapeHtml(partition)}</span>
+          <span><b>Open positions</b> ${roundNumber(numberFromUnknown(ownership?.openPositionCount, 0), 0)}</span>
+          <span><b>Reserved risk</b> ${currency(numberFromUnknown(ownership?.reservedRiskDollars, 0))}</span>
+          <span><b>Daily trades</b> ${roundNumber(numberFromUnknown(ownership?.dailyTradeCount, 0), 0)}</span>
+          <span><b>Live trading</b> Disabled</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderMetaTradingSettingInput(
+  name: keyof TradingSettings,
+  label: string,
+  value: number,
+  min: number,
+  max: number,
+  step: number,
+  locked = false,
+) {
+  return `
+    <label data-generated="${String(locked)}">
+      <span>${escapeHtml(label)}</span>
+      <input data-meta-trading-setting="${escapeHtml(name)}" type="number" min="${min}" max="${max}" step="${step}" value="${roundNumber(value, 6)}" ${locked ? "readonly" : ""} />
+    </label>
+  `;
+}
+
+function renderMetaTradingSettingToggle(name: keyof TradingSettings, label: string, checked: boolean) {
+  return `
+    <label class="trading-default-toggle">
+      <span>${escapeHtml(label)}</span>
+      <input data-meta-trading-setting="${escapeHtml(name)}" type="checkbox" ${checked ? "checked" : ""} />
+    </label>
+  `;
+}
+
+function metaBackendTargetOrderRecommendation(): ManualOrderRecommendation {
+  const payload = state.metaTradingSettingsBackend;
+  const order = childRecord(payload, "targetOrder");
+  const settings = state.metaTradingSettings;
+  const failedGates = arrayFromUnknown(order?.failedGates).map((value) => String(value));
+  const accountBalance = numberFromUnknown(order?.accountBalance, settings.startingCapital);
+  const quantity = Math.floor(numberFromUnknown(order?.quantity, 0));
+  const triggerPrice = nullableBackendNumber(order?.triggerPrice);
+  return applyConfidenceTargetOrderOverrides({
+    eligible: false,
+    side: algoSignalFromUnknown(order?.side ?? "Hold"),
+    orderType: stringFromUnknown(order?.orderType, "No order"),
+    symbol: stringFromUnknown(order?.symbol, state.symbol).toUpperCase(),
+    quantity,
+    triggerPrice,
+    limitPrice: nullableBackendNumber(order?.limitPrice),
+    stopPrice: nullableBackendNumber(order?.stopPrice),
+    targetPrice: nullableBackendNumber(order?.targetPrice),
+    accountBalance,
+    orderLimitDollars: numberFromUnknown(order?.orderLimitDollars, accountBalance * settings.orderAllocationPercent / 100),
+    dailyLimitDollars: numberFromUnknown(order?.dailyLimitDollars, 0),
+    riskDollars: numberFromUnknown(order?.riskDollars, 0),
+    orderNotional: triggerPrice !== null ? quantity * triggerPrice : 0,
+    plannedStopRiskDollars: numberFromUnknown(order?.plannedStopRiskDollars, 0),
+    estimatedSlippage: numberFromUnknown(order?.estimatedSlippage, 0),
+    timeInForce: stringFromUnknown(order?.timeInForce, "DAY"),
+    cutoff: stringFromUnknown(order?.cutoff, "Backend controlled"),
+    submitMode: stringFromUnknown(order?.submitMode, "Automatic") === "Manual" ? "Manual" : "Automatic",
+    failedGates: failedGates.length ? failedGates : ["Backend Meta-Strategy has not proposed an entry order."],
+    gates: failedGates.map((gate) => ({ layer: "Meta-Strategy backend", status: "info", signal: "Hold", detail: gate })),
+    levels: { last: null, vwap: null, openingHigh: null, openingLow: null, lastTime: null },
+    summary: "Meta-Strategy order intents are created by backend workers after readiness, market clock, local risk, sizing, and execution guards pass.",
+  }, "meta");
+}
+
+function metaEditableTradingSettingsPayload(settings: TradingSettings): Partial<TradingSettings> {
+  return {
+    orderAllocationPercent: settings.orderAllocationPercent,
+    riskBudgetPercentOfOrder: settings.riskBudgetPercentOfOrder,
+    maxTradesPerDay: settings.maxTradesPerDay,
+    stopLossPercent: settings.stopLossPercent,
+    fixedStopDistanceDollars: settings.fixedStopDistanceDollars,
+    takeProfitR: settings.takeProfitR,
+    slippagePerShare: settings.slippagePerShare,
+    minimumBuyScore: settings.minimumBuyScore,
+    minimumSignalEdge: settings.minimumSignalEdge,
+    baseRiskPercent: settings.baseRiskPercent,
+    maxPositionPercent: settings.maxPositionPercent,
+    atrStopMultiplier: settings.atrStopMultiplier,
+    minimumStopDistancePercent: settings.minimumStopDistancePercent,
+    maxParticipationPercent: settings.maxParticipationPercent,
+    maxAllowedShares: settings.maxAllowedShares,
+    minimumActiveStrategies: settings.minimumActiveStrategies,
+    minimumBuyStrategyCount: settings.minimumBuyStrategyCount,
+    maxSpreadPercent: settings.maxSpreadPercent,
+    minimumOneMinuteVolume: settings.minimumOneMinuteVolume,
+    pyramidingEnabled: settings.pyramidingEnabled,
+  };
+}
+
 function updateMetaStrategyPanel() {
   const result = metaStrategyPresentationResult();
-  state.currentMetaTargetOrder = null;
   metaFinalSignal.textContent = result.decisionLabel;
   metaFinalSignal.className = `algo-final ${result.signal.toLowerCase()}`;
   metaScoreGrid.innerHTML = renderMetaScoreGrid(result);
   metaSummary.innerHTML = "";
   metaSummary.hidden = true;
+  renderMetaRuntimeStatus();
+  if (state.metaStrategyReadinessStatus === "idle") {
+    void loadMetaStrategyReadinessStatus();
+  }
+  if (state.metaStrategyLatestDecisionStatus === "idle") {
+    void loadMetaStrategyLatestDecision();
+  }
   renderMetaMlReadiness();
   if (state.metaTrainingStatus === "idle") {
     void loadMetaStrategyTrainingStatus();
+  }
+  updateMetaTradingSettingsMount();
+  if (state.metaTradingSettingsStatus === "idle") {
+    void loadMetaStrategyTradingSettings();
   }
   metaGateList.innerHTML = renderMetaDecisionChecks(result);
   metaFamilyGrid.innerHTML = renderMetaFamilyGrid(result);
@@ -14711,12 +15285,149 @@ function updateMetaStrategyPanel() {
   metaChecksToggleMeta.textContent = failedChecks
     ? `${failedChecks} blocked / ${result.safetyGates.length} checks`
     : `${result.safetyGates.length - infoChecks} pass / ${result.safetyGates.length} checks`;
+  renderMetaRuntimeReadinessExpandedState();
+  renderMetaMlReadinessExpandedState();
   renderMetaStrategiesExpandedState();
   renderMetaChecksExpandedState();
 }
 
 function metaStrategyPresentationResult(): MetaStrategyResult {
+  const decisionEnvelope = state.metaStrategyLatestDecision;
+  const decisionPayload = childRecord(decisionEnvelope, "payload");
+  if (decisionPayload) {
+    return metaStrategyResultFromBackendDecision(decisionPayload);
+  }
+  if (state.metaStrategyLatestDecisionStatus === "error") {
+    return emptyMetaStrategyResult(state.metaStrategyLatestDecisionWarning || "Meta-Strategy latest decision route is unavailable.");
+  }
   return emptyMetaStrategyResult("Backend Meta-Strategy service is authoritative; frontend displays returned status, predictions, evidence, backtests, promotions, and diagnostics only.");
+}
+
+function metaStrategyResultFromBackendDecision(payload: Record<string, unknown>): MetaStrategyResult {
+  const signal = algoSignalFromUnknown(payload.signal ?? payload.decisionLabel);
+  const familyScores = metaFamilyScoresFromBackend(childRecord(payload, "familyScores"));
+  const familyAggregation = metaFamilyAggregationFromBackend(childRecord(payload, "familyAggregation"), familyScores);
+  const strategies = metaStrategiesFromBackend(arrayFromUnknown(payload.strategies), stringFromUnknown(payload.summary, ""));
+  const reasonCodes = arrayFromUnknown(payload.reasonCodes).map((value) => String(value));
+  const safetyGates = metaSafetyGatesFromBackend(arrayFromUnknown(payload.safetyGates), reasonCodes);
+  const summary = stringFromUnknown(payload.summary, "");
+  return {
+    signal,
+    decisionLabel: signal,
+    buyScore: numberFromUnknown(payload.buyScore, 0),
+    sellScore: numberFromUnknown(payload.sellScore, 0),
+    holdScore: numberFromUnknown(payload.holdScore, signal === "Hold" ? 1 : 0),
+    netScore: numberFromUnknown(payload.buyScore, 0) - numberFromUnknown(payload.sellScore, 0),
+    edge: numberFromUnknown(payload.edge, 0),
+    contextMultiplier: 1,
+    aggregateScale: 1,
+    activeDirectionalCount: strategies.filter((strategy) => strategy.signal !== "hold").length,
+    familyAggregation,
+    familyScores,
+    familyDisplayScores: metaFamilyDisplayScoresFromBackend(childRecord(payload, "familyDisplayScores")),
+    safetyGates,
+    strategies: strategies.length ? strategies : emptyMetaStrategyResult(summary || "Latest Meta-Strategy decision contains no per-strategy outputs yet.").strategies,
+    reasons: [summary, ...reasonCodes].filter(Boolean),
+  };
+}
+
+function metaFamilyScoresFromBackend(raw: Record<string, unknown> | null): Record<MetaStrategyFamily, { buy: number; sell: number; hold: number; capped: boolean }> {
+  const scores = emptyMetaFamilyScores();
+  for (const family of metaStrategyFamilies()) {
+    const row = childRecord(raw, family);
+    if (!row) {
+      continue;
+    }
+    scores[family] = {
+      buy: numberFromUnknown(row.buy ?? row.buyScore, scores[family].buy),
+      sell: numberFromUnknown(row.sell ?? row.sellScore, scores[family].sell),
+      hold: numberFromUnknown(row.hold ?? row.holdScore, scores[family].hold),
+      capped: weightedTruthFromUnknown(row.capped, false),
+    };
+  }
+  return scores;
+}
+
+function metaFamilyAggregationFromBackend(raw: Record<string, unknown> | null, scores: Record<MetaStrategyFamily, { buy: number; sell: number; hold: number; capped: boolean }>): MetaFamilyAggregationScores {
+  return {
+    trend_buy_score: numberFromUnknown(raw?.trend_buy_score ?? raw?.trendBuyScore, scores.trend.buy),
+    trend_sell_score: numberFromUnknown(raw?.trend_sell_score ?? raw?.trendSellScore, scores.trend.sell),
+    breakout_buy_score: numberFromUnknown(raw?.breakout_buy_score ?? raw?.breakoutBuyScore, scores.breakout.buy),
+    breakout_sell_score: numberFromUnknown(raw?.breakout_sell_score ?? raw?.breakoutSellScore, scores.breakout.sell),
+    mean_reversion_buy_score: numberFromUnknown(raw?.mean_reversion_buy_score ?? raw?.meanReversionBuyScore, scores.mean_reversion.buy),
+    mean_reversion_sell_score: numberFromUnknown(raw?.mean_reversion_sell_score ?? raw?.meanReversionSellScore, scores.mean_reversion.sell),
+    reversal_buy_score: numberFromUnknown(raw?.reversal_buy_score ?? raw?.reversalBuyScore, scores.reversal.buy),
+    reversal_sell_score: numberFromUnknown(raw?.reversal_sell_score ?? raw?.reversalSellScore, scores.reversal.sell),
+    confirmation_score: numberFromUnknown(raw?.confirmation_score ?? raw?.confirmationScore, 0),
+    regime_score: numberFromUnknown(raw?.regime_score ?? raw?.regimeScore, 0),
+  };
+}
+
+function metaFamilyDisplayScoresFromBackend(raw: Record<string, unknown> | null): Partial<Record<MetaStrategyFamily, MetaFamilyDisplayScore>> {
+  const result: Partial<Record<MetaStrategyFamily, MetaFamilyDisplayScore>> = {};
+  for (const family of metaStrategyFamilies()) {
+    const row = childRecord(raw, family);
+    if (!row) {
+      continue;
+    }
+    result[family] = {
+      label: stringFromUnknown(row.label, metaFamilyLabel(family)),
+      value: numberFromUnknown(row.value, 0),
+    };
+  }
+  return result;
+}
+
+function metaStrategiesFromBackend(rows: unknown[], fallbackReason: string): MetaStrategyFeature[] {
+  return rows.filter(isRecord).map((row) => {
+    const signal = String(row.signal ?? "hold").toLowerCase();
+    const normalizedSignal: ConfidenceStrategySignal = signal === "buy" ? "buy" : signal === "sell" ? "sell" : "hold";
+    const family = metaStrategyFamilyFromUnknown(row.family);
+    return {
+      name: stringFromUnknown(row.name, "Meta strategy"),
+      role: metaStrategyRoleFromUnknown(row.role),
+      family,
+      moduleStatus: votingEnsembleInventoryStatusFromUnknown(row.moduleStatus),
+      signal: normalizedSignal,
+      confidence: numberFromUnknown(row.confidence, 0),
+      direction: normalizedSignal === "buy" ? 1 : normalizedSignal === "sell" ? -1 : 0,
+      contribution: numberFromUnknown(row.contribution, 0),
+      effectiveContribution: numberFromUnknown(row.effectiveContribution, 0),
+      source: stringFromUnknown(row.source, "backend"),
+      reason: stringFromUnknown(row.reason, fallbackReason || "Backend strategy evidence"),
+    };
+  });
+}
+
+function metaSafetyGatesFromBackend(rows: unknown[], reasonCodes: string[]): { label: string; status: "pass" | "fail" | "info"; detail: string }[] {
+  const gates = rows.filter(isRecord).map((row) => ({
+    label: stringFromUnknown(row.label, "Meta-Strategy check"),
+    status: stringFromUnknown(row.status, "info") === "fail" ? "fail" as const : stringFromUnknown(row.status, "info") === "pass" ? "pass" as const : "info" as const,
+    detail: stringFromUnknown(row.detail, ""),
+  }));
+  if (gates.length) {
+    return gates;
+  }
+  return reasonCodes.length
+    ? reasonCodes.slice(0, 8).map((code) => ({ label: "Meta-Strategy decision", status: "info" as const, detail: code }))
+    : [{ label: "Meta-Strategy decision", status: "info", detail: "No latest decision blockers reported." }];
+}
+
+function metaStrategyFamilyFromUnknown(value: unknown): MetaStrategyFamily {
+  const family = String(value ?? "").toLowerCase();
+  return metaStrategyFamilies().includes(family as MetaStrategyFamily) ? family as MetaStrategyFamily : "trend";
+}
+
+function metaStrategyRoleFromUnknown(value: unknown): MetaStrategyRole {
+  const role = String(value ?? "").toLowerCase();
+  return ["directional", "context", "regime", "safety", "meta_safety"].includes(role) ? role as MetaStrategyRole : "directional";
+}
+
+function votingEnsembleInventoryStatusFromUnknown(value: unknown): VotingEnsembleInventoryStatus {
+  const status = String(value ?? "").toLowerCase();
+  return ["active", "shadow", "disabled", "unavailable", "not_data_ready", "deprecated_alias"].includes(status)
+    ? status as VotingEnsembleInventoryStatus
+    : "unavailable";
 }
 
 function emptyMetaStrategyResult(reason: string): MetaStrategyResult {
@@ -15864,13 +16575,71 @@ async function fetchVotingEnsembleRuntimeJson(path: string, init: RequestInit = 
   throw new Error(lastMessage);
 }
 
+async function fetchMetaStrategyPaperControlJson(path: string, init: RequestInit = {}) {
+  let lastMessage = "Meta-Strategy paper control route unavailable";
+  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+    try {
+      const response = await fetchWithTimeout(`${baseUrl}/api/meta-strategy${path}`, 15000, {
+        ...init,
+        headers: {
+          "Content-Type": "application/json",
+          ...(init.headers ?? {}),
+        },
+      });
+      if (response.ok) {
+        return (await response.json()) as Record<string, unknown>;
+      }
+      lastMessage =
+        response.status === 404
+          ? `Meta-Strategy paper control route not loaded on ${baseUrl}; restart the FastAPI backend.`
+          : await readableResponseError(response);
+      if (response.status !== 404) {
+        throw new Error(lastMessage);
+      }
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : lastMessage;
+    }
+  }
+  throw new Error(lastMessage);
+}
+
+async function fetchMetaStrategyJson(path: string, init: RequestInit = {}) {
+  let lastMessage = "Meta-Strategy route unavailable";
+  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+    try {
+      const response = await fetchWithTimeout(`${baseUrl}/api/meta-strategy${path}`, 15000, {
+        ...init,
+        headers: {
+          "Content-Type": "application/json",
+          ...(init.headers ?? {}),
+        },
+      });
+      if (response.ok) {
+        return (await response.json()) as Record<string, unknown>;
+      }
+      lastMessage =
+        response.status === 404
+          ? `Meta-Strategy route not loaded on ${baseUrl}; restart the FastAPI backend.`
+          : await readableResponseError(response);
+      if (response.status !== 404) {
+        throw new Error(lastMessage);
+      }
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : lastMessage;
+    }
+  }
+  throw new Error(lastMessage);
+}
+
 async function handlePaperToggleClick() {
-  if (state.votingEnsembleRuntimeControlStatus === "loading") {
+  if (state.votingEnsembleRuntimeControlStatus === "loading" || state.metaStrategyPaperControlStatus === "loading") {
     return;
   }
-  const requested = !votingEnsemblePaperRequested();
+  const requested = !(votingEnsemblePaperRequested() || wcaPaperRequested() || regimePaperRequested() || metaStrategyPaperRequested() || globalPaperTradingEnabled());
   state.votingEnsembleRuntimeControlStatus = "loading";
+  state.metaStrategyPaperControlStatus = "loading";
   state.votingEnsembleRuntimeControlWarning = "";
+  state.metaStrategyPaperControlWarning = "";
   updateTradeToggleButton();
   try {
     const control = await syncVotingEnsembleAutomaticPaperControl(requested);
@@ -15882,12 +16651,15 @@ async function handlePaperToggleClick() {
       syncWeightedVotingAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
       syncRegimeAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
       syncWcaAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
+      syncMetaStrategyAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
     ]);
     await Promise.allSettled([loadVotingEnsembleRuntimeStatus(), refreshVotingEnsemblePaperInventory()]);
   } catch (error) {
     setGlobalPaperTradingEnabled(false);
     state.votingEnsembleRuntimeControlStatus = "error";
     state.votingEnsembleRuntimeControlWarning = error instanceof Error ? error.message : "Voting Ensemble paper control sync failed";
+    state.metaStrategyPaperControlWarning = "";
+    void loadMetaStrategyPaperControl();
     saveUiState();
     updateTradeToggleButton();
     updateQuoteCard(currentCandle());
@@ -16152,6 +16924,83 @@ function backendTradeEvidence(source: "fill" | "order", payload: Record<string, 
       winner: normalizeTradeHistorySide(payload.side) ?? "Hold",
       summary: arrayFromUnknown(payload.reasonCodes).map((value) => String(value)).join(", ") || "Loaded from backend paper inventory",
     },
+  };
+}
+
+async function loadMetaStrategyPaperControl() {
+  state.metaStrategyPaperControlStatus = "loading";
+  state.metaStrategyPaperControlWarning = "";
+  updateTradeToggleButton();
+  try {
+    const control = normalizeMetaStrategyPaperControl(await fetchMetaStrategyPaperControlJson("/paper-control"));
+    state.metaStrategyPaperControl = control;
+    state.metaStrategyPaperControlStatus = control.newPaperEntriesEnabled && !control.paperEntriesAllowed ? "blocked" : "ready";
+  } catch (error) {
+    state.metaStrategyPaperControl = null;
+    state.metaStrategyPaperControlStatus = "error";
+    state.metaStrategyPaperControlWarning = error instanceof Error ? error.message : "Meta-Strategy paper control unavailable";
+  }
+  updateTradeToggleButton();
+  return state.metaStrategyPaperControl;
+}
+
+async function syncMetaStrategyAutomaticPaperControl(enabled: boolean) {
+  state.metaStrategyPaperControlStatus = "loading";
+  state.metaStrategyPaperControlWarning = "";
+  updateTradeToggleButton();
+  try {
+    const latest = normalizeMetaStrategyPaperControl(await fetchMetaStrategyPaperControlJson("/paper-control"));
+    const updated = await fetchMetaStrategyPaperControlJson("/paper-control", {
+        method: "PUT",
+        body: JSON.stringify({
+          algorithmId: "meta_strategy",
+          capitalPartitionId: latest.capitalPartitionId,
+          newPaperEntriesEnabled: enabled,
+          expectedVersion: latest.version,
+          actor: "dashboard.global_paper_toggle",
+          reason: enabled
+            ? "meta_strategy.paper_control.dashboard_global_paper_toggle_on"
+            : "meta_strategy.paper_control.dashboard_global_paper_toggle_off",
+        }),
+      });
+    if (isRecord(updated) && stringFromUnknown(updated.status, "") === "REJECTED") {
+      const reasonCodes = arrayFromUnknown(updated.reasonCodes).map((value) => String(value)).join(", ");
+      throw new Error(reasonCodes || "Meta-Strategy paper control update rejected");
+    }
+    const control = normalizeMetaStrategyPaperControl(updated);
+    state.metaStrategyPaperControl = control;
+    state.metaStrategyPaperControlStatus = control.newPaperEntriesEnabled && !control.paperEntriesAllowed ? "blocked" : "ready";
+    updateTradeToggleButton();
+    return control;
+  } catch (error) {
+    state.metaStrategyPaperControl = null;
+    state.metaStrategyPaperControlStatus = "error";
+    state.metaStrategyPaperControlWarning = error instanceof Error ? error.message : "Meta-Strategy automatic paper control sync failed";
+    updateTradeToggleButton();
+    throw error;
+  }
+}
+
+function normalizeMetaStrategyPaperControl(raw: unknown): MetaStrategyPaperControl {
+  const envelope = isRecord(raw) ? raw : {};
+  const record = childRecord(envelope, "payload") ?? envelope;
+  if (record.algorithmId && record.algorithmId !== "meta_strategy") {
+    throw new Error("Meta-Strategy paper control response used the wrong algorithm id.");
+  }
+  const enabled = weightedTruthFromUnknown(record.newPaperEntriesEnabled ?? record.automaticPaperTradingEnabled ?? record.paperEntriesAllowed, false);
+  return {
+    algorithmId: "meta_strategy",
+    algorithm_id: "meta_strategy",
+    capitalPartitionId: stringFromUnknown(record.capitalPartitionId ?? record.capital_partition_id, "meta_strategy.paper.default"),
+    newPaperEntriesEnabled: enabled,
+    automaticPaperTradingEnabled: weightedTruthFromUnknown(record.automaticPaperTradingEnabled, enabled),
+    paperEntriesAllowed: weightedTruthFromUnknown(record.paperEntriesAllowed, enabled),
+    liveTradingEnabled: false,
+    updatedAt: stringFromUnknown(record.updatedAt ?? record.updated_at, "") || null,
+    updatedBy: stringFromUnknown(record.updatedBy ?? record.updated_by, ""),
+    reason: stringFromUnknown(record.reason, ""),
+    version: Math.max(0, Math.floor(numberFromUnknown(record.version, 0))),
+    reasonCodes: arrayFromUnknown(record.reasonCodes ?? record.reason_codes).map((value) => String(value)),
   };
 }
 
@@ -17295,7 +18144,7 @@ function renderWeightedTradingSettingsPanel() {
   const expanded = state.weightedTradingSettingsExpanded;
   const settings = state.weightedTradingSettings;
   const config = childRecord(weightedVotingBackendState.config, "configuration");
-  const order = state.currentWeightedTargetOrder;
+  const order = state.currentWeightedTargetOrder ?? weightedBackendOrderRecommendation();
   return `
     <div class="trading-settings-panel weighted-trading-settings-panel" data-status="ready" data-expanded="${String(expanded)}">
       <button id="weightedTradingSettingsToggle" class="trading-settings-head" type="button" aria-expanded="${String(expanded)}" aria-controls="weightedTradingSettingsBody">
@@ -17317,7 +18166,7 @@ function renderWeightedTradingSettingsPanel() {
           ${renderWeightedTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
           ${renderWeightedTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
         </div>
-        ${order ? renderConfidenceTargetOrderSettings(order, "Weighted Voting", "weighted") : ""}
+        ${renderWeightedTargetOrderSettings(order)}
         ${renderWeightedDefaultSettingsSection()}
       </div>
     </div>
@@ -17365,14 +18214,9 @@ function renderWeightedBackendConfigEditor(config: Record<string, unknown> | nul
   `;
 }
 
-function weightedBackendOrderRecommendation(): ManualOrderRecommendation | null {
+function weightedBackendOrderRecommendation(): ManualOrderRecommendation {
   const proposal = childRecord(weightedVotingBackendState.evaluation, "globalOrderProposal");
   const application = childRecord(weightedVotingBackendState.evaluation, "globalGateApplication");
-  const quantity = Math.floor(numberFromUnknown(application?.allowed_quantity ?? application?.allowedQuantity ?? proposal?.quantity ?? proposal?.proposed_quantity ?? proposal?.proposedQuantity, 0));
-  const side = algoSignalFromUnknown(proposal?.side ?? proposal?.proposed_side ?? proposal?.proposedSide);
-  if (!proposal) {
-    return null;
-  }
   const settings = state.weightedTradingSettings;
   const accountBalance = settings.startingCapital;
   const orderLimitDollars = accountBalance * (settings.orderAllocationPercent / 100);
@@ -17380,21 +18224,55 @@ function weightedBackendOrderRecommendation(): ManualOrderRecommendation | null 
   const riskDollars = settings.useDefaultSizingSettings
     ? accountBalance * (settings.baseRiskPercent / 100)
     : orderLimitDollars * (settings.riskBudgetPercentOfOrder / 100);
+  const gateRows = weightedVotingGateRows();
+  const failedGates = gateRows.filter((gate) => gate.status === "fail").map((gate) => `${gate.label}: ${gate.detail}`);
+  if (!proposal) {
+    const reason = weightedVotingBackendState.evaluation
+      ? "Weighted Voting backend did not create a target-order proposal"
+      : "Waiting for Weighted Voting backend finalized-bar evaluation";
+    return applyConfidenceTargetOrderOverrides({
+      eligible: false,
+      side: "Hold",
+      orderType: "No order",
+      symbol: state.symbol,
+      quantity: 0,
+      triggerPrice: null,
+      limitPrice: null,
+      stopPrice: null,
+      targetPrice: null,
+      accountBalance,
+      orderLimitDollars,
+      dailyLimitDollars,
+      riskDollars,
+      orderNotional: 0,
+      plannedStopRiskDollars: 0,
+      estimatedSlippage: 0,
+      timeInForce: "Day",
+      cutoff: "Backend session policy",
+      submitMode: "Manual",
+      failedGates: uniqueStrings([...failedGates, `Weighted Voting proposal: ${reason}`]),
+      gates: gateRows.map((gate) => ({ layer: gate.label, status: gate.status, signal: "Hold", detail: gate.detail })),
+      levels: { last: null, vwap: null, openingHigh: null, openingLow: null, lastTime: weightedVotingBackendState.updatedAt || null },
+      summary: `No order: ${reason}.`,
+    }, "weighted");
+  }
+  const quantity = Math.floor(numberFromUnknown(application?.allowed_quantity ?? application?.allowedQuantity ?? proposal.quantity ?? proposal.proposed_quantity ?? proposal.proposedQuantity, 0));
+  const proposedSide = algoSignalFromUnknown(proposal.side ?? proposal.proposed_side ?? proposal.proposedSide);
   const triggerPrice = nullableBackendNumber(proposal.trigger_price ?? proposal.triggerPrice);
   const orderNotional = triggerPrice !== null && quantity > 0
     ? roundNumber(quantity * triggerPrice, 2)
     : numberFromUnknown(proposal.notional_dollars ?? proposal.notionalDollars, 0);
-  const failedGates = weightedVotingGateRows().filter((gate) => gate.status === "fail").map((gate) => `${gate.label}: ${gate.detail}`);
-  const eligible = quantity > 0 && side !== "Hold" && failedGates.length === 0;
+  const eligible = quantity > 0 && proposedSide !== "Hold" && failedGates.length === 0;
+  const side = eligible ? proposedSide : "Hold";
   const summary = eligible
-    ? `Weighted Voting backend proposal is eligible for manual review. Auto paper still follows runtime rollout and global paper gates.`
+    ? `Weighted Voting backend proposal is eligible; automatic paper submission still follows Weighted runtime control and paper gates.`
     : `No order: ${failedGates.length ? uniqueStrings(failedGates).join(", ") : "Weighted Voting backend did not approve a directional proposal"}.`;
   return applyConfidenceTargetOrderOverrides({
     eligible,
     side,
-    orderType: eligible ? `${side} stop-limit` : "No order",
+    orderType: eligible ? "Limit" : "No order",
     symbol: stringFromUnknown(proposal.symbol, state.symbol),
-    quantity,
+    quantity: eligible ? quantity : 0,
     triggerPrice,
     limitPrice: nullableBackendNumber(proposal.limit_price ?? proposal.limitPrice),
     stopPrice: nullableBackendNumber(proposal.stop_price ?? proposal.stopPrice),
@@ -17405,15 +18283,50 @@ function weightedBackendOrderRecommendation(): ManualOrderRecommendation | null 
     riskDollars,
     orderNotional,
     plannedStopRiskDollars: numberFromUnknown(proposal.planned_risk ?? proposal.plannedRisk, 0),
-    estimatedSlippage: numberFromUnknown(proposal.estimated_slippage ?? proposal.estimatedSlippage, 0),
+    estimatedSlippage: numberFromUnknown(proposal.estimated_slippage ?? proposal.estimatedSlippage, roundNumber(quantity * settings.slippagePerShare, 2)),
     timeInForce: "Day",
     cutoff: "Backend session policy",
-    submitMode: "Manual",
+    submitMode: eligible && weightedVotingBackendState.runtimeControl?.automaticEntriesEnabled ? "Automatic" : "Manual",
     failedGates,
-    gates: weightedVotingGateRows().map((gate) => ({ layer: gate.label, status: gate.status, signal: side, detail: gate.detail })),
+    gates: gateRows.map((gate) => ({ layer: gate.label, status: gate.status, signal: side, detail: gate.detail })),
     levels: { last: null, vwap: null, openingHigh: null, openingLow: null, lastTime: weightedVotingBackendState.updatedAt || null },
     summary,
   }, "weighted");
+}
+
+function renderWeightedTargetOrderSettings(order: ManualOrderRecommendation) {
+  const defaultsOn = state.weightedTradingSettings.useDefaultSizingSettings;
+  const visibleBlockers = targetOrderVisibleBlockers(order, "weighted");
+  const orderType = order.orderType === "Market" || order.orderType === "Limit" ? order.orderType : "No order";
+  const submitMode = order.submitMode === "Automatic" ? "Automatic" : "Manual";
+  return `
+    <div class="target-settings-panel weighted-target-settings-panel" data-side="${escapeHtml(order.side.toLowerCase())}">
+      <strong>Target Order</strong>
+      <span class="target-settings-note">${defaultsOn ? "Generated from Weighted Voting backend proposal, Weighted Voting settings, and Weighted Voting isolated inventory" : "Manual target-order overrides enabled for Weighted Voting only"}</span>
+      ${renderTargetOrderBlockers(order, "weighted")}
+      <div class="target-settings-grid">
+        ${renderConfidenceTargetSettingInput("accountBalance", "Total balance", order.accountBalance, "number", 0.01, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("dailyLimitDollars", "Buying power", order.dailyLimitDollars, "number", 0.01, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("orderLimitDollars", "Order limit", order.orderLimitDollars, "number", 0.01, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("orderNotional", "Order value", order.orderNotional, "number", 0.01, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("symbol", "Symbol", order.symbol, "text", undefined, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingSelect("side", "Side", order.side, ["Hold", "Buy", "Sell"], undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingSelect("orderType", "Order type", orderType, ["No order", "Market", "Limit"], undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("quantity", "Quantity", order.quantity, "number", 1, undefined, true, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("triggerPrice", "Trigger / stop price", order.triggerPrice, "number", 0.01, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("limitPrice", "Limit price", order.limitPrice, "number", 0.01, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("stopPrice", "Protective stop", order.stopPrice, "number", 0.01, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("targetPrice", "Take profit", order.targetPrice, "number", 0.01, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("riskDollars", "Risk budget", order.riskDollars, "number", 0.01, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("plannedStopRiskDollars", "Planned stop risk", order.plannedStopRiskDollars, "number", 0.01, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("estimatedSlippage", "Estimated slippage", order.estimatedSlippage, "number", 0.01, undefined, defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("timeInForce", "Time in force", order.timeInForce, "text", undefined, "half", defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingInput("cutoff", "Cutoff", order.cutoff, "text", undefined, "half", defaultsOn, "weighted-target-setting")}
+        ${renderConfidenceTargetSettingSelect("submitMode", "Submit order", submitMode, ["Manual", "Automatic"], "half", false, "weighted-target-setting")}
+      </div>
+      ${order.eligible || (!order.failedGates.length && !visibleBlockers.length) ? `<span class="trading-settings-warning">${escapeHtml(order.summary)}</span>` : ""}
+    </div>
+  `;
 }
 
 function renderWeightedBackendOrderProposal(order: ManualOrderRecommendation) {
@@ -22964,9 +23877,6 @@ function marketForecastDirectionImpact(direction: string | null | undefined, mod
 }
 
 function marketForecastHorizonImpact(horizon: MarketForecastHorizon): MarketForecastImpact {
-  if (horizon.primaryDecisionGate || horizon.advice.entryGate) {
-    return "neutral";
-  }
   return marketForecastDirectionImpact(horizon.predictedDirection, horizon.modelApplied);
 }
 
@@ -23006,8 +23916,8 @@ function marketForecastHorizonRows(forecast: MarketForecastPrediction): MarketFo
               ? "CLOSE_REVIEW"
               : "NO_ML_ADVICE",
         shortPosition: "NO_ML_ADVICE",
-        newLongEntry: isPrimary && forecast.decision.action === "buy" ? "CONSIDER_AFTER_STRATEGY_SIGNAL" : "WAIT_FOR_VALIDATED_MODEL",
-        newShortEntry: isPrimary && forecast.decision.action === "sell" ? "CONSIDER_AFTER_STRATEGY_SIGNAL" : "WAIT_FOR_VALIDATED_MODEL",
+        newLongEntry: "WAIT_FOR_VALIDATED_MODEL",
+        newShortEntry: "WAIT_FOR_VALIDATED_MODEL",
         flatMarket: "WAIT_FOR_VALIDATED_MODEL",
         reasonCodes: ["backend_multi_horizon_forecast_not_loaded"],
       },
@@ -23032,16 +23942,12 @@ function renderMultiHorizonForecastStrip(forecast: MarketForecastPrediction) {
               : `${horizon.predictedChangeDollars >= 0 ? "+" : ""}${currency(horizon.predictedChangeDollars)}`;
           const direction = horizon.modelApplied ? marketForecastDirectionLabel(horizon.predictedDirection) : "ML unavailable";
           const impact = marketForecastHorizonImpact(horizon);
-          const newEntry = horizon.primaryDecisionGate || horizon.advice.entryGate
-            ? "WAIT"
-            : horizon.advice.newLongEntry.replaceAll("_", " ");
           return `
             <div class="market-forecast-horizon-card" data-impact="${impact}">
               <b>${horizon.horizonMinutes}m ML</b>
               <strong>${escapeHtml(direction)}</strong>
               <span>P up/down ${escapeHtml(`${formatNullableProbability(up)} / ${formatNullableProbability(down)}`)}</span>
-              <span>Long ${escapeHtml(horizon.advice.longPosition.replaceAll("_", " "))}</span>
-              <span>New entry ${escapeHtml(newEntry)}</span>
+              <span>P flat ${escapeHtml(formatNullableProbability(horizon.probabilityFlatOrNoEdge ?? horizon.probabilityTimeout))}</span>
               <span>Move ${escapeHtml(change)}</span>
             </div>
           `;
@@ -23057,13 +23963,6 @@ function thresholdImpact(value: number | null | undefined, threshold: number | n
   }
   const passes = higherIsBetter ? value >= threshold : value <= threshold;
   return passes ? "positive" : "negative";
-}
-
-function signedImpact(value: number | null | undefined): MarketForecastImpact {
-  if (value == null || Math.abs(value) < 0.0001) {
-    return "neutral";
-  }
-  return value > 0 ? "positive" : "negative";
 }
 
 function renderMarketForecastPanel() {
@@ -23106,27 +24005,21 @@ function renderMarketForecastPanel() {
   const buyProbability = buyProbabilityValue === null ? "NA" : formatProbability(buyProbabilityValue);
   const sellProbability = sellProbabilityValue === null ? "NA" : formatProbability(sellProbabilityValue);
   const timeoutProbability = forecast.probabilityTimeout === null ? "NA" : formatProbability(forecast.probabilityTimeout);
-  const expectedValue = forecast.expectedValue === null ? "NA" : `${forecast.expectedValue >= 0 ? "+" : ""}${currency(forecast.expectedValue)}/share`;
-  const targetDistance = forecast.barriers?.targetDistance == null ? "NA" : currency(forecast.barriers.targetDistance);
-  const stopDistance = forecast.barriers?.stopDistance == null ? "NA" : currency(forecast.barriers.stopDistance);
   const regimeLabel = forecast.marketRegime
     ? `${forecast.marketRegime.trend.replaceAll("_", " ")}, ${forecast.marketRegime.volatility.replaceAll("_", " ")}, ${forecast.marketRegime.session.replaceAll("_", " ")}`
     : `${forecast.regime.trend}, ${forecast.regime.volatility}, ${forecast.regime.vwap}`;
-  const sizeLabel = forecast.decision.positionSizeMultiplier == null ? "NA" : `${Math.round(forecast.decision.positionSizeMultiplier * 100)}%`;
-  const algoScores = forecast.algorithmSignals?.weightedScores;
-  const algoScoreLabel = algoScores
-    ? `B ${formatProbability(algoScores.buy ?? 0)} / S ${formatProbability(algoScores.sell ?? 0)} / H ${formatProbability(algoScores.hold ?? 0)}`
-    : "NA";
+  const behaviorDirection = forecast.futurePricePrediction?.direction ?? forecast.futurePricePrediction?.expectedPriceDirection ?? "flat";
+  const directionLabel = marketForecastDirectionLabel(behaviorDirection);
+  const predictedMove =
+    forecast.futurePricePrediction?.predictedChangeDollars == null
+      ? "NA"
+      : `${forecast.futurePricePrediction.predictedChangeDollars >= 0 ? "+" : ""}${currency(forecast.futurePricePrediction.predictedChangeDollars)}`;
   const statusLabel =
     forecast.status === "INFERENCE_NOT_RUN" || forecast.status === "MODEL_UNAVAILABLE"
       ? "Inference not run"
-      : forecast.decision.action === "buy"
-        ? "Buy edge"
-        : forecast.decision.action === "sell"
-          ? "Sell edge"
-          : forecast.status === "insufficient_data"
-            ? "Need data"
-            : "No trade";
+      : forecast.status === "insufficient_data"
+        ? "Need data"
+        : directionLabel;
   const modelLabel =
     forecast.model.status === "ready"
       ? forecast.model.kind
@@ -23135,28 +24028,9 @@ function renderMarketForecastPanel() {
   const modelDisagreement = forecast.uncertainty?.modelDisagreement ?? forecast.decision.modelDisagreement;
   const maxDisagreement = forecast.uncertainty?.maximumModelDisagreement ?? forecast.decision.maximumModelDisagreement ?? 0.1;
   const uncertaintyLabel = modelDisagreement == null ? "NA" : `${formatProbability(modelDisagreement)} / max ${formatProbability(maxDisagreement)}`;
-  const targetStopImpact =
-    forecast.barriers?.targetDistance == null || forecast.barriers?.stopDistance == null
-      ? "neutral"
-      : forecast.barriers.targetDistance >= forecast.barriers.stopDistance
-        ? "positive"
-        : "negative";
-  const regimeImpact =
-    forecast.decision.action === "buy"
-      ? forecast.marketRegime?.allowedLong ? "positive" : "negative"
-      : forecast.decision.action === "sell"
-        ? forecast.marketRegime?.allowedShort ? "positive" : "negative"
-        : "negative";
-  const sizeImpact = forecast.decision.positionSizeMultiplier > 0 ? "positive" : "negative";
+  const directionImpact = marketForecastDirectionImpact(behaviorDirection, forecast.status === "ready");
   const modelImpact = forecast.model.status === "ready" ? "positive" : forecast.status === "INFERENCE_NOT_RUN" || forecast.status === "MODEL_UNAVAILABLE" ? "negative" : "neutral";
-  const algoScoresImpact = algoScores
-    ? forecast.decision.action === "buy"
-      ? (algoScores.buy ?? 0) > Math.max(algoScores.sell ?? 0, algoScores.hold ?? 0) ? "positive" : "negative"
-      : forecast.decision.action === "sell"
-        ? (algoScores.sell ?? 0) > Math.max(algoScores.buy ?? 0, algoScores.hold ?? 0) ? "positive" : "negative"
-        : "negative"
-    : "neutral";
-  marketForecastPanel.dataset.status = forecast.allowed ? "pass" : forecast.status === "insufficient_data" ? "info" : "blocked";
+  marketForecastPanel.dataset.status = forecast.status === "ready" ? "pass" : forecast.status === "insufficient_data" ? "info" : "blocked";
   marketForecastPanel.innerHTML = `
     <div class="market-forecast-head">
       <span>Future Market Forecast</span>
@@ -23164,16 +24038,14 @@ function renderMarketForecastPanel() {
     </div>
     ${renderMultiHorizonForecastStrip(forecast)}
     <div class="market-forecast-grid">
-      ${renderMarketForecastItem("P(buy success)", `${buyProbability} / need ${formatProbability(forecast.threshold)}`, forecast.decision.action === "buy" ? thresholdImpact(buyProbabilityValue, forecast.threshold) : "neutral")}
-      ${renderMarketForecastItem("P(sell success)", sellProbability, forecast.decision.action === "sell" ? thresholdImpact(sellProbabilityValue, forecast.threshold) : "neutral")}
-      ${renderMarketForecastItem("P(no trade)", timeoutProbability, thresholdImpact(forecast.probabilityTimeout, 0.35, false))}
-      ${renderMarketForecastItem("Edge gap", `${edgeGap} / need ${formatProbability(forecast.minimumEdgeGap)}`, thresholdImpact(forecast.decision.edgeGap, forecast.minimumEdgeGap))}
-      ${renderMarketForecastItem("Target / Stop", `${targetDistance} / ${stopDistance}`, targetStopImpact)}
-      ${renderMarketForecastItem("Expected Value", expectedValue, signedImpact(forecast.expectedValue))}
+      ${renderMarketForecastItem("P(up)", buyProbability, directionImpact)}
+      ${renderMarketForecastItem("P(down)", sellProbability, directionImpact)}
+      ${renderMarketForecastItem("P(flat/no edge)", timeoutProbability, directionImpact)}
+      ${renderMarketForecastItem("Direction", directionLabel, directionImpact)}
+      ${renderMarketForecastItem("Predicted move", predictedMove, directionImpact)}
+      ${renderMarketForecastItem("Directional gap", edgeGap, directionImpact)}
       ${renderMarketForecastItem("Uncertainty", uncertaintyLabel, thresholdImpact(modelDisagreement, maxDisagreement, false))}
-      ${renderMarketForecastItem("Regime", regimeLabel, regimeImpact)}
-      ${renderMarketForecastItem("Size", sizeLabel, sizeImpact)}
-      ${renderMarketForecastItem("Algo Scores", algoScoreLabel, algoScoresImpact)}
+      ${renderMarketForecastItem("Regime", regimeLabel, "neutral")}
       ${renderMarketForecastItem("Model", modelLabel, modelImpact)}
     </div>
     <div class="market-forecast-note">${escapeHtml(
@@ -23269,6 +24141,9 @@ void loadEsSnapshot();
 void loadVotingEnsembleInventory();
 void loadVotingEnsembleRuntimeControl();
 void loadWeightedVotingRuntimeControl();
+void loadMetaStrategyPaperControl();
+void loadMetaStrategyReadinessStatus();
+void loadMetaStrategyTradingSettings();
 void loadRegimeRuntimeStatus();
 void loadWcaRuntimeControl();
 void refreshVotingEnsemblePaperInventory();

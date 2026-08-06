@@ -101,7 +101,8 @@ def apply_decision_policy(
         final = fallback_signal(signal, hard_gates_passed=hard_gates_passed, candidate_eligible=candidate_eligible, behavior=config.fallbackBehavior)
         return _result(config, "FALLBACK", signal, final, "FALLBACK", final != "HOLD", False, False, hard_gates_passed, deterministic_risk, fallback_risk(deterministic_risk, behavior=config.fallbackBehavior, final_signal=final), reason_codes + ["meta_strategy.inference.fallback"], predicted_at, session_date, feature_missingness, model_health, candidate_conditional_output, success_probability, calibrated_probability, expected_value, ood_score)
 
-    operationally_ok = float(model_health.get("score", 0.0)) >= config.minModelHealthScore and feature_missingness <= config.maxFeatureMissingness and (ood_score or 0.0) <= config.maxOutOfDistributionScore
+    ood_value = float(ood_score) if ood_score is not None else 0.0
+    operationally_ok = float(model_health.get("score", 0.0)) >= config.minModelHealthScore and feature_missingness <= config.maxFeatureMissingness and ood_value <= config.maxOutOfDistributionScore
     candidate_ok = base_acceptance and (success_probability or 0.0) >= config.minSuccessProbability and (calibrated_probability or 0.0) >= config.minCalibratedProbability
     if not operationally_ok:
         if feature_missingness > config.maxFeatureMissingness:

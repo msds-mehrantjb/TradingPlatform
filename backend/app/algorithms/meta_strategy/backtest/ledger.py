@@ -81,7 +81,8 @@ def _trade_from_result(
     if order is None:
         raise ValueError("cannot create ledger trade without order intent")
     requested = int(order.quantity)
-    filled = max(0, int(result.broker_result.get("filledQuantity") or 0))
+    filled_value = result.broker_result.get("filledQuantity")
+    filled = max(0, int(filled_value) if filled_value is not None else 0)
     entry = float(result.geometry.entry_reference or result.snapshot.last_price)
     if order.side == "BUY":
         exit_price = float(result.geometry.geometry.target_price or entry)

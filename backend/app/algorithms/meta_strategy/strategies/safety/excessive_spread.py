@@ -17,7 +17,8 @@ class ExcessiveSpreadFilterStrategy(SafetySnapshotStrategy):
         snapshot = context_market_snapshot(value)
         if not all(required_status.values()):
             return missing_required_evidence(self.strategy_id, required_status)
-        observed_spread = float(spread_bps(snapshot) or 0.0)
+        spread_value = spread_bps(snapshot)
+        observed_spread = float(spread_value) if spread_value is not None else 0.0
         observed = {"spreadBasisPoints": observed_spread}
         threshold = {"maxSpreadBasisPoints": self.max_spread_bps}
         if observed_spread > self.max_spread_bps:

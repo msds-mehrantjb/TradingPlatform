@@ -301,7 +301,9 @@ def _base_feature_values(
     values["candidate_side"] = _signal_value(snapshot.ensembleDecision.signal)
     values["deterministic_score"] = snapshot.ensembleDecision.finalScore
     values["signal_margin"] = abs(snapshot.ensembleDecision.buyConfidence - snapshot.ensembleDecision.sellConfidence)
-    values["expected_transaction_cost"] = (float(spread or 0.0) + (2.0 * float(slippage or 0.0)))
+    values["expected_transaction_cost"] = (
+        float(spread) if spread is not None else 0.0
+    ) + (2.0 * (float(slippage) if slippage is not None else 0.0))
     values.update(_forecast_feature_values(snapshot, forecast_feature))
     return values
 

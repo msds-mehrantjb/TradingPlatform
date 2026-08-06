@@ -118,6 +118,20 @@ def service_with_runtime(runtime: dict) -> MetaStrategyApplicationService:
 
 
 def healthy_runtime() -> dict:
+    prerequisites = {
+        "durableDatabaseAvailable": True,
+        "activeSettingsPromotedForPaper": True,
+        "paperBrokerVerified": True,
+        "authoritativeMarketDataHealthy": True,
+        "marketClockHealthy": True,
+        "requiredWorkersHealthy": True,
+        "queueLagBelowThreshold": True,
+        "deadLetterWithinThreshold": True,
+        "restartReconstructionSucceeded": True,
+        "inventoryReconciliationCurrent": True,
+        "globalRiskSourceCurrent": True,
+        "requiredAcceptanceTestsPassed": True,
+    }
     return {
         "algorithmId": "meta_strategy",
         "ready": True,
@@ -125,6 +139,11 @@ def healthy_runtime() -> dict:
         "mode": "PAPER",
         "paperOrdersBlocked": False,
         "workers": {queue: "healthy" for queue in MARKET_TIME_QUEUES},
+        "marketWorkersHealthy": True,
+        "paperReadinessPrerequisites": prerequisites,
+        "queueLagSeconds": {queue: 0 for queue in MARKET_TIME_QUEUES},
+        "deadLetterCount": 0,
+        "restartState": {"status": "OK"},
         "reasonCodes": ("meta_strategy.runtime.ready",),
     }
 

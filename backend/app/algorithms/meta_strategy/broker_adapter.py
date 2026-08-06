@@ -122,7 +122,8 @@ class NoopMetaStrategyBrokerAdapter:
             if self.transport is not None:
                 response = self.transport.submit(order_intent, idempotency_key=key, mode=mode)
                 broker_order_id = str(response.get("brokerOrderId") or response.get("orderId") or f"meta_strategy.broker.{order_intent.order_intent_id}")
-                filled = max(0, int(response.get("filledQuantity") or 0))
+                filled_value = response.get("filledQuantity")
+                filled = max(0, int(filled_value) if filled_value is not None else 0)
             else:
                 broker_order_id = f"meta_strategy.paper.{order_intent.order_intent_id}"
                 filled = int(order_intent.quantity) if mode == "PAPER" else 0

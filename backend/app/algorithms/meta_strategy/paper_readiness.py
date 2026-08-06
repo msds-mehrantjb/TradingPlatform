@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +11,17 @@ from backend.app.algorithms.meta_strategy.identity import ALGORITHM_ID
 
 
 META_STRATEGY_PAPER_READINESS_ACCEPTANCE_VERSION = "meta_strategy_paper_readiness_acceptance_v1"
+META_STRATEGY_PAPER_ENTRY_READINESS_VERSION = "meta_strategy_paper_entry_readiness_v1"
+META_STRATEGY_MARKET_TIME_WORKERS: tuple[str, ...] = (
+    "finalised_bar_decisions",
+    "order_submission",
+    "order_reconciliation",
+    "stale_order_handling",
+    "inventory_reconciliation",
+    "position_management",
+)
+META_STRATEGY_MAX_ENTRY_QUEUE_LAG_SECONDS = 75
+META_STRATEGY_MAX_ENTRY_DEAD_LETTERS = 0
 
 
 @dataclass(frozen=True)
@@ -67,6 +79,158 @@ def meta_strategy_paper_readiness_is_complete(
     runtime: Mapping[str, Any] | None = None,
 ) -> bool:
     return bool(build_meta_strategy_paper_readiness_acceptance_report(snapshot, runtime)["paperReady"])
+
+
+def build_meta_strategy_paper_entry_readiness_prerequisites(
+    snapshot: Mapping[str, Any],
+    runtime: Mapping[str, Any] | None = None,
+    paper_readiness: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime_data = dict(runtime or {})
+    runtime_prerequisites = dict(runtime_data.get("paperReadinessPrerequisites") or {})
+    metrics = dict(snapshot.get("metrics") or {})
+    settings = dict(snapshot.get("settings") or {})
+    paper_execution = dict(settings.get("paperExecution") or {})
+    queue_health = dict(snapshot.get("queueHealth") or {})
+    queues = dict(queue_health.get("queues") or {})
+    controls = dict(snapshot.get("controls") or {})
+    algorithm_readiness = dict(snapshot.get("algorithmReadiness") or {})
+    inventory = dict(snapshot.get("inventory") or {})
+    consistency = dict(inventory.get("consistency") or {})
+    broker = dict(metrics.get("paperBrokerConnectivity") or {})
+    queue_lag_seconds = _queue_lag_seconds(runtime_data, queues)
+    dead_letter_count = _dead_letter_count(runtime_data, queues, metrics)
+    workers = dict(runtime_data.get("workers") or {})
+    required_workers_healthy = _runtime_bool(runtime_prerequisites, runtime_data, "requiredWorkersHealthy", "marketWorkersHealthy")
+    if required_workers_healthy is None and workers:
+        required_workers_healthy = all(workers.get(queue) == "healthy" for queue in META_STRATEGY_MARKET_TIME_WORKERS)
+    if required_workers_healthy is None:
+        required_workers_healthy = False
+    inventory_reconciled = _runtime_bool(runtime_prerequisites, runtime_data, "inventoryReconciliationCurrent")
+    if inventory_reconciled is None:
+        inventory_reconciled = bool(
+            consistency.get("consistent") is True
+            or (
+                consistency.get("derivedSnapshotId") is not None
+                and consistency.get("derivedSnapshotId") == consistency.get("storedSnapshotId")
+            )
+        )
+    restart_state = dict(runtime_data.get("restartState") or {})
+    restart_reconstructed = _runtime_bool(runtime_prerequisites, runtime_data, "restartReconstructionSucceeded")
+    if restart_reconstructed is None:
+        restart_reconstructed = restart_state.get("status") == "OK"
+    required_acceptance_passed = _runtime_bool(runtime_prerequisites, runtime_data, "requiredAcceptanceTestsPassed")
+    if required_acceptance_passed is None and paper_readiness is not None:
+        required_acceptance_passed = paper_readiness.get("paperReady") is True and not tuple(paper_readiness.get("blockingCriteria") or ())
+    prerequisites = {
+        "version": META_STRATEGY_PAPER_ENTRY_READINESS_VERSION,
+        "durableDatabaseAvailable": _runtime_bool(runtime_prerequisites, runtime_data, "durableDatabaseAvailable") is not False,
+        "activeSettingsPromotedForPaper": _runtime_bool(runtime_prerequisites, runtime_data, "activeSettingsPromotedForPaper")
+        if _runtime_bool(runtime_prerequisites, runtime_data, "activeSettingsPromotedForPaper") is not None
+        else (
+            paper_execution.get("enabled") is True
+            and str(paper_execution.get("executionMode") or paper_execution.get("execution_mode") or "").upper() == "PAPER"
+        ),
+        "paperBrokerVerified": _runtime_bool(runtime_prerequisites, runtime_data, "paperBrokerVerified")
+        if _runtime_bool(runtime_prerequisites, runtime_data, "paperBrokerVerified") is not None
+        else broker.get("verified") is True or str(broker.get("status") or "").upper() in {"OK", "CONNECTED", "VERIFIED"},
+        "authoritativeMarketDataHealthy": _runtime_bool(runtime_prerequisites, runtime_data, "authoritativeMarketDataHealthy", "marketDataHealthy") is True,
+        "marketClockHealthy": _runtime_bool(runtime_prerequisites, runtime_data, "marketClockHealthy") is True,
+        "requiredWorkersHealthy": bool(required_workers_healthy),
+        "queueLagBelowThreshold": bool(queue_lag_seconds is not None and queue_lag_seconds <= _entry_queue_lag_limit_seconds()),
+        "deadLetterWithinThreshold": bool(dead_letter_count is not None and dead_letter_count <= _entry_dead_letter_limit()),
+        "restartReconstructionSucceeded": bool(restart_reconstructed),
+        "inventoryReconciliationCurrent": bool(inventory_reconciled),
+        "globalRiskSourceCurrent": _runtime_bool(runtime_prerequisites, runtime_data, "globalRiskSourceCurrent") is True,
+        "requiredAcceptanceTestsPassed": bool(required_acceptance_passed),
+        "queueLagSeconds": queue_lag_seconds,
+        "deadLetterCount": dead_letter_count,
+        "workers": workers,
+        "restartState": restart_state,
+        "evidence": {
+            "runtimePrerequisites": runtime_prerequisites,
+            "algorithmReadiness": algorithm_readiness,
+            "inventoryConsistency": consistency,
+            "paperBrokerConnectivity": broker,
+            "queueHealth": queue_health,
+        },
+    }
+    blocking = [
+        key
+        for key, value in prerequisites.items()
+        if key
+        in {
+            "durableDatabaseAvailable",
+            "activeSettingsPromotedForPaper",
+            "paperBrokerVerified",
+            "authoritativeMarketDataHealthy",
+            "marketClockHealthy",
+            "requiredWorkersHealthy",
+            "queueLagBelowThreshold",
+            "deadLetterWithinThreshold",
+            "restartReconstructionSucceeded",
+            "inventoryReconciliationCurrent",
+            "globalRiskSourceCurrent",
+            "requiredAcceptanceTestsPassed",
+        }
+        and value is not True
+    ]
+    prerequisites["ready"] = not blocking
+    prerequisites["blockingPrerequisites"] = tuple(blocking)
+    return prerequisites
+
+
+def _runtime_bool(prerequisites: Mapping[str, Any], runtime: Mapping[str, Any], *keys: str) -> bool | None:
+    for key in keys:
+        if prerequisites.get(key) is not None:
+            return prerequisites.get(key) is True
+        if runtime.get(key) is not None:
+            return runtime.get(key) is True
+    return None
+
+
+def _entry_queue_lag_limit_seconds() -> int:
+    return _env_non_negative_int("META_STRATEGY_QUEUE_LAG_THRESHOLD_SECONDS", META_STRATEGY_MAX_ENTRY_QUEUE_LAG_SECONDS)
+
+
+def _entry_dead_letter_limit() -> int:
+    return _env_non_negative_int("META_STRATEGY_DEAD_LETTER_THRESHOLD", META_STRATEGY_MAX_ENTRY_DEAD_LETTERS)
+
+
+def _env_non_negative_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(0, value)
+
+
+def _queue_lag_seconds(runtime: Mapping[str, Any], queues: Mapping[str, Any]) -> int | None:
+    lag = runtime.get("queueLagSeconds")
+    if isinstance(lag, Mapping) and lag:
+        return max(int(value or 0) for value in lag.values())
+    if isinstance(lag, (int, float)):
+        return int(lag)
+    values = []
+    for data in queues.values():
+        if isinstance(data, Mapping) and data.get("lagSeconds") is not None:
+            values.append(int(data.get("lagSeconds") or 0))
+    return max(values) if values else None
+
+
+def _dead_letter_count(runtime: Mapping[str, Any], queues: Mapping[str, Any], metrics: Mapping[str, Any]) -> int | None:
+    if runtime.get("deadLetterCount") is not None:
+        return int(runtime.get("deadLetterCount") or 0)
+    if metrics.get("jobDeadLetterCount") is not None:
+        return int(metrics.get("jobDeadLetterCount") or 0)
+    values = []
+    for data in queues.values():
+        if isinstance(data, Mapping) and data.get("deadLetter") is not None:
+            values.append(int(data.get("deadLetter") or 0))
+    return sum(values) if values else None
 
 
 def _worker_healthy(queue_name: str) -> Callable[[Mapping[str, Any], Mapping[str, Any] | None], tuple[bool, Any]]:
@@ -164,9 +328,12 @@ META_STRATEGY_PAPER_READINESS_TEST_IDS: tuple[str, ...] = tuple(
 
 __all__ = [
     "META_STRATEGY_PAPER_READINESS_ACCEPTANCE_VERSION",
+    "META_STRATEGY_PAPER_ENTRY_READINESS_VERSION",
     "META_STRATEGY_PAPER_READINESS_CRITERIA",
     "META_STRATEGY_PAPER_READINESS_TEST_IDS",
+    "META_STRATEGY_MARKET_TIME_WORKERS",
     "MetaStrategyPaperReadinessCriterion",
+    "build_meta_strategy_paper_entry_readiness_prerequisites",
     "build_meta_strategy_paper_readiness_acceptance_report",
     "meta_strategy_paper_readiness_is_complete",
 ]

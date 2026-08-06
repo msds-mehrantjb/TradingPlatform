@@ -20,6 +20,7 @@ from backend.app.algorithms.meta_strategy.market_snapshot import (
     MetaStrategySnapshotCandle,
     MetaStrategySnapshotQuote,
 )
+from backend.app.algorithms.meta_strategy.market_clock import read_market_clock_snapshot
 from backend.app.algorithms.meta_strategy.models import load_runtime_model_artifact_data
 from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 from backend.app.algorithms.meta_strategy.repository import MetaStrategySqliteRepository
@@ -67,6 +68,7 @@ MANDATORY_CONTEXT_FIELDS: tuple[str, ...] = (
     "accountSnapshot",
     "globalRiskSnapshot",
     "marketCalendar",
+    "runtimeHealth",
 )
 TERMINAL_ORDER_STATUSES = frozenset({"FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "DONE_FOR_DAY"})
 
@@ -90,6 +92,7 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
         account_source: MetaStrategyReadOnlyAccountSource | Any | None = None,
         global_risk_source: MetaStrategyReadOnlyGlobalRiskSource | Any | None = None,
         operational_health_source: MetaStrategyReadOnlyOperationalHealthSource | Any | None = None,
+        market_clock_source: Any | None = None,
         economic_event_source: MetaStrategyReadOnlyEconomicEventSource | Any | None = None,
         app_settings: Any | None = None,
         feed: str = "iex",
@@ -106,6 +109,7 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
         self.account_source = account_source
         self.global_risk_source = global_risk_source
         self.operational_health_source = operational_health_source
+        self.market_clock_source = market_clock_source
         self.economic_event_source = economic_event_source
         self.feed = feed
         self.history_limit = max(minimum_warmup, int(history_limit))
@@ -121,6 +125,7 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
         reason_codes: list[str] = ["meta_strategy.state_provider.point_in_time_context_built"]
 
         settings, settings_reasons = self._settings(event.settings_version)
+        active_settings_version = self._active_settings_version()
         reason_codes.extend(settings_reasons)
 
         one_minute = self._candles(event.symbol, "1Min", end=bar_end, limit=self.history_limit)
@@ -156,16 +161,28 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
         global_risk = self._global_risk_snapshot(bar_end, capital_partition_id=capital_partition_id)
         market_calendar = self._market_calendar_snapshot(bar_end)
         operational = self._operational_health(bar_end)
+        runtime_health = self._runtime_health(bar_end)
+        operational_controls = self._operational_controls(bar_end)
+        paper_control = self._paper_control(capital_partition_id=capital_partition_id)
         economic = self._economic_event_state(event.symbol, bar_end)
         artifact, artifact_state = self._active_or_shadow_model_artifact(bar_end)
 
         missing["accountSnapshot"] = not bool(account.get("authoritativeReadOnly"))
         missing["globalRiskSnapshot"] = not bool(global_risk.get("authoritativeReadOnly"))
-        missing["marketCalendar"] = not bool(market_calendar.get("isOpen")) and market_calendar.get("source") == "local_static_calendar"
+        missing["marketCalendar"] = market_calendar.get("authoritativeReadOnly") is not True
+        missing["runtimeHealth"] = runtime_health.get("authoritativeReadOnly") is not True or runtime_health.get("ready") is not True
         reason_codes.extend(account["reasonCodes"])
         reason_codes.extend(global_risk["reasonCodes"])
         reason_codes.extend(operational["reasonCodes"])
+        reason_codes.extend(runtime_health["reasonCodes"])
+        reason_codes.extend(operational_controls["reasonCodes"])
+        reason_codes.extend(paper_control["reasonCodes"])
         reason_codes.extend(artifact_state["reasonCodes"])
+        paper_control_blocks_entry = (
+            event.mode.upper() == "PAPER"
+            and paper_control.get("newPaperEntriesEnabled") is not True
+        )
+        wrong_partition = capital_partition_id != META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 
         blocked_reasons = tuple(
             reason
@@ -176,10 +193,38 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
                 ("latestQuote", "meta_strategy.state_provider.latest_quote_missing"),
                 ("accountSnapshot", "meta_strategy.state_provider.account_snapshot_missing"),
                 ("globalRiskSnapshot", "meta_strategy.state_provider.global_risk_snapshot_missing"),
+                ("marketCalendar", "meta_strategy.state_provider.authoritative_market_clock_missing"),
+                ("runtimeHealth", "meta_strategy.state_provider.runtime_health_missing_or_not_ready"),
             )
             if missing.get(field)
         )
+        if wrong_partition:
+            blocked_reasons = (*blocked_reasons, "meta_strategy.state_provider.wrong_capital_partition")
         data_blocked = bool(blocked_reasons)
+        source_timestamps = _source_timestamps(
+            settings=settings,
+            inventory=inventory,
+            account=account,
+            global_risk=global_risk,
+            quote=quote,
+            market_calendar=market_calendar,
+            operational=operational,
+            runtime_health=runtime_health,
+            paper_control=paper_control,
+            economic=economic,
+            artifact=artifact,
+            bar_end=bar_end,
+        )
+        source_versions = _source_versions(
+            settings=settings,
+            event_settings_version=event.settings_version,
+            artifact=artifact,
+            snapshot_request_versions={
+                "strategyCatalogVersion": META_STRATEGY_STRATEGY_CATALOG_VERSION,
+                "featureSchemaVersion": META_STRATEGY_FEATURE_SCHEMA_VERSION,
+                "activeSettingsVersion": active_settings_version,
+            },
+        )
         event_state = {
             **economic,
             "algorithmId": ALGORITHM_ID,
@@ -196,15 +241,47 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
             "dataQualityState": "BLOCKED" if data_blocked else "OK",
             "missingMandatoryInputs": tuple(field for field, is_missing in missing.items() if is_missing),
             "optionalFeatureMissingness": self._optional_feature_missingness(qqq=qqq, iwm=iwm, breadth=breadth, prior_close=prior_close, artifact=artifact),
-            "reasonCodes": tuple(dict.fromkeys((*reason_codes, *blocked_reasons))),
+            "sourceTimestamps": source_timestamps,
+            "sourceVersions": source_versions,
+            "reasonCodes": tuple(
+                dict.fromkeys(
+                    (
+                        *reason_codes,
+                        *blocked_reasons,
+                        *(("meta_strategy.paper_control.new_entry_blocked_at_decision",) if paper_control_blocks_entry else ()),
+                    )
+                )
+            ),
         }
         operational_health = {
             **operational,
             "status": "BLOCKED" if data_blocked else operational.get("status", "OK"),
-            "tradingAllowed": bool(operational.get("tradingAllowed", True)) and not data_blocked,
+            "tradingAllowed": (
+                bool(operational.get("tradingAllowed", True))
+                and runtime_health.get("ready") is True
+                and not _any_new_entry_control_active(operational_controls)
+                and not data_blocked
+                and not paper_control_blocks_entry
+            ),
             "marketCalendar": market_calendar,
+            "paperControl": paper_control,
+            "runtimeHealth": runtime_health,
+            "operationalControls": operational_controls,
             "dataQualityState": event_state["dataQualityState"],
             "missingMandatoryInputs": event_state["missingMandatoryInputs"],
+            "sourceTimestamps": source_timestamps,
+            "sourceVersions": source_versions,
+            "reasonCodes": tuple(
+                dict.fromkeys(
+                    (
+                        *tuple(operational.get("reasonCodes") or ()),
+                        *tuple(runtime_health.get("reasonCodes") or ()),
+                        *tuple(operational_controls.get("reasonCodes") or ()),
+                        *paper_control["reasonCodes"],
+                        *(("meta_strategy.paper_control.new_entry_blocked_at_decision",) if paper_control_blocks_entry else ()),
+                    )
+                )
+            ),
         }
         global_risk = {
             **global_risk,
@@ -254,6 +331,50 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
                 ml_inference={"mode": "DISABLED", "fallback_behavior": "NO_TRADE"},
             )
             return disabled, ("meta_strategy.state_provider.settings_version_missing",)
+
+    def _active_settings_version(self) -> str | None:
+        try:
+            return self.settings_store.get_active_settings().settings_version
+        except Exception:
+            return None
+
+    def _paper_control(self, *, capital_partition_id: str) -> dict[str, Any]:
+        if self.job_repository is None:
+            return {
+                "algorithmId": ALGORITHM_ID,
+                "capitalPartitionId": capital_partition_id,
+                "newPaperEntriesEnabled": False,
+                "automaticPaperTradingEnabled": False,
+                "paperEntriesAllowed": False,
+                "paperOnly": True,
+                "liveExecutionEnabled": False,
+                "available": False,
+                "reasonCodes": (
+                    "meta_strategy.paper_control.state_unavailable",
+                    "meta_strategy.paper_control.new_entry_blocked_at_decision",
+                ),
+            }
+        try:
+            record = self.job_repository.read_paper_trading_control(capital_partition_id=capital_partition_id)
+        except Exception:
+            record = None
+        if record is None:
+            return {
+                "algorithmId": ALGORITHM_ID,
+                "capitalPartitionId": capital_partition_id,
+                "newPaperEntriesEnabled": False,
+                "automaticPaperTradingEnabled": False,
+                "paperEntriesAllowed": False,
+                "paperOnly": True,
+                "liveExecutionEnabled": False,
+                "available": False,
+                "reasonCodes": (
+                    "meta_strategy.paper_control.state_unavailable",
+                    "meta_strategy.paper_control.new_entry_blocked_at_decision",
+                ),
+            }
+        payload = record.to_dict()
+        return {**payload, "available": True, "reasonCodes": tuple(payload.get("reasonCodes") or ())}
 
     def _candles(self, symbol: str, timeframe: str, *, end: datetime, limit: int) -> tuple[MetaStrategySnapshotCandle, ...]:
         query_end = end.isoformat().replace("+00:00", "Z")
@@ -354,10 +475,7 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
         }
         open_lots, realised = _lots_and_realised(rows_by_type["fills"])
         positions = _positions_from_lots(open_lots, mark_prices={symbol.upper(): mark_price} if mark_price is not None else {})
-        reserved = round(
-            sum(float((row.get("payload") or {}).get("reservedRiskDelta") or (row.get("payload") or {}).get("reservedRiskDollars") or 0.0) for row in rows_by_type["risk_reservations"]),
-            10,
-        )
+        reserved = round(sum(_reserved_risk_delta(row) for row in rows_by_type["risk_reservations"]), 10)
         allocated = _latest_float(rows_by_type["allocated_capital"], "allocatedCapital", "allocated_capital")
         daily_trade_count = sum(
             1
@@ -367,6 +485,7 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
         pending_intents = tuple(row for row in rows_by_type["order_intents"] if str(row.get("status") or "").upper() not in TERMINAL_ORDER_STATUSES)
         open_orders = tuple(row for row in rows_by_type["orders"] if str(row.get("status") or "").upper() not in TERMINAL_ORDER_STATUSES)
         latest_checkpoint = rows_by_type["reconciliation_checkpoints"][-1] if rows_by_type["reconciliation_checkpoints"] else None
+        last_trade_at = _last_trade_timestamp(rows_by_type["fills"])
         return {
             "algorithmId": ALGORITHM_ID,
             "capitalPartitionId": capital_partition_id,
@@ -379,15 +498,19 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
             "positionLots": open_lots,
             "pendingOrderIntents": pending_intents,
             "submittedAndOpenOrders": open_orders,
+            "openOrders": open_orders,
             "fills": tuple(rows_by_type["fills"]),
+            "reservedRiskLedger": tuple(rows_by_type["risk_reservations"]),
             "reservedRiskDollars": reserved,
-            "remainingRiskDollars": max(0.0, 1_000.0 - reserved),
+            "remainingRiskDollars": None,
+            "remainingRiskSource": "meta_strategy_inventory_risk_ledger_unavailable",
             "allocatedCapital": allocated,
             "realizedPnl": round(realised, 10),
             "realisedPnl": round(realised, 10),
             "unrealizedPnl": round(sum(float(row["unrealisedPnl"]) for row in positions), 10),
             "dailyTradeCount": daily_trade_count,
             "daily_trade_count": daily_trade_count,
+            "lastTradeAt": last_trade_at,
             "strategyExposure": {"meta_strategy": round(sum(abs(float(row["quantity"]) * float(row["marketPrice"])) for row in positions), 10)},
             "symbolExposure": {row["symbol"]: round(abs(float(row["quantity"]) * float(row["marketPrice"])), 10) for row in positions},
             "lastSignalAndCooldownState": self._last_signal_state(bar_end, capital_partition_id),
@@ -459,21 +582,47 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
             "source": str(payload.get("source") or "read_only_global_risk"),
             "authoritativeReadOnly": True,
             "capturedAt": captured_at.isoformat(),
-            "availableRiskDollars": _float_or_none(_first(payload, "availableRiskDollars", "available_risk_dollars")) or 0.0,
-            "maxQuantity": int(_first(payload, "maxQuantity", "max_quantity", "globalQuantityCap", "global_quantity_cap") or 0),
+            "availableRiskDollars": (
+                _float_or_none(_first(payload, "availableRiskDollars", "available_risk_dollars"))
+                if _float_or_none(_first(payload, "availableRiskDollars", "available_risk_dollars")) is not None
+                else 0.0
+            ),
+            "maxQuantity": (
+                int(_first(payload, "maxQuantity", "max_quantity", "globalQuantityCap", "global_quantity_cap"))
+                if _first(payload, "maxQuantity", "max_quantity", "globalQuantityCap", "global_quantity_cap") is not None
+                else 0
+            ),
             "reject": bool(payload.get("reject") or payload.get("rejected") or payload.get("tradingHalt") or payload.get("trading_halt")),
             "tradingHalt": bool(payload.get("tradingHalt") or payload.get("trading_halt")),
             "reasonCodes": tuple(payload.get("reasonCodes") or payload.get("reason_codes") or ("meta_strategy.state_provider.global_risk_snapshot_loaded",)),
         }
 
     def _market_calendar_snapshot(self, at: datetime) -> dict[str, Any]:
+        try:
+            normalized = read_market_clock_snapshot(self.market_clock_source or self.operational_health_source, evaluated_at=at)
+        except Exception:
+            normalized = None
+        if normalized is None:
+            return {
+                "source": "authoritative_market_clock_unavailable",
+                "capturedAt": at.isoformat(),
+                "dataSourceTimestamp": at.isoformat(),
+                "sessionPhase": "UNKNOWN",
+                "isOpen": False,
+                "authoritativeReadOnly": False,
+                "fresh": False,
+                "canAuthorizeNewEntries": False,
+                "reasonCodes": ("meta_strategy.state_provider.authoritative_market_clock_missing",),
+            }
         session = meta_strategy_session_at(at)
+        payload = normalized.as_dict()
+        reasons = tuple(payload.get("reasonCodes") or ())
+        if payload.get("authoritativeReadOnly") is not True or payload.get("fresh") is not True:
+            reasons = (*reasons, "meta_strategy.state_provider.market_clock_not_authorizing")
         return {
-            "source": "local_static_calendar",
-            "capturedAt": at.isoformat(),
+            **payload,
             "sessionPhase": session.value,
-            "isOpen": session.value in {"OPENING", "MORNING", "MIDDAY", "AFTERNOON", "CLOSING"},
-            "reasonCodes": ("meta_strategy.state_provider.market_calendar_loaded",),
+            "reasonCodes": tuple(dict.fromkeys((*reasons, "meta_strategy.state_provider.authoritative_market_clock_loaded" if payload.get("authoritativeReadOnly") is True else "meta_strategy.state_provider.authoritative_market_clock_degraded"))),
         }
 
     def _operational_health(self, at: datetime) -> dict[str, Any]:
@@ -499,6 +648,62 @@ class MetaStrategyAuthoritativeDecisionStateProvider:
             "capturedAt": min(captured_at, at).isoformat(),
             "reasonCodes": ("meta_strategy.state_provider.operational_health_loaded",) if captured_at <= at else ("meta_strategy.state_provider.operational_health_after_bar_end",),
         }
+
+    def _runtime_health(self, at: datetime) -> dict[str, Any]:
+        payload = _gateway_snapshot_at(self.job_repository, "meta_strategy.runtime.readiness", at)
+        if payload is None:
+            return {
+                "source": "meta_strategy_runtime_readiness_unavailable",
+                "authoritativeReadOnly": False,
+                "enabled": False,
+                "ready": False,
+                "mode": "PAPER",
+                "paperOrdersBlocked": True,
+                "capturedAt": at.isoformat(),
+                "reasonCodes": ("meta_strategy.state_provider.runtime_health_missing_or_not_ready",),
+            }
+        captured_at = _payload_time(payload, at)
+        ready = payload.get("ready") is True and str(payload.get("mode") or "").upper() == "PAPER" and payload.get("paperOrdersBlocked") is not True
+        return {
+            **dict(payload),
+            "source": str(payload.get("source") or "meta_strategy.runtime.readiness"),
+            "authoritativeReadOnly": captured_at <= at,
+            "ready": ready and captured_at <= at,
+            "capturedAt": min(captured_at, at).isoformat(),
+            "reasonCodes": (
+                "meta_strategy.state_provider.runtime_health_loaded"
+                if ready and captured_at <= at
+                else "meta_strategy.state_provider.runtime_health_missing_or_not_ready"
+            ),
+        }
+
+    def _operational_controls(self, at: datetime) -> dict[str, Any]:
+        controls: dict[str, Any] = {}
+        reasons: list[str] = []
+        for name in ("PAUSE_NEW_ENTRIES", "EXIT_ONLY", "STOP_META_RUNTIME"):
+            key = f"meta_strategy.controls.{name}"
+            payload = _gateway_snapshot_at(self.job_repository, key, at)
+            if payload is None:
+                controls[name] = {"available": False, "active": False, "capturedAt": at.isoformat()}
+                reasons.append(f"meta_strategy.state_provider.control_{name.lower()}_unavailable")
+                continue
+            state = payload.get("state") if isinstance(payload.get("state"), Mapping) else payload
+            state_dict = dict(state) if isinstance(state, Mapping) else {}
+            captured_at = _payload_time(payload, at)
+            active = captured_at <= at and (
+                state_dict.get("newEntriesPaused") is True
+                or state_dict.get("exitOnly") is True
+                or state_dict.get("runtimeStopRequested") is True
+                or state_dict.get("paperOrdersBlocked") is True
+            )
+            controls[name] = {
+                **state_dict,
+                "available": captured_at <= at,
+                "active": active,
+                "capturedAt": min(captured_at, at).isoformat(),
+            }
+            reasons.append(f"meta_strategy.state_provider.control_{name.lower()}_loaded" if captured_at <= at else f"meta_strategy.state_provider.control_{name.lower()}_after_bar_end")
+        return {"source": "meta_strategy.operational_controls", "controls": controls, "reasonCodes": tuple(reasons)}
 
     def _economic_event_state(self, symbol: str, at: datetime) -> dict[str, Any]:
         payload = _call_economic(self.economic_event_source, symbol=symbol.upper(), at=at)
@@ -613,13 +818,36 @@ def _inventory_records_at(
     return tuple(sorted(eligible, key=lambda row: (str(row["timestamp"]), str(row["recordId"]))))
 
 
+def _reserved_risk_delta(row: Mapping[str, Any]) -> float:
+    payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+    value = payload.get("reservedRiskDelta")
+    if value is None:
+        value = payload.get("reserved_risk_delta")
+    if value is None:
+        value = payload.get("reservedRiskDollars")
+    if value is None:
+        value = payload.get("reserved_risk_dollars")
+    return float(value) if value is not None else 0.0
+
+
+def _last_trade_timestamp(fills: tuple[dict[str, Any], ...]) -> str | None:
+    timestamps = [
+        _parse_timestamp(str(fill["timestamp"]))
+        for fill in fills
+        if fill.get("timestamp") is not None
+    ]
+    return max(timestamps).isoformat() if timestamps else None
+
+
 def _lots_and_realised(fills: tuple[dict[str, Any], ...]) -> tuple[tuple[dict[str, Any], ...], float]:
     lots: list[dict[str, Any]] = []
     realised = 0.0
     for fill in fills:
         side = str(fill.get("side") or "").upper()
-        qty = abs(float(fill.get("quantity") or 0.0))
-        price = float(fill.get("price") or 0.0)
+        quantity_value = fill.get("quantity")
+        price_value = fill.get("price")
+        qty = abs(float(quantity_value) if quantity_value is not None else 0.0)
+        price = float(price_value) if price_value is not None else 0.0
         if qty <= 0.0:
             continue
         if side == "BUY":
@@ -759,6 +987,21 @@ def _call_global_risk(source: Any | None, *, at: datetime, capital_partition_id:
     return dict(result) if isinstance(result, Mapping) else None
 
 
+def _call_market_clock(source: Any | None, *, at: datetime) -> Mapping[str, Any] | None:
+    if source is None:
+        return None
+    for method_name in ("read_market_clock", "get_market_clock", "get_clock", "market_clock"):
+        method = getattr(source, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            result = method(at=at)
+        except TypeError:
+            result = method()
+        return dict(result) if isinstance(result, Mapping) else None
+    return None
+
+
 def _call_economic(source: Any | None, *, symbol: str, at: datetime) -> Mapping[str, Any] | None:
     if source is None or not hasattr(source, "read_economic_event_state"):
         return None
@@ -769,6 +1012,18 @@ def _call_economic(source: Any | None, *, symbol: str, at: datetime) -> Mapping[
 def _payload_time(payload: Mapping[str, Any], default: datetime) -> datetime:
     value = _first(payload, "capturedAt", "captured_at", "timestamp", "asOf", "as_of")
     return _parse_timestamp(str(value)) if value else default
+
+
+def _clock_is_open(payload: Mapping[str, Any]) -> bool | None:
+    for key in ("isOpen", "is_open", "marketOpen", "market_open"):
+        if key in payload:
+            return bool(payload[key])
+    status = str(payload.get("status") or payload.get("state") or "").lower()
+    if status in {"open", "regular", "regular_session"}:
+        return True
+    if status in {"closed", "pre_market", "post_market", "halted"}:
+        return False
+    return None
 
 
 def _quote_timestamp(payload: Mapping[str, Any]) -> datetime:
@@ -789,6 +1044,89 @@ def _float_or_none(value: Any) -> float | None:
     if value is None or value == "":
         return None
     return float(value)
+
+
+def _gateway_snapshot_at(repository: Any | None, key: str, at: datetime) -> dict[str, Any] | None:
+    if repository is None or not hasattr(repository, "read_gateway_snapshot"):
+        return None
+    try:
+        payload = repository.read_gateway_snapshot(key)
+    except Exception:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    captured_at = _payload_time(payload, at)
+    if captured_at > at:
+        return {**dict(payload), "capturedAt": captured_at.isoformat(), "metaStrategyRejectedFutureSnapshot": True}
+    return dict(payload)
+
+
+def _source_timestamps(
+    *,
+    settings: MetaStrategySettings,
+    inventory: Mapping[str, Any],
+    account: Mapping[str, Any],
+    global_risk: Mapping[str, Any],
+    quote: MetaStrategySnapshotQuote | None,
+    market_calendar: Mapping[str, Any],
+    operational: Mapping[str, Any],
+    runtime_health: Mapping[str, Any],
+    paper_control: Mapping[str, Any],
+    economic: Mapping[str, Any],
+    artifact: Mapping[str, Any] | None,
+    bar_end: datetime,
+) -> dict[str, Any]:
+    return {
+        "decisionCutoff": bar_end.isoformat(),
+        "settingsCreatedAt": _timestamp_string(getattr(settings, "created_at", None)),
+        "inventoryPointInTimeCutoff": inventory.get("pointInTimeCutoff"),
+        "lastTradeAt": inventory.get("lastTradeAt"),
+        "accountCapturedAt": account.get("capturedAt"),
+        "globalRiskCapturedAt": global_risk.get("capturedAt"),
+        "quoteTimestamp": quote.timestamp.isoformat() if quote is not None else None,
+        "marketClockCapturedAt": market_calendar.get("capturedAt"),
+        "operationalHealthCapturedAt": operational.get("capturedAt"),
+        "runtimeHealthCapturedAt": runtime_health.get("capturedAt"),
+        "paperControlUpdatedAt": paper_control.get("updatedAt"),
+        "economicEventCapturedAt": economic.get("capturedAt"),
+        "modelArtifactCreatedAt": (artifact or {}).get("createdAt") or (artifact or {}).get("created_at"),
+    }
+
+
+def _source_versions(
+    *,
+    settings: MetaStrategySettings,
+    event_settings_version: str,
+    artifact: Mapping[str, Any] | None,
+    snapshot_request_versions: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "eventSettingsVersion": event_settings_version,
+        "loadedSettingsVersion": settings.settings_version,
+        "activeSettingsVersion": snapshot_request_versions.get("activeSettingsVersion"),
+        "effectiveSettingsHash": settings.effective_settings_hash,
+        "configurationVersion": settings.configuration_version,
+        "strategyCatalogVersion": snapshot_request_versions.get("strategyCatalogVersion"),
+        "featureSchemaVersion": snapshot_request_versions.get("featureSchemaVersion"),
+        "modelArtifactId": (artifact or {}).get("modelArtifactId") or (artifact or {}).get("artifactId"),
+        "modelVersion": (artifact or {}).get("modelVersion") or (artifact or {}).get("model_version"),
+    }
+
+
+def _timestamp_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _any_new_entry_control_active(operational_controls: Mapping[str, Any]) -> bool:
+    controls = operational_controls.get("controls") if isinstance(operational_controls.get("controls"), Mapping) else {}
+    return any(
+        isinstance(state, Mapping) and state.get("active") is True
+        for state in controls.values()
+    )
 
 
 def _capital_partition_id(event: MetaStrategyFinalisedBarDecisionEvent) -> str:

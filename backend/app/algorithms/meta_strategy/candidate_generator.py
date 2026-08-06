@@ -67,32 +67,37 @@ class GeneratedDeterministicCandidate:
     deterministic_candidate: DeterministicCandidate
 
 
+@dataclass(frozen=True)
+class CandidateComponentEvaluation:
+    active_settings: MetaStrategySettings
+    generation_config: CandidateGenerationConfig
+    directional_outputs: tuple[SnapshotEvaluationResult, ...]
+    context_outputs: tuple[SnapshotEvaluationResult, ...]
+    active_context_outputs: tuple[SnapshotEvaluationResult, ...]
+    regime_outputs: tuple[SnapshotEvaluationResult, ...]
+    safety_outputs: tuple[SnapshotEvaluationResult, ...]
+    safety_blockers: tuple[SnapshotEvaluationResult, ...]
+    aggregation: FamilyAggregationResult
+    safety_blocks: bool
+
+
 def generate_deterministic_candidate(
     snapshot: MetaStrategyMarketSnapshot,
     *,
     config: CandidateGenerationConfig | None = None,
     settings: MetaStrategySettings | None = None,
+    components: CandidateComponentEvaluation | None = None,
 ) -> GeneratedDeterministicCandidate:
-    active_settings = settings or build_meta_strategy_settings(
-        settings_version=snapshot.settings_version,
-        status="ACTIVE",
-    )
-    generation_config = config or _candidate_generation_config(active_settings)
-    directional_outputs = evaluate_registry_group(snapshot, DIRECTIONAL_STRATEGIES, settings=active_settings)
-    context_outputs = evaluate_registry_group(snapshot, CONTEXT_STRATEGIES, settings=active_settings)
-    active_context_outputs = tuple(
-        output
-        for output, entry in zip(context_outputs, CONTEXT_STRATEGIES, strict=True)
-        if entry.enabled
-    )
-    regime_outputs = evaluate_registry_group(snapshot, REGIME_STRATEGIES, settings=active_settings)
-    safety_outputs = evaluate_registry_group(snapshot, SAFETY_STRATEGIES, settings=active_settings)
-    safety_blockers = tuple(output for output in safety_outputs if bool((output.evidence or {}).get("blocksNewEntries")))
-    aggregation = aggregate_family_scores(
-        _directional_contributions(directional_outputs, DIRECTIONAL_STRATEGIES, active_context_outputs, regime_outputs),
-        config=generation_config.aggregation,
-    )
-    safety_blocks = generation_config.block_new_entries_on_safety_failure and bool(safety_blockers)
+    components = components or evaluate_candidate_components(snapshot, config=config, settings=settings)
+    active_settings = components.active_settings
+    generation_config = components.generation_config
+    directional_outputs = components.directional_outputs
+    context_outputs = components.context_outputs
+    regime_outputs = components.regime_outputs
+    safety_outputs = components.safety_outputs
+    safety_blockers = components.safety_blockers
+    aggregation = components.aggregation
+    safety_blocks = components.safety_blocks
     provisional_direction: Direction = "HOLD" if safety_blocks else aggregation.signal
     provisional_eligible = aggregation.eligible and not safety_blocks
     base_reason_codes = tuple(
@@ -190,6 +195,46 @@ def generate_deterministic_candidate(
         evidence=evidence,
         reason_codes=reason_codes,
         deterministic_candidate=candidate_contract,
+    )
+
+
+def evaluate_candidate_components(
+    snapshot: MetaStrategyMarketSnapshot,
+    *,
+    config: CandidateGenerationConfig | None = None,
+    settings: MetaStrategySettings | None = None,
+) -> CandidateComponentEvaluation:
+    active_settings = settings or build_meta_strategy_settings(
+        settings_version=snapshot.settings_version,
+        status="ACTIVE",
+    )
+    generation_config = config or _candidate_generation_config(active_settings)
+    directional_outputs = evaluate_registry_group(snapshot, DIRECTIONAL_STRATEGIES, settings=active_settings)
+    context_outputs = evaluate_registry_group(snapshot, CONTEXT_STRATEGIES, settings=active_settings)
+    active_context_outputs = tuple(
+        output
+        for output, entry in zip(context_outputs, CONTEXT_STRATEGIES, strict=True)
+        if entry.enabled
+    )
+    regime_outputs = evaluate_registry_group(snapshot, REGIME_STRATEGIES, settings=active_settings)
+    safety_outputs = evaluate_registry_group(snapshot, SAFETY_STRATEGIES, settings=active_settings)
+    safety_blockers = tuple(output for output in safety_outputs if bool((output.evidence or {}).get("blocksNewEntries")))
+    aggregation = aggregate_family_scores(
+        _directional_contributions(directional_outputs, DIRECTIONAL_STRATEGIES, active_context_outputs, regime_outputs),
+        config=generation_config.aggregation,
+    )
+    safety_blocks = generation_config.block_new_entries_on_safety_failure and bool(safety_blockers)
+    return CandidateComponentEvaluation(
+        active_settings=active_settings,
+        generation_config=generation_config,
+        directional_outputs=directional_outputs,
+        context_outputs=context_outputs,
+        active_context_outputs=active_context_outputs,
+        regime_outputs=regime_outputs,
+        safety_outputs=safety_outputs,
+        safety_blockers=safety_blockers,
+        aggregation=aggregation,
+        safety_blocks=safety_blocks,
     )
 
 
@@ -393,7 +438,8 @@ def _candidate_rejection_codes(
         codes.append("meta_strategy.candidate.reject.conflict_excessive")
     if not _data_fresh(snapshot, config.maximum_data_age_seconds):
         codes.append("meta_strategy.candidate.reject.data_stale")
-    spread = float(snapshot.spread_bps if snapshot.spread_bps is not None else (snapshot.spread or {}).get("basisPoints") or 0.0)
+    spread_value = snapshot.spread_bps if snapshot.spread_bps is not None else (snapshot.spread or {}).get("basisPoints")
+    spread = float(spread_value) if spread_value is not None else 0.0
     if spread > config.maximum_spread_bps:
         codes.append("meta_strategy.candidate.reject.spread_unacceptable")
     if _liquidity(snapshot) < config.minimum_liquidity:
@@ -611,9 +657,11 @@ def _aggregation_evidence(aggregation: FamilyAggregationResult) -> dict[str, Any
 
 
 __all__ = [
+    "CandidateComponentEvaluation",
     "CandidateGenerationConfig",
     "EXECUTION_SEQUENCE",
     "GeneratedDeterministicCandidate",
+    "evaluate_candidate_components",
     "evaluate_registry_group",
     "generate_deterministic_candidate",
     "instantiate_meta_strategy",

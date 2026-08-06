@@ -9,7 +9,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from backend.app.algorithms.meta_strategy.alpaca_paper_broker import MetaStrategyAlpacaPaperBroker
+from backend.app.algorithms.meta_strategy.alpaca_paper_broker import (
+    MetaStrategyAlpacaPaperBroker,
+    MetaStrategyAlpacaPaperBrokerConfigurationError,
+)
 from backend.app.algorithms.meta_strategy.finalized_candle_producer import (
     MetaStrategyFinalizedCandleProducer,
     MetaStrategyFinalizedCandleProducerConfig,
@@ -17,6 +20,18 @@ from backend.app.algorithms.meta_strategy.finalized_candle_producer import (
 )
 from backend.app.algorithms.meta_strategy.identity import ALGORITHM_ID
 from backend.app.algorithms.meta_strategy.jobs import META_STRATEGY_JOB_QUEUES, MetaStrategyJobRepository
+from backend.app.algorithms.meta_strategy.local_ledger_paper_broker import MetaStrategyLocalLedgerPaperBroker
+from backend.app.algorithms.meta_strategy.local_paper_broker import MetaStrategyLocalPaperBroker
+from backend.app.algorithms.meta_strategy.local_settings_risk import MetaStrategyLocalSettingsRiskSource
+from backend.app.algorithms.meta_strategy.observability import (
+    META_STRATEGY_AUTOMATIC_PAPER_CONTROL_KEY,
+    build_meta_strategy_evidence_acceptance_report,
+    build_meta_strategy_observability_snapshot,
+)
+from backend.app.algorithms.meta_strategy.paper_readiness import (
+    build_meta_strategy_paper_entry_readiness_prerequisites,
+    build_meta_strategy_paper_readiness_acceptance_report,
+)
 from backend.app.algorithms.meta_strategy.repository import MetaStrategySqliteRepository
 from backend.app.algorithms.meta_strategy.runtime import (
     MetaStrategyRuntimeDependencies,
@@ -61,6 +76,7 @@ class MetaStrategyRuntimeSupervisorConfig:
     max_dead_letter_count: int = 0
     symbols: tuple[str, ...] = ("SPY",)
     market_data_feed: str = "iex"
+    candle_max_staleness_seconds: int = 180
 
 
 @dataclass
@@ -108,6 +124,7 @@ class MetaStrategyRuntimeSupervisor:
         self.dependencies = dependencies
         self.paper_gateway = paper_gateway
         self.global_risk_source = global_risk_source
+        self.account_source: Any | None = None
         self.market_data_client = market_data_client
         self.candle_store = candle_store
         self.candle_producer: MetaStrategyFinalizedCandleProducer | None = None
@@ -200,6 +217,7 @@ class MetaStrategyRuntimeSupervisor:
         if self.dependencies is not None and self.dependencies.job_repository is not None:
             queue_status = self.dependencies.job_repository.queue_status()
             self._observe_queue_status(queue_status)
+        runtime_prerequisites = self._runtime_prerequisites()
         enabled = self.config.enabled
         market_workers_healthy = all(
             self.metrics.worker_status.get(queue_name) == "healthy"
@@ -233,6 +251,7 @@ class MetaStrategyRuntimeSupervisor:
                 "marketWorkersHealthy": market_workers_healthy,
                 "queueLagClear": lag_clear,
                 "deadLettersClear": dead_letters_clear,
+                **runtime_prerequisites,
             },
             "startupReport": self.startup_report.to_dict() if self.startup_report else None,
             "restartState": self.metrics.last_reconstruction,
@@ -246,6 +265,37 @@ class MetaStrategyRuntimeSupervisor:
             "queues": queue_status["queues"] if queue_status else {},
         }
 
+    def _runtime_prerequisites(self) -> dict[str, bool]:
+        broker = getattr(self.paper_gateway, "broker", None) if self.paper_gateway is not None else getattr(self.dependencies, "broker_adapter", None)
+        paper_verified = False
+        clock_healthy = False
+        local_ledger_mode = str(getattr(broker, "broker_kind", "")).lower() == "local_paper_ledger"
+        verifier = getattr(broker, "verify_paper_account", None)
+        if callable(verifier):
+            try:
+                paper_verified = verifier() is True
+            except Exception:
+                paper_verified = False
+        clock_reader = getattr(broker, "get_clock", None)
+        if callable(clock_reader):
+            try:
+                clock = clock_reader()
+                clock_healthy = bool(isinstance(clock, Mapping) and clock.get("fresh") is True)
+            except Exception:
+                clock_healthy = False
+        global_risk_current = False
+        try:
+            snapshot = _load_global_risk_snapshot(self.global_risk_source)
+            global_risk_current = bool(isinstance(snapshot, Mapping) and snapshot.get("current") is True and snapshot.get("status") == "OK")
+        except Exception:
+            global_risk_current = False
+        return {
+            "paperBrokerVerified": paper_verified,
+            "marketClockHealthy": clock_healthy,
+            "globalRiskSourceCurrent": global_risk_current,
+            "authoritativeMarketDataHealthy": local_ledger_mode or self.metrics.worker_status.get("finalized_candle_producer") == "healthy",
+        }
+
     def _construct_dependencies(self) -> None:
         if self.dependencies is not None:
             return
@@ -254,7 +304,23 @@ class MetaStrategyRuntimeSupervisor:
             raise MetaStrategyRuntimeStartupError(("meta_strategy.runtime.durable_database_required",))
         job_repository = MetaStrategyJobRepository(database_url)
         inventory_repository = MetaStrategySqliteRepository(database_url)
-        broker = MetaStrategyAlpacaPaperBroker(self.settings)
+        from backend.app.algorithms.meta_strategy.settings import MetaStrategySettingsStore
+        from pathlib import Path
+
+        settings_store = MetaStrategySettingsStore(Path("./data/meta_strategy_settings.db"))
+        settings_store.get_active_settings()
+        local_settings_risk = MetaStrategyLocalSettingsRiskSource(
+            settings_store=settings_store,
+            inventory_repository=inventory_repository,
+        )
+        self.account_source = local_settings_risk
+        try:
+            broker = _paper_broker_from_env(self.settings, job_repository.gateway_store())
+        except (MetaStrategyAlpacaPaperBrokerConfigurationError, ValueError) as exc:
+            reason = str(exc) or "meta_strategy.runtime.paper_broker_required"
+            raise MetaStrategyRuntimeStartupError((reason,)) from exc
+        if self.global_risk_source is None:
+            self.global_risk_source = local_settings_risk
         if self.global_risk_source is None:
             raise MetaStrategyRuntimeStartupError(("meta_strategy.runtime.global_risk_source_required",))
         self.paper_gateway = PaperOrderGateway(broker, job_repository.gateway_store())
@@ -264,18 +330,14 @@ class MetaStrategyRuntimeSupervisor:
             broker_adapter=broker,
             inventory_repository=inventory_repository,
             job_repository=job_repository,
-            settings_store=None,
-            account_data_source=MetaStrategyRuntimeSnapshotSource(lambda: {"paperBrokerConfigured": broker.configured}),
+            settings_store=settings_store,
+            account_data_source=MetaStrategyRuntimeSnapshotSource(lambda: _load_account_snapshot(self.account_source)),
             global_risk_source=MetaStrategyRuntimeSnapshotSource(lambda: _load_global_risk_snapshot(self.global_risk_source)),
             operational_health_source=MetaStrategyRuntimeSnapshotSource(lambda: {"clockUtc": datetime.now(UTC).isoformat(), "status": "OK"}),
         )
         from backend.app.algorithms.meta_strategy.repository import MetaStrategyRepositoryPersistenceAdapter
-        from backend.app.algorithms.meta_strategy.settings import MetaStrategySettingsStore
-        from pathlib import Path
 
         self.dependencies.persistence_adapter = MetaStrategyRepositoryPersistenceAdapter(inventory_repository)
-        self.dependencies.settings_store = MetaStrategySettingsStore(Path("./data/meta_strategy_settings.db"))
-        self.dependencies.settings_store.get_active_settings()
 
     def _construct_candle_producer(self) -> None:
         assert self.dependencies is not None
@@ -292,6 +354,7 @@ class MetaStrategyRuntimeSupervisor:
                 symbols=tuple(symbol.upper() for symbol in self.config.symbols),
                 feed=self.config.market_data_feed,
                 mode=self.config.mode.value,
+                max_staleness_seconds=self.config.candle_max_staleness_seconds,
             ),
         )
 
@@ -305,7 +368,9 @@ class MetaStrategyRuntimeSupervisor:
             inventory_repository=inventory,
             job_repository=repository,
             quote_source=self.market_data_client,
+            account_source=self.account_source or getattr(gateway, "broker", None),
             global_risk_source=self.global_risk_source,
+            market_clock_source=getattr(gateway, "broker", None),
         )
         common = {"repository": repository, "inventory_repository": inventory, "paper_gateway": gateway, "global_risk_source": risk}
         self._workers = {
@@ -318,6 +383,10 @@ class MetaStrategyRuntimeSupervisor:
             "order_submission": build_meta_strategy_worker(
                 queue_name="order_submission",
                 worker_id="meta_strategy.supervisor.order_submission",
+                settings_store=self.dependencies.settings_store,
+                runtime_readiness_source=self.readiness_status,
+                readiness_report_source=self._readiness_report_for_submission,
+                market_clock_source=getattr(gateway, "broker", None),
                 **common,
             ),
             "order_reconciliation": build_meta_strategy_worker(
@@ -354,6 +423,36 @@ class MetaStrategyRuntimeSupervisor:
         broker = getattr(self.paper_gateway, "broker", None) if self.paper_gateway is not None else getattr(self.dependencies, "broker_adapter", None)
         if broker is None or not callable(getattr(broker, "verify_paper_account", None)) or broker.verify_paper_account() is not True:
             raise MetaStrategyRuntimeStartupError(("meta_strategy.runtime.paper_broker_unavailable",))
+
+    def _readiness_report_for_submission(self) -> dict[str, Any]:
+        dependencies = _require(self.dependencies, "meta_strategy.runtime.dependencies_required")
+        repository = _require(dependencies.job_repository, "meta_strategy.runtime.job_repository_required")
+        inventory = _require(dependencies.inventory_repository, "meta_strategy.runtime.inventory_repository_required")
+        settings = _require(dependencies.settings_store, "meta_strategy.runtime.settings_store_required")
+        snapshot = build_meta_strategy_observability_snapshot(
+            job_repository=repository,
+            inventory_repository=inventory,
+            settings_store=settings,
+        )
+        report = build_meta_strategy_evidence_acceptance_report(snapshot)
+        runtime = self.readiness_status()
+        paper_readiness = build_meta_strategy_paper_readiness_acceptance_report(snapshot, runtime)
+        entry_prerequisites = build_meta_strategy_paper_entry_readiness_prerequisites(snapshot, runtime, paper_readiness)
+        return {
+            **report,
+            "complete": bool(report.get("complete") and paper_readiness.get("paperReady") and entry_prerequisites.get("ready")),
+            "paperReady": bool(paper_readiness.get("paperReady") and entry_prerequisites.get("ready")),
+            "paperReadinessAcceptance": paper_readiness,
+            "paperEntryReadinessPrerequisites": entry_prerequisites,
+            "operationalPrerequisites": entry_prerequisites,
+            "runtimeSupervisor": runtime,
+            "currentShadowPaperStatus": {
+                "shadow": report.get("shadowStatus"),
+                "paper": "READY" if entry_prerequisites.get("ready") else "blocked",
+                "liveExecutionEnabled": False,
+                "paperOrdersBlocked": entry_prerequisites.get("ready") is not True,
+            },
+        }
 
     def _start_loop(self, worker_id: str, coro) -> None:
         self._tasks.append(asyncio.create_task(coro, name=f"meta_strategy.runtime.{worker_id}"))
@@ -393,10 +492,23 @@ class MetaStrategyRuntimeSupervisor:
                 self.metrics.worker_iterations["finalized_candle_producer"] = self.metrics.worker_iterations.get("finalized_candle_producer", 0) + 1
                 self.metrics.last_worker_result["finalized_candle_producer"] = _plain(result)
             except Exception as exc:
-                self.metrics.worker_status["finalized_candle_producer"] = "failed"
-                self.metrics.worker_failures["finalized_candle_producer"] = self.metrics.worker_failures.get("finalized_candle_producer", 0) + 1
                 self.metrics.last_error = str(exc)
-                self.metrics.unavailable_reason_codes = ("meta_strategy.runtime.candle_producer_failed",)
+                if self._local_paper_ledger_mode():
+                    self.metrics.worker_status["finalized_candle_producer"] = "healthy"
+                    self.metrics.worker_iterations["finalized_candle_producer"] = self.metrics.worker_iterations.get("finalized_candle_producer", 0) + 1
+                    self.metrics.last_worker_result["finalized_candle_producer"] = (
+                        {
+                            "algorithmId": "meta_strategy",
+                            "producerVersion": "meta_strategy_finalized_candle_producer_v1",
+                            "status": "BLOCKED",
+                            "reasonCodes": ("meta_strategy.candle.market_data_unavailable",),
+                            "dataQualityState": {"status": "MARKET_DATA_UNAVAILABLE", "detail": str(exc)},
+                        },
+                    )
+                else:
+                    self.metrics.worker_status["finalized_candle_producer"] = "failed"
+                    self.metrics.worker_failures["finalized_candle_producer"] = self.metrics.worker_failures.get("finalized_candle_producer", 0) + 1
+                    self.metrics.unavailable_reason_codes = ("meta_strategy.runtime.candle_producer_failed",)
             await self._sleep(self.config.candle_poll_seconds)
 
     async def _run_worker_once(self, queue_name: str, worker: Any, *, now: datetime | None = None) -> None:
@@ -429,6 +541,10 @@ class MetaStrategyRuntimeSupervisor:
         )
         self.metrics.scheduled_jobs[job_type] = job.job_id
 
+    def _local_paper_ledger_mode(self) -> bool:
+        broker = getattr(self.paper_gateway, "broker", None) if self.paper_gateway is not None else getattr(self.dependencies, "broker_adapter", None)
+        return str(getattr(broker, "broker_kind", "")).lower() == "local_paper_ledger"
+
     def _monitor_queues(self) -> None:
         if self.dependencies is None or self.dependencies.job_repository is None:
             return
@@ -448,6 +564,41 @@ class MetaStrategyRuntimeSupervisor:
             if dead_letters:
                 reasons.append("meta_strategy.runtime.dead_letters_present")
             self.metrics.unavailable_reason_codes = tuple(reasons)
+        self.dependencies.job_repository.write_gateway_snapshot(
+            "meta_strategy.runtime.readiness",
+            self.readiness_status(),
+            now=datetime.now(UTC),
+        )
+
+    def set_automatic_paper_trading(self, *, enabled: bool, actor: str = "runtime_supervisor", reason: str = "meta_strategy.runtime.automatic_paper_control") -> None:
+        if self.dependencies is None or self.dependencies.job_repository is None:
+            raise RuntimeError("meta_strategy.runtime.job_repository_required")
+        current = datetime.now(UTC)
+        record = self.dependencies.job_repository.update_paper_trading_control(
+            new_paper_entries_enabled=bool(enabled),
+            updated_by=actor,
+            reason=reason,
+            now=current,
+        )
+        self.dependencies.job_repository.write_gateway_snapshot(
+            META_STRATEGY_AUTOMATIC_PAPER_CONTROL_KEY,
+            {
+                "actor": actor,
+                "reason": reason,
+                "control": "ENABLE_AUTOMATIC_PAPER_TRADING" if enabled else "DISABLE_AUTOMATIC_PAPER_TRADING",
+                "requestedAt": current.isoformat(),
+                "paperControl": record.to_dict(),
+                "state": {
+                    "newPaperEntriesEnabled": bool(enabled),
+                    "automaticPaperTradingEnabled": bool(enabled),
+                    "paperEntriesAllowed": bool(enabled),
+                    "paperOnly": True,
+                    "liveExecutionEnabled": False,
+                    "version": record.version,
+                },
+            },
+            now=current,
+        )
 
     def _observe_queue_status(self, status: Mapping[str, Any]) -> None:
         queues = status.get("queues") if isinstance(status, Mapping) else {}
@@ -468,7 +619,51 @@ def _config_from_settings(settings: Any | None) -> MetaStrategyRuntimeSupervisor
         enabled=bool(getattr(flags, "metaStrategyRuntimeEnabled", os.getenv("META_STRATEGY_RUNTIME_ENABLED", "").lower() in {"1", "true", "yes", "on"})),
         mode=MetaStrategyRuntimeMode.PAPER if mode == "PAPER" else MetaStrategyRuntimeMode.SHADOW,
         database_url=str(getattr(settings, "database_url", os.getenv("DATABASE_URL", "sqlite:///./data/trading.db"))),
+        worker_poll_seconds=_env_float("META_STRATEGY_WORKER_POLL_SECONDS", 1.0, minimum=0.05),
+        reconciliation_poll_seconds=_env_float("META_STRATEGY_RECONCILIATION_POLL_SECONDS", 15.0, minimum=0.05),
+        stale_order_poll_seconds=_env_float("META_STRATEGY_STALE_ORDER_POLL_SECONDS", 30.0, minimum=0.05),
+        inventory_poll_seconds=_env_float("META_STRATEGY_INVENTORY_RECONCILIATION_POLL_SECONDS", 60.0, minimum=0.05),
+        position_poll_seconds=_env_float("META_STRATEGY_POSITION_MANAGEMENT_POLL_SECONDS", 15.0, minimum=0.05),
+        heartbeat_interval_seconds=_env_float("META_STRATEGY_HEARTBEAT_INTERVAL_SECONDS", 5.0, minimum=0.05),
+        maintenance_interval_seconds=_env_float("META_STRATEGY_MAINTENANCE_INTERVAL_SECONDS", 15.0, minimum=0.05),
+        candle_poll_seconds=_env_float("META_STRATEGY_CANDLE_POLL_SECONDS", 5.0, minimum=0.05),
+        worker_lease_seconds=_env_int("META_STRATEGY_WORKER_LEASE_SECONDS", 60, minimum=1),
+        max_queue_lag_seconds=_env_int("META_STRATEGY_QUEUE_LAG_THRESHOLD_SECONDS", 75, minimum=0),
+        max_dead_letter_count=_env_int("META_STRATEGY_DEAD_LETTER_THRESHOLD", 0, minimum=0),
+        symbols=_env_symbols("META_STRATEGY_SYMBOLS", ("SPY",)),
+        market_data_feed=str(os.getenv("META_STRATEGY_MARKET_DATA_FEED", "iex")).strip().lower() or "iex",
+        candle_max_staleness_seconds=_env_int("META_STRATEGY_CANDLE_FRESHNESS_LIMIT_SECONDS", 180, minimum=0),
     )
+
+
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _env_symbols(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    symbols = tuple(dict.fromkeys(symbol.strip().upper() for symbol in raw.split(",") if symbol.strip()))
+    return symbols or default
 
 
 def _require(value: Any | None, reason_code: str) -> Any:
@@ -487,6 +682,33 @@ def _load_global_risk_snapshot(source: Any | None) -> Mapping[str, Any]:
     if hasattr(source, "approve_order"):
         return {"source": type(source).__name__, "approveOrderAvailable": True}
     raise RuntimeError("meta_strategy.runtime.global_risk_source_required")
+
+
+def _load_account_snapshot(source: Any | None) -> Mapping[str, Any]:
+    if source is None:
+        return {"paperBrokerConfigured": False, "reasonCodes": ("meta_strategy.runtime.paper_broker_required",)}
+    reader = getattr(source, "read_account_snapshot", None)
+    if callable(reader):
+        payload = reader(at=datetime.now(UTC))
+        if isinstance(payload, Mapping):
+            return payload
+    verifier = getattr(source, "verify_paper_account", None)
+    return {
+        "paperBrokerConfigured": bool(getattr(source, "configured", False)),
+        "paperAccountVerified": bool(verifier() is True) if callable(verifier) else False,
+        "source": type(source).__name__,
+    }
+
+
+def _paper_broker_from_env(settings: Any | None, store: Any | None = None) -> Any:
+    broker = os.getenv("META_STRATEGY_PAPER_BROKER", "ALPACA").strip().upper()
+    if broker in {"LOCAL_LEDGER", "LEDGER", "PAPER_LEDGER"}:
+        if store is None:
+            raise ValueError("meta_strategy.local_ledger.store_required")
+        return MetaStrategyLocalLedgerPaperBroker(store)
+    if broker in {"LOCAL", "LOCAL_PAPER", "LOCAL_HTTP"}:
+        return MetaStrategyLocalPaperBroker()
+    return MetaStrategyAlpacaPaperBroker(settings)
 
 
 def _plain(value: Any) -> Any:

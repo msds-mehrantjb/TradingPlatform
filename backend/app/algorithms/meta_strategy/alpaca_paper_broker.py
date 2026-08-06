@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
@@ -17,6 +18,7 @@ from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill
 
 META_STRATEGY_ALPACA_PAPER_BROKER_VERSION = "meta_strategy_alpaca_paper_broker_v1"
 _PAPER_HOST_MARKER = "paper-api.alpaca.markets"
+_EXCHANGE_TZ = ZoneInfo("America/New_York")
 
 
 class MetaStrategyAlpacaPaperBrokerConfigurationError(ValueError):
@@ -64,6 +66,60 @@ class MetaStrategyAlpacaPaperBroker:
             return False
         payload = response.json()
         return bool(payload.get("id") or payload.get("account_number"))
+
+    def get_clock(self) -> dict[str, Any]:
+        try:
+            response = self.client.get(f"{self.base_url}/clock", headers=self._headers())
+            response.raise_for_status()
+        except (httpx.HTTPError, AttributeError):
+            return {
+                "source": "alpaca_paper_clock",
+                "isOpen": False,
+                "status": "unavailable",
+                "authoritativeReadOnly": False,
+                "reasonCodes": ("meta_strategy.alpaca_paper.clock_unavailable",),
+            }
+        payload = response.json()
+        timestamp = str(payload.get("timestamp") or datetime.now(UTC).isoformat())
+        calendar = self._calendar_for_timestamp(timestamp)
+        return {
+            "source": "alpaca_paper_clock",
+            "capturedAt": timestamp,
+            "dataSourceTimestamp": timestamp,
+            "isOpen": bool(payload.get("is_open")),
+            "status": "open" if payload.get("is_open") else "closed",
+            "nextOpen": payload.get("next_open"),
+            "nextClose": payload.get("next_close"),
+            **calendar,
+            "authoritativeReadOnly": True,
+            "reasonCodes": ("meta_strategy.alpaca_paper.clock_loaded",),
+        }
+
+    def _calendar_for_timestamp(self, timestamp: str) -> dict[str, Any]:
+        try:
+            current = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(_EXCHANGE_TZ)
+        except ValueError:
+            return {}
+        session_date = current.date().isoformat()
+        try:
+            response = self.client.get(f"{self.base_url}/calendar", headers=self._headers(), params={"start": session_date, "end": session_date})
+            response.raise_for_status()
+            rows = response.json()
+        except (httpx.HTTPError, AttributeError):
+            return {}
+        if not rows:
+            return {"holiday": True}
+        row = rows[0]
+        open_time = str(row.get("open") or "")
+        close_time = str(row.get("close") or "")
+        session_open = _calendar_datetime(session_date, open_time)
+        session_close = _calendar_datetime(session_date, close_time)
+        return {
+            **({"regularSessionOpen": session_open.isoformat()} if session_open else {}),
+            **({"regularSessionClose": session_close.isoformat()} if session_close else {}),
+            "holiday": False,
+            "earlyClose": bool(session_close and session_close.astimezone(_EXCHANGE_TZ).time().hour < 16),
+        }
 
     def submit_bracket_order(self, intent) -> PaperGatewayBrokerAck:
         order_type = _alpaca_order_type(getattr(intent, "orderType", None), limit_price=intent.limitPrice)
@@ -207,6 +263,15 @@ class MetaStrategyUnavailablePaperBroker:
     def verify_paper_account(self) -> bool:
         return False
 
+    def get_clock(self) -> dict[str, Any]:
+        return {
+            "source": "unavailable_paper_broker_clock",
+            "isOpen": False,
+            "status": "unavailable",
+            "authoritativeReadOnly": False,
+            "reasonCodes": ("meta_strategy.alpaca_paper.clock_unavailable",),
+        }
+
     def submit_bracket_order(self, intent) -> PaperGatewayBrokerAck:
         return PaperGatewayBrokerAck(
             clientOrderId=intent.clientOrderId,
@@ -244,8 +309,8 @@ def _event_from_order(order: Mapping[str, Any]) -> dict[str, Any]:
         "status": status,
         "symbol": str(order.get("symbol") or "UNKNOWN").upper(),
         "side": str(order.get("side") or "buy").upper(),
-        "filledQuantity": int(float(order.get("filled_qty") or 0.0)),
-        "averageFillPrice": float(order.get("filled_avg_price") or 0.0),
+        "filledQuantity": int(float(order.get("filled_qty") if order.get("filled_qty") is not None else 0.0)),
+        "averageFillPrice": float(order.get("filled_avg_price") if order.get("filled_avg_price") is not None else 0.0),
         "timestamp": str(order.get("updated_at") or order.get("submitted_at") or datetime.now(UTC).isoformat()),
     }
 
@@ -296,6 +361,16 @@ def _parse_time(value: Any) -> datetime | None:
         return None
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     return parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _calendar_datetime(session_date: str, clock_time: str) -> datetime | None:
+    if not session_date or not clock_time:
+        return None
+    try:
+        hour, minute = [int(part) for part in clock_time.split(":", 1)]
+    except (TypeError, ValueError):
+        return None
+    return datetime.fromisoformat(f"{session_date}T{hour:02d}:{minute:02d}:00").replace(tzinfo=_EXCHANGE_TZ)
 
 
 class _PaperSettings:

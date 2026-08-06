@@ -7,6 +7,7 @@ from typing import Any
 
 from backend.app.algorithms.meta_strategy.identity import ALGORITHM_ID
 from backend.app.algorithms.meta_strategy.jobs import MetaStrategyJobRepository
+from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 from backend.app.algorithms.meta_strategy.paper_readiness import META_STRATEGY_PAPER_READINESS_TEST_IDS
 from backend.app.algorithms.meta_strategy.repository import MetaStrategySqliteRepository
 from backend.app.algorithms.meta_strategy.settings import MetaStrategySettingsStore
@@ -16,6 +17,8 @@ from backend.app.algorithms.meta_strategy.strategy_registry import ALL_META_STRA
 META_STRATEGY_OBSERVABILITY_VERSION = "meta_strategy_observability_v1"
 META_STRATEGY_CONTROL_SNAPSHOT_PREFIX = "meta_strategy.controls."
 META_STRATEGY_OPERATIONAL_CONTROLS: tuple[str, ...] = (
+    "ENABLE_AUTOMATIC_PAPER_TRADING",
+    "DISABLE_AUTOMATIC_PAPER_TRADING",
     "PAUSE_NEW_ENTRIES",
     "RESUME_NEW_ENTRIES",
     "EXIT_ONLY",
@@ -24,8 +27,16 @@ META_STRATEGY_OPERATIONAL_CONTROLS: tuple[str, ...] = (
     "DISABLE_ML_INFLUENCE",
     "DISABLE_DYNAMIC_OVERLAYS",
     "STOP_META_RUNTIME",
+    "resolve_dead_letters",
 )
+META_STRATEGY_AUTOMATIC_PAPER_CONTROL_KEY = f"{META_STRATEGY_CONTROL_SNAPSHOT_PREFIX}AUTOMATIC_PAPER_TRADING"
 _LEGACY_CONTROL_ALIASES = {
+    "paper_on": "ENABLE_AUTOMATIC_PAPER_TRADING",
+    "paper_off": "DISABLE_AUTOMATIC_PAPER_TRADING",
+    "enable_paper_trading": "ENABLE_AUTOMATIC_PAPER_TRADING",
+    "disable_paper_trading": "DISABLE_AUTOMATIC_PAPER_TRADING",
+    "enable_automatic_paper_trading": "ENABLE_AUTOMATIC_PAPER_TRADING",
+    "disable_automatic_paper_trading": "DISABLE_AUTOMATIC_PAPER_TRADING",
     "pause_new_entries": "PAUSE_NEW_ENTRIES",
     "resume_new_entries": "RESUME_NEW_ENTRIES",
     "exit_only": "EXIT_ONLY",
@@ -35,6 +46,9 @@ _LEGACY_CONTROL_ALIASES = {
     "disable_dynamic_overlays": "DISABLE_DYNAMIC_OVERLAYS",
     "stop_meta_runtime": "STOP_META_RUNTIME",
     "cancel_pending_jobs": "cancel_pending_jobs",
+    "resolve_dead_letters": "resolve_dead_letters",
+    "recover_dead_letters": "resolve_dead_letters",
+    "dead_letter_recovery": "resolve_dead_letters",
     "force_reconciliation": "force_reconciliation",
     "model_rollback": "model_rollback",
     "disable_strategy": "disable_strategy",
@@ -118,6 +132,9 @@ def build_meta_strategy_observability_snapshot(
     model = job_repository.active_model_pointer()
     gateway = job_repository.gateway_snapshots()
     controls = _control_snapshots(gateway)
+    durable_paper_control = job_repository.read_paper_trading_control()
+    if durable_paper_control is not None:
+        controls["AUTOMATIC_PAPER_TRADING"] = _paper_control_payload(durable_paper_control.to_dict())
     strategy_counts = _strategy_counts()
     required_metrics = _required_operational_metrics(
         job_repository=job_repository,
@@ -196,9 +213,46 @@ def apply_meta_strategy_operational_control(
     }
     if canonical is None:
         result_payload["state"] = {"supported": False, "supportedControls": META_STRATEGY_OPERATIONAL_CONTROLS}
+    elif canonical in {"ENABLE_AUTOMATIC_PAPER_TRADING", "DISABLE_AUTOMATIC_PAPER_TRADING"}:
+        enabled = canonical == "ENABLE_AUTOMATIC_PAPER_TRADING"
+        expected = body.get("expectedVersion") if body.get("expectedVersion") is not None else body.get("expected_version")
+        capital_partition_id = str(
+            body.get("capitalPartitionId")
+            or body.get("capital_partition_id")
+            or META_STRATEGY_DEFAULT_CAPITAL_PARTITION
+        )
+        try:
+            durable = job_repository.update_paper_trading_control(
+                new_paper_entries_enabled=enabled,
+                updated_by=actor,
+                reason=reason,
+                expected_version=int(expected) if expected is not None else None,
+                capital_partition_id=capital_partition_id,
+                now=current,
+            ).to_dict()
+        except ValueError as exc:
+            result_payload["state"] = {"supported": True, "versionConflict": True}
+            evidence = job_repository.record_operational_event(f"control.{canonical}", result_payload, status="REJECTED", correlation_id=correlation_id, now=current)
+            return MetaStrategyOperationalControlResult(
+                algorithm_id=ALGORITHM_ID,
+                control=canonical,
+                status="REJECTED",
+                evidence_id=evidence["eventId"],
+                payload=result_payload,
+                reason_codes=(str(exc),),
+            )
+        result_payload["state"] = _control_state(canonical, {**body, **durable})
+        result_payload["paperControl"] = durable
     elif canonical == "cancel_pending_jobs":
         cancel = job_repository.cancel_pending_jobs(queue_name=_optional_str(body.get("queueName") or body.get("queue_name")), now=current)
         result_payload.update(cancel)
+    elif canonical == "resolve_dead_letters":
+        recovered = job_repository.resolve_dead_letter_jobs(
+            queue_name=_optional_str(body.get("queueName") or body.get("queue_name")),
+            reason=reason,
+            now=current,
+        )
+        result_payload.update(recovered)
     elif canonical == "force_reconciliation":
         job = job_repository.enqueue_job(
             job_type="inventory_reconciliation",
@@ -219,6 +273,8 @@ def apply_meta_strategy_operational_control(
         result_payload["state"] = _control_state(canonical, body)
     snapshot_key = f"{META_STRATEGY_CONTROL_SNAPSHOT_PREFIX}{canonical or control}"
     job_repository.write_gateway_snapshot(snapshot_key, result_payload, now=current)
+    if canonical in {"ENABLE_AUTOMATIC_PAPER_TRADING", "DISABLE_AUTOMATIC_PAPER_TRADING"}:
+        job_repository.write_gateway_snapshot(META_STRATEGY_AUTOMATIC_PAPER_CONTROL_KEY, result_payload, now=current)
     evidence = job_repository.record_operational_event(f"control.{canonical or control}", result_payload, status=status, correlation_id=correlation_id, now=current)
     if canonical and canonical != control:
         job_repository.record_operational_event(f"control.{control}", result_payload, status=status, correlation_id=correlation_id, now=current)
@@ -345,6 +401,26 @@ def _enqueue_control_job(
 
 
 def _control_state(control: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    if control == "ENABLE_AUTOMATIC_PAPER_TRADING":
+        version = payload.get("version")
+        return {
+            "automaticPaperTradingEnabled": True,
+            "paperEntriesAllowed": True,
+            "newPaperEntriesEnabled": True,
+            "paperOnly": True,
+            "liveExecutionEnabled": False,
+            **({"version": version} if version is not None else {}),
+        }
+    if control == "DISABLE_AUTOMATIC_PAPER_TRADING":
+        version = payload.get("version")
+        return {
+            "automaticPaperTradingEnabled": False,
+            "paperEntriesAllowed": False,
+            "newPaperEntriesEnabled": False,
+            "paperOnly": True,
+            "liveExecutionEnabled": False,
+            **({"version": version} if version is not None else {}),
+        }
     if control == "PAUSE_NEW_ENTRIES":
         return {"newEntriesPaused": True, "riskReducingExitsAllowed": True}
     if control == "RESUME_NEW_ENTRIES":
@@ -372,6 +448,28 @@ def _control_state(control: str, payload: Mapping[str, Any]) -> dict[str, Any]:
     if control == "drain_and_stop_workers":
         return {"drainRequested": True, "workersStopAfterDrain": True}
     return {"recorded": True}
+
+
+def _paper_control_payload(control: Mapping[str, Any]) -> dict[str, Any]:
+    enabled = control.get("newPaperEntriesEnabled") is True
+    return {
+        "control": "ENABLE_AUTOMATIC_PAPER_TRADING" if enabled else "DISABLE_AUTOMATIC_PAPER_TRADING",
+        "state": {
+            "algorithmId": ALGORITHM_ID,
+            "capitalPartitionId": str(control.get("capitalPartitionId") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),
+            "automaticPaperTradingEnabled": enabled,
+            "paperEntriesAllowed": enabled,
+            "newPaperEntriesEnabled": enabled,
+            "paperOnly": True,
+            "liveExecutionEnabled": False,
+            "version": int(control.get("version") or 0),
+        },
+        "paperControl": dict(control),
+        "reasonCodes": tuple(control.get("reasonCodes") or ()),
+        "updatedAt": control.get("updatedAt"),
+        "updatedBy": control.get("updatedBy"),
+        "reason": control.get("reason"),
+    }
 
 
 def _required_operational_metrics(
@@ -573,6 +671,7 @@ def _optional_str(value: Any) -> str | None:
 
 __all__ = [
     "META_STRATEGY_FINAL_DOD_IDS",
+    "META_STRATEGY_AUTOMATIC_PAPER_CONTROL_KEY",
     "META_STRATEGY_OBSERVABILITY_VERSION",
     "META_STRATEGY_OPERATIONAL_CONTROLS",
     "META_STRATEGY_RECOVERY_TEST_IDS",

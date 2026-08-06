@@ -25,7 +25,10 @@ class EconomicEventContextStrategy(ContextSnapshotStrategy):
             severity = str(snapshot.economic_event_state.get("severity") or "none").lower()
             minutes_to_event = snapshot.economic_event_state.get("minutesToEvent")
             active = bool(snapshot.economic_event_state.get("active") or state in {"active", "blocked", "halt"})
-        spread_bps = float(snapshot.spread.get("basisPoints") or snapshot.spread_bps or 0.0)
+        spread_value = snapshot.spread.get("basisPoints")
+        if spread_value is None:
+            spread_value = snapshot.spread_bps
+        spread_bps = float(spread_value) if spread_value is not None else 0.0
         return {
             "eventState": state,
             "eventSeverity": severity,

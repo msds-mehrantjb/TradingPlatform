@@ -9,6 +9,7 @@ from uuid import uuid4
 from backend.app.algorithms.meta_strategy import (
     META_STRATEGY_INVENTORY_TABLES,
     MetaStrategyApplicationService,
+    MetaStrategyInventoryOwnershipConflict,
     MetaStrategyRepositoryAttributionError,
     MetaStrategySqliteRepository,
     deterministic_meta_strategy_client_order_id,
@@ -78,7 +79,45 @@ class MetaStrategyPhase5InventoryTest(unittest.TestCase):
             repository.ingest_broker_fill(fill_payload(algorithm_id="weighted_voting", broker_fill_id="foreign-fill", quantity=10))
         with self.assertRaises(MetaStrategyRepositoryAttributionError):
             repository.ingest_broker_fill(fill_payload(broker_fill_id="foreign-partition-fill", quantity=10, capital_partition_id="meta_strategy.paper.other"))
+        with self.assertRaises(MetaStrategyRepositoryAttributionError):
+            repository.ingest_broker_fill({key: value for key, value in fill_payload(broker_fill_id="missing-partition-fill", quantity=10).items() if key != "capitalPartitionId"})
 
+        self.assertEqual(repository.current_inventory_snapshot().open_positions, ())
+
+    def test_sibling_order_status_cannot_release_meta_strategy_reserved_risk(self) -> None:
+        repository = MetaStrategySqliteRepository(f"sqlite:///{temp_db_path()}")
+        repository.record_order_intent(order_intent_payload(quantity=10, reserved_risk=100.0))
+
+        with self.assertRaises(MetaStrategyRepositoryAttributionError):
+            repository.record_order_status({**order_status_payload(status="CANCELED"), "algorithmId": "weighted_voting"})
+
+        self.assertEqual(repository.current_inventory_snapshot().reserved_risk_dollars, 100.0)
+
+    def test_duplicate_owned_order_identity_cannot_replace_existing_records(self) -> None:
+        repository = MetaStrategySqliteRepository(f"sqlite:///{temp_db_path()}")
+        repository.record_order_intent(order_intent_payload(quantity=10))
+        repository.record_submitted_order(order_payload(status="ACCEPTED", client_order_id="client-1"))
+
+        with self.assertRaises(MetaStrategyInventoryOwnershipConflict):
+            repository.record_order_intent({**order_intent_payload(quantity=5), "decisionId": "decision-2", "eventId": "intent-event-2", "clientOrderId": "client-2"})
+        with self.assertRaises(MetaStrategyInventoryOwnershipConflict):
+            repository.record_submitted_order({**order_payload(status="ACCEPTED", client_order_id="client-1"), "decisionId": "decision-2", "orderIntentId": "intent-2", "eventId": "order-accepted-2"})
+
+        self.assertEqual(len(repository.inventory_records("order_intents")), 1)
+        self.assertEqual(len(repository.inventory_records("orders")), 1)
+
+    def test_foreign_ownership_quarantine_preserves_observed_owner_without_position_change(self) -> None:
+        repository = MetaStrategySqliteRepository(f"sqlite:///{temp_db_path()}")
+
+        result = repository.record_foreign_ownership_quarantine(
+            fill_payload(algorithm_id="weighted_voting", broker_fill_id="foreign-fill", quantity=10),
+            reason="BROKER_EVENT_FOREIGN_ALGORITHM",
+        )
+
+        quarantine = repository.inventory_records("quarantine")[0]
+        self.assertEqual(result["status"], "QUARANTINED")
+        self.assertEqual(quarantine["payload"]["observedAlgorithmId"], "weighted_voting")
+        self.assertEqual(quarantine["payload"]["quarantineReason"], "BROKER_EVENT_FOREIGN_ALGORITHM")
         self.assertEqual(repository.current_inventory_snapshot().open_positions, ())
 
     def test_database_constraints_reject_foreign_algorithm_and_partition_rows(self) -> None:

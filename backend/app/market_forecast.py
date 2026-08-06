@@ -805,11 +805,12 @@ def resolve_horizon_direction(
     buy_expected_value: float,
     sell_expected_value: float,
 ) -> str:
+    del threshold, minimum_edge_gap, buy_expected_value, sell_expected_value
     if timeout_probability >= buy_probability and timeout_probability >= sell_probability:
         return "flat"
-    if buy_probability >= threshold and (buy_probability - sell_probability) >= minimum_edge_gap and buy_expected_value > 0:
+    if buy_probability > sell_probability:
         return "up"
-    if sell_probability >= threshold and (sell_probability - buy_probability) >= minimum_edge_gap and sell_expected_value > 0:
+    if sell_probability > buy_probability:
         return "down"
     return "flat"
 

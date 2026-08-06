@@ -10,6 +10,12 @@ from backend.app.algorithms.meta_strategy import (
     MetaStrategySizingContext,
     calculate_meta_strategy_position_size,
 )
+from backend.app.algorithms.meta_strategy.execution_pipeline import (
+    MetaStrategyExecutionPipelineConfig,
+    MetaStrategyExecutionPipelineRequest,
+    run_meta_strategy_execution_pipeline,
+)
+from backend.tests.test_meta_strategy_step7_market_snapshot import request_with
 
 
 EXPECTED_CAP_IDS = {
@@ -224,6 +230,43 @@ class MetaStrategyStep29PositionSizingTest(unittest.TestCase):
                 self.assertEqual(result.quantity, 0)
                 self.assertEqual(result.limiting_cap, "invalid_market")
                 self.assertIn(reason_code, result.reason_codes)
+
+    def test_zero_authoritative_values_do_not_become_fixture_defaults(self) -> None:
+        result = calculate_meta_strategy_position_size(
+            base_context(
+                account_equity=0.0,
+                available_buying_power=0.0,
+                remaining_algorithm_risk=0.0,
+                global_available_risk=0.0,
+            )
+        )
+
+        self.assertEqual(result.quantity, 0)
+        self.assertIn("meta_strategy.sizing.zero_account_equity", result.reason_codes)
+        self.assertIn("meta_strategy.sizing.zero_buying_power", result.reason_codes)
+        self.assertIn("meta_strategy.sizing.zero_algorithm_risk", result.reason_codes)
+        self.assertIn("meta_strategy.sizing.zero_global_risk", result.reason_codes)
+
+    def test_none_authoritative_values_in_paper_mode_do_not_use_fixture_defaults(self) -> None:
+        result = run_meta_strategy_execution_pipeline(
+            MetaStrategyExecutionPipelineRequest(
+                mode="PAPER",
+                snapshot_request=request_with(),
+                account_equity=None,
+                available_buying_power=None,
+                remaining_algorithm_risk=None,
+                global_available_risk=None,
+                global_quantity_cap=None,
+            ),
+            config=MetaStrategyExecutionPipelineConfig(submit_to_broker=False),
+        )
+
+        self.assertIsNone(result.order_intent)
+        self.assertEqual(result.sizing.quantity, 0)
+        self.assertIn("meta_strategy.sizing.account_equity_unavailable", result.reason_codes)
+        self.assertIn("meta_strategy.sizing.buying_power_unavailable", result.reason_codes)
+        self.assertIn("meta_strategy.sizing.algorithm_risk_unavailable", result.reason_codes)
+        self.assertIn("meta_strategy.sizing.global_risk_unavailable", result.reason_codes)
 
 
 if __name__ == "__main__":

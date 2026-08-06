@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -41,6 +43,59 @@ class MetaStrategyPhase7DecisionWorkerTest(unittest.TestCase):
         self.assertTrue(duplicate.duplicate)
         self.assertIsNotNone(decision)
         self.assertEqual(repository.queue_status(queue_name="finalised_bar_decisions", now=NOW)["queues"]["finalised_bar_decisions"]["succeeded"], 1)
+
+    def test_worker_atomically_projects_runtime_stage_evidence_to_meta_owned_tables(self) -> None:
+        path = temp_db_path()
+        repository = MetaStrategyJobRepository(f"sqlite:///{path}")
+        settings = build_meta_strategy_settings(settings_version="phase7-settings-v1", created_at=NOW)
+        job = repository.enqueue_finalised_bar_decision(mode="PAPER", symbol="SPY", timeframe="1m", bar_end=NOW, settings_version=settings.settings_version, now=NOW)
+        worker = MetaStrategyFinalisedBarDecisionWorker(repository=repository, state_provider=FixtureStateProvider(settings=settings))
+
+        worker.run_once(now=NOW)
+
+        event_id = repository.read_payload(job.payload_reference)["payload"]["eventId"]
+        decision = repository.decision_for_event(event_id)
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            counts = {
+                table: conn.execute(f"SELECT COUNT(*) AS count FROM {table} WHERE algorithm_id = 'meta_strategy'").fetchone()["count"]
+                for table in (
+                    "meta_strategy_market_snapshots",
+                    "meta_strategy_strategy_outputs",
+                    "meta_strategy_family_scores",
+                    "meta_strategy_decisions",
+                )
+            }
+            projected = conn.execute(
+                """
+                SELECT *
+                FROM meta_strategy_decisions
+                WHERE algorithm_id = 'meta_strategy' AND decision_id = ?
+                """,
+                (decision["decisionId"],),
+            ).fetchone()
+            owners = {
+                table: {
+                    (row["algorithm_id"], row["capital_partition_id"])
+                    for row in conn.execute(f"SELECT algorithm_id, capital_partition_id FROM {table}")
+                }
+                for table in counts
+            }
+
+        self.assertGreaterEqual(counts["meta_strategy_market_snapshots"], 1)
+        self.assertGreaterEqual(counts["meta_strategy_strategy_outputs"], 1)
+        self.assertGreaterEqual(counts["meta_strategy_family_scores"], 1)
+        self.assertGreaterEqual(counts["meta_strategy_decisions"], 1)
+        self.assertIsNotNone(projected)
+        assert projected is not None
+        projected_payload = json.loads(str(projected["payload_json"]))
+        self.assertEqual(projected_payload["mode"], "PAPER")
+        self.assertEqual(projected_payload["payload"]["runtimeDecision"]["mode"], "PAPER")
+        for table, table_owners in owners.items():
+            with self.subTest(table=table):
+                self.assertEqual(table_owners, {("meta_strategy", "meta_strategy.paper.default")})
 
     def test_idempotency_key_includes_capital_partition_symbol_timeframe_bar_end_and_settings_version(self) -> None:
         key = finalised_bar_idempotency_key(mode="paper", symbol="spy", timeframe="1m", bar_end=NOW, settings_version="settings-v1")
@@ -141,7 +196,15 @@ class MetaStrategyPhase7DecisionWorkerTest(unittest.TestCase):
         event_id = repository.read_payload(job.payload_reference)["payload"]["eventId"]
         decision = repository.decision_for_event(event_id)
         direct = run_meta_strategy_execution_pipeline(
-            MetaStrategyExecutionPipelineRequest(mode="PAPER", snapshot_request=provider.request),
+            MetaStrategyExecutionPipelineRequest(
+                mode="PAPER",
+                snapshot_request=provider.request,
+                account_equity=100_000.0,
+                available_buying_power=90_000.0,
+                global_available_risk=1_000.0,
+                global_quantity_cap=10_000,
+                model_artifact={"modelVersion": "phase7-model"},
+            ),
             config=MetaStrategyExecutionPipelineConfig(submit_to_broker=False),
             config_settings=settings,
         )
@@ -165,6 +228,28 @@ class MetaStrategyPhase7DecisionWorkerTest(unittest.TestCase):
         decision = repository.decision_for_event(event_id)
         self.assertIn("meta_strategy.pipeline.broker_skipped_in_decision_worker", decision["payload"]["reasonCodes"])
 
+    def test_worker_passes_authoritative_context_fields_to_pipeline_request(self) -> None:
+        repository = MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}")
+        settings = build_meta_strategy_settings(settings_version="phase7-settings-v1", created_at=NOW)
+        repository.enqueue_finalised_bar_decision(mode="PAPER", symbol="SPY", timeframe="1m", bar_end=NOW, settings_version=settings.settings_version, now=NOW)
+        captured: dict[str, MetaStrategyExecutionPipelineRequest] = {}
+
+        def capture_runner(request, settings, global_risk_snapshot):
+            captured["request"] = request
+            return fake_hold_runner(request, settings, global_risk_snapshot)
+
+        worker = MetaStrategyFinalisedBarDecisionWorker(repository=repository, state_provider=FixtureStateProvider(settings=settings), pipeline_runner=capture_runner)
+        worker.run_once(now=NOW)
+
+        request = captured["request"]
+        self.assertEqual(request.inventory_snapshot["snapshotId"], "phase7-inventory")
+        self.assertEqual(request.account_snapshot["buyingPower"], 90_000.0)
+        self.assertEqual(request.global_risk_snapshot["availableRiskDollars"], 1_000.0)
+        self.assertTrue(request.runtime_health["ready"])
+        self.assertIn("PAUSE_NEW_ENTRIES", request.operational_controls["controls"])
+        self.assertEqual(request.market_clock_state["isOpen"], True)
+        self.assertEqual(request.state_source_versions["eventSettingsVersion"], settings.settings_version)
+
 
 class FixtureStateProvider:
     def __init__(self, *, settings):
@@ -181,11 +266,27 @@ class FixtureStateProvider:
             event=event,
             settings=self.settings,
             market_snapshot_request=self.request,
-            inventory_snapshot={"positions": []},
-            account_snapshot={"source": "read_only_account_view"},
-            global_risk_snapshot={"source": "read_only_global_risk"},
-            event_state={"blackout": False},
-            operational_health={"status": "ok"},
+            inventory_snapshot={
+                "snapshotId": "phase7-inventory",
+                "positions": [],
+                "reservedRiskLedger": (),
+                "dailyTradeCount": 0,
+                "lastTradeAt": None,
+            },
+            account_snapshot={"source": "read_only_account_view", "accountEquity": 100_000.0, "buyingPower": 90_000.0},
+            global_risk_snapshot={"source": "read_only_global_risk", "availableRiskDollars": 1_000.0, "maxQuantity": 10_000},
+            event_state={
+                "blackout": False,
+                "sourceVersions": {"eventSettingsVersion": self.settings.settings_version, "activeSettingsVersion": self.settings.settings_version},
+                "sourceTimestamps": {"decisionCutoff": event.bar_end.isoformat()},
+            },
+            operational_health={
+                "status": "ok",
+                "marketCalendar": {"isOpen": True, "capturedAt": event.bar_end.isoformat()},
+                "runtimeHealth": {"ready": True, "capturedAt": event.bar_end.isoformat()},
+                "operationalControls": {"controls": {"PAUSE_NEW_ENTRIES": {"active": False}}},
+                "paperControl": {"newPaperEntriesEnabled": True},
+            },
             active_model_artifact={"modelVersion": "phase7-model"},
         )
 
@@ -208,7 +309,7 @@ def fake_order_runner(request, settings, global_risk_snapshot):
         snapshot=snapshot,
         settings_version=settings.settings_version,
         effective_settings_hash=settings.effective_settings_hash,
-        order_intent={"orderIntentId": "intent-phase7", "symbol": "SPY", "side": "BUY", "quantity": 1},
+        order_intent={"orderIntentId": "intent-phase7", "symbol": "SPY", "side": "BUY", "quantity": 1, "limitPrice": 100.0, "reservedRiskDollars": 10.0},
         final_valid=True,
         reason_codes=("meta_strategy.test.order",),
         stage_results={
@@ -220,9 +321,34 @@ def fake_order_runner(request, settings, global_risk_snapshot):
             "model_inference": {"reasonCodes": ("model",)},
             "ml_decision_policy": {"reasonCodes": ("policy",)},
             "local_gates": {"reasonCodes": ("local",)},
-            "sizing": {"reasonCodes": ("sizing",)},
+            "sizing": {"reasonCodes": ("sizing",), "quantity": 1, "reservedRiskDollars": 10.0},
             "order_intent": {"status": "ORDER", "reasonCodes": ("order",)},
         },
+    )
+
+
+def fake_hold_runner(request, settings, global_risk_snapshot):
+    snapshot = SimpleNamespace(decision_id="phase7-hold-decision")
+    return SimpleNamespace(
+        snapshot=snapshot,
+        settings_version=settings.settings_version,
+        effective_settings_hash=settings.effective_settings_hash,
+        order_intent=None,
+        final_valid=False,
+        reason_codes=("meta_strategy.test.hold",),
+        stage_results={
+            "market_snapshot": {"reasonCodes": ("snapshot",)},
+            "strategies": {"reasonCodes": ("strategies",)},
+            "context_and_regime": {"reasonCodes": ("regime",)},
+            "safety": {"reasonCodes": ("safety",)},
+            "family_aggregation": {"reasonCodes": ("aggregate",)},
+            "model_inference": {"reasonCodes": ("model",)},
+            "ml_decision_policy": {"reasonCodes": ("policy",)},
+            "local_gates": {"reasonCodes": ("gates",)},
+            "sizing": {"reasonCodes": ("sizing",)},
+            "order_intent": {"reasonCodes": ("order",)},
+        },
+        local_gates=SimpleNamespace(passed=False),
     )
 
 

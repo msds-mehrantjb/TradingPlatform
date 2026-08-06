@@ -111,7 +111,7 @@ def validate_meta_strategy_runtime_startup(dependencies: MetaStrategyRuntimeDepe
         if noop_broker or dependencies.broker_adapter is None or getattr(dependencies.broker_adapter, "configured", True) is False:
             reason_codes.append("meta_strategy.runtime.paper_broker_required")
         if mode == MetaStrategyRuntimeMode.PAPER:
-            if not _is_configured_alpaca_paper_broker(dependencies.broker_adapter):
+            if not _is_configured_paper_broker(dependencies.broker_adapter):
                 reason_codes.append("meta_strategy.runtime.configured_alpaca_paper_gateway_required")
         if not _has_active_settings(dependencies.settings_store):
             reason_codes.append("meta_strategy.runtime.active_settings_required")
@@ -200,10 +200,10 @@ def _has_active_settings(settings_store: MetaStrategySettingsStore | None) -> bo
     return True
 
 
-def _is_configured_alpaca_paper_broker(broker_adapter: Any | None) -> bool:
+def _is_configured_paper_broker(broker_adapter: Any | None) -> bool:
     if broker_adapter is None:
         return False
-    if getattr(broker_adapter, "broker_kind", None) != "alpaca_paper":
+    if getattr(broker_adapter, "broker_kind", None) not in {"alpaca_paper", "local_paper", "local_paper_ledger"}:
         return False
     if getattr(broker_adapter, "configured", False) is not True:
         return False

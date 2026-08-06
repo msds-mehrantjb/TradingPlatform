@@ -12,6 +12,7 @@ from backend.app.algorithms.meta_strategy.jobs import (
     MetaStrategyJobStatus,
     MetaStrategyWorker,
 )
+from backend.app.algorithms.meta_strategy.observability import apply_meta_strategy_operational_control
 
 
 NOW = datetime(2026, 1, 5, 15, 45, tzinfo=UTC)
@@ -111,6 +112,38 @@ class MetaStrategyPhase6JobsTest(unittest.TestCase):
         self.assertEqual(failed.status, MetaStrategyJobStatus.DEAD_LETTER)
         self.assertEqual(failed.error_category, "transient")
         self.assertNotIn("secret", failed.error_details)
+
+    def test_dead_letter_recovery_control_resolves_backlog_without_claiming_jobs(self) -> None:
+        repository = MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}")
+        queued = repository.enqueue_job(job_type="finalised_bar_decision", idempotency_key="bar-dead-letter", payload={}, max_attempts=1, now=NOW)
+        claimed = repository.claim_next_job(queue_name="finalised_bar_decisions", worker_id="decision-worker", lease_seconds=30, now=NOW)
+        repository.fail_job(
+            claimed.job_id,
+            worker_id="decision-worker",
+            error_category="RuntimeError",
+            error_details="at least one completed one-minute candle is required",
+            now=NOW,
+        )
+        self.assertEqual(repository.read_job(queued.job_id).status, MetaStrategyJobStatus.DEAD_LETTER)
+        self.assertEqual(repository.operational_metrics(now=NOW)["jobDeadLetterCount"], 1)
+
+        result = apply_meta_strategy_operational_control(
+            job_repository=repository,
+            control="resolve_dead_letters",
+            actor="operator-test",
+            reason="meta_strategy.operator.resolve_stale_no_candle_dead_letters",
+            payload={"queueName": "finalised_bar_decisions"},
+            now=NOW + timedelta(seconds=5),
+        )
+        resolved = repository.read_job(queued.job_id)
+
+        self.assertEqual(result.status, "RECORDED")
+        self.assertEqual(result.payload["resolvedDeadLetters"], 1)
+        self.assertEqual(result.payload["jobIds"], (queued.job_id,))
+        self.assertEqual(resolved.status, MetaStrategyJobStatus.CANCELLED)
+        self.assertTrue(resolved.cancel_requested)
+        self.assertIn("resolve_stale_no_candle_dead_letters", resolved.error_details)
+        self.assertEqual(repository.operational_metrics(now=NOW + timedelta(seconds=5))["jobDeadLetterCount"], 0)
 
     def test_jobs_from_another_algorithm_cannot_be_claimed_by_meta_strategy_workers(self) -> None:
         repository = MetaStrategyJobRepository(f"sqlite:///{temp_db_path()}")

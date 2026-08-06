@@ -566,7 +566,11 @@ def _partial_entry_remainder_should_cancel(payload: dict[str, Any], inventory_re
     order_intent = _latest_entry_order_intent(inventory_repository, open_position)
     if order_intent is None:
         return False
-    requested = float(order_intent.get("quantity") or (order_intent.get("payload") or {}).get("quantity") or 0.0)
+    requested_value = order_intent.get("quantity")
+    if requested_value is None:
+        payload = order_intent.get("payload") if isinstance(order_intent.get("payload"), dict) else {}
+        requested_value = payload.get("quantity")
+    requested = float(requested_value) if requested_value is not None else 0.0
     return requested > float(open_position.quantity)
 
 
@@ -577,7 +581,8 @@ def _protective_order_missing(payload: dict[str, Any], *, symbol: str, quantity:
         if isinstance(order, dict):
             if str(order.get("status") or "").upper() in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "MISSING", "STALE"}:
                 return True
-            return float(order.get("quantity") or 0.0) + 1e-9 < float(quantity)
+            order_quantity = order.get("quantity")
+            return (float(order_quantity) if order_quantity is not None else 0.0) + 1e-9 < float(quantity)
     return int(lifecycle.protective_order_quantity) < int(round(quantity))
 
 
@@ -626,8 +631,8 @@ def _exit_inputs_from_payload(payload: dict[str, Any]) -> MetaStrategyExitInputs
         proposed_stop=_optional_float(payload.get("proposedStop") if "proposedStop" in payload else payload.get("proposed_stop")),
         ml_delay_requested=bool(payload.get("mlDelayRequested") or payload.get("ml_delay_requested") or False),
         partial_exit_enabled=bool(payload.get("partialExitEnabled") if "partialExitEnabled" in payload else payload.get("partial_exit_enabled", True)),
-        partial_exit_fraction=float(payload.get("partialExitFraction") or payload.get("partial_exit_fraction") or 0.5),
-        partial_exit_trigger_r=float(payload.get("partialExitTriggerR") or payload.get("partial_exit_trigger_r") or 1.0),
+        partial_exit_fraction=_float_value(payload.get("partialExitFraction") if payload.get("partialExitFraction") is not None else payload.get("partial_exit_fraction"), default=0.5),
+        partial_exit_trigger_r=_float_value(payload.get("partialExitTriggerR") if payload.get("partialExitTriggerR") is not None else payload.get("partial_exit_trigger_r"), default=1.0),
     )
 
 
@@ -636,14 +641,14 @@ def _position_from_payload(payload: dict[str, Any]) -> MetaStrategyPositionState
         position_id=str(payload.get("positionId") or payload.get("position_id") or ""),
         symbol=str(payload.get("symbol") or ""),
         side=str(payload.get("side") or "BUY"),  # type: ignore[arg-type]
-        original_quantity=_int_value(payload.get("originalQuantity") or payload.get("original_quantity") or payload.get("quantity") or 0),
-        remaining_quantity=_int_value(payload.get("remainingQuantity") or payload.get("remaining_quantity") or payload.get("quantity") or 0),
-        entry_price=float(payload.get("entryPrice") or payload.get("entry_price") or 0.0),
+        original_quantity=_int_value(_first_present(payload, "originalQuantity", "original_quantity", "quantity")),
+        remaining_quantity=_int_value(_first_present(payload, "remainingQuantity", "remaining_quantity", "quantity")),
+        entry_price=_float_value(_first_present(payload, "entryPrice", "entry_price"), default=0.0),
         opened_at=_parse_datetime(payload.get("openedAt") or payload.get("opened_at")),
-        protective_stop=float(payload.get("protectiveStop") or payload.get("protective_stop") or 0.0),
-        profit_target=float(payload.get("profitTarget") or payload.get("profit_target") or 0.0),
-        maximum_holding_minutes=_int_value(payload.get("maximumHoldingMinutes") or payload.get("maximum_holding_minutes") or 1),
-        protective_order_quantity=_int_value(payload.get("protectiveOrderQuantity") or payload.get("protective_order_quantity") or payload.get("quantity") or 0),
+        protective_stop=_float_value(_first_present(payload, "protectiveStop", "protective_stop"), default=0.0),
+        profit_target=_float_value(_first_present(payload, "profitTarget", "profit_target"), default=0.0),
+        maximum_holding_minutes=_int_value(_first_present(payload, "maximumHoldingMinutes", "maximum_holding_minutes", default=1)),
+        protective_order_quantity=_int_value(_first_present(payload, "protectiveOrderQuantity", "protective_order_quantity", "quantity")),
         partial_exit_taken=bool(payload.get("partialExitTaken") or payload.get("partial_exit_taken") or False),
     )
 
@@ -671,8 +676,19 @@ def _optional_float(value: Any) -> float | None:
     return None if value is None else float(value)
 
 
+def _float_value(value: Any, *, default: float) -> float:
+    return float(value) if value is not None else float(default)
+
+
 def _int_value(value: Any) -> int:
-    return int(float(value or 0))
+    return int(float(value) if value is not None else 0)
+
+
+def _first_present(payload: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if payload.get(key) is not None:
+            return payload[key]
+    return default
 
 
 def _jsonable(value: Any) -> Any:

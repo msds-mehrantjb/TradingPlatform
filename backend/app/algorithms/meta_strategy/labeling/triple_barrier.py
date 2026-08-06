@@ -414,7 +414,8 @@ def _candidate_geometry_values(geometry: CandidateGeometry | Mapping[str, Any] |
         target_price = geometry.target_price
     else:
         candidate_id = geometry.get("candidateId") or geometry.get("candidate_id")
-        quantity = float(geometry.get("quantity") or 0.0)
+        quantity_value = geometry.get("quantity")
+        quantity = float(quantity_value) if quantity_value is not None else 0.0
         stop_price = geometry.get("stopPrice", geometry.get("stop_price"))
         target_price = geometry.get("targetPrice", geometry.get("target_price"))
         if geometry.get("eligible") is False:

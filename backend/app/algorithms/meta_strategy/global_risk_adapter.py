@@ -89,7 +89,7 @@ class ReadOnlyMetaStrategyGlobalRiskAdapter:
         if self.available_risk_dollars is not None and self.stop_distance is not None and self.stop_distance > 0:
             caps.append(max(0, int(float(self.available_risk_dollars) // float(self.stop_distance))))
         approved = min(caps)
-        stop_distance = max(0.0, float(self.stop_distance or 0.0))
+        stop_distance = max(0.0, float(self.stop_distance) if self.stop_distance is not None else 0.0)
         reserved = approved * stop_distance
         return MetaStrategyGlobalRiskDecision(
             algorithm_id=ALGORITHM_ID,

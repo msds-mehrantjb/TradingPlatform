@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import defaultdict, deque
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta, timezone
@@ -24,7 +25,7 @@ import httpx
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from .alpaca import AlpacaClient, demo_bars, local_market_status, nyse_holiday_name
+from .alpaca import TIMEFRAME_MINUTES, AlpacaClient, demo_bars, local_market_status, nyse_holiday_name
 from .algorithms.regime.api import router as regime_router
 from .algorithms.regime.api import REGIME_REPOSITORY
 from .algorithms.regime.runtime_factory import get_regime_runtime_supervisor
@@ -87,10 +88,99 @@ settings = get_settings()
 store = CandleStore(settings)
 alpaca = AlpacaClient(settings)
 session_decision_store = SessionDecisionJsonlStore(root=SESSION_PERSISTENCE_ROOT)
-meta_strategy_runtime_supervisor = get_meta_strategy_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
 voting_ensemble_runtime_supervisor = get_voting_ensemble_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
 regime_runtime_supervisor = get_regime_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
-META_STRATEGY_SERVICE.set_runtime_readiness_provider(meta_strategy_runtime_supervisor.readiness_status)
+meta_strategy_runtime_supervisor = None
+UI_RESPONSE_CACHE_TTL_SECONDS = 5.0
+_UI_RESPONSE_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+
+
+def _api_embedded_meta_strategy_runtime_enabled() -> bool:
+    return bool(settings.api_embedded_algorithm_runtimes_enabled and settings.api_embedded_meta_strategy_runtime_enabled)
+
+
+def _get_api_meta_strategy_runtime_supervisor():
+    global meta_strategy_runtime_supervisor
+    if meta_strategy_runtime_supervisor is None:
+        meta_strategy_runtime_supervisor = get_meta_strategy_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
+    return meta_strategy_runtime_supervisor
+
+
+def _meta_strategy_runtime_readiness_for_api() -> dict[str, Any]:
+    if not _api_embedded_meta_strategy_runtime_enabled():
+        try:
+            snapshot = META_STRATEGY_SERVICE.job_repository.read_gateway_snapshot("meta_strategy.runtime.readiness")
+        except KeyError:
+            return _meta_strategy_external_runtime_unavailable("meta_strategy.runtime.external_worker_required")
+        if not isinstance(snapshot, dict):
+            return _meta_strategy_external_runtime_unavailable("meta_strategy.runtime.external_readiness_snapshot_invalid")
+        if not _meta_strategy_external_runtime_snapshot_fresh(snapshot.get("lastHealthCheckAt")):
+            reason_codes = tuple(snapshot.get("reasonCodes") or ())
+            return {
+                **snapshot,
+                "algorithmId": "meta_strategy",
+                "ready": False,
+                "status": "unavailable",
+                "paperOrdersBlocked": True,
+                "apiDisplayControlOnly": True,
+                "apiEmbeddedRuntimeEnabled": False,
+                "reasonCodes": (*reason_codes, "meta_strategy.runtime.external_readiness_snapshot_stale"),
+            }
+        return {
+            **snapshot,
+            "apiDisplayControlOnly": True,
+            "apiEmbeddedRuntimeEnabled": False,
+            "readinessSource": "external_worker_snapshot",
+        }
+    return _get_api_meta_strategy_runtime_supervisor().readiness_status()
+
+
+META_STRATEGY_SERVICE.set_runtime_readiness_provider(_meta_strategy_runtime_readiness_for_api)
+
+
+def _meta_strategy_external_runtime_unavailable(reason_code: str) -> dict[str, Any]:
+    return {
+        "algorithmId": "meta_strategy",
+        "ready": False,
+        "status": "external_worker_required",
+        "paperOrdersBlocked": True,
+        "apiDisplayControlOnly": True,
+        "apiEmbeddedRuntimeEnabled": False,
+        "reasonCodes": (reason_code,),
+    }
+
+
+def _meta_strategy_external_runtime_snapshot_fresh(value: object) -> bool:
+    if value is None:
+        return False
+    try:
+        observed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if observed.tzinfo is None:
+        return False
+    raw_limit = os.getenv("META_STRATEGY_RUNTIME_READINESS_SNAPSHOT_MAX_AGE_SECONDS", "30")
+    try:
+        max_age_seconds = max(1, int(raw_limit))
+    except ValueError:
+        max_age_seconds = 30
+    return (datetime.now(UTC) - observed.astimezone(UTC)).total_seconds() <= max_age_seconds
+
+
+def _read_ui_response_cache(key: tuple[Any, ...]) -> dict[str, Any] | None:
+    cached = _UI_RESPONSE_CACHE.get(key)
+    if cached is None:
+        return None
+    expires_at, payload = cached
+    if expires_at < time.monotonic():
+        _UI_RESPONSE_CACHE.pop(key, None)
+        return None
+    return deepcopy(payload)
+
+
+def _write_ui_response_cache(key: tuple[Any, ...], payload: dict[str, Any]) -> dict[str, Any]:
+    _UI_RESPONSE_CACHE[key] = (time.monotonic() + UI_RESPONSE_CACHE_TTL_SECONDS, deepcopy(payload))
+    return payload
 
 app = FastAPI(title="Trading Dashboard API", version="0.1.0")
 app.add_middleware(
@@ -184,11 +274,17 @@ async def start_daily_backtest_refresh_scheduler() -> None:
     assert_wca_module_catalog_valid()
     asyncio.create_task(end_of_day_backtest_refresh_scheduler())
     asyncio.create_task(market_forecast_ledger_scheduler())
-    WCA_FINALIZED_BAR_TASK = asyncio.create_task(wca_finalized_bar_scheduler())
-    await voting_ensemble_runtime_supervisor.start()
-    await get_weighted_voting_runtime_supervisor().start()
-    await regime_runtime_supervisor.start()
-    await meta_strategy_runtime_supervisor.start()
+    if settings.api_embedded_algorithm_runtimes_enabled:
+        if settings.api_embedded_wca_finalized_bar_enabled:
+            WCA_FINALIZED_BAR_TASK = asyncio.create_task(wca_finalized_bar_scheduler())
+        if settings.api_embedded_voting_ensemble_runtime_enabled:
+            await voting_ensemble_runtime_supervisor.start()
+        if settings.api_embedded_weighted_voting_runtime_enabled:
+            await get_weighted_voting_runtime_supervisor().start()
+        if settings.api_embedded_regime_runtime_enabled:
+            await regime_runtime_supervisor.start()
+        if settings.api_embedded_meta_strategy_runtime_enabled:
+            await _get_api_meta_strategy_runtime_supervisor().start()
 
 
 @app.on_event("shutdown")
@@ -198,10 +294,15 @@ async def stop_weighted_voting_runtime_supervisor() -> None:
         WCA_FINALIZED_BAR_TASK.cancel()
         await asyncio.gather(WCA_FINALIZED_BAR_TASK, return_exceptions=True)
         WCA_FINALIZED_BAR_TASK = None
-    await meta_strategy_runtime_supervisor.shutdown()
-    await regime_runtime_supervisor.shutdown()
-    await get_weighted_voting_runtime_supervisor().shutdown()
-    await voting_ensemble_runtime_supervisor.shutdown()
+    if settings.api_embedded_algorithm_runtimes_enabled:
+        if settings.api_embedded_meta_strategy_runtime_enabled:
+            await _get_api_meta_strategy_runtime_supervisor().shutdown()
+        if settings.api_embedded_regime_runtime_enabled:
+            await regime_runtime_supervisor.shutdown()
+        if settings.api_embedded_weighted_voting_runtime_enabled:
+            await get_weighted_voting_runtime_supervisor().shutdown()
+        if settings.api_embedded_voting_ensemble_runtime_enabled:
+            await voting_ensemble_runtime_supervisor.shutdown()
 
 
 DEFAULT_LOOKBACKS = {
@@ -1658,22 +1759,46 @@ async def candles(
     refresh: bool = True,
 ) -> dict:
     normalized_symbol = symbol.upper()
-    cached = store.latest(
+    cache_key = ("candles", normalized_symbol, feed, timeframe, limit, start or "", end or "", sort)
+    if not refresh:
+        cached_response = _read_ui_response_cache(cache_key)
+        if cached_response is not None:
+            return cached_response
+    cached = dedupe_candles_by_time(store.latest(
         symbol=normalized_symbol,
         timeframe=timeframe,
         feed=feed,
         limit=limit,
-    )
-
-    if cached and not refresh:
-        return {"source": "cache", "candles": cached}
-    if (
-        not refresh
-        and not start
+    ))
+    closed_intraday_request = (
+        not start
         and not end
         and timeframe in INTRADAY_CHART_TIMEFRAMES
         and local_market_is_closed()
-    ):
+    )
+
+    if cached and (not refresh or closed_intraday_request):
+        payload = {"source": "cache", "candles": cached}
+        if closed_intraday_request:
+            payload["warning"] = "Market is closed; showing last cached candles."
+            payload["sessionDate"] = latest_session_date(cached)
+        return _write_ui_response_cache(cache_key, payload)
+    if closed_intraday_request:
+        prepared_session_date, prepared_bars = prepared_last_available_bars(
+            symbol=normalized_symbol,
+            timeframe=timeframe,
+            feed=feed,
+            limit=limit,
+        )
+        if prepared_bars:
+            prepared_bars = dedupe_candles_by_time(prepared_bars)
+            store.upsert_many(prepared_bars)
+            return _write_ui_response_cache(cache_key, {
+                "source": "prepared-backtest-data",
+                "warning": f"Market is closed; showing last available prepared market session {prepared_session_date}.",
+                "candles": prepared_bars,
+                "sessionDate": prepared_session_date,
+            })
         try:
             session_date, session_bars = await completed_session_bars(
                 symbol=normalized_symbol,
@@ -1682,25 +1807,26 @@ async def candles(
                 limit=limit,
             )
             if session_bars:
+                session_bars = dedupe_candles_by_time(session_bars)
                 store.upsert_many(session_bars)
-                return {
+                return _write_ui_response_cache(cache_key, {
                     "source": session_bars[0]["provider"],
                     "warning": f"Market is closed; showing latest completed market session {session_date}.",
                     "candles": session_bars,
                     "sessionDate": session_date,
-                }
+                })
         except (TimeoutError, httpx.HTTPError) as exc:
-            return {
+            return _write_ui_response_cache(cache_key, {
                 "source": "cache",
                 "warning": f"No cached candles are available and latest completed session fetch failed: {exc}",
                 "candles": [],
-            }
+            })
     if not refresh:
-        return {
+        return _write_ui_response_cache(cache_key, {
             "source": "cache",
             "warning": "No cached candles are available for this symbol/feed/timeframe. Use refresh=true to request Alpaca data.",
             "candles": [],
-        }
+        })
 
     request_start = start
     request_end = end
@@ -1734,6 +1860,7 @@ async def candles(
             feed=feed,
             limit=limit,
         )
+        fallback = dedupe_candles_by_time(fallback)
         store.upsert_many(fallback)
         return {"source": "demo", "warning": warning, "candles": fallback}
     except httpx.HTTPStatusError as exc:
@@ -1750,9 +1877,11 @@ async def candles(
             feed=feed,
             limit=limit,
         )
+        fallback = dedupe_candles_by_time(fallback)
         store.upsert_many(fallback)
         return {"source": "demo", "warning": str(exc), "candles": fallback}
 
+    fresh = dedupe_candles_by_time(fresh)
     store.upsert_many(fresh)
     return {
         "source": fresh[0]["provider"] if fresh else "alpaca",
@@ -3537,6 +3666,66 @@ def local_market_is_closed() -> bool:
     return not bool(local_market_status().get("isOpen"))
 
 
+def prepared_last_available_bars(
+    *,
+    symbol: str,
+    feed: Literal["iex", "sip", "otc"],
+    timeframe: Literal["1Min", "3Min", "5Min", "15Min", "1Hour", "1Day"],
+    limit: int,
+) -> tuple[str | None, list[dict]]:
+    manifest = best_backtest_manifest_or_none(symbol)
+    files = manifest.get("files", {}) if manifest else {}
+    if not files:
+        return None, []
+
+    rows: list[dict] = []
+    if timeframe == "1Day":
+        rows = read_jsonl_tail(Path(str(files.get("dailyJsonl", ""))), limit)
+    elif timeframe == "1Min":
+        rows = read_json_if_exists(Path(str(files.get("latestDay1mJson", ""))))
+        if not rows:
+            rows = latest_session_from_prepared_1m(files)
+    elif timeframe == "5Min":
+        rows = read_json_if_exists(Path(str(files.get("latestDay5mJson", ""))))
+        if not rows:
+            rows = read_jsonl_tail(Path(str(files.get("continuous5mJsonl", ""))), limit)
+            session_date = latest_session_date(rows)
+            rows = filter_session_date(rows, session_date)
+    else:
+        one_minute = read_json_if_exists(Path(str(files.get("latestDay1mJson", "")))) or latest_session_from_prepared_1m(files)
+        minutes = TIMEFRAME_MINUTES.get(timeframe, 1)
+        rows = aggregate_candles(one_minute, timeframe=timeframe, minutes=minutes)
+
+    normalized = [
+        {
+            **row,
+            "provider": row.get("provider") or "prepared-backtest-data",
+            "feed": row.get("feed") or feed,
+            "symbol": str(row.get("symbol") or symbol).upper(),
+            "timeframe": timeframe,
+        }
+        for row in rows[-limit:]
+        if isinstance(row, dict) and row.get("timestamp") and row.get("close") is not None
+    ]
+    return latest_session_date(normalized), normalized
+
+
+def latest_session_from_prepared_1m(files: dict) -> list[dict]:
+    rows = read_jsonl_tail(Path(str(files.get("continuous1mJsonl", ""))), 1500)
+    session_date = latest_session_date(rows)
+    return filter_session_date(rows, session_date)
+
+
+def read_json_if_exists(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return payload if isinstance(payload, list) else []
+
+
 async def completed_session_bars(
     *,
     symbol: str,
@@ -4999,27 +5188,27 @@ def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timefram
             candle
             for candle in read_jsonl(one_minute_path)
             if start <= parse_utc_datetime(str(candle["timestamp"])) <= end
-        ] if one_minute_path.exists() else candles
+        ] if one_minute_path.is_file() else candles
         five_minute = [
             candle
             for candle in read_jsonl(five_minute_path)
             if start <= parse_utc_datetime(str(candle["timestamp"])) <= end
-        ] if five_minute_path.exists() else []
+        ] if five_minute_path.is_file() else []
         fifteen_minute = [
             candle
             for candle in read_jsonl(fifteen_minute_path)
             if start <= parse_utc_datetime(str(candle["timestamp"])) <= end
-        ] if fifteen_minute_path.exists() else []
+        ] if fifteen_minute_path.is_file() else []
         qqq_candles = [
             candle
             for candle in read_jsonl(qqq_path)
             if start <= parse_utc_datetime(str(candle["timestamp"])) <= end
-        ] if qqq_path.exists() else []
+        ] if qqq_path.is_file() else []
         iwm_candles = [
             candle
             for candle in read_jsonl(iwm_path)
             if start <= parse_utc_datetime(str(candle["timestamp"])) <= end
-        ] if iwm_path.exists() else []
+        ] if iwm_path.is_file() else []
         breadth_components = {
             symbol: [
                 candle
@@ -7262,6 +7451,24 @@ def parse_utc_datetime(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def canonical_candle_timestamp(value: object) -> str | None:
+    try:
+        parsed = parse_utc_datetime(str(value or ""))
+    except (TypeError, ValueError):
+        return None
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
+def dedupe_candles_by_time(candles: list[dict]) -> list[dict]:
+    by_time: dict[str, dict] = {}
+    for candle in candles:
+        canonical_timestamp = canonical_candle_timestamp(candle.get("timestamp"))
+        if canonical_timestamp is None:
+            continue
+        by_time[canonical_timestamp] = {**candle, "timestamp": canonical_timestamp}
+    return sorted(by_time.values(), key=lambda candle: str(candle["timestamp"]))
+
+
 def latest_session_date(candles: list[dict]) -> str | None:
     if not candles:
         return None
@@ -9420,6 +9627,11 @@ async def market_context(
 ) -> dict:
     normalized_symbol = symbol.upper()
     should_refresh = refresh and as_of is None
+    cache_key = ("market_context", normalized_symbol, feed, as_of or "")
+    if not should_refresh:
+        cached_response = _read_ui_response_cache(cache_key)
+        if cached_response is not None:
+            return cached_response
     daily = await _context_bars(
         symbol=normalized_symbol,
         feed=feed,
@@ -9438,6 +9650,8 @@ async def market_context(
     )
     context = compute_market_context(normalized_symbol, daily, intraday)
     persist_session_context_decision(context)
+    if not should_refresh:
+        return _write_ui_response_cache(cache_key, context)
     return context
 
 
@@ -9477,19 +9691,31 @@ async def _context_bars(
     as_of: str | None,
 ) -> list[dict]:
     cached = (
-        store.latest_until(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit, end=as_of)
+        dedupe_candles_by_time(store.latest_until(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit, end=as_of))
         if as_of
-        else store.latest(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit)
+        else dedupe_candles_by_time(store.latest(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit))
     )
-    if cached and not refresh:
+    closed_latest_request = as_of is None and local_market_is_closed()
+    if cached and (not refresh or closed_latest_request):
         return cached
     if (
         not cached
-        and not refresh
+        and (not refresh or closed_latest_request)
         and as_of is None
-        and timeframe == "1Min"
-        and local_market_is_closed()
     ):
+        prepared_timeframe: Literal["1Min", "1Day"] = "1Day" if timeframe == "1Day" else "1Min"
+        _, prepared = prepared_last_available_bars(
+            symbol=symbol,
+            feed=feed,
+            timeframe=prepared_timeframe,
+            limit=limit,
+        )
+        if prepared:
+            prepared = dedupe_candles_by_time(prepared)
+            store.upsert_many(prepared)
+            return prepared
+        if timeframe != "1Min":
+            return []
         try:
             _, session_bars = await completed_session_bars(
                 symbol=symbol,
@@ -9498,10 +9724,13 @@ async def _context_bars(
                 limit=limit,
             )
             if session_bars:
+                session_bars = dedupe_candles_by_time(session_bars)
                 store.upsert_many(session_bars)
                 return session_bars
         except (TimeoutError, httpx.HTTPError):
             return []
+    if not refresh:
+        return cached
 
     now = datetime.now(UTC)
     lookback = timedelta(days=900) if timeframe == "1Day" else timedelta(days=10)
@@ -9519,7 +9748,8 @@ async def _context_bars(
             timeout=CANDLE_REFRESH_TIMEOUT_SECONDS,
         )
     except (TimeoutError, httpx.HTTPError):
-        return cached or demo_bars(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit)
+        return cached or dedupe_candles_by_time(demo_bars(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit))
 
+    fresh = dedupe_candles_by_time(fresh)
     store.upsert_many(fresh)
     return fresh or cached

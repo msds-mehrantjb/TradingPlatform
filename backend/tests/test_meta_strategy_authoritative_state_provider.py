@@ -70,6 +70,51 @@ class MetaStrategyAuthoritativeDecisionStateProviderTest(unittest.TestCase):
         self.assertTrue(context.global_risk_snapshot["reject"])
         self.assertFalse(context.operational_health["tradingAllowed"])
 
+    def test_missing_authoritative_market_clock_blocks_without_local_calendar_fallback(self) -> None:
+        fixture = provider_fixture(market_clock_source=None)
+        settings = fixture.settings_store.create_baseline(build_meta_strategy_settings(settings_version="settings-no-clock"), actor="test")
+        fixture.store.upsert_many(candle_rows("SPY", "1Min", count=90, end=BAR_END - timedelta(minutes=1)))
+        fixture.store.upsert_many(candle_rows("SPY", "5Min", count=80, step=5, end=BAR_END - timedelta(minutes=5)))
+        fixture.store.upsert_many(candle_rows("SPY", "15Min", count=80, step=15, end=BAR_END - timedelta(minutes=15)))
+
+        context = fixture.provider.load_context(event(settings_version=settings.settings_version))
+
+        self.assertFalse(context.operational_health["marketCalendar"]["isOpen"])
+        self.assertIn("marketCalendar", context.event_state["missingMandatoryInputs"])
+        self.assertIn("meta_strategy.state_provider.authoritative_market_clock_missing", context.event_state["reasonCodes"])
+        self.assertFalse(context.operational_health["tradingAllowed"])
+
+    def test_paper_control_off_blocks_decision_time_new_entry_permission(self) -> None:
+        fixture = provider_fixture()
+        settings = fixture.settings_store.create_baseline(build_meta_strategy_settings(settings_version="settings-paper-off"), actor="test")
+        fixture.jobs.update_paper_trading_control(
+            new_paper_entries_enabled=False,
+            updated_by="test",
+            reason="meta_strategy.test.paper_off_at_decision",
+            now=BAR_END,
+        )
+        fixture.store.upsert_many(candle_rows("SPY", "1Min", count=90, end=BAR_END - timedelta(minutes=1)))
+        fixture.store.upsert_many(candle_rows("SPY", "5Min", count=80, step=5, end=BAR_END - timedelta(minutes=5)))
+        fixture.store.upsert_many(candle_rows("SPY", "15Min", count=80, step=15, end=BAR_END - timedelta(minutes=15)))
+
+        context = fixture.provider.load_context(event(settings_version=settings.settings_version))
+
+        self.assertFalse(context.operational_health["tradingAllowed"])
+        self.assertFalse(context.operational_health["paperControl"]["newPaperEntriesEnabled"])
+        self.assertIn("meta_strategy.paper_control.new_entry_blocked_at_decision", context.event_state["reasonCodes"])
+
+    def test_missing_paper_control_blocks_decision_time_new_entry_permission(self) -> None:
+        fixture = provider_fixture(arm_control=False)
+        settings = fixture.settings_store.create_baseline(build_meta_strategy_settings(settings_version="settings-paper-missing"), actor="test")
+        fixture.store.upsert_many(candle_rows("SPY", "1Min", count=90, end=BAR_END - timedelta(minutes=1)))
+        fixture.store.upsert_many(candle_rows("SPY", "5Min", count=80, step=5, end=BAR_END - timedelta(minutes=5)))
+        fixture.store.upsert_many(candle_rows("SPY", "15Min", count=80, step=15, end=BAR_END - timedelta(minutes=15)))
+
+        context = fixture.provider.load_context(event(settings_version=settings.settings_version))
+
+        self.assertFalse(context.operational_health["tradingAllowed"])
+        self.assertIn("meta_strategy.paper_control.state_unavailable", context.event_state["reasonCodes"])
+
     def test_inventory_snapshot_uses_only_meta_strategy_ledger_records_at_bar_end(self) -> None:
         fixture = provider_fixture()
         settings = fixture.settings_store.create_baseline(build_meta_strategy_settings(settings_version="settings-inventory"), actor="test")
@@ -85,6 +130,49 @@ class MetaStrategyAuthoritativeDecisionStateProviderTest(unittest.TestCase):
         self.assertEqual(context.inventory_snapshot["fills"][0]["brokerFillId"], "fill-before")
         self.assertEqual(context.inventory_snapshot["positions"][0]["quantity"], 3.0)
         self.assertEqual(context.inventory_snapshot["capitalPartitionId"], META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+        self.assertEqual(context.inventory_snapshot["lastTradeAt"], (BAR_END - timedelta(minutes=5)).isoformat())
+
+    def test_source_timestamps_versions_and_runtime_health_are_persistable_evidence(self) -> None:
+        fixture = provider_fixture()
+        requested = fixture.settings_store.create_baseline(build_meta_strategy_settings(settings_version="settings-evidence"), actor="test")
+        active = fixture.settings_store.create_baseline(build_meta_strategy_settings(settings_version="settings-active-evidence"), actor="test")
+        fixture.settings_store.activate_settings(active.settings_version, actor="test")
+        fixture.store.upsert_many(candle_rows("SPY", "1Min", count=90, end=BAR_END - timedelta(minutes=1)))
+        fixture.store.upsert_many(candle_rows("SPY", "5Min", count=80, step=5, end=BAR_END - timedelta(minutes=5)))
+        fixture.store.upsert_many(candle_rows("SPY", "15Min", count=80, step=15, end=BAR_END - timedelta(minutes=15)))
+
+        context = fixture.provider.load_context(event(settings_version=requested.settings_version))
+
+        self.assertEqual(context.event_state["sourceVersions"]["eventSettingsVersion"], requested.settings_version)
+        self.assertEqual(context.event_state["sourceVersions"]["activeSettingsVersion"], active.settings_version)
+        self.assertEqual(context.event_state["sourceTimestamps"]["decisionCutoff"], BAR_END.isoformat())
+        self.assertTrue(context.operational_health["runtimeHealth"]["ready"])
+        self.assertIn("operationalControls", context.operational_health)
+
+    def test_missing_authoritative_paper_account_state_blocks_new_entries(self) -> None:
+        fixture = provider_fixture(account_source=None)
+        settings = fixture.settings_store.create_baseline(build_meta_strategy_settings(settings_version="settings-no-account"), actor="test")
+        fixture.store.upsert_many(candle_rows("SPY", "1Min", count=90, end=BAR_END - timedelta(minutes=1)))
+        fixture.store.upsert_many(candle_rows("SPY", "5Min", count=80, step=5, end=BAR_END - timedelta(minutes=5)))
+        fixture.store.upsert_many(candle_rows("SPY", "15Min", count=80, step=15, end=BAR_END - timedelta(minutes=15)))
+
+        context = fixture.provider.load_context(event(settings_version=settings.settings_version))
+
+        self.assertFalse(context.operational_health["tradingAllowed"])
+        self.assertIn("accountSnapshot", context.event_state["missingMandatoryInputs"])
+        self.assertIn("meta_strategy.state_provider.account_snapshot_missing", context.event_state["reasonCodes"])
+
+    def test_wrong_capital_partition_is_rejected_in_point_in_time_context(self) -> None:
+        fixture = provider_fixture()
+        settings = fixture.settings_store.create_baseline(build_meta_strategy_settings(settings_version="settings-wrong-partition"), actor="test")
+        fixture.store.upsert_many(candle_rows("SPY", "1Min", count=90, end=BAR_END - timedelta(minutes=1)))
+        fixture.store.upsert_many(candle_rows("SPY", "5Min", count=80, step=5, end=BAR_END - timedelta(minutes=5)))
+        fixture.store.upsert_many(candle_rows("SPY", "15Min", count=80, step=15, end=BAR_END - timedelta(minutes=15)))
+
+        context = fixture.provider.load_context(event(settings_version=settings.settings_version, capital_partition_id="weighted_voting.paper.default"))
+
+        self.assertFalse(context.operational_health["tradingAllowed"])
+        self.assertIn("meta_strategy.state_provider.wrong_capital_partition", context.event_state["reasonCodes"])
 
 
 class StaticQuoteSource:
@@ -102,28 +190,62 @@ class StaticGlobalRiskSource:
         return {"availableRiskDollars": 1_000.0, "maxQuantity": 10_000, "reject": False, "capturedAt": at.isoformat(), "source": "test_global_risk_source"}
 
 
-def provider_fixture(*, quote_source=StaticQuoteSource()):
+class StaticMarketClockSource:
+    def get_clock(self):
+        return {"isOpen": True, "status": "open", "capturedAt": BAR_END.isoformat(), "source": "test_alpaca_paper_clock"}
+
+
+def provider_fixture(
+    *,
+    quote_source=StaticQuoteSource(),
+    account_source=StaticAccountSource(),
+    market_clock_source=StaticMarketClockSource(),
+    arm_control: bool = True,
+):
     database_url = f"sqlite:///{temp_db_path()}"
     settings_path = temp_db_path(prefix="meta-strategy-state-settings")
     store = CandleStore(SimpleNamespace(database_url=database_url))
     inventory = MetaStrategySqliteRepository(database_url)
     jobs = MetaStrategyJobRepository(database_url)
     settings_store = MetaStrategySettingsStore(settings_path)
+    if arm_control:
+        jobs.update_paper_trading_control(
+            new_paper_entries_enabled=True,
+            updated_by="test",
+            reason="meta_strategy.test.paper_on",
+            now=BAR_END,
+        )
+    jobs.write_gateway_snapshot(
+        "meta_strategy.runtime.readiness",
+        {
+            "algorithmId": "meta_strategy",
+            "enabled": True,
+            "ready": True,
+            "status": "ready",
+            "mode": "PAPER",
+            "paperOrdersBlocked": False,
+            "liveTradingEnabled": False,
+            "capturedAt": BAR_END.isoformat(),
+            "reasonCodes": ("meta_strategy.runtime.ready",),
+        },
+        now=BAR_END,
+    )
     provider = MetaStrategyAuthoritativeDecisionStateProvider(
         candle_store=store,
         inventory_repository=inventory,
         job_repository=jobs,
         settings_store=settings_store,
         quote_source=quote_source,
-        account_source=StaticAccountSource(),
+        account_source=account_source,
         global_risk_source=StaticGlobalRiskSource(),
+        market_clock_source=market_clock_source,
         history_limit=90,
         minimum_warmup=80,
     )
     return SimpleNamespace(provider=provider, store=store, inventory=inventory, jobs=jobs, settings_store=settings_store)
 
 
-def event(*, settings_version: str) -> MetaStrategyFinalisedBarDecisionEvent:
+def event(*, settings_version: str, capital_partition_id: str = META_STRATEGY_DEFAULT_CAPITAL_PARTITION) -> MetaStrategyFinalisedBarDecisionEvent:
     return MetaStrategyFinalisedBarDecisionEvent(
         event_id=f"event-{uuid4().hex}",
         job_id=f"job-{uuid4().hex}",
@@ -133,7 +255,7 @@ def event(*, settings_version: str) -> MetaStrategyFinalisedBarDecisionEvent:
         bar_end=BAR_END,
         settings_version=settings_version,
         idempotency_key=f"meta_strategy:{META_STRATEGY_DEFAULT_CAPITAL_PARTITION}:SPY:1m:{BAR_END.isoformat()}:{settings_version}",
-        capital_partition_id=META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+        capital_partition_id=capital_partition_id,
     )
 
 
@@ -184,4 +306,3 @@ def fill_payload(fill_id: str, *, timestamp: datetime, quantity: float, price: f
 
 def temp_db_path(*, prefix: str = "meta-strategy-state") -> str:
     return str((Path("data/test_tmp") / f"{prefix}-{uuid4().hex}.sqlite").resolve())
-

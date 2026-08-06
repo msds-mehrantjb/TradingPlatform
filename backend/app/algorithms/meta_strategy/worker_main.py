@@ -15,6 +15,7 @@ from backend.app.algorithms.meta_strategy.decision_worker import MetaStrategyDec
 from backend.app.algorithms.meta_strategy.jobs import META_STRATEGY_JOB_QUEUES, MetaStrategyJobRepository
 from backend.app.algorithms.meta_strategy.repository import MetaStrategySqliteRepository
 from backend.app.algorithms.meta_strategy.state_provider import MetaStrategyCandleStoreStateProvider
+from backend.app.algorithms.meta_strategy.settings import MetaStrategySettingsStore
 from backend.app.algorithms.meta_strategy.workers import (
     MetaStrategyBacktestingWorker,
     MetaStrategyFinalisedBarDecisionWorker,
@@ -30,7 +31,7 @@ from backend.app.algorithms.meta_strategy.workers import (
     MetaStrategyTrainingWorker,
 )
 from backend.app.execution import PaperOrderGateway
-from backend.app.gates import GlobalGateResponse, GlobalOrderProposal, NeutralGlobalGateService, response_from_neutral_gate
+from backend.app.gates import GlobalGateResponse, GlobalOrderProposal, NeutralGlobalGateService
 
 
 PAPER_EXECUTION_QUEUES = frozenset({"order_submission", "order_reconciliation", "stale_order_handling"})
@@ -108,6 +109,10 @@ def build_meta_strategy_worker(
     state_provider: MetaStrategyDecisionStateProvider | None = None,
     paper_gateway: PaperOrderGateway | None = None,
     global_risk_source: Any | None = None,
+    settings_store: MetaStrategySettingsStore | None = None,
+    runtime_readiness_source: Any | None = None,
+    readiness_report_source: Any | None = None,
+    market_clock_source: Any | None = None,
 ) -> Any:
     if repository is None:
         raise RuntimeError("meta_strategy.worker.repository_required")
@@ -126,6 +131,10 @@ def build_meta_strategy_worker(
             inventory_repository=_require_inventory_repository(inventory_repository),
             paper_gateway=_require_paper_gateway(paper_gateway),
             global_risk_source=_require_global_risk_source(global_risk_source),
+            settings_store=settings_store,
+            runtime_readiness_source=runtime_readiness_source,
+            readiness_report_source=readiness_report_source,
+            market_clock_source=market_clock_source,
             worker_id=worker_id,
         )
     if queue_name == "order_reconciliation":
@@ -180,75 +189,29 @@ class MetaStrategyWorkerGlobalRiskSource:
             "source": "meta_strategy.worker.global_risk_read_only_snapshot",
             "capitalPartitionId": capital_partition_id,
             "capturedAt": at.isoformat(),
-            "availableRiskDollars": 1_000.0,
-            "maxQuantity": 10_000,
-            "reject": False,
-            "tradingHalt": False,
+            "availableRiskDollars": 0.0,
+            "maxQuantity": 0,
+            "reject": True,
+            "tradingHalt": True,
             "authoritativeReadOnly": True,
-            "reasonCodes": ("meta_strategy.worker.global_risk_snapshot_available",),
+            "reasonCodes": (
+                "meta_strategy.sizing.global_risk_unavailable",
+                "meta_strategy.worker.global_risk_source_not_configured",
+            ),
         }
 
     def approve_order(self, proposal: GlobalOrderProposal) -> GlobalGateResponse:
         evaluated_at = datetime.now(UTC)
-        decision = self.service.evaluate(
-            {
-                "intent": proposal.intent,
-                "evaluatedAt": evaluated_at,
-                "sessionDate": proposal.sessionDate,
-                "symbol": proposal.symbol,
-                "operational": {
-                    "masterTradingEnabled": True,
-                    "paperTradingMode": True,
-                    "liveTradingRequested": False,
-                    "allowedSession": True,
-                    "marketCalendarOpen": True,
-                    "entryWindowOpen": True,
-                    "orderApiHealthy": True,
-                    "brokerConnected": True,
-                    "accountNotRestricted": True,
-                    "systemClockHealthy": True,
-                    "systemClockDriftSeconds": 0.0,
-                    "emergencyKillSwitch": False,
-                },
-                "data": {
-                    "freshCandle": True,
-                    "freshQuote": True,
-                    "candleAgeSeconds": 0.0,
-                    "quoteAgeSeconds": 0.0,
-                    "validMarketData": True,
-                    "corruptedMarketData": False,
-                },
-                "market": {
-                    "tradingHalt": False,
-                    "luldActive": False,
-                    "marketWideCircuitBreaker": False,
-                    "absoluteSpreadBps": 0.0,
-                    "globalEventBlackout": False,
-                },
-                "accountRisk": {
-                    "equity": max(1.0, float(proposal.settingsSnapshot.get("allocatedCapital") or 1.0)),
-                    "dailyPnl": 0.0,
-                    "accountDrawdownPercent": 0.0,
-                    "totalOpenRiskPercent": 0.0,
-                    "grossExposurePercent": 0.0,
-                    "netExposurePercent": 0.0,
-                    "perSymbolExposurePercent": 0.0,
-                    "buyingPowerReservePercent": 100.0,
-                    "pendingOrderRiskPercent": 0.0,
-                },
-                "orderFlow": {
-                    "orderRateLastMinute": 0,
-                    "duplicateOrder": False,
-                    "idempotencyKeySeen": False,
-                    "idempotencyKeyValid": True,
-                },
-            }
-        )
-        return response_from_neutral_gate(
-            proposal,
-            decision,
-            maximum_allowed_quantity=int(proposal.quantity),
-            maximum_additional_risk_dollars=float(proposal.plannedRiskDollars),
+        return GlobalGateResponse(
+            action="REJECT_NEW_ENTRY",
+            maximumAllowedQuantity=0,
+            maximumAdditionalRiskDollars=0.0,
+            rejectionReasons=(
+                "meta_strategy.sizing.global_risk_unavailable",
+                "meta_strategy.worker.global_risk_source_not_configured",
+            ),
+            evaluatedAt=evaluated_at,
+            configurationHash="meta_strategy.worker.global_risk_fail_closed",
         )
 
 
@@ -270,8 +233,8 @@ def _require_paper_gateway(paper_gateway: PaperOrderGateway | None) -> PaperOrde
     if paper_gateway is None:
         raise RuntimeError("meta_strategy.worker.paper_broker_required")
     broker = getattr(paper_gateway, "broker", None)
-    if getattr(broker, "broker_kind", None) != "alpaca_paper" or getattr(broker, "configured", False) is not True or getattr(broker, "paper_endpoint", False) is not True:
-        raise RuntimeError("meta_strategy.worker.configured_alpaca_paper_broker_required")
+    if getattr(broker, "broker_kind", None) not in {"alpaca_paper", "local_paper", "local_paper_ledger"} or getattr(broker, "configured", False) is not True or getattr(broker, "paper_endpoint", False) is not True:
+        raise RuntimeError("meta_strategy.worker.configured_paper_broker_required")
     return paper_gateway
 
 

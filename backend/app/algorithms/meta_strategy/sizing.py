@@ -105,9 +105,9 @@ def calculate_meta_strategy_position_size(
         return _zero_result(context, settings, "candidate", ("meta_strategy.sizing.candidate_rejected_or_hold",))
     if not context.local_gates_passed:
         return _zero_result(context, settings, "local_gates", ("meta_strategy.sizing.local_gate_failed",))
-    invalid_reason = _invalid_market_reason(context)
-    if invalid_reason:
-        return _zero_result(context, settings, "invalid_market", (invalid_reason,))
+    invalid_reasons = _invalid_market_reasons(context)
+    if invalid_reasons:
+        return _zero_result(context, settings, "invalid_market", invalid_reasons)
 
     base_risk = max(0.0, context.account_equity * context.baseline_settings.risk_percentage)
     dynamic_risk = min(base_risk, max(0.0, context.account_equity * context.effective_settings.risk_percentage))
@@ -189,22 +189,33 @@ def _zero_result(
     )
 
 
-def _invalid_market_reason(context: MetaStrategySizingContext) -> str:
+def _invalid_market_reasons(context: MetaStrategySizingContext) -> tuple[str, ...]:
+    reasons: list[str] = []
     if context.entry_price <= 0:
-        return "meta_strategy.sizing.invalid_entry_price"
+        reasons.append("meta_strategy.sizing.invalid_entry_price")
     if context.stop_distance <= 0:
-        return "meta_strategy.sizing.invalid_stop_distance"
-    if context.account_equity <= 0:
-        return "meta_strategy.sizing.invalid_account_equity"
+        reasons.append("meta_strategy.sizing.invalid_stop_distance")
+    if context.account_equity < 0:
+        reasons.extend(("meta_strategy.sizing.non_finite_input", "meta_strategy.sizing.invalid_account_equity"))
+    elif context.account_equity == 0:
+        reasons.extend(("meta_strategy.sizing.zero_account_equity", "meta_strategy.sizing.invalid_account_equity"))
     if context.available_buying_power < 0:
-        return "meta_strategy.sizing.invalid_buying_power"
+        reasons.extend(("meta_strategy.sizing.non_finite_input", "meta_strategy.sizing.invalid_buying_power"))
+    elif context.available_buying_power == 0:
+        reasons.append("meta_strategy.sizing.zero_buying_power")
     if context.market_liquidity < 0:
-        return "meta_strategy.sizing.invalid_liquidity"
+        reasons.append("meta_strategy.sizing.invalid_liquidity")
     if context.remaining_algorithm_risk < 0:
-        return "meta_strategy.sizing.invalid_remaining_algorithm_risk"
+        reasons.extend(("meta_strategy.sizing.non_finite_input", "meta_strategy.sizing.invalid_remaining_algorithm_risk"))
+    elif context.remaining_algorithm_risk == 0:
+        reasons.append("meta_strategy.sizing.zero_algorithm_risk")
     if context.global_available_risk < 0:
-        return "meta_strategy.sizing.invalid_global_risk"
-    return ""
+        reasons.extend(("meta_strategy.sizing.non_finite_input", "meta_strategy.sizing.invalid_global_risk"))
+    elif context.global_available_risk == 0:
+        reasons.append("meta_strategy.sizing.zero_global_risk")
+    if context.global_quantity_cap == 0:
+        reasons.append("meta_strategy.sizing.zero_approved_quantity")
+    return tuple(dict.fromkeys(reasons))
 
 
 def _cap(cap_id: str, quantity: int, basis: str) -> MetaStrategySizingCap:

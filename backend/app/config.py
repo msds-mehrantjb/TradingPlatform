@@ -61,6 +61,12 @@ class Settings:
     database_url: str
     allowed_origins: list[str]
     application_config: ApplicationConfig
+    api_embedded_algorithm_runtimes_enabled: bool = False
+    api_embedded_meta_strategy_runtime_enabled: bool = False
+    api_embedded_voting_ensemble_runtime_enabled: bool = False
+    api_embedded_weighted_voting_runtime_enabled: bool = False
+    api_embedded_regime_runtime_enabled: bool = False
+    api_embedded_wca_finalized_bar_enabled: bool = False
 
     @property
     def has_alpaca_credentials(self) -> bool:
@@ -100,6 +106,12 @@ def get_settings() -> Settings:
                 metaStrategyRuntimeMode=meta_strategy_runtime_mode,
             )
         ),
+        api_embedded_algorithm_runtimes_enabled=_env_bool("API_EMBEDDED_ALGORITHM_RUNTIMES_ENABLED", False),
+        api_embedded_meta_strategy_runtime_enabled=_env_bool("API_EMBEDDED_META_STRATEGY_RUNTIME_ENABLED", False),
+        api_embedded_voting_ensemble_runtime_enabled=_env_bool("API_EMBEDDED_VOTING_ENSEMBLE_RUNTIME_ENABLED", False),
+        api_embedded_weighted_voting_runtime_enabled=_env_bool("API_EMBEDDED_WEIGHTED_VOTING_RUNTIME_ENABLED", False),
+        api_embedded_regime_runtime_enabled=_env_bool("API_EMBEDDED_REGIME_RUNTIME_ENABLED", False),
+        api_embedded_wca_finalized_bar_enabled=_env_bool("API_EMBEDDED_WCA_FINALIZED_BAR_ENABLED", False),
     )
 
 

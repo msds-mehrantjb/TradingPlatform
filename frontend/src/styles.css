@@ -2709,6 +2709,14 @@ select {
   background: #ffffff;
 }
 
+.wca-trading-actions {
+  justify-content: flex-end;
+}
+
+.wca-trading-actions .primary-action {
+  white-space: nowrap;
+}
+
 .regime-trading-settings-panel {
   border-color: #f0abfc;
   background: #fdf4ff;

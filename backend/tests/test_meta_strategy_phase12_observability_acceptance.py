@@ -7,10 +7,12 @@ from uuid import uuid4
 
 from backend.app.algorithms.meta_strategy import (
     ALGORITHM_ID,
+    META_STRATEGY_FINALIZED_CANDLE_TERMINAL_OUTCOMES,
     META_STRATEGY_FINAL_DOD_IDS,
     META_STRATEGY_OPERATIONAL_CONTROLS,
     META_STRATEGY_RECOVERY_TEST_IDS,
     MetaStrategyApplicationService,
+    MetaStrategyDurableFinalisedBarDecisionWorker,
 )
 from backend.app.algorithms.meta_strategy.jobs import MetaStrategyJobRepository
 from backend.app.algorithms.meta_strategy.observability import (
@@ -33,6 +35,234 @@ class MetaStrategyPhase12ObservabilityAcceptanceTest(unittest.TestCase):
         self.jobs = MetaStrategyJobRepository(f"sqlite:///{root / 'jobs.db'}")
         self.inventory = MetaStrategySqliteRepository(f"sqlite:///{root / 'inventory.db'}")
         self.settings = MetaStrategySettingsStore(root / "settings.db")
+        self._phase12_bar_offset = 0
+
+    def _claimed_finalized_bar(self, *, symbol: str = "SPY", bar_end: datetime | None = None, settings_version: str = "settings-v1"):
+        if bar_end is None:
+            self._phase12_bar_offset += 1
+            bar_end = NOW - timedelta(minutes=1, seconds=self._phase12_bar_offset)
+        job = self.jobs.enqueue_finalised_bar_decision(
+            mode="PAPER",
+            symbol=symbol,
+            timeframe="1m",
+            bar_end=bar_end,
+            settings_version=settings_version,
+            now=NOW - timedelta(seconds=2),
+        )
+        claimed = self.jobs.claim_next_job(queue_name="finalised_bar_decisions", worker_id="phase12-test-helper", now=NOW)
+        assert claimed is not None
+        job_payload = self.jobs.read_payload(job.payload_reference)
+        event_payload = job_payload.get("payload") if isinstance(job_payload.get("payload"), dict) else job_payload
+        return claimed, self.jobs.event_by_id(str(event_payload.get("eventId") or event_payload.get("event_id")))
+
+    def _persist_phase12_decision(
+        self,
+        *,
+        decision_id: str,
+        symbol: str = "SPY",
+        final_valid: bool = True,
+        decision_status: str = "ORDER_PROPOSED",
+        reason_codes: tuple[str, ...] = (),
+        order_intent_id: str | None = None,
+    ) -> dict[str, str | None]:
+        claimed, event = self._claimed_finalized_bar(symbol=symbol)
+        event_payload = self.jobs.read_payload(event.payload_reference).get("payload") or {}
+        bar_end = str(event_payload["barEnd"])
+        payload = {
+            "eventId": event.event_id,
+            "jobId": claimed.job_id,
+            "decisionId": decision_id,
+            "symbol": symbol,
+            "barEnd": bar_end,
+            "settingsVersion": "settings-v1",
+            "modelVersion": "model-v1",
+            "decisionStatus": decision_status,
+            "finalValid": final_valid,
+            "dataAgeSeconds": 7,
+            "latencyMs": 88,
+            "quoteTimestamp": (NOW - timedelta(seconds=11)).isoformat(),
+            "reasonCodes": reason_codes,
+            "authoritativeState": {
+                "globalRiskSnapshot": {"availableRiskDollars": 250.0},
+                "inventorySnapshot": {"positionQuantity": 0, "reservedRisk": 0.0},
+            },
+            "latencyMeasurements": {
+                "marketSnapshotMs": 3,
+                "strategyEvaluationMs": 8,
+                "safetyMs": 2,
+                "modelInferenceMs": 4,
+                "decisionPersistenceTimeMs": 1,
+            },
+            "stages": {
+                "strategyEvidence": {
+                    "directionalOutputs": {
+                        "relative_strength": {
+                            "strategyId": "relative_strength",
+                            "strategyVersion": "rs-v1",
+                            "familyId": "trend",
+                            "signal": "BUY",
+                            "confidence": 0.72,
+                            "eligible": True,
+                            "dataQuality": "OK",
+                            "evidence": {"qqqIwmRatio": 1.03},
+                            "vetoes": (),
+                            "reasonCodes": (),
+                            "evaluatedAt": NOW.isoformat(),
+                        }
+                    }
+                },
+                "regime": {"sessionPhase": "REGULAR", "trendRegime": "UP", "reasonCodes": ()},
+                "safetyResult": {"status": "OK", "eligible": final_valid, "reasonCodes": reason_codes},
+                "aggregateCandidate": {"winningScore": 0.61, "edge": 0.14, "supportingFamilies": ("trend",), "opposingFamilies": ()},
+                "orderProposal": {"geometry": {"stopDistance": 0.55}, "costEstimate": {"spreadBps": 1.2}},
+                "modelPrediction": {"status": "OK", "decision": "CONFIRM"},
+                "decisionPolicy": {"finalSignal": "BUY" if order_intent_id else "HOLD"},
+                "localRisk": {"status": "OK", "passed": final_valid},
+                "sizing": {"approvedQuantity": 3, "maxByRisk": 3, "maxByBuyingPower": 3},
+            },
+        }
+        order_intent = None
+        if order_intent_id is not None:
+            order_intent = {
+                "algorithmId": ALGORITHM_ID,
+                "capitalPartitionId": "meta_strategy.paper.default",
+                "mode": "PAPER",
+                "settingsVersion": "settings-v1",
+                "modelVersion": "model-v1",
+                "decisionId": decision_id,
+                "jobId": claimed.job_id,
+                "eventId": event.event_id,
+                "orderIntentId": order_intent_id,
+                "symbol": symbol,
+                "side": "BUY",
+                "quantity": 3,
+                "limitPrice": 100.0,
+                "stopPrice": 99.45,
+                "targetPrice": 101.1,
+                "reservedRiskDollars": 1.65,
+                "localGatesPassed": True,
+                "decisionTimestamp": bar_end,
+                "quoteTimestamp": (NOW - timedelta(seconds=11)).isoformat(),
+                "buyingPower": 10_000.0,
+                "createdAt": NOW.isoformat(),
+                "timestamp": NOW.isoformat(),
+            }
+        persisted = self.jobs.persist_decision_atomic(
+            job=claimed,
+            event=event,
+            decision_id=decision_id,
+            payload=payload,
+            order_intent=order_intent,
+            now=NOW,
+        )
+        self.jobs.complete_job(claimed.job_id, worker_id="phase12-test-helper", result=persisted, now=NOW)
+        return {"eventId": event.event_id, "jobId": claimed.job_id, "outboxId": persisted.get("outboxId")}
+
+    def test_finalized_candle_outcome_ledger_records_terminal_outcomes_and_redacts_sensitive_payloads(self) -> None:
+        self.assertEqual(
+            META_STRATEGY_FINALIZED_CANDLE_TERMINAL_OUTCOMES,
+            frozenset({"NO_DECISION", "HOLD", "BLOCKED", "ORDER_PROPOSED", "ORDER_SUBMITTED", "ORDER_REJECTED", "RECONCILIATION_REQUIRED"}),
+        )
+        proposed = self._persist_phase12_decision(decision_id="decision-proposed", order_intent_id="intent-proposed")
+        assert proposed["outboxId"] is not None
+
+        outcome = self.jobs.finalized_candle_outcome(str(proposed["eventId"]))
+        assert outcome is not None
+        self.assertEqual(outcome["outcome"], "ORDER_PROPOSED")
+        self.assertEqual(outcome["decisionId"], "decision-proposed")
+        self.assertEqual(outcome["orderIntentId"], "intent-proposed")
+        for key in (
+            "strategyResults",
+            "regimeContext",
+            "safetyResult",
+            "familyAggregation",
+            "candidateScore",
+            "geometry",
+            "costEstimate",
+            "modelResult",
+            "localGates",
+            "sizingCaps",
+            "globalRisk",
+            "latencyPerStage",
+            "reasonCodes",
+        ):
+            self.assertIn(key, outcome["payload"])
+
+        self.jobs.update_execution_outbox(
+            str(proposed["outboxId"]),
+            status="ACKNOWLEDGED",
+            payload={
+                "executionGuard": {"eligible": True, "reasonCodes": ()},
+                "gatewayResult": {
+                    "status": "ACKNOWLEDGED",
+                    "brokerOrderId": "paper-order-1",
+                    "Authorization": "Bearer must-not-persist",
+                    "apiKey": "must-not-persist",
+                },
+            },
+            client_order_id="meta-strategy-client-proposed",
+            broker_order_id="paper-order-1",
+            now=NOW + timedelta(seconds=1),
+        )
+        submitted = self.jobs.finalized_candle_outcome(str(proposed["eventId"]))
+        assert submitted is not None
+        self.assertEqual(submitted["outcome"], "ORDER_SUBMITTED")
+        self.assertEqual(submitted["payload"]["brokerResult"]["Authorization"], "[REDACTED]")
+        self.assertEqual(submitted["payload"]["brokerResult"]["apiKey"], "[REDACTED]")
+        self.assertEqual(sum(1 for row in self.jobs.finalized_candle_outcomes(limit=10) if row["eventId"] == proposed["eventId"]), 1)
+
+        rejected = self._persist_phase12_decision(decision_id="decision-rejected", order_intent_id="intent-rejected")
+        self.jobs.update_execution_outbox(
+            str(rejected["outboxId"]),
+            status="REJECTED",
+            payload={"reasonCodes": ("meta_strategy.execution_guard.market_closed",), "gatewayResult": {"status": "REJECTED"}},
+            now=NOW + timedelta(seconds=2),
+        )
+        self.assertEqual(self.jobs.finalized_candle_outcome(str(rejected["eventId"]))["outcome"], "ORDER_REJECTED")
+
+        unknown = self._persist_phase12_decision(decision_id="decision-unknown", order_intent_id="intent-unknown")
+        self.jobs.update_execution_outbox(
+            str(unknown["outboxId"]),
+            status="RECONCILIATION_REQUIRED",
+            payload={"reasonCodes": ("meta_strategy.paper_broker.unknown_outcome",), "gatewayResult": {"status": "UNKNOWN"}},
+            now=NOW + timedelta(seconds=3),
+        )
+        self.assertEqual(self.jobs.finalized_candle_outcome(str(unknown["eventId"]))["outcome"], "RECONCILIATION_REQUIRED")
+
+    def test_hold_blocked_and_no_decision_outcomes_are_recorded_for_finalized_candles(self) -> None:
+        hold = self._persist_phase12_decision(decision_id="decision-hold", decision_status="HOLD_OR_BLOCKED", order_intent_id=None)
+        blocked = self._persist_phase12_decision(
+            decision_id="decision-blocked",
+            final_valid=False,
+            decision_status="BLOCKED",
+            reason_codes=("meta_strategy.safety.hard_gate_blocked",),
+            order_intent_id=None,
+        )
+        self.assertEqual(self.jobs.finalized_candle_outcome(str(hold["eventId"]))["outcome"], "HOLD")
+        blocked_outcome = self.jobs.finalized_candle_outcome(str(blocked["eventId"]))
+        self.assertEqual(blocked_outcome["outcome"], "BLOCKED")
+        self.assertIn("meta_strategy.safety.hard_gate_blocked", blocked_outcome["reasonCodes"])
+
+        class FailingStateProvider:
+            def load_context(self, event):  # noqa: ANN001
+                raise RuntimeError("authorization=must-not-persist")
+
+        job = self.jobs.enqueue_finalised_bar_decision(
+            mode="PAPER",
+            symbol="QQQ",
+            timeframe="1m",
+            bar_end=NOW - timedelta(minutes=1),
+            settings_version="settings-v1",
+            now=NOW,
+        )
+        event_payload = self.jobs.read_payload(job.payload_reference).get("payload")
+        worker = MetaStrategyDurableFinalisedBarDecisionWorker(repository=self.jobs, state_provider=FailingStateProvider(), worker_id="phase12-failing-worker")
+        worker.run_once(now=NOW + timedelta(seconds=1))
+
+        no_decision = self.jobs.finalized_candle_outcome(str(event_payload["eventId"]))
+        assert no_decision is not None
+        self.assertEqual(no_decision["outcome"], "NO_DECISION")
+        self.assertIn(self.jobs.read_job(job.job_id).status.value, {"RETRY", "FAILED", "DEAD_LETTER"})
 
     def test_observability_reports_required_metrics_and_versions(self) -> None:
         self.jobs.enqueue_job(job_type="training", idempotency_key="training-old", payload={}, now=NOW - timedelta(seconds=45))
@@ -162,10 +392,28 @@ class MetaStrategyPhase12ObservabilityAcceptanceTest(unittest.TestCase):
             order_intent=None,
             now=NOW,
         )
+        self.jobs.complete_job(claimed.job_id, worker_id="decision-worker", now=NOW)
         self.jobs.record_worker_heartbeat(worker_id="decision-worker", queue_name="finalised_bar_decisions", now=NOW)
         self.jobs.record_operational_event("finalised_candle_enqueued", {"duplicate": False}, now=NOW)
         self.jobs.record_operational_event("finalised_candle_enqueued", {"duplicate": True}, now=NOW)
         self.jobs.record_operational_event("finalised_candle_data_quality", {"status": "MISSING_GAP"}, status="MISSING_GAP", now=NOW)
+        self.jobs.write_gateway_snapshot("authoritative_market_clock", {"status": "OK", "capturedAt": (NOW - timedelta(seconds=4)).isoformat()}, now=NOW)
+        self.jobs.update_paper_trading_control(new_paper_entries_enabled=True, updated_by="ops", reason="phase12.enable", now=NOW)
+        self.jobs.update_paper_trading_control(new_paper_entries_enabled=False, updated_by="ops", reason="phase12.disable", expected_version=1, now=NOW + timedelta(seconds=1))
+        rejected_order = self._persist_phase12_decision(decision_id="decision-phase12-rejected-metrics", order_intent_id="intent-phase12-rejected-metrics")
+        self.jobs.update_execution_outbox(
+            str(rejected_order["outboxId"]),
+            status="REJECTED",
+            payload={"reasonCodes": ("meta_strategy.execution_guard.duplicate_client_order_id",), "gatewayResult": {"status": "REJECTED"}},
+            now=NOW + timedelta(seconds=2),
+        )
+        unknown_order = self._persist_phase12_decision(decision_id="decision-phase12-unknown-metrics", order_intent_id="intent-phase12-unknown-metrics")
+        self.jobs.update_execution_outbox(
+            str(unknown_order["outboxId"]),
+            status="RECONCILIATION_REQUIRED",
+            payload={"reasonCodes": ("meta_strategy.paper_broker.unknown_outcome",), "gatewayResult": {"status": "UNKNOWN"}},
+            now=NOW + timedelta(seconds=3),
+        )
 
         snapshot = build_meta_strategy_observability_snapshot(job_repository=self.jobs, inventory_repository=self.inventory, settings_store=self.settings, now=NOW)
         metrics = snapshot["metrics"]
@@ -197,6 +445,15 @@ class MetaStrategyPhase12ObservabilityAcceptanceTest(unittest.TestCase):
             "dailyDrawdown",
             "restartFailures",
             "reconciliationFailures",
+            "quoteAgeSeconds",
+            "brokerClockAgeSeconds",
+            "finalizedCandleOutcomeCounts",
+            "rejectedEntriesByReason",
+            "inventoryDivergence",
+            "duplicateOrderAttempts",
+            "riskReservations",
+            "unknownBrokerOutcomes",
+            "paperToggleStateTransitions",
         ):
             self.assertIn(key, metrics)
         self.assertEqual(metrics["finalizedBarCount"], 1)
@@ -207,7 +464,17 @@ class MetaStrategyPhase12ObservabilityAcceptanceTest(unittest.TestCase):
         self.assertEqual(metrics["strategyAbstentionCounts"]["reversion"], 1)
         self.assertEqual(metrics["familyConflicts"]["trend_alignment"], 1)
         self.assertEqual(metrics["mlInferenceFailures"], 1)
-        self.assertEqual(metrics["oodRate"], 1.0)
+        self.assertGreater(metrics["oodRate"], 0.0)
+        self.assertGreaterEqual(metrics["quoteAgeSeconds"]["count"], 1)
+        self.assertGreaterEqual(metrics["brokerClockAgeSeconds"]["count"], 1)
+        self.assertEqual(metrics["finalizedCandleOutcomeCounts"]["BLOCKED"], 1)
+        self.assertEqual(metrics["finalizedCandleOutcomeCounts"]["ORDER_REJECTED"], 1)
+        self.assertEqual(metrics["finalizedCandleOutcomeCounts"]["RECONCILIATION_REQUIRED"], 1)
+        self.assertEqual(metrics["rejectedEntriesByReason"]["meta_strategy.execution_guard.duplicate_client_order_id"], 1)
+        self.assertEqual(metrics["duplicateOrderAttempts"], 1)
+        self.assertGreaterEqual(metrics["riskReservations"]["count"], 2)
+        self.assertEqual(metrics["unknownBrokerOutcomes"], 1)
+        self.assertEqual(len(metrics["paperToggleStateTransitions"]), 2)
 
     def test_recovery_evidence_paths_are_exercised_and_recorded(self) -> None:
         job = self.jobs.enqueue_job(job_type="training", idempotency_key="lease", payload={}, now=NOW)

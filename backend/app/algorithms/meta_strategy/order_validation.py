@@ -97,7 +97,8 @@ def validate_meta_strategy_order(context: MetaStrategyOrderValidationContext) ->
         context.reward_risk,
         ">0",
     )
-    notional = float(intent.quantity) * abs(float(context.entry_price or 0.0))
+    notional_entry = context.entry_price if context.entry_price is not None else 0.0
+    notional = float(intent.quantity) * abs(float(notional_entry))
     _check(
         notional <= float(context.available_buying_power),
         failures,
@@ -133,7 +134,10 @@ def validate_meta_strategy_order(context: MetaStrategyOrderValidationContext) ->
         spread,
         context.max_spread_bps,
     )
-    liquidity = float((context.snapshot.liquidity or {}).get("shareVolume") or context.snapshot.volume or 0.0)
+    liquidity_value = (context.snapshot.liquidity or {}).get("shareVolume")
+    if liquidity_value is None:
+        liquidity_value = context.snapshot.volume
+    liquidity = float(liquidity_value) if liquidity_value is not None else 0.0
     _check(
         liquidity >= float(context.minimum_liquidity),
         failures,
