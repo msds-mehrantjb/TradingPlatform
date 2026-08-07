@@ -691,7 +691,8 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
 
             self.assertIsNotNone(recovery)
             assert recovery is not None
-            self.assertEqual(recovery["status"], "RECONCILED")
+            self.assertEqual(recovery["status"], "VALIDATED")
+            self.assertTrue(recovery["brokerReconciliationSkipped"])
             self.assertEqual(recovery["brokerPositionsObserved"], 0)
             self.assertEqual(recovery["recovery"]["status"], "RECOVERED")
             self.assertEqual(recovery["recovery"]["markRecompute"]["symbolsMarked"], ["SPY"])
@@ -753,7 +754,8 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
 
             self.assertIsNotNone(recovery)
             assert recovery is not None
-            self.assertEqual(recovery["status"], "RECONCILIATION_REQUIRED")
+            self.assertEqual(recovery["status"], "LOCAL_CONSISTENCY_REQUIRED")
+            self.assertTrue(recovery["brokerReconciliationSkipped"])
             self.assertEqual(recovery["recovery"]["status"], "RECOVERY_FAILED")
             self.assertIn("voting_ensemble.local_paper_recovery.cash_fill_invariant_failed", recovery["recovery"]["reasonCodes"])
             self.assertFalse(blocked_entry["enqueued"])
@@ -803,7 +805,8 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
         recovery = runtime.reconcile_broker_state(evaluated_at=NOW)
         inventory = runtime.inventory_snapshot()
 
-        self.assertEqual(recovery["status"], "RECONCILIATION_REQUIRED")
+        self.assertEqual(recovery["status"], "LOCAL_CONSISTENCY_REQUIRED")
+        self.assertTrue(recovery["brokerReconciliationSkipped"])
         self.assertIn("voting_ensemble.local_paper_recovery.account_missing_with_existing_inventory", recovery["recovery"]["reasonCodes"])
         self.assertIsNone(inventory["account"])
         self.assertNotIn("voting_ensemble.paper_execution.local_account.latest", repository.snapshots)
@@ -840,7 +843,10 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             second = runtime.reconcile_broker_state(evaluated_at=NOW + timedelta(seconds=2))
             inventory = runtime.inventory_snapshot()
 
-            self.assertEqual(first["status"], "RECONCILED")
+            self.assertEqual(first["status"], "VALIDATED")
+            self.assertEqual(second["status"], "VALIDATED")
+            self.assertTrue(first["brokerReconciliationSkipped"])
+            self.assertTrue(second["brokerReconciliationSkipped"])
             self.assertEqual(first["recovery"]["migration"]["status"], "MIGRATED")
             self.assertEqual(first["recovery"]["migration"]["migratedSymbols"], ["SPY"])
             self.assertEqual(second["recovery"]["migration"]["status"], "MIGRATED")
@@ -893,7 +899,8 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             )
             inventory = runtime.inventory_snapshot()
 
-            self.assertEqual(recovery["status"], "RECONCILIATION_REQUIRED")
+            self.assertEqual(recovery["status"], "LOCAL_CONSISTENCY_REQUIRED")
+            self.assertTrue(recovery["brokerReconciliationSkipped"])
             self.assertEqual(recovery["recovery"]["status"], "RECOVERY_FAILED")
             self.assertIn("voting_ensemble.local_paper_migration.account_cash_or_pnl_not_reconstructable", recovery["recovery"]["reasonCodes"])
             self.assertEqual(inventory["localFillMigration"]["status"], "FAILED")

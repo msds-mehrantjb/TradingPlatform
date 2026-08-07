@@ -451,6 +451,59 @@ class VotingEnsemblePaperExecutionRepository:
         self.write_snapshot("local_recovery.latest", payload)
         return self.read_snapshot("local_recovery.latest")
 
+    def validate_local_consistency(self, *, evaluated_at: datetime) -> dict[str, Any]:
+        observed = _require_utc(evaluated_at)
+        snapshots = dict(self.snapshots)
+        account_key = f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_account.latest"
+        account = dict(snapshots.get(account_key) or {})
+        failures: list[str] = []
+        if not account:
+            if _has_persisted_local_inventory_without_account(snapshots):
+                failures.append("voting_ensemble.local_paper_consistency.account_missing_with_existing_inventory")
+            else:
+                self.local_account_snapshot(observed_at=observed)
+                snapshots = dict(self.snapshots)
+                account = dict(snapshots.get(account_key) or {})
+        if account:
+            failures.extend(_validate_local_recovery_state(account=account, snapshots=snapshots))
+            failures.extend(_local_consistency_invariant_failures(account=account, snapshots=snapshots))
+        else:
+            failures.append("voting_ensemble.local_paper_consistency.account_missing")
+        status = "VALIDATED" if not failures else "LOCAL_CONSISTENCY_REQUIRED"
+        payload = {
+            "schemaVersion": "voting_ensemble_local_consistency_v1",
+            "executionMode": "LOCAL_PAPER",
+            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+            "status": status,
+            "consistencyStatus": status,
+            "sourceAuthority": "voting_ensemble_local_paper_account",
+            "normalRuntimeAuthority": "canonical_local_inventory_positions_not_broker_reconciliation",
+            "newEntriesBlocked": bool(failures),
+            "riskReducingExitsPreserved": True,
+            "accountCashEquityInvariantHealthy": "voting_ensemble.local_paper_consistency.account_equity_invariant_failed" not in failures,
+            "positionQuantityInvariantHealthy": "voting_ensemble.local_paper_recovery.position_quantity_fill_invariant_failed" not in failures,
+            "ordersVsFillsInvariantHealthy": not any(code.startswith("voting_ensemble.local_paper_consistency.order_") for code in failures),
+            "ownershipInvariantHealthy": not any("foreign_" in code or "owner_mismatch" in code or "mismatch" in code for code in failures),
+            "appliedFillIdUniquenessHealthy": not any("applied_fill_id" in code for code in failures),
+            "riskStateConsistencyHealthy": not any(code.startswith("voting_ensemble.local_paper_consistency.risk_") for code in failures),
+            "ordersValidated": len(_records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_order.")),
+            "fillsValidated": len(_local_recovery_fill_records(snapshots)),
+            "positionsValidated": len(_records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_position.")),
+            "riskSnapshotsValidated": len(_records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_risk_snapshot.")),
+            "brokerAccountsObserved": 0,
+            "brokerPositionsObserved": 0,
+            "brokerOrdersObserved": 0,
+            "brokerFillsObserved": 0,
+            "evaluatedAt": observed.isoformat().replace("+00:00", "Z"),
+            "reasonCodes": (
+                ["voting_ensemble.local_paper_consistency.validated"]
+                if not failures
+                else ["voting_ensemble.local_paper_consistency.failed", *sorted(set(failures))]
+            ),
+        }
+        self.write_snapshot("local_consistency.latest", payload)
+        return self.read_snapshot("local_consistency.latest")
+
     def _migrate_legacy_fill_derived_state_if_needed(self, *, evaluated_at: datetime) -> dict[str, Any]:
         try:
             existing = self.read_snapshot("local_fill_migration.latest")
@@ -754,6 +807,7 @@ class VotingEnsemblePaperExecutionRepository:
         local_inventory_manifests = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_inventory_manifest.")
         local_market_clocks = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_market_clock.")
         local_recoveries = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_recovery.")
+        local_consistencies = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_consistency.")
         local_fill_migrations = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_fill_migration.")
         local_executions = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_execution.")
         reconciliation_blocks = [
@@ -790,6 +844,8 @@ class VotingEnsemblePaperExecutionRepository:
             "localMarketClock": local_market_clocks[-1] if local_market_clocks else None,
             "localRecovery": local_recoveries[-1] if local_recoveries else None,
             "localRecoveries": local_recoveries,
+            "localConsistency": local_consistencies[-1] if local_consistencies else None,
+            "localConsistencies": local_consistencies,
             "localFillMigration": local_fill_migrations[-1] if local_fill_migrations else None,
             "localFillMigrations": local_fill_migrations,
             "localExecutions": local_executions,
@@ -1774,33 +1830,91 @@ class VotingEnsemblePaperExecutionRuntime:
     def reconcile_broker_state(self, *, evaluated_at: datetime | None = None) -> dict[str, Any] | None:
         now = evaluated_at or datetime.now(UTC)
         if self.execution_mode == "LOCAL_PAPER":
-            recovery = self.repository.recover_local_inventory_from_persistence(evaluated_at=_require_utc(now))
-            evaluator = getattr(self.paper_gateway.broker, "evaluate_open_protective_orders", None)
-            protective_fills = evaluator() if callable(evaluator) else []
-            eod_updates = self._local_end_of_day_updates(evaluated_at=_require_utc(now))
-            inventory = self.repository.inventory_snapshot()
-            status = "RECONCILED" if recovery.get("status") == "RECOVERED" and not inventory.get("reconciliationBlocks") else "RECONCILIATION_REQUIRED"
+            maintenance = self.run_local_position_order_maintenance(evaluated_at=_require_utc(now))
+            consistency = self.validate_local_consistency(evaluated_at=_require_utc(now))
             return {
-                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
-                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
-                "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
-                "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
-                "executionMode": "LOCAL_PAPER",
-                "status": status,
-                "recovery": recovery,
-                "ordersObserved": len(inventory.get("orders") or []),
-                "positionsObserved": len(inventory.get("positions") or []),
-                "protectiveFillsObserved": len(protective_fills),
-                "eodUpdates": eod_updates,
-                "eodExitsSubmitted": len([item for item in eod_updates if item.get("submitted")]),
-                "brokerPositionsObserved": 0,
-                "evaluatedAt": _require_utc(now).isoformat().replace("+00:00", "Z"),
-                "reasonCodes": ["voting_ensemble.local_paper.reconciliation_uses_local_inventory_only"],
+                **consistency,
+                "protectiveFillsObserved": maintenance["protectiveFillsObserved"],
+                "eodUpdates": maintenance["eodUpdates"],
+                "eodExitsSubmitted": maintenance["eodExitsSubmitted"],
+                "brokerReconciliationSkipped": True,
             }
         result = self.worker.reconcile_broker_state(evaluated_at=now)
         if result is not None:
             return result
         return self.paper_gateway.recover_from_restart(evaluated_at=now)
+
+    def run_local_position_order_maintenance(self, *, evaluated_at: datetime | None = None) -> dict[str, Any]:
+        now = _require_utc(evaluated_at or datetime.now(UTC))
+        if self.execution_mode != "LOCAL_PAPER":
+            return {
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                "executionMode": self.execution_mode,
+                "status": "SKIPPED",
+                "protectiveFillsObserved": 0,
+                "eodUpdates": [],
+                "eodExitsSubmitted": 0,
+                "evaluatedAt": now.isoformat().replace("+00:00", "Z"),
+                "reasonCodes": ["voting_ensemble.local_paper_maintenance.skipped_for_broker_paper_mode"],
+            }
+        evaluator = getattr(self.paper_gateway.broker, "evaluate_open_protective_orders", None)
+        protective_fills = evaluator() if callable(evaluator) else []
+        eod_updates = self._local_end_of_day_updates(evaluated_at=now)
+        return {
+            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+            "executionMode": "LOCAL_PAPER",
+            "status": "MAINTAINED",
+            "protectiveFillsObserved": len(protective_fills),
+            "eodUpdates": eod_updates,
+            "eodExitsSubmitted": len([item for item in eod_updates if item.get("submitted")]),
+            "brokerAccountsObserved": 0,
+            "brokerPositionsObserved": 0,
+            "brokerOrdersObserved": 0,
+            "brokerFillsObserved": 0,
+            "evaluatedAt": now.isoformat().replace("+00:00", "Z"),
+            "reasonCodes": ["voting_ensemble.local_paper_maintenance.local_inventory_maintenance_completed"],
+        }
+
+    def validate_local_consistency(self, *, evaluated_at: datetime | None = None) -> dict[str, Any]:
+        now = _require_utc(evaluated_at or datetime.now(UTC))
+        if self.execution_mode != "LOCAL_PAPER":
+            return {
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                "executionMode": self.execution_mode,
+                "status": "SKIPPED",
+                "evaluatedAt": now.isoformat().replace("+00:00", "Z"),
+                "reasonCodes": ["voting_ensemble.local_paper_consistency.skipped_for_broker_paper_mode"],
+            }
+        recovery = self.repository.recover_local_inventory_from_persistence(evaluated_at=now)
+        consistency = self.repository.validate_local_consistency(evaluated_at=now)
+        inventory = self.repository.inventory_snapshot()
+        status = "VALIDATED" if recovery.get("status") == "RECOVERED" and consistency.get("status") == "VALIDATED" else "LOCAL_CONSISTENCY_REQUIRED"
+        return {
+            **consistency,
+            "status": status,
+            "consistencyStatus": status,
+            "recovery": recovery,
+            "ordersObserved": len(inventory.get("orders") or []),
+            "positionsObserved": len(inventory.get("positions") or []),
+            "brokerAccountsObserved": 0,
+            "brokerPositionsObserved": 0,
+            "brokerOrdersObserved": 0,
+            "brokerFillsObserved": 0,
+            "reasonCodes": (
+                ["voting_ensemble.local_paper_consistency.validated"]
+                if status == "VALIDATED"
+                else ["voting_ensemble.local_paper_consistency.failed", *list(recovery.get("reasonCodes") or []), *list(consistency.get("reasonCodes") or [])]
+            ),
+        }
 
     def mark_to_market_from_payload(self, payload: Mapping[str, Any] | None, *, observed_at: datetime | None = None) -> dict[str, Any] | None:
         if self.execution_mode != "LOCAL_PAPER" or not isinstance(payload, Mapping):
@@ -3397,6 +3511,62 @@ def _local_recovery_accounting_failures(
     return failures
 
 
+def _local_consistency_invariant_failures(*, account: Mapping[str, Any], snapshots: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    failures: list[str] = []
+    local_positions = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_position.")
+    local_orders = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_order.")
+    local_fills = _local_recovery_fill_records(snapshots)
+    applied_fill_records = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.applied_fill.")
+    risk_snapshots = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_risk_snapshot.")
+
+    expected_equity = _signed_float(account.get("cash")) + sum(_signed_float(position.get("marketValue", position.get("notional"))) for position in local_positions)
+    if local_positions and abs(expected_equity - _signed_float(account.get("equity"))) > 0.05:
+        failures.append("voting_ensemble.local_paper_consistency.account_equity_invariant_failed")
+    if _signed_float(account.get("buyingPower")) - _signed_float(account.get("cash")) > 0.05:
+        failures.append("voting_ensemble.local_paper_consistency.buying_power_exceeds_cash_without_margin")
+
+    fill_ids = [str(record.get("appliedFillId")) for record in applied_fill_records if record.get("appliedFillId")]
+    if len(fill_ids) != len(set(fill_ids)):
+        failures.append("voting_ensemble.local_paper_consistency.applied_fill_id_duplicate_record")
+    account_fill_ids = [str(item) for item in account.get("appliedFillIds") or []]
+    if len(account_fill_ids) != len(set(account_fill_ids)):
+        failures.append("voting_ensemble.local_paper_consistency.account_applied_fill_id_duplicate")
+
+    filled_by_order: dict[str, int] = {}
+    for fill in local_fills:
+        client_order_id = str(fill.get("clientOrderId") or fill.get("orderId") or "")
+        if not client_order_id:
+            failures.append("voting_ensemble.local_paper_consistency.fill_order_id_missing")
+            continue
+        filled_by_order[client_order_id] = filled_by_order.get(client_order_id, 0) + _safe_int(fill.get("filledQuantity"))
+    for order in local_orders:
+        client_order_id = str(order.get("clientOrderId") or order.get("orderId") or "")
+        quantity = _safe_int(order.get("quantity"))
+        filled_quantity = _safe_int(order.get("filledQuantity"))
+        observed_filled_quantity = filled_by_order.get(client_order_id, 0)
+        if quantity > 0 and observed_filled_quantity > quantity:
+            failures.append("voting_ensemble.local_paper_consistency.order_overfilled")
+        if filled_quantity and abs(filled_quantity - observed_filled_quantity) > 0:
+            failures.append("voting_ensemble.local_paper_consistency.order_filled_quantity_mismatch")
+        if str(order.get("capitalPartitionId") or "") != VOTING_ENSEMBLE_CAPITAL_PARTITION_ID:
+            failures.append("voting_ensemble.local_paper_consistency.order_foreign_capital_partition")
+        if order.get("algorithmId", order.get("algorithm_id")) != VOTING_ENSEMBLE_ALGORITHM_ID:
+            failures.append("voting_ensemble.local_paper_consistency.order_foreign_algorithm")
+
+    total_unrealized = sum(_signed_float(position.get("unrealizedPnl")) for position in local_positions)
+    if abs(total_unrealized - _signed_float(account.get("unrealizedPnl"))) > 0.05:
+        failures.append("voting_ensemble.local_paper_consistency.unrealized_pnl_invariant_failed")
+    if risk_snapshots:
+        latest_risk = risk_snapshots[-1]
+        if latest_risk.get("accountId", VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID) != VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID:
+            failures.append("voting_ensemble.local_paper_consistency.risk_account_mismatch")
+        if latest_risk.get("capitalPartitionId") != VOTING_ENSEMBLE_CAPITAL_PARTITION_ID:
+            failures.append("voting_ensemble.local_paper_consistency.risk_capital_partition_mismatch")
+        if _signed_float(latest_risk.get("equity")) and abs(_signed_float(latest_risk.get("equity")) - _signed_float(account.get("equity"))) > 0.05:
+            failures.append("voting_ensemble.local_paper_consistency.risk_equity_mismatch")
+    return sorted(set(failures))
+
+
 def _reconstruct_local_positions_from_fills(local_fills: list[Mapping[str, Any]], *, evaluated_at: datetime) -> dict[str, Any]:
     states: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
@@ -4016,6 +4186,13 @@ def _float(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(0.0, parsed)
+
+
+def _signed_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _local_paper_env_float(name: str, default: float) -> float:

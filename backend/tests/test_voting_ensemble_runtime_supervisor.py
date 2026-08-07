@@ -284,6 +284,40 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("voting_ensemble.control.paper_credentials_missing", enabled["reasonCodes"])
         self.assertNotIn("voting_ensemble.paper_ready.alpaca_paper_client_not_configured", status["paperReadyBlockingReasonCodes"])
 
+    async def test_local_paper_supervisor_uses_local_consistency_not_broker_reconciliation(self) -> None:
+        self.supervisor = supervisor_with_runtime(settings=paper_settings(), market_clock_provider=lambda: {"isOpen": True})
+        broker_calls: list[datetime] = []
+        local_calls: list[datetime] = []
+
+        def broker_reconcile(*, evaluated_at: datetime):
+            broker_calls.append(evaluated_at)
+            raise AssertionError("LOCAL_PAPER supervisor must not call broker reconciliation")
+
+        def validate_local_consistency(*, evaluated_at: datetime):
+            local_calls.append(evaluated_at)
+            return {
+                "algorithmId": "voting_ensemble",
+                "capitalPartitionId": "voting_ensemble.paper.default",
+                "accountId": "voting_ensemble.paper.default.account",
+                "executionMode": "LOCAL_PAPER",
+                "status": "VALIDATED",
+                "brokerAccountsObserved": 0,
+                "brokerPositionsObserved": 0,
+                "brokerOrdersObserved": 0,
+                "brokerFillsObserved": 0,
+                "reasonCodes": ["voting_ensemble.local_paper_consistency.validated"],
+            }
+
+        self.supervisor.paper_execution_runtime.reconcile_broker_state = broker_reconcile  # type: ignore[method-assign]
+        self.supervisor.paper_execution_runtime.validate_local_consistency = validate_local_consistency  # type: ignore[method-assign]
+
+        await self.supervisor.start()
+
+        self.assertEqual(broker_calls, [])
+        self.assertGreaterEqual(len(local_calls), 1)
+        self.assertEqual(self.supervisor.metrics.lastReconciliation["status"], "VALIDATED")
+        self.assertEqual(self.supervisor.metrics.lastReconciliation["brokerPositionsObserved"], 0)
+
     async def test_paper_off_blocks_new_entries_but_not_exit_and_reconciliation_work(self) -> None:
         self.supervisor = supervisor_with_runtime(settings=paper_settings(), market_clock_provider=lambda: {"isOpen": True})
         await self.supervisor.start()

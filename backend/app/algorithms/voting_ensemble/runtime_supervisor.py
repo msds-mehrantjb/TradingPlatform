@@ -650,20 +650,30 @@ class VotingEnsembleRuntimeSupervisor:
 
     async def _position_order_manager_loop(self) -> None:
         while not self.stop_event.is_set():
-            gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
-            if gateway is not None:
-                await asyncio.to_thread(gateway.cancel_stale_orders, evaluated_at=datetime.now(UTC))
+            if _is_local_paper_mode(self.paper_execution_runtime):
+                local_maintenance = getattr(self.paper_execution_runtime, "run_local_position_order_maintenance", None)
+                if callable(local_maintenance):
+                    await asyncio.to_thread(local_maintenance, evaluated_at=datetime.now(UTC))
+            else:
+                gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
+                if gateway is not None:
+                    await asyncio.to_thread(gateway.cancel_stale_orders, evaluated_at=datetime.now(UTC))
             await asyncio.sleep(self.config.reconciliation_poll_seconds)
 
     async def _reconciliation_loop(self) -> None:
         while not self.stop_event.is_set():
-            broker_reconcile = getattr(self.paper_execution_runtime, "reconcile_broker_state", None)
-            if callable(broker_reconcile):
-                self.metrics.lastReconciliation = await asyncio.to_thread(broker_reconcile, evaluated_at=datetime.now(UTC))
+            if _is_local_paper_mode(self.paper_execution_runtime):
+                local_validate = getattr(self.paper_execution_runtime, "validate_local_consistency", None)
+                if callable(local_validate):
+                    self.metrics.lastReconciliation = await asyncio.to_thread(local_validate, evaluated_at=datetime.now(UTC))
             else:
-                gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
-                if gateway is not None:
-                    self.metrics.lastReconciliation = await asyncio.to_thread(gateway.recover_from_restart, evaluated_at=datetime.now(UTC))
+                broker_reconcile = getattr(self.paper_execution_runtime, "reconcile_broker_state", None)
+                if callable(broker_reconcile):
+                    self.metrics.lastReconciliation = await asyncio.to_thread(broker_reconcile, evaluated_at=datetime.now(UTC))
+                else:
+                    gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
+                    if gateway is not None:
+                        self.metrics.lastReconciliation = await asyncio.to_thread(gateway.recover_from_restart, evaluated_at=datetime.now(UTC))
             await asyncio.sleep(self.config.reconciliation_poll_seconds)
 
     async def _legacy_reconciliation_loop(self) -> None:
@@ -788,14 +798,18 @@ class VotingEnsembleRuntimeSupervisor:
 
     def _run_reconciliation_once(self) -> None:
         try:
+            if _is_local_paper_mode(self.paper_execution_runtime):
+                local_validate = getattr(self.paper_execution_runtime, "validate_local_consistency", None)
+                if callable(local_validate):
+                    self.metrics.lastReconciliation = local_validate(evaluated_at=datetime.now(UTC))
+                return
             broker_reconcile = getattr(self.paper_execution_runtime, "reconcile_broker_state", None)
             if callable(broker_reconcile):
                 self.metrics.lastReconciliation = broker_reconcile(evaluated_at=datetime.now(UTC))
                 return
             gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
-            if gateway is None:
-                return
-            self.metrics.lastReconciliation = gateway.recover_from_restart(evaluated_at=datetime.now(UTC))
+            if gateway is not None:
+                self.metrics.lastReconciliation = gateway.recover_from_restart(evaluated_at=datetime.now(UTC))
         except Exception as exc:
             self.record_worker_failure("reconciliation_loop", exc)
 
@@ -1115,6 +1129,11 @@ def _local_inventory_healthy(inventory: dict[str, Any]) -> bool:
     if isinstance(recovery, dict):
         status = str(recovery.get("status") or recovery.get("recoveryStatus") or "").upper()
         if status in {"FAILED", "RECOVERY_FAILED", "CORRUPTED", "CORRUPT", "BLOCKED"}:
+            return False
+    consistency = inventory.get("localConsistency")
+    if isinstance(consistency, dict):
+        status = str(consistency.get("status") or consistency.get("consistencyStatus") or "").upper()
+        if status in {"FAILED", "LOCAL_CONSISTENCY_REQUIRED", "CORRUPTED", "CORRUPT", "BLOCKED"}:
             return False
     return True
 
