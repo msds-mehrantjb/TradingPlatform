@@ -23,6 +23,7 @@ from .algorithms.voting_ensemble.strategies.registry import (
 from .config import get_settings
 from .database import CandleStore
 from .market_context import compute_market_context
+from .market_forecast import MARKET_FORECAST_SERVICE
 
 
 settings = get_settings()
@@ -209,6 +210,62 @@ def strategy_fit_inventory() -> dict[str, Any]:
     }
 
 
+@app.get("/api/market-forecast/prediction")
+async def market_forecast_prediction(
+    symbol: str = Query("SPY", min_length=1, max_length=12),
+    feed: Literal["iex", "sip", "otc"] = "iex",
+    timeframe: Literal["1Min"] = "1Min",
+    limit: int = Query(240, ge=60, le=1000),
+    refresh: bool = False,
+) -> dict[str, Any]:
+    normalized_symbol = symbol.upper()
+    cache_key = ("market_forecast_prediction", normalized_symbol, feed, timeframe, limit, refresh)
+    cached_response = _read_response_cache(cache_key)
+    if cached_response is not None:
+        return cached_response
+
+    candles_for_prediction = _dedupe_candles(await _store_latest(symbol=normalized_symbol, timeframe=timeframe, feed=feed, limit=limit))
+    if refresh and settings.has_alpaca_credentials:
+        try:
+            fresh = await asyncio.wait_for(
+                alpaca.get_bars(
+                    symbol=normalized_symbol,
+                    timeframe=timeframe,
+                    feed=feed,
+                    limit=limit,
+                    start=None,
+                    end=None,
+                    sort="asc",
+                ),
+                timeout=min(3.0, CANDLE_REFRESH_TIMEOUT_SECONDS),
+            )
+            fresh = _dedupe_candles(fresh)
+            await _store_upsert(fresh)
+            candles_for_prediction = fresh or candles_for_prediction
+        except (TimeoutError, httpx.HTTPError):
+            pass
+    if not candles_for_prediction:
+        candles_for_prediction = _dedupe_candles(demo_bars(symbol=normalized_symbol, timeframe=timeframe, feed=feed, limit=limit))
+
+    try:
+        forecast = await asyncio.wait_for(
+            asyncio.to_thread(MARKET_FORECAST_SERVICE.predict, candles_for_prediction, microstructure_rows=[]),
+            timeout=3.0,
+        )
+        forecast["sourceAuthority"] = "lightweight_market_data_service.market_forecast_advisory"
+        return _write_response_cache(cache_key, forecast)
+    except (TimeoutError, Exception) as exc:
+        latest = candles_for_prediction[-1] if candles_for_prediction else None
+        return _write_response_cache(
+            cache_key,
+            _lightweight_forecast_unavailable(
+                symbol=normalized_symbol,
+                latest=latest,
+                reason=f"Forecast inference is still warming up on the lightweight service: {type(exc).__name__}",
+            ),
+        )
+
+
 async def _context_bars(
     *,
     symbol: str,
@@ -282,6 +339,169 @@ def _voting_ensemble_strategy_catalog_modules() -> dict[str, list[dict[str, Any]
         "regime": [_voting_ensemble_strategy_module_payload(entry) for entry in VOTING_ENSEMBLE_REGIME_STRATEGIES],
         "safety": [_voting_ensemble_strategy_module_payload(entry) for entry in VOTING_ENSEMBLE_SAFETY_STRATEGIES],
         "aggregator": [_voting_ensemble_strategy_module_payload(entry) for entry in VOTING_ENSEMBLE_AGGREGATOR_STRATEGIES],
+    }
+
+
+def _lightweight_forecast_unavailable(*, symbol: str, latest: dict[str, Any] | None, reason: str) -> dict[str, Any]:
+    now = _now_iso()
+    close = float((latest or {}).get("close") or 0.0)
+    timestamp = str((latest or {}).get("timestamp") or now)
+    horizons = [_lightweight_forecast_horizon(close, horizon, reason) for horizon in (5, 10, 15)]
+    return {
+        "forecastInvocationId": f"{symbol}|{now}|lightweight-fallback",
+        "eventTimestamp": timestamp,
+        "barFinalizationTimestamp": timestamp,
+        "featureReadyTimestamp": None,
+        "inferenceStartTimestamp": None,
+        "inferenceEndTimestamp": None,
+        "decisionTimestamp": now,
+        "status": "INFERENCE_NOT_RUN",
+        "forecastStatus": "INFERENCE_NOT_RUN",
+        "forecast_status": "INFERENCE_NOT_RUN",
+        "symbol": symbol,
+        "horizonMinutes": 5,
+        "probabilitySuccess": None,
+        "probabilityBuySuccess": None,
+        "probabilitySellSuccess": None,
+        "probabilityStop": None,
+        "probabilityTimeout": None,
+        "probability_buy": None,
+        "probability_sell": None,
+        "outcome": {
+            "predicted": "timeout_no_edge",
+            "probabilities": {"target_hit_first": None, "stop_hit_first": None, "timeout_no_edge": None},
+            "labels": {"target_hit_first": 1, "stop_hit_first": -1, "timeout_no_edge": 0},
+        },
+        "decision": {
+            "action": "no_trade",
+            "candidateAction": "no_trade",
+            "confidence": None,
+            "edgeGap": None,
+            "minimumConfidence": 0.55,
+            "minimumEdgeGap": 0.05,
+            "modelDisagreement": None,
+            "maximumModelDisagreement": 0.1,
+            "expectedValue": None,
+            "positionSizeMultiplier": 0.0,
+            "reasons": [reason],
+        },
+        "threshold": 0.55,
+        "minimumEdgeGap": 0.05,
+        "maximumModelDisagreement": 0.1,
+        "expectedValue": None,
+        "buyExpectedValue": None,
+        "sellExpectedValue": None,
+        "barriers": {
+            "targetDistance": None,
+            "stopDistance": None,
+            "fixedTargetDollars": 0.35,
+            "minTargetPct": 0.0005,
+            "minStopPct": 0.0005,
+            "targetAtrMultiplier": 1.0,
+            "stopAtrMultiplier": 1.0,
+        },
+        "expectedMove": None,
+        "futurePricePrediction": _lightweight_no_edge_price_prediction(close, 5, reason),
+        "multiHorizonForecast": {
+            "status": "INFERENCE_NOT_RUN",
+            "forecastStatus": "INFERENCE_NOT_RUN",
+            "activationPolicy": "advisory_only_until_live_paper_validation",
+            "positionManagementAuthority": "advisory_only",
+            "entryAuthorization": False,
+            "forecastAppliedToOrder": False,
+            "positionManagementAppliedToOrder": False,
+            "summary": {
+                "primaryBias": "MODEL_UNAVAILABLE",
+                "longPosition": "NO_ML_ADVICE",
+                "shortPosition": "NO_ML_ADVICE",
+                "newLongEntry": "WAIT_FOR_VALIDATED_MODEL",
+                "readyHorizons": 0,
+            },
+            "horizons": horizons,
+        },
+        "costs": 0.0,
+        "allowed": False,
+        "inferencePerformed": False,
+        "inference_performed": False,
+        "forecastAppliedToOrder": False,
+        "forecast_applied_to_order": False,
+        "model": {
+            "status": "warming_up",
+            "kind": "lightweight_advisory_fallback",
+            "message": reason,
+        },
+        "regime": {
+            "trend": "unknown",
+            "volatility": "unknown",
+            "vwap": "unknown",
+            "timeOfDay": "unknown",
+        },
+        "marketRegime": {
+            "trend": "unknown",
+            "volatility": "unknown",
+            "session": "unknown",
+            "allowedLong": False,
+            "allowedShort": False,
+            "thresholdAdjustment": 0.0,
+            "positionSizeMultiplier": 0.0,
+            "notes": [reason],
+        },
+        "uncertainty": {
+            "modelCount": 0,
+            "modelDisagreement": None,
+            "maximumModelDisagreement": 0.1,
+            "members": [],
+        },
+        "features": {},
+        "topDrivers": [reason, "Chart, quote, regime, session, and event context remain served by the lightweight market-data service."],
+        "heuristicEstimate": {
+            "status": "not_computed",
+            "forecast_applied_to_order": False,
+        },
+        "sourceAuthority": "lightweight_market_data_service.market_forecast_advisory_fallback",
+    }
+
+
+def _lightweight_forecast_horizon(close: float, horizon_minutes: int, reason: str) -> dict[str, Any]:
+    return {
+        "status": "INFERENCE_NOT_RUN",
+        "horizonMinutes": horizon_minutes,
+        "modelApplied": False,
+        "probabilityUp": None,
+        "probabilityDown": None,
+        "probabilityFlatOrNoEdge": None,
+        "probabilityBuySuccess": None,
+        "probabilitySellSuccess": None,
+        "probabilityTimeout": None,
+        "predictedDirection": "unavailable",
+        "predictedPrice": None,
+        "predictedChangeDollars": None,
+        "buyExpectedValue": None,
+        "sellExpectedValue": None,
+        "advice": {
+            "longPosition": "NO_ML_ADVICE",
+            "shortPosition": "NO_ML_ADVICE",
+            "newLongEntry": "WAIT_FOR_VALIDATED_MODEL",
+            "newShortEntry": "WAIT_FOR_VALIDATED_MODEL",
+            "flatMarket": "WAIT_FOR_VALIDATED_MODEL",
+            "reasonCodes": ["market_forecast.lightweight_inference_not_ready"],
+        },
+        "activationPolicy": "advisory_only_until_live_paper_validation",
+        "reason": reason,
+        "futurePricePrediction": _lightweight_no_edge_price_prediction(close, horizon_minutes, reason),
+    }
+
+
+def _lightweight_no_edge_price_prediction(close: float, horizon_minutes: int, reason: str) -> dict[str, Any]:
+    price = round(max(0.0, close), 4)
+    return {
+        "horizonMinutes": horizon_minutes,
+        "predictedPrice": price,
+        "predictedChange": 0.0,
+        "predictedChangeDollars": 0.0,
+        "expectedPriceDirection": "unavailable",
+        "direction": "unavailable",
+        "reason": reason,
     }
 
 

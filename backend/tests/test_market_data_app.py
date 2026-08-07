@@ -51,3 +51,18 @@ def test_lightweight_strategy_fit_inventory_returns_active_catalog_without_heavy
     assert payload["sourceAuthority"] == "lightweight_market_data_service.voting_ensemble.strategy_catalog"
     assert payload["modules"]["directional"]
     assert payload["modules"]["directional"][0]["status"] == "active"
+
+
+def test_lightweight_market_forecast_prediction_returns_advisory_contract() -> None:
+    client = TestClient(app)
+
+    response = client.get("/api/market-forecast/prediction?symbol=SPY&feed=iex&timeframe=1Min&limit=60&refresh=false")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["symbol"] == "SPY"
+    assert payload["status"] in {"ready", "INFERENCE_NOT_RUN", "MODEL_UNAVAILABLE", "insufficient_data"}
+    assert payload["sourceAuthority"].startswith("lightweight_market_data_service.market_forecast_advisory")
+    assert payload["forecastAppliedToOrder"] is False
+    assert payload["multiHorizonForecast"]["positionManagementAuthority"] == "advisory_only"
+    assert [row["horizonMinutes"] for row in payload["multiHorizonForecast"]["horizons"]] == [5, 10, 15]

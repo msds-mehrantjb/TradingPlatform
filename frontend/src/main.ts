@@ -7364,7 +7364,8 @@ async function loadMarketForecast(options: { refresh?: boolean } = {}) {
       limit: "240",
       refresh: String(options.refresh ?? false),
     });
-    const response = await fetchWithTimeout(`${API_BASE}/api/market-forecast/prediction?${params.toString()}`, MARKET_FORECAST_TIMEOUT_MS);
+    const result = await fetchFromMarketDataCandidates(`/api/market-forecast/prediction?${params.toString()}`, MARKET_FORECAST_TIMEOUT_MS);
+    const response = result.response;
     if (loadId !== marketForecastLoadId) {
       return;
     }
