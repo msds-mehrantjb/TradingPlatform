@@ -602,11 +602,7 @@ def _account_snapshot_from_payload(payload: AccountSnapshot | dict[str, Any], *,
         return None
     equity = _positive_float(payload.get("equity") or payload.get("accountEquity") or payload.get("portfolioValue"))
     buying_power = _non_negative_float(
-        payload.get("availableBuyingPower")
-        or payload.get("buyingPower")
-        or payload.get("usableEntryBuyingPower")
-        or payload.get("cashBuyingPower")
-        or payload.get("cash")
+        _first_present(payload, "availableBuyingPower", "buyingPower", "usableEntryBuyingPower", "cashBuyingPower", "cash")
     )
     if equity <= 0:
         return None
@@ -616,7 +612,7 @@ def _account_snapshot_from_payload(payload: AccountSnapshot | dict[str, Any], *,
         equity=equity,
         highWaterEquity=max(equity, _positive_float(payload.get("highWaterEquity") or payload.get("intradayEquityHigh") or equity)),
         availableBuyingPower=buying_power,
-        settledCash=_optional_non_negative_float(payload.get("settledCash") or payload.get("cash")),
+        settledCash=_optional_non_negative_float(_first_present(payload, "settledCash", "cash")),
         realizedDailyPnl=_signed_float(payload.get("realizedDailyPnl") or payload.get("realizedPnlToday")),
         unrealizedDailyPnl=_signed_float(payload.get("unrealizedDailyPnl") or payload.get("unrealizedPnlToday") or payload.get("unrealizedPnl")),
         brokerConnected=bool(payload.get("brokerConnected", True)),
@@ -826,6 +822,14 @@ def _optional_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
     return float(value)
+
+
+def _first_present(payload: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and value != "":
+            return value
+    return default
 
 
 def _positive_float(value: Any) -> float:

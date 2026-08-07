@@ -907,7 +907,7 @@ class VotingEnsembleInventoryLedger:
 
     def _enriched_account_payload(self, existing: Mapping[str, Any], *, observed_at: datetime, reason_codes: list[str]) -> dict[str, Any]:
         initial = _decimal(existing.get("initialCash") or existing.get("startingCash") or _configured_initial_cash())
-        cash = _decimal(existing.get("cash") or existing.get("cashBalance") or existing.get("buyingPower") or initial)
+        cash = _decimal(_first_present(existing, "cash", "cashBalance", "buyingPower", default=initial))
         realized = _decimal(existing.get("realizedPnl") or existing.get("realizedPnlToday") or 0)
         unrealized = _decimal(existing.get("unrealizedPnl") or existing.get("unrealizedPnlToday") or 0)
         intraday_high = _decimal(existing.get("intradayEquityHigh")) if existing.get("intradayEquityHigh") is not None else None
@@ -1028,14 +1028,14 @@ class VotingEnsembleInventoryLedger:
         unrealized = sum((_decimal(position.get("unrealizedPnl")) for position in positions), Decimal("0"))
         equity = _max_decimal(
             Decimal("0"),
-            _decimal(account.get("cash") or account.get("cashBalance") or 0)
+            _decimal(_first_present(account, "cash", "cashBalance", default=0))
             + _owned_position_market_value(positions),
         )
         self.store.write_snapshot(
             "local_account.latest",
             self._account_payload(
                 initial_cash=_decimal(account.get("initialCash") or _configured_initial_cash()),
-                cash=_decimal(account.get("cash") or account.get("cashBalance") or 0),
+                cash=_decimal(_first_present(account, "cash", "cashBalance", default=0)),
                 realized_pnl=_decimal(account.get("realizedPnl") or 0),
                 unrealized_pnl=unrealized,
                 equity=equity,
@@ -1160,7 +1160,7 @@ class VotingEnsembleInventoryLedger:
         cash_delta = _decimal(quantity) * _decimal(fill_price)
         fee = _decimal(fee_amount)
         cash_delta = -(cash_delta + fee) if side == Signal.BUY else cash_delta - fee
-        cash = _decimal(account.get("cash") or account.get("cashBalance") or account.get("buyingPower") or 0) + cash_delta
+        cash = _decimal(_first_present(account, "cash", "cashBalance", "buyingPower", default=0)) + cash_delta
         prior_realized = _decimal(account.get("realizedPnl") or account.get("realizedPnlToday") or 0)
         positions = self.positions(include_flat=False)
         unrealized = sum((_decimal(position.get("unrealizedPnl")) for position in positions), Decimal("0"))
@@ -1440,6 +1440,14 @@ def _decimal(value: Any) -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return Decimal("0")
+
+
+def _first_present(payload: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and value != "":
+            return value
+    return default
 
 
 def _abs_decimal(value: Any) -> Decimal:

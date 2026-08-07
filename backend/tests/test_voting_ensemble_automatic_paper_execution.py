@@ -1065,6 +1065,74 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             self.assertIn("voting_ensemble.paper_execution.local_mark_stale_blocks_new_entries", blocked["reasonCodes"])
             self.assertTrue(exit_result["enqueued"])
 
+    def test_local_paper_entry_risk_blocks_do_not_trap_position_reducing_exit(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository()
+            repository.local_account_snapshot(observed_at=NOW)
+            repository.inventory_ledger.apply_fill(
+                client_order_id="blocked-risk-existing-long",
+                order_intent_id="intent-blocked-risk-existing-long",
+                symbol="SPY",
+                side=Signal.BUY,
+                requested_quantity=3,
+                fill_price=100.0,
+                filled_at=NOW,
+            )
+            seed_local_quote(repository, bid=101.0, ask=101.05, bid_size=3, observed_at=NOW + timedelta(seconds=1))
+            stressed_account = {
+                **repository.local_account_snapshot(observed_at=NOW + timedelta(seconds=1)),
+                "cash": 0.0,
+                "cashBalance": 0.0,
+                "buyingPower": 0.0,
+                "usableEntryBuyingPower": 0.0,
+                "dailyNetPnl": -5000.0,
+                "dailyNetPnlAfterExitCosts": -5000.0,
+                "drawdownPercent": 10.0,
+                "drawdownFromIntradayHighPercent": 10.0,
+                "tradesToday": 99,
+            }
+            repository.write_snapshot("local_account.latest", stressed_account)
+            execution_runtime = VotingEnsemblePaperExecutionRuntime(
+                repository=repository,
+                queue=VotingEnsemblePaperExecutionQueue(),
+                entry_permission_provider=lambda: {
+                    "newEntriesAllowed": False,
+                    "effectivePaperTradingEnabled": False,
+                    "reasonCodes": ["paper.off", "daily.loss", "drawdown.limit"],
+                },
+                auto_start=False,
+            )
+
+            enqueued = execution_runtime.enqueue_from_decision(
+                {"algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID, "final_signal": "Sell", "safety_gate_failed": False, "order_plan": order_plan(side=Signal.SELL).model_dump(mode="json")},
+                correlation_id="corr-local-risk-blocked-exit",
+                idempotency_key="idem-local-risk-blocked-exit",
+                source_job_id="job-local-risk-blocked-exit",
+                source_command_id="event-local-risk-blocked-exit",
+                evaluated_at=NOW + timedelta(seconds=1),
+            )
+            result = execution_runtime.process_once(evaluated_at=NOW + timedelta(seconds=2))
+            inventory = execution_runtime.inventory_snapshot()
+
+            self.assertTrue(enqueued["enqueued"])
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertTrue(result["submitted"])
+            self.assertEqual(result["status"], "FILLED")
+            self.assertEqual(inventory["positions"], [])
+            sell_fill = [fill for fill in inventory["fills"] if fill["side"] == Signal.SELL.value][0]
+            self.assertEqual(sell_fill["filledQuantity"], 3)
+            gateway_account = repository.read_snapshot(f"paper_order_gateway.global_risk_account.{result['gatewayResult']['orderIntentId']}")
+            self.assertEqual(gateway_account["accountId"], VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID)
+            self.assertEqual(gateway_account["availableBuyingPower"], 0.0)
+
     def test_finalized_bar_worker_marks_local_inventory_from_payload_nbbo(self) -> None:
         repository = VotingEnsemblePaperExecutionRepository()
         paper_runtime = VotingEnsemblePaperExecutionRuntime(repository=repository, queue=VotingEnsemblePaperExecutionQueue(), auto_start=False)
