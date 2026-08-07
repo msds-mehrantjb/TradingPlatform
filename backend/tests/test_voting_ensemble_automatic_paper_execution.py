@@ -974,6 +974,126 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
         self.assertEqual(stop_fill.filledQuantity, 3)
         self.assertEqual(inventory["positions"], [])
 
+    def test_local_paper_end_of_day_close_uses_local_inventory_and_persists_accounting(self) -> None:
+        store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-local-eod-{uuid4().hex}.json"
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository(store_path)
+            runtime = VotingEnsemblePaperExecutionRuntime(repository=repository, queue=VotingEnsemblePaperExecutionQueue(), auto_start=False)
+            repository.local_account_snapshot(observed_at=NOW)
+            repository.inventory_ledger.apply_fill(
+                client_order_id="local-eod-entry",
+                order_intent_id="intent-local-eod-entry",
+                symbol="SPY",
+                side=Signal.BUY,
+                requested_quantity=3,
+                fill_price=100.0,
+                filled_at=NOW,
+            )
+            seed_local_quote(repository, bid=105.0, ask=105.05, bid_size=3, observed_at=NOW + timedelta(seconds=1))
+            runtime.update_local_market_clock(
+                {"nextClose": (NOW + timedelta(minutes=4)).isoformat().replace("+00:00", "Z"), "sourceAuthority": "local_test_clock"},
+                observed_at=NOW,
+            )
+
+            result = runtime.reconcile_broker_state(evaluated_at=NOW)
+            inventory = runtime.inventory_snapshot()
+            reloaded = VotingEnsemblePaperExecutionRepository(store_path).inventory_snapshot()
+            blocked = runtime.enqueue_from_decision(
+                BuyDecisionService().evaluate({}),
+                correlation_id="corr-eod-block",
+                idempotency_key="idem-eod-block",
+                source_job_id="job-eod-block",
+                source_command_id="event-eod-block",
+                evaluated_at=NOW + timedelta(seconds=2),
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result["brokerPositionsObserved"], 0)
+            self.assertEqual(result["eodExitsSubmitted"], 1)
+            self.assertEqual(inventory["positions"], [])
+            self.assertEqual(inventory["account"]["cash"], 100015.0)
+            self.assertEqual(inventory["account"]["realizedPnl"], 15.0)
+            self.assertEqual(inventory["account"]["realizedPnlToday"], 15.0)
+            self.assertEqual(inventory["account"]["dailyNetPnl"], 15.0)
+            eod_orders = [order for order in inventory["orders"] if order.get("exitReason") == "END_OF_DAY_LIQUIDATION"]
+            self.assertEqual(len(eod_orders), 1)
+            self.assertEqual(eod_orders[0]["quantity"], 3)
+            self.assertEqual(eod_orders[0]["status"], "FILLED")
+            self.assertEqual(inventory["closedTrades"][0]["quantity"], 3)
+            self.assertEqual(reloaded["positions"], [])
+            self.assertEqual(reloaded["account"]["cash"], 100015.0)
+            self.assertFalse(blocked["enqueued"])
+            self.assertIn("voting_ensemble.local_paper.end_of_day_blocks_new_entries", blocked["reasonCodes"])
+        store_path.unlink(missing_ok=True)
+
+    def test_local_paper_end_of_day_close_ignores_foreign_spy_inventory(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository()
+            runtime = VotingEnsemblePaperExecutionRuntime(repository=repository, queue=VotingEnsemblePaperExecutionQueue(), auto_start=False)
+            repository.snapshots["foreign.position.spy"] = {"algorithmId": "weighted_voting", "symbol": "SPY", "quantity": 50}
+            repository.local_account_snapshot(observed_at=NOW)
+            repository.inventory_ledger.apply_fill(
+                client_order_id="local-eod-owned-entry",
+                order_intent_id="intent-local-eod-owned-entry",
+                symbol="SPY",
+                side=Signal.BUY,
+                requested_quantity=3,
+                fill_price=100.0,
+                filled_at=NOW,
+            )
+            seed_local_quote(repository, bid=105.0, ask=105.05, bid_size=100, observed_at=NOW + timedelta(seconds=1))
+            runtime.update_local_market_clock({"forceClose": True, "sourceAuthority": "local_test_clock"}, observed_at=NOW)
+
+            runtime.reconcile_broker_state(evaluated_at=NOW)
+            inventory = runtime.inventory_snapshot()
+            eod_fill = [fill for fill in inventory["fills"] if fill["clientOrderId"].startswith("ve-eod-")][0]
+
+            self.assertEqual(eod_fill["filledQuantity"], 3)
+            self.assertEqual(inventory["positions"], [])
+            self.assertEqual(inventory["closedTrades"][0]["quantity"], 3)
+            self.assertFalse(any(record.get("algorithmId") == "weighted_voting" for record in inventory["positions"]))
+
+    def test_local_paper_end_of_day_flatten_cancels_remaining_same_inventory_exits(self) -> None:
+        with patch.dict("os.environ", {"VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0", "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0"}):
+            repository = VotingEnsemblePaperExecutionRepository()
+            engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+            runtime = VotingEnsemblePaperExecutionRuntime(repository=repository, queue=VotingEnsemblePaperExecutionQueue(), auto_start=False)
+            seed_local_quote(repository, bid=100.0, ask=100.0, ask_size=3)
+            engine.submit_order(local_engine_intent(client_order_id="local-eod-protected-entry", quantity=3, side=Signal.BUY, limit_price=100.0))
+            engine.refresh_order("local-eod-protected-entry")
+            seed_local_quote(repository, bid=101.0, ask=101.05, bid_size=3, observed_at=NOW + timedelta(seconds=1))
+            runtime.update_local_market_clock({"forceClose": True, "sourceAuthority": "local_test_clock"}, observed_at=NOW)
+
+            runtime.reconcile_broker_state(evaluated_at=NOW)
+            inventory = runtime.inventory_snapshot()
+            protective = [order for order in inventory["orders"] if order.get("protectiveKind")]
+
+            self.assertEqual(inventory["positions"], [])
+            self.assertTrue(protective)
+            self.assertTrue(all(order["status"] == "CANCELED" for order in protective))
+            self.assertTrue(
+                all(
+                    "voting_ensemble.local_paper_execution_engine.local_exit_siblings_canceled_after_flatten"
+                    in order["reasonCodes"]
+                    for order in protective
+                )
+            )
+
     def test_local_paper_exit_requires_position_owned_by_voting_ensemble(self) -> None:
         store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-exit-owner-{uuid4().hex}.json"
         store_path.parent.mkdir(parents=True, exist_ok=True)

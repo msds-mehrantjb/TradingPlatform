@@ -114,6 +114,28 @@ class VotingEnsemblePaperOrderIntent:
         }
 
 
+@dataclass(frozen=True)
+class _LocalPaperEngineIntent:
+    algorithmId: str
+    capitalPartitionId: str
+    accountId: str
+    orderIntentId: str
+    decisionId: str
+    clientOrderId: str
+    symbol: str
+    side: Signal
+    orderType: str
+    submittedQuantity: int
+    limitPrice: float
+    triggerPrice: float | None
+    stopPrice: float | None
+    targetPrice: float | None
+    plannedRiskDollars: float
+    createdAt: datetime
+    timeInForce: str = "DAY"
+    exitReason: str | None = None
+
+
 class VotingEnsemblePaperExecutionRepository:
     """Algorithm-owned snapshot store used by the paper gateway and execution worker."""
 
@@ -516,6 +538,7 @@ class VotingEnsemblePaperExecutionRepository:
         realized_pnl = self.inventory_ledger.realized_pnl_records()
         risk_snapshots = self.inventory_ledger.risk_snapshots()
         market_data = self.inventory_ledger.market_data_statuses()
+        local_market_clocks = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_market_clock.")
         local_executions = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_execution.")
         reconciliation_blocks = [
             record
@@ -543,6 +566,8 @@ class VotingEnsemblePaperExecutionRepository:
             "realizedPnlRecords": realized_pnl,
             "riskSnapshots": risk_snapshots,
             "marketData": market_data,
+            "localMarketClocks": local_market_clocks,
+            "localMarketClock": local_market_clocks[-1] if local_market_clocks else None,
             "localExecutions": local_executions,
             "brokerOrders": broker_orders,
             "brokerPositions": broker_positions,
@@ -1125,7 +1150,7 @@ class VotingEnsemblePaperExecutionWorker:
                 updates.append(self._submit_position_reducing_exit(position, reason_code="voting_ensemble.paper_execution.maximum_holding_time_exit_submitted", observed_at=now))
             clock_reader = getattr(self.broker_client, "refresh_market_clock", None)
             clock = clock_reader() if callable(clock_reader) else {}
-            if _clock_requires_eod_flatten(clock):
+            if _clock_requires_eod_flatten(clock, now=now):
                 updates.append(self._submit_position_reducing_exit(position, reason_code="voting_ensemble.paper_execution.end_of_day_flattening_exit_submitted", observed_at=now))
         return updates
 
@@ -1527,6 +1552,7 @@ class VotingEnsemblePaperExecutionRuntime:
         if self.execution_mode == "LOCAL_PAPER":
             evaluator = getattr(self.paper_gateway.broker, "evaluate_open_protective_orders", None)
             protective_fills = evaluator() if callable(evaluator) else []
+            eod_updates = self._local_end_of_day_updates(evaluated_at=_require_utc(now))
             inventory = self.repository.inventory_snapshot()
             return {
                 "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
@@ -1538,6 +1564,8 @@ class VotingEnsemblePaperExecutionRuntime:
                 "ordersObserved": len(inventory.get("orders") or []),
                 "positionsObserved": len(inventory.get("positions") or []),
                 "protectiveFillsObserved": len(protective_fills),
+                "eodUpdates": eod_updates,
+                "eodExitsSubmitted": len([item for item in eod_updates if item.get("submitted")]),
                 "brokerPositionsObserved": 0,
                 "evaluatedAt": _require_utc(now).isoformat().replace("+00:00", "Z"),
                 "reasonCodes": ["voting_ensemble.local_paper.reconciliation_uses_local_inventory_only"],
@@ -1550,6 +1578,9 @@ class VotingEnsemblePaperExecutionRuntime:
     def mark_to_market_from_payload(self, payload: Mapping[str, Any] | None, *, observed_at: datetime | None = None) -> dict[str, Any] | None:
         if self.execution_mode != "LOCAL_PAPER" or not isinstance(payload, Mapping):
             return None
+        clock = _extract_market_clock_payload(payload)
+        if clock:
+            self.update_local_market_clock(clock, observed_at=observed_at)
         nbbo = _extract_nbbo_payload(payload)
         symbol = str(payload.get("symbol") or _nested_value(payload, ("marketEvent", "symbol")) or "SPY").upper()
         point_in_time = (
@@ -1564,6 +1595,63 @@ class VotingEnsemblePaperExecutionRuntime:
             nbbo=nbbo,
             observed_at=_require_utc(point_in_time),
         )
+
+    def update_local_market_clock(self, clock: Mapping[str, Any], *, observed_at: datetime | None = None) -> dict[str, Any]:
+        observed = _require_utc(observed_at or datetime.now(UTC))
+        due = _clock_requires_eod_flatten(clock, now=observed)
+        payload = {
+            "schemaVersion": "voting_ensemble_local_market_clock_v1",
+            "executionMode": "LOCAL_PAPER",
+            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+            "sourceAuthority": str(clock.get("sourceAuthority") or clock.get("source") or "local_market_data_clock"),
+            "isOpen": bool(clock.get("isOpen", clock.get("is_open", True))),
+            "forceClose": bool(clock.get("forceClose") or clock.get("requiresEodFlatten")),
+            "requiresEodFlatten": bool(due),
+            "nextClose": _iso_or_none(_parse_time(clock.get("nextClose") or clock.get("next_close"))),
+            "timestamp": _iso_or_none(_parse_time(clock.get("timestamp"))) or observed.isoformat().replace("+00:00", "Z"),
+            "observedAt": observed.isoformat().replace("+00:00", "Z"),
+            "reasonCodes": [
+                "voting_ensemble.local_paper.market_clock_eod_flatten_due"
+                if due
+                else "voting_ensemble.local_paper.market_clock_recorded"
+            ],
+        }
+        self.repository.write_snapshot("local_market_clock.latest", payload)
+        return payload
+
+    def _local_end_of_day_updates(self, *, evaluated_at: datetime) -> list[dict[str, Any]]:
+        clock = self._local_market_clock_snapshot()
+        if not _clock_requires_eod_flatten(clock, now=evaluated_at):
+            return []
+        self.repository.write_snapshot(
+            "local_entry_control.end_of_day",
+            {
+                "schemaVersion": "voting_ensemble_local_entry_control_v1",
+                "executionMode": "LOCAL_PAPER",
+                "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                "newEntriesAllowed": False,
+                "positionReducingExitsAllowed": True,
+                "observedAt": evaluated_at.isoformat().replace("+00:00", "Z"),
+                "reasonCodes": ["voting_ensemble.local_paper.end_of_day_blocks_new_entries"],
+            },
+        )
+        broker = getattr(self.paper_gateway, "broker", None)
+        submit_eod = getattr(broker, "submit_end_of_day_liquidation", None)
+        if not callable(submit_eod):
+            return [
+                {
+                    "status": "RECONCILIATION_REQUIRED",
+                    "submitted": False,
+                    "reasonCodes": ["voting_ensemble.local_paper.end_of_day_local_liquidation_engine_unavailable"],
+                }
+            ]
+        return submit_eod(evaluated_at=evaluated_at)
+
+    def _local_market_clock_snapshot(self) -> dict[str, Any]:
+        try:
+            return self.repository.read_snapshot("local_market_clock.latest")
+        except KeyError:
+            return {}
 
     def _entry_permission(self) -> Mapping[str, Any]:
         repository_block = _repository_entry_blocks(self.repository)
@@ -1704,6 +1792,9 @@ class VotingEnsembleLocalPaperBroker:
     def evaluate_open_protective_orders(self) -> list[PaperGatewayFill]:
         return self.engine.evaluate_open_protective_orders()
 
+    def submit_end_of_day_liquidation(self, *, evaluated_at: datetime) -> list[dict[str, Any]]:
+        return self.engine.submit_end_of_day_liquidation(evaluated_at=evaluated_at)
+
 
 class VotingEnsembleLocalPaperExecutionEngine:
     """Authoritative LOCAL_PAPER execution engine for Voting Ensemble.
@@ -1832,6 +1923,65 @@ class VotingEnsembleLocalPaperExecutionEngine:
                 fills.append(fill)
         return fills
 
+    def submit_end_of_day_liquidation(self, *, evaluated_at: datetime) -> list[dict[str, Any]]:
+        observed = _require_utc(evaluated_at)
+        updates: list[dict[str, Any]] = []
+        for position in self.repository.inventory_ledger.positions():
+            symbol = str(position.get("symbol") or "").upper()
+            quantity = max(0, int(position.get("quantity") or position.get("signedQuantity") or 0))
+            if not symbol or quantity <= 0:
+                continue
+            if self._has_open_local_exit(symbol, reason="END_OF_DAY_LIQUIDATION"):
+                updates.append(
+                    {
+                        "symbol": symbol,
+                        "submitted": False,
+                        "status": "OPEN",
+                        "reasonCodes": ["voting_ensemble.local_paper.end_of_day_exit_already_open"],
+                    }
+                )
+                continue
+            limit_price = max(0.01, _float(position.get("markPrice") or position.get("averageEntryPrice") or position.get("averagePrice")))
+            client_order_id = f"ve-eod-{_hash({'symbol': symbol, 'quantity': quantity, 'at': observed.isoformat()})[:20]}"
+            intent = _LocalPaperEngineIntent(
+                algorithmId=VOTING_ENSEMBLE_ALGORITHM_ID,
+                capitalPartitionId=VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                accountId=VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                orderIntentId=client_order_id,
+                decisionId=client_order_id,
+                clientOrderId=client_order_id,
+                symbol=symbol,
+                side=Signal.SELL,
+                orderType="LIMIT",
+                submittedQuantity=quantity,
+                limitPrice=limit_price,
+                triggerPrice=limit_price,
+                stopPrice=None,
+                targetPrice=None,
+                plannedRiskDollars=0.0,
+                createdAt=observed,
+                timeInForce="DAY",
+                exitReason="END_OF_DAY_LIQUIDATION",
+            )
+            ack = self.submit_order(intent)
+            fill = self.refresh_order(client_order_id) if ack.status != "REJECTED" else None
+            updates.append(
+                {
+                    "symbol": symbol,
+                    "clientOrderId": client_order_id,
+                    "submitted": ack.status != "REJECTED",
+                    "status": fill.status if fill else ack.status,
+                    "quantity": quantity,
+                    "filledQuantity": fill.filledQuantity if fill else 0,
+                    "averageFillPrice": fill.averageFillPrice if fill else None,
+                    "reasonCodes": [
+                        "voting_ensemble.local_paper.end_of_day_flattening_exit_submitted",
+                        "voting_ensemble.paper_execution.risk_reducing_exit_allowed_when_entries_blocked",
+                    ],
+                }
+            )
+        return updates
+
     def _simulate_and_apply_fill(self, order: Mapping[str, Any]) -> PaperGatewayFill | None:
         client_order_id = str(order.get("clientOrderId") or "")
         ownership_reason = self._stored_order_ownership_rejection_reason(order)
@@ -1926,6 +2076,22 @@ class VotingEnsembleLocalPaperExecutionEngine:
                 self._cancel_competing_oco_exit(order, reason_code="voting_ensemble.local_paper_execution_engine.oco_sibling_canceled_after_exit_fill")
             else:
                 self._resize_open_oco_siblings(order, remaining_quantity=remaining)
+            return
+        if fill.side == Signal.SELL:
+            symbol = str(order.get("symbol") or fill.symbol).upper()
+            remaining = self.repository.inventory_ledger.quantity_for_symbol(symbol)
+            if remaining <= 0:
+                self._cancel_open_local_exits_for_symbol(
+                    symbol,
+                    exclude_client_order_id=str(order.get("clientOrderId") or fill.clientOrderId),
+                    reason_code="voting_ensemble.local_paper_execution_engine.local_exit_siblings_canceled_after_flatten",
+                )
+            else:
+                self._resize_open_exit_orders_for_symbol(
+                    symbol,
+                    remaining_quantity=remaining,
+                    exclude_client_order_id=str(order.get("clientOrderId") or fill.clientOrderId),
+                )
 
     def _ensure_local_protective_oco(self, entry_order: Mapping[str, Any], fill: PaperGatewayFill) -> None:
         if fill.side != Signal.BUY:
@@ -2063,6 +2229,57 @@ class VotingEnsembleLocalPaperExecutionEngine:
                     "status": "CANCELED",
                     "canceledAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                     "reasonCodes": [*list(sibling.get("reasonCodes") or ()), reason_code],
+                },
+            )
+
+    def _has_open_local_exit(self, symbol: str, *, reason: str | None = None) -> bool:
+        for order in self.repository.inventory_ledger.orders():
+            if str(order.get("symbol") or "").upper() != symbol.upper():
+                continue
+            if Signal(order.get("side") or Signal.BUY) != Signal.SELL:
+                continue
+            if str(order.get("status") or "").upper() not in {"OPEN", "PARTIALLY_FILLED", "NEW", "ACCEPTED"}:
+                continue
+            if reason is None or order.get("exitReason") == reason:
+                return True
+        return False
+
+    def _cancel_open_local_exits_for_symbol(self, symbol: str, *, exclude_client_order_id: str, reason_code: str) -> None:
+        for sibling in self.repository.inventory_ledger.orders():
+            if sibling.get("clientOrderId") == exclude_client_order_id:
+                continue
+            if str(sibling.get("symbol") or "").upper() != symbol.upper():
+                continue
+            if Signal(sibling.get("side") or Signal.BUY) != Signal.SELL:
+                continue
+            if str(sibling.get("status") or "").upper() in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}:
+                continue
+            self.repository.write_snapshot(
+                f"local_order.{sibling['clientOrderId']}",
+                {
+                    **sibling,
+                    "status": "CANCELED",
+                    "canceledAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "reasonCodes": [*list(sibling.get("reasonCodes") or ()), reason_code],
+                },
+            )
+
+    def _resize_open_exit_orders_for_symbol(self, symbol: str, *, remaining_quantity: int, exclude_client_order_id: str) -> None:
+        for sibling in self.repository.inventory_ledger.orders():
+            if sibling.get("clientOrderId") == exclude_client_order_id:
+                continue
+            if str(sibling.get("symbol") or "").upper() != symbol.upper():
+                continue
+            if Signal(sibling.get("side") or Signal.BUY) != Signal.SELL:
+                continue
+            if str(sibling.get("status") or "").upper() not in {"OPEN", "PARTIALLY_FILLED", "NEW", "ACCEPTED"}:
+                continue
+            self.repository.write_snapshot(
+                f"local_order.{sibling['clientOrderId']}",
+                {
+                    **sibling,
+                    "quantity": int(remaining_quantity) + int(sibling.get("filledQuantity") or 0),
+                    "reasonCodes": [*list(sibling.get("reasonCodes") or ()), "voting_ensemble.local_paper_execution_engine.exit_order_resized_to_remaining_position"],
                 },
             )
 
@@ -2865,13 +3082,14 @@ def _maximum_holding_minutes(state: VotingEnsembleExecutionState | None) -> int:
     return max(1, int(plan.maximumHoldingMinutes or 120))
 
 
-def _clock_requires_eod_flatten(clock: Mapping[str, Any]) -> bool:
+def _clock_requires_eod_flatten(clock: Mapping[str, Any], *, now: datetime | None = None) -> bool:
     if bool(clock.get("forceClose") or clock.get("requiresEodFlatten")):
         return True
     next_close = _parse_time(clock.get("nextClose") or clock.get("next_close"))
     if next_close is None:
         return False
-    return next_close - datetime.now(UTC) <= timedelta(minutes=5)
+    observed = _require_utc(now or datetime.now(UTC))
+    return next_close - observed <= timedelta(minutes=5)
 
 
 def _has_open_exit_for_position(open_orders: list[BrokerOrderState], position: BrokerPositionState) -> bool:
@@ -2976,7 +3194,18 @@ def _iso_or_none(value: datetime | None) -> str | None:
 def _repository_entry_blocks(repository: VotingEnsemblePaperExecutionRepository) -> list[str]:
     blocks = [] if repository.persistenceHealthy else ["voting_ensemble.paper_execution.persistence_failure_blocks_new_entries"]
     blocks.extend(_repository_reconciliation_blocks(repository))
+    blocks.extend(_repository_local_entry_blocks(repository))
     return sorted(set(blocks))
+
+
+def _repository_local_entry_blocks(repository: VotingEnsemblePaperExecutionRepository) -> list[str]:
+    try:
+        control = repository.read_snapshot("local_entry_control.end_of_day")
+    except KeyError:
+        return []
+    if control.get("newEntriesAllowed") is False:
+        return list(control.get("reasonCodes") or ["voting_ensemble.local_paper.end_of_day_blocks_new_entries"])
+    return []
 
 
 def _local_mark_blocks_new_entry(repository: VotingEnsemblePaperExecutionRepository, order_plan: OrderPlan, *, evaluated_at: datetime) -> tuple[str, ...]:
@@ -3319,6 +3548,32 @@ def _extract_nbbo_payload(payload: Mapping[str, Any]) -> Mapping[str, Any] | Non
         automatic_nbbo = automatic.get("nbbo")
         if isinstance(automatic_nbbo, Mapping):
             return automatic_nbbo
+    return None
+
+
+def _extract_market_clock_payload(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    for key in ("marketClock", "market_clock", "clock"):
+        candidate = payload.get(key)
+        if isinstance(candidate, Mapping):
+            return candidate
+    context = payload.get("market_context")
+    if isinstance(context, Mapping):
+        for key in ("marketClock", "market_clock", "clock"):
+            candidate = context.get(key)
+            if isinstance(candidate, Mapping):
+                return candidate
+        automatic = context.get("automaticRuntimeSnapshot")
+        if isinstance(automatic, Mapping):
+            for key in ("marketClock", "market_clock", "clock"):
+                candidate = automatic.get(key)
+                if isinstance(candidate, Mapping):
+                    return candidate
+    automatic = payload.get("automaticRuntimeSnapshot")
+    if isinstance(automatic, Mapping):
+        for key in ("marketClock", "market_clock", "clock"):
+            candidate = automatic.get(key)
+            if isinstance(candidate, Mapping):
+                return candidate
     return None
 
 

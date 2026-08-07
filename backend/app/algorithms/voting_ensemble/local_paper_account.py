@@ -399,6 +399,10 @@ class VotingEnsembleInventoryLedger:
             submittedAt=_require_utc(observed_at),
         )
         payload = order.to_record(reason_codes=["voting_ensemble.local_paper.order_accepted_locally"])
+        exit_reason = getattr(intent, "exitReason", None)
+        if exit_reason:
+            payload["exitReason"] = str(exit_reason)
+            payload["reasonCodes"] = [*list(payload.get("reasonCodes") or ()), "voting_ensemble.local_paper.risk_reducing_exit_order_accepted_locally"]
         self.store.write_snapshot(f"local_order.{order.clientOrderId}", payload)
         return payload
 
