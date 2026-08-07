@@ -29,6 +29,7 @@ class VotingEnsembleInventoryIsolationTest(unittest.TestCase):
             "readOnly": True,
             "sourceAuthority": "global_risk.read_only_aggregate",
         }
+        before_exit = repository.inventory_snapshot()
         seed_local_quote(repository, bid=101.0, ask=101.05, bid_size=200, observed_at=NOW + timedelta(seconds=1))
         runtime = VotingEnsemblePaperExecutionRuntime(repository=repository, queue=VotingEnsemblePaperExecutionQueue(), auto_start=False)
         sell_plan = order_plan(side=Signal.SELL).model_copy(update={"quantity": 150})
@@ -46,6 +47,8 @@ class VotingEnsembleInventoryIsolationTest(unittest.TestCase):
 
         self.assertIsNotNone(result)
         assert result is not None
+        self.assertEqual(before_exit["localPositions"][0]["signedQuantity"], 100)
+        self.assertFalse(any(position.get("algorithmId") == "algorithm_b" for position in before_exit["localPositions"]))
         self.assertTrue(result["submitted"])
         self.assertEqual(inventory["localPositions"], [])
         self.assertEqual(inventory["closedTrades"][0]["quantity"], 100)
