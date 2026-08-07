@@ -145,6 +145,18 @@ class VotingEnsembleLocalPaperExecutionTest(unittest.TestCase):
             self.assertTrue(result["submitted"])
             self.assertIsNone(runtime.broker_client)
 
+    def test_live_execution_mode_is_not_supported_for_voting_ensemble_paper_runtime(self) -> None:
+        with self.assertRaisesRegex(
+            VotingEnsemblePaperExecutionNamespaceError,
+            "LOCAL_PAPER or BROKER_PAPER",
+        ):
+            VotingEnsemblePaperExecutionRuntime(
+                repository=VotingEnsemblePaperExecutionRepository(),
+                queue=VotingEnsemblePaperExecutionQueue(),
+                execution_mode="LIVE",
+                auto_start=False,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
