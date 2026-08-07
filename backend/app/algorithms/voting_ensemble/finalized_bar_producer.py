@@ -26,6 +26,7 @@ VOTING_ENSEMBLE_FINALIZED_BAR_PRODUCER_VERSION = "voting_ensemble_finalized_bar_
 VOTING_ENSEMBLE_FINALIZED_BAR_EVENT_STORE_VERSION = "voting_ensemble_finalized_bar_event_store_v1"
 VOTING_ENSEMBLE_MARKET_EVENT_CONTRACT_VERSION = "voting_ensemble_market_bar_finalized_event_v1"
 VOTING_ENSEMBLE_DEFAULT_SYMBOL = "SPY"
+VOTING_ENSEMBLE_LOCAL_ACCOUNT_RISK_SOURCE_AUTHORITY = "voting_ensemble.local_paper_account"
 
 
 class VotingEnsembleMarketDataClient(Protocol):
@@ -465,7 +466,7 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
         except Exception:
             account_snapshot = None
         account_risk = _account_snapshot_from_backend_account(account_snapshot, inventory, event)
-        if account_snapshot is None and account_risk.get("sourceAuthority") != "voting_ensemble_local_paper_account":
+        if account_risk.get("sourceAuthority") != VOTING_ENSEMBLE_LOCAL_ACCOUNT_RISK_SOURCE_AUTHORITY:
             failures.append("voting_ensemble.automatic_snapshot.local_paper_account_snapshot_missing")
 
         quote = _call_market_provider(self.quote_provider, symbol=event.symbol.upper(), feed=feed)
@@ -568,7 +569,8 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
             "freshSpyQuote": quote,
             "freshSpyLastTrade": trade,
             "backendMarketStatus": market_status,
-            "backendAccountSnapshot": account_snapshot,
+            "backendAccountSnapshot": account_risk,
+            "localPaperAccountSnapshot": account_risk,
             "votingEnsembleInventory": inventory,
             "votingEnsembleDailyCounters": daily_counters,
             "sharedReadOnlyGlobalRiskDecision": global_gate,
@@ -583,7 +585,8 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
                 "marketEvent": event.snapshot(),
                 "sourceAuthority": event.sourceAuthority,
                 "backendMarketStatus": market_status,
-                "backendAccountSnapshot": account_snapshot,
+                "backendAccountSnapshot": account_risk,
+                "localPaperAccountSnapshot": account_risk,
                 "votingEnsembleInventory": inventory,
                 "votingEnsembleDailyCounters": daily_counters,
                 "sharedReadOnlyGlobalRiskDecision": global_gate,
@@ -957,24 +960,39 @@ def _record_session(record: Any, session: str) -> bool:
 
 def _account_snapshot_from_backend_account(account: dict[str, Any] | None, inventory: dict[str, Any], event: VotingEnsembleFinalizedBarMarketEvent) -> dict[str, Any]:
     fallback = _account_snapshot_from_inventory(inventory, event)
+    if _inventory_has_local_account(inventory):
+        return fallback
     if not isinstance(account, dict):
+        return fallback
+    if _normalized_source_authority(account.get("sourceAuthority")) != VOTING_ENSEMBLE_LOCAL_ACCOUNT_RISK_SOURCE_AUTHORITY:
         return fallback
     equity = _positive_or_zero(account.get("equity") or account.get("portfolio_value") or account.get("portfolioValue"))
     buying_power = _positive_or_zero(account.get("buying_power") or account.get("buyingPower"))
-    counters = _daily_counters_from_inventory(inventory, event)
+    open_notional = _positive_or_zero(account.get("openPositionNotional") or fallback.get("openPositionNotional"))
+    total_open_risk_percent = _positive_or_zero(account.get("totalOpenRiskPercent") or fallback.get("totalOpenRiskPercent"))
+    total_spy_notional_percent = _percent(open_notional, equity)
     return {
         **fallback,
         "accountId": str(account.get("id") or account.get("accountId") or fallback["accountId"]),
         "equity": equity,
         "buyingPower": buying_power,
-        "realizedPnlToday": counters["realizedPnlToday"],
-        "unrealizedPnlToday": counters["unrealizedPnlToday"],
-        "dailyNetPnlAfterExitCosts": counters["dailyNetPnlAfterExitCosts"],
-        "tradesToday": counters["tradesToday"],
+        "realizedPnlToday": float(account.get("realizedPnlToday") or fallback.get("realizedPnlToday") or 0.0),
+        "unrealizedPnlToday": float(account.get("unrealizedPnlToday") or account.get("unrealizedPnl") or fallback.get("unrealizedPnlToday") or 0.0),
+        "dailyNetPnlAfterExitCosts": float(account.get("dailyNetPnlAfterExitCosts") or account.get("dailyNetPnl") or fallback.get("dailyNetPnlAfterExitCosts") or 0.0),
+        "intradayEquityHigh": _positive_or_zero(account.get("intradayEquityHigh") or fallback.get("intradayEquityHigh") or equity),
+        "drawdownPercent": _positive_or_zero(account.get("drawdownPercent") or fallback.get("drawdownPercent")),
+        "drawdownFromIntradayHighPercent": _positive_or_zero(account.get("drawdownFromIntradayHighPercent") or account.get("drawdownPercent") or fallback.get("drawdownFromIntradayHighPercent")),
+        "openPositionNotional": open_notional,
+        "totalOpenRiskPercent": total_open_risk_percent,
+        "totalSpyNotionalPercent": total_spy_notional_percent,
+        "sameDirectionExposurePercent": total_spy_notional_percent,
+        "tradesToday": int(account.get("tradesToday") or fallback.get("tradesToday") or 0),
         "observedAt": str(account.get("observedAt") or _iso(event.receivedAt)),
         "sessionDate": _iso(event.barEndTimestamp)[:10],
-        "sourceAuthority": str(account.get("sourceAuthority") or fallback.get("sourceAuthority") or "voting_ensemble_local_paper_account"),
+        "sourceAuthority": VOTING_ENSEMBLE_LOCAL_ACCOUNT_RISK_SOURCE_AUTHORITY,
         "capitalPartitionId": str(account.get("capitalPartitionId") or fallback.get("capitalPartitionId") or "voting_ensemble.paper.default"),
+        "paperAccount": True,
+        "brokerAccount": False,
     }
 
 
@@ -1088,21 +1106,34 @@ def _server_global_gate(event: VotingEnsembleFinalizedBarMarketEvent, control: d
 def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEnsembleFinalizedBarMarketEvent) -> dict[str, Any]:
     account = inventory.get("account") if isinstance(inventory, dict) else None
     if isinstance(account, dict):
+        equity = _positive_or_zero(account.get("equity"))
+        open_notional = _positive_or_zero(account.get("openPositionNotional"))
+        total_spy_notional_percent = _percent(open_notional, equity)
+        drawdown = _positive_or_zero(account.get("drawdownPercent") or account.get("drawdownFromIntradayHighPercent"))
         return {
             "algorithmId": "voting_ensemble",
             "algorithm_id": "voting_ensemble",
             "capitalPartitionId": str(account.get("capitalPartitionId") or "voting_ensemble.paper.default"),
             "accountId": str(account.get("accountId") or "voting_ensemble.paper.default.account"),
-            "equity": _positive_or_zero(account.get("equity")),
+            "equity": equity,
             "buyingPower": _positive_or_zero(account.get("buyingPower")),
-            "openPositionNotional": _positive_or_zero(account.get("openPositionNotional")),
+            "openPositionNotional": open_notional,
             "realizedPnlToday": float(account.get("realizedPnlToday") or 0.0),
             "unrealizedPnlToday": float(account.get("unrealizedPnlToday") or 0.0),
+            "dailyNetPnlAfterExitCosts": float(account.get("dailyNetPnlAfterExitCosts") or account.get("dailyNetPnl") or 0.0),
+            "intradayEquityHigh": _positive_or_zero(account.get("intradayEquityHigh") or equity),
+            "drawdownPercent": drawdown,
+            "drawdownFromIntradayHighPercent": drawdown,
+            "totalOpenRiskPercent": _positive_or_zero(account.get("totalOpenRiskPercent")),
+            "totalSpyNotionalPercent": total_spy_notional_percent,
+            "sameDirectionExposurePercent": total_spy_notional_percent,
             "estimatedExitCosts": 0.0,
-            "tradesToday": len(inventory.get("fills") or []),
+            "tradesToday": int(account.get("tradesToday") or 0),
             "observedAt": str(account.get("observedAt") or _iso(event.receivedAt)),
-            "sessionDate": _iso(event.barEndTimestamp)[:10],
-            "sourceAuthority": str(account.get("sourceAuthority") or "voting_ensemble_local_paper_account"),
+            "sessionDate": str(account.get("sessionDate") or _iso(event.barEndTimestamp)[:10]),
+            "sourceAuthority": VOTING_ENSEMBLE_LOCAL_ACCOUNT_RISK_SOURCE_AUTHORITY,
+            "paperAccount": True,
+            "brokerAccount": False,
         }
     positions = inventory.get("positions") if isinstance(inventory, dict) else []
     open_notional = 0.0
@@ -1121,12 +1152,39 @@ def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEns
         "openPositionNotional": open_notional,
         "realizedPnlToday": 0.0,
         "unrealizedPnlToday": 0.0,
+        "dailyNetPnlAfterExitCosts": 0.0,
+        "intradayEquityHigh": 0.0,
+        "drawdownPercent": 0.0,
+        "drawdownFromIntradayHighPercent": 0.0,
+        "totalOpenRiskPercent": 0.0,
+        "totalSpyNotionalPercent": 0.0,
+        "sameDirectionExposurePercent": 0.0,
         "estimatedExitCosts": 0.0,
         "tradesToday": len(inventory.get("orders") or []) if isinstance(inventory, dict) else 0,
         "observedAt": _iso(event.receivedAt),
         "sessionDate": _iso(event.barEndTimestamp)[:10],
-        "sourceAuthority": "voting_ensemble_local_paper_account",
+        "sourceAuthority": "voting_ensemble.local_paper_account.missing",
+        "paperAccount": True,
+        "brokerAccount": False,
     }
+
+
+def _inventory_has_local_account(inventory: dict[str, Any]) -> bool:
+    account = inventory.get("account") if isinstance(inventory, dict) else None
+    return isinstance(account, dict) and bool(account.get("accountId"))
+
+
+def _normalized_source_authority(value: Any) -> str:
+    raw = str(value or "")
+    if raw in {VOTING_ENSEMBLE_LOCAL_ACCOUNT_RISK_SOURCE_AUTHORITY, "voting_ensemble_local_paper_account"}:
+        return VOTING_ENSEMBLE_LOCAL_ACCOUNT_RISK_SOURCE_AUTHORITY
+    return raw
+
+
+def _percent(numerator: float, denominator: float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(max(0.0, numerator) / denominator * 100.0, 6)
 
 
 def _positive_float(value: Any) -> float | None:

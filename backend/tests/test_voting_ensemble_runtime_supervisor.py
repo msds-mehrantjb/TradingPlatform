@@ -394,12 +394,33 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
                 "liveTradingEnabled": False,
                 "reasonCodes": ["test.backend_control_allowed"],
             },
-            paper_inventory_provider=lambda: {"orders": [], "fills": [], "positions": []},
+            paper_inventory_provider=lambda: {
+                "orders": [],
+                "fills": [],
+                "positions": [{"symbol": "SPY", "notional": 12500.0}],
+                "account": {
+                    "accountId": "voting_ensemble.paper.default.account",
+                    "capitalPartitionId": "voting_ensemble.paper.default",
+                    "equity": 100000.0,
+                    "buyingPower": 87500.0,
+                    "realizedPnlToday": 120.0,
+                    "unrealizedPnlToday": 50.0,
+                    "dailyNetPnlAfterExitCosts": 170.0,
+                    "intradayEquityHigh": 101000.0,
+                    "drawdownPercent": 0.990099,
+                    "openPositionNotional": 12500.0,
+                    "totalOpenRiskPercent": 0.75,
+                    "tradesToday": 4,
+                    "sessionDate": NOW.date().isoformat(),
+                    "observedAt": (NOW + timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
+                    "sourceAuthority": "voting_ensemble_local_paper_account",
+                },
+            },
             market_status_provider=lambda: {"isOpen": True, "status": "open", "timestamp": NOW.isoformat().replace("+00:00", "Z")},
             account_snapshot_provider=lambda: {
-                "accountId": "paper-account-test",
-                "equity": 100000.0,
-                "buyingPower": 90000.0,
+                "accountId": "broker-account-must-not-be-authoritative",
+                "equity": 999999.0,
+                "buyingPower": 999999.0,
                 "observedAt": (NOW + timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
                 "sourceAuthority": "broker",
             },
@@ -437,11 +458,27 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         operational = payload["market_context"]["operationalHealthSnapshot"]
         self.assertTrue(operational["tradingEnabled"])
         self.assertFalse(operational["liveTradingEnabled"])
-        self.assertEqual(operational["authoritativeInventory"]["positions"], [])
+        self.assertEqual(operational["authoritativeInventory"]["positions"], [{"symbol": "SPY", "notional": 12500.0}])
         self.assertEqual(payload["market_context"]["sourceAuthority"], "backend.test.finalized_bar")
         automatic_snapshot = payload["market_context"]["automaticRuntimeSnapshot"]
         self.assertTrue(automatic_snapshot["immutable"])
-        self.assertEqual(automatic_snapshot["backendAccountSnapshot"]["sourceAuthority"], "broker")
+        account_risk = payload["market_context"]["accountRiskSnapshot"]
+        self.assertEqual(account_risk["accountId"], "voting_ensemble.paper.default.account")
+        self.assertEqual(account_risk["equity"], 100000.0)
+        self.assertEqual(account_risk["buyingPower"], 87500.0)
+        self.assertEqual(account_risk["realizedPnlToday"], 120.0)
+        self.assertEqual(account_risk["unrealizedPnlToday"], 50.0)
+        self.assertEqual(account_risk["dailyNetPnlAfterExitCosts"], 170.0)
+        self.assertEqual(account_risk["intradayEquityHigh"], 101000.0)
+        self.assertEqual(account_risk["drawdownPercent"], 0.990099)
+        self.assertEqual(account_risk["openPositionNotional"], 12500.0)
+        self.assertEqual(account_risk["totalOpenRiskPercent"], 0.75)
+        self.assertEqual(account_risk["totalSpyNotionalPercent"], 12.5)
+        self.assertEqual(account_risk["tradesToday"], 4)
+        self.assertEqual(account_risk["sourceAuthority"], "voting_ensemble.local_paper_account")
+        self.assertFalse(account_risk["brokerAccount"])
+        self.assertEqual(automatic_snapshot["backendAccountSnapshot"]["sourceAuthority"], "voting_ensemble.local_paper_account")
+        self.assertEqual(automatic_snapshot["localPaperAccountSnapshot"], account_risk)
         self.assertTrue(automatic_snapshot["dataFreshnessAndSynchronization"]["snapshotSynchronized"])
 
 

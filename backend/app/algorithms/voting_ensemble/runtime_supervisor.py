@@ -780,22 +780,12 @@ class VotingEnsembleRuntimeSupervisor:
                 "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
                 "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
                 "accountId": str(account.get("accountId") or VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID),
-                "sourceAuthority": "voting_ensemble_local_paper_account",
+                "sourceAuthority": "voting_ensemble.local_paper_account",
                 "paperAccount": True,
+                "brokerAccount": False,
                 "liveTradingEnabled": False,
             }
-        return {
-            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
-            "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
-            "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
-            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
-            "equity": 100_000.0,
-            "buyingPower": 100_000.0,
-            "observedAt": _now(),
-            "sourceAuthority": "voting_ensemble_local_paper_account",
-            "paperAccount": True,
-            "liveTradingEnabled": False,
-        }
+        return None
 
     def _latest_quote(self, *, symbol: str, feed: str) -> dict[str, Any] | None:
         client = getattr(self.finalized_bar_producer, "market_data_client", None) if self.finalized_bar_producer is not None else None
