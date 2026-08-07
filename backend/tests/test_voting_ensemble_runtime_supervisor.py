@@ -274,6 +274,89 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("lastDecision", payload)
         self.assertFalse(payload["liveTradingEnabled"])
 
+    async def test_manual_evaluate_api_injects_backend_local_account_risk_snapshot(self) -> None:
+        captured_payloads: list[dict[str, Any]] = []
+        account = {
+            "accountId": "voting_ensemble.paper.default.account",
+            "capitalPartitionId": "voting_ensemble.paper.default",
+            "equity": 100000.0,
+            "buyingPower": 91000.0,
+            "realizedPnlToday": 12.5,
+            "unrealizedPnlToday": 7.5,
+            "dailyNetPnlAfterExitCosts": 20.0,
+            "intradayEquityHigh": 100500.0,
+            "drawdownPercent": 0.497512,
+            "openPositionNotional": 9000.0,
+            "totalOpenRiskPercent": 0.4,
+            "tradesToday": 1,
+            "observedAt": NOW.isoformat().replace("+00:00", "Z"),
+            "sourceAuthority": "voting_ensemble.local_paper_account",
+        }
+
+        class CapturingRuntime:
+            def enqueue_manual_evaluation(self, payload: dict[str, Any]) -> dict[str, Any]:
+                captured_payloads.append(payload)
+                return {
+                    "algorithmId": "voting_ensemble",
+                    "accepted": True,
+                    "deduplicated": False,
+                    "jobId": "ve-job-api-test",
+                    "commandId": "ve-command-api-test",
+                    "reasonCodes": ["voting_ensemble.runtime.command.enqueued"],
+                }
+
+        class LocalSupervisor:
+            def control_status(self, *, refresh_readiness: bool = True) -> dict[str, Any]:
+                return {
+                    "requestedPaperTradingEnabled": True,
+                    "effectivePaperTradingEnabled": True,
+                    "newEntriesEnabled": True,
+                    "liveTradingEnabled": False,
+                    "controlVersion": "test-control",
+                    "reasonCodes": ["voting_ensemble.control.effective_paper_on"],
+                }
+
+            def paper_inventory(self) -> dict[str, Any]:
+                return {
+                    "algorithmId": "voting_ensemble",
+                    "capitalPartitionId": "voting_ensemble.paper.default",
+                    "localPaperAccount": account,
+                    "positions": [],
+                    "orders": [],
+                }
+
+        original_getter = voting_ensemble_api.get_voting_ensemble_runtime_supervisor
+        original_boundary = voting_ensemble_api._runtime_boundary
+        voting_ensemble_api.get_voting_ensemble_runtime_supervisor = lambda: LocalSupervisor()
+        voting_ensemble_api._runtime_boundary = lambda: CapturingRuntime()
+        test_app = FastAPI()
+        test_app.include_router(voting_ensemble_api.router)
+        request_payload = {
+            **evaluate_payload(),
+            "market_context": {
+                "operationalHealthSnapshot": {
+                    "upstreamGlobalGateDecision": {"authority": "display_only"},
+                },
+            },
+        }
+        try:
+            response = TestClient(test_app).post("/api/voting-ensemble/evaluate", json=request_payload)
+        finally:
+            voting_ensemble_api.get_voting_ensemble_runtime_supervisor = original_getter
+            voting_ensemble_api._runtime_boundary = original_boundary
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(len(captured_payloads), 1)
+        market_context = captured_payloads[0]["market_context"]
+        account_risk = market_context["accountRiskSnapshot"]
+        self.assertEqual(account_risk["accountId"], "voting_ensemble.paper.default.account")
+        self.assertEqual(account_risk["equity"], 100000.0)
+        self.assertEqual(account_risk["buyingPower"], 91000.0)
+        self.assertEqual(account_risk["sourceAuthority"], "voting_ensemble.local_paper_account")
+        upstream = market_context["operationalHealthSnapshot"]["upstreamGlobalGateDecision"]
+        self.assertEqual(upstream["status"], "PASS")
+        self.assertNotIn("authority", upstream)
+
     async def test_worker_failure_blocks_new_finalized_bar_entries(self) -> None:
         self.supervisor = supervisor_with_runtime()
         await self.supervisor.start()

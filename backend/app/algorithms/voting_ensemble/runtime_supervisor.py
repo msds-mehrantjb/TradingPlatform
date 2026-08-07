@@ -965,7 +965,9 @@ class VotingEnsembleRuntimeSupervisor:
 
     def _default_account_snapshot(self) -> dict[str, Any] | None:
         inventory = self.paper_inventory()
-        account = inventory.get("account") if isinstance(inventory, dict) else None
+        account = None
+        if isinstance(inventory, dict):
+            account = inventory.get("localPaperAccount") or inventory.get("account")
         if isinstance(account, dict):
             return {
                 **account,

@@ -1123,7 +1123,9 @@ def _server_global_gate(event: VotingEnsembleFinalizedBarMarketEvent, control: d
 
 
 def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEnsembleFinalizedBarMarketEvent) -> dict[str, Any]:
-    account = inventory.get("account") if isinstance(inventory, dict) else None
+    account = None
+    if isinstance(inventory, dict):
+        account = inventory.get("localPaperAccount") or inventory.get("account")
     if isinstance(account, dict):
         equity = _positive_or_zero(account.get("equity"))
         open_notional = _positive_or_zero(account.get("openPositionNotional"))
@@ -1191,7 +1193,9 @@ def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEns
 
 
 def _inventory_has_local_account(inventory: dict[str, Any]) -> bool:
-    account = inventory.get("account") if isinstance(inventory, dict) else None
+    account = None
+    if isinstance(inventory, dict):
+        account = inventory.get("localPaperAccount") or inventory.get("account")
     return isinstance(account, dict) and bool(account.get("accountId"))
 
 
