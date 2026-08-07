@@ -809,6 +809,99 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
         self.assertNotIn("voting_ensemble.paper_execution.local_account.latest", repository.snapshots)
         store_path.unlink(missing_ok=True)
 
+    def test_local_paper_recovery_migrates_legacy_fill_derived_position_once_when_account_matches(self) -> None:
+        store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-local-fill-migration-{uuid4().hex}.json"
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository(store_path)
+            repository.local_account_snapshot(observed_at=NOW)
+            repository.inventory_ledger.apply_fill(
+                client_order_id="legacy-migrate-buy",
+                order_intent_id="intent-legacy-migrate-buy",
+                symbol="SPY",
+                side=Signal.BUY,
+                requested_quantity=3,
+                fill_price=100.0,
+                filled_at=NOW,
+            )
+            payload = json.loads(store_path.read_text(encoding="utf-8"))
+            payload["snapshots"].pop("voting_ensemble.paper_execution.local_position.SPY")
+            store_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+            restarted = VotingEnsemblePaperExecutionRepository(store_path)
+            runtime = VotingEnsemblePaperExecutionRuntime(repository=restarted, queue=VotingEnsemblePaperExecutionQueue(), auto_start=False)
+            first = runtime.reconcile_broker_state(evaluated_at=NOW + timedelta(seconds=1))
+            second = runtime.reconcile_broker_state(evaluated_at=NOW + timedelta(seconds=2))
+            inventory = runtime.inventory_snapshot()
+
+            self.assertEqual(first["status"], "RECONCILED")
+            self.assertEqual(first["recovery"]["migration"]["status"], "MIGRATED")
+            self.assertEqual(first["recovery"]["migration"]["migratedSymbols"], ["SPY"])
+            self.assertEqual(second["recovery"]["migration"]["status"], "MIGRATED")
+            self.assertEqual(inventory["positions"][0]["signedQuantity"], 3)
+            self.assertEqual(inventory["positions"][0]["averageEntryPrice"], 100.0)
+            self.assertEqual(inventory["account"]["cash"], 99700.0)
+            self.assertEqual(inventory["account"]["realizedPnl"], 0.0)
+            self.assertEqual(inventory["localFillMigration"]["normalRuntimeAuthority"], "canonical_local_inventory_positions_not_fill_replay")
+            self.assertEqual(inventory["localFillMigration"]["fillReplayAllowedFor"], ["migration", "audit", "recovery_verification"])
+        store_path.unlink(missing_ok=True)
+
+    def test_local_paper_recovery_failed_migration_blocks_entries_when_cash_not_reconstructable(self) -> None:
+        store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-local-fill-migration-failed-{uuid4().hex}.json"
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository(store_path)
+            repository.local_account_snapshot(observed_at=NOW)
+            repository.inventory_ledger.apply_fill(
+                client_order_id="legacy-bad-cash-buy",
+                order_intent_id="intent-legacy-bad-cash-buy",
+                symbol="SPY",
+                side=Signal.BUY,
+                requested_quantity=3,
+                fill_price=100.0,
+                filled_at=NOW,
+            )
+            payload = json.loads(store_path.read_text(encoding="utf-8"))
+            payload["snapshots"].pop("voting_ensemble.paper_execution.local_position.SPY")
+            account = payload["snapshots"]["voting_ensemble.paper_execution.local_account.latest"]
+            account["cash"] = 100000.0
+            account["cashBalance"] = 100000.0
+            store_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+            restarted = VotingEnsemblePaperExecutionRepository(store_path)
+            runtime = VotingEnsemblePaperExecutionRuntime(repository=restarted, queue=VotingEnsemblePaperExecutionQueue(), auto_start=False)
+            recovery = runtime.reconcile_broker_state(evaluated_at=NOW + timedelta(seconds=1))
+            blocked = runtime.enqueue_from_decision(
+                BuyDecisionService().evaluate({}),
+                correlation_id="corr-bad-migration-buy",
+                idempotency_key="idem-bad-migration-buy",
+                source_job_id="job-bad-migration-buy",
+                source_command_id="event-bad-migration-buy",
+                evaluated_at=NOW + timedelta(seconds=2),
+            )
+            inventory = runtime.inventory_snapshot()
+
+            self.assertEqual(recovery["status"], "RECONCILIATION_REQUIRED")
+            self.assertEqual(recovery["recovery"]["status"], "RECOVERY_FAILED")
+            self.assertIn("voting_ensemble.local_paper_migration.account_cash_or_pnl_not_reconstructable", recovery["recovery"]["reasonCodes"])
+            self.assertEqual(inventory["localFillMigration"]["status"], "FAILED")
+            self.assertEqual(inventory["positions"], [])
+            self.assertFalse(blocked["enqueued"])
+            self.assertIn("voting_ensemble.local_paper_migration.account_cash_or_pnl_not_reconstructable", blocked["reasonCodes"])
+        store_path.unlink(missing_ok=True)
+
     def test_local_paper_mark_to_market_uses_fresh_bid_for_long_accounting(self) -> None:
         with patch.dict(
             "os.environ",

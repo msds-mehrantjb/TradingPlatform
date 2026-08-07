@@ -401,10 +401,19 @@ class VotingEnsemblePaperExecutionRepository:
         )
         if account_key not in snapshots and has_local_inventory:
             failures = ["voting_ensemble.local_paper_recovery.account_missing_with_existing_inventory"]
+            self._record_local_fill_migration(
+                status="FAILED",
+                evaluated_at=observed,
+                reason_codes=["voting_ensemble.local_paper_migration.account_missing_cannot_reconstruct_cash"],
+            )
             return self._record_local_recovery_failure(failures, evaluated_at=observed, mark_recompute={})
         if account_key not in snapshots:
             self.local_account_snapshot(observed_at=observed)
             snapshots = dict(self.snapshots)
+        migration = self._migrate_legacy_fill_derived_state_if_needed(evaluated_at=observed)
+        if migration.get("status") == "FAILED":
+            return self._record_local_recovery_failure(list(migration.get("reasonCodes") or []), evaluated_at=observed, mark_recompute={})
+        snapshots = dict(self.snapshots)
         account = dict(snapshots.get(account_key) or {})
         failures = _validate_local_recovery_state(account=account, snapshots=snapshots)
         if failures:
@@ -434,12 +443,92 @@ class VotingEnsemblePaperExecutionRepository:
             "cash": (inventory.get("account") or {}).get("cash"),
             "realizedPnl": (inventory.get("account") or {}).get("realizedPnl"),
             "sessionDate": (inventory.get("account") or {}).get("sessionDate"),
+            "migration": migration,
             "markRecompute": mark_recompute,
             "evaluatedAt": observed.isoformat().replace("+00:00", "Z"),
             "reasonCodes": ["voting_ensemble.local_paper_recovery.recovered_from_persisted_inventory"],
         }
         self.write_snapshot("local_recovery.latest", payload)
         return self.read_snapshot("local_recovery.latest")
+
+    def _migrate_legacy_fill_derived_state_if_needed(self, *, evaluated_at: datetime) -> dict[str, Any]:
+        try:
+            existing = self.read_snapshot("local_fill_migration.latest")
+        except KeyError:
+            existing = {}
+        if existing.get("schemaVersion") == "voting_ensemble_local_fill_migration_v1" and existing.get("status") in {"MIGRATED", "SKIPPED"}:
+            return existing
+        snapshots = dict(self.snapshots)
+        local_fills = _local_recovery_fill_records(snapshots)
+        canonical_positions = [
+            payload
+            for key, payload in snapshots.items()
+            if key.startswith(f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_position.")
+            and _safe_int(payload.get("quantity") or payload.get("signedQuantity")) != 0
+        ]
+        if not local_fills or canonical_positions:
+            return self._record_local_fill_migration(
+                status="SKIPPED",
+                evaluated_at=evaluated_at,
+                reason_codes=["voting_ensemble.local_paper_migration.no_legacy_fill_derived_state_to_migrate"],
+            )
+        account = snapshots.get(f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_account.latest")
+        if not isinstance(account, Mapping):
+            return self._record_local_fill_migration(
+                status="FAILED",
+                evaluated_at=evaluated_at,
+                reason_codes=["voting_ensemble.local_paper_migration.account_missing_cannot_reconstruct_cash"],
+            )
+        migration_failures = _local_recovery_accounting_failures(account=account, snapshots=snapshots, local_fills=local_fills, require_positions=False)
+        if any(reason in migration_failures for reason in ("voting_ensemble.local_paper_recovery.cash_fill_invariant_failed", "voting_ensemble.local_paper_recovery.realized_pnl_fill_invariant_failed")):
+            return self._record_local_fill_migration(
+                status="FAILED",
+                evaluated_at=evaluated_at,
+                reason_codes=["voting_ensemble.local_paper_migration.account_cash_or_pnl_not_reconstructable", *migration_failures],
+            )
+        reconstructed = _reconstruct_local_positions_from_fills(local_fills, evaluated_at=evaluated_at)
+        if reconstructed.get("failures"):
+            return self._record_local_fill_migration(
+                status="FAILED",
+                evaluated_at=evaluated_at,
+                reason_codes=["voting_ensemble.local_paper_migration.fill_replay_not_safe", *list(reconstructed.get("failures") or [])],
+            )
+        migrated_symbols: list[str] = []
+        for symbol, position in (reconstructed.get("positions") or {}).items():
+            self.write_snapshot(f"local_position.{symbol}", position)
+            migrated_symbols.append(str(symbol))
+        self.inventory_ledger.persist_inventory_manifest(observed_at=evaluated_at)
+        return self._record_local_fill_migration(
+            status="MIGRATED",
+            evaluated_at=evaluated_at,
+            reason_codes=["voting_ensemble.local_paper_migration.legacy_fill_derived_state_migrated_once"],
+            migrated_symbols=sorted(migrated_symbols),
+        )
+
+    def _record_local_fill_migration(
+        self,
+        *,
+        status: str,
+        evaluated_at: datetime,
+        reason_codes: list[str],
+        migrated_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "schemaVersion": "voting_ensemble_local_fill_migration_v1",
+            "version": "voting_ensemble_local_fill_migration_v1",
+            "executionMode": "LOCAL_PAPER",
+            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+            "status": status,
+            "migrationStatus": status,
+            "migrationSource": "legacy_local_fill_records",
+            "normalRuntimeAuthority": "canonical_local_inventory_positions_not_fill_replay",
+            "fillReplayAllowedFor": ["migration", "audit", "recovery_verification"],
+            "migratedSymbols": list(migrated_symbols or []),
+            "evaluatedAt": evaluated_at.isoformat().replace("+00:00", "Z"),
+            "reasonCodes": list(dict.fromkeys(reason_codes)),
+        }
+        self.write_snapshot("local_fill_migration.latest", payload)
+        return self.read_snapshot("local_fill_migration.latest")
 
     def _record_local_recovery_failure(self, failures: list[str], *, evaluated_at: datetime, mark_recompute: Mapping[str, Any]) -> dict[str, Any]:
         reason_codes = list(dict.fromkeys(["voting_ensemble.local_paper_recovery.failed", *failures]))
@@ -665,6 +754,7 @@ class VotingEnsemblePaperExecutionRepository:
         local_inventory_manifests = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_inventory_manifest.")
         local_market_clocks = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_market_clock.")
         local_recoveries = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_recovery.")
+        local_fill_migrations = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_fill_migration.")
         local_executions = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_execution.")
         reconciliation_blocks = [
             record
@@ -700,6 +790,8 @@ class VotingEnsemblePaperExecutionRepository:
             "localMarketClock": local_market_clocks[-1] if local_market_clocks else None,
             "localRecovery": local_recoveries[-1] if local_recoveries else None,
             "localRecoveries": local_recoveries,
+            "localFillMigration": local_fill_migrations[-1] if local_fill_migrations else None,
+            "localFillMigrations": local_fill_migrations,
             "localExecutions": local_executions,
             "brokerOrders": broker_orders,
             "brokerPositions": broker_positions,
@@ -3261,6 +3353,7 @@ def _local_recovery_accounting_failures(
     account: Mapping[str, Any],
     snapshots: Mapping[str, Mapping[str, Any]],
     local_fills: list[Mapping[str, Any]],
+    require_positions: bool = True,
 ) -> list[str]:
     failures: list[str] = []
     expected_cash = _float(account.get("initialCash"))
@@ -3292,15 +3385,108 @@ def _local_recovery_accounting_failures(
             continue
         symbol = str(payload.get("symbol") or key.rsplit(".", 1)[-1]).upper()
         persisted_quantities[symbol] = int(payload.get("quantity") or payload.get("signedQuantity") or 0)
-    for symbol, expected_quantity in expected_quantities.items():
-        if expected_quantity < 0:
-            failures.append("voting_ensemble.local_paper_recovery.short_position_not_enabled")
-        if persisted_quantities.get(symbol, 0) != expected_quantity:
-            failures.append("voting_ensemble.local_paper_recovery.position_quantity_fill_invariant_failed")
-    for symbol, persisted_quantity in persisted_quantities.items():
-        if symbol not in expected_quantities and persisted_quantity != 0:
-            failures.append("voting_ensemble.local_paper_recovery.position_without_fill_history")
+    if require_positions:
+        for symbol, expected_quantity in expected_quantities.items():
+            if expected_quantity < 0:
+                failures.append("voting_ensemble.local_paper_recovery.short_position_not_enabled")
+            if persisted_quantities.get(symbol, 0) != expected_quantity:
+                failures.append("voting_ensemble.local_paper_recovery.position_quantity_fill_invariant_failed")
+        for symbol, persisted_quantity in persisted_quantities.items():
+            if symbol not in expected_quantities and persisted_quantity != 0:
+                failures.append("voting_ensemble.local_paper_recovery.position_without_fill_history")
     return failures
+
+
+def _reconstruct_local_positions_from_fills(local_fills: list[Mapping[str, Any]], *, evaluated_at: datetime) -> dict[str, Any]:
+    states: dict[str, dict[str, Any]] = {}
+    failures: list[str] = []
+    for fill in sorted(local_fills, key=lambda item: str(item.get("filledAt") or "")):
+        symbol = str(fill.get("symbol") or "").upper()
+        side = Signal(fill.get("side") or Signal.BUY)
+        quantity = _safe_int(fill.get("filledQuantity"))
+        price = _float(fill.get("averageFillPrice"))
+        filled_at = _parse_time(fill.get("filledAt")) or evaluated_at
+        if not symbol or quantity <= 0 or price <= 0:
+            failures.append("voting_ensemble.local_paper_migration.fill_required_field_invalid")
+            continue
+        state = states.setdefault(
+            symbol,
+            {
+                "quantity": 0,
+                "averagePrice": 0.0,
+                "realizedPnl": 0.0,
+                "entryFillIds": [],
+                "openedAt": None,
+                "entryOrderId": None,
+                "lastFillId": None,
+                "updatedAt": filled_at,
+            },
+        )
+        current_quantity = int(state["quantity"])
+        average = float(state["averagePrice"])
+        if side == Signal.BUY:
+            next_quantity = current_quantity + quantity
+            if next_quantity <= 0:
+                failures.append("voting_ensemble.local_paper_migration.position_quantity_invalid")
+                continue
+            state["averagePrice"] = ((current_quantity * average) + (quantity * price)) / next_quantity if current_quantity > 0 else price
+            state["quantity"] = next_quantity
+            state["entryFillIds"] = [*list(state["entryFillIds"]), str(fill.get("clientOrderId") or "")]
+            state["openedAt"] = state["openedAt"] or filled_at
+            state["entryOrderId"] = state["entryOrderId"] or str(fill.get("clientOrderId") or "")
+        else:
+            if current_quantity <= 0 or quantity > current_quantity:
+                failures.append("voting_ensemble.local_paper_migration.sell_would_create_short_or_reverse")
+                continue
+            state["quantity"] = current_quantity - quantity
+            state["realizedPnl"] = float(state["realizedPnl"]) + ((price - average) * quantity)
+        state["lastFillId"] = str(fill.get("clientOrderId") or "")
+        state["updatedAt"] = filled_at
+    positions: dict[str, dict[str, Any]] = {}
+    for symbol, state in states.items():
+        quantity = int(state["quantity"])
+        if quantity <= 0:
+            continue
+        average = float(state["averagePrice"])
+        updated_at = _require_utc(state["updatedAt"])
+        positions[symbol] = {
+            "schemaVersion": "voting_ensemble_local_position_v1",
+            "symbol": symbol,
+            "quantity": quantity,
+            "signedQuantity": quantity,
+            "side": "LONG",
+            "averagePrice": round(average, 6),
+            "averageEntryPrice": round(average, 6),
+            "markPrice": round(average, 6),
+            "notional": round(quantity * average, 6),
+            "marketValue": round(quantity * average, 6),
+            "unrealizedPnl": 0.0,
+            "realizedPnl": round(float(state["realizedPnl"]), 6),
+            "openedAt": _iso_or_none(state["openedAt"]),
+            "updatedAt": updated_at.isoformat().replace("+00:00", "Z"),
+            "stopPrice": None,
+            "profitTargetPrice": None,
+            "entryOrderId": state["entryOrderId"],
+            "entryFillIds": [fill_id for fill_id in state["entryFillIds"] if fill_id],
+            "lastFillId": state["lastFillId"],
+            "lastMarkedAt": updated_at.isoformat().replace("+00:00", "Z"),
+            "markPricePolicy": "migration_fill_price_until_fresh_nbbo_mark",
+            "marketDataFresh": False,
+            "quoteAgeSeconds": None,
+            "marketDataReceiptAgeSeconds": None,
+            "status": "OPEN",
+            "source": "voting_ensemble.local_paper_migration.fill_replay",
+            "sourceAuthority": "voting_ensemble_local_paper_account",
+            "positionOwner": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "exitOwner": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+            "executionMode": "LOCAL_PAPER",
+            "reasonCodes": ["voting_ensemble.local_paper_migration.position_created_from_legacy_fill_replay"],
+        }
+    return {"positions": positions, "failures": sorted(set(failures))}
 
 
 def _is_local_recovery_validated_key(key: str) -> bool:
@@ -3314,6 +3500,7 @@ def _is_local_recovery_validated_key(key: str) -> bool:
             f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_realized_pnl.",
             f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_risk_snapshot.",
             f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_inventory_manifest.",
+            f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_fill_migration.",
             f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.fill.",
         )
     )
