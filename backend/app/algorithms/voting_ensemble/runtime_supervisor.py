@@ -44,6 +44,9 @@ VOTING_ENSEMBLE_SUPERVISOR_WORKERS = (
     "reconciliation_loop",
     "health_monitor",
 )
+VOTING_ENSEMBLE_RECOVERABLE_WORKER_ENTRY_BLOCKS = {
+    f"voting_ensemble.runtime.{worker_id}.failed": worker_id for worker_id in VOTING_ENSEMBLE_SUPERVISOR_WORKERS
+}
 
 
 @dataclass
@@ -726,16 +729,46 @@ class VotingEnsembleRuntimeSupervisor:
     def _refresh_readiness(self) -> None:
         runtime_summary = self.runtime.summary()
         paper_summary = self.paper_execution_runtime.summary()
-        readiness = self._readiness_from_summaries(runtime_summary, paper_summary)
-        self.metrics.readiness = readiness["status"]
         self.metrics.workerStatus["evaluation_worker"] = "running" if runtime_summary.get("workerAlive") else "blocked"
         self.metrics.workerStatus["execution_worker"] = "running" if paper_summary.get("workerAlive") else self.metrics.workerStatus.get("execution_worker", "blocked")
+        self._clear_recovered_worker_entry_block(runtime_summary, paper_summary)
+        readiness = self._readiness_from_summaries(runtime_summary, paper_summary)
+        self.metrics.readiness = readiness["status"]
         effective = self._effective_control(runtime_summary, paper_summary)
         self.control_store.save_effective(
             effective=effective["effectivePaperTradingEnabled"],
             new_entries=effective["newEntriesEnabled"],
             reason_codes=effective["reasonCodes"],
         )
+
+    def _clear_recovered_worker_entry_block(self, runtime_summary: dict[str, Any], paper_summary: dict[str, Any]) -> None:
+        control = self.control_store.control
+        if not control.localEntryBlockActive or not control.localEntryBlockReasonCodes:
+            return
+        if self.metrics.lastError:
+            return
+        reasons = set(control.localEntryBlockReasonCodes)
+        recoverable_reasons = set(VOTING_ENSEMBLE_RECOVERABLE_WORKER_ENTRY_BLOCKS)
+        if not reasons <= recoverable_reasons:
+            return
+        if not all(self._worker_recovered_for_entry_block(reason, runtime_summary, paper_summary) for reason in reasons):
+            return
+        self.metrics.lastError = None
+        self.metrics.lastErrorAt = None
+        self.control_store.clear_entry_block("voting_ensemble.control.transient_worker_entry_block_recovered")
+
+    def _worker_recovered_for_entry_block(
+        self,
+        reason_code: str,
+        runtime_summary: dict[str, Any],
+        paper_summary: dict[str, Any],
+    ) -> bool:
+        worker_id = VOTING_ENSEMBLE_RECOVERABLE_WORKER_ENTRY_BLOCKS.get(reason_code)
+        if worker_id == "evaluation_worker":
+            return bool(runtime_summary.get("workerAlive"))
+        if worker_id == "execution_worker":
+            return bool(paper_summary.get("workerAlive"))
+        return self.metrics.workerStatus.get(str(worker_id)) == "running"
 
     def _readiness_from_summaries(self, runtime_summary: dict[str, Any], paper_summary: dict[str, Any]) -> dict[str, Any]:
         blockers: list[str] = []

@@ -329,6 +329,30 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("voting_ensemble.control.effective_paper_on", enabled["reasonCodes"])
         control_path.unlink(missing_ok=True)
 
+    async def test_recovered_worker_failure_block_is_cleared_by_health_refresh(self) -> None:
+        control_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"control-{uuid4().hex}.json"
+        self.supervisor = supervisor_with_runtime(
+            control_store=VotingEnsembleRuntimeControlStore(VotingEnsembleRuntimeControlRepository(control_path)),
+            settings=paper_settings(),
+            market_clock_provider=lambda: {"isOpen": True, "status": "open"},
+            market_data_client=FakeMarketDataClient([]),
+            candle_store=MemoryCandleStore(),
+        )
+        await self.supervisor.start()
+        self.supervisor.update_control(requested_paper_trading_enabled=True, updated_by="test")
+        self.supervisor.control_store.block_new_entries("voting_ensemble.runtime.finalized_bar_producer.failed")
+        self.supervisor.metrics.workerStatus["finalized_bar_producer"] = "running"
+
+        status = self.supervisor.control_status()
+
+        self.assertTrue(status["requestedPaperTradingEnabled"])
+        self.assertTrue(status["effectivePaperTradingEnabled"])
+        self.assertTrue(status["newEntriesEnabled"])
+        self.assertFalse(status["localEntryBlockActive"])
+        self.assertEqual(status["localEntryBlockReasonCodes"], [])
+        self.assertIn("voting_ensemble.control.effective_paper_on", status["reasonCodes"])
+        control_path.unlink(missing_ok=True)
+
     async def test_local_paper_readiness_refreshes_stale_market_data_mark_from_quote_provider(self) -> None:
         quote_time = datetime.now(UTC) + timedelta(seconds=1)
         self.supervisor = supervisor_with_runtime(

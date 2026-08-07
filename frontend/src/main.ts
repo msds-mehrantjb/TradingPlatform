@@ -8853,7 +8853,12 @@ function metaStrategyPaperBlocked() {
 }
 
 function selectedPaperStatus() {
-  const mode = state.tradingWindowMode;
+  const mode: TradingWindowMode =
+    state.algoTab === "meta" ? "meta"
+    : state.algoTab === "regime" ? "regime"
+    : state.algoTab === "confidence" ? "confidence"
+    : state.algoTab === "weighted" ? "weighted"
+    : "ensemble";
   if (mode === "meta") {
     const requested = metaStrategyPaperRequested();
     const effective = metaStrategyPaperEffective();
