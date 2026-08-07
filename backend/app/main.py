@@ -2054,25 +2054,51 @@ async def latest_market_data_quote(symbol: str = Query("SPY"), feed: str = Query
     normalized_symbol = symbol.upper().strip() or "SPY"
     normalized_feed = feed.lower().strip() or "iex"
     if not settings.has_alpaca_credentials:
-        return {
-            "status": "unavailable",
-            "symbol": normalized_symbol,
-            "feed": normalized_feed,
-            "quote": None,
-            "reasonCodes": ["market_data.nbbo.alpaca_credentials_missing"],
-        }
+        fallback = _latest_quote_from_cached_candle(symbol=normalized_symbol, feed=normalized_feed)
+        if fallback is not None:
+            return {
+                "status": "ready",
+                "symbol": normalized_symbol,
+                "feed": normalized_feed,
+                "quote": fallback,
+                "reasonCodes": ["market_data.nbbo.alpaca_credentials_missing", "market_data.nbbo.cached_candle_quote_fallback_ready"],
+                "warning": "Alpaca quote credentials are missing; using a conservative cached-candle bid/ask fallback.",
+            }
+        return _latest_quote_unavailable(
+            symbol=normalized_symbol,
+            feed=normalized_feed,
+            reason_code="market_data.nbbo.alpaca_credentials_missing",
+        )
     try:
         quote = await alpaca.get_latest_quote(symbol=normalized_symbol, feed=normalized_feed)
     except httpx.HTTPError as exc:
+        fallback = _latest_quote_from_cached_candle(symbol=normalized_symbol, feed=normalized_feed)
+        if fallback is not None:
+            return {
+                "status": "ready",
+                "symbol": normalized_symbol,
+                "feed": normalized_feed,
+                "quote": fallback,
+                "reasonCodes": ["market_data.nbbo.alpaca_latest_quote_unavailable", "market_data.nbbo.cached_candle_quote_fallback_ready"],
+                "warning": f"Latest quote feed unavailable; using a conservative cached-candle bid/ask fallback: {exc}",
+            }
         raise HTTPException(status_code=502, detail=f"Latest quote feed unavailable: {exc}") from exc
     if quote is None:
-        return {
-            "status": "unavailable",
-            "symbol": normalized_symbol,
-            "feed": normalized_feed,
-            "quote": None,
-            "reasonCodes": ["market_data.nbbo.latest_quote_missing"],
-        }
+        fallback = _latest_quote_from_cached_candle(symbol=normalized_symbol, feed=normalized_feed)
+        if fallback is not None:
+            return {
+                "status": "ready",
+                "symbol": normalized_symbol,
+                "feed": normalized_feed,
+                "quote": fallback,
+                "reasonCodes": ["market_data.nbbo.latest_quote_missing", "market_data.nbbo.cached_candle_quote_fallback_ready"],
+                "warning": "Latest quote feed returned no quote; using a conservative cached-candle bid/ask fallback.",
+            }
+        return _latest_quote_unavailable(
+            symbol=normalized_symbol,
+            feed=normalized_feed,
+            reason_code="market_data.nbbo.latest_quote_missing",
+        )
     return {
         "status": "ready",
         "symbol": normalized_symbol,
@@ -2080,6 +2106,56 @@ async def latest_market_data_quote(symbol: str = Query("SPY"), feed: str = Query
         "quote": quote,
         "reasonCodes": ["market_data.nbbo.latest_quote_ready"],
     }
+
+
+def _latest_quote_unavailable(*, symbol: str, feed: str, reason_code: str) -> dict[str, Any]:
+    return {
+        "status": "unavailable",
+        "symbol": symbol,
+        "feed": feed,
+        "quote": None,
+        "reasonCodes": [reason_code],
+    }
+
+
+def _latest_quote_from_cached_candle(*, symbol: str, feed: str) -> dict[str, Any] | None:
+    candles = dedupe_candles_by_time(store.latest(symbol=symbol, timeframe="1Min", feed=feed, limit=1))
+    if not candles:
+        return None
+    candle = candles[-1]
+    close = _quote_positive_float(candle.get("close"))
+    if close is None:
+        return None
+    spread = max(0.01, close * 0.0001)
+    bid = max(0.01, close - (spread / 2.0))
+    ask = close + (spread / 2.0)
+    observed_at = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return {
+        "provider": str(candle.get("provider") or "cache"),
+        "feed": feed,
+        "symbol": symbol,
+        "bid": round(bid, 4),
+        "ask": round(ask, 4),
+        "bidSize": max(1, int(candle.get("volume") or 1)),
+        "askSize": max(1, int(candle.get("volume") or 1)),
+        "quoteTimestamp": observed_at,
+        "lastTradeTimestamp": str(candle.get("timestamp") or observed_at),
+        "marketDataReceiptTimestamp": observed_at,
+        "source": "cached_candle_quote_fallback",
+        "markPricePolicy": "cached_last_close_with_conservative_one_basis_point_spread",
+        "referenceCandleTimestamp": candle.get("timestamp"),
+        "referenceClose": close,
+    }
+
+
+def _quote_positive_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
 
 
 @app.post("/api/execution-cost-model/train")

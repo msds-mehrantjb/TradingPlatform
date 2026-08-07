@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import asyncio
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 
 _TEST_DB = Path(tempfile.gettempdir()) / "trading_candles_endpoint_tests.db"
@@ -53,6 +55,45 @@ def test_candles_refresh_false_empty_cache_returns_without_alpaca_call_when_mark
     assert payload["candles"] == []
     assert "No cached candles" in payload["warning"]
     get_bars.assert_not_called()
+
+
+def test_latest_quote_uses_cached_candle_fallback_when_credentials_missing() -> None:
+    with (
+        patch.object(main, "settings", replace(main.settings, alpaca_key_id="", alpaca_secret_key="")),
+        patch.object(main.store, "latest", return_value=[cached_candle()]),
+        patch.object(main.alpaca, "get_latest_quote", new_callable=AsyncMock) as get_latest_quote,
+    ):
+        response = TestClient(main.app).get("/api/market-data/quotes/latest?symbol=SPY&feed=iex")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ready"
+    assert payload["quote"]["source"] == "cached_candle_quote_fallback"
+    assert payload["quote"]["bid"] > 0
+    assert payload["quote"]["ask"] > payload["quote"]["bid"]
+    assert payload["quote"]["bidSize"] > 0
+    assert payload["quote"]["askSize"] > 0
+    assert "market_data.nbbo.cached_candle_quote_fallback_ready" in payload["reasonCodes"]
+    get_latest_quote.assert_not_called()
+
+
+def test_latest_quote_uses_cached_candle_fallback_when_alpaca_quote_fails() -> None:
+    with (
+        patch.object(main, "settings", replace(main.settings, alpaca_key_id="test-key", alpaca_secret_key="test-secret")),
+        patch.object(main.store, "latest", return_value=[cached_candle()]),
+        patch.object(main.alpaca, "get_latest_quote", new_callable=AsyncMock) as get_latest_quote,
+    ):
+        get_latest_quote.side_effect = httpx.ConnectError("quote upstream unavailable")
+        response = TestClient(main.app).get("/api/market-data/quotes/latest?symbol=SPY&feed=iex")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ready"
+    assert payload["quote"]["source"] == "cached_candle_quote_fallback"
+    assert payload["quote"]["bid"] > 0
+    assert payload["quote"]["ask"] > payload["quote"]["bid"]
+    assert "market_data.nbbo.alpaca_latest_quote_unavailable" in payload["reasonCodes"]
+    assert "market_data.nbbo.cached_candle_quote_fallback_ready" in payload["reasonCodes"]
 
 
 def test_candles_refresh_false_empty_cache_loads_latest_completed_session_when_market_closed() -> None:
