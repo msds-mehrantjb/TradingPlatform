@@ -8852,6 +8852,85 @@ function metaStrategyPaperBlocked() {
   return metaStrategyPaperRequested() && !metaStrategyPaperEffective();
 }
 
+function selectedPaperStatus() {
+  const mode = state.tradingWindowMode;
+  if (mode === "meta") {
+    const requested = metaStrategyPaperRequested();
+    const effective = metaStrategyPaperEffective();
+    return {
+      mode,
+      label: "Meta-Strategy",
+      requested,
+      effective,
+      blocked: requested && !effective,
+      loading: state.metaStrategyPaperControlStatus === "loading",
+      error: requested && state.metaStrategyPaperControlStatus === "error",
+      warning: state.metaStrategyPaperControlWarning,
+      reasonCodes: metaStrategyPaperControlRecord()?.reasonCodes ?? [],
+    };
+  }
+  if (mode === "regime") {
+    const requested = regimePaperRequested();
+    const effective = regimePaperEffective();
+    const control = regimeRuntimeControlRecord();
+    return {
+      mode,
+      label: "Regime",
+      requested,
+      effective,
+      blocked: requested && !effective,
+      loading: state.regimeRuntimeControlStatus === "loading",
+      error: requested && state.regimeRuntimeControlStatus === "error",
+      warning: state.regimeRuntimeControlWarning,
+      reasonCodes: [...(control?.paperEffectiveBlockerReasonCodes ?? []), ...(control?.paperEffectiveBlockers ?? [])],
+    };
+  }
+  if (mode === "confidence") {
+    const requested = wcaPaperRequested();
+    const effective = wcaPaperEffective() && wcaAutomaticEntriesEffective();
+    const control = wcaRuntimeControlRecord();
+    return {
+      mode,
+      label: "WCA",
+      requested,
+      effective,
+      blocked: requested && !effective,
+      loading: state.wcaRuntimeControlStatus === "loading",
+      error: requested && state.wcaRuntimeControlStatus === "error",
+      warning: state.wcaRuntimeControlWarning,
+      reasonCodes: arrayFromUnknown(control?.reasonCodes ?? control?.reason_codes).map((value) => String(value)),
+    };
+  }
+  if (mode === "weighted") {
+    const requested = globalPaperTradingEnabled();
+    return {
+      mode,
+      label: "Weighted Voting",
+      requested,
+      effective: requested,
+      blocked: false,
+      loading: state.wcaRuntimeControlStatus === "loading",
+      error: false,
+      warning: "",
+      reasonCodes: [] as string[],
+    };
+  }
+  const requested = votingEnsemblePaperRequested();
+  const effective = votingEnsemblePaperEffective();
+  const runtime = state.votingEnsembleRuntimeStatus;
+  return {
+    mode,
+    label: "Voting Ensemble",
+    requested,
+    effective,
+    blocked: requested && !effective,
+    loading: state.votingEnsembleRuntimeControlStatus === "loading",
+    error: requested && state.votingEnsembleRuntimeControlStatus === "error",
+    warning: state.votingEnsembleRuntimeControlWarning,
+    reasonCodes: [...(runtime?.activeEntryBlocks ?? []), ...(runtime?.paperReadyBlockingReasonCodes ?? []), ...(state.votingEnsembleRuntimeControl?.reasonCodes ?? [])],
+  };
+}
+
 function wcaPaperRequestedFromControl(control: WcaRuntimeControl | null | undefined) {
   return Boolean(control?.paperTradingRequested ?? control?.paper_trading_requested);
 }
@@ -8884,6 +8963,20 @@ function tradeSubmissionBlockedTitle(submitMode: SubmitOrderMode | "Manual" | "A
 }
 
 function updateTradeToggleButton() {
+  const selected = selectedPaperStatus();
+  const requested = selected.requested;
+  const effective = selected.effective;
+  const blocked = selected.blocked;
+  const loading = selected.loading;
+  const error = selected.error;
+  tradeToggleButton.textContent = loading ? "Paper Requested" : error ? "Paper Error" : blocked ? "Paper ON but blocked" : effective ? "Paper Effective" : requested ? "Paper Requested" : "Paper Off";
+  tradeToggleButton.setAttribute("aria-pressed", String(effective));
+  tradeToggleButton.dataset.enabled = String(effective);
+  tradeToggleButton.dataset.requested = String(requested);
+  tradeToggleButton.dataset.effective = String(effective);
+  tradeToggleButton.dataset.status = loading ? "requested" : error ? "error" : blocked ? "blocked" : effective ? "effective" : requested ? "requested" : "off";
+  tradeToggleButton.dataset.algorithm = selected.mode;
+  const runtime = state.votingEnsembleRuntimeStatus;
   const votingRequested = votingEnsemblePaperRequested();
   const votingEffective = votingEnsemblePaperEffective();
   const wcaRequested = wcaPaperRequested();
@@ -8893,22 +8986,6 @@ function updateTradeToggleButton() {
   const regimeEffective = regimePaperEffective();
   const metaRequested = metaStrategyPaperRequested();
   const metaEffective = metaStrategyPaperEffective();
-  const requested = votingRequested || wcaRequested || regimeRequested || metaRequested || globalPaperTradingEnabled();
-  const effective = requested && (!votingRequested || votingEffective) && (!wcaRequested || (wcaEffective && wcaEntriesEffective)) && (!regimeRequested || regimeEffective) && (!metaRequested || metaEffective);
-  const blocked = votingEnsemblePaperBlocked() || wcaPaperBlocked() || regimePaperBlocked() || metaStrategyPaperBlocked();
-  const loading = state.votingEnsembleRuntimeControlStatus === "loading" || state.wcaRuntimeControlStatus === "loading" || state.regimeRuntimeControlStatus === "loading" || state.metaStrategyPaperControlStatus === "loading";
-  const error =
-    (votingRequested && state.votingEnsembleRuntimeControlStatus === "error") ||
-    (wcaRequested && state.wcaRuntimeControlStatus === "error") ||
-    (regimeRequested && state.regimeRuntimeControlStatus === "error") ||
-    (metaRequested && state.metaStrategyPaperControlStatus === "error");
-  tradeToggleButton.textContent = loading ? "Paper Requested" : error ? "Paper Error" : blocked ? "Paper ON but blocked" : effective ? "Paper Effective" : requested ? "Paper Requested" : "Paper Off";
-  tradeToggleButton.setAttribute("aria-pressed", String(effective));
-  tradeToggleButton.dataset.enabled = String(effective);
-  tradeToggleButton.dataset.requested = String(requested);
-  tradeToggleButton.dataset.effective = String(effective);
-  tradeToggleButton.dataset.status = loading ? "requested" : error ? "error" : blocked ? "blocked" : effective ? "effective" : requested ? "requested" : "off";
-  const runtime = state.votingEnsembleRuntimeStatus;
   const wcaControl = wcaRuntimeControlRecord();
   const wcaReasons = arrayFromUnknown(wcaControl?.reasonCodes ?? wcaControl?.reason_codes).map((value) => String(value)).join(", ");
   const regimeControl = regimeRuntimeControlRecord();
@@ -8918,10 +8995,12 @@ function updateTradeToggleButton() {
   const metaReasonCodes = arrayFromUnknown(metaControl?.reasonCodes).map((value) => String(value)).join(", ");
   const activeBlocks = runtime?.activeEntryBlocks?.length ? runtime.activeEntryBlocks.join(", ") : "";
   const paperReadyBlocks = runtime?.paperReadyBlockingReasonCodes?.length ? runtime.paperReadyBlockingReasonCodes.join(", ") : "";
-  const reason = activeBlocks || state.votingEnsembleRuntimeControl?.reasonCodes?.join(", ") || state.votingEnsembleRuntimeControlWarning;
+  const selectedReason = selected.reasonCodes.length ? selected.reasonCodes.join(", ") : selected.warning;
+  const reason = selectedReason || activeBlocks || state.votingEnsembleRuntimeControl?.reasonCodes?.join(", ") || state.votingEnsembleRuntimeControlWarning;
   const controlLabel = [
-    `Paper Requested: ${requested ? "ON" : "OFF"}`,
-    `Paper Effective: ${effective ? "ON" : "OFF"}`,
+    `Selected algorithm: ${selected.label}`,
+    `Selected paper requested: ${requested ? "ON" : "OFF"}`,
+    `Selected paper effective: ${effective ? "ON" : "OFF"}`,
     `Voting Ensemble requested: ${votingRequested ? "ON" : "OFF"}`,
     `Voting Ensemble effective: ${votingEffective ? "ON" : "OFF"}`,
     `WCA requested: ${wcaRequested ? "ON" : "OFF"}`,
@@ -11316,6 +11395,7 @@ function setAlgoTab(tab: AlgoTab) {
   if (meta) {
     updateMetaStrategyPanel();
   }
+  updateTradeToggleButton();
 }
 
 function shouldRefreshVotingEnsembleBackend() {
