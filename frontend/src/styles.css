@@ -3764,6 +3764,17 @@ select {
   color: #475467;
 }
 
+.position-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.position-title .trade-toggle-button {
+  flex: 0 0 auto;
+}
+
 .position-section {
   padding-bottom: 14px;
 }

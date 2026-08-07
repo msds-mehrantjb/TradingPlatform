@@ -3602,7 +3602,6 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <div class="quote-header">
             <span>SPDR S&P 500 ETF TRUST</span>
             <div class="quote-header-actions">
-              <button id="tradeToggleButton" class="trade-toggle-button" type="button" aria-pressed="false">Paper Off</button>
               <strong id="quoteSymbol">SPY</strong>
             </div>
           </div>
@@ -3631,7 +3630,10 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
             <button id="metaTradingWindowTab" class="trading-window-tab" type="button" role="tab" aria-selected="false" aria-controls="tradingWindowPanel">Meta-Strategy</button>
           </div>
           <div id="tradingWindowPanel" class="trading-window-panel" role="tabpanel">
-            <div class="section-title">Position</div>
+            <div class="section-title position-title">
+              <span>Position</span>
+              <button id="tradeToggleButton" class="trade-toggle-button" type="button" aria-pressed="false">Paper Off</button>
+            </div>
             <div id="quotePosition" class="quote-grid"></div>
             <button id="closePositionButton" class="close-position">Close Position</button>
             <div class="open-order-controls-section">
@@ -8921,17 +8923,19 @@ function selectedPaperStatus() {
     };
   }
   if (mode === "weighted") {
-    const requested = globalPaperTradingEnabled();
+    const control = weightedVotingBackendState.runtimeControl;
+    const requested = Boolean(control?.paperTradingEnabled);
+    const effective = Boolean(control?.paperTradingEnabled && control.automaticEntriesEnabled && !control.liveTradingEnabled);
     return {
       mode,
       label: "Weighted Voting",
       requested,
-      effective: requested,
-      blocked: false,
-      loading: state.wcaRuntimeControlStatus === "loading",
-      error: false,
-      warning: "",
-      reasonCodes: [] as string[],
+      effective,
+      blocked: requested && !effective,
+      loading: weightedVotingBackendState.status === "loading",
+      error: requested && weightedVotingBackendState.status === "error",
+      warning: weightedVotingBackendState.warning,
+      reasonCodes: control?.reasonCodes ?? [],
     };
   }
   const requested = votingEnsemblePaperRequested();
@@ -16731,37 +16735,94 @@ async function fetchMetaStrategyJson(path: string, init: RequestInit = {}) {
 }
 
 async function handlePaperToggleClick() {
-  if (state.votingEnsembleRuntimeControlStatus === "loading" || state.metaStrategyPaperControlStatus === "loading") {
+  const selected = selectedPaperStatus();
+  if (selected.loading) {
     return;
   }
-  const requested = !(votingEnsemblePaperRequested() || wcaPaperRequested() || regimePaperRequested() || metaStrategyPaperRequested() || globalPaperTradingEnabled());
-  state.votingEnsembleRuntimeControlStatus = "loading";
-  state.metaStrategyPaperControlStatus = "loading";
-  state.votingEnsembleRuntimeControlWarning = "";
-  state.metaStrategyPaperControlWarning = "";
+  const requested = !selected.requested;
+  setSelectedPaperControlLoading(selected.mode);
   updateTradeToggleButton();
   try {
-    const control = await syncVotingEnsembleAutomaticPaperControl(requested);
-    setGlobalPaperTradingEnabled(Boolean(control.requestedPaperTradingEnabled));
+    await syncSelectedAlgorithmPaperControl(selected.mode, requested);
     saveUiState();
-    updateTradeToggleButton();
-    updateQuoteCard(currentCandle());
-    await Promise.allSettled([
-      syncWeightedVotingAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
-      syncRegimeAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
-      syncWcaAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
-      syncMetaStrategyAutomaticPaperControl(Boolean(control.requestedPaperTradingEnabled)),
-    ]);
-    await Promise.allSettled([loadVotingEnsembleRuntimeStatus(), refreshVotingEnsemblePaperInventory()]);
   } catch (error) {
-    state.votingEnsembleRuntimeControlStatus = "error";
-    state.votingEnsembleRuntimeControlWarning = error instanceof Error ? error.message : "Voting Ensemble paper control sync failed";
-    state.metaStrategyPaperControlWarning = "";
-    void loadMetaStrategyPaperControl();
+    setSelectedPaperControlError(selected.mode, error);
     saveUiState();
-    updateTradeToggleButton();
-    updateQuoteCard(currentCandle());
   }
+  updateTradeToggleButton();
+  updateQuoteCard(currentCandle());
+}
+
+function setSelectedPaperControlLoading(mode: TradingWindowMode) {
+  if (mode === "ensemble") {
+    state.votingEnsembleRuntimeControlStatus = "loading";
+    state.votingEnsembleRuntimeControlWarning = "";
+    return;
+  }
+  if (mode === "weighted") {
+    weightedVotingBackendState.status = "loading";
+    weightedVotingBackendState.warning = "";
+    return;
+  }
+  if (mode === "confidence") {
+    state.wcaRuntimeControlStatus = "loading";
+    state.wcaRuntimeControlWarning = "";
+    return;
+  }
+  if (mode === "regime") {
+    state.regimeRuntimeControlStatus = "loading";
+    state.regimeRuntimeControlWarning = "";
+    return;
+  }
+  state.metaStrategyPaperControlStatus = "loading";
+  state.metaStrategyPaperControlWarning = "";
+}
+
+function setSelectedPaperControlError(mode: TradingWindowMode, error: unknown) {
+  const message = error instanceof Error ? error.message : `${algorithmDisplayName(mode)} paper control sync failed`;
+  if (mode === "ensemble") {
+    state.votingEnsembleRuntimeControlStatus = "error";
+    state.votingEnsembleRuntimeControlWarning = message;
+    return;
+  }
+  if (mode === "weighted") {
+    weightedVotingBackendState.status = "error";
+    weightedVotingBackendState.warning = message;
+    return;
+  }
+  if (mode === "confidence") {
+    state.wcaRuntimeControlStatus = "error";
+    state.wcaRuntimeControlWarning = message;
+    return;
+  }
+  if (mode === "regime") {
+    state.regimeRuntimeControlStatus = "error";
+    state.regimeRuntimeControlWarning = message;
+    return;
+  }
+  state.metaStrategyPaperControlStatus = "error";
+  state.metaStrategyPaperControlWarning = message;
+}
+
+async function syncSelectedAlgorithmPaperControl(mode: TradingWindowMode, enabled: boolean) {
+  if (mode === "ensemble") {
+    await syncVotingEnsembleAutomaticPaperControl(enabled);
+    await refreshVotingEnsemblePaperInventory();
+    return;
+  }
+  if (mode === "weighted") {
+    await syncWeightedVotingAutomaticPaperControl(enabled);
+    return;
+  }
+  if (mode === "confidence") {
+    await syncWcaAutomaticPaperControl(enabled);
+    return;
+  }
+  if (mode === "regime") {
+    await syncRegimeAutomaticPaperControl(enabled);
+    return;
+  }
+  await syncMetaStrategyAutomaticPaperControl(enabled);
 }
 
 async function loadVotingEnsembleRuntimeControl() {
@@ -16772,7 +16833,6 @@ async function loadVotingEnsembleRuntimeControl() {
     state.votingEnsembleRuntimeControl = control;
     state.votingEnsembleRuntimeControlStatus = control.requestedPaperTradingEnabled && !control.effectivePaperTradingEnabled ? "blocked" : "ready";
     state.votingEnsembleRuntimeControlWarning = "";
-    setGlobalPaperTradingEnabled(control.requestedPaperTradingEnabled);
     await loadVotingEnsembleRuntimeStatus();
   } catch (error) {
     state.votingEnsembleRuntimeControlStatus = "error";
@@ -17056,10 +17116,10 @@ async function syncMetaStrategyAutomaticPaperControl(enabled: boolean) {
           capitalPartitionId: latest.capitalPartitionId,
           newPaperEntriesEnabled: enabled,
           expectedVersion: latest.version,
-          actor: "dashboard.global_paper_toggle",
+          actor: "dashboard.local_paper_toggle",
           reason: enabled
-            ? "meta_strategy.paper_control.dashboard_global_paper_toggle_on"
-            : "meta_strategy.paper_control.dashboard_global_paper_toggle_off",
+            ? "meta_strategy.paper_control.dashboard_local_paper_toggle_on"
+            : "meta_strategy.paper_control.dashboard_local_paper_toggle_off",
         }),
       });
     if (isRecord(updated) && stringFromUnknown(updated.status, "") === "REJECTED") {
@@ -17104,6 +17164,9 @@ function normalizeMetaStrategyPaperControl(raw: unknown): MetaStrategyPaperContr
 }
 
 async function syncWeightedVotingAutomaticPaperControl(enabled: boolean) {
+  weightedVotingBackendState.status = "loading";
+  weightedVotingBackendState.warning = "";
+  updateTradeToggleButton();
   try {
     const control = normalizeWeightedVotingRuntimeControl(
       await fetchWeightedVotingRuntimeControlJson("/runtime/control", {
@@ -17111,23 +17174,28 @@ async function syncWeightedVotingAutomaticPaperControl(enabled: boolean) {
         body: JSON.stringify({
           paper_trading_enabled: enabled,
           automatic_entries_enabled: enabled,
-          actor: "dashboard.global_paper_toggle",
+          actor: "dashboard.local_paper_toggle",
           reason: enabled
-            ? "weighted_voting.runtime.dashboard.global_paper_toggle_on"
-            : "weighted_voting.runtime.dashboard.global_paper_toggle_off",
+            ? "weighted_voting.runtime.dashboard.local_paper_toggle_on"
+            : "weighted_voting.runtime.dashboard.local_paper_toggle_off",
         }),
       }),
     );
     weightedVotingBackendState.runtimeControl = control;
+    weightedVotingBackendState.status = "ready";
     weightedVotingBackendState.warning = enabled && !control.automaticEntriesEnabled
-      ? `Global paper is on; Weighted Voting automatic entries remain blocked by backend control: ${control.reasonCodes.join(", ")}`
+      ? `Weighted Voting paper is on; automatic entries remain blocked by backend control: ${control.reasonCodes.join(", ")}`
       : !enabled
-        ? "Global paper is off; Weighted Voting backend control is blocking new entries while preserving risk-reducing exits."
+        ? "Weighted Voting paper is off; backend control is blocking new entries while preserving risk-reducing exits."
         : "";
     updateWeightedVotingPanel({ refresh: false });
+    updateTradeToggleButton();
   } catch (error) {
+    weightedVotingBackendState.status = "error";
     weightedVotingBackendState.warning = error instanceof Error ? error.message : "Weighted Voting automatic paper control sync failed";
     updateWeightedVotingPanel({ refresh: false });
+    updateTradeToggleButton();
+    throw error;
   }
 }
 
@@ -17166,11 +17234,11 @@ async function syncRegimeAutomaticPaperControl(enabled: boolean) {
   updateTradeToggleButton();
   try {
     const reason = enabled
-      ? "regime.runtime.dashboard.global_paper_toggle_on"
-      : "regime.runtime.dashboard.global_paper_toggle_off";
+      ? "regime.runtime.dashboard.local_paper_toggle_on"
+      : "regime.runtime.dashboard.local_paper_toggle_off";
     const result = await setRegimeAutomaticPaperTrading<Record<string, unknown>>({
       enabled,
-      actor: "dashboard.global_paper_toggle",
+      actor: "dashboard.local_paper_toggle",
       reason,
     });
     const control = childRecord(result, "automaticPaperControl") ?? result;
@@ -17246,11 +17314,11 @@ async function syncWcaAutomaticPaperControl(enabled: boolean) {
   updateTradeToggleButton();
   try {
     const reason = enabled
-      ? "wca.runtime.dashboard.global_paper_toggle_on"
-      : "wca.runtime.dashboard.global_paper_toggle_off";
+      ? "wca.runtime.dashboard.local_paper_toggle_on"
+      : "wca.runtime.dashboard.local_paper_toggle_off";
     await setWcaAutomaticPaperTrading({
       enabled,
-      actor: "dashboard.global_paper_toggle",
+      actor: "dashboard.local_paper_toggle",
       reason,
       accountId: "paper",
       symbol: "SPY",
