@@ -117,6 +117,7 @@ class PaperOrderIntentRecord(DomainModel):
     maxReplacementCount: int = Field(default=0, ge=0)
     replacementCount: int = Field(default=0, ge=0)
     protectiveExitEscalationPolicy: str = Field(default="CANCEL_AND_MARKETABLE_LIMIT", min_length=1)
+    settingsSnapshot: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("createdAt", "decisionTimestamp")
     @classmethod
@@ -426,6 +427,7 @@ class PaperOrderGateway:
             cancelAndReplaceEnabled=bool(proposal.settingsSnapshot.get("cancelAndReplaceEnabled") or False),
             maxReplacementCount=int(proposal.settingsSnapshot.get("maximumReplacementCount") or 0),
             protectiveExitEscalationPolicy=str(proposal.settingsSnapshot.get("protectiveExitEscalationPolicy") or "CANCEL_AND_MARKETABLE_LIMIT"),
+            settingsSnapshot=dict(proposal.settingsSnapshot or {}),
         )
 
     def _evaluate_global_portfolio_risk(self, proposal: GlobalOrderProposal, intent: PaperOrderIntentRecord, evaluated_at: datetime) -> PortfolioGateDecision:

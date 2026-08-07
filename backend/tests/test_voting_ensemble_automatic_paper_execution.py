@@ -388,6 +388,48 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
                 self.assertEqual(record["algorithmId"], VOTING_ENSEMBLE_ALGORITHM_ID)
                 self.assertEqual(record["capitalPartitionId"], VOTING_ENSEMBLE_CAPITAL_PARTITION_ID)
 
+    def test_local_paper_new_entry_uses_ve_cash_not_foreign_unused_capital(self) -> None:
+        with patch.dict("os.environ", {"VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "50"}):
+            repository = VotingEnsemblePaperExecutionRepository()
+            repository.snapshots["global_risk.read_only_account.algorithm_b"] = {
+                "algorithmId": "algorithm_b",
+                "capitalPartitionId": "algorithm_b.paper.default",
+                "accountId": "algorithm-b-paper",
+                "equity": 1_000_000.0,
+                "buyingPower": 1_000_000.0,
+                "readOnly": True,
+                "sourceAuthority": "global_risk.read_only_aggregate",
+            }
+            seed_local_quote(repository)
+            execution_runtime = VotingEnsemblePaperExecutionRuntime(
+                repository=repository,
+                queue=VotingEnsemblePaperExecutionQueue(),
+                auto_start=False,
+            )
+
+            execution_runtime.enqueue_from_decision(
+                BuyDecisionService().evaluate({}),
+                correlation_id="corr-local-cash-isolation",
+                idempotency_key="idem-local-cash-isolation",
+                source_job_id="job-local-cash-isolation",
+                source_command_id="event-local-cash-isolation",
+                evaluated_at=NOW,
+            )
+            result = execution_runtime.process_once(evaluated_at=NOW + timedelta(seconds=1))
+            inventory = execution_runtime.inventory_snapshot()
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertFalse(result["submitted"])
+            self.assertEqual(result["gatewayResult"]["status"], "NOT_SUBMITTED")
+            self.assertIn("paper_gateway.global_portfolio_risk_denied", result["gatewayResult"]["reasonCodes"])
+            risk_account = repository.read_snapshot(f"paper_order_gateway.global_risk_account.{result['gatewayResult']['orderIntentId']}")
+            self.assertEqual(risk_account["accountId"], VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID)
+            self.assertEqual(risk_account["equity"], 50.0)
+            self.assertEqual(risk_account["availableBuyingPower"], 50.0)
+            self.assertEqual(inventory["positions"], [])
+            self.assertEqual(inventory["fills"], [])
+
     def test_local_paper_account_fields_initial_cash_and_restart_persistence(self) -> None:
         store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-account-fields-{uuid4().hex}.json"
         with patch.dict("os.environ", {"VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "250000"}):
@@ -1152,6 +1194,58 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
         self.assertEqual(risk_ack.rejectedReason, "voting_ensemble.local_paper.local_risk_limit_exceeded")
         self.assertEqual(sell_ack.status, "REJECTED")
         self.assertEqual(sell_ack.rejectedReason, "voting_ensemble.local_paper.sell_cannot_mutate_foreign_or_absent_position")
+
+    def test_local_paper_execution_engine_enforces_configured_local_entry_risk_caps(self) -> None:
+        repository = VotingEnsemblePaperExecutionRepository()
+        engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+
+        risk_ack = engine.submit_order(
+            local_engine_intent(
+                client_order_id="engine-risk-per-trade",
+                quantity=1,
+                planned_risk=20.0,
+                settings_snapshot={"riskPerTradePercent": 0.01},
+            )
+        )
+        repository.write_snapshot(
+            "local_account.latest",
+            {
+                **repository.local_account_snapshot(observed_at=NOW),
+                "tradesToday": 3,
+            },
+        )
+        trade_count_ack = engine.submit_order(
+            local_engine_intent(
+                client_order_id="engine-trade-count",
+                quantity=1,
+                planned_risk=1.0,
+                settings_snapshot={"maximumTradesPerDay": 3},
+            )
+        )
+        repository.write_snapshot(
+            "local_account.latest",
+            {
+                **repository.local_account_snapshot(observed_at=NOW),
+                "tradesToday": 0,
+                "dailyNetPnl": -2000.0,
+                "dailyNetPnlAfterExitCosts": -2000.0,
+            },
+        )
+        daily_loss_ack = engine.submit_order(
+            local_engine_intent(
+                client_order_id="engine-daily-loss",
+                quantity=1,
+                planned_risk=1.0,
+                settings_snapshot={"maximumDailyLossPercent": 2.0},
+            )
+        )
+
+        self.assertEqual(risk_ack.status, "REJECTED")
+        self.assertEqual(risk_ack.rejectedReason, "voting_ensemble.local_paper.risk_dollars_per_trade_exceeded")
+        self.assertEqual(trade_count_ack.status, "REJECTED")
+        self.assertEqual(trade_count_ack.rejectedReason, "voting_ensemble.local_paper.maximum_trades_per_day_exceeded")
+        self.assertEqual(daily_loss_ack.status, "REJECTED")
+        self.assertEqual(daily_loss_ack.rejectedReason, "voting_ensemble.local_paper.maximum_daily_loss_exceeded")
 
     def test_local_paper_execution_engine_limit_requires_executable_quote(self) -> None:
         repository = VotingEnsemblePaperExecutionRepository()
@@ -2273,6 +2367,7 @@ def local_engine_intent(
     planned_risk: float = 5.0,
     algorithm_id: str = VOTING_ENSEMBLE_ALGORITHM_ID,
     capital_partition_id: str = VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+    settings_snapshot: dict[str, Any] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         executionMode="LOCAL_PAPER",
@@ -2297,6 +2392,7 @@ def local_engine_intent(
         decisionTimestamp=NOW,
         timeInForce="DAY",
         reasonCodes=(),
+        settingsSnapshot=dict(settings_snapshot or {}),
     )
 
 

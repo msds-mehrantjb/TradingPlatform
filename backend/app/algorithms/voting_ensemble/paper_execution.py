@@ -44,6 +44,12 @@ VOTING_ENSEMBLE_DEFAULT_EXECUTION_MODE: VotingEnsembleExecutionMode = "LOCAL_PAP
 VOTING_ENSEMBLE_PAPER_EXECUTION_VERSION = "voting_ensemble_paper_execution_v1"
 VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE = "voting_ensemble.paper_execution"
 VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE = "voting_ensemble.paper_gateway"
+VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_DAILY_LOSS_PERCENT = 2.0
+VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_DRAWDOWN_PERCENT = 5.0
+VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_OPEN_RISK_PERCENT = 3.0
+VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_SPY_NOTIONAL_PERCENT = 50.0
+VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_ALGORITHM_EXPOSURE_PERCENT = 50.0
+VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_TRADES_PER_DAY = 3
 VOTING_ENSEMBLE_EXECUTION_OUTBOX_SCHEMA_VERSION = "voting_ensemble_execution_outbox_v1"
 VOTING_ENSEMBLE_DECISION_RECORD_SCHEMA_VERSION = "voting_ensemble_decision_record_v1"
 VOTING_ENSEMBLE_EXECUTION_OUTBOX_STATES = {
@@ -91,6 +97,7 @@ class VotingEnsemblePaperOrderIntent:
     createdAt: datetime
     sourceJobId: str | None = None
     sourceCommandId: str | None = None
+    settingsSnapshot: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.algorithmId != VOTING_ENSEMBLE_ALGORITHM_ID:
@@ -110,6 +117,7 @@ class VotingEnsemblePaperOrderIntent:
             "sourceJobId": self.sourceJobId,
             "sourceCommandId": self.sourceCommandId,
             "localGatePassed": self.localGatePassed,
+            "settingsSnapshot": dict(self.settingsSnapshot or {}),
             "orderPlan": self.orderPlan.model_dump(mode="json"),
             "createdAt": self.createdAt.isoformat().replace("+00:00", "Z"),
         }
@@ -1728,6 +1736,7 @@ class VotingEnsemblePaperExecutionRuntime:
             createdAt=_require_utc(evaluated_at),
             sourceJobId=source_job_id,
             sourceCommandId=source_command_id,
+            settingsSnapshot=_local_risk_settings_from_decision(decision),
         )
         try:
             outbox_record, inserted = self.repository.reserve_decision_and_outbox(decision, intent)
@@ -2715,22 +2724,132 @@ class VotingEnsembleLocalPaperExecutionEngine:
         if quantity <= 0:
             return "voting_ensemble.local_paper.zero_quantity"
         side = Signal(getattr(intent, "side"))
-        account = self.repository.local_account_snapshot()
-        if account.get("allowMargin") is not False or account.get("allowShorts") is not False:
-            return "voting_ensemble.local_paper.margin_or_shorts_not_enabled"
-        notional = quantity * float(getattr(intent, "limitPrice", None) or getattr(intent, "triggerPrice", None) or 0.0)
-        if side == Signal.BUY and float(account.get("usableEntryBuyingPower") or account.get("buyingPower") or 0.0) < notional:
-            return "voting_ensemble.local_paper.insufficient_buying_power"
-        planned_risk = float(getattr(intent, "plannedRiskDollars", 0.0) or 0.0)
-        if side == Signal.BUY and planned_risk > max(0.0, float(account.get("equity") or 0.0)):
-            return "voting_ensemble.local_paper.local_risk_limit_exceeded"
         if side == Signal.SELL:
             position = self.repository.inventory_ledger.position_for_symbol(str(getattr(intent, "symbol", "SPY")).upper())
             owned = int(position.get("quantity") or 0)
-            if owned <= 0:
+            if (
+                owned <= 0
+                or position.get("algorithmId") != VOTING_ENSEMBLE_ALGORITHM_ID
+                or position.get("capitalPartitionId") != VOTING_ENSEMBLE_CAPITAL_PARTITION_ID
+                or position.get("positionOwner") != VOTING_ENSEMBLE_ALGORITHM_ID
+                or position.get("exitOwner") != VOTING_ENSEMBLE_ALGORITHM_ID
+            ):
                 return "voting_ensemble.local_paper.sell_cannot_mutate_foreign_or_absent_position"
             if quantity > owned:
                 return "voting_ensemble.local_paper.sell_quantity_exceeds_owned_inventory"
+        inventory = self.repository.inventory_snapshot()
+        account = inventory.get("account")
+        if not isinstance(account, Mapping):
+            return "voting_ensemble.local_paper.account_snapshot_missing"
+        if (
+            account.get("algorithmId") != VOTING_ENSEMBLE_ALGORITHM_ID
+            or account.get("capitalPartitionId") != VOTING_ENSEMBLE_CAPITAL_PARTITION_ID
+            or account.get("accountId") != VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID
+        ):
+            return "voting_ensemble.local_paper.account_ownership_invalid"
+        if account.get("allowMargin") is not False or account.get("allowShorts") is not False:
+            return "voting_ensemble.local_paper.margin_or_shorts_not_enabled"
+        if side == Signal.BUY:
+            entry_blocker = self._new_entry_risk_rejection_reason(intent, inventory=inventory, account=account, quantity=quantity)
+            if entry_blocker is not None:
+                return entry_blocker
+        return None
+
+    def _new_entry_risk_rejection_reason(
+        self,
+        intent: Any,
+        *,
+        inventory: Mapping[str, Any],
+        account: Mapping[str, Any],
+        quantity: int,
+    ) -> str | None:
+        symbol = str(getattr(intent, "symbol", "SPY") or "SPY").upper()
+        settings = getattr(intent, "settingsSnapshot", None)
+        settings_payload = settings if isinstance(settings, Mapping) else {}
+        entry_price = _positive_float(getattr(intent, "limitPrice", None) or getattr(intent, "triggerPrice", None))
+        if entry_price is None:
+            return "voting_ensemble.local_paper.entry_price_missing"
+        notional = quantity * entry_price
+        usable_buying_power = _float(account.get("usableEntryBuyingPower") or account.get("availableBuyingPower") or account.get("buyingPower") or account.get("cash"))
+        if usable_buying_power < notional:
+            return "voting_ensemble.local_paper.insufficient_buying_power"
+
+        stop_price = _positive_float(getattr(intent, "stopPrice", None))
+        if stop_price is None or stop_price >= entry_price:
+            return "voting_ensemble.local_paper.invalid_stop_distance"
+        stop_distance = entry_price - stop_price
+        min_stop_distance = _local_entry_risk_setting(settings_payload, "minimumStopDistanceDollars", "minStopDistanceDollars", default=0.01)
+        if stop_distance < min_stop_distance:
+            return "voting_ensemble.local_paper.stop_distance_below_configured_minimum"
+
+        planned_risk = _float(getattr(intent, "plannedRiskDollars", None))
+        if planned_risk <= 0:
+            planned_risk = stop_distance * quantity
+        equity = _float(account.get("equity"))
+        if equity <= 0:
+            return "voting_ensemble.local_paper.non_positive_local_equity"
+        if planned_risk > equity:
+            return "voting_ensemble.local_paper.local_risk_limit_exceeded"
+        risk_per_trade_percent = _local_entry_risk_setting(settings_payload, "riskPerTradePercent", "maximumRiskPerTradePercent", default=0.5)
+        if planned_risk > equity * (risk_per_trade_percent / 100.0):
+            return "voting_ensemble.local_paper.risk_dollars_per_trade_exceeded"
+
+        open_risk = _float(account.get("totalOpenRiskDollars"))
+        max_open_risk_percent = _local_entry_risk_setting(
+            settings_payload,
+            "maximumOpenRiskPercent",
+            "maxOpenRiskPercent",
+            default=VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_OPEN_RISK_PERCENT,
+        )
+        if open_risk + planned_risk > equity * (max_open_risk_percent / 100.0):
+            return "voting_ensemble.local_paper.maximum_open_risk_exceeded"
+
+        positions = [position for position in inventory.get("positions") or [] if isinstance(position, Mapping)]
+        current_symbol_notional = sum(
+            abs(_signed_float(position.get("marketValue") or position.get("notional")))
+            for position in positions
+            if str(position.get("symbol") or "").upper() == symbol
+            and position.get("algorithmId") == VOTING_ENSEMBLE_ALGORITHM_ID
+            and position.get("capitalPartitionId") == VOTING_ENSEMBLE_CAPITAL_PARTITION_ID
+        )
+        current_open_notional = _float(account.get("openPositionNotional") or account.get("grossExposure"))
+        max_position_percent = _local_entry_risk_setting(settings_payload, "maximumPositionPercent", default=VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_SPY_NOTIONAL_PERCENT)
+        if current_symbol_notional + notional > equity * (max_position_percent / 100.0):
+            return "voting_ensemble.local_paper.maximum_position_percent_exceeded"
+        max_spy_percent = _local_entry_risk_setting(
+            settings_payload,
+            "maximumSpyNotionalPercent",
+            "totalSpyNotionalPercentLimit",
+            default=VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_SPY_NOTIONAL_PERCENT,
+        )
+        if symbol == "SPY" and current_symbol_notional + notional > equity * (max_spy_percent / 100.0):
+            return "voting_ensemble.local_paper.maximum_spy_notional_exceeded"
+        max_algorithm_exposure_percent = _local_entry_risk_setting(
+            settings_payload,
+            "maximumAlgorithmExposurePercent",
+            "maximumSameDirectionExposurePercent",
+            default=VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_ALGORITHM_EXPOSURE_PERCENT,
+        )
+        if current_open_notional + notional > equity * (max_algorithm_exposure_percent / 100.0):
+            return "voting_ensemble.local_paper.maximum_algorithm_exposure_exceeded"
+
+        daily_loss_percent = _local_entry_risk_setting(settings_payload, "maximumDailyLossPercent", "maxDailyLossPercent", default=VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_DAILY_LOSS_PERCENT)
+        if _signed_float(account.get("dailyNetPnlAfterExitCosts") or account.get("dailyNetPnl")) <= -(equity * (daily_loss_percent / 100.0)):
+            return "voting_ensemble.local_paper.maximum_daily_loss_exceeded"
+        max_drawdown_percent = _local_entry_risk_setting(
+            settings_payload,
+            "maximumDrawdownFromIntradayHighPercent",
+            "maximumDrawdownPercent",
+            "maxDrawdownPercent",
+            default=VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_DRAWDOWN_PERCENT,
+        )
+        if _float(account.get("drawdownFromIntradayHighPercent") or account.get("drawdownPercent")) >= max_drawdown_percent:
+            return "voting_ensemble.local_paper.maximum_drawdown_exceeded"
+        max_trades_per_day = int(
+            _local_entry_risk_setting(settings_payload, "maximumTradesPerDay", "maxTradesPerDay", default=float(VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_TRADES_PER_DAY))
+        )
+        if max_trades_per_day <= 0 or int(account.get("tradesToday") or 0) >= max_trades_per_day:
+            return "voting_ensemble.local_paper.maximum_trades_per_day_exceeded"
         return None
 
     def _stored_order_ownership_rejection_reason(self, order: Mapping[str, Any]) -> str | None:
@@ -3195,9 +3314,69 @@ def eligible_order_plan_from_decision(decision: Mapping[str, Any]) -> OrderPlan 
     return plan
 
 
+def _local_default_risk_settings() -> dict[str, Any]:
+    return {
+        "riskPerTradePercent": 0.5,
+        "maximumDailyLossPercent": VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_DAILY_LOSS_PERCENT,
+        "maximumDrawdownFromIntradayHighPercent": VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_DRAWDOWN_PERCENT,
+        "maximumPositionPercent": VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_SPY_NOTIONAL_PERCENT,
+        "maximumOpenRiskPercent": VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_OPEN_RISK_PERCENT,
+        "maximumSpyNotionalPercent": VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_SPY_NOTIONAL_PERCENT,
+        "maximumAlgorithmExposurePercent": VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_ALGORITHM_EXPOSURE_PERCENT,
+        "maximumSameDirectionExposurePercent": VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_ALGORITHM_EXPOSURE_PERCENT,
+        "maximumTradesPerDay": VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_TRADES_PER_DAY,
+        "minimumStopDistanceDollars": 0.01,
+    }
+
+
+def _local_risk_settings_from_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
+    settings = _local_default_risk_settings()
+    profile = decision.get("resolved_trading_profile") or decision.get("resolvedTradingProfile")
+    if isinstance(profile, Mapping):
+        _copy_number(profile, settings, "riskPerTradePercent")
+        _copy_number(profile, settings, "maximumPositionPercent")
+        _copy_number(profile, settings, "maxTradesPerDay", destination_key="maximumTradesPerDay")
+    trading_settings = decision.get("tradingSettings") or decision.get("settings")
+    if isinstance(trading_settings, Mapping):
+        daily_loss = trading_settings.get("dailyLossCap")
+        if isinstance(daily_loss, Mapping):
+            _copy_number(daily_loss, settings, "maxDailyLossPercent", destination_key="maximumDailyLossPercent")
+        stop_policy = trading_settings.get("stopPolicy")
+        if isinstance(stop_policy, Mapping):
+            _copy_number(stop_policy, settings, "minimumStopDistanceDollars")
+    risk_budget = decision.get("risk_budget") or decision.get("riskBudget")
+    if isinstance(risk_budget, Mapping):
+        _copy_number(risk_budget, settings, "planned_risk", destination_key="budgetPlannedRiskDollars")
+        _copy_number(risk_budget, settings, "risk_budget", destination_key="budgetMaximumRiskDollars")
+        _copy_number(risk_budget, settings, "order_limit", destination_key="budgetOrderLimitDollars")
+    return settings
+
+
+def _copy_number(source: Mapping[str, Any], target: dict[str, Any], key: str, *, destination_key: str | None = None) -> None:
+    destination = destination_key or key
+    value = source.get(key)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return
+    target[destination] = parsed
+
+
 def proposal_from_order_plan(intent: VotingEnsemblePaperOrderIntent, *, quantity_override: int | None = None) -> GlobalOrderProposal:
     order = intent.orderPlan
     quantity = max(0, int(quantity_override if quantity_override is not None else order.quantity))
+    settings_snapshot = {
+        **_local_default_risk_settings(),
+        **dict(intent.settingsSnapshot or {}),
+        "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+        "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+        "clientOrderId": voting_ensemble_gateway_client_order_id(intent),
+        "timeInForce": order.timeInForce,
+        "maximumHoldingMinutes": order.maximumHoldingMinutes,
+        "paperOnly": True,
+        "liveTradingEnabled": False,
+        "maximumOrderAgeSeconds": 60,
+    }
     return GlobalOrderProposal(
         algorithmId=VOTING_ENSEMBLE_ALGORITHM_ID,
         capitalPartitionId=VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
@@ -3212,16 +3391,7 @@ def proposal_from_order_plan(intent: VotingEnsemblePaperOrderIntent, *, quantity
         stopPrice=order.stopPrice,
         targetPrice=order.targetPrice,
         plannedRiskDollars=max(0.0, abs(order.entryPrice - (order.stopPrice or order.entryPrice)) * quantity),
-        settingsSnapshot={
-            "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
-            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
-            "clientOrderId": voting_ensemble_gateway_client_order_id(intent),
-            "timeInForce": order.timeInForce,
-            "maximumHoldingMinutes": order.maximumHoldingMinutes,
-            "paperOnly": True,
-            "liveTradingEnabled": False,
-            "maximumOrderAgeSeconds": 60,
-        },
+        settingsSnapshot=settings_snapshot,
         entryFormula={"orderType": order.orderType, "timeInForce": order.timeInForce},
         stopFormula={"stopPrice": order.stopPrice},
         targetFormula={"targetPrice": order.targetPrice, "orderType": "LIMIT"},
@@ -4037,6 +4207,7 @@ def _intent_from_record(payload: Mapping[str, Any]) -> VotingEnsemblePaperOrderI
         createdAt=_parse_time(payload.get("createdAt")) or datetime.now(UTC),
         sourceJobId=str(payload["sourceJobId"]) if payload.get("sourceJobId") else None,
         sourceCommandId=str(payload["sourceCommandId"]) if payload.get("sourceCommandId") else None,
+        settingsSnapshot=dict(payload.get("settingsSnapshot") or {}),
     )
 
 
@@ -4236,6 +4407,17 @@ def _signed_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _local_entry_risk_setting(settings: Mapping[str, Any], *keys: str, default: float) -> float:
+    for key in keys:
+        try:
+            value = float(settings.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            return value
+    return max(0.0, float(default))
 
 
 def _local_paper_env_float(name: str, default: float) -> float:
