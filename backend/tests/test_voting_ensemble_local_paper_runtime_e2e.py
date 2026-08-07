@@ -3,11 +3,15 @@ from __future__ import annotations
 import unittest
 from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from uuid import uuid4
 
 import backend.app.algorithms.voting_ensemble.service as service_module
+from backend.app.config import get_settings
 from backend.app.algorithms.voting_ensemble.paper_execution import (
+    AlpacaPaperBrokerClient,
     VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
     VotingEnsemblePaperExecutionQueue,
     VotingEnsemblePaperExecutionRepository,
@@ -26,10 +30,16 @@ SESSION_DATE = date(2026, 1, 5)
 
 class VotingEnsembleLocalPaperRuntimeE2ETest(unittest.TestCase):
     def test_complete_automatic_local_paper_entry_stateful_next_evaluation_and_exit_loop(self) -> None:
+        store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"local-paper-acceptance-{uuid4().hex}.json"
+        store_path.parent.mkdir(parents=True, exist_ok=True)
         with patch.dict(
             "os.environ",
             {
+                "APCA_API_KEY_ID": "",
+                "APCA_API_SECRET_KEY": "",
+                "ALPACA_TRADING_BASE_URL": "",
                 "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_PAPER_EXECUTION_MODE": "LOCAL_PAPER",
                 "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
                 "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
                 "VOTING_ENSEMBLE_LOCAL_PAPER_MAX_MARK_QUOTE_AGE_SECONDS": "999999999",
@@ -38,11 +48,25 @@ class VotingEnsembleLocalPaperRuntimeE2ETest(unittest.TestCase):
         ), patch(
             "backend.app.algorithms.voting_ensemble.paper_execution._default_paper_broker_client",
             side_effect=AssertionError("LOCAL_PAPER end-to-end test must not create a broker trading client"),
+        ), patch.object(
+            AlpacaPaperBrokerClient,
+            "refresh_account_snapshot",
+            side_effect=AssertionError("/account must not be requested in LOCAL_PAPER"),
+        ), patch.object(
+            AlpacaPaperBrokerClient,
+            "refresh_positions",
+            side_effect=AssertionError("/positions must not be requested in LOCAL_PAPER"),
+        ), patch.object(
+            AlpacaPaperBrokerClient,
+            "refresh_open_orders",
+            side_effect=AssertionError("/orders must not be requested in LOCAL_PAPER"),
         ):
-            repository = VotingEnsemblePaperExecutionRepository()
+            self.assertFalse(get_settings().has_alpaca_credentials)
+            repository = VotingEnsemblePaperExecutionRepository(store_path)
             execution_runtime = VotingEnsemblePaperExecutionRuntime(
                 repository=repository,
                 queue=VotingEnsemblePaperExecutionQueue(),
+                execution_mode="LOCAL_PAPER",
                 auto_start=False,
             )
             payload_builder = LocalPaperRuntimePayloadBuilder(repository)
@@ -52,6 +76,8 @@ class VotingEnsembleLocalPaperRuntimeE2ETest(unittest.TestCase):
                 automatic_payload_builder=payload_builder,
                 auto_start=False,
             )
+            self.assertEqual(execution_runtime.execution_mode, "LOCAL_PAPER")
+            self.assertIsNone(execution_runtime.broker_client)
 
             initial = repository.local_account_snapshot(observed_at=datetime(2026, 1, 5, 14, 59, tzinfo=UTC))
             self.assertEqual(initial["initialCash"], 100000.0)
@@ -122,6 +148,7 @@ class VotingEnsembleLocalPaperRuntimeE2ETest(unittest.TestCase):
             exit_execution = execution_runtime.process_once(evaluated_at=payload_time(exit_payload) + timedelta(seconds=1))
             after_exit = repository.inventory_snapshot()
             final_account = after_exit["localPaperAccount"]
+            final_closed_trades = list(after_exit["closedTrades"])
 
             self.assertIsNotNone(exit_execution)
             assert exit_execution is not None
@@ -140,6 +167,33 @@ class VotingEnsembleLocalPaperRuntimeE2ETest(unittest.TestCase):
             exit_gateway_account = repository.read_snapshot(f"paper_order_gateway.global_risk_account.{exit_execution['gatewayResult']['orderIntentId']}")
             self.assertEqual(exit_gateway_account["accountId"], VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID)
             self.assertEqual(exit_gateway_account["availableBuyingPower"], 99000.0)
+
+            restarted_repository = VotingEnsemblePaperExecutionRepository(store_path)
+            restarted_runtime = VotingEnsemblePaperExecutionRuntime(
+                repository=restarted_repository,
+                queue=VotingEnsemblePaperExecutionQueue(),
+                execution_mode="LOCAL_PAPER",
+                auto_start=False,
+            )
+            recovery = restarted_runtime.reconcile_broker_state(evaluated_at=payload_time(exit_payload) + timedelta(seconds=2))
+            after_restart = restarted_runtime.inventory_snapshot()
+            restart_account = after_restart["localPaperAccount"]
+
+            self.assertIsNotNone(recovery)
+            assert recovery is not None
+            self.assertTrue(recovery["brokerReconciliationSkipped"])
+            self.assertEqual(recovery["brokerAccountsObserved"], 0)
+            self.assertEqual(recovery["brokerPositionsObserved"], 0)
+            self.assertEqual(recovery["brokerOrdersObserved"], 0)
+            self.assertEqual(after_restart["localPositions"], after_exit["localPositions"])
+            self.assertEqual(after_restart["closedTrades"], final_closed_trades)
+            self.assertEqual(restart_account["cash"], final_account["cash"])
+            self.assertEqual(restart_account["equity"], final_account["equity"])
+            self.assertEqual(restart_account["realizedPnl"], final_account["realizedPnl"])
+            self.assertEqual(restart_account["realizedPnlToday"], final_account["realizedPnlToday"])
+            self.assertEqual(restart_account["dailyNetPnl"], final_account["dailyNetPnl"])
+            self.assertEqual(restart_account["tradesToday"], final_account["tradesToday"])
+        store_path.unlink(missing_ok=True)
 
 
 class LocalPaperRuntimePayloadBuilder:
