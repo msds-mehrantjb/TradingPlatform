@@ -589,6 +589,80 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             self.assertEqual(len(after_replay["fills"]), 1)
             self.assertEqual(after_replay["account"]["appliedFillIds"], after_first["account"]["appliedFillIds"])
 
+    def test_local_paper_durable_persistence_manifest_tracks_owned_schema_records(self) -> None:
+        store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-persistence-manifest-{uuid4().hex}.json"
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository(store_path)
+            repository.local_account_snapshot(observed_at=NOW)
+            repository.inventory_ledger.apply_fill(
+                client_order_id="persist-buy",
+                order_intent_id="intent-persist-buy",
+                symbol="SPY",
+                side=Signal.BUY,
+                requested_quantity=5,
+                fill_price=100.0,
+                filled_at=NOW,
+            )
+            repository.inventory_ledger.apply_fill(
+                client_order_id="persist-sell",
+                order_intent_id="intent-persist-sell",
+                symbol="SPY",
+                side=Signal.SELL,
+                requested_quantity=5,
+                fill_price=103.0,
+                filled_at=NOW + timedelta(minutes=1),
+            )
+
+            reloaded = VotingEnsemblePaperExecutionRepository(store_path)
+            inventory = reloaded.inventory_snapshot()
+            manifest = inventory["localInventoryManifest"]
+            snapshots = reloaded.snapshots
+            expected_prefixes = (
+                "voting_ensemble.paper_execution.local_account.latest",
+                "voting_ensemble.paper_execution.local_position.SPY",
+                "voting_ensemble.paper_gateway.paper_order_gateway.fill.persist-buy",
+                "voting_ensemble.paper_gateway.paper_order_gateway.fill.persist-sell",
+                "voting_ensemble.paper_execution.applied_fill.",
+                "voting_ensemble.paper_execution.local_closed_trade.",
+                "voting_ensemble.paper_execution.local_realized_pnl.",
+                "voting_ensemble.paper_execution.local_risk_snapshot.latest",
+                "voting_ensemble.paper_execution.local_inventory_manifest.latest",
+            )
+
+            self.assertIsNotNone(manifest)
+            assert manifest is not None
+            self.assertEqual(manifest["schemaVersion"], "voting_ensemble_local_inventory_manifest_v1")
+            self.assertEqual(manifest["version"], "voting_ensemble_local_inventory_manifest_v1")
+            self.assertEqual(manifest["conceptualStorageKeys"]["voting_ensemble.local_account.latest"], "voting_ensemble.paper_execution.local_account.latest")
+            self.assertEqual(manifest["conceptualStorageKeys"]["voting_ensemble.inventory.positions"], "voting_ensemble.paper_execution.local_position.")
+            self.assertEqual(manifest["conceptualStorageKeys"]["voting_ensemble.local_orders"], "voting_ensemble.paper_execution.local_order.")
+            self.assertEqual(manifest["conceptualStorageKeys"]["voting_ensemble.local_fills"], "voting_ensemble.paper_gateway.paper_order_gateway.fill.")
+            self.assertEqual(manifest["conceptualStorageKeys"]["voting_ensemble.closed_trades"], "voting_ensemble.paper_execution.local_closed_trade.")
+            self.assertEqual(manifest["conceptualStorageKeys"]["voting_ensemble.applied_fill_ids"], "voting_ensemble.paper_execution.applied_fill.")
+            self.assertEqual(manifest["tradeCounters"]["tradesToday"], 2)
+            self.assertEqual(manifest["sessionDate"], SESSION_DATE.isoformat())
+            self.assertEqual(len(manifest["appliedFillIds"]), 2)
+            for prefix in expected_prefixes:
+                self.assertTrue(any(key.startswith(prefix) for key in snapshots), prefix)
+            for key, payload in snapshots.items():
+                if not (
+                    key.startswith("voting_ensemble.paper_execution.local_")
+                    or key.startswith("voting_ensemble.paper_execution.applied_fill.")
+                    or key.startswith("voting_ensemble.paper_gateway.paper_order_gateway.fill.")
+                ):
+                    continue
+                self.assertEqual(payload["algorithmId"], VOTING_ENSEMBLE_ALGORITHM_ID, key)
+                self.assertEqual(payload["capitalPartitionId"], VOTING_ENSEMBLE_CAPITAL_PARTITION_ID, key)
+                self.assertIn("schemaVersion", payload, key)
+        store_path.unlink(missing_ok=True)
+
     def test_local_paper_mark_to_market_uses_fresh_bid_for_long_accounting(self) -> None:
         with patch.dict(
             "os.environ",

@@ -17,6 +17,7 @@ VOTING_ENSEMBLE_ALGORITHM_ID = "voting_ensemble"
 VOTING_ENSEMBLE_CAPITAL_PARTITION_ID = "voting_ensemble.paper.default"
 VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID = "voting_ensemble.paper.default.account"
 VOTING_ENSEMBLE_LOCAL_PAPER_ACCOUNT_VERSION = "voting_ensemble_local_paper_account_v2"
+VOTING_ENSEMBLE_LOCAL_INVENTORY_MANIFEST_VERSION = "voting_ensemble_local_inventory_manifest_v1"
 VOTING_ENSEMBLE_DEFAULT_LOCAL_CASH = Decimal("100000")
 VOTING_ENSEMBLE_LOCAL_SOURCE_AUTHORITY = "voting_ensemble_local_paper_account"
 VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE = "voting_ensemble.paper_execution"
@@ -345,6 +346,9 @@ class VotingEnsembleInventoryLedger:
             enriched = self._enriched_account_payload(existing, observed_at=observed, reason_codes=["voting_ensemble.local_paper_account.enriched_from_existing_balance"])
             if _account_requires_upgrade(existing) and getattr(self.store, "lastPersistenceError", None) is None:
                 self.store.write_snapshot("local_account.latest", enriched)
+                self.persist_inventory_manifest(observed_at=observed)
+            elif getattr(self.store, "lastPersistenceError", None) is None:
+                self.persist_inventory_manifest(observed_at=observed)
             return enriched
         account = self._account_payload(
             initial_cash=_configured_initial_cash(),
@@ -356,6 +360,7 @@ class VotingEnsembleInventoryLedger:
         if getattr(self.store, "lastPersistenceError", None) is not None:
             return account
         self.store.write_snapshot("local_account.latest", account)
+        self.persist_inventory_manifest(observed_at=observed)
         return account
 
     def broker_account_snapshot(self, *, observed_at: datetime | None = None) -> BrokerAccountSnapshot:
@@ -404,6 +409,7 @@ class VotingEnsembleInventoryLedger:
             payload["exitReason"] = str(exit_reason)
             payload["reasonCodes"] = [*list(payload.get("reasonCodes") or ()), "voting_ensemble.local_paper.risk_reducing_exit_order_accepted_locally"]
         self.store.write_snapshot(f"local_order.{order.clientOrderId}", payload)
+        self.persist_inventory_manifest(observed_at=observed_at)
         return payload
 
     def mark_order_filled(self, client_order_id: str, fill: PaperGatewayFill) -> dict[str, Any]:
@@ -417,6 +423,7 @@ class VotingEnsembleInventoryLedger:
             "reasonCodes": [*list(order.get("reasonCodes") or ()), "voting_ensemble.local_paper.order_filled_locally"],
         }
         self.store.write_snapshot(f"local_order.{client_order_id}", updated)
+        self.persist_inventory_manifest(observed_at=fill.filledAt)
         return self.store.read_snapshot(f"local_order.{client_order_id}")
 
     def cancel_order(self, client_order_id: str, *, canceled_at: datetime) -> bool:
@@ -435,6 +442,7 @@ class VotingEnsembleInventoryLedger:
                 "reasonCodes": [*list(order.get("reasonCodes") or ()), "voting_ensemble.local_paper.order_canceled_locally"],
             },
         )
+        self.persist_inventory_manifest(observed_at=canceled_at)
         return True
 
     def mark_open_positions_from_market_data(
@@ -470,6 +478,7 @@ class VotingEnsembleInventoryLedger:
             self.store.write_snapshot(f"local_market_data.{normalized_symbol}.latest", status_payload)
             if mark["fresh"]:
                 self._apply_mark_to_positions(normalized_symbol, mark=mark, observed_at=observed)
+        self.persist_inventory_manifest(observed_at=observed)
         return {
             **status_payload,
             "positionsMarked": len([position for position in self.positions() if str(position.get("symbol") or "").upper() == normalized_symbol]),
@@ -643,6 +652,7 @@ class VotingEnsembleInventoryLedger:
             fill_price=fill_price_decimal,
             filled_at=filled_at,
         )
+        self.persist_inventory_manifest(observed_at=filled_at)
         return PaperGatewayFill(
             executionMode="LOCAL_PAPER",
             clientOrderId=client_order_id,
@@ -699,6 +709,53 @@ class VotingEnsembleInventoryLedger:
 
     def applied_fill_ids(self) -> list[str]:
         return [str(record.get("appliedFillId")) for record in self._records("applied_fill.") if record.get("appliedFillId")]
+
+    def persist_inventory_manifest(self, *, observed_at: datetime | None = None) -> dict[str, Any]:
+        observed = _require_utc(observed_at or datetime.now(UTC))
+        snapshots = dict(self.store.snapshots)
+        latest_account = snapshots.get(_execution_key("local_account.latest"), {})
+        session_date = str(latest_account.get("sessionDate") or observed.date().isoformat()) if isinstance(latest_account, Mapping) else observed.date().isoformat()
+        trades_today = int(latest_account.get("tradesToday") or 0) if isinstance(latest_account, Mapping) else 0
+        payload = _owned_record(
+            {
+                "schemaVersion": VOTING_ENSEMBLE_LOCAL_INVENTORY_MANIFEST_VERSION,
+                "version": VOTING_ENSEMBLE_LOCAL_INVENTORY_MANIFEST_VERSION,
+                "inventoryAuthority": "canonical_mutable_voting_ensemble_local_paper_inventory",
+                "sourceAuthority": VOTING_ENSEMBLE_LOCAL_SOURCE_AUTHORITY,
+                "accountKey": _execution_key("local_account.latest"),
+                "positionKeyPrefix": _execution_key("local_position."),
+                "orderKeyPrefix": _execution_key("local_order."),
+                "fillKeyPrefix": f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.fill.",
+                "appliedFillKeyPrefix": _execution_key("applied_fill."),
+                "closedTradeKeyPrefix": _execution_key("local_closed_trade."),
+                "realizedPnlKeyPrefix": _execution_key("local_realized_pnl."),
+                "riskSnapshotKey": _execution_key("local_risk_snapshot.latest"),
+                "tradeCountersKey": _execution_key("local_account.latest"),
+                "sessionDateKey": _execution_key("local_account.latest"),
+                "conceptualStorageKeys": {
+                    "voting_ensemble.local_account.latest": _execution_key("local_account.latest"),
+                    "voting_ensemble.inventory.positions": _execution_key("local_position."),
+                    "voting_ensemble.local_orders": _execution_key("local_order."),
+                    "voting_ensemble.local_fills": f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.fill.",
+                    "voting_ensemble.closed_trades": _execution_key("local_closed_trade."),
+                    "voting_ensemble.applied_fill_ids": _execution_key("applied_fill."),
+                },
+                "currentPositionKeys": _owned_keys(snapshots, _execution_key("local_position.")),
+                "localOrderKeys": _owned_keys(snapshots, _execution_key("local_order.")),
+                "localFillKeys": _owned_keys(snapshots, f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.fill."),
+                "appliedFillKeys": _owned_keys(snapshots, _execution_key("applied_fill.")),
+                "closedTradeKeys": _owned_keys(snapshots, _execution_key("local_closed_trade.")),
+                "realizedPnlKeys": _owned_keys(snapshots, _execution_key("local_realized_pnl.")),
+                "riskSnapshotKeys": _owned_keys(snapshots, _execution_key("local_risk_snapshot.")),
+                "appliedFillIds": self.applied_fill_ids(),
+                "tradeCounters": {"tradesToday": trades_today},
+                "sessionDate": session_date,
+                "observedAt": _iso(observed),
+                "reasonCodes": ["voting_ensemble.local_paper.persistence_manifest_recorded"],
+            }
+        )
+        self.store.write_snapshot("local_inventory_manifest.latest", payload)
+        return payload
 
     def _applied_fill_exists(self, applied_fill_id: str) -> bool:
         try:
@@ -1210,6 +1267,16 @@ def _owned_record(payload: dict[str, Any]) -> dict[str, Any]:
     payload["accountId"] = VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID
     payload["executionMode"] = "LOCAL_PAPER"
     return payload
+
+
+def _owned_keys(snapshots: Mapping[str, Mapping[str, Any]], prefix: str) -> list[str]:
+    return [
+        key
+        for key, payload in sorted(snapshots.items())
+        if key.startswith(prefix)
+        and payload.get("algorithmId", payload.get("algorithm_id")) == VOTING_ENSEMBLE_ALGORITHM_ID
+        and payload.get("capitalPartitionId") == VOTING_ENSEMBLE_CAPITAL_PARTITION_ID
+    ]
 
 
 def _is_voting_ensemble_owned_position(payload: Mapping[str, Any]) -> bool:

@@ -538,6 +538,7 @@ class VotingEnsemblePaperExecutionRepository:
         realized_pnl = self.inventory_ledger.realized_pnl_records()
         risk_snapshots = self.inventory_ledger.risk_snapshots()
         market_data = self.inventory_ledger.market_data_statuses()
+        local_inventory_manifests = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_inventory_manifest.")
         local_market_clocks = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_market_clock.")
         local_executions = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_execution.")
         reconciliation_blocks = [
@@ -566,6 +567,8 @@ class VotingEnsemblePaperExecutionRepository:
             "realizedPnlRecords": realized_pnl,
             "riskSnapshots": risk_snapshots,
             "marketData": market_data,
+            "localInventoryManifest": local_inventory_manifests[-1] if local_inventory_manifests else None,
+            "localInventoryManifests": local_inventory_manifests,
             "localMarketClocks": local_market_clocks,
             "localMarketClock": local_market_clocks[-1] if local_market_clocks else None,
             "localExecutions": local_executions,
