@@ -16740,7 +16740,6 @@ async function handlePaperToggleClick() {
     ]);
     await Promise.allSettled([loadVotingEnsembleRuntimeStatus(), refreshVotingEnsemblePaperInventory()]);
   } catch (error) {
-    setGlobalPaperTradingEnabled(false);
     state.votingEnsembleRuntimeControlStatus = "error";
     state.votingEnsembleRuntimeControlWarning = error instanceof Error ? error.message : "Voting Ensemble paper control sync failed";
     state.metaStrategyPaperControlWarning = "";
@@ -16762,9 +16761,6 @@ async function loadVotingEnsembleRuntimeControl() {
     setGlobalPaperTradingEnabled(control.requestedPaperTradingEnabled);
     await loadVotingEnsembleRuntimeStatus();
   } catch (error) {
-    setGlobalPaperTradingEnabled(false);
-    state.votingEnsembleRuntimeControl = null;
-    state.votingEnsembleRuntimeStatus = null;
     state.votingEnsembleRuntimeControlStatus = "error";
     state.votingEnsembleRuntimeControlWarning = error instanceof Error ? error.message : "Voting Ensemble paper control unavailable";
   }
@@ -16781,7 +16777,12 @@ async function syncVotingEnsembleAutomaticPaperControl(enabled: boolean) {
   state.votingEnsembleRuntimeControl = control;
   state.votingEnsembleRuntimeControlStatus = control.requestedPaperTradingEnabled && !control.effectivePaperTradingEnabled ? "blocked" : "ready";
   state.votingEnsembleRuntimeControlWarning = "";
-  await loadVotingEnsembleRuntimeStatus();
+  try {
+    await loadVotingEnsembleRuntimeStatus();
+  } catch (error) {
+    state.votingEnsembleRuntimeControlWarning = error instanceof Error ? error.message : "Voting Ensemble runtime status unavailable";
+    updateTradeToggleButton();
+  }
   return control;
 }
 

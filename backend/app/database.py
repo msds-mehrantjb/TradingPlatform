@@ -22,12 +22,17 @@ class CandleStore:
         self.using_memory = False
         self._memory_conn: sqlite3.Connection | None = None
         self._memory_lock = threading.RLock()
+        self._disk_write_lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.init()
 
     @staticmethod
     def _is_disk_io_error(exc: sqlite3.OperationalError) -> bool:
         return "disk I/O" in str(exc)
+
+    @staticmethod
+    def _is_database_locked(exc: sqlite3.OperationalError) -> bool:
+        return "database is locked" in str(exc).lower()
 
     def _switch_to_memory(self) -> None:
         self.using_memory = True
@@ -47,9 +52,10 @@ class CandleStore:
                 self._memory_conn.commit()
             return
 
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
         try:
             conn.execute("PRAGMA journal_mode=WAL")
         except sqlite3.OperationalError:
@@ -101,8 +107,13 @@ class CandleStore:
         if not candles:
             return
         try:
-            self._upsert_many(candles)
+            with self._disk_write_lock:
+                self._upsert_many(candles)
         except sqlite3.OperationalError as exc:
+            if self._is_database_locked(exc):
+                with self._disk_write_lock:
+                    self._upsert_many(candles)
+                return
             if not self._is_disk_io_error(exc):
                 raise
             self._switch_to_memory()
