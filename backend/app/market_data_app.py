@@ -266,6 +266,44 @@ async def market_forecast_prediction(
         )
 
 
+@app.get("/api/news-summary")
+async def news_summary(
+    symbol: str = Query("SPY", min_length=1, max_length=12),
+    limit: int = Query(10, ge=3, le=20),
+) -> dict[str, Any]:
+    normalized_symbol = symbol.upper()
+    now = _now_iso()
+    news = await _lightweight_news_feed(normalized_symbol, limit)
+    context = await market_context(symbol=normalized_symbol, feed="iex", refresh=False)
+    forecast = await market_forecast_prediction(symbol=normalized_symbol, feed="iex", timeframe="1Min", limit=60, refresh=False)
+    summary = _lightweight_trade_summary(symbol=normalized_symbol, news=news, context=context, forecast=forecast)
+    return {
+        "source": "Lightweight rule summary",
+        "updatedAt": now,
+        "symbol": normalized_symbol,
+        "summary": summary,
+        "snapshot": {
+            "symbol": normalized_symbol,
+            "news": news,
+            "marketContext": context,
+            "marketForecast": {
+                "status": forecast.get("status"),
+                "sourceAuthority": forecast.get("sourceAuthority"),
+                "decision": forecast.get("decision"),
+                "marketRegime": forecast.get("marketRegime"),
+            },
+        },
+        "warning": "",
+        "ollamaHealth": {
+            "status": "not_required",
+            "baseUrl": "",
+            "model": "lightweight_rule_summary",
+            "detail": "Summary is generated deterministically by the lightweight market-data service.",
+            "action": "",
+        },
+    }
+
+
 async def _context_bars(
     *,
     symbol: str,
@@ -460,6 +498,126 @@ def _lightweight_forecast_unavailable(*, symbol: str, latest: dict[str, Any] | N
         },
         "sourceAuthority": "lightweight_market_data_service.market_forecast_advisory_fallback",
     }
+
+
+async def _lightweight_news_feed(symbol: str, limit: int) -> dict[str, Any]:
+    now = datetime.now(UTC)
+    return {
+        "source": "Lightweight dashboard fallback",
+        "updatedAt": _now_iso(),
+        "symbol": symbol,
+        "items": [
+            {
+                "id": f"{symbol.lower()}-market-context",
+                "headline": f"{symbol} market context and price action are updating from local market data",
+                "summary": "The lightweight dashboard service is using chart, quote, regime, session, event, and forecast context.",
+                "url": "",
+                "source": "Lightweight dashboard fallback",
+                "publishedAt": now.isoformat().replace("+00:00", "Z"),
+                "symbols": [symbol],
+            },
+            {
+                "id": f"{symbol.lower()}-risk-context",
+                "headline": f"{symbol} risk read is driven by market context while live news providers warm up",
+                "summary": "Use VWAP, opening range, spread, and local algorithm risk gates before acting.",
+                "url": "",
+                "source": "Lightweight dashboard fallback",
+                "publishedAt": (now - timedelta(minutes=15)).isoformat().replace("+00:00", "Z"),
+                "symbols": [symbol],
+            },
+        ][:limit],
+        "sources": [
+            {
+                "name": "Lightweight Summary",
+                "kind": "local",
+                "status": "ready",
+                "note": "Deterministic summary is available without Ollama.",
+            }
+        ],
+        "warning": "",
+    }
+
+
+def _lightweight_trade_summary(
+    *,
+    symbol: str,
+    news: dict[str, Any],
+    context: dict[str, Any],
+    forecast: dict[str, Any],
+) -> dict[str, Any]:
+    regime = context.get("regime") if isinstance(context.get("regime"), dict) else {}
+    session = context.get("session") if isinstance(context.get("session"), dict) else {}
+    event = context.get("event") if isinstance(context.get("event"), dict) else {}
+    forecast_decision = forecast.get("decision") if isinstance(forecast.get("decision"), dict) else {}
+    forecast_action = str(forecast_decision.get("action") or "no_trade")
+    risk_state = _context_risk_state(context)
+    regime_label = str(regime.get("label") or "Regime unavailable")
+    session_label = str(session.get("label") or "Session unavailable")
+    event_label = str(event.get("label") or "Event unavailable")
+    headlines = news.get("items") if isinstance(news.get("items"), list) else []
+    bias = _summary_bias(regime, forecast_action, risk_state)
+    confidence = "Medium" if forecast.get("status") == "ready" and risk_state.lower() == "normal" else "Low"
+    return {
+        "bias": bias,
+        "confidence": confidence,
+        "conclusion": (
+            f"{symbol} summary is using the lightweight market-data service. "
+            f"Regime is {regime_label}; forecast action is {forecast_action.replace('_', ' ')}. "
+            "Treat this as advisory context, not an order authorization."
+        ),
+        "drivers": [
+            f"Regime: {regime_label}.",
+            f"Session: {session_label}.",
+            f"Event window: {event_label}.",
+            f"Forecast status: {forecast.get('status', 'unknown')}.",
+            f"Local headline/context items available: {len(headlines)}.",
+        ],
+        "risks": [
+            f"Risk state: {risk_state}.",
+            "Live LLM/Ollama summary is not required for this deterministic read.",
+            "Use price confirmation, spread, and local paper risk gates before entry.",
+        ],
+        "actionPlan": [
+            "Wait for strategy signal and local paper risk approval.",
+            "Prefer VWAP/opening-range confirmation when bias and price action agree.",
+            "Keep exits risk-reducing even when new entries are blocked.",
+        ],
+    }
+
+
+def _summary_bias(regime: dict[str, Any], forecast_action: str, risk_state: str) -> str:
+    label = str(regime.get("label") or "").lower()
+    direction = str(regime.get("directionBias") or regime.get("direction_bias") or "").lower()
+    if risk_state.lower() not in {"normal", "low", ""}:
+        return "Cautious"
+    if forecast_action == "sell" or direction == "short" or "down" in label:
+        return "Bearish"
+    if forecast_action == "buy" or direction == "long" or "up" in label:
+        return "Bullish"
+    return "Neutral"
+
+
+def _context_label(context: dict[str, Any], key: str, fallback: str) -> str:
+    value = context.get(key)
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        return value or fallback
+    return str(value) or fallback
+
+
+def _context_risk_state(context: dict[str, Any]) -> str:
+    for key in ("riskState", "risk_state"):
+        value = context.get(key)
+        if value:
+            return str(value)
+    for container_key in ("risk", "riskState", "marketRisk"):
+        container = context.get(container_key)
+        if isinstance(container, dict):
+            value = container.get("label") or container.get("state") or container.get("status")
+            if value:
+                return str(value)
+    return "Normal"
 
 
 def _lightweight_forecast_horizon(close: float, horizon_minutes: int, reason: str) -> dict[str, Any]:

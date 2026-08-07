@@ -3102,10 +3102,10 @@ const fallbackTradeSummary: TradeSummaryResponse = {
   summary: {
     bias: "Cautious",
     confidence: "Low",
-    conclusion: "Summary is waiting for the local Ollama endpoint and current market feeds.",
-    drivers: ["SPY headlines are loading.", "News Feeds are loading."],
-    risks: ["Ollama may not be running.", "Use price confirmation before acting."],
-    actionPlan: ["Refresh Summary after SPY News and News Feeds load.", "Wait for VWAP/opening range confirmation."],
+    conclusion: "Summary is waiting for lightweight market context and current market feeds.",
+    drivers: ["SPY market context is loading.", "News/context feeds are loading."],
+    risks: ["Use price confirmation before acting.", "Wait for local paper risk gates before entry."],
+    actionPlan: ["Refresh Summary after context loads.", "Wait for VWAP/opening range confirmation."],
   },
   warning: "Summary endpoint unavailable.",
 };
@@ -7466,6 +7466,7 @@ async function loadTradeSummary() {
 
 async function fetchTradeSummaryResponse() {
   const candidates = [
+    ...MARKET_DATA_API_CANDIDATES,
     API_BASE,
     "http://127.0.0.1:8034",
     "http://127.0.0.1:8033",

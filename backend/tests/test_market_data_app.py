@@ -66,3 +66,17 @@ def test_lightweight_market_forecast_prediction_returns_advisory_contract() -> N
     assert payload["forecastAppliedToOrder"] is False
     assert payload["multiHorizonForecast"]["positionManagementAuthority"] == "advisory_only"
     assert [row["horizonMinutes"] for row in payload["multiHorizonForecast"]["horizons"]] == [5, 10, 15]
+
+
+def test_lightweight_news_summary_does_not_require_ollama() -> None:
+    client = TestClient(app)
+
+    response = client.get("/api/news-summary?symbol=SPY&limit=10")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "Lightweight rule summary"
+    assert payload["ollamaHealth"]["status"] == "not_required"
+    assert payload["warning"] == ""
+    assert payload["summary"]["drivers"]
+    assert "lightweight market-data service" in payload["summary"]["conclusion"]
