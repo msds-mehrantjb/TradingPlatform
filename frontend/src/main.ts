@@ -1,6 +1,6 @@
 ﻿import "./styles.css";
 import { evaluatePaperDecisionV2 } from "./api/v2";
-import { API_BASE, BACKTEST_API_CANDIDATES, TRADING_ALGORITHM_INVENTORY_ENDPOINTS } from "./api/client";
+import { API_BASE, BACKTEST_API_CANDIDATES, MARKET_DATA_API_CANDIDATES, TRADING_ALGORITHM_INVENTORY_ENDPOINTS } from "./api/client";
 import { renderV2DecisionPanel } from "./components";
 import { directionalSignal, isEligibleStrategyVote, winningVoteSignal } from "./domain/tradingSignals";
 import type { RegimeBacktestResult } from "./features/regime/types";
@@ -5845,7 +5845,7 @@ async function loadCandles(options: { showLoading?: boolean; refresh?: boolean }
   }
 
   try {
-    const result = await fetchFromBackendCandidates(candlesPath, CORE_MARKET_DATA_TIMEOUT_MS);
+    const result = await fetchFromMarketDataCandidates(candlesPath, CORE_MARKET_DATA_TIMEOUT_MS);
     const response = result.response;
     candlesUrl = result.url;
     if (!response.ok) {
@@ -6715,9 +6715,18 @@ async function fetchWithTimeout(url: string, timeoutMs: number, init: RequestIni
 }
 
 async function fetchFromBackendCandidates(path: string, timeoutMs: number, init: RequestInit = {}) {
+  return fetchFromCandidates(BACKTEST_API_CANDIDATES, path, timeoutMs, init, "Backend route unavailable");
+}
+
+async function fetchFromMarketDataCandidates(path: string, timeoutMs: number, init: RequestInit = {}) {
+  return fetchFromCandidates(MARKET_DATA_API_CANDIDATES, path, timeoutMs, init, "Market-data route unavailable");
+}
+
+async function fetchFromCandidates(candidates: string[], path: string, timeoutMs: number, init: RequestInit = {}, fallbackMessage = "Backend route unavailable") {
   let lastMessage = "Backend route unavailable";
+  lastMessage = fallbackMessage;
   let lastUrl = `${API_BASE}${path}`;
-  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+  for (const baseUrl of candidates) {
     lastUrl = `${baseUrl}${path}`;
     try {
       const response = await fetchWithTimeout(lastUrl, timeoutMs, init);
@@ -7013,7 +7022,8 @@ async function fetchAlgoBacktestCandles(timeframe: BacktestResultTimeframe) {
     limit: timeframe === "1Min" ? "1000" : "700",
     refresh: "false",
   });
-  const response = await fetchWithTimeout(`${API_BASE}/api/candles?${params.toString()}`, 10000);
+  const result = await fetchFromMarketDataCandidates(`/api/candles?${params.toString()}`, 10000);
+  const response = result.response;
   if (!response.ok) {
     throw new Error(await response.text());
   }
@@ -7098,7 +7108,8 @@ async function fetchWeightedSymbolCandles(symbol: string, refresh: boolean) {
   if (end) {
     params.set("end", end);
   }
-  const response = await fetchWithTimeout(`${API_BASE}/api/candles?${params.toString()}`, 10000);
+  const result = await fetchFromMarketDataCandidates(`/api/candles?${params.toString()}`, 10000);
+  const response = result.response;
   if (!response.ok) {
     throw new Error(await response.text());
   }
@@ -7122,7 +7133,8 @@ async function fetchWeightedTimeframeCandles(timeframe: WeightedSpyContextTimefr
   if (end) {
     params.set("end", end);
   }
-  const response = await fetchWithTimeout(`${API_BASE}/api/candles?${params.toString()}`, 10000);
+  const result = await fetchFromMarketDataCandidates(`/api/candles?${params.toString()}`, 10000);
+  const response = result.response;
   if (!response.ok) {
     throw new Error(await response.text());
   }
@@ -7132,7 +7144,8 @@ async function fetchWeightedTimeframeCandles(timeframe: WeightedSpyContextTimefr
 
 async function loadMarketStatus() {
   try {
-    const response = await fetch(`${API_BASE}/api/market-status`);
+    const result = await fetchFromMarketDataCandidates("/api/market-status", 5000);
+    const response = result.response;
     if (!response.ok) {
       throw new Error(await response.text());
     }
@@ -7664,7 +7677,7 @@ async function loadMarketContext(options: { showLoading?: boolean; refresh?: boo
   marketContextLoadInFlightKey = contextLoadKey;
 
   try {
-    const result = await fetchFromBackendCandidates(contextPath, CORE_MARKET_DATA_TIMEOUT_MS);
+    const result = await fetchFromMarketDataCandidates(contextPath, CORE_MARKET_DATA_TIMEOUT_MS);
     const response = result.response;
     contextUrl = result.url;
     if (!response.ok) {
@@ -8610,7 +8623,8 @@ async function loadOlderCandles() {
   params.set("start", boundedStart.toISOString());
 
   try {
-    const response = await fetch(`${API_BASE}/api/candles?${params.toString()}`);
+    const result = await fetchFromMarketDataCandidates(`/api/candles?${params.toString()}`, 10000);
+    const response = result.response;
     if (!response.ok) {
       throw new Error(await response.text());
     }
@@ -15925,7 +15939,7 @@ async function refreshVotingEnsembleNbbo(options: { force?: boolean } = {}) {
   state.votingEnsembleNbboStatus = state.votingEnsembleNbboStatus === "ready" ? "ready" : "loading";
   state.votingEnsembleNbboWarning = "";
   let lastMessage = "Latest NBBO quote route unavailable";
-  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+  for (const baseUrl of MARKET_DATA_API_CANDIDATES) {
     try {
       const params = new URLSearchParams({ symbol: state.symbol, feed: state.feed });
       const response = await fetchWithTimeout(`${baseUrl}/api/market-data/quotes/latest?${params.toString()}`, 5000);

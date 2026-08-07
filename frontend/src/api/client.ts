@@ -4,6 +4,12 @@ export const BACKTEST_API_CANDIDATES = ["http://127.0.0.1:8020", API_BASE].filte
   (value, index, values) => values.indexOf(value) === index,
 );
 
+export const MARKET_DATA_API_BASE = import.meta.env.VITE_MARKET_DATA_API_BASE_URL ?? "http://127.0.0.1:8021";
+
+export const MARKET_DATA_API_CANDIDATES = [MARKET_DATA_API_BASE, API_BASE, "http://127.0.0.1:8020"].filter(
+  (value, index, values) => values.indexOf(value) === index,
+);
+
 export const TRADING_ALGORITHM_INVENTORY_ENDPOINTS = {
   strategyFit: "/api/v2/algorithms/strategy-fit/inventory",
   marketForecast: "/api/v2/algorithms/market-forecast/inventory",

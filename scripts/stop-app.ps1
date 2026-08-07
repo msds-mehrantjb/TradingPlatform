@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Continue"
 
-$ports = @(8020, 5173)
+$ports = @(8020, 8021, 5173)
 $processIds = @()
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $pidFiles = @(
@@ -27,6 +27,24 @@ foreach ($processId in $processIds) {
   if ($processId) {
     Stop-Process -Id ([int]$processId) -Force -ErrorAction SilentlyContinue
   }
+}
+
+$uvicornPatterns = @(
+  "uvicorn backend.app.main:app --host 127.0.0.1 --port 8020",
+  "uvicorn backend.app.market_data_app:app --host 127.0.0.1 --port 8021"
+)
+
+try {
+  Get-CimInstance Win32_Process |
+    Where-Object {
+      $commandLine = [string]$_.CommandLine
+      $uvicornPatterns | Where-Object { $commandLine -like "*$_*" }
+    } |
+    ForEach-Object {
+      Stop-Process -Id ([int]$_.ProcessId) -Force -ErrorAction SilentlyContinue
+    }
+} catch {
+  # Port ownership cleanup above is enough on restricted shells.
 }
 
 foreach ($pidFile in $pidFiles) {
