@@ -139,7 +139,9 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
             "requestedPaperTradingEnabled",
             "effectivePaperTradingEnabled",
             "liveTradingEnabled",
-            "paperBrokerVerified",
+            "brokerPaperAccountVerified",
+            "localPaperAccountVerified",
+            "localInventoryVerified",
             "marketOpen",
             "marketDataReady",
             "inventoryReconciled",
@@ -149,6 +151,7 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
             "lastEvaluation",
             "lastDecision",
             "lastExecutionIntent",
+            "lastLocalOrder",
             "lastBrokerOrder",
             "openVotingEnsembleOrders",
             "openVotingEnsemblePositions",
@@ -212,7 +215,9 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["requestedPaperTradingEnabled"])
         self.assertTrue(status["effectivePaperTradingEnabled"])
         self.assertFalse(status["liveTradingEnabled"])
-        self.assertTrue(status["paperBrokerVerified"])
+        self.assertIsNone(status["brokerPaperAccountVerified"])
+        self.assertTrue(status["localPaperAccountVerified"])
+        self.assertTrue(status["localInventoryVerified"])
         self.assertTrue(status["localPaperAccountLoaded"])
         self.assertTrue(status["inventoryHealthy"])
         self.assertTrue(status["persistenceHealthy"])
@@ -228,7 +233,8 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["activeEntryBlocks"], [])
         self.assertEqual(status["lastFinalizedBar"]["symbol"], "SPY")
         self.assertEqual(status["lastExecutionIntent"]["orderIntentId"], "intent-phase11")
-        self.assertEqual(status["lastBrokerOrder"]["clientOrderId"], "ve-entry-phase11")
+        self.assertEqual(status["lastLocalOrder"]["clientOrderId"], "ve-entry-phase11")
+        self.assertIsNone(status["lastBrokerOrder"])
         self.assertEqual(status["openVotingEnsembleOrders"][0]["clientOrderId"], "ve-entry-phase11")
         self.assertEqual(status["openVotingEnsemblePositions"][0]["symbol"], "SPY")
         self.assertEqual(status["settingsHash"], "settings-phase11")
@@ -580,7 +586,8 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(account_risk["totalSpyNotionalPercent"], 12.5)
         self.assertEqual(account_risk["tradesToday"], 4)
         self.assertEqual(account_risk["sourceAuthority"], "voting_ensemble.local_paper_account")
-        self.assertFalse(account_risk["brokerAccount"])
+        self.assertTrue(account_risk["localPaperAccount"])
+        self.assertFalse(account_risk["externalBrokerAccount"])
         self.assertEqual(automatic_snapshot["backendAccountSnapshot"]["sourceAuthority"], "voting_ensemble.local_paper_account")
         self.assertEqual(automatic_snapshot["localPaperAccountSnapshot"], account_risk)
         self.assertTrue(automatic_snapshot["dataFreshnessAndSynchronization"]["snapshotSynchronized"])

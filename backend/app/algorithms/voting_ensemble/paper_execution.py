@@ -156,6 +156,7 @@ class VotingEnsemblePaperExecutionRepository:
         self.lastPersistenceErrorAt: str | None = None
         self.persistenceFailureCount = 0
         self.inventory_ledger = VotingEnsembleInventoryLedger(self)
+        self.execution_mode: VotingEnsembleExecutionMode | None = None
         self._transaction_depth = 0
         self._transaction_dirty = False
         self._load()
@@ -830,11 +831,17 @@ class VotingEnsemblePaperExecutionRepository:
         reconciliations = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.restart_recovery.")
         has_persisted_local_inventory = _has_persisted_local_inventory_without_account(snapshots)
         account_observed_at = _parse_time((local_accounts[-1] if local_accounts else {}).get("observedAt")) if local_accounts else None
-        account_payload = None if has_persisted_local_inventory and not local_accounts else self.local_account_snapshot(observed_at=account_observed_at)
+        configured_execution_mode = getattr(self, "execution_mode", None)
+        broker_authority_mode = configured_execution_mode == "BROKER_PAPER" or (configured_execution_mode is None and bool(broker_accounts) and not local_accounts)
+        account_payload = None if (broker_authority_mode or (has_persisted_local_inventory and not local_accounts)) else self.local_account_snapshot(observed_at=account_observed_at)
         positions = self.inventory_ledger.positions()
         open_orders = [order for order in orders if str(order.get("status") or "").upper() in {"NEW", "OPEN", "ACCEPTED", "PARTIALLY_FILLED"}]
         recent_fills = sorted(fills, key=lambda fill: str(fill.get("filledAt") or fill.get("createdAt") or ""), reverse=True)[:25]
-        inventory_execution_mode = "LOCAL_PAPER" if account_payload is not None or not broker_accounts else "BROKER_PAPER"
+        inventory_execution_mode = configured_execution_mode or ("LOCAL_PAPER" if account_payload is not None or not broker_accounts else "BROKER_PAPER")
+        if inventory_execution_mode == "LOCAL_PAPER":
+            broker_orders = []
+            broker_positions = []
+            broker_accounts = []
         source_authority = (
             str((account_payload or {}).get("sourceAuthority") or "voting_ensemble_local_paper_account")
             if inventory_execution_mode == "LOCAL_PAPER"
@@ -1668,6 +1675,7 @@ class VotingEnsemblePaperExecutionRuntime:
         self.repository = repository or VotingEnsemblePaperExecutionRepository()
         self.queue = queue or VotingEnsemblePaperExecutionQueue()
         self.execution_mode: VotingEnsembleExecutionMode = _normalize_execution_mode(execution_mode)
+        self.repository.execution_mode = self.execution_mode
         if self.execution_mode == "LOCAL_PAPER" and broker_client is not None:
             raise VotingEnsemblePaperExecutionNamespaceError("Voting Ensemble LOCAL_PAPER mode cannot be constructed with a broker trading client")
         if self.execution_mode == "LOCAL_PAPER" and paper_gateway is not None and not _gateway_is_local_paper(paper_gateway):
@@ -3098,7 +3106,7 @@ class AlpacaPaperBrokerClient:
             partiallyFilledOrders=[],
             observedAt=observed_at,
             sessionDate=observed_at.date(),
-            sourceAuthority="broker",
+            sourceAuthority="alpaca_paper_broker",
             positionsReconciled=True,
             openOrdersReconciled=True,
         )

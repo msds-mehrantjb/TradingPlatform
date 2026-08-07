@@ -466,8 +466,18 @@ class VotingEnsembleRuntimeSupervisor:
         last_evaluation = _latest_record(jobs, "updatedAt", "completedAt", "startedAt", "createdAt")
         last_decision = _last_decision_from_evaluation(last_evaluation)
         last_execution_intent = _latest_record(inventory.get("outbox") or [], "updatedAt", "submittedAt", "createdAt", "evaluatedAt")
+        local_paper_mode = _is_local_paper_mode(self.paper_execution_runtime)
+        last_local_order = _latest_record(
+            inventory.get("localOrders") or inventory.get("orders") or [],
+            "updatedAt",
+            "submittedAt",
+            "acceptedAt",
+            "createdAt",
+            "observedAt",
+            "persistedAt",
+        )
         last_broker_order = _latest_record(
-            [*(inventory.get("brokerOrders") or []), *(inventory.get("orders") or [])],
+            inventory.get("brokerOrders") or [],
             "updatedAt",
             "submittedAt",
             "acceptedAt",
@@ -487,7 +497,6 @@ class VotingEnsembleRuntimeSupervisor:
         evaluation_worker_healthy = bool(runtime_summary.get("workerAlive")) and self.metrics.workerStatus.get("evaluation_worker") != "failed"
         execution_worker_healthy = bool(paper_summary.get("workerAlive")) and self.metrics.workerStatus.get("execution_worker") != "failed"
         checks = effective.get("checks", {})
-        local_paper_mode = _is_local_paper_mode(self.paper_execution_runtime)
         reconciliation_healthy = (
             self.metrics.workerStatus.get("reconciliation_loop") != "failed"
             and bool(checks.get("inventoryHealthy") if local_paper_mode else checks.get("inventoryReconciled"))
@@ -538,7 +547,9 @@ class VotingEnsembleRuntimeSupervisor:
             "requestedPaperTradingEnabled": self.control_store.control.requestedPaperTradingEnabled,
             "effectivePaperTradingEnabled": effective["effectivePaperTradingEnabled"],
             "liveTradingEnabled": False,
-            "paperBrokerVerified": bool(checks.get("localPaperAccountLoaded")) and bool(checks.get("localPaperInventoryIsolated")),
+            "localPaperAccountVerified": bool(checks.get("localPaperAccountLoaded")) and bool(checks.get("localPaperInventoryIsolated")),
+            "localInventoryVerified": bool(checks.get("localPaperInventoryIsolated")) and bool(checks.get("inventoryHealthy")),
+            "brokerPaperAccountVerified": None if local_paper_mode else bool(checks.get("inventoryReconciled")),
             "localPaperObservability": local_observability,
             "localPaperAccount": local_observability["localPaperAccount"],
             "localPositions": local_observability["localPositions"],
@@ -563,6 +574,7 @@ class VotingEnsembleRuntimeSupervisor:
             "lastEvaluation": last_evaluation,
             "lastDecision": last_decision,
             "lastExecutionIntent": last_execution_intent,
+            "lastLocalOrder": last_local_order if local_paper_mode else None,
             "lastBrokerOrder": last_broker_order,
             "openVotingEnsembleOrders": _open_order_records(inventory),
             "openVotingEnsemblePositions": _open_position_records(inventory),
@@ -572,7 +584,7 @@ class VotingEnsembleRuntimeSupervisor:
                 last_evaluation=last_evaluation,
                 last_decision=last_decision,
                 last_execution_intent=last_execution_intent,
-                last_broker_order=last_broker_order,
+                last_broker_order=last_broker_order if not local_paper_mode else last_local_order,
             ),
             "controlStore": self.control_store.snapshot(),
             "readiness": readiness,
@@ -874,7 +886,8 @@ class VotingEnsembleRuntimeSupervisor:
                 "accountId": str(account.get("accountId") or VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID),
                 "sourceAuthority": "voting_ensemble.local_paper_account",
                 "paperAccount": True,
-                "brokerAccount": False,
+                "localPaperAccount": True,
+                "externalBrokerAccount": False,
                 "liveTradingEnabled": False,
             }
         return None
@@ -932,11 +945,14 @@ def _paper_inventory_snapshot(paper_execution_runtime: Any) -> dict[str, Any]:
         return {
             "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
             "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "executionMode": "LOCAL_PAPER",
+            "sourceAuthority": "voting_ensemble.local_paper_account.unavailable",
             "orders": [],
             "fills": [],
             "positions": [],
-            "brokerOrders": [],
-            "brokerPositions": [],
+            "localOrders": [],
+            "localFills": [],
+            "localPositions": [],
             "outbox": [],
             "reconciliationBlocks": [
                 {
@@ -1102,7 +1118,11 @@ def _active_entry_blocks(
 
 
 def _open_order_records(inventory: dict[str, Any]) -> list[dict[str, Any]]:
-    records = [*(inventory.get("brokerOrders") or []), *(inventory.get("orders") or [])]
+    execution_mode = str(inventory.get("executionMode") or "LOCAL_PAPER").upper()
+    if execution_mode == "LOCAL_PAPER":
+        records = inventory.get("localOrders") or inventory.get("orders") or []
+    else:
+        records = [*(inventory.get("brokerOrders") or []), *(inventory.get("orders") or [])]
     return [dict(record) for record in records if isinstance(record, dict) and _order_is_open(record)]
 
 

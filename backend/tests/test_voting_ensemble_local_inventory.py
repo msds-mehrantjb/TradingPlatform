@@ -43,6 +43,39 @@ class VotingEnsembleLocalInventoryTest(unittest.TestCase):
                 self.assertEqual(record["algorithmId"], VOTING_ENSEMBLE_ALGORITHM_ID)
                 self.assertEqual(record["capitalPartitionId"], VOTING_ENSEMBLE_CAPITAL_PARTITION_ID)
 
+    def test_local_inventory_snapshot_hides_stale_broker_mirrors_in_local_paper_mode(self) -> None:
+        repository = VotingEnsemblePaperExecutionRepository()
+        repository.execution_mode = "LOCAL_PAPER"
+        repository.local_account_snapshot(observed_at=NOW)
+        repository.inventory_ledger.apply_fill(
+            client_order_id="local-authority-buy",
+            order_intent_id="intent-local-authority-buy",
+            symbol="SPY",
+            side=Signal.BUY,
+            requested_quantity=4,
+            fill_price=100.0,
+            filled_at=NOW,
+        )
+        repository.write_snapshot(
+            "broker_position.SPY.BUY",
+            {
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                "schemaVersion": "voting_ensemble_broker_position_mirror_v1",
+                "executionMode": "BROKER_PAPER",
+                "symbol": "SPY",
+                "side": "BUY",
+                "quantity": 99,
+                "sourceAuthority": "alpaca_paper_broker",
+            },
+        )
+
+        snapshot = repository.inventory_snapshot()
+
+        self.assertEqual(snapshot["executionMode"], "LOCAL_PAPER")
+        self.assertEqual(snapshot["localPositions"][0]["signedQuantity"], 4)
+        self.assertEqual(snapshot["brokerPositions"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

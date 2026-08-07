@@ -104,7 +104,7 @@ class BrokerAccountSnapshot(DomainModel):
     exitCostPerShare: float = Field(default=0.02, ge=0.0)
     observedAt: datetime
     sessionDate: date
-    sourceAuthority: Literal["broker", "local_ui_history", "unknown"] = "broker"
+    sourceAuthority: Literal["broker", "alpaca_paper_broker", "local_ui_history", "unknown"] = "broker"
     positionsReconciled: bool = True
     openOrdersReconciled: bool = True
 
@@ -183,7 +183,7 @@ def aggregate_global_account_risk(
         "capitalPartitionExposure": _capital_partition_exposure(snapshot),
         "authority": snapshot.sourceAuthority,
     }
-    broker_authoritative = snapshot.sourceAuthority == "broker"
+    broker_authoritative = snapshot.sourceAuthority in {"broker", "alpaca_paper_broker"}
     broker_state = {
         "brokerConnected": broker_authoritative,
         "paperAccountActive": broker_authoritative,

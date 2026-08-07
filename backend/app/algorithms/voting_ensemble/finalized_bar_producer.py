@@ -992,7 +992,8 @@ def _account_snapshot_from_backend_account(account: dict[str, Any] | None, inven
         "sourceAuthority": VOTING_ENSEMBLE_LOCAL_ACCOUNT_RISK_SOURCE_AUTHORITY,
         "capitalPartitionId": str(account.get("capitalPartitionId") or fallback.get("capitalPartitionId") or "voting_ensemble.paper.default"),
         "paperAccount": True,
-        "brokerAccount": False,
+        "localPaperAccount": True,
+        "externalBrokerAccount": False,
     }
 
 
@@ -1133,7 +1134,8 @@ def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEns
             "sessionDate": str(account.get("sessionDate") or _iso(event.barEndTimestamp)[:10]),
             "sourceAuthority": VOTING_ENSEMBLE_LOCAL_ACCOUNT_RISK_SOURCE_AUTHORITY,
             "paperAccount": True,
-            "brokerAccount": False,
+            "localPaperAccount": True,
+            "externalBrokerAccount": False,
         }
     positions = inventory.get("positions") if isinstance(inventory, dict) else []
     open_notional = 0.0
@@ -1165,7 +1167,8 @@ def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEns
         "sessionDate": _iso(event.barEndTimestamp)[:10],
         "sourceAuthority": "voting_ensemble.local_paper_account.missing",
         "paperAccount": True,
-        "brokerAccount": False,
+        "localPaperAccount": True,
+        "externalBrokerAccount": False,
     }
 
 
