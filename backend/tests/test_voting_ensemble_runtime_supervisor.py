@@ -609,6 +609,38 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([receipt["status"] for receipt in receipts], ["enqueued", "duplicate", "stale"])
         event_store_path.unlink(missing_ok=True)
 
+    async def test_finalized_bar_producer_uses_cached_bars_when_provider_rate_limited(self) -> None:
+        candle_store = MemoryCandleStore()
+        candle_store.upsert_many(
+            [
+                stored_candle(NOW - timedelta(minutes=1), symbol="SPY"),
+                stored_candle(NOW - timedelta(minutes=1), symbol="QQQ"),
+            ]
+        )
+        published: list[tuple[VotingEnsembleFinalizedBarMarketEvent, str, int]] = []
+        event_store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"events-{uuid4().hex}.json"
+        producer = VotingEnsembleFinalizedBarProducer(
+            market_data_client=FailingMarketDataClient("429 Too Many Requests"),
+            candle_store=candle_store,
+            event_store=VotingEnsembleFinalizedBarEventStore(event_store_path),
+            config=VotingEnsembleFinalizedBarProducerConfig(
+                symbols=("SPY",),
+                auxiliary_symbols=("QQQ",),
+                decision_deadline_seconds=20,
+                finalization_delay_seconds=2,
+            ),
+            publish_event=lambda event, settings_hash, deadline: published_event_job(published, event, settings_hash, deadline),
+            settings_hash_provider=lambda: "settings-a",
+        )
+
+        results = await producer.poll_once(now=NOW + timedelta(seconds=3))
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "enqueued")
+        self.assertTrue(results[0]["accepted"])
+        self.assertEqual(len(published), 1)
+        event_store_path.unlink(missing_ok=True)
+
     async def test_automatic_payload_builder_constructs_backend_authoritative_evaluation_payload(self) -> None:
         candle_store = MemoryCandleStore()
         bar_start = NOW - timedelta(minutes=1)
@@ -799,6 +831,14 @@ class FakeMarketDataClient:
 
     def get_latest_quote_sync(self, **kwargs: Any) -> dict[str, Any] | None:
         return dict(self.quote) if self.quote is not None else None
+
+
+class FailingMarketDataClient:
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    async def get_bars(self, **kwargs: Any) -> list[dict[str, Any]]:
+        raise RuntimeError(self.message)
 
 
 class MemoryCandleStore:

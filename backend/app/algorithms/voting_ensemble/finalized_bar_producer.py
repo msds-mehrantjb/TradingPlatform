@@ -359,20 +359,38 @@ class VotingEnsembleFinalizedBarProducer:
         )
 
     async def _refresh_symbol_history(self, symbol: str, *, now: datetime) -> list[dict[str, Any]]:
-        rows = await self.market_data_client.get_bars(
-            symbol=symbol.upper(),
-            timeframe=self.config.timeframe,
-            feed=self.config.feed,
-            limit=self.config.fetch_limit,
-            start=None,
-            end=now.isoformat(),
-            sort="asc",
-        )
+        normalized_symbol = symbol.upper()
+        try:
+            rows = await self.market_data_client.get_bars(
+                symbol=normalized_symbol,
+                timeframe=self.config.timeframe,
+                feed=self.config.feed,
+                limit=self.config.fetch_limit,
+                start=None,
+                end=now.isoformat(),
+                sort="asc",
+            )
+        except Exception:
+            return self._cached_symbol_history(normalized_symbol, now=now, limit=self.config.history_limit)
         valid = [_normalize_candle(row, symbol=symbol.upper(), timeframe=self.config.timeframe, feed=self.config.feed) for row in rows]
         valid = [row for row in valid if row is not None]
         if valid:
             self.candle_store.upsert_many(valid)
         return valid
+
+    def _cached_symbol_history(self, symbol: str, *, now: datetime, limit: int) -> list[dict[str, Any]]:
+        try:
+            cached = self.candle_store.latest_until(
+                symbol=symbol.upper(),
+                timeframe=self.config.timeframe,
+                feed=self.config.feed,
+                limit=limit,
+                end=now.isoformat(),
+            )
+        except Exception:
+            return []
+        valid = [_normalize_candle(row, symbol=symbol.upper(), timeframe=self.config.timeframe, feed=self.config.feed) for row in cached]
+        return [row for row in valid if row is not None]
 
 
 class VotingEnsembleAutomaticEvaluationPayloadBuilder:
