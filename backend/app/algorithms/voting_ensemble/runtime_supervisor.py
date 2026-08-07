@@ -422,7 +422,13 @@ class VotingEnsembleRuntimeSupervisor:
     def paper_inventory(self) -> dict[str, Any]:
         return self.paper_execution_runtime.inventory_snapshot()
 
-    def update_control(self, *, requested_paper_trading_enabled: bool, updated_by: str = "api") -> dict[str, Any]:
+    def update_control(
+        self,
+        *,
+        requested_paper_trading_enabled: bool,
+        clear_local_entry_block: bool = False,
+        updated_by: str = "api",
+    ) -> dict[str, Any]:
         reason_codes = [
             "voting_ensemble.control.paper_requested_on"
             if requested_paper_trading_enabled
@@ -433,6 +439,8 @@ class VotingEnsembleRuntimeSupervisor:
             updated_by=updated_by,
             reason_codes=reason_codes,
         )
+        if clear_local_entry_block:
+            self.control_store.clear_entry_block("voting_ensemble.control.local_entry_block_cleared_by_operator")
         self._refresh_readiness()
         return self.control_store.snapshot()
 
@@ -757,9 +765,12 @@ class VotingEnsembleRuntimeSupervisor:
     def _effective_control(self, runtime_summary: dict[str, Any], paper_summary: dict[str, Any]) -> dict[str, Any]:
         control = self.control_store.control
         clock = self.market_clock_provider()
-        inventory = self.paper_inventory()
-        account = inventory.get("account") if isinstance(inventory, dict) else None
         local_paper_mode = _is_local_paper_mode(self.paper_execution_runtime)
+        inventory = self.paper_inventory()
+        if local_paper_mode:
+            self._refresh_local_market_data_mark(symbol="SPY", feed="iex")
+            inventory = self.paper_inventory()
+        account = inventory.get("account") if isinstance(inventory, dict) else None
         local_account_loaded = _local_paper_account_loaded(account)
         inventory_healthy = _local_inventory_healthy(inventory)
         persistence_healthy = paper_summary.get("persistenceHealthy") is not False and inventory.get("persistenceHealthy") is not False
@@ -905,6 +916,25 @@ class VotingEnsembleRuntimeSupervisor:
         if not callable(reader):
             return None
         return reader(symbol=symbol, feed=feed)
+
+    def _refresh_local_market_data_mark(self, *, symbol: str, feed: str) -> dict[str, Any] | None:
+        if not _is_local_paper_mode(self.paper_execution_runtime):
+            return None
+        quote = self._latest_quote(symbol=symbol, feed=feed)
+        if not quote:
+            return None
+        marker = getattr(self.paper_execution_runtime, "mark_to_market_from_payload", None)
+        if not callable(marker):
+            return None
+        try:
+            observed_at = datetime.now(UTC)
+            for key in ("quoteTimestamp", "marketDataReceiptTimestamp", "lastTradeTimestamp"):
+                timestamp = _parse_supervisor_time(quote.get(key))
+                if timestamp is not None and timestamp > observed_at:
+                    observed_at = timestamp
+            return marker({"symbol": symbol, "feed": feed, "nbbo": quote}, observed_at=observed_at)
+        except Exception:
+            return None
 
 
 _VOTING_ENSEMBLE_RUNTIME_SUPERVISOR: VotingEnsembleRuntimeSupervisor | None = None
@@ -1215,6 +1245,23 @@ def _local_paper_account_loaded(account: Any) -> bool:
         and account.get("accountId") == VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID
         and str(account.get("executionMode") or "LOCAL_PAPER").upper() == "LOCAL_PAPER"
     )
+
+
+def _parse_supervisor_time(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _local_inventory_healthy(inventory: dict[str, Any]) -> bool:

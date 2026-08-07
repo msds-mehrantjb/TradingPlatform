@@ -23,6 +23,8 @@ class VotingEnsembleRuntimeControlUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     requestedPaperTradingEnabled: bool
+    localEntryBlockActive: bool | None = None
+    localEntryBlockReasonCodes: list[str] | None = None
 
 
 @router.post("/evaluate", status_code=status.HTTP_202_ACCEPTED, summary="Enqueue Voting Ensemble evaluation")
@@ -86,6 +88,7 @@ def runtime_control() -> dict[str, Any]:
 def update_runtime_control(payload: VotingEnsembleRuntimeControlUpdate) -> dict[str, Any]:
     return get_voting_ensemble_runtime_supervisor().update_control(
         requested_paper_trading_enabled=payload.requestedPaperTradingEnabled,
+        clear_local_entry_block=payload.localEntryBlockActive is False,
         updated_by="api",
     )
 

@@ -305,6 +305,69 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(enabled["liveTradingEnabled"])
         control_path.unlink(missing_ok=True)
 
+    async def test_control_update_can_clear_operator_local_entry_block(self) -> None:
+        control_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"control-{uuid4().hex}.json"
+        self.supervisor = supervisor_with_runtime(
+            control_store=VotingEnsembleRuntimeControlStore(VotingEnsembleRuntimeControlRepository(control_path)),
+            settings=paper_settings(),
+            market_clock_provider=lambda: {"isOpen": True, "status": "open"},
+        )
+        await self.supervisor.start()
+        self.supervisor.control_store.block_new_entries("voting_ensemble.runtime.finalized_bar_producer.failed")
+
+        enabled = self.supervisor.update_control(
+            requested_paper_trading_enabled=True,
+            clear_local_entry_block=True,
+            updated_by="test",
+        )
+
+        self.assertTrue(enabled["requestedPaperTradingEnabled"])
+        self.assertTrue(enabled["effectivePaperTradingEnabled"])
+        self.assertTrue(enabled["newEntriesEnabled"])
+        self.assertFalse(enabled["localEntryBlockActive"])
+        self.assertEqual(enabled["localEntryBlockReasonCodes"], [])
+        self.assertIn("voting_ensemble.control.effective_paper_on", enabled["reasonCodes"])
+        control_path.unlink(missing_ok=True)
+
+    async def test_local_paper_readiness_refreshes_stale_market_data_mark_from_quote_provider(self) -> None:
+        quote_time = datetime.now(UTC) + timedelta(seconds=1)
+        self.supervisor = supervisor_with_runtime(
+            settings=paper_settings(),
+            market_clock_provider=lambda: {"isOpen": True, "status": "open"},
+            market_data_client=FakeMarketDataClient(
+                [],
+                quote={
+                    "provider": "alpaca",
+                    "feed": "iex",
+                    "symbol": "SPY",
+                    "bid": 100.0,
+                    "ask": 100.01,
+                    "bidSize": 100,
+                    "askSize": 100,
+                    "quoteTimestamp": quote_time.isoformat().replace("+00:00", "Z"),
+                    "marketDataReceiptTimestamp": quote_time.isoformat().replace("+00:00", "Z"),
+                },
+            ),
+            candle_store=MemoryCandleStore(),
+        )
+        await self.supervisor.start()
+        self.supervisor.paper_execution_runtime.repository.mark_local_positions_from_market_data(
+            symbol="SPY",
+            nbbo=None,
+            observed_at=datetime.now(UTC),
+        )
+
+        enabled = self.supervisor.update_control(
+            requested_paper_trading_enabled=True,
+            clear_local_entry_block=True,
+            updated_by="test",
+        )
+        status = self.supervisor.status()
+
+        self.assertTrue(enabled["effectivePaperTradingEnabled"])
+        self.assertTrue(enabled["newEntriesEnabled"])
+        self.assertTrue(status["marketDataFresh"])
+
     async def test_live_alpaca_endpoint_does_not_block_local_paper_trading(self) -> None:
         self.supervisor = supervisor_with_runtime(
             settings=live_settings(),
@@ -651,11 +714,15 @@ class FakePaperBroker:
 
 
 class FakeMarketDataClient:
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
+    def __init__(self, rows: list[dict[str, Any]], quote: dict[str, Any] | None = None) -> None:
         self.rows = rows
+        self.quote = quote
 
     async def get_bars(self, **kwargs: Any) -> list[dict[str, Any]]:
         return list(self.rows)
+
+    def get_latest_quote_sync(self, **kwargs: Any) -> dict[str, Any] | None:
+        return dict(self.quote) if self.quote is not None else None
 
 
 class MemoryCandleStore:
@@ -702,6 +769,8 @@ def supervisor_with_runtime(
     control_store: VotingEnsembleRuntimeControlStore | None = None,
     settings: Settings | None = None,
     market_clock_provider=None,
+    market_data_client=None,
+    candle_store=None,
 ) -> VotingEnsembleRuntimeSupervisor:
     execution = paper_runtime()
     if control_store is None:
@@ -720,6 +789,8 @@ def supervisor_with_runtime(
         control_store=control_store,
         settings=settings,
         market_clock_provider=market_clock_provider,
+        market_data_client=market_data_client,
+        candle_store=candle_store,
         config=VotingEnsembleRuntimeSupervisorConfig(health_poll_seconds=0.05, reconciliation_poll_seconds=0.05),
     )
 
