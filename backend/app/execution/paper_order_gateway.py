@@ -657,19 +657,21 @@ def _portfolio_snapshot_from_payload(payload: PortfolioSnapshot | dict[str, Any]
 def _portfolio_position_from_payload(payload: Any, *, proposal: GlobalOrderProposal) -> PortfolioPosition | None:
     if not isinstance(payload, dict):
         return None
-    quantity = int(_signed_float(payload.get("signedQuantity", payload.get("quantity", payload.get("qty", 0)))))
-    if quantity == 0:
+    raw_quantity = int(_signed_float(payload.get("signedQuantity", payload.get("quantity", payload.get("qty", 0)))))
+    if raw_quantity == 0:
         return None
+    raw_side = str(payload.get("side") or "").upper()
+    side = "short" if raw_side in {"SHORT", "SELL"} or raw_quantity < 0 else "long"
     symbol = str(payload.get("symbol") or proposal.symbol).upper()
-    market_value = _non_negative_float(payload.get("marketValue") or payload.get("notional") or abs(quantity) * _positive_float(payload.get("markPrice") or payload.get("averageEntryPrice") or 0.0))
+    market_value = _non_negative_float(payload.get("marketValue") or payload.get("notional") or abs(raw_quantity) * _positive_float(payload.get("markPrice") or payload.get("averageEntryPrice") or 0.0))
     return PortfolioPosition(
         algorithmId=str(payload.get("algorithmId", payload.get("algorithm_id", proposal.algorithmId))),
         symbol=symbol,
         sector=str(payload["sector"]) if payload.get("sector") else None,
-        quantity=quantity,
+        quantity=abs(raw_quantity),
         marketValue=market_value,
         openRiskDollars=_non_negative_float(payload.get("openRiskDollars") or payload.get("riskDollars") or payload.get("totalOpenRiskDollars")),
-        side="long" if quantity > 0 or str(payload.get("side") or "").upper() != "SHORT" else "short",
+        side=side,
     )
 
 

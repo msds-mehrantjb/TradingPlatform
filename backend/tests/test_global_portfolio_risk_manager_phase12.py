@@ -18,6 +18,7 @@ from backend.app.risk import (
     PortfolioSnapshot,
 )
 from backend.app.risk.order_gates import global_intent_key
+from backend.app.risk.portfolio_gates import portfolio_metrics
 from backend.app.main import app
 from backend.tests.test_weighted_voting_paper_order_gateway import NOW, global_application, global_proposal, local_gate, validated_rollout_flags, validated_rollout_validation
 from backend.app.algorithms.weighted_voting.execution_gateway import submit_weighted_voting_paper_order
@@ -80,6 +81,23 @@ class GlobalPortfolioRiskManagerPhase12Test(unittest.TestCase):
         self.assertEqual(decision.status, "denied")
         self.assertIn("conflicting_simultaneous_orders", failed_ids)
         self.assertIn("insufficient_shortability", failed_ids)
+
+    def test_global_risk_reads_separate_algorithm_inventories_without_consolidating_positions(self) -> None:
+        portfolio = PortfolioSnapshot(
+            positions=(
+                PortfolioPosition(algorithmId="voting_ensemble", symbol="SPY", quantity=100, marketValue=10_000, openRiskDollars=100, side="long"),
+                PortfolioPosition(algorithmId="algorithm_b", symbol="SPY", quantity=30, marketValue=3_000, openRiskDollars=30, side="short"),
+            )
+        )
+
+        metrics = portfolio_metrics(portfolio)
+
+        self.assertEqual(len(portfolio.positions), 2)
+        self.assertEqual(metrics["grossExposure"], 13_000)
+        self.assertEqual(metrics["netExposure"], 7_000)
+        self.assertEqual(metrics["symbolExposure"]["SPY"], 13_000)
+        self.assertEqual(portfolio.positions[0].algorithmId, "voting_ensemble")
+        self.assertEqual(portfolio.positions[1].algorithmId, "algorithm_b")
 
     def test_atomic_reservation_prevents_two_algorithms_consuming_same_decision_capacity(self) -> None:
         manager = GlobalPortfolioRiskManager()

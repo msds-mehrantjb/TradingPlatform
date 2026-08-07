@@ -1547,6 +1547,65 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
         self.assertFalse(any(record.get("algorithmId") == "weighted_voting" for record in repository.snapshots.values()))
         store_path.unlink(missing_ok=True)
 
+    def test_local_paper_global_risk_reads_foreign_exposure_without_mutating_ve_inventory(self) -> None:
+        store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-global-risk-readonly-{uuid4().hex}.json"
+        with patch.dict("os.environ", {"VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0", "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0"}):
+            repository = VotingEnsemblePaperExecutionRepository(store_path)
+            repository.local_account_snapshot(observed_at=NOW)
+            repository.inventory_ledger.apply_fill(
+                client_order_id="ve-owned-100",
+                order_intent_id="intent-ve-owned-100",
+                symbol="SPY",
+                side=Signal.BUY,
+                requested_quantity=100,
+                fill_price=100.0,
+                filled_at=NOW,
+            )
+            repository.snapshots["global_risk.read_only_position.algorithm_b.spy"] = {
+                "algorithmId": "algorithm_b",
+                "capitalPartitionId": "algorithm_b.paper.default",
+                "symbol": "SPY",
+                "side": "SHORT",
+                "quantity": 30,
+                "marketValue": 3000.0,
+                "readOnly": True,
+                "sourceAuthority": "global_risk.read_only_aggregate",
+            }
+            seed_local_quote(repository, bid=100.0, ask=100.05, bid_size=200, observed_at=NOW + timedelta(seconds=1))
+            execution_runtime = VotingEnsemblePaperExecutionRuntime(
+                repository=repository,
+                queue=VotingEnsemblePaperExecutionQueue(),
+                auto_start=False,
+            )
+            sell_plan = order_plan(side=Signal.SELL).model_copy(update={"quantity": 150})
+
+            execution_runtime.enqueue_from_decision(
+                {"algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID, "final_signal": "Sell", "safety_gate_failed": False, "order_plan": sell_plan.model_dump(mode="json")},
+                correlation_id="corr-global-readonly-sell",
+                idempotency_key="idem-global-readonly-sell",
+                source_job_id="job-global-readonly-sell",
+                source_command_id="event-global-readonly-sell",
+                evaluated_at=NOW + timedelta(seconds=2),
+            )
+            result = execution_runtime.process_once(evaluated_at=NOW + timedelta(seconds=3))
+            inventory = execution_runtime.inventory_snapshot()
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            risk_portfolio = repository.read_snapshot(f"paper_order_gateway.global_risk_portfolio.{result['gatewayResult']['orderIntentId']}")
+            self.assertEqual(
+                [(position["algorithmId"], position["symbol"], position["quantity"], position["side"]) for position in risk_portfolio["positions"]],
+                [(VOTING_ENSEMBLE_ALGORITHM_ID, "SPY", 100, "long"), ("algorithm_b", "SPY", 30, "short")],
+            )
+            self.assertEqual(inventory["positions"], [])
+            self.assertEqual(inventory["closedTrades"][0]["quantity"], 100)
+            sell_order = [order for order in inventory["orders"] if order["side"] == Signal.SELL.value][0]
+            sell_fill = [fill for fill in inventory["fills"] if fill["side"] == Signal.SELL.value][0]
+            self.assertEqual(sell_order["quantity"], 100)
+            self.assertEqual(sell_fill["filledQuantity"], 100)
+            self.assertFalse(any(position.get("algorithmId") == "algorithm_b" for position in inventory["positions"]))
+        store_path.unlink(missing_ok=True)
+
     def test_automatic_broker_client_execution_state_is_durable_and_reloadable(self) -> None:
         store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-execution-state-{uuid4().hex}.json"
         repository = VotingEnsemblePaperExecutionRepository(store_path)

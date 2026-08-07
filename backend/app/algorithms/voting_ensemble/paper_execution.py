@@ -3814,7 +3814,7 @@ def _local_gateway_portfolio_snapshot_provider(repository: VotingEnsemblePaperEx
     def provider(**_: Any) -> dict[str, Any]:
         inventory = repository.inventory_snapshot()
         return {
-            "positions": list(inventory.get("positions") or []),
+            "positions": [*list(inventory.get("positions") or []), *_global_risk_read_only_positions(repository)],
             "orders": list(inventory.get("orders") or []),
             "pendingOrders": list(inventory.get("outbox") or []),
             "tradesToday": int((inventory.get("account") or {}).get("tradesToday") or 0),
@@ -3822,6 +3822,24 @@ def _local_gateway_portfolio_snapshot_provider(repository: VotingEnsemblePaperEx
         }
 
     return provider
+
+
+def _global_risk_read_only_positions(repository: VotingEnsemblePaperExecutionRepository) -> list[dict[str, Any]]:
+    snapshots = getattr(repository, "snapshots", {})
+    if not isinstance(snapshots, dict):
+        return []
+    records: list[dict[str, Any]] = []
+    for key, payload in sorted(snapshots.items()):
+        if not str(key).startswith(("global_risk.read_only_position.", "global_portfolio_risk.read_only_position.")):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        if payload.get("algorithmId", payload.get("algorithm_id")) == VOTING_ENSEMBLE_ALGORITHM_ID:
+            continue
+        if payload.get("mutable") is True or payload.get("readOnly", True) is False:
+            continue
+        records.append({"snapshotKey": str(key), **dict(payload), "readOnly": True, "globalRiskReadOnly": True})
+    return records
 
 
 def _execution_state_key(client_order_id: str) -> str:
