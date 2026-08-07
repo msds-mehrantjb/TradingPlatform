@@ -16626,9 +16626,14 @@ function latestWeightedCalculationCandles() {
 
 async function fetchVotingEnsembleRuntimeJson(path: string, init: RequestInit = {}) {
   let lastMessage = "Voting Ensemble runtime route unavailable";
-  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+  const isControlRoute = path === "/runtime/control";
+  const candidates = isControlRoute
+    ? [...MARKET_DATA_API_CANDIDATES, ...BACKTEST_API_CANDIDATES].filter((value, index, values) => values.indexOf(value) === index)
+    : BACKTEST_API_CANDIDATES;
+  const timeoutMs = isControlRoute ? 5000 : 15000;
+  for (const baseUrl of candidates) {
     try {
-      const response = await fetchWithTimeout(`${baseUrl}/api/voting-ensemble${path}`, 15000, {
+      const response = await fetchWithTimeout(`${baseUrl}/api/voting-ensemble${path}`, timeoutMs, {
         ...init,
         headers: {
           "Content-Type": "application/json",
@@ -16781,7 +16786,7 @@ function setSelectedPaperControlError(mode: TradingWindowMode, error: unknown) {
 async function syncSelectedAlgorithmPaperControl(mode: TradingWindowMode, enabled: boolean) {
   if (mode === "ensemble") {
     await syncVotingEnsembleAutomaticPaperControl(enabled);
-    await refreshVotingEnsemblePaperInventory();
+    void refreshVotingEnsemblePaperInventory();
     return;
   }
   if (mode === "weighted") {
@@ -16807,7 +16812,7 @@ async function loadVotingEnsembleRuntimeControl() {
     state.votingEnsembleRuntimeControl = control;
     state.votingEnsembleRuntimeControlStatus = control.requestedPaperTradingEnabled && !control.effectivePaperTradingEnabled ? "blocked" : "ready";
     state.votingEnsembleRuntimeControlWarning = "";
-    await loadVotingEnsembleRuntimeStatus();
+    refreshVotingEnsembleRuntimeStatusInBackground();
   } catch (error) {
     state.votingEnsembleRuntimeControlStatus = "error";
     state.votingEnsembleRuntimeControlWarning = error instanceof Error ? error.message : "Voting Ensemble paper control unavailable";
@@ -16825,13 +16830,20 @@ async function syncVotingEnsembleAutomaticPaperControl(enabled: boolean) {
   state.votingEnsembleRuntimeControl = control;
   state.votingEnsembleRuntimeControlStatus = control.requestedPaperTradingEnabled && !control.effectivePaperTradingEnabled ? "blocked" : "ready";
   state.votingEnsembleRuntimeControlWarning = "";
-  try {
-    await loadVotingEnsembleRuntimeStatus();
-  } catch (error) {
-    state.votingEnsembleRuntimeControlWarning = error instanceof Error ? error.message : "Voting Ensemble runtime status unavailable";
-    updateTradeToggleButton();
-  }
+  refreshVotingEnsembleRuntimeStatusInBackground();
   return control;
+}
+
+function refreshVotingEnsembleRuntimeStatusInBackground() {
+  void loadVotingEnsembleRuntimeStatus().catch((error) => {
+    state.votingEnsembleRuntimeControlWarning =
+      error instanceof Error && state.votingEnsembleRuntimeControl?.requestedPaperTradingEnabled
+        ? "Runtime readiness refresh is still pending."
+        : error instanceof Error
+          ? error.message
+          : "Voting Ensemble runtime status unavailable";
+    updateTradeToggleButton();
+  });
 }
 
 async function loadVotingEnsembleRuntimeStatus() {

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ConfigDict
 
 from .alpaca import AlpacaClient, demo_bars, local_market_status
 from .algorithms.voting_ensemble.strategies.registry import (
@@ -38,6 +41,10 @@ DEFAULT_LOOKBACKS = {
 }
 _RESPONSE_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
 
+VOTING_ENSEMBLE_ALGORITHM_ID = "voting_ensemble"
+VOTING_ENSEMBLE_CONTROL_NAMESPACE = "voting_ensemble.runtime.controls"
+VOTING_ENSEMBLE_CONTROL_VERSION = "voting_ensemble_runtime_control_v1"
+
 app = FastAPI(title="Trading Dashboard Market Data API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -48,6 +55,14 @@ app.add_middleware(
 )
 
 
+class VotingEnsembleRuntimeControlUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    requestedPaperTradingEnabled: bool
+    localEntryBlockActive: bool | None = None
+    localEntryBlockReasonCodes: list[str] | None = None
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {
@@ -56,6 +71,20 @@ def health() -> dict[str, Any]:
         "port": 8021,
         "generatedAt": _now_iso(),
     }
+
+
+@app.get("/api/voting-ensemble/runtime/control")
+def voting_ensemble_runtime_control() -> dict[str, Any]:
+    return _read_voting_ensemble_runtime_control()
+
+
+@app.put("/api/voting-ensemble/runtime/control")
+def update_voting_ensemble_runtime_control(payload: VotingEnsembleRuntimeControlUpdate) -> dict[str, Any]:
+    return _write_voting_ensemble_runtime_control(
+        requested_paper_trading_enabled=payload.requestedPaperTradingEnabled,
+        local_entry_block_active=payload.localEntryBlockActive,
+        local_entry_block_reason_codes=payload.localEntryBlockReasonCodes,
+    )
 
 
 @app.get("/api/market-status")
@@ -730,6 +759,105 @@ def _read_response_cache(key: tuple[Any, ...]) -> dict[str, Any] | None:
 def _write_response_cache(key: tuple[Any, ...], payload: dict[str, Any]) -> dict[str, Any]:
     _RESPONSE_CACHE[key] = (time.monotonic() + MARKET_DATA_CACHE_TTL_SECONDS, deepcopy(payload))
     return payload
+
+
+def _read_voting_ensemble_runtime_control() -> dict[str, Any]:
+    path = _voting_ensemble_control_store_path()
+    if not path.exists():
+        return _default_voting_ensemble_runtime_control()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    control = payload if isinstance(payload, dict) else {}
+    if control.get("algorithmId", control.get("algorithm_id", VOTING_ENSEMBLE_ALGORITHM_ID)) != VOTING_ENSEMBLE_ALGORITHM_ID:
+        control = {}
+    return _normalize_voting_ensemble_runtime_control(control)
+
+
+def _write_voting_ensemble_runtime_control(
+    *,
+    requested_paper_trading_enabled: bool,
+    local_entry_block_active: bool | None,
+    local_entry_block_reason_codes: list[str] | None,
+) -> dict[str, Any]:
+    control = _read_voting_ensemble_runtime_control()
+    requested = bool(requested_paper_trading_enabled)
+    control["requestedPaperTradingEnabled"] = requested
+    if not requested:
+        control["effectivePaperTradingEnabled"] = False
+        control["newEntriesEnabled"] = False
+    control["liveTradingEnabled"] = False
+    control["updatedAt"] = _now_iso()
+    control["updatedBy"] = "market_data_control_api"
+    control["reasonCodes"] = [
+        "voting_ensemble.control.paper_requested_on" if requested else "voting_ensemble.control.paper_requested_off"
+    ]
+    if local_entry_block_active is not None:
+        control["localEntryBlockActive"] = bool(local_entry_block_active)
+        if local_entry_block_active is False:
+            control["localEntryBlockReasonCodes"] = []
+            control["reasonCodes"].append("voting_ensemble.control.local_entry_block_cleared_by_operator")
+    if local_entry_block_reason_codes is not None:
+        control["localEntryBlockReasonCodes"] = [str(code) for code in local_entry_block_reason_codes]
+    control = _normalize_voting_ensemble_runtime_control(control)
+    path = _voting_ensemble_control_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    encoded = json.dumps(control, sort_keys=True, indent=2)
+    try:
+        temporary.write_text(encoded, encoding="utf-8")
+        temporary.replace(path)
+    except PermissionError:
+        path.write_text(encoded, encoding="utf-8")
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return control
+
+
+def _default_voting_ensemble_runtime_control() -> dict[str, Any]:
+    return {
+        "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+        "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+        "requestedPaperTradingEnabled": False,
+        "effectivePaperTradingEnabled": False,
+        "liveTradingEnabled": False,
+        "newEntriesEnabled": False,
+        "killSwitchActive": False,
+        "controlVersion": VOTING_ENSEMBLE_CONTROL_VERSION,
+        "updatedAt": _now_iso(),
+        "updatedBy": "market_data_control_api",
+        "reasonCodes": ["voting_ensemble.control.default_paper_off"],
+        "localEntryBlockActive": False,
+        "localEntryBlockReasonCodes": [],
+        "namespace": VOTING_ENSEMBLE_CONTROL_NAMESPACE,
+    }
+
+
+def _normalize_voting_ensemble_runtime_control(payload: dict[str, Any]) -> dict[str, Any]:
+    default = _default_voting_ensemble_runtime_control()
+    control = {**default, **payload}
+    control["algorithmId"] = VOTING_ENSEMBLE_ALGORITHM_ID
+    control["algorithm_id"] = VOTING_ENSEMBLE_ALGORITHM_ID
+    control["requestedPaperTradingEnabled"] = bool(control.get("requestedPaperTradingEnabled"))
+    control["effectivePaperTradingEnabled"] = bool(control.get("effectivePaperTradingEnabled"))
+    control["liveTradingEnabled"] = False
+    control["newEntriesEnabled"] = bool(control.get("newEntriesEnabled"))
+    control["killSwitchActive"] = bool(control.get("killSwitchActive"))
+    control["controlVersion"] = str(control.get("controlVersion") or VOTING_ENSEMBLE_CONTROL_VERSION)
+    control["updatedAt"] = str(control.get("updatedAt") or _now_iso())
+    control["updatedBy"] = str(control.get("updatedBy") or "market_data_control_api")
+    control["reasonCodes"] = [str(code) for code in control.get("reasonCodes") or []]
+    control["localEntryBlockActive"] = bool(control.get("localEntryBlockActive"))
+    control["localEntryBlockReasonCodes"] = [str(code) for code in control.get("localEntryBlockReasonCodes") or []]
+    control["namespace"] = VOTING_ENSEMBLE_CONTROL_NAMESPACE
+    return control
+
+
+def _voting_ensemble_control_store_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "data" / "algorithms" / "voting_ensemble" / "runtime" / "control.json"
 
 
 def _now_iso() -> str:

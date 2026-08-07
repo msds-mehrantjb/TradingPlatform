@@ -104,29 +104,43 @@ class VotingEnsembleRuntimeControlRepository:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path).resolve() if path is not None else default_control_store_path()
         self._lock = Lock()
+        self._last_signature: tuple[int, int] | None = None
 
     def load(self) -> VotingEnsembleRuntimeControl:
         with self._lock:
-            if not self.path.exists():
-                control = VotingEnsembleRuntimeControl(updatedAt=_now())
-                self._save_unlocked(control)
-                return control
-            try:
-                payload = json.loads(self.path.read_text(encoding="utf-8"))
-                control = VotingEnsembleRuntimeControl.from_payload(payload if isinstance(payload, dict) else {})
-            except Exception:
-                control = VotingEnsembleRuntimeControl(
-                    updatedAt=_now(),
-                    reasonCodes=["voting_ensemble.control.unrecoverable_startup_state_fail_closed"],
-                    localEntryBlockActive=True,
-                    localEntryBlockReasonCodes=["voting_ensemble.control.unrecoverable_startup_state_fail_closed"],
-                )
-                self._save_unlocked(control)
-            return control
+            return self._load_unlocked()
+
+    def load_if_changed(self, current: VotingEnsembleRuntimeControl) -> VotingEnsembleRuntimeControl:
+        with self._lock:
+            signature = self._signature_unlocked()
+            if signature is not None and signature == self._last_signature:
+                return current
+            if signature is None and self._last_signature is None:
+                return current
+            return self._load_unlocked()
 
     def save(self, control: VotingEnsembleRuntimeControl) -> VotingEnsembleRuntimeControl:
         with self._lock:
             return self._save_unlocked(control)
+
+    def _load_unlocked(self) -> VotingEnsembleRuntimeControl:
+        if not self.path.exists():
+            control = VotingEnsembleRuntimeControl(updatedAt=_now())
+            self._save_unlocked(control)
+            return control
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            control = VotingEnsembleRuntimeControl.from_payload(payload if isinstance(payload, dict) else {})
+            self._last_signature = self._signature_unlocked()
+        except Exception:
+            control = VotingEnsembleRuntimeControl(
+                updatedAt=_now(),
+                reasonCodes=["voting_ensemble.control.unrecoverable_startup_state_fail_closed"],
+                localEntryBlockActive=True,
+                localEntryBlockReasonCodes=["voting_ensemble.control.unrecoverable_startup_state_fail_closed"],
+            )
+            self._save_unlocked(control)
+        return control
 
     def _save_unlocked(self, control: VotingEnsembleRuntimeControl) -> VotingEnsembleRuntimeControl:
         control.liveTradingEnabled = False
@@ -142,7 +156,15 @@ class VotingEnsembleRuntimeControlRepository:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+        self._last_signature = self._signature_unlocked()
         return control
+
+    def _signature_unlocked(self) -> tuple[int, int] | None:
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
 
 
 class VotingEnsembleRuntimeControlStore:
@@ -164,7 +186,12 @@ class VotingEnsembleRuntimeControlStore:
     def blockReasonCodes(self) -> list[str]:
         return self.control.localEntryBlockReasonCodes
 
+    def reload_if_changed(self) -> VotingEnsembleRuntimeControl:
+        self.control = self.repository.load_if_changed(self.control)
+        return self.control
+
     def update_requested_paper(self, requested: bool, *, updated_by: str, reason_codes: list[str]) -> VotingEnsembleRuntimeControl:
+        self.reload_if_changed()
         self.control.requestedPaperTradingEnabled = bool(requested)
         if not requested:
             self.control.effectivePaperTradingEnabled = False
@@ -176,6 +203,7 @@ class VotingEnsembleRuntimeControlStore:
         return self.repository.save(self.control)
 
     def save_effective(self, *, effective: bool, new_entries: bool, reason_codes: list[str]) -> VotingEnsembleRuntimeControl:
+        self.reload_if_changed()
         self.control.effectivePaperTradingEnabled = bool(effective)
         self.control.newEntriesEnabled = bool(new_entries)
         self.control.liveTradingEnabled = False
@@ -184,6 +212,7 @@ class VotingEnsembleRuntimeControlStore:
         return self.repository.save(self.control)
 
     def block_new_entries(self, reason_code: str) -> None:
+        self.reload_if_changed()
         self.control.localEntryBlockActive = True
         if reason_code not in self.control.localEntryBlockReasonCodes:
             self.control.localEntryBlockReasonCodes.append(reason_code)
@@ -193,6 +222,7 @@ class VotingEnsembleRuntimeControlStore:
         self.repository.save(self.control)
 
     def clear_entry_block(self, reason_code: str) -> None:
+        self.reload_if_changed()
         self.control.localEntryBlockActive = False
         self.control.localEntryBlockReasonCodes = []
         self.control.reasonCodes = [reason_code]
@@ -200,6 +230,7 @@ class VotingEnsembleRuntimeControlStore:
         self.repository.save(self.control)
 
     def snapshot(self, *, reason_codes: list[str] | None = None) -> dict[str, Any]:
+        self.reload_if_changed()
         payload = self.control.snapshot()
         payload["namespace"] = self.namespace
         if reason_codes is not None:
@@ -418,8 +449,9 @@ class VotingEnsembleRuntimeSupervisor:
     def readiness_status(self) -> dict[str, Any]:
         return self.status()["readiness"]
 
-    def control_status(self) -> dict[str, Any]:
-        self._refresh_readiness()
+    def control_status(self, *, refresh_readiness: bool = True) -> dict[str, Any]:
+        if refresh_readiness:
+            self._refresh_readiness()
         return self.control_store.snapshot()
 
     def paper_inventory(self) -> dict[str, Any]:
@@ -431,6 +463,7 @@ class VotingEnsembleRuntimeSupervisor:
         requested_paper_trading_enabled: bool,
         clear_local_entry_block: bool = False,
         updated_by: str = "api",
+        refresh_readiness: bool = True,
     ) -> dict[str, Any]:
         reason_codes = [
             "voting_ensemble.control.paper_requested_on"
@@ -444,7 +477,8 @@ class VotingEnsembleRuntimeSupervisor:
         )
         if clear_local_entry_block:
             self.control_store.clear_entry_block("voting_ensemble.control.local_entry_block_cleared_by_operator")
-        self._refresh_readiness()
+        if refresh_readiness:
+            self._refresh_readiness()
         return self.control_store.snapshot()
 
     def entry_permission_snapshot(self) -> dict[str, Any]:
@@ -468,8 +502,14 @@ class VotingEnsembleRuntimeSupervisor:
         }
 
     def status(self) -> dict[str, Any]:
+        self.control_store.reload_if_changed()
         runtime_summary = self.runtime.summary()
         paper_summary = self.paper_execution_runtime.summary()
+        if self.metrics.workerStatus.get("evaluation_worker") != "failed":
+            self.metrics.workerStatus["evaluation_worker"] = "running" if runtime_summary.get("workerAlive") else self.metrics.workerStatus.get("evaluation_worker", "blocked")
+        if self.metrics.workerStatus.get("execution_worker") != "failed":
+            self.metrics.workerStatus["execution_worker"] = "running" if paper_summary.get("workerAlive") else self.metrics.workerStatus.get("execution_worker", "blocked")
+        self._clear_recovered_worker_entry_block(runtime_summary, paper_summary)
         readiness = self._readiness_from_summaries(runtime_summary, paper_summary)
         effective = self._effective_control(runtime_summary, paper_summary)
         inventory = _paper_inventory_snapshot(self.paper_execution_runtime)
@@ -727,14 +767,21 @@ class VotingEnsembleRuntimeSupervisor:
             await asyncio.sleep(self.config.health_poll_seconds)
 
     def _refresh_readiness(self) -> None:
+        self.control_store.reload_if_changed()
+        requested_at_start = self.control_store.control.requestedPaperTradingEnabled
         runtime_summary = self.runtime.summary()
         paper_summary = self.paper_execution_runtime.summary()
-        self.metrics.workerStatus["evaluation_worker"] = "running" if runtime_summary.get("workerAlive") else "blocked"
-        self.metrics.workerStatus["execution_worker"] = "running" if paper_summary.get("workerAlive") else self.metrics.workerStatus.get("execution_worker", "blocked")
+        if self.metrics.workerStatus.get("evaluation_worker") != "failed":
+            self.metrics.workerStatus["evaluation_worker"] = "running" if runtime_summary.get("workerAlive") else "blocked"
+        if self.metrics.workerStatus.get("execution_worker") != "failed":
+            self.metrics.workerStatus["execution_worker"] = "running" if paper_summary.get("workerAlive") else self.metrics.workerStatus.get("execution_worker", "blocked")
         self._clear_recovered_worker_entry_block(runtime_summary, paper_summary)
         readiness = self._readiness_from_summaries(runtime_summary, paper_summary)
         self.metrics.readiness = readiness["status"]
         effective = self._effective_control(runtime_summary, paper_summary)
+        self.control_store.reload_if_changed()
+        if self.control_store.control.requestedPaperTradingEnabled != requested_at_start:
+            effective = self._effective_control(runtime_summary, paper_summary)
         self.control_store.save_effective(
             effective=effective["effectivePaperTradingEnabled"],
             new_entries=effective["newEntriesEnabled"],
@@ -744,8 +791,6 @@ class VotingEnsembleRuntimeSupervisor:
     def _clear_recovered_worker_entry_block(self, runtime_summary: dict[str, Any], paper_summary: dict[str, Any]) -> None:
         control = self.control_store.control
         if not control.localEntryBlockActive or not control.localEntryBlockReasonCodes:
-            return
-        if self.metrics.lastError:
             return
         reasons = set(control.localEntryBlockReasonCodes)
         recoverable_reasons = set(VOTING_ENSEMBLE_RECOVERABLE_WORKER_ENTRY_BLOCKS)
@@ -765,9 +810,9 @@ class VotingEnsembleRuntimeSupervisor:
     ) -> bool:
         worker_id = VOTING_ENSEMBLE_RECOVERABLE_WORKER_ENTRY_BLOCKS.get(reason_code)
         if worker_id == "evaluation_worker":
-            return bool(runtime_summary.get("workerAlive"))
+            return self.metrics.workerStatus.get("evaluation_worker") == "running" and bool(runtime_summary.get("workerAlive"))
         if worker_id == "execution_worker":
-            return bool(paper_summary.get("workerAlive"))
+            return self.metrics.workerStatus.get("execution_worker") == "running" and bool(paper_summary.get("workerAlive"))
         return self.metrics.workerStatus.get(str(worker_id)) == "running"
 
     def _readiness_from_summaries(self, runtime_summary: dict[str, Any], paper_summary: dict[str, Any]) -> dict[str, Any]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -329,6 +330,35 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("voting_ensemble.control.effective_paper_on", enabled["reasonCodes"])
         control_path.unlink(missing_ok=True)
 
+    async def test_control_store_reloads_external_lightweight_control_write(self) -> None:
+        control_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"control-{uuid4().hex}.json"
+        self.supervisor = supervisor_with_runtime(
+            control_store=VotingEnsembleRuntimeControlStore(VotingEnsembleRuntimeControlRepository(control_path)),
+            settings=paper_settings(),
+            market_clock_provider=lambda: {"isOpen": True, "status": "open"},
+        )
+        await self.supervisor.start()
+
+        payload = self.supervisor.control_status(refresh_readiness=False)
+        payload["requestedPaperTradingEnabled"] = True
+        payload["effectivePaperTradingEnabled"] = False
+        payload["newEntriesEnabled"] = False
+        payload["updatedBy"] = "market_data_control_api"
+        payload["reasonCodes"] = ["voting_ensemble.control.paper_requested_on"]
+        control_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        permission = self.supervisor.entry_permission_snapshot()
+        status = self.supervisor.status()
+
+        self.assertTrue(permission["requestedPaperTradingEnabled"])
+        self.assertTrue(permission["effectivePaperTradingEnabled"])
+        self.assertTrue(permission["newEntriesAllowed"])
+        self.assertIn("voting_ensemble.control.effective_paper_on", permission["reasonCodes"])
+        self.assertTrue(status["requestedPaperTradingEnabled"])
+        self.assertTrue(status["effectivePaperTradingEnabled"])
+        self.assertTrue(status["newEntriesAllowed"])
+        control_path.unlink(missing_ok=True)
+
     async def test_recovered_worker_failure_block_is_cleared_by_health_refresh(self) -> None:
         control_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"control-{uuid4().hex}.json"
         self.supervisor = supervisor_with_runtime(
@@ -351,6 +381,28 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status["localEntryBlockActive"])
         self.assertEqual(status["localEntryBlockReasonCodes"], [])
         self.assertIn("voting_ensemble.control.effective_paper_on", status["reasonCodes"])
+        control_path.unlink(missing_ok=True)
+
+    async def test_recovered_worker_failure_clears_stale_last_error_block(self) -> None:
+        control_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"control-{uuid4().hex}.json"
+        self.supervisor = supervisor_with_runtime(
+            control_store=VotingEnsembleRuntimeControlStore(VotingEnsembleRuntimeControlRepository(control_path)),
+            settings=paper_settings(),
+            market_clock_provider=lambda: {"isOpen": True, "status": "open"},
+        )
+        await self.supervisor.start()
+        self.supervisor.update_control(requested_paper_trading_enabled=True, updated_by="test")
+        self.supervisor.control_store.block_new_entries("voting_ensemble.runtime.execution_worker.failed")
+        self.supervisor.metrics.workerStatus["execution_worker"] = "running"
+        self.supervisor.metrics.lastError = "transient execution worker failure"
+        self.supervisor.metrics.lastErrorAt = datetime.now(UTC).isoformat()
+
+        status = self.supervisor.status()
+
+        self.assertIsNone(status["lastError"])
+        self.assertTrue(status["effectivePaperTradingEnabled"])
+        self.assertTrue(status["newEntriesAllowed"])
+        self.assertNotIn("voting_ensemble.runtime.worker_failure_recorded", status["paperReadyBlockingReasonCodes"])
         control_path.unlink(missing_ok=True)
 
     async def test_local_paper_readiness_refreshes_stale_market_data_mark_from_quote_provider(self) -> None:

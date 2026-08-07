@@ -81,7 +81,7 @@ def recovery_reconciliation(payload: dict[str, Any] | None = Body(default=None))
 
 @router.get("/runtime/control", summary="Voting Ensemble runtime control")
 def runtime_control() -> dict[str, Any]:
-    return get_voting_ensemble_runtime_supervisor().control_status()
+    return get_voting_ensemble_runtime_supervisor().control_status(refresh_readiness=False)
 
 
 @router.put("/runtime/control", summary="Update Voting Ensemble requested paper control")
@@ -90,6 +90,7 @@ def update_runtime_control(payload: VotingEnsembleRuntimeControlUpdate) -> dict[
         requested_paper_trading_enabled=payload.requestedPaperTradingEnabled,
         clear_local_entry_block=payload.localEntryBlockActive is False,
         updated_by="api",
+        refresh_readiness=False,
     )
 
 
