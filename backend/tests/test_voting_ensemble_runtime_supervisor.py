@@ -90,12 +90,13 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.supervisor.paper_execution_runtime.repository.write_snapshot(
-            "broker_order.ve-entry-phase11",
+            "local_order.ve-entry-phase11",
             {
                 "algorithmId": "voting_ensemble",
                 "algorithm_id": "voting_ensemble",
                 "clientOrderId": "ve-entry-phase11",
-                "brokerOrderId": "broker-phase11",
+                "orderIntentId": "intent-phase11",
+                "executionMode": "LOCAL_PAPER",
                 "settingsHash": "settings-phase11",
                 "symbol": "SPY",
                 "side": "Buy",
@@ -154,8 +155,51 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
             "lastReconciliation",
             "lastError",
             "settingsHash",
+            "executionMode",
+            "sourceAuthority",
+            "automaticTradingReady",
+            "localPaperObservability",
+            "localPaperAccount",
+            "localPositions",
+            "localOrders",
+            "openOrders",
+            "recentFills",
+            "closedTrades",
         }
         self.assertLessEqual(expected_keys, set(status))
+        self.assertEqual(status["executionMode"], "LOCAL_PAPER")
+        self.assertEqual(status["sourceAuthority"], "voting_ensemble_local_paper_account")
+        self.assertFalse(status["automaticTradingReady"])
+        observability = status["localPaperObservability"]
+        self.assertEqual(observability["executionMode"], "LOCAL_PAPER")
+        self.assertEqual(observability["sourceAuthority"], "voting_ensemble_local_paper_account")
+        self.assertEqual(observability["localPaperAccount"]["accountId"], "voting_ensemble.paper.default.account")
+        self.assertEqual(observability["initialCash"], 100000.0)
+        self.assertEqual(observability["cash"], 100000.0)
+        self.assertEqual(observability["equity"], 100200.0)
+        self.assertEqual(observability["buyingPower"], 100000.0)
+        self.assertEqual(observability["realizedPnl"], 0.0)
+        self.assertEqual(observability["realizedPnlToday"], 0.0)
+        self.assertEqual(observability["unrealizedPnl"], 0.0)
+        self.assertEqual(observability["dailyNetPnl"], 0.0)
+        self.assertEqual(observability["positions"], observability["localPositions"])
+        self.assertEqual(observability["localPositions"][0]["symbol"], "SPY")
+        self.assertEqual(observability["openOrders"][0]["clientOrderId"], "ve-entry-phase11")
+        self.assertEqual(observability["recentFills"], [])
+        self.assertEqual(observability["closedTrades"], [])
+        self.assertEqual(observability["grossExposure"], 200.0)
+        self.assertEqual(observability["netExposure"], 200.0)
+        self.assertEqual(observability["openRisk"], 0.0)
+        self.assertEqual(observability["drawdown"], 0.0)
+        self.assertTrue(observability["inventoryHealthy"])
+        self.assertTrue(observability["persistenceHealthy"])
+        self.assertFalse(observability["automaticTradingReady"])
+        self.assertEqual(status["localPaperAccount"], observability["localPaperAccount"])
+        self.assertEqual(status["localPositions"], observability["localPositions"])
+        self.assertEqual(status["localOrders"], observability["localOrders"])
+        self.assertEqual(status["openOrders"], observability["openOrders"])
+        self.assertEqual(status["recentFills"], observability["recentFills"])
+        self.assertEqual(status["closedTrades"], observability["closedTrades"])
         self.assertTrue(status["supervisorRunning"])
         self.assertFalse(status["paperReady"])
         self.assertNotIn("voting_ensemble.paper_ready.alpaca_paper_client_not_configured", status["paperReadyBlockingReasonCodes"])

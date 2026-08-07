@@ -515,12 +515,20 @@ class VotingEnsembleRuntimeSupervisor:
             new_entries_allowed=bool(effective["newEntriesEnabled"]) and bool(readiness["ready"]),
             active_entry_blocks=active_entry_blocks,
         )
+        local_observability = _local_paper_observability(
+            inventory=inventory,
+            checks=checks,
+            automatic_trading_ready=not paper_ready_blocking_reason_codes,
+        )
         self.metrics.readiness = readiness["status"]
         return {
             "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
             "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
             "supervisorVersion": VOTING_ENSEMBLE_RUNTIME_SUPERVISOR_VERSION,
+            "executionMode": str(inventory.get("executionMode") or paper_summary.get("executionMode") or "LOCAL_PAPER"),
+            "sourceAuthority": str(inventory.get("sourceAuthority") or local_observability.get("sourceAuthority") or "voting_ensemble_local_paper_account"),
             "paperReady": not paper_ready_blocking_reason_codes,
+            "automaticTradingReady": not paper_ready_blocking_reason_codes,
             "paperReadyBlockingReasonCodes": paper_ready_blocking_reason_codes,
             "supervisorRunning": self.metrics.supervisorStarted,
             "supervisorStarted": self.metrics.supervisorStarted,
@@ -531,6 +539,13 @@ class VotingEnsembleRuntimeSupervisor:
             "effectivePaperTradingEnabled": effective["effectivePaperTradingEnabled"],
             "liveTradingEnabled": False,
             "paperBrokerVerified": bool(checks.get("localPaperAccountLoaded")) and bool(checks.get("localPaperInventoryIsolated")),
+            "localPaperObservability": local_observability,
+            "localPaperAccount": local_observability["localPaperAccount"],
+            "localPositions": local_observability["localPositions"],
+            "localOrders": local_observability["localOrders"],
+            "openOrders": local_observability["openOrders"],
+            "recentFills": local_observability["recentFills"],
+            "closedTrades": local_observability["closedTrades"],
             "localPaperAccountLoaded": bool(checks.get("localPaperAccountLoaded")),
             "inventoryHealthy": bool(checks.get("inventoryHealthy")),
             "persistenceHealthy": bool(checks.get("persistenceHealthy")),
@@ -935,6 +950,72 @@ def _paper_inventory_snapshot(paper_execution_runtime: Any) -> dict[str, Any]:
             "reasonCodes": ["voting_ensemble.runtime.status.inventory_snapshot_unavailable"],
         }
     return snapshot if isinstance(snapshot, dict) else {}
+
+
+def _local_paper_observability(
+    *,
+    inventory: dict[str, Any],
+    checks: dict[str, Any],
+    automatic_trading_ready: bool,
+) -> dict[str, Any]:
+    account = inventory.get("localPaperAccount") or inventory.get("account") or {}
+    account_payload = dict(account) if isinstance(account, dict) else {}
+    local_positions = list(inventory.get("localPositions") or inventory.get("positions") or [])
+    local_orders = list(inventory.get("localOrders") or inventory.get("orders") or [])
+    open_orders = list(inventory.get("openOrders") or _open_order_records(inventory))
+    recent_fills = list(inventory.get("recentFills") or inventory.get("fills") or [])[:25]
+    closed_trades = list(inventory.get("closedTrades") or [])
+    source_authority = str(account_payload.get("sourceAuthority") or inventory.get("sourceAuthority") or "voting_ensemble_local_paper_account")
+    return {
+        "executionMode": str(inventory.get("executionMode") or account_payload.get("executionMode") or "LOCAL_PAPER"),
+        "sourceAuthority": source_authority,
+        "localPaperAccount": account_payload,
+        "initialCash": _number(account_payload.get("initialCash")),
+        "cash": _number(account_payload.get("cash")),
+        "equity": _number(account_payload.get("equity")),
+        "buyingPower": _number(account_payload.get("buyingPower")),
+        "realizedPnl": _signed_number(account_payload.get("realizedPnl")),
+        "realizedPnlToday": _signed_number(account_payload.get("realizedPnlToday")),
+        "unrealizedPnl": _signed_number(account_payload.get("unrealizedPnl")),
+        "dailyNetPnl": _signed_number(account_payload.get("dailyNetPnl")),
+        "positions": local_positions,
+        "localPositions": local_positions,
+        "openOrders": open_orders,
+        "localOrders": local_orders,
+        "recentFills": recent_fills,
+        "closedTrades": closed_trades,
+        "grossExposure": _number(account_payload.get("grossExposure")),
+        "netExposure": _signed_number(account_payload.get("netExposure")),
+        "openRisk": _number(_first_present(account_payload, "totalOpenRiskDollars", "openRisk")),
+        "drawdown": _number(_first_present(account_payload, "drawdownDollars", "drawdown")),
+        "drawdownPercent": _number(_first_present(account_payload, "drawdownPercent", "drawdownFromIntradayHighPercent")),
+        "inventoryHealthy": bool(checks.get("inventoryHealthy")),
+        "persistenceHealthy": bool(checks.get("persistenceHealthy")),
+        "automaticTradingReady": bool(automatic_trading_ready),
+    }
+
+
+def _first_present(payload: dict[str, Any], *keys: str, default: Any = 0.0) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _number(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if parsed > 0 else 0.0
+
+
+def _signed_number(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _runtime_jobs(runtime: Any) -> list[dict[str, Any]]:

@@ -829,22 +829,53 @@ class VotingEnsemblePaperExecutionRepository:
         results = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.result.")
         reconciliations = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.restart_recovery.")
         has_persisted_local_inventory = _has_persisted_local_inventory_without_account(snapshots)
-        account_payload = local_accounts[-1] if local_accounts else (None if has_persisted_local_inventory else self.local_account_snapshot())
+        account_observed_at = _parse_time((local_accounts[-1] if local_accounts else {}).get("observedAt")) if local_accounts else None
+        account_payload = None if has_persisted_local_inventory and not local_accounts else self.local_account_snapshot(observed_at=account_observed_at)
+        positions = self.inventory_ledger.positions()
+        open_orders = [order for order in orders if str(order.get("status") or "").upper() in {"NEW", "OPEN", "ACCEPTED", "PARTIALLY_FILLED"}]
+        recent_fills = sorted(fills, key=lambda fill: str(fill.get("filledAt") or fill.get("createdAt") or ""), reverse=True)[:25]
+        inventory_execution_mode = "LOCAL_PAPER" if account_payload is not None or not broker_accounts else "BROKER_PAPER"
+        source_authority = (
+            str((account_payload or {}).get("sourceAuthority") or "voting_ensemble_local_paper_account")
+            if inventory_execution_mode == "LOCAL_PAPER"
+            else str((broker_accounts[-1] if broker_accounts else {}).get("sourceAuthority") or "alpaca_paper_broker")
+        )
         return {
             "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
             "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
             "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
             "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
             "paperExecutionVersion": VOTING_ENSEMBLE_PAPER_EXECUTION_VERSION,
+            "executionMode": inventory_execution_mode,
+            "sourceAuthority": source_authority,
             "orders": orders,
             "orderIntents": order_intents,
             "fills": fills,
-            "positions": self.inventory_ledger.positions(),
+            "positions": positions,
             "account": account_payload,
             "accounts": local_accounts,
+            "localPaperAccount": account_payload,
+            "localPositions": positions,
+            "localOrders": orders,
+            "openOrders": open_orders,
+            "recentFills": recent_fills,
+            "localFills": fills,
             "closedTrades": closed_trades,
             "realizedPnlRecords": realized_pnl,
             "riskSnapshots": risk_snapshots,
+            "initialCash": _float((account_payload or {}).get("initialCash")) if isinstance(account_payload, Mapping) else 0.0,
+            "cash": _float((account_payload or {}).get("cash")) if isinstance(account_payload, Mapping) else 0.0,
+            "equity": _float((account_payload or {}).get("equity")) if isinstance(account_payload, Mapping) else 0.0,
+            "buyingPower": _float((account_payload or {}).get("buyingPower")) if isinstance(account_payload, Mapping) else 0.0,
+            "realizedPnl": _float((account_payload or {}).get("realizedPnl")) if isinstance(account_payload, Mapping) else 0.0,
+            "realizedPnlToday": _float((account_payload or {}).get("realizedPnlToday")) if isinstance(account_payload, Mapping) else 0.0,
+            "unrealizedPnl": _float((account_payload or {}).get("unrealizedPnl")) if isinstance(account_payload, Mapping) else 0.0,
+            "dailyNetPnl": _signed_float((account_payload or {}).get("dailyNetPnl")) if isinstance(account_payload, Mapping) else 0.0,
+            "grossExposure": _float((account_payload or {}).get("grossExposure")) if isinstance(account_payload, Mapping) else 0.0,
+            "netExposure": _signed_float((account_payload or {}).get("netExposure")) if isinstance(account_payload, Mapping) else 0.0,
+            "openRisk": _float((account_payload or {}).get("totalOpenRiskDollars")) if isinstance(account_payload, Mapping) else 0.0,
+            "drawdown": _float((account_payload or {}).get("drawdownDollars")) if isinstance(account_payload, Mapping) else 0.0,
+            "drawdownPercent": _float((account_payload or {}).get("drawdownPercent")) if isinstance(account_payload, Mapping) else 0.0,
             "marketData": market_data,
             "localInventoryManifest": local_inventory_manifests[-1] if local_inventory_manifests else None,
             "localInventoryManifests": local_inventory_manifests,

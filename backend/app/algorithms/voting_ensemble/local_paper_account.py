@@ -911,7 +911,7 @@ class VotingEnsembleInventoryLedger:
         realized = _decimal(existing.get("realizedPnl") or existing.get("realizedPnlToday") or 0)
         unrealized = _decimal(existing.get("unrealizedPnl") or existing.get("unrealizedPnlToday") or 0)
         intraday_high = _decimal(existing.get("intradayEquityHigh")) if existing.get("intradayEquityHigh") is not None else None
-        return self._account_payload(
+        payload = self._account_payload(
             initial_cash=initial,
             cash=cash,
             realized_pnl=realized,
@@ -920,6 +920,17 @@ class VotingEnsembleInventoryLedger:
             observed_at=observed_at,
             reason_codes=reason_codes,
         )
+        existing_session = str(existing.get("sessionDate") or "")
+        if existing_session == str(payload.get("sessionDate") or ""):
+            try:
+                payload["tradesToday"] = max(int(payload.get("tradesToday") or 0), int(existing.get("tradesToday") or 0))
+            except (TypeError, ValueError):
+                pass
+            if existing.get("dailyNetPnl") is not None:
+                payload["dailyNetPnl"] = _money(existing.get("dailyNetPnl"))
+            if existing.get("dailyNetPnlAfterExitCosts") is not None:
+                payload["dailyNetPnlAfterExitCosts"] = _money(existing.get("dailyNetPnlAfterExitCosts"))
+        return payload
 
     def _apply_position_update(
         self,
