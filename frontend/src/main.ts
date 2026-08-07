@@ -16887,7 +16887,6 @@ async function refreshVotingEnsemblePaperInventory() {
   } catch (error) {
     state.votingEnsemblePaperInventoryStatus = "error";
     state.votingEnsemblePaperInventoryWarning = error instanceof Error ? error.message : "Voting Ensemble paper inventory unavailable";
-    state.tradeHistory = [];
     renderTradeHistory("ensemble");
   }
 }
