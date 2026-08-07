@@ -14,6 +14,7 @@ from collections import defaultdict, deque
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from functools import partial
 from html.parser import HTMLParser
 from math import exp
 from pathlib import Path
@@ -93,6 +94,22 @@ regime_runtime_supervisor = get_regime_runtime_supervisor(settings=settings, mar
 meta_strategy_runtime_supervisor = None
 UI_RESPONSE_CACHE_TTL_SECONDS = 5.0
 _UI_RESPONSE_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+
+
+async def _store_latest_candles(*, symbol: str, timeframe: str, feed: str, limit: int) -> list[dict]:
+    return await asyncio.to_thread(
+        partial(store.latest, symbol=symbol, timeframe=timeframe, feed=feed, limit=limit)
+    )
+
+
+async def _store_latest_candles_until(*, symbol: str, timeframe: str, feed: str, limit: int, end: str) -> list[dict]:
+    return await asyncio.to_thread(
+        partial(store.latest_until, symbol=symbol, timeframe=timeframe, feed=feed, limit=limit, end=end)
+    )
+
+
+async def _store_upsert_candles(candles: list[dict]) -> None:
+    await asyncio.to_thread(store.upsert_many, candles)
 
 
 def _api_embedded_meta_strategy_runtime_enabled() -> bool:
@@ -1764,7 +1781,7 @@ async def candles(
         cached_response = _read_ui_response_cache(cache_key)
         if cached_response is not None:
             return cached_response
-    cached = dedupe_candles_by_time(store.latest(
+    cached = dedupe_candles_by_time(await _store_latest_candles(
         symbol=normalized_symbol,
         timeframe=timeframe,
         feed=feed,
@@ -1792,7 +1809,7 @@ async def candles(
         )
         if prepared_bars:
             prepared_bars = dedupe_candles_by_time(prepared_bars)
-            store.upsert_many(prepared_bars)
+            await _store_upsert_candles(prepared_bars)
             return _write_ui_response_cache(cache_key, {
                 "source": "prepared-backtest-data",
                 "warning": f"Market is closed; showing last available prepared market session {prepared_session_date}.",
@@ -1808,7 +1825,7 @@ async def candles(
             )
             if session_bars:
                 session_bars = dedupe_candles_by_time(session_bars)
-                store.upsert_many(session_bars)
+                await _store_upsert_candles(session_bars)
                 return _write_ui_response_cache(cache_key, {
                     "source": session_bars[0]["provider"],
                     "warning": f"Market is closed; showing latest completed market session {session_date}.",
@@ -1861,7 +1878,7 @@ async def candles(
             limit=limit,
         )
         fallback = dedupe_candles_by_time(fallback)
-        store.upsert_many(fallback)
+        await _store_upsert_candles(fallback)
         return {"source": "demo", "warning": warning, "candles": fallback}
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text
@@ -1878,11 +1895,11 @@ async def candles(
             limit=limit,
         )
         fallback = dedupe_candles_by_time(fallback)
-        store.upsert_many(fallback)
+        await _store_upsert_candles(fallback)
         return {"source": "demo", "warning": str(exc), "candles": fallback}
 
     fresh = dedupe_candles_by_time(fresh)
-    store.upsert_many(fresh)
+    await _store_upsert_candles(fresh)
     return {
         "source": fresh[0]["provider"] if fresh else "alpaca",
         "candles": fresh or cached,
@@ -9724,8 +9741,8 @@ async def market_context(
         refresh=should_refresh,
         as_of=as_of,
     )
-    context = compute_market_context(normalized_symbol, daily, intraday)
-    persist_session_context_decision(context)
+    context = await asyncio.to_thread(compute_market_context, normalized_symbol, daily, intraday)
+    await asyncio.to_thread(persist_session_context_decision, context)
     if not should_refresh:
         return _write_ui_response_cache(cache_key, context)
     return context
@@ -9767,9 +9784,9 @@ async def _context_bars(
     as_of: str | None,
 ) -> list[dict]:
     cached = (
-        dedupe_candles_by_time(store.latest_until(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit, end=as_of))
+        dedupe_candles_by_time(await _store_latest_candles_until(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit, end=as_of))
         if as_of
-        else dedupe_candles_by_time(store.latest(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit))
+        else dedupe_candles_by_time(await _store_latest_candles(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit))
     )
     closed_latest_request = as_of is None and local_market_is_closed()
     if cached and (not refresh or closed_latest_request):
@@ -9788,7 +9805,7 @@ async def _context_bars(
         )
         if prepared:
             prepared = dedupe_candles_by_time(prepared)
-            store.upsert_many(prepared)
+            await _store_upsert_candles(prepared)
             return prepared
         if timeframe != "1Min":
             return []
@@ -9801,7 +9818,7 @@ async def _context_bars(
             )
             if session_bars:
                 session_bars = dedupe_candles_by_time(session_bars)
-                store.upsert_many(session_bars)
+                await _store_upsert_candles(session_bars)
                 return session_bars
         except (TimeoutError, httpx.HTTPError):
             return []
@@ -9827,5 +9844,5 @@ async def _context_bars(
         return cached or dedupe_candles_by_time(demo_bars(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit))
 
     fresh = dedupe_candles_by_time(fresh)
-    store.upsert_many(fresh)
+    await _store_upsert_candles(fresh)
     return fresh or cached
