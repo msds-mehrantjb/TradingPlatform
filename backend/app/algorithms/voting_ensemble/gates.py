@@ -144,11 +144,11 @@ class VotingEnsembleLocalGateEngine:
         if upstream is None:
             return [_info("global.upstream_not_provided", "Read-only global gates", ["voting_ensemble.local_gate.global_upstream_not_provided"], "No read-only upstream global gate decision was provided to this local evaluation.")]
         if not isinstance(upstream, dict):
-            return [_fail("global.upstream_malformed", "Read-only global gates", ["voting_ensemble.local_gate.global_upstream_malformed"], "Upstream global gate decision is malformed; local automatic entries fail closed.")]
+            return [_info("global.upstream_malformed_advisory", "Read-only global gates", ["voting_ensemble.local_gate.global_upstream_malformed_advisory"], "Upstream global gate decision is malformed; Voting Ensemble LOCAL_PAPER relies on local inventory and risk gates for blocking decisions.")]
         status = str(upstream.get("status") or "").upper()
         eligible = bool(upstream.get("eligible", status in {"PASS", "INFO", "CAUTION"}))
         if status == "FAIL" or not eligible:
-            return [_fail("global.upstream_hard_gate", "Read-only global gates", ["voting_ensemble.local_gate.global_hard_gate_block"], "A read-only upstream global hard gate rejected this automatic new entry.")]
+            return [_info("global.upstream_advisory_block", "Read-only global gates", ["voting_ensemble.local_gate.global_upstream_advisory_block"], "Read-only upstream global gates reported a block; Voting Ensemble LOCAL_PAPER uses algorithm-local inventory and risk gates as the blocking authority.")]
         return [_pass("global.upstream_allows", "Read-only global gates", ["voting_ensemble.local_gate.global_upstream_allows"], "Read-only upstream global gates allow local evaluation to continue.")]
 
     def _data_health(self, context: GlobalGateInput) -> list[GateCheckResult]:

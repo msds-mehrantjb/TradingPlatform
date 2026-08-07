@@ -57,6 +57,38 @@ class VotingEnsembleLocalGatesTest(unittest.TestCase):
                 self.assertFalse(decision.eligible)
                 self.assertIn(reason_code, decision.reasonCodes)
 
+    def test_upstream_global_gate_failure_is_advisory_for_local_paper(self) -> None:
+        gate_input = base_gate_input(
+            operationalState={
+                "upstreamGlobalGateDecision": {
+                    "status": "FAIL",
+                    "eligible": False,
+                    "dataReady": True,
+                    "gateResults": [],
+                    "reasonCodes": ["global.risk.blocked_elsewhere"],
+                    "explanation": "External read-only portfolio gate reported a block.",
+                    "checkedAt": NOW,
+                    "sessionDate": SESSION_DATE,
+                    "configurationHash": "global-test",
+                }
+            }
+        )
+
+        decision = VotingEnsembleLocalGateEngine().evaluate(gate_input).to_global_gate_decision()
+
+        self.assertTrue(decision.eligible)
+        self.assertIn("voting_ensemble.local_gate.global_upstream_advisory_block", decision.reasonCodes)
+        self.assertNotIn("voting_ensemble.local_gate.global_hard_gate_block", decision.reasonCodes)
+
+    def test_local_account_risk_still_blocks_local_paper_entries(self) -> None:
+        gate_input = base_gate_input(accountRiskState=account_state(realized=-600.0))
+
+        decision = VotingEnsembleLocalGateEngine().evaluate(gate_input).to_global_gate_decision()
+
+        self.assertFalse(decision.eligible)
+        self.assertIn("voting_ensemble.local_gate.daily_loss", decision.reasonCodes)
+        self.assertNotIn("voting_ensemble.local_gate.global_hard_gate_block", decision.reasonCodes)
+
     def test_service_pre_gate_block_skips_directional_evaluation(self) -> None:
         original_directional = service_module.DIRECTIONAL_STRATEGIES
         calls: list[str] = []
