@@ -2481,8 +2481,11 @@ const BROWSER_STORAGE_SNAPSHOT_INTERVAL_MS = 5 * 60_000;
 const AUTO_DAILY_ALGORITHM_BACKTESTS = false;
 const WAKE_CHECK_INTERVAL_MS = 15_000;
 const WAKE_GAP_THRESHOLD_MS = 90_000;
-const MARKET_FORECAST_TIMEOUT_MS = 20_000;
-const STRATEGY_INVENTORY_TIMEOUT_MS = 30_000;
+const MARKET_FORECAST_TIMEOUT_MS = 4_000;
+const STRATEGY_INVENTORY_TIMEOUT_MS = 3_000;
+const TRADE_SUMMARY_TIMEOUT_MS = 4_000;
+const NEWS_FEED_TIMEOUT_MS = 4_000;
+const SESSION_CURRENT_TIMEOUT_MS = 3_000;
 const DECISION_SNAPSHOT_MAX_CANDLES = 500;
 let browserStorageSnapshotTimer: number | null = null;
 let browserStorageSnapshotInFlight = false;
@@ -7375,8 +7378,9 @@ async function loadMarketForecast(options: { refresh?: boolean } = {}) {
     if (loadId !== marketForecastLoadId) {
       return;
     }
+    console.warn("Market forecast unavailable; using advisory fallback.", error);
     state.marketForecastStatus = state.marketForecast ? "fallback" : "error";
-    state.marketForecastError = error instanceof Error ? error.message : "Market forecast unavailable";
+    state.marketForecastError = "Forecast backend is still warming up; live chart, quote, regime, session, and event context remain available.";
   } finally {
     if (marketForecastRequestKey === requestKey) {
       marketForecastRequestKey = "";
@@ -7477,7 +7481,7 @@ async function fetchTradeSummaryResponse() {
         symbol: state.symbol,
         limit: "10",
       });
-      const response = await fetch(`${baseUrl}/api/news-summary?${params.toString()}`);
+      const response = await fetchWithTimeout(`${baseUrl}/api/news-summary?${params.toString()}`, TRADE_SUMMARY_TIMEOUT_MS);
       if (response.ok || response.status !== 404) {
         return response;
       }
@@ -7507,7 +7511,7 @@ async function fetchSpyNewsResponse(limit: number) {
         symbol: state.symbol,
         limit: String(limit),
       });
-      const response = await fetch(`${baseUrl}/api/news-feed?${params.toString()}`);
+      const response = await fetchWithTimeout(`${baseUrl}/api/news-feed?${params.toString()}`, NEWS_FEED_TIMEOUT_MS);
       if (response.ok || response.status !== 404) {
         return response;
       }
@@ -7729,7 +7733,7 @@ async function fetchSessionCurrent(options: { showLoading?: boolean; sessionDate
   }
 
   try {
-    const response = await fetch(`${API_BASE}${TRADING_ALGORITHM_INVENTORY_ENDPOINTS.session}?${params.toString()}`);
+    const response = await fetchWithTimeout(`${API_BASE}${TRADING_ALGORITHM_INVENTORY_ENDPOINTS.session}?${params.toString()}`, SESSION_CURRENT_TIMEOUT_MS);
     if (!response.ok) {
       throw new Error(await response.text());
     }
@@ -16081,11 +16085,14 @@ async function loadVotingEnsembleInventory() {
       if (loadId !== votingEnsembleInventoryLoadId) {
         return;
       }
+      console.warn("Strategy Fit inventory unavailable; using context fallback.", error);
       lastMessage = error instanceof Error ? error.message : lastMessage;
     }
   }
   state.votingEnsembleInventoryStatus = "error";
-  state.votingEnsembleInventoryWarning = lastMessage;
+  state.votingEnsembleInventoryWarning = lastMessage.includes("timed out")
+    ? "Backend Strategy Fit inventory is still warming up; showing market-context strategy rows."
+    : lastMessage;
   updateAlgorithmPanel(visibleCandles());
 }
 
@@ -23771,16 +23778,23 @@ function candleWindowLabel(layer: MarketLayer) {
 
 function renderStrategies(context: MarketContext) {
   const liveDefinitions = defaultDecisionInventoryDefinitions();
-  if (!liveDefinitions.length) {
+  const visibleStrategies = liveDefinitions.length
+    ? strategyFitDisplayRows(context.strategies)
+    : strategyFitFallbackRows(context);
+  if (!visibleStrategies.length) {
     renderStrategyInventoryPending();
     return;
   }
-  const visibleStrategies = strategyFitDisplayRows(context.strategies);
   const strong = visibleStrategies.filter((strategy) => strategy.status === "Strong Fit").length;
+  const inventoryPending = state.votingEnsembleInventoryStatus !== "ready";
   strategySummary.textContent = strong
-    ? `${strong} strong fit${strong === 1 ? "" : "s"} - ${visibleStrategies.length} live modules`
-    : `${visibleStrategies.length} live modules ranked`;
-  contextUpdatedAt.textContent = context.updatedAt ? `updated ${formatDate(context.updatedAt)}` : "updated --";
+    ? `${strong} strong fit${strong === 1 ? "" : "s"} - ${visibleStrategies.length} ${inventoryPending ? "context modules" : "live modules"}`
+    : `${visibleStrategies.length} ${inventoryPending ? "context modules" : "live modules"} ranked`;
+  contextUpdatedAt.textContent = context.updatedAt
+    ? `${inventoryPending ? "context" : "updated"} ${formatDate(context.updatedAt)}`
+    : inventoryPending
+      ? "context ready"
+      : "updated --";
   strategyList.innerHTML = visibleStrategies
     .map(
       (strategy) => {
@@ -23808,6 +23822,56 @@ function renderStrategies(context: MarketContext) {
       },
     )
     .join("");
+}
+
+function strategyFitFallbackRows(context: MarketContext): StrategyFit[] {
+  const contextRows = Array.isArray(context.strategies) ? context.strategies : [];
+  if (contextRows.length) {
+    return contextRows.slice(0, 6).map((strategy) => ({
+      ...strategy,
+      moduleStatus: strategy.moduleStatus ?? "not_data_ready",
+      matches: strategy.matches?.length
+        ? strategy.matches
+        : ["Market context is available; backend module inventory is still warming up."],
+      risks: strategy.risks?.length ? strategy.risks : [],
+    }));
+  }
+  return [
+    {
+      name: "Regime / Session / Event Context",
+      role: "context",
+      family: "market_regime",
+      moduleStatus: "not_data_ready",
+      status: "Watch",
+      score: 50,
+      matches: [
+        `${context.regime.label} regime`,
+        `${context.session.label} session`,
+        `${context.event.label} event window`,
+      ],
+      risks: ["Backend strategy inventory is warming up; exact module statuses are pending."],
+    },
+    {
+      name: "Voting Ensemble Decision Modules",
+      role: "directional",
+      family: "trend",
+      moduleStatus: "not_data_ready",
+      status: "Watch",
+      score: 45,
+      matches: ["Using loaded chart and market context while backend inventory catches up."],
+      risks: ["Backend fit scores are pending."],
+    },
+    {
+      name: "Local Paper Risk Gates",
+      role: "safety",
+      family: "safety",
+      moduleStatus: "not_data_ready",
+      status: "Watch",
+      score: 45,
+      matches: ["Risk gates remain separate from display inventory loading."],
+      risks: ["Wait for backend readiness before treating this as a paper-entry approval."],
+    },
+  ];
 }
 
 function renderStrategyInventoryPending() {
