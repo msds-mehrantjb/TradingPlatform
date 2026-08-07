@@ -36,7 +36,7 @@ from backend.app.algorithms.voting_ensemble.runtime_supervisor import (
 )
 from backend.app.config import ApplicationConfig, Settings
 from backend.app.domain.models import OrderPlan, Signal
-from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill, PaperOrderGateway
+from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill
 
 
 NOW = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
@@ -106,14 +106,23 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.supervisor.paper_execution_runtime.repository.write_snapshot(
-            "broker_position.spy",
+            "local_position.spy",
             {
                 "algorithmId": "voting_ensemble",
                 "algorithm_id": "voting_ensemble",
+                "capitalPartitionId": "voting_ensemble.paper.default",
+                "accountId": "voting_ensemble.paper.default.account",
+                "executionMode": "LOCAL_PAPER",
+                "schemaVersion": "voting_ensemble_local_position_v1",
                 "symbol": "SPY",
                 "side": "Buy",
                 "quantity": 2,
+                "averagePrice": 100.0,
+                "markPrice": 100.0,
+                "notional": 200.0,
+                "unrealizedPnl": 0.0,
                 "observedAt": NOW.isoformat().replace("+00:00", "Z"),
+                "updatedAt": NOW.isoformat().replace("+00:00", "Z"),
             },
         )
 
@@ -149,7 +158,7 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(expected_keys, set(status))
         self.assertTrue(status["supervisorRunning"])
         self.assertFalse(status["paperReady"])
-        self.assertIn("voting_ensemble.paper_ready.alpaca_paper_client_not_configured", status["paperReadyBlockingReasonCodes"])
+        self.assertNotIn("voting_ensemble.paper_ready.alpaca_paper_client_not_configured", status["paperReadyBlockingReasonCodes"])
         self.assertIn("voting_ensemble.paper_ready.backend_finalized_bar_producer_not_configured", status["paperReadyBlockingReasonCodes"])
         self.assertIn("voting_ensemble.paper_ready.execution_state_not_durable", status["paperReadyBlockingReasonCodes"])
         self.assertTrue(status["evaluationWorkerHealthy"])
@@ -236,7 +245,7 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(enabled["liveTradingEnabled"])
         control_path.unlink(missing_ok=True)
 
-    async def test_live_alpaca_endpoint_blocks_effective_paper_trading(self) -> None:
+    async def test_live_alpaca_endpoint_does_not_block_local_paper_trading(self) -> None:
         self.supervisor = supervisor_with_runtime(
             settings=live_settings(),
             market_clock_provider=lambda: {"isOpen": True, "status": "open"},
@@ -246,9 +255,10 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         enabled = self.supervisor.update_control(requested_paper_trading_enabled=True, updated_by="test")
 
         self.assertTrue(enabled["requestedPaperTradingEnabled"])
-        self.assertFalse(enabled["effectivePaperTradingEnabled"])
-        self.assertFalse(enabled["newEntriesEnabled"])
-        self.assertIn("voting_ensemble.control.alpacaPaperUrlVerified", enabled["reasonCodes"])
+        self.assertTrue(enabled["effectivePaperTradingEnabled"])
+        self.assertTrue(enabled["newEntriesEnabled"])
+        self.assertNotIn("voting_ensemble.control.alpacaPaperUrlVerified", enabled["reasonCodes"])
+        self.assertIn("voting_ensemble.control.effective_paper_on", enabled["reasonCodes"])
 
     async def test_paper_off_blocks_new_entries_but_not_exit_and_reconciliation_work(self) -> None:
         self.supervisor = supervisor_with_runtime(settings=paper_settings(), market_clock_provider=lambda: {"isOpen": True})
@@ -272,13 +282,11 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(permission["brokerReconciliationEnabled"])
 
     async def test_broker_submission_rechecks_control_after_intent_exists(self) -> None:
-        broker = FakePaperBroker()
         repository = VotingEnsemblePaperExecutionRepository()
         permission = {"newEntriesAllowed": True, "effectivePaperTradingEnabled": True, "reasonCodes": ["test.allowed"]}
         execution = VotingEnsemblePaperExecutionRuntime(
             repository=repository,
             queue=VotingEnsemblePaperExecutionQueue(),
-            paper_gateway=PaperOrderGateway(broker, repository),
             entry_permission_provider=lambda: permission,
             auto_start=False,
         )
@@ -298,7 +306,7 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         assert result is not None
         self.assertFalse(result["submitted"])
-        self.assertEqual(broker.submit_count, 0)
+        self.assertFalse(any(key.startswith("voting_ensemble.paper_execution.local_order.") for key in repository.snapshots))
         self.assertIn("voting_ensemble.paper_execution.control_blocked_before_broker_submission", result["reasonCodes"])
 
     async def test_shutdown_stops_workers_without_losing_persisted_commands(self) -> None:
@@ -574,7 +582,6 @@ def paper_runtime() -> VotingEnsemblePaperExecutionRuntime:
     return VotingEnsemblePaperExecutionRuntime(
         repository=repository,
         queue=queue,
-        paper_gateway=PaperOrderGateway(FakePaperBroker(), repository),
         auto_start=False,
     )
 

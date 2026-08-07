@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 from uuid import uuid4
 
 from backend.app.algorithms.voting_ensemble.paper_execution import (
     AlpacaPaperBrokerClient,
     VOTING_ENSEMBLE_ALGORITHM_ID,
+    VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+    VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
     VotingEnsembleAlpacaPaperBrokerConfigurationError,
     VotingEnsembleDurableExecutionStateStore,
+    VotingEnsembleLocalPaperExecutionEngine,
+    VotingEnsembleLocalPaperBroker,
     VotingEnsemblePaperExecutionNamespaceError,
     VotingEnsemblePaperExecutionPersistenceError,
     VotingEnsemblePaperExecutionRepository,
@@ -112,7 +119,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
         queue = VotingEnsemblePaperExecutionQueue()
         broker = FakePaperBroker(fill_status="FILLED", filled_quantity=3)
         gateway = PaperOrderGateway(broker, repository)
-        execution_runtime = VotingEnsemblePaperExecutionRuntime(repository=repository, queue=queue, paper_gateway=gateway, auto_start=False)
+        execution_runtime = VotingEnsemblePaperExecutionRuntime(repository=repository, queue=queue, paper_gateway=gateway, execution_mode="BROKER_PAPER", auto_start=False)
 
         enqueued = execution_runtime.enqueue_from_decision(
             BuyDecisionService().evaluate({}),
@@ -140,6 +147,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             repository=repository,
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(broker, repository),
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
 
@@ -167,6 +175,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             repository=first_repository,
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(FakePaperBroker(), first_repository),
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
         first_runtime.enqueue_from_decision(
@@ -184,6 +193,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             repository=restarted_repository,
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(broker, restarted_repository),
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
         result = restarted_runtime.process_once(evaluated_at=NOW + timedelta(seconds=1))
@@ -203,6 +213,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             repository=repository,
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(FakePaperBroker(), repository),
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
         enqueued = runtime.enqueue_from_decision(
@@ -222,6 +233,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             repository=restarted_repository,
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(broker, restarted_repository),
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
         result = restarted_runtime.process_once(evaluated_at=NOW + timedelta(seconds=1))
@@ -241,6 +253,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             repository=repository,
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(FakePaperBroker(), repository),
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
 
@@ -305,11 +318,10 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
 
     def test_paper_inventory_snapshot_reports_backend_orders_fills_and_positions(self) -> None:
         repository = VotingEnsemblePaperExecutionRepository()
-        broker = FakePaperBroker(fill_status="FILLED", filled_quantity=3)
+        seed_local_quote(repository)
         execution_runtime = VotingEnsemblePaperExecutionRuntime(
             repository=repository,
             queue=VotingEnsemblePaperExecutionQueue(),
-            paper_gateway=PaperOrderGateway(broker, repository),
             auto_start=False,
         )
 
@@ -325,11 +337,770 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
         inventory = execution_runtime.inventory_snapshot()
 
         self.assertEqual(inventory["algorithm_id"], VOTING_ENSEMBLE_ALGORITHM_ID)
-        self.assertEqual(len(inventory["orders"]), 1)
+        self.assertEqual(len(inventory["orders"]), 3)
+        self.assertEqual({order.get("protectiveKind") for order in inventory["orders"] if order.get("protectiveKind")}, {"STOP_LOSS", "PROFIT_TARGET"})
+        self.assertEqual(len(inventory["orderIntents"]), 1)
         self.assertEqual(len(inventory["fills"]), 1)
         self.assertEqual(inventory["positions"][0]["symbol"], "SPY")
         self.assertEqual(inventory["positions"][0]["quantity"], 3)
-        self.assertTrue(inventory["orders"][0]["snapshotKey"].startswith("voting_ensemble.paper_gateway.paper_order_gateway.intent."))
+        self.assertEqual(inventory["orders"][0]["schemaVersion"], "voting_ensemble_local_order_v1")
+        self.assertTrue(inventory["orderIntents"][0]["snapshotKey"].startswith("voting_ensemble.paper_gateway.paper_order_gateway.intent."))
+
+    def test_default_automatic_paper_runtime_uses_local_account_not_alpaca(self) -> None:
+        repository = VotingEnsemblePaperExecutionRepository()
+        seed_local_quote(repository)
+        execution_runtime = VotingEnsemblePaperExecutionRuntime(
+            repository=repository,
+            queue=VotingEnsemblePaperExecutionQueue(),
+            auto_start=False,
+        )
+
+        execution_runtime.enqueue_from_decision(
+            BuyDecisionService().evaluate({}),
+            correlation_id="corr-local-default",
+            idempotency_key="idem-local-default",
+            source_job_id="job-local-default",
+            source_command_id="event-local-default",
+            evaluated_at=NOW,
+        )
+        result = execution_runtime.process_once(evaluated_at=NOW + timedelta(seconds=1))
+        inventory = execution_runtime.inventory_snapshot()
+
+        self.assertIsInstance(execution_runtime.paper_gateway.broker, VotingEnsembleLocalPaperBroker)
+        self.assertIsNone(execution_runtime.broker_client)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result["submitted"])
+        self.assertEqual(execution_runtime.summary()["executionMode"], "LOCAL_PAPER")
+        self.assertEqual(result["gatewayResult"]["executionMode"], "LOCAL_PAPER")
+        self.assertEqual(inventory["account"]["accountId"], VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID)
+        self.assertEqual(inventory["account"]["capitalPartitionId"], VOTING_ENSEMBLE_CAPITAL_PARTITION_ID)
+        self.assertEqual(inventory["account"]["sourceAuthority"], "voting_ensemble_local_paper_account")
+        self.assertEqual(inventory["positions"][0]["quantity"], 3)
+        self.assertTrue(inventory["riskSnapshots"])
+        for collection_name in ("orders", "fills", "positions", "accounts", "riskSnapshots"):
+            for record in inventory[collection_name]:
+                self.assertEqual(record["algorithmId"], VOTING_ENSEMBLE_ALGORITHM_ID)
+                self.assertEqual(record["capitalPartitionId"], VOTING_ENSEMBLE_CAPITAL_PARTITION_ID)
+
+    def test_local_paper_account_fields_initial_cash_and_restart_persistence(self) -> None:
+        store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-account-fields-{uuid4().hex}.json"
+        with patch.dict("os.environ", {"VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "250000"}):
+            repository = VotingEnsemblePaperExecutionRepository(store_path)
+            account = repository.local_account_snapshot(observed_at=NOW)
+
+            self.assertEqual(account["initialCash"], 250000.0)
+            self.assertEqual(account["cash"], 250000.0)
+            self.assertEqual(account["buyingPower"], 250000.0)
+            self.assertEqual(account["usableEntryBuyingPower"], 250000.0)
+            self.assertFalse(account["allowLeverage"])
+            self.assertFalse(account["allowMargin"])
+            self.assertFalse(account["allowShorts"])
+            self.assertEqual(account["maxLeverage"], 1.0)
+            self.assertEqual(account["buyingPowerModel"], "LOCAL_CASH_NO_MARGIN_LONG_ONLY")
+            self.assertEqual(account["equityModel"], "cash_plus_local_owned_position_market_value")
+            for field in (
+                "equity",
+                "realizedPnl",
+                "realizedPnlToday",
+                "unrealizedPnl",
+                "dailyNetPnl",
+                "intradayEquityHigh",
+                "drawdownDollars",
+                "drawdownPercent",
+                "openPositionNotional",
+                "grossExposure",
+                "netExposure",
+                "totalOpenRiskDollars",
+                "totalOpenRiskPercent",
+                "tradesToday",
+                "sessionDate",
+                "lastMarkPrice",
+                "lastMarkedAt",
+                "cashBuyingPower",
+                "marginBuyingPower",
+                "algorithmId",
+                "capitalPartitionId",
+                "version",
+            ):
+                self.assertIn(field, account)
+
+            runtime = VotingEnsemblePaperExecutionRuntime(repository=repository, queue=VotingEnsemblePaperExecutionQueue(), auto_start=False)
+            seed_local_quote(repository)
+            runtime.enqueue_from_decision(
+                BuyDecisionService().evaluate({}),
+                correlation_id="corr-account-fields",
+                idempotency_key="idem-account-fields",
+                source_job_id="job-account-fields",
+                source_command_id="event-account-fields",
+                evaluated_at=NOW,
+            )
+            runtime.process_once(evaluated_at=NOW + timedelta(seconds=1))
+            inventory_after_fill = runtime.inventory_snapshot()
+            after_fill = inventory_after_fill["account"]
+            self.assertLess(after_fill["cash"], 250000.0)
+            self.assertEqual(after_fill["initialCash"], 250000.0)
+            self.assertEqual(after_fill["tradesToday"], 1)
+            self.assertEqual(after_fill["sessionDate"], SESSION_DATE.isoformat())
+            self.assertEqual(after_fill["lastMarkPrice"], inventory_after_fill["positions"][0]["markPrice"])
+            self.assertEqual(after_fill["grossExposure"], after_fill["openPositionNotional"])
+
+        with patch.dict("os.environ", {"VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "999999"}):
+            restarted = VotingEnsemblePaperExecutionRepository(store_path)
+            restarted_account = restarted.local_account_snapshot(observed_at=NOW + timedelta(minutes=1))
+            self.assertEqual(restarted_account["cash"], after_fill["cash"])
+            self.assertEqual(restarted_account["initialCash"], 250000.0)
+
+    def test_local_paper_fill_accounting_uses_cost_basis_not_sale_proceeds(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository()
+            ledger = repository.inventory_ledger
+            repository.local_account_snapshot(observed_at=NOW)
+
+            ledger.apply_fill(client_order_id="buy-100", order_intent_id="intent-buy-100", symbol="SPY", side=Signal.BUY, requested_quantity=100, fill_price=500.0, filled_at=NOW)
+            first = repository.inventory_snapshot()
+            self.assertEqual(first["positions"][0]["signedQuantity"], 100)
+            self.assertEqual(first["positions"][0]["averageEntryPrice"], 500.0)
+            self.assertEqual(first["account"]["cash"], 50000.0)
+
+            ledger.apply_fill(client_order_id="buy-50", order_intent_id="intent-buy-50", symbol="SPY", side=Signal.BUY, requested_quantity=50, fill_price=510.0, filled_at=NOW + timedelta(minutes=1))
+            second = repository.inventory_snapshot()
+            self.assertEqual(second["positions"][0]["signedQuantity"], 150)
+            self.assertAlmostEqual(second["positions"][0]["averageEntryPrice"], 503.333333, places=6)
+            self.assertEqual(second["account"]["cash"], 24500.0)
+
+            ledger.apply_fill(client_order_id="sell-40", order_intent_id="intent-sell-40", symbol="SPY", side=Signal.SELL, requested_quantity=40, fill_price=520.0, filled_at=NOW + timedelta(minutes=2))
+            reduced = repository.inventory_snapshot()
+            self.assertEqual(reduced["positions"][0]["signedQuantity"], 110)
+            self.assertAlmostEqual(reduced["positions"][0]["averageEntryPrice"], 503.333333, places=6)
+            self.assertEqual(reduced["account"]["cash"], 45300.0)
+            self.assertAlmostEqual(reduced["account"]["realizedPnl"], 666.67, places=2)
+            self.assertAlmostEqual(reduced["account"]["dailyNetPnl"], 2500.0, places=2)
+
+            ledger.apply_fill(client_order_id="sell-110", order_intent_id="intent-sell-110", symbol="SPY", side=Signal.SELL, requested_quantity=110, fill_price=515.0, filled_at=NOW + timedelta(minutes=3))
+            closed = repository.inventory_snapshot()
+            self.assertEqual(closed["positions"], [])
+            self.assertAlmostEqual(closed["account"]["cash"], 101950.0, places=2)
+            self.assertAlmostEqual(closed["account"]["realizedPnl"], 1950.0, places=2)
+            self.assertTrue(closed["closedTrades"])
+            full_close = [trade for trade in closed["closedTrades"] if trade["exitOrderId"] == "sell-110"][0]
+            self.assertEqual(full_close["quantity"], 110)
+            self.assertIn("buy-100", full_close["associatedFillIds"])
+            self.assertIn("buy-50", full_close["associatedFillIds"])
+            self.assertIn("sell-110", full_close["associatedFillIds"])
+
+    def test_local_paper_fill_accounting_applies_configured_fees_to_cash(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0.01",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "1.00",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository()
+            repository.local_account_snapshot(observed_at=NOW)
+            repository.inventory_ledger.apply_fill(
+                client_order_id="fee-buy",
+                order_intent_id="intent-fee-buy",
+                symbol="SPY",
+                side=Signal.BUY,
+                requested_quantity=10,
+                fill_price=100.0,
+                filled_at=NOW,
+            )
+            inventory = repository.inventory_snapshot()
+            self.assertEqual(inventory["fills"][0]["grossNotional"], 1000.0)
+            self.assertEqual(inventory["fills"][0]["feeAmount"], 1.1)
+            self.assertEqual(inventory["account"]["cash"], 98998.9)
+
+    def test_local_paper_duplicate_fill_is_applied_once(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository()
+            repository.local_account_snapshot(observed_at=NOW)
+            fill_kwargs = {
+                "client_order_id": "dup-buy",
+                "order_intent_id": "intent-dup-buy",
+                "symbol": "SPY",
+                "side": Signal.BUY,
+                "requested_quantity": 10,
+                "fill_price": 100.0,
+                "filled_at": NOW,
+            }
+
+            first_fill = repository.inventory_ledger.apply_fill(**fill_kwargs)
+            after_first = repository.inventory_snapshot()
+            duplicate_fill = repository.inventory_ledger.apply_fill(**fill_kwargs)
+            after_duplicate = repository.inventory_snapshot()
+
+            self.assertIsNotNone(first_fill)
+            self.assertIsNotNone(duplicate_fill)
+            self.assertEqual(after_duplicate["account"]["cash"], after_first["account"]["cash"])
+            self.assertEqual(after_duplicate["account"]["tradesToday"], 1)
+            self.assertEqual(after_duplicate["positions"][0]["signedQuantity"], 10)
+            self.assertEqual(len(after_duplicate["fills"]), 1)
+            self.assertEqual(len(after_duplicate["account"]["appliedFillIds"]), 1)
+
+    def test_local_paper_duplicate_fill_after_restart_is_applied_once(self) -> None:
+        store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-fill-idempotency-{uuid4().hex}.json"
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository(store_path)
+            repository.local_account_snapshot(observed_at=NOW)
+            fill_kwargs = {
+                "client_order_id": "restart-dup-buy",
+                "order_intent_id": "intent-restart-dup-buy",
+                "symbol": "SPY",
+                "side": Signal.BUY,
+                "requested_quantity": 10,
+                "fill_price": 100.0,
+                "filled_at": NOW,
+            }
+
+            repository.inventory_ledger.apply_fill(**fill_kwargs)
+            after_first = repository.inventory_snapshot()
+            restarted = VotingEnsemblePaperExecutionRepository(store_path)
+            restarted.inventory_ledger.apply_fill(**fill_kwargs)
+            after_replay = restarted.inventory_snapshot()
+
+            self.assertEqual(after_replay["account"]["cash"], after_first["account"]["cash"])
+            self.assertEqual(after_replay["account"]["tradesToday"], 1)
+            self.assertEqual(after_replay["positions"][0]["signedQuantity"], 10)
+            self.assertEqual(len(after_replay["fills"]), 1)
+            self.assertEqual(after_replay["account"]["appliedFillIds"], after_first["account"]["appliedFillIds"])
+
+    def test_local_paper_mark_to_market_uses_fresh_bid_for_long_accounting(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_MAX_MARK_QUOTE_AGE_SECONDS": "5",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository()
+            repository.local_account_snapshot(observed_at=NOW)
+            repository.inventory_ledger.apply_fill(
+                client_order_id="mark-buy",
+                order_intent_id="intent-mark-buy",
+                symbol="SPY",
+                side=Signal.BUY,
+                requested_quantity=10,
+                fill_price=100.0,
+                filled_at=NOW,
+            )
+
+            mark_result = repository.mark_local_positions_from_market_data(
+                symbol="SPY",
+                nbbo={
+                    "bid": 104.0,
+                    "ask": 104.05,
+                    "quoteTimestamp": (NOW + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                    "marketDataReceiptTimestamp": (NOW + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                },
+                observed_at=NOW + timedelta(seconds=2),
+            )
+            inventory = repository.inventory_snapshot()
+            position = inventory["positions"][0]
+
+            self.assertTrue(mark_result["fresh"])
+            self.assertEqual(position["markPrice"], 104.0)
+            self.assertEqual(position["marketValue"], 1040.0)
+            self.assertEqual(position["unrealizedPnl"], 40.0)
+            self.assertEqual(position["markPricePolicy"], "conservative_liquidation_nbbo_bid_for_long_ask_for_short")
+            self.assertEqual(inventory["account"]["equity"], 100040.0)
+            self.assertEqual(inventory["account"]["buyingPower"], 99000.0)
+            self.assertEqual(inventory["account"]["usableEntryBuyingPower"], 99000.0)
+            self.assertEqual(inventory["account"]["marginBuyingPower"], 0.0)
+            self.assertFalse(inventory["account"]["allowLeverage"])
+            self.assertFalse(inventory["account"]["allowMargin"])
+            self.assertFalse(inventory["account"]["allowShorts"])
+            self.assertEqual(inventory["account"]["maxLeverage"], 1.0)
+            self.assertEqual(inventory["account"]["openPositionNotional"], 1040.0)
+            self.assertEqual(inventory["account"]["grossExposure"], 1040.0)
+            self.assertEqual(inventory["account"]["netExposure"], 1040.0)
+            self.assertEqual(inventory["account"]["drawdownDollars"], 0.0)
+            self.assertEqual(inventory["account"]["totalOpenRiskDollars"], 0.0)
+
+    def test_stale_local_mark_blocks_new_entries_but_allows_risk_reducing_exit(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_MAX_MARK_QUOTE_AGE_SECONDS": "5",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository()
+            execution_runtime = VotingEnsemblePaperExecutionRuntime(repository=repository, queue=VotingEnsemblePaperExecutionQueue(), auto_start=False)
+            repository.local_account_snapshot(observed_at=NOW)
+            repository.inventory_ledger.apply_fill(
+                client_order_id="stale-mark-buy",
+                order_intent_id="intent-stale-mark-buy",
+                symbol="SPY",
+                side=Signal.BUY,
+                requested_quantity=3,
+                fill_price=100.0,
+                filled_at=NOW,
+            )
+            stale_mark = repository.mark_local_positions_from_market_data(
+                symbol="SPY",
+                nbbo={
+                    "bid": 101.0,
+                    "ask": 101.05,
+                    "quoteTimestamp": NOW.isoformat().replace("+00:00", "Z"),
+                    "marketDataReceiptTimestamp": NOW.isoformat().replace("+00:00", "Z"),
+                },
+                observed_at=NOW + timedelta(seconds=10),
+            )
+
+            blocked = execution_runtime.enqueue_from_decision(
+                BuyDecisionService().evaluate({}),
+                correlation_id="corr-stale-mark-buy",
+                idempotency_key="idem-stale-mark-buy",
+                source_job_id="job-stale-mark-buy",
+                source_command_id="event-stale-mark-buy",
+                evaluated_at=NOW + timedelta(seconds=10),
+            )
+            exit_result = execution_runtime.enqueue_from_decision(
+                {"algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID, "final_signal": "Sell", "safety_gate_failed": False, "order_plan": order_plan(side=Signal.SELL).model_dump(mode="json")},
+                correlation_id="corr-stale-mark-sell",
+                idempotency_key="idem-stale-mark-sell",
+                source_job_id="job-stale-mark-sell",
+                source_command_id="event-stale-mark-sell",
+                evaluated_at=NOW + timedelta(seconds=10),
+            )
+
+            self.assertFalse(stale_mark["fresh"])
+            self.assertFalse(blocked["enqueued"])
+            self.assertIn("voting_ensemble.paper_execution.local_mark_stale_blocks_new_entries", blocked["reasonCodes"])
+            self.assertTrue(exit_result["enqueued"])
+
+    def test_finalized_bar_worker_marks_local_inventory_from_payload_nbbo(self) -> None:
+        repository = VotingEnsemblePaperExecutionRepository()
+        paper_runtime = VotingEnsemblePaperExecutionRuntime(repository=repository, queue=VotingEnsemblePaperExecutionQueue(), auto_start=False)
+        repository.local_account_snapshot(observed_at=NOW)
+        repository.inventory_ledger.apply_fill(
+            client_order_id="worker-mark-buy",
+            order_intent_id="intent-worker-mark-buy",
+            symbol="SPY",
+            side=Signal.BUY,
+            requested_quantity=2,
+            fill_price=100.0,
+            filled_at=NOW,
+        )
+        runtime = VotingEnsembleRuntimeOrchestrator(
+            service=HoldDecisionService(),
+            paper_execution_runtime=paper_runtime,
+            automatic_payload_builder=PassthroughAutomaticPayloadBuilder(),
+            auto_start=False,
+        )
+        event = FinalizedOneMinuteBarEvent(
+            symbol="SPY",
+            barEndTimestamp=NOW + timedelta(minutes=1),
+            finalized=True,
+            evaluationPayload={
+                "symbol": "SPY",
+                "data_timestamp": (NOW + timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
+                "candles": [],
+                "nbbo": {
+                    "bid": 103.0,
+                    "ask": 103.05,
+                    "quoteTimestamp": (NOW + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                    "marketDataReceiptTimestamp": (NOW + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                },
+            },
+        )
+
+        runtime.enqueue_finalized_bar_event(event)
+        result = runtime.drain_in_process(max_commands=1)[0]
+        inventory = paper_runtime.inventory_snapshot()
+
+        self.assertTrue(result["result"]["localPaperMarkToMarket"]["fresh"])
+        self.assertEqual(inventory["positions"][0]["markPrice"], 103.0)
+        self.assertEqual(inventory["positions"][0]["unrealizedPnl"], 6.0)
+
+    def test_local_paper_mode_rejects_broker_trading_client(self) -> None:
+        with self.assertRaises(VotingEnsemblePaperExecutionNamespaceError):
+            VotingEnsemblePaperExecutionRuntime(
+                repository=VotingEnsemblePaperExecutionRepository(),
+                queue=VotingEnsemblePaperExecutionQueue(),
+                broker_client=FakePaperBrokerClient(),
+                auto_start=False,
+            )
+
+        repository = VotingEnsemblePaperExecutionRepository()
+        with self.assertRaises(VotingEnsemblePaperExecutionNamespaceError):
+            VotingEnsemblePaperExecutionRuntime(
+                repository=repository,
+                queue=VotingEnsemblePaperExecutionQueue(),
+                paper_gateway=PaperOrderGateway(FakePaperBroker(), repository, execution_mode="LOCAL_PAPER"),
+                auto_start=False,
+            )
+
+    def test_local_paper_execution_engine_accepts_order_and_applies_fill_atomically(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "100000",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FEE_PER_SHARE": "0",
+                "VOTING_ENSEMBLE_LOCAL_PAPER_FLAT_FEE_PER_FILL": "0",
+            },
+        ):
+            repository = VotingEnsemblePaperExecutionRepository()
+            engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+            seed_local_quote(repository)
+            intent = local_engine_intent(client_order_id="engine-buy", quantity=5, side=Signal.BUY, limit_price=100.0)
+
+            ack = engine.submit_order(intent)
+            fill = engine.refresh_order("engine-buy")
+            inventory = repository.inventory_snapshot()
+
+            self.assertTrue(engine.verify_account())
+            self.assertEqual(ack.status, "OPEN")
+            self.assertIsNotNone(fill)
+            self.assertEqual(fill.filledQuantity, 5)
+            self.assertEqual(inventory["positions"][0]["signedQuantity"], 5)
+            self.assertEqual(inventory["account"]["cash"], 99500.0)
+            self.assertEqual(inventory["orders"][0]["status"], "FILLED")
+            self.assertEqual(inventory["orders"][0]["algorithmId"], VOTING_ENSEMBLE_ALGORITHM_ID)
+            self.assertEqual(inventory["orders"][0]["capitalPartitionId"], VOTING_ENSEMBLE_CAPITAL_PARTITION_ID)
+            self.assertEqual(inventory["orders"][0]["accountId"], VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID)
+            self.assertEqual(inventory["fills"][0]["clientOrderId"], "engine-buy")
+            self.assertEqual(inventory["localExecutions"][-1]["status"], "FILLED")
+            self.assertEqual(inventory["localExecutions"][-1]["executionMode"], "LOCAL_PAPER")
+
+    def test_local_paper_execution_engine_rejects_foreign_inventory_and_insufficient_cash(self) -> None:
+        with patch.dict("os.environ", {"VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH": "1000"}):
+            repository = VotingEnsemblePaperExecutionRepository()
+            engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+
+            foreign = local_engine_intent(client_order_id="engine-foreign", algorithm_id="weighted_voting", quantity=1)
+            foreign_partition = local_engine_intent(client_order_id="engine-foreign-partition", capital_partition_id="weighted_voting.paper.default", quantity=1)
+            too_large = local_engine_intent(client_order_id="engine-too-large", quantity=20, limit_price=100.0)
+
+            foreign_ack = engine.submit_order(foreign)
+            partition_ack = engine.submit_order(foreign_partition)
+            cash_ack = engine.submit_order(too_large)
+            inventory = repository.inventory_snapshot()
+
+            self.assertEqual(foreign_ack.status, "REJECTED")
+            self.assertEqual(foreign_ack.rejectedReason, "voting_ensemble.local_paper.foreign_algorithm_rejected")
+            self.assertEqual(partition_ack.status, "REJECTED")
+            self.assertEqual(partition_ack.rejectedReason, "voting_ensemble.local_paper.foreign_capital_partition_rejected")
+            self.assertEqual(cash_ack.status, "REJECTED")
+            self.assertEqual(cash_ack.rejectedReason, "voting_ensemble.local_paper.insufficient_buying_power")
+            self.assertEqual(inventory["positions"], [])
+            self.assertEqual(inventory["fills"], [])
+            self.assertEqual(len(inventory["localExecutions"]), 3)
+
+    def test_local_paper_execution_engine_rejects_invalid_local_risk_and_naked_exit(self) -> None:
+        repository = VotingEnsemblePaperExecutionRepository()
+        engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+
+        risk_ack = engine.submit_order(local_engine_intent(client_order_id="engine-risk", quantity=1, planned_risk=200000.0))
+        sell_ack = engine.submit_order(local_engine_intent(client_order_id="engine-sell", quantity=1, side=Signal.SELL))
+
+        self.assertEqual(risk_ack.status, "REJECTED")
+        self.assertEqual(risk_ack.rejectedReason, "voting_ensemble.local_paper.local_risk_limit_exceeded")
+        self.assertEqual(sell_ack.status, "REJECTED")
+        self.assertEqual(sell_ack.rejectedReason, "voting_ensemble.local_paper.sell_cannot_mutate_foreign_or_absent_position")
+
+    def test_local_paper_execution_engine_limit_requires_executable_quote(self) -> None:
+        repository = VotingEnsemblePaperExecutionRepository()
+        engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+        seed_local_quote(repository, bid=100.0, ask=100.25, ask_size=100)
+        engine.submit_order(local_engine_intent(client_order_id="engine-buy-not-executable", quantity=5, side=Signal.BUY, limit_price=100.0))
+
+        fill = engine.refresh_order("engine-buy-not-executable")
+        inventory = repository.inventory_snapshot()
+
+        self.assertIsNone(fill)
+        self.assertEqual(inventory["orders"][0]["status"], "OPEN")
+        self.assertIn("voting_ensemble.local_paper_execution_engine.buy_limit_not_executable", inventory["orders"][0]["reasonCodes"])
+        self.assertEqual(inventory["positions"], [])
+
+    def test_local_paper_execution_engine_partial_fill_uses_quote_size_and_participation(self) -> None:
+        with patch.dict("os.environ", {"VOTING_ENSEMBLE_LOCAL_PAPER_MAX_PARTICIPATION_PCT": "50"}):
+            repository = VotingEnsemblePaperExecutionRepository()
+            engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+            seed_local_quote(repository, bid=100.0, ask=100.0, ask_size=4)
+            engine.submit_order(local_engine_intent(client_order_id="engine-partial", quantity=10, side=Signal.BUY, limit_price=100.0))
+
+            fill = engine.refresh_order("engine-partial")
+            inventory = repository.inventory_snapshot()
+
+            self.assertIsNotNone(fill)
+            assert fill is not None
+            self.assertEqual(fill.filledQuantity, 2)
+            self.assertEqual(inventory["orders"][0]["status"], "PARTIALLY_FILLED")
+            self.assertEqual(inventory["orders"][0]["filledQuantity"], 2)
+            self.assertEqual(inventory["positions"][0]["signedQuantity"], 2)
+
+    def test_local_paper_execution_engine_stop_limit_triggers_then_uses_limit_rules(self) -> None:
+        repository = VotingEnsemblePaperExecutionRepository()
+        engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+        seed_local_quote(repository, bid=100.0, ask=100.5, ask_size=100)
+        engine.submit_order(
+            local_engine_intent(
+                client_order_id="engine-stop-limit",
+                quantity=3,
+                side=Signal.BUY,
+                order_type="STOP_LIMIT",
+                trigger_price=101.0,
+                limit_price=101.5,
+            )
+        )
+
+        first = engine.refresh_order("engine-stop-limit")
+        seed_local_quote(repository, bid=101.0, ask=101.25, ask_size=100, observed_at=NOW + timedelta(seconds=1))
+        second = engine.refresh_order("engine-stop-limit")
+        inventory = repository.inventory_snapshot()
+
+        self.assertIsNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(inventory["orders"][0]["status"], "FILLED")
+        self.assertTrue(inventory["orders"][0]["stopTriggered"])
+        self.assertLessEqual(inventory["fills"][0]["averageFillPrice"], 101.5)
+
+    def test_local_paper_execution_engine_slippage_never_worse_than_limit(self) -> None:
+        with patch.dict("os.environ", {"VOTING_ENSEMBLE_LOCAL_PAPER_SLIPPAGE_BPS": "100"}):
+            repository = VotingEnsemblePaperExecutionRepository()
+            engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+            seed_local_quote(repository, bid=99.45, ask=99.5, ask_size=100)
+            engine.submit_order(local_engine_intent(client_order_id="engine-slippage-cap", quantity=1, side=Signal.BUY, limit_price=100.0))
+
+            fill = engine.refresh_order("engine-slippage-cap")
+
+            self.assertIsNotNone(fill)
+            assert fill is not None
+            self.assertEqual(fill.averageFillPrice, 100.0)
+
+    def test_local_paper_entry_fill_creates_same_inventory_stop_and_target_oco(self) -> None:
+        with patch.dict("os.environ", {"VOTING_ENSEMBLE_LOCAL_PAPER_MAX_PARTICIPATION_PCT": "100"}):
+            repository = VotingEnsemblePaperExecutionRepository()
+            engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+            seed_local_quote(repository, bid=100.0, ask=100.0, ask_size=2)
+            engine.submit_order(local_engine_intent(client_order_id="engine-oco-entry", quantity=5, side=Signal.BUY, limit_price=100.0))
+
+            fill = engine.refresh_order("engine-oco-entry")
+            inventory = repository.inventory_snapshot()
+            protective = [order for order in inventory["orders"] if order.get("ocoGroupId") == "engine-oco-entry-oco"]
+
+            self.assertIsNotNone(fill)
+            assert fill is not None
+            self.assertEqual(fill.filledQuantity, 2)
+            self.assertEqual(inventory["positions"][0]["signedQuantity"], 2)
+            self.assertEqual({order["protectiveKind"] for order in protective}, {"STOP_LOSS", "PROFIT_TARGET"})
+            self.assertTrue(all(order["quantity"] == 2 for order in protective))
+            self.assertTrue(all(order["positionOwner"] == VOTING_ENSEMBLE_ALGORITHM_ID for order in protective))
+            self.assertTrue(all(order["exitOwner"] == VOTING_ENSEMBLE_ALGORITHM_ID for order in protective))
+
+    def test_local_paper_partial_target_exit_resizes_competing_stop_to_remaining_owned_quantity(self) -> None:
+        with patch.dict("os.environ", {"VOTING_ENSEMBLE_LOCAL_PAPER_MAX_PARTICIPATION_PCT": "100"}):
+            repository = VotingEnsemblePaperExecutionRepository()
+            engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+            seed_local_quote(repository, bid=100.0, ask=100.0, ask_size=5)
+            engine.submit_order(local_engine_intent(client_order_id="engine-oco-partial", quantity=5, side=Signal.BUY, limit_price=100.0))
+            engine.refresh_order("engine-oco-partial")
+
+            seed_local_quote(repository, bid=101.5, ask=101.55, bid_size=2, observed_at=NOW + timedelta(seconds=1))
+            target_fill = engine.refresh_order("engine-oco-partial-target")
+            inventory = repository.inventory_snapshot()
+            stop = [order for order in inventory["orders"] if order.get("clientOrderId") == "engine-oco-partial-stop"][0]
+
+            self.assertIsNotNone(target_fill)
+            assert target_fill is not None
+            self.assertEqual(target_fill.filledQuantity, 2)
+            self.assertEqual(inventory["positions"][0]["signedQuantity"], 3)
+            self.assertEqual(stop["status"], "OPEN")
+            self.assertEqual(stop["quantity"], 3)
+
+    def test_local_paper_completed_target_exit_cancels_competing_stop(self) -> None:
+        repository = VotingEnsemblePaperExecutionRepository()
+        engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+        seed_local_quote(repository, bid=100.0, ask=100.0, ask_size=3)
+        engine.submit_order(local_engine_intent(client_order_id="engine-oco-complete", quantity=3, side=Signal.BUY, limit_price=100.0))
+        engine.refresh_order("engine-oco-complete")
+
+        seed_local_quote(repository, bid=101.5, ask=101.55, bid_size=3, observed_at=NOW + timedelta(seconds=1))
+        target_fill = engine.refresh_order("engine-oco-complete-target")
+        inventory = repository.inventory_snapshot()
+        stop = [order for order in inventory["orders"] if order.get("clientOrderId") == "engine-oco-complete-stop"][0]
+        target = [order for order in inventory["orders"] if order.get("clientOrderId") == "engine-oco-complete-target"][0]
+
+        self.assertIsNotNone(target_fill)
+        self.assertEqual(inventory["positions"], [])
+        self.assertEqual(target["status"], "FILLED")
+        self.assertEqual(stop["status"], "CANCELED")
+        self.assertIn("voting_ensemble.local_paper_execution_engine.oco_sibling_canceled_after_exit_fill", stop["reasonCodes"])
+
+    def test_local_paper_stop_exit_uses_remaining_voting_ensemble_quantity_not_foreign_spy(self) -> None:
+        repository = VotingEnsemblePaperExecutionRepository()
+        engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+        repository.snapshots["foreign.position.spy"] = {"algorithmId": "weighted_voting", "symbol": "SPY", "quantity": 50}
+        seed_local_quote(repository, bid=100.0, ask=100.0, ask_size=3)
+        engine.submit_order(local_engine_intent(client_order_id="engine-oco-owned-only", quantity=3, side=Signal.BUY, limit_price=100.0))
+        engine.refresh_order("engine-oco-owned-only")
+
+        seed_local_quote(repository, bid=99.0, ask=99.05, bid_size=100, observed_at=NOW + timedelta(seconds=1))
+        stop_fill = engine.refresh_order("engine-oco-owned-only-stop")
+        inventory = repository.inventory_snapshot()
+
+        self.assertIsNotNone(stop_fill)
+        assert stop_fill is not None
+        self.assertEqual(stop_fill.filledQuantity, 3)
+        self.assertEqual(inventory["positions"], [])
+
+    def test_local_paper_exit_requires_position_owned_by_voting_ensemble(self) -> None:
+        store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-exit-owner-{uuid4().hex}.json"
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text(
+            json.dumps(
+                {
+                    "snapshots": {
+                        "voting_ensemble.paper_execution.local_position.SPY": {
+                            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                            "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                            "symbol": "SPY",
+                            "quantity": 10,
+                            "signedQuantity": 10,
+                            "averagePrice": 100.0,
+                            "averageEntryPrice": 100.0,
+                            "markPrice": 100.0,
+                            "notional": 1000.0,
+                            "marketValue": 1000.0,
+                            "unrealizedPnl": 0.0,
+                            "realizedPnl": 0.0,
+                            "positionOwner": "weighted_voting",
+                            "exitOwner": "weighted_voting",
+                            "updatedAt": NOW.isoformat().replace("+00:00", "Z"),
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        repository = VotingEnsemblePaperExecutionRepository(store_path)
+        engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+
+        sell_ack = engine.submit_order(local_engine_intent(client_order_id="engine-foreign-owner-sell", quantity=1, side=Signal.SELL))
+        inventory = repository.inventory_snapshot()
+
+        self.assertEqual(sell_ack.status, "REJECTED")
+        self.assertEqual(sell_ack.rejectedReason, "voting_ensemble.local_paper.sell_cannot_mutate_foreign_or_absent_position")
+        self.assertEqual(inventory["positions"], [])
+        store_path.unlink(missing_ok=True)
+
+    def test_local_paper_inventory_ignores_foreign_spy_and_sell_closes_only_owned_quantity(self) -> None:
+        store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-foreign-isolation-{uuid4().hex}.json"
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text(
+            json.dumps(
+                {
+                    "snapshots": {
+                        "foreign.position.spy": {
+                            "algorithmId": "weighted_voting",
+                            "capitalPartitionId": "weighted_voting.paper.default",
+                            "symbol": "SPY",
+                            "quantity": 50,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        repository = VotingEnsemblePaperExecutionRepository(store_path)
+        seed_local_quote(repository)
+        execution_runtime = VotingEnsemblePaperExecutionRuntime(
+            repository=repository,
+            queue=VotingEnsemblePaperExecutionQueue(),
+            auto_start=False,
+        )
+
+        execution_runtime.enqueue_from_decision(
+            BuyDecisionService().evaluate({}),
+            correlation_id="corr-owned-buy",
+            idempotency_key="idem-owned-buy",
+            source_job_id="job-owned-buy",
+            source_command_id="event-owned-buy",
+            evaluated_at=NOW,
+        )
+        execution_runtime.process_once(evaluated_at=NOW + timedelta(seconds=1))
+        owned_inventory = execution_runtime.inventory_snapshot()
+        position = owned_inventory["positions"][0]
+        for field in (
+            "symbol",
+            "signedQuantity",
+            "side",
+            "averageEntryPrice",
+            "markPrice",
+            "marketValue",
+            "unrealizedPnl",
+            "realizedPnl",
+            "openedAt",
+            "updatedAt",
+            "stopPrice",
+            "profitTargetPrice",
+            "entryOrderId",
+            "lastFillId",
+            "algorithmId",
+            "capitalPartitionId",
+            "positionOwner",
+            "exitOwner",
+        ):
+            self.assertIn(field, position)
+        self.assertEqual(position["signedQuantity"], 3)
+        self.assertEqual(position["side"], "LONG")
+        self.assertEqual(position["positionOwner"], VOTING_ENSEMBLE_ALGORITHM_ID)
+        self.assertEqual(position["exitOwner"], VOTING_ENSEMBLE_ALGORITHM_ID)
+
+        sell_plan = order_plan(side=Signal.SELL).model_copy(update={"quantity": 10})
+        execution_runtime.enqueue_from_decision(
+            {"algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID, "final_signal": "Sell", "safety_gate_failed": False, "order_plan": sell_plan.model_dump(mode="json")},
+            correlation_id="corr-owned-sell",
+            idempotency_key="idem-owned-sell",
+            source_job_id="job-owned-sell",
+            source_command_id="event-owned-sell",
+            evaluated_at=NOW + timedelta(seconds=2),
+        )
+        execution_runtime.process_once(evaluated_at=NOW + timedelta(seconds=3))
+        inventory = execution_runtime.inventory_snapshot()
+
+        self.assertEqual(inventory["positions"], [])
+        self.assertEqual(len(inventory["closedTrades"]), 1)
+        self.assertEqual(inventory["closedTrades"][0]["quantity"], 3)
+        sell_order = [order for order in inventory["orders"] if order["side"] == Signal.SELL.value][0]
+        sell_fill = [fill for fill in inventory["fills"] if fill["side"] == Signal.SELL.value][0]
+        self.assertEqual(sell_order["quantity"], 3)
+        self.assertEqual(sell_fill["filledQuantity"], 3)
+        self.assertEqual(inventory["closedTrades"][0]["algorithmId"], VOTING_ENSEMBLE_ALGORITHM_ID)
+        self.assertEqual(inventory["closedTrades"][0]["capitalPartitionId"], VOTING_ENSEMBLE_CAPITAL_PARTITION_ID)
+        self.assertFalse(any(record.get("algorithmId") == "weighted_voting" for record in repository.snapshots.values()))
+        store_path.unlink(missing_ok=True)
 
     def test_automatic_broker_client_execution_state_is_durable_and_reloadable(self) -> None:
         store_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"paper-execution-state-{uuid4().hex}.json"
@@ -348,6 +1119,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(FakePaperBroker(), repository),
             broker_client=broker_client,
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
 
@@ -396,6 +1168,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
                 queue=VotingEnsemblePaperExecutionQueue(),
                 paper_gateway=PaperOrderGateway(FakePaperBroker(), memory_repository),
                 broker_client=FakePaperBrokerClient(),
+                execution_mode="BROKER_PAPER",
                 auto_start=False,
             )
 
@@ -406,6 +1179,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             repository=repository,
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(FakePaperBroker(), repository),
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
 
@@ -427,6 +1201,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(FakePaperBroker(), repository),
             broker_client=broker_client,
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
 
@@ -463,6 +1238,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(FakePaperBroker(), repository),
             broker_client=broker_client,
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
 
@@ -511,6 +1287,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             paper_gateway=PaperOrderGateway(FakePaperBroker(), repository),
             broker_client=broker_client,
             entry_permission_provider=lambda: {"newEntriesAllowed": False, "effectivePaperTradingEnabled": False, "reasonCodes": ["paper.off"]},
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
         repository.upsert_broker_fill(
@@ -546,6 +1323,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             paper_gateway=PaperOrderGateway(FakePaperBroker(), repository),
             broker_client=FakePaperBrokerClient(),
             short_trading_enabled=False,
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
 
@@ -583,6 +1361,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(FakePaperBroker(), repository),
             broker_client=broker_client,
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
 
@@ -634,6 +1413,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             queue=VotingEnsemblePaperExecutionQueue(),
             paper_gateway=PaperOrderGateway(FakePaperBroker(), repository),
             broker_client=broker_client,
+            execution_mode="BROKER_PAPER",
             auto_start=False,
         )
 
@@ -699,6 +1479,16 @@ class BuyDecisionService:
             "safety_gate_failed": False,
             "order_plan": order_plan().model_dump(mode="json"),
             "reason_codes": ["test.buy"],
+        }
+
+
+class HoldDecisionService:
+    def evaluate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "final_signal": "Hold",
+            "safety_gate_failed": False,
+            "reason_codes": ["test.hold"],
         }
 
 
@@ -965,6 +1755,67 @@ def order_plan(*, side: Signal = Signal.BUY) -> OrderPlan:
         generatedAt=NOW,
         sessionDate=SESSION_DATE,
         configurationHash="order-config",
+    )
+
+
+def local_engine_intent(
+    *,
+    client_order_id: str,
+    quantity: int,
+    side: Signal = Signal.BUY,
+    limit_price: float = 100.0,
+    trigger_price: float | None = None,
+    order_type: str = "LIMIT",
+    planned_risk: float = 5.0,
+    algorithm_id: str = VOTING_ENSEMBLE_ALGORITHM_ID,
+    capital_partition_id: str = VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        executionMode="LOCAL_PAPER",
+        algorithmId=algorithm_id,
+        capitalPartitionId=capital_partition_id,
+        accountId=VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+        decisionId=f"decision-{client_order_id}",
+        orderIntentId=f"intent-{client_order_id}",
+        clientOrderId=client_order_id,
+        symbol="SPY",
+        side=side,
+        submittedQuantity=quantity,
+        proposedQuantity=quantity,
+        globallyAllowedQuantity=quantity,
+        orderType=order_type,
+        limitPrice=limit_price,
+        triggerPrice=trigger_price if trigger_price is not None else limit_price,
+        stopPrice=99.0 if side == Signal.BUY else 101.0,
+        targetPrice=101.5 if side == Signal.BUY else 98.5,
+        plannedRiskDollars=planned_risk,
+        createdAt=NOW,
+        decisionTimestamp=NOW,
+        timeInForce="DAY",
+        reasonCodes=(),
+    )
+
+
+def seed_local_quote(
+    repository: VotingEnsemblePaperExecutionRepository,
+    *,
+    bid: float = 100.0,
+    ask: float = 100.0,
+    bid_size: float = 100.0,
+    ask_size: float = 100.0,
+    observed_at: datetime = NOW,
+) -> None:
+    repository.mark_local_positions_from_market_data(
+        symbol="SPY",
+        nbbo={
+            "bid": bid,
+            "ask": ask,
+            "bidSize": bid_size,
+            "askSize": ask_size,
+            "quoteTimestamp": observed_at.isoformat().replace("+00:00", "Z"),
+            "marketDataReceiptTimestamp": observed_at.isoformat().replace("+00:00", "Z"),
+        },
+        observed_at=observed_at,
     )
 
 

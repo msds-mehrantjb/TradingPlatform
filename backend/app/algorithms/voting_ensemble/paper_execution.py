@@ -12,11 +12,18 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Condition, Event, RLock, Thread
 from time import sleep
-from typing import Any
+from typing import Any, Literal
+from contextlib import contextmanager
 
 import httpx
 from dotenv import load_dotenv
 
+from backend.app.algorithms.voting_ensemble.local_paper_account import (
+    VOTING_ENSEMBLE_ALGORITHM_ID,
+    VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+    VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+    VotingEnsembleInventoryLedger,
+)
 from backend.app.config import get_settings
 from backend.app.algorithms.voting_ensemble.execution_adapter import (
     VOTING_ENSEMBLE_EXECUTION_STATE_NAMESPACE,
@@ -31,8 +38,8 @@ from backend.app.execution.broker_reconciliation import BrokerFillUpdate, Broker
 from backend.app.gates import AppliedGlobalGateDecision, BrokerAccountSnapshot, BrokerOrderState, BrokerPositionState, GlobalOrderProposal
 
 
-VOTING_ENSEMBLE_ALGORITHM_ID = "voting_ensemble"
-VOTING_ENSEMBLE_CAPITAL_PARTITION_ID = "voting_ensemble.paper.default"
+VotingEnsembleExecutionMode = Literal["LOCAL_PAPER", "BROKER_PAPER"]
+VOTING_ENSEMBLE_DEFAULT_EXECUTION_MODE: VotingEnsembleExecutionMode = "LOCAL_PAPER"
 VOTING_ENSEMBLE_PAPER_EXECUTION_VERSION = "voting_ensemble_paper_execution_v1"
 VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE = "voting_ensemble.paper_execution"
 VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE = "voting_ensemble.paper_gateway"
@@ -117,6 +124,9 @@ class VotingEnsemblePaperExecutionRepository:
         self.lastPersistenceError: str | None = None
         self.lastPersistenceErrorAt: str | None = None
         self.persistenceFailureCount = 0
+        self.inventory_ledger = VotingEnsembleInventoryLedger(self)
+        self._transaction_depth = 0
+        self._transaction_dirty = False
         self._load()
 
     def read_snapshot(self, key: str) -> dict[str, Any]:
@@ -131,7 +141,27 @@ class VotingEnsemblePaperExecutionRepository:
         normalized = self._key(key)
         with self._lock:
             self.snapshots[normalized] = self._owned_payload(snapshot)
-            self._save_unlocked()
+            if self._transaction_depth > 0:
+                self._transaction_dirty = True
+            else:
+                self._save_unlocked()
+
+    @contextmanager
+    def transaction(self):
+        with self._lock:
+            backup = dict(self.snapshots)
+            self._transaction_depth += 1
+            try:
+                yield
+            except Exception:
+                self.snapshots = backup
+                self._transaction_dirty = False
+                raise
+            finally:
+                self._transaction_depth -= 1
+            if self._transaction_depth == 0 and self._transaction_dirty:
+                self._save_unlocked()
+                self._transaction_dirty = False
 
     @property
     def persistenceHealthy(self) -> bool:
@@ -290,6 +320,7 @@ class VotingEnsemblePaperExecutionRepository:
                 "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
                 "namespace": f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.broker_orders",
                 "schemaVersion": "voting_ensemble_broker_order_mirror_v1",
+                "executionMode": "BROKER_PAPER",
                 "clientOrderId": order.clientOrderId,
                 "symbol": order.symbol,
                 "side": order.side,
@@ -313,6 +344,7 @@ class VotingEnsemblePaperExecutionRepository:
                 "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
                 "namespace": f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.broker_account",
                 "schemaVersion": "voting_ensemble_broker_account_mirror_v1",
+                "executionMode": "BROKER_PAPER",
                 "accountId": account.accountId,
                 "equity": account.equity,
                 "buyingPower": account.buyingPower,
@@ -323,6 +355,71 @@ class VotingEnsemblePaperExecutionRepository:
                 "reasonCodes": ["voting_ensemble.paper_execution.broker_account_read_only_snapshot"],
             },
         )
+
+    def local_account_snapshot(self, *, observed_at: datetime | None = None) -> dict[str, Any]:
+        return self.inventory_ledger.account_snapshot(observed_at=observed_at)
+
+    def local_broker_account_snapshot(self, *, observed_at: datetime | None = None) -> BrokerAccountSnapshot:
+        return self.inventory_ledger.broker_account_snapshot(observed_at=observed_at)
+
+    def mark_local_positions_from_market_data(
+        self,
+        *,
+        symbol: str,
+        nbbo: Mapping[str, Any] | None,
+        observed_at: datetime,
+    ) -> dict[str, Any]:
+        return self.inventory_ledger.mark_open_positions_from_market_data(
+            symbol=symbol,
+            nbbo=nbbo,
+            observed_at=observed_at,
+        )
+
+    def local_mark_fresh_for_entries(self, symbol: str, *, evaluated_at: datetime) -> bool:
+        return self.inventory_ledger.local_mark_is_fresh_for_entries(symbol, evaluated_at=evaluated_at)
+
+    def apply_local_fill(
+        self,
+        *,
+        client_order_id: str,
+        order_intent_id: str,
+        symbol: str,
+        side: Signal | str,
+        requested_quantity: int,
+        fill_price: float,
+        filled_at: datetime,
+    ) -> PaperGatewayFill | None:
+        return self.inventory_ledger.apply_fill(
+            client_order_id=client_order_id,
+            order_intent_id=order_intent_id,
+            symbol=symbol,
+            side=side,
+            requested_quantity=requested_quantity,
+            fill_price=fill_price,
+            filled_at=filled_at,
+        )
+
+    def _local_account_payload(
+        self,
+        *,
+        cash: float,
+        realized_pnl: float,
+        observed_at: datetime,
+        reason_codes: list[str],
+        equity: float | None = None,
+        unrealized_pnl: float = 0.0,
+    ) -> dict[str, Any]:
+        return self.inventory_ledger._account_payload(
+            cash=cash,
+            realized_pnl=realized_pnl,
+            observed_at=observed_at,
+            reason_codes=reason_codes,
+            equity=equity,
+            unrealized_pnl=unrealized_pnl,
+        )
+
+    def _local_risk_snapshot_payload(self, *, observed_at: datetime) -> dict[str, Any]:
+        return self.inventory_ledger.risk_snapshot_payload(observed_at=observed_at)
 
     def upsert_broker_fill(
         self,
@@ -335,11 +432,31 @@ class VotingEnsemblePaperExecutionRepository:
     ) -> None:
         if not _is_voting_ensemble_client_order_id(fill.clientOrderId):
             return
+        try:
+            existing_fill = self.read_snapshot(f"paper_order_gateway.fill.{fill.clientOrderId}")
+        except KeyError:
+            existing_fill = {}
+        previous_quantity = _safe_int(existing_fill.get("filledQuantity") or 0)
+        fill_delta = max(0, int(fill.filledQuantity) - previous_quantity)
+        if fill_delta > 0 and fill.averageFillPrice:
+            self.inventory_ledger.apply_fill(
+                client_order_id=fill.clientOrderId,
+                applied_fill_id=f"{fill.clientOrderId}:cum:{fill.filledQuantity}",
+                order_intent_id=str(order_intent_id or fill.clientOrderId),
+                symbol=order_plan.symbol,
+                side=order_plan.side,
+                requested_quantity=fill_delta,
+                fill_price=float(fill.averageFillPrice),
+                filled_at=fill.updatedAt,
+            )
         self.write_snapshot(
             f"paper_order_gateway.fill.{fill.clientOrderId}",
             {
                 "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
                 "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "executionMode": "BROKER_PAPER",
+                "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                "accountId": str(getattr(order_plan, "accountId", "") or VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID),
                 "source": "alpaca_paper_broker",
                 "sourceAuthority": "alpaca_paper_broker",
                 "orderIntentId": order_intent_id,
@@ -387,12 +504,19 @@ class VotingEnsemblePaperExecutionRepository:
     def inventory_snapshot(self) -> dict[str, Any]:
         with self._lock:
             snapshots = dict(self.snapshots)
-        orders = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.intent.")
-        fills = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.fill.")
+        order_intents = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.intent.")
+        orders = self.inventory_ledger.orders()
+        fills = self.inventory_ledger.fills()
         protective_orders = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.protective.")
         broker_orders = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.broker_order.")
         broker_positions = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.broker_position.")
         broker_accounts = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.broker_account.")
+        local_accounts = self.inventory_ledger.accounts()
+        closed_trades = self.inventory_ledger.closed_trades()
+        realized_pnl = self.inventory_ledger.realized_pnl_records()
+        risk_snapshots = self.inventory_ledger.risk_snapshots()
+        market_data = self.inventory_ledger.market_data_statuses()
+        local_executions = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_execution.")
         reconciliation_blocks = [
             record
             for record in _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_EXECUTION_STATE_NAMESPACE}.unknown_state.")
@@ -406,10 +530,20 @@ class VotingEnsemblePaperExecutionRepository:
         return {
             "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
             "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
             "paperExecutionVersion": VOTING_ENSEMBLE_PAPER_EXECUTION_VERSION,
             "orders": orders,
+            "orderIntents": order_intents,
             "fills": fills,
-            "positions": _positions_from_fills(fills),
+            "positions": self.inventory_ledger.positions(),
+            "account": local_accounts[-1] if local_accounts else self.local_account_snapshot(),
+            "accounts": local_accounts,
+            "closedTrades": closed_trades,
+            "realizedPnlRecords": realized_pnl,
+            "riskSnapshots": risk_snapshots,
+            "marketData": market_data,
+            "localExecutions": local_executions,
             "brokerOrders": broker_orders,
             "brokerPositions": broker_positions,
             "brokerAccounts": broker_accounts,
@@ -441,8 +575,12 @@ class VotingEnsemblePaperExecutionRepository:
         raw_algorithm = payload.get("algorithm_id", payload.get("algorithmId", VOTING_ENSEMBLE_ALGORITHM_ID))
         if raw_algorithm != VOTING_ENSEMBLE_ALGORITHM_ID:
             raise VotingEnsemblePaperExecutionNamespaceError("Voting Ensemble repository rejected a foreign algorithm record")
+        raw_partition = payload.get("capitalPartitionId", VOTING_ENSEMBLE_CAPITAL_PARTITION_ID)
+        if raw_partition != VOTING_ENSEMBLE_CAPITAL_PARTITION_ID:
+            raise VotingEnsemblePaperExecutionNamespaceError("Voting Ensemble repository rejected a foreign capital partition record")
         payload["algorithm_id"] = VOTING_ENSEMBLE_ALGORITHM_ID
         payload["algorithmId"] = VOTING_ENSEMBLE_ALGORITHM_ID
+        payload["capitalPartitionId"] = VOTING_ENSEMBLE_CAPITAL_PARTITION_ID
         return payload
 
     def _load(self) -> None:
@@ -685,7 +823,23 @@ class VotingEnsemblePaperExecutionWorker:
             }
             self.repository.mark_outbox_status(intent, "BLOCKED", result=result, reason_codes=tuple(result["reasonCodes"]))
             return result
-        proposal = proposal_from_order_plan(intent)
+        mark_blockers = _local_mark_blocks_new_entry(self.repository, intent.orderPlan, evaluated_at=now)
+        if mark_blockers:
+            result = {
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "paperExecutionVersion": VOTING_ENSEMBLE_PAPER_EXECUTION_VERSION,
+                "orderIntentId": intent.orderIntentId,
+                "submitted": False,
+                "status": "BLOCKED",
+                "reasonCodes": list(mark_blockers),
+            }
+            self.repository.mark_outbox_status(intent, "BLOCKED", result=result, reason_codes=tuple(result["reasonCodes"]))
+            return result
+        executable_quantity = _executable_quantity_for_order_plan(self.repository, intent.orderPlan)
+        proposal = proposal_from_order_plan(intent, quantity_override=executable_quantity)
+        if exit_intent:
+            proposal = proposal.model_copy(update={"intent": "risk_reducing"})
         application = allow_all_global_application(proposal, evaluated_at=now)
         try:
             self.repository.mark_outbox_status(
@@ -1042,9 +1196,11 @@ class VotingEnsemblePaperExecutionWorker:
         evaluated_at: datetime,
     ) -> dict[str, Any]:
         adapter_result: VotingEnsembleExecutionAdapterResult | None = None
+        executable_quantity = _executable_quantity_for_order_plan(self.repository, intent.orderPlan)
+        executable_order_plan = intent.orderPlan.model_copy(update={"quantity": executable_quantity})
         try:
             adapter_result = self.execution_adapter.submit_order_once(
-                orderPlan=intent.orderPlan,
+                orderPlan=executable_order_plan,
                 broker=self.broker_client,
                 idempotencyKey=str(outbox_record.get("executionIdempotencyKey") or intent.idempotencyKey),
                 evaluatedAt=evaluated_at,
@@ -1102,22 +1258,18 @@ class VotingEnsemblePaperExecutionWorker:
         }
         self.repository.write_snapshot(f"paper_order_gateway.intent.{intent.orderIntentId}", order_payload)
         if result.fillUpdate:
-            self.repository.write_snapshot(
-                f"paper_order_gateway.fill.{result.clientOrderId}",
-                {
-                    "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
-                    "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
-                    "source": "voting_ensemble.execution_adapter",
-                    "orderIntentId": intent.orderIntentId,
-                    "clientOrderId": result.clientOrderId,
-                    "symbol": result.orderPlan.symbol,
-                    "side": result.orderPlan.side,
-                    "filledQuantity": result.fillUpdate.filledQuantity,
-                    "averageFillPrice": result.fillUpdate.averageFillPrice,
-                    "status": result.fillUpdate.status,
-                    "filledAt": result.fillUpdate.updatedAt.isoformat().replace("+00:00", "Z"),
-                    "reasonCodes": list(result.reasonCodes),
-                },
+            self.repository.upsert_broker_fill(
+                BrokerFillUpdate(
+                    clientOrderId=result.clientOrderId,
+                    filledQuantity=result.fillUpdate.filledQuantity,
+                    averageFillPrice=result.fillUpdate.averageFillPrice,
+                    status=result.fillUpdate.status,
+                    updatedAt=result.fillUpdate.updatedAt,
+                ),
+                order_plan=result.orderPlan,
+                order_intent_id=intent.orderIntentId,
+                observed_at=result.evaluatedAt,
+                reason_codes=tuple(result.reasonCodes),
             )
 
     def _mark_uncertain_restart(self, intent: VotingEnsemblePaperOrderIntent, *, evaluated_at: datetime | None = None) -> dict[str, Any]:
@@ -1165,13 +1317,25 @@ class VotingEnsemblePaperExecutionRuntime:
         execution_adapter: VotingEnsembleExecutionAdapter | None = None,
         entry_permission_provider: Callable[[], Mapping[str, Any]] | None = None,
         short_trading_enabled: bool = False,
+        execution_mode: VotingEnsembleExecutionMode = VOTING_ENSEMBLE_DEFAULT_EXECUTION_MODE,
         auto_start: bool = False,
     ) -> None:
         provided_gateway = paper_gateway is not None
         self.repository = repository or VotingEnsemblePaperExecutionRepository()
         self.queue = queue or VotingEnsemblePaperExecutionQueue()
-        self.paper_gateway = paper_gateway or PaperOrderGateway(_default_paper_broker(), self.repository)
-        self.broker_client = broker_client if broker_client is not None else (_default_paper_broker_client() if not provided_gateway else None)
+        self.execution_mode: VotingEnsembleExecutionMode = _normalize_execution_mode(execution_mode)
+        if self.execution_mode == "LOCAL_PAPER" and broker_client is not None:
+            raise VotingEnsemblePaperExecutionNamespaceError("Voting Ensemble LOCAL_PAPER mode cannot be constructed with a broker trading client")
+        if self.execution_mode == "LOCAL_PAPER" and paper_gateway is not None and not _gateway_is_local_paper(paper_gateway):
+            raise VotingEnsemblePaperExecutionNamespaceError("Voting Ensemble LOCAL_PAPER mode requires a local paper gateway")
+        if self.execution_mode == "BROKER_PAPER" and broker_client is None and not provided_gateway:
+            broker_client = _default_paper_broker_client()
+        self.paper_gateway = paper_gateway or PaperOrderGateway(
+            VotingEnsembleLocalPaperBroker(self.repository) if self.execution_mode == "LOCAL_PAPER" else _default_paper_broker(),
+            self.repository,
+            execution_mode=self.execution_mode,
+        )
+        self.broker_client = broker_client if self.execution_mode == "BROKER_PAPER" else None
         self.execution_adapter = execution_adapter or _default_execution_adapter_for_runtime(repository=self.repository, broker_client=self.broker_client)
         self.entry_permission_provider = entry_permission_provider
         self.short_trading_enabled = short_trading_enabled
@@ -1237,6 +1401,14 @@ class VotingEnsemblePaperExecutionRuntime:
                 "enqueued": False,
                 "reasonCodes": ["voting_ensemble.paper_execution.control_blocked_before_intent", *list(permission.get("reasonCodes") or permission.get("blockers") or ())],
                 "control": dict(permission),
+            }
+        mark_blockers = _local_mark_blocks_new_entry(self.repository, order_plan, evaluated_at=evaluated_at)
+        if mark_blockers:
+            return {
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "enqueued": False,
+                "reasonCodes": list(mark_blockers),
             }
         intent = VotingEnsemblePaperOrderIntent(
             algorithmId=VOTING_ENSEMBLE_ALGORITHM_ID,
@@ -1335,14 +1507,63 @@ class VotingEnsemblePaperExecutionRuntime:
             }
             self.repository.mark_outbox_status(intent, "BLOCKED", result=result, reason_codes=tuple(result["reasonCodes"]))
             return result
+        mark_blockers = _local_mark_blocks_new_entry(self.repository, intent.orderPlan, evaluated_at=now)
+        if mark_blockers:
+            result = {
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "paperExecutionVersion": VOTING_ENSEMBLE_PAPER_EXECUTION_VERSION,
+                "orderIntentId": intent.orderIntentId,
+                "submitted": False,
+                "status": "BLOCKED",
+                "reasonCodes": list(mark_blockers),
+            }
+            self.repository.mark_outbox_status(intent, "BLOCKED", result=result, reason_codes=tuple(result["reasonCodes"]))
+            return result
         return self.worker.process_intent(intent, evaluated_at=evaluated_at)
 
     def reconcile_broker_state(self, *, evaluated_at: datetime | None = None) -> dict[str, Any] | None:
         now = evaluated_at or datetime.now(UTC)
+        if self.execution_mode == "LOCAL_PAPER":
+            evaluator = getattr(self.paper_gateway.broker, "evaluate_open_protective_orders", None)
+            protective_fills = evaluator() if callable(evaluator) else []
+            inventory = self.repository.inventory_snapshot()
+            return {
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                "executionMode": "LOCAL_PAPER",
+                "status": "RECONCILED",
+                "ordersObserved": len(inventory.get("orders") or []),
+                "positionsObserved": len(inventory.get("positions") or []),
+                "protectiveFillsObserved": len(protective_fills),
+                "brokerPositionsObserved": 0,
+                "evaluatedAt": _require_utc(now).isoformat().replace("+00:00", "Z"),
+                "reasonCodes": ["voting_ensemble.local_paper.reconciliation_uses_local_inventory_only"],
+            }
         result = self.worker.reconcile_broker_state(evaluated_at=now)
         if result is not None:
             return result
         return self.paper_gateway.recover_from_restart(evaluated_at=now)
+
+    def mark_to_market_from_payload(self, payload: Mapping[str, Any] | None, *, observed_at: datetime | None = None) -> dict[str, Any] | None:
+        if self.execution_mode != "LOCAL_PAPER" or not isinstance(payload, Mapping):
+            return None
+        nbbo = _extract_nbbo_payload(payload)
+        symbol = str(payload.get("symbol") or _nested_value(payload, ("marketEvent", "symbol")) or "SPY").upper()
+        point_in_time = (
+            _parse_time(payload.get("data_timestamp"))
+            or _parse_time(_nested_value(payload, ("market_context", "data_timestamp")))
+            or _parse_time(_nested_value(payload, ("marketEvent", "receivedAt")))
+            or observed_at
+            or datetime.now(UTC)
+        )
+        return self.repository.mark_local_positions_from_market_data(
+            symbol=symbol,
+            nbbo=nbbo,
+            observed_at=_require_utc(point_in_time),
+        )
 
     def _entry_permission(self) -> Mapping[str, Any]:
         repository_block = _repository_entry_blocks(self.repository)
@@ -1379,6 +1600,9 @@ class VotingEnsemblePaperExecutionRuntime:
         return {
             "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
             "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+            "executionMode": self.execution_mode,
             "paperExecutionVersion": VOTING_ENSEMBLE_PAPER_EXECUTION_VERSION,
             "executionNamespace": VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE,
             "gatewayNamespace": VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE,
@@ -1394,7 +1618,7 @@ class VotingEnsemblePaperExecutionRuntime:
             "lastPersistenceError": self.repository.lastPersistenceError,
             "lastPersistenceErrorAt": self.repository.lastPersistenceErrorAt,
             "highSeverityRuntimeWarnings": self.repository.runtime_warnings(),
-            "durableExecutionStateRequired": self.broker_client is not None,
+            "durableExecutionStateRequired": self.execution_mode == "BROKER_PAPER",
             "durableExecutionStateActive": isinstance(self.execution_adapter.state_store, VotingEnsembleDurableExecutionStateStore),
             "executionStateCount": len(inventory.get("executionStates") or []),
         }
@@ -1445,6 +1669,539 @@ class VotingEnsemblePaperExecutionWorkerThread:
                 self.lastError = str(exc) or type(exc).__name__
                 self.lastErrorAt = datetime.now(UTC).isoformat()
                 sleep(0.25)
+
+
+class VotingEnsembleLocalPaperBroker:
+    """Voting Ensemble-owned local paper broker.
+
+    This broker never submits to Alpaca or any external account. It simulates
+    orders and fills against the repository-owned Voting Ensemble account only.
+    """
+
+    configured = True
+    broker_kind = "voting_ensemble_local_paper"
+    paper_endpoint = True
+
+    def __init__(self, repository: VotingEnsemblePaperExecutionRepository) -> None:
+        self.repository = repository
+        self.engine = VotingEnsembleLocalPaperExecutionEngine(repository)
+
+    def verify_paper_account(self) -> bool:
+        return self.engine.verify_account()
+
+    def submit_bracket_order(self, intent: Any) -> PaperGatewayBrokerAck:
+        return self.engine.submit_order(intent)
+
+    def refresh_order(self, client_order_id: str) -> PaperGatewayFill | None:
+        return self.engine.refresh_order(client_order_id)
+
+    def cancel_order(self, client_order_id: str) -> bool:
+        return self.engine.cancel_order(client_order_id)
+
+    def refresh_positions(self) -> list[dict[str, Any]]:
+        return self.engine.refresh_positions()
+
+    def evaluate_open_protective_orders(self) -> list[PaperGatewayFill]:
+        return self.engine.evaluate_open_protective_orders()
+
+
+class VotingEnsembleLocalPaperExecutionEngine:
+    """Authoritative LOCAL_PAPER execution engine for Voting Ensemble.
+
+    The engine accepts only Voting Ensemble-owned gateway intents, validates
+    local inventory/cash/risk, creates local orders, simulates fills, applies
+    those fills atomically to the canonical inventory ledger, and persists every
+    order/fill/status transition. It never calls Alpaca trading endpoints.
+    """
+
+    execution_mode = "LOCAL_PAPER"
+
+    def __init__(self, repository: VotingEnsemblePaperExecutionRepository) -> None:
+        self.repository = repository
+
+    def verify_account(self) -> bool:
+        account = self.repository.local_account_snapshot()
+        return (
+            account.get("algorithmId") == VOTING_ENSEMBLE_ALGORITHM_ID
+            and account.get("capitalPartitionId") == VOTING_ENSEMBLE_CAPITAL_PARTITION_ID
+            and account.get("accountId") == VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID
+            and account.get("buyingPowerModel") == "LOCAL_CASH_NO_MARGIN_LONG_ONLY"
+            and account.get("allowMargin") is False
+            and account.get("allowShorts") is False
+        )
+
+    def submit_order(self, intent: Any) -> PaperGatewayBrokerAck:
+        reason = self._submission_rejection_reason(intent)
+        if reason is not None:
+            self._record_rejected_order(intent, reason)
+            return PaperGatewayBrokerAck(
+                clientOrderId=str(getattr(intent, "clientOrderId", "") or "voting-ensemble-local-rejected"),
+                brokerOrderId=None,
+                status="REJECTED",
+                rejectedReason=reason,
+            )
+        observed_at = _require_utc(getattr(intent, "createdAt", None) or datetime.now(UTC))
+        self.repository.inventory_ledger.create_order(intent, observed_at=observed_at)
+        self.repository.write_snapshot(
+            f"local_execution.{intent.clientOrderId}",
+            {
+                "schemaVersion": "voting_ensemble_local_execution_engine_v1",
+                "executionMode": "LOCAL_PAPER",
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                "clientOrderId": intent.clientOrderId,
+                "orderIntentId": intent.orderIntentId,
+                "status": "OPEN",
+                "simulated": True,
+                "createdAt": observed_at.isoformat().replace("+00:00", "Z"),
+                "reasonCodes": ["voting_ensemble.local_paper_execution_engine.order_opened"],
+            },
+        )
+        return PaperGatewayBrokerAck(
+            clientOrderId=intent.clientOrderId,
+            brokerOrderId=f"local-{intent.clientOrderId}",
+            status="OPEN",
+            acceptedAt=observed_at,
+        )
+
+    def refresh_order(self, client_order_id: str) -> PaperGatewayFill | None:
+        try:
+            order = self.repository.read_snapshot(f"local_order.{client_order_id}")
+        except KeyError:
+            try:
+                existing = self.repository.read_snapshot(f"paper_order_gateway.fill.{client_order_id}")
+                return _paper_gateway_fill_from_payload(existing)
+            except Exception:
+                return None
+        if str(order.get("status") or "").upper() == "FILLED":
+            try:
+                return _paper_gateway_fill_from_payload(self.repository.read_snapshot(f"paper_order_gateway.fill.{client_order_id}"))
+            except Exception:
+                return None
+        transaction = getattr(self.repository, "transaction", None)
+        if callable(transaction):
+            with transaction():
+                fill = self._simulate_and_apply_fill(order)
+        else:
+            fill = self._simulate_and_apply_fill(order)
+        return fill
+
+    def cancel_order(self, client_order_id: str) -> bool:
+        try:
+            order = self.repository.read_snapshot(f"local_order.{client_order_id}")
+        except KeyError:
+            return False
+        if int(order.get("filledQuantity") or 0) > 0:
+            return False
+        canceled = self.repository.inventory_ledger.cancel_order(client_order_id, canceled_at=datetime.now(UTC))
+        if canceled:
+            self.repository.write_snapshot(
+                f"local_execution.{client_order_id}",
+                {
+                    "schemaVersion": "voting_ensemble_local_execution_engine_v1",
+                    "executionMode": "LOCAL_PAPER",
+                    "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                    "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                    "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                    "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                    "clientOrderId": client_order_id,
+                    "orderIntentId": order.get("orderIntentId"),
+                    "status": "CANCELED",
+                    "simulated": True,
+                    "updatedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "reasonCodes": ["voting_ensemble.local_paper_execution_engine.order_canceled"],
+                },
+            )
+        return canceled
+
+    def refresh_positions(self) -> list[dict[str, Any]]:
+        self.evaluate_open_protective_orders()
+        return list(self.repository.inventory_snapshot().get("positions") or [])
+
+    def evaluate_open_protective_orders(self) -> list[PaperGatewayFill]:
+        fills: list[PaperGatewayFill] = []
+        for order in self.repository.inventory_ledger.orders():
+            if not order.get("protectiveKind"):
+                continue
+            if str(order.get("status") or "").upper() not in {"OPEN", "PARTIALLY_FILLED", "NEW", "ACCEPTED"}:
+                continue
+            fill = self.refresh_order(str(order.get("clientOrderId") or ""))
+            if fill is not None:
+                fills.append(fill)
+        return fills
+
+    def _simulate_and_apply_fill(self, order: Mapping[str, Any]) -> PaperGatewayFill | None:
+        client_order_id = str(order.get("clientOrderId") or "")
+        ownership_reason = self._stored_order_ownership_rejection_reason(order)
+        if ownership_reason is not None:
+            self.repository.write_snapshot(
+                f"local_execution.{client_order_id}",
+                {
+                    "schemaVersion": "voting_ensemble_local_execution_engine_v1",
+                    "executionMode": "LOCAL_PAPER",
+                    "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                    "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                    "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                    "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                    "clientOrderId": client_order_id,
+                    "orderIntentId": order.get("orderIntentId"),
+                    "status": "REJECTED",
+                    "simulated": True,
+                    "rejectedReason": ownership_reason,
+                    "reasonCodes": [ownership_reason, "voting_ensemble.local_paper_execution_engine.stored_order_owner_rejected"],
+                },
+            )
+            return None
+        order = self._order_sized_to_owned_position(order)
+        if int(order.get("quantity") or 0) <= int(order.get("filledQuantity") or 0):
+            self._record_open_order_status(order, status="CANCELED", reason_code="voting_ensemble.local_paper_execution_engine.exit_has_no_remaining_owned_quantity")
+            self._cancel_competing_oco_exit(order, reason_code="voting_ensemble.local_paper_execution_engine.exit_has_no_remaining_owned_quantity")
+            return None
+        fill_plan = self._local_fill_plan(order)
+        if fill_plan["status"] != "FILLABLE":
+            self._record_open_order_status(order, status=str(fill_plan["orderStatus"]), reason_code=str(fill_plan["reasonCode"]))
+            return None
+        fill = self.repository.apply_local_fill(
+            client_order_id=client_order_id,
+            order_intent_id=str(order.get("orderIntentId") or client_order_id),
+            symbol=str(order.get("symbol") or "SPY"),
+            side=Signal(order.get("side") or Signal.BUY),
+            requested_quantity=int(fill_plan["quantity"]),
+            fill_price=float(fill_plan["fillPrice"]),
+            filled_at=_parse_time(order.get("submittedAt")) or datetime.now(UTC),
+        )
+        if fill is None:
+            self.repository.write_snapshot(
+                f"local_execution.{client_order_id}",
+                {
+                    "schemaVersion": "voting_ensemble_local_execution_engine_v1",
+                    "executionMode": "LOCAL_PAPER",
+                    "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                    "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                    "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                    "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                    "clientOrderId": client_order_id,
+                    "orderIntentId": order.get("orderIntentId"),
+                    "status": "REJECTED",
+                    "simulated": True,
+                    "reasonCodes": ["voting_ensemble.local_paper_execution_engine.fill_rejected_by_inventory"],
+                },
+            )
+            return None
+        self.repository.inventory_ledger.mark_order_filled(client_order_id, fill)
+        updated_order = self.repository.read_snapshot(f"local_order.{client_order_id}")
+        self._after_local_fill(order=updated_order, fill=fill)
+        self.repository.write_snapshot(
+            f"local_execution.{client_order_id}",
+            {
+                "schemaVersion": "voting_ensemble_local_execution_engine_v1",
+                "executionMode": "LOCAL_PAPER",
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                "clientOrderId": client_order_id,
+                "orderIntentId": order.get("orderIntentId"),
+                "status": updated_order.get("status") or fill.status,
+                "filledQuantity": updated_order.get("filledQuantity"),
+                "lastFillQuantity": fill.filledQuantity,
+                "averageFillPrice": fill.averageFillPrice,
+                "filledAt": fill.filledAt.isoformat().replace("+00:00", "Z"),
+                "fillPolicy": fill_plan.get("fillPolicy"),
+                "simulated": True,
+                "reasonCodes": ["voting_ensemble.local_paper_execution_engine.fill_simulated_and_applied"],
+            },
+        )
+        return fill
+
+    def _after_local_fill(self, *, order: Mapping[str, Any], fill: PaperGatewayFill) -> None:
+        if not order.get("protectiveKind") and fill.side == Signal.BUY and fill.filledQuantity > 0:
+            self._ensure_local_protective_oco(order, fill)
+            return
+        if order.get("protectiveKind"):
+            remaining = self.repository.inventory_ledger.quantity_for_symbol(str(order.get("symbol") or fill.symbol).upper())
+            if remaining <= 0 or str(order.get("status") or "").upper() == "FILLED":
+                self._cancel_competing_oco_exit(order, reason_code="voting_ensemble.local_paper_execution_engine.oco_sibling_canceled_after_exit_fill")
+            else:
+                self._resize_open_oco_siblings(order, remaining_quantity=remaining)
+
+    def _ensure_local_protective_oco(self, entry_order: Mapping[str, Any], fill: PaperGatewayFill) -> None:
+        if fill.side != Signal.BUY:
+            return
+        symbol = str(entry_order.get("symbol") or fill.symbol).upper()
+        remaining = self.repository.inventory_ledger.quantity_for_symbol(symbol)
+        if remaining <= 0:
+            return
+        stop_price = _positive_float(entry_order.get("stopPrice"))
+        target_price = _positive_float(entry_order.get("targetPrice"))
+        if stop_price is None and target_price is None:
+            return
+        parent_id = str(entry_order.get("clientOrderId") or fill.clientOrderId)
+        oco_group_id = f"{parent_id}-oco"
+        if stop_price is not None:
+            self._upsert_local_protective_order(
+                parent_order=entry_order,
+                client_order_id=f"{parent_id}-stop",
+                protective_kind="STOP_LOSS",
+                quantity=remaining,
+                order_type="STOP_LIMIT",
+                trigger_price=stop_price,
+                limit_price=stop_price,
+                oco_group_id=oco_group_id,
+            )
+        if target_price is not None:
+            self._upsert_local_protective_order(
+                parent_order=entry_order,
+                client_order_id=f"{parent_id}-target",
+                protective_kind="PROFIT_TARGET",
+                quantity=remaining,
+                order_type="LIMIT",
+                trigger_price=None,
+                limit_price=target_price,
+                oco_group_id=oco_group_id,
+            )
+
+    def _upsert_local_protective_order(
+        self,
+        *,
+        parent_order: Mapping[str, Any],
+        client_order_id: str,
+        protective_kind: str,
+        quantity: int,
+        order_type: str,
+        trigger_price: float | None,
+        limit_price: float,
+        oco_group_id: str,
+    ) -> None:
+        try:
+            existing = self.repository.read_snapshot(f"local_order.{client_order_id}")
+        except KeyError:
+            existing = {}
+        if str(existing.get("status") or "").upper() in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}:
+            return
+        submitted_at = _parse_time(parent_order.get("submittedAt")) or datetime.now(UTC)
+        payload = {
+            **existing,
+            "schemaVersion": "voting_ensemble_local_order_v1",
+            "clientOrderId": client_order_id,
+            "parentClientOrderId": parent_order.get("clientOrderId"),
+            "orderIntentId": parent_order.get("orderIntentId"),
+            "decisionId": parent_order.get("decisionId"),
+            "symbol": str(parent_order.get("symbol") or "SPY").upper(),
+            "side": Signal.SELL.value,
+            "orderType": order_type,
+            "quantity": int(quantity),
+            "filledQuantity": min(int(existing.get("filledQuantity") or 0), int(quantity)),
+            "entryPrice": float(limit_price),
+            "triggerPrice": trigger_price,
+            "limitPrice": float(limit_price),
+            "stopPrice": trigger_price if protective_kind == "STOP_LOSS" else None,
+            "targetPrice": limit_price if protective_kind == "PROFIT_TARGET" else None,
+            "submittedAt": submitted_at.isoformat().replace("+00:00", "Z"),
+            "status": "OPEN",
+            "protectiveKind": protective_kind,
+            "ocoGroupId": oco_group_id,
+            "positionOwner": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "exitOwner": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+            "executionMode": "LOCAL_PAPER",
+            "sourceAuthority": "voting_ensemble_local_paper_account",
+            "reasonCodes": [*list(existing.get("reasonCodes") or ()), "voting_ensemble.local_paper_execution_engine.protective_oco_order_upserted"],
+        }
+        self.repository.write_snapshot(f"local_order.{client_order_id}", payload)
+
+    def _order_sized_to_owned_position(self, order: Mapping[str, Any]) -> Mapping[str, Any]:
+        if not order.get("protectiveKind") and Signal(order.get("side") or Signal.BUY) != Signal.SELL:
+            return order
+        if Signal(order.get("side") or Signal.BUY) != Signal.SELL:
+            return order
+        position = self.repository.inventory_ledger.position_for_symbol(str(order.get("symbol") or "SPY").upper())
+        owned = max(0, int(position.get("quantity") or 0))
+        quantity = min(int(order.get("quantity") or 0), owned + int(order.get("filledQuantity") or 0))
+        if quantity == int(order.get("quantity") or 0):
+            return order
+        updated = {**dict(order), "quantity": quantity, "reasonCodes": [*list(order.get("reasonCodes") or ()), "voting_ensemble.local_paper_execution_engine.exit_quantity_sized_to_owned_position"]}
+        self.repository.write_snapshot(f"local_order.{order.get('clientOrderId')}", updated)
+        return updated
+
+    def _resize_open_oco_siblings(self, order: Mapping[str, Any], *, remaining_quantity: int) -> None:
+        oco_group_id = order.get("ocoGroupId")
+        if not oco_group_id:
+            return
+        for sibling in self.repository.inventory_ledger.orders():
+            if sibling.get("ocoGroupId") != oco_group_id or sibling.get("clientOrderId") == order.get("clientOrderId"):
+                continue
+            if str(sibling.get("status") or "").upper() not in {"OPEN", "PARTIALLY_FILLED", "NEW", "ACCEPTED"}:
+                continue
+            self.repository.write_snapshot(
+                f"local_order.{sibling['clientOrderId']}",
+                {
+                    **sibling,
+                    "quantity": int(remaining_quantity) + int(sibling.get("filledQuantity") or 0),
+                    "reasonCodes": [*list(sibling.get("reasonCodes") or ()), "voting_ensemble.local_paper_execution_engine.oco_sibling_resized_to_remaining_position"],
+                },
+            )
+
+    def _cancel_competing_oco_exit(self, order: Mapping[str, Any], *, reason_code: str) -> None:
+        oco_group_id = order.get("ocoGroupId")
+        if not oco_group_id:
+            return
+        for sibling in self.repository.inventory_ledger.orders():
+            if sibling.get("ocoGroupId") != oco_group_id or sibling.get("clientOrderId") == order.get("clientOrderId"):
+                continue
+            if str(sibling.get("status") or "").upper() in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}:
+                continue
+            self.repository.write_snapshot(
+                f"local_order.{sibling['clientOrderId']}",
+                {
+                    **sibling,
+                    "status": "CANCELED",
+                    "canceledAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    "reasonCodes": [*list(sibling.get("reasonCodes") or ()), reason_code],
+                },
+            )
+
+    def _local_fill_plan(self, order: Mapping[str, Any]) -> dict[str, Any]:
+        side = Signal(order.get("side") or Signal.BUY)
+        symbol = str(order.get("symbol") or "SPY").upper()
+        quote = self.repository.inventory_ledger.latest_market_data_status(symbol)
+        if not quote or not bool(quote.get("fresh")):
+            return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.no_fresh_quote"}
+        quote_timestamp = _parse_time(quote.get("quoteTimestamp"))
+        if quote_timestamp is None:
+            return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.quote_timestamp_missing"}
+        age_ms = max(0.0, (datetime.now(UTC) - quote_timestamp).total_seconds() * 1000.0)
+        max_age_ms = _local_paper_env_float("VOTING_ENSEMBLE_LOCAL_PAPER_MAX_QUOTE_AGE_MS", 5000.0)
+        if age_ms > max_age_ms and quote.get("observedAt"):
+            observed = _parse_time(quote.get("observedAt"))
+            age_ms = max(0.0, ((observed or datetime.now(UTC)) - quote_timestamp).total_seconds() * 1000.0)
+        if age_ms > max_age_ms:
+            return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.stale_quote"}
+        order_type = str(order.get("orderType") or "LIMIT").upper()
+        trigger = _positive_float(order.get("triggerPrice"))
+        if "STOP" in order_type and not bool(order.get("stopTriggered")):
+            triggered = (side == Signal.BUY and trigger is not None and _float(quote.get("ask")) >= trigger) or (side == Signal.SELL and trigger is not None and _float(quote.get("bid")) <= trigger)
+            if not triggered:
+                return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.stop_not_triggered"}
+            self.repository.write_snapshot(
+                f"local_order.{order['clientOrderId']}",
+                {
+                    **dict(order),
+                    "stopTriggered": True,
+                    "status": "OPEN",
+                    "reasonCodes": [*list(order.get("reasonCodes") or ()), "voting_ensemble.local_paper_execution_engine.stop_triggered_limit_active"],
+                },
+            )
+        limit = _positive_float(order.get("limitPrice") or order.get("entryPrice"))
+        if limit is None:
+            return {"status": "NOT_FILLABLE", "orderStatus": "REJECTED", "reasonCode": "voting_ensemble.local_paper_execution_engine.limit_price_missing"}
+        executable_price = _float(quote.get("ask" if side == Signal.BUY else "bid"))
+        if side == Signal.BUY and executable_price > limit:
+            return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.buy_limit_not_executable"}
+        if side == Signal.SELL and executable_price < limit:
+            return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.sell_limit_not_executable"}
+        slippage_bps = _local_paper_env_float("VOTING_ENSEMBLE_LOCAL_PAPER_SLIPPAGE_BPS", 0.0)
+        fill_price = executable_price * (1.0 + slippage_bps / 10000.0) if side == Signal.BUY else executable_price * (1.0 - slippage_bps / 10000.0)
+        fill_price = min(fill_price, limit) if side == Signal.BUY else max(fill_price, limit)
+        remaining = max(0, int(order.get("quantity") or 0) - int(order.get("filledQuantity") or 0))
+        quote_size = _float(quote.get("askSize" if side == Signal.BUY else "bidSize"))
+        participation = max(0.0, min(100.0, _local_paper_env_float("VOTING_ENSEMBLE_LOCAL_PAPER_MAX_PARTICIPATION_PCT", 100.0))) / 100.0
+        fill_quantity = min(remaining, max(0, int(quote_size * participation)))
+        if fill_quantity <= 0:
+            return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.no_quote_size_available"}
+        return {
+            "status": "FILLABLE",
+            "quantity": fill_quantity,
+            "fillPrice": round(fill_price, 6),
+            "fillPolicy": "limit_quote_size_participation_slippage_capped_at_limit",
+        }
+
+    def _record_open_order_status(self, order: Mapping[str, Any], *, status: str, reason_code: str) -> None:
+        client_order_id = str(order.get("clientOrderId") or "")
+        updated = {**dict(order), "status": status, "reasonCodes": [*list(order.get("reasonCodes") or ()), reason_code]}
+        self.repository.write_snapshot(f"local_order.{client_order_id}", updated)
+        self.repository.write_snapshot(
+            f"local_execution.{client_order_id}",
+            {
+                "schemaVersion": "voting_ensemble_local_execution_engine_v1",
+                "executionMode": "LOCAL_PAPER",
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                "clientOrderId": client_order_id,
+                "orderIntentId": order.get("orderIntentId"),
+                "status": status,
+                "filledQuantity": int(order.get("filledQuantity") or 0),
+                "simulated": True,
+                "reasonCodes": [reason_code],
+            },
+        )
+
+    def _submission_rejection_reason(self, intent: Any) -> str | None:
+        if getattr(intent, "algorithmId", None) != VOTING_ENSEMBLE_ALGORITHM_ID:
+            return "voting_ensemble.local_paper.foreign_algorithm_rejected"
+        if getattr(intent, "capitalPartitionId", None) != VOTING_ENSEMBLE_CAPITAL_PARTITION_ID:
+            return "voting_ensemble.local_paper.foreign_capital_partition_rejected"
+        quantity = int(getattr(intent, "submittedQuantity", 0) or 0)
+        if quantity <= 0:
+            return "voting_ensemble.local_paper.zero_quantity"
+        side = Signal(getattr(intent, "side"))
+        account = self.repository.local_account_snapshot()
+        if account.get("allowMargin") is not False or account.get("allowShorts") is not False:
+            return "voting_ensemble.local_paper.margin_or_shorts_not_enabled"
+        notional = quantity * float(getattr(intent, "limitPrice", None) or getattr(intent, "triggerPrice", None) or 0.0)
+        if side == Signal.BUY and float(account.get("usableEntryBuyingPower") or account.get("buyingPower") or 0.0) < notional:
+            return "voting_ensemble.local_paper.insufficient_buying_power"
+        planned_risk = float(getattr(intent, "plannedRiskDollars", 0.0) or 0.0)
+        if side == Signal.BUY and planned_risk > max(0.0, float(account.get("equity") or 0.0)):
+            return "voting_ensemble.local_paper.local_risk_limit_exceeded"
+        if side == Signal.SELL:
+            position = self.repository.inventory_ledger.position_for_symbol(str(getattr(intent, "symbol", "SPY")).upper())
+            owned = int(position.get("quantity") or 0)
+            if owned <= 0:
+                return "voting_ensemble.local_paper.sell_cannot_mutate_foreign_or_absent_position"
+            if quantity > owned:
+                return "voting_ensemble.local_paper.sell_quantity_exceeds_owned_inventory"
+        return None
+
+    def _stored_order_ownership_rejection_reason(self, order: Mapping[str, Any]) -> str | None:
+        if order.get("algorithmId", order.get("algorithm_id")) != VOTING_ENSEMBLE_ALGORITHM_ID:
+            return "voting_ensemble.local_paper.stored_order_foreign_algorithm_rejected"
+        if order.get("capitalPartitionId") != VOTING_ENSEMBLE_CAPITAL_PARTITION_ID:
+            return "voting_ensemble.local_paper.stored_order_foreign_capital_partition_rejected"
+        if order.get("accountId", VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID) != VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID:
+            return "voting_ensemble.local_paper.stored_order_foreign_account_rejected"
+        if Signal(order.get("side") or Signal.BUY) == Signal.SELL:
+            position = self.repository.inventory_ledger.position_for_symbol(str(order.get("symbol") or "SPY").upper())
+            if not position or int(position.get("quantity") or 0) <= 0:
+                return "voting_ensemble.local_paper.sell_cannot_mutate_foreign_or_absent_position"
+        return None
+
+    def _record_rejected_order(self, intent: Any, reason: str) -> None:
+        client_order_id = str(getattr(intent, "clientOrderId", "") or "voting-ensemble-local-rejected")
+        self.repository.write_snapshot(
+            f"local_execution.{client_order_id}",
+            {
+                "schemaVersion": "voting_ensemble_local_execution_engine_v1",
+                "executionMode": "LOCAL_PAPER",
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+                "clientOrderId": client_order_id,
+                "orderIntentId": getattr(intent, "orderIntentId", None),
+                "status": "REJECTED",
+                "simulated": True,
+                "rejectedReason": reason,
+                "reasonCodes": [reason, "voting_ensemble.local_paper_execution_engine.order_rejected"],
+            },
+        )
 
 
 class VotingEnsembleAlpacaPaperBroker:
@@ -1875,8 +2632,9 @@ def eligible_order_plan_from_decision(decision: Mapping[str, Any]) -> OrderPlan 
     return plan
 
 
-def proposal_from_order_plan(intent: VotingEnsemblePaperOrderIntent) -> GlobalOrderProposal:
+def proposal_from_order_plan(intent: VotingEnsemblePaperOrderIntent, *, quantity_override: int | None = None) -> GlobalOrderProposal:
     order = intent.orderPlan
+    quantity = max(0, int(quantity_override if quantity_override is not None else order.quantity))
     return GlobalOrderProposal(
         algorithmId=VOTING_ENSEMBLE_ALGORITHM_ID,
         capitalPartitionId=VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
@@ -1885,12 +2643,12 @@ def proposal_from_order_plan(intent: VotingEnsemblePaperOrderIntent) -> GlobalOr
         intent="new_entry",
         symbol=order.symbol,
         side=order.side,
-        quantity=order.quantity,
+        quantity=quantity,
         triggerPrice=order.entryPrice,
         limitPrice=order.limitPrice,
         stopPrice=order.stopPrice,
         targetPrice=order.targetPrice,
-        plannedRiskDollars=max(0.0, abs(order.entryPrice - (order.stopPrice or order.entryPrice)) * order.quantity),
+        plannedRiskDollars=max(0.0, abs(order.entryPrice - (order.stopPrice or order.entryPrice)) * quantity),
         settingsSnapshot={
             "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
             "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
@@ -1954,7 +2712,7 @@ def _is_voting_ensemble_client_order_id(value: str | None) -> bool:
 
 def _positions_by_symbol(repository: VotingEnsemblePaperExecutionRepository) -> dict[str, int]:
     positions: dict[str, int] = {}
-    for position in repository.inventory_snapshot().get("positions") or []:
+    for position in repository.inventory_ledger.positions():
         symbol = str(position.get("symbol") or "").upper()
         if not symbol:
             continue
@@ -2057,6 +2815,17 @@ def _is_risk_reducing_order_plan(repository: VotingEnsemblePaperExecutionReposit
     return (side == Signal.SELL and quantity > 0) or (side == Signal.BUY and quantity < 0)
 
 
+def _executable_quantity_for_order_plan(repository: VotingEnsemblePaperExecutionRepository, order_plan: OrderPlan) -> int:
+    requested = max(0, int(order_plan.quantity))
+    owned = _positions_by_symbol(repository).get(order_plan.symbol.upper(), 0)
+    side = Signal(order_plan.side)
+    if side == Signal.SELL and owned > 0:
+        return min(requested, owned)
+    if side == Signal.BUY and owned < 0:
+        return min(requested, abs(owned))
+    return requested
+
+
 def _short_entry_blockers(
     *,
     repository: VotingEnsemblePaperExecutionRepository,
@@ -2133,6 +2902,18 @@ def _default_execution_adapter_for_runtime(
     return VotingEnsembleExecutionAdapter(state_store=VotingEnsembleDurableExecutionStateStore(repository))
 
 
+def _normalize_execution_mode(value: str) -> VotingEnsembleExecutionMode:
+    normalized = str(value or VOTING_ENSEMBLE_DEFAULT_EXECUTION_MODE).upper()
+    if normalized not in {"LOCAL_PAPER", "BROKER_PAPER"}:
+        raise VotingEnsemblePaperExecutionNamespaceError("Voting Ensemble paper execution mode must be LOCAL_PAPER or BROKER_PAPER")
+    return normalized  # type: ignore[return-value]
+
+
+def _gateway_is_local_paper(gateway: PaperOrderGateway) -> bool:
+    broker = getattr(gateway, "broker", None)
+    return getattr(gateway, "execution_mode", None) == "LOCAL_PAPER" and getattr(broker, "broker_kind", None) == "voting_ensemble_local_paper"
+
+
 def _execution_state_key(client_order_id: str) -> str:
     return f"{VOTING_ENSEMBLE_EXECUTION_STATE_NAMESPACE}.orders.{client_order_id}"
 
@@ -2196,6 +2977,14 @@ def _repository_entry_blocks(repository: VotingEnsemblePaperExecutionRepository)
     blocks = [] if repository.persistenceHealthy else ["voting_ensemble.paper_execution.persistence_failure_blocks_new_entries"]
     blocks.extend(_repository_reconciliation_blocks(repository))
     return sorted(set(blocks))
+
+
+def _local_mark_blocks_new_entry(repository: VotingEnsemblePaperExecutionRepository, order_plan: OrderPlan, *, evaluated_at: datetime) -> tuple[str, ...]:
+    if _is_risk_reducing_order_plan(repository, order_plan):
+        return ()
+    if repository.local_mark_fresh_for_entries(order_plan.symbol, evaluated_at=evaluated_at):
+        return ()
+    return ("voting_ensemble.paper_execution.local_mark_stale_blocks_new_entries",)
 
 
 def _merge_permission_with_persistence(permission: Mapping[str, Any], persistence_block: list[str]) -> dict[str, Any]:
@@ -2351,10 +3140,7 @@ def _order_intent_id(order_plan: OrderPlan, idempotency_key: str) -> str:
 
 
 def _default_paper_broker() -> VotingEnsembleAlpacaPaperBroker | VotingEnsembleUnavailablePaperBroker:
-    try:
-        return VotingEnsembleAlpacaPaperBroker()
-    except VotingEnsembleAlpacaPaperBrokerConfigurationError:
-        return VotingEnsembleUnavailablePaperBroker()
+    return VotingEnsembleUnavailablePaperBroker()
 
 
 def _default_paper_broker_client() -> AlpacaPaperBrokerClient | None:
@@ -2473,6 +3259,23 @@ def _fill_update_from_activity(payload: Mapping[str, Any]) -> BrokerFillUpdate:
     )
 
 
+def _paper_gateway_fill_from_payload(payload: Mapping[str, Any]) -> PaperGatewayFill:
+    return PaperGatewayFill(
+        executionMode=_normalize_execution_mode(payload.get("executionMode") or "LOCAL_PAPER"),
+        clientOrderId=str(payload.get("clientOrderId") or ""),
+        algorithmId=VOTING_ENSEMBLE_ALGORITHM_ID,
+        capitalPartitionId=str(payload.get("capitalPartitionId") or VOTING_ENSEMBLE_CAPITAL_PARTITION_ID),
+        accountId=str(payload.get("accountId") or VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID),
+        orderIntentId=str(payload.get("orderIntentId") or payload.get("clientOrderId") or ""),
+        symbol=str(payload.get("symbol") or "SPY").upper(),
+        side=Signal(payload.get("side") or Signal.BUY),
+        filledQuantity=int(payload.get("filledQuantity") or 0),
+        averageFillPrice=_positive_float(payload.get("averageFillPrice")),
+        status=_broker_status(str(payload.get("status") or "FILLED")),  # type: ignore[arg-type]
+        filledAt=_parse_time(payload.get("filledAt")) or datetime.now(UTC),
+    )
+
+
 def _positive_float(value: Any) -> float | None:
     try:
         parsed = float(value)
@@ -2487,6 +3290,45 @@ def _float(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(0.0, parsed)
+
+
+def _local_paper_env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, value)
+
+
+def _extract_nbbo_payload(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    direct = payload.get("nbbo")
+    if isinstance(direct, Mapping):
+        return direct
+    context = payload.get("market_context")
+    if isinstance(context, Mapping):
+        context_nbbo = context.get("nbbo")
+        if isinstance(context_nbbo, Mapping):
+            return context_nbbo
+        automatic = context.get("automaticRuntimeSnapshot")
+        if isinstance(automatic, Mapping):
+            automatic_nbbo = automatic.get("nbbo")
+            if isinstance(automatic_nbbo, Mapping):
+                return automatic_nbbo
+    automatic = payload.get("automaticRuntimeSnapshot")
+    if isinstance(automatic, Mapping):
+        automatic_nbbo = automatic.get("nbbo")
+        if isinstance(automatic_nbbo, Mapping):
+            return automatic_nbbo
+    return None
+
+
+def _nested_value(payload: Mapping[str, Any], path: tuple[str, ...]) -> Any:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(key)
+    return current
 
 
 def _safe_int(value: Any) -> int:
@@ -2514,38 +3356,6 @@ def _records_with_prefix(snapshots: Mapping[str, Mapping[str, Any]], prefix: str
         for key, payload in sorted(snapshots.items())
         if key.startswith(prefix) and payload.get("algorithmId", payload.get("algorithm_id")) == VOTING_ENSEMBLE_ALGORITHM_ID
     ]
-
-
-def _positions_from_fills(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    positions: dict[str, dict[str, Any]] = {}
-    for fill in fills:
-        symbol = str(fill.get("symbol") or "SPY")
-        quantity = int(fill.get("filledQuantity") or 0)
-        price = float(fill.get("averageFillPrice") or 0.0)
-        if quantity <= 0 or price <= 0:
-            continue
-        side = str(fill.get("side") or "").lower()
-        signed_quantity = -quantity if side == "sell" else quantity
-        current = positions.setdefault(
-            symbol,
-            {
-                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
-                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
-                "symbol": symbol,
-                "quantity": 0,
-                "averagePrice": 0.0,
-                "notional": 0.0,
-                "updatedAt": fill.get("filledAt"),
-                "source": "voting_ensemble.paper_execution.fills",
-            },
-        )
-        next_quantity = int(current["quantity"]) + signed_quantity
-        next_notional = float(current["notional"]) + signed_quantity * price
-        current["quantity"] = next_quantity
-        current["notional"] = next_notional
-        current["averagePrice"] = abs(next_notional / next_quantity) if next_quantity else 0.0
-        current["updatedAt"] = fill.get("filledAt") or current.get("updatedAt")
-    return [position for position in positions.values() if int(position["quantity"]) != 0]
 
 
 def _hash(payload: Mapping[str, Any]) -> str:

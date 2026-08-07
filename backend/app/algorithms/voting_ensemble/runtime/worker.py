@@ -69,6 +69,7 @@ class VotingEnsembleWorker:
 
     def _execute(self, command: VotingEnsembleRuntimeCommand) -> dict[str, Any]:
         if command.commandKind in {"manual_evaluation", "finalized_bar_evaluation"}:
+            local_mark_result = None
             if command.commandKind == "finalized_bar_evaluation":
                 if self.automatic_payload_builder is None:
                     return _automatic_fail_closed_result(
@@ -79,7 +80,10 @@ class VotingEnsembleWorker:
                 try:
                     authoritative_payload = self.automatic_payload_builder.build(command)
                 except VotingEnsembleAutomaticSnapshotError as exc:
-                    return _automatic_fail_closed_result(command, str(exc), exc.reason_codes, snapshot=exc.snapshot)
+                    local_mark_result = _mark_local_paper_from_payload(self.paper_execution_runtime, exc.snapshot)
+                    failed = _automatic_fail_closed_result(command, str(exc), exc.reason_codes, snapshot=exc.snapshot)
+                    failed["localPaperMarkToMarket"] = local_mark_result
+                    return failed
                 except Exception as exc:
                     return _automatic_fail_closed_result(
                         command,
@@ -87,6 +91,7 @@ class VotingEnsembleWorker:
                         ["voting_ensemble.runtime.automatic_snapshot_construction_failed"],
                     )
                 payload = authoritative_payload
+                local_mark_result = _mark_local_paper_from_payload(self.paper_execution_runtime, payload)
             else:
                 authoritative_payload = {
                     **command.payload,
@@ -133,6 +138,7 @@ class VotingEnsembleWorker:
                 "runtimeMode": "automatic_finalized_bar" if command.commandKind == "finalized_bar_evaluation" else "manual_research",
                 "brokerSubmissionAllowed": command.commandKind == "finalized_bar_evaluation",
                 "automaticRuntimeSnapshotHash": _snapshot_hash(payload) if command.commandKind == "finalized_bar_evaluation" else None,
+                "localPaperMarkToMarket": local_mark_result,
                 "decision": result,
                 "paperExecution": execution_enqueue_result,
                 "reasonCodes": [
@@ -347,6 +353,13 @@ def _automatic_fail_closed_result(
         },
         "reasonCodes": decision["reason_codes"],
     }
+
+
+def _mark_local_paper_from_payload(paper_execution_runtime: Any, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    marker = getattr(paper_execution_runtime, "mark_to_market_from_payload", None)
+    if not callable(marker):
+        return None
+    return marker(payload, observed_at=datetime.now(UTC))
 
 
 def _snapshot_hash(payload: dict[str, Any]) -> str | None:

@@ -17,7 +17,8 @@ from backend.app.risk.types import AccountSnapshot, GlobalGateDecision as Portfo
 
 PAPER_ORDER_GATEWAY_VERSION = "paper_order_gateway_v1"
 SubmissionMode = Literal["manual", "automatic"]
-GatewayOrderStatus = Literal["NOT_SUBMITTED", "PENDING_SUBMISSION", "ACCEPTED", "REJECTED", "PARTIALLY_FILLED", "FILLED", "CANCELED", "DUPLICATE", "RECOVERED", "REPLACED"]
+PaperExecutionMode = Literal["LOCAL_PAPER", "BROKER_PAPER"]
+GatewayOrderStatus = Literal["NOT_SUBMITTED", "PENDING_SUBMISSION", "NEW", "OPEN", "ACCEPTED", "REJECTED", "PARTIALLY_FILLED", "FILLED", "CANCELED", "DUPLICATE", "RECOVERED", "REPLACED", "EXPIRED"]
 
 
 class PaperGatewayBrokerAck(DomainModel):
@@ -34,8 +35,11 @@ class PaperGatewayBrokerAck(DomainModel):
 
 
 class PaperGatewayFill(DomainModel):
+    executionMode: PaperExecutionMode = "BROKER_PAPER"
     clientOrderId: str = Field(min_length=1)
     algorithmId: str = Field(min_length=1)
+    capitalPartitionId: str | None = None
+    accountId: str | None = None
     orderIntentId: str = Field(min_length=1)
     symbol: str = Field(min_length=1)
     side: Signal
@@ -51,9 +55,12 @@ class PaperGatewayFill(DomainModel):
 
 
 class PaperGatewayProtectiveOrder(DomainModel):
+    executionMode: PaperExecutionMode = "BROKER_PAPER"
     clientOrderId: str = Field(min_length=1)
     parentClientOrderId: str = Field(min_length=1)
     algorithmId: str = Field(min_length=1)
+    capitalPartitionId: str | None = None
+    accountId: str | None = None
     orderIntentId: str = Field(min_length=1)
     quantity: int = Field(ge=0)
     stopPrice: float | None = Field(default=None, gt=0)
@@ -64,6 +71,7 @@ class PaperGatewayProtectiveOrder(DomainModel):
 
 class PaperOrderIntentRecord(DomainModel):
     gatewayVersion: str = PAPER_ORDER_GATEWAY_VERSION
+    executionMode: PaperExecutionMode = "BROKER_PAPER"
     algorithmId: str = Field(min_length=1)
     capitalPartitionId: str = Field(min_length=1)
     decisionId: str = Field(min_length=1)
@@ -107,6 +115,7 @@ class PaperOrderIntentRecord(DomainModel):
 
 class PaperOrderGatewayResult(DomainModel):
     gatewayVersion: str = PAPER_ORDER_GATEWAY_VERSION
+    executionMode: PaperExecutionMode = "BROKER_PAPER"
     algorithmId: str
     orderIntentId: str
     clientOrderId: str
@@ -157,11 +166,20 @@ class PaperOrderBroker(Protocol):
 
 
 class PaperOrderGateway:
-    def __init__(self, broker: PaperOrderBroker, store: PaperOrderGatewayStore, *, max_decision_age_seconds: int = 300, global_risk_manager: GlobalPortfolioRiskManager | None = None) -> None:
+    def __init__(
+        self,
+        broker: PaperOrderBroker,
+        store: PaperOrderGatewayStore,
+        *,
+        max_decision_age_seconds: int = 300,
+        global_risk_manager: GlobalPortfolioRiskManager | None = None,
+        execution_mode: PaperExecutionMode = "BROKER_PAPER",
+    ) -> None:
         self.broker = broker
         self.store = store
         self.max_decision_age_seconds = max_decision_age_seconds
         self.global_risk_manager = global_risk_manager or GlobalPortfolioRiskManager()
+        self.execution_mode = execution_mode
 
     def submit(
         self,
@@ -180,7 +198,16 @@ class PaperOrderGateway:
 
         intent = self._intent_record(proposal, global_application, local_gate_passed, mode, client_order_id, evaluated_at)
         self.store.write_snapshot(_intent_key(proposal.orderIntentId), intent.model_dump(mode="json"))
-        self.store.write_snapshot(_client_key(client_order_id), {"clientOrderId": client_order_id, "orderIntentId": proposal.orderIntentId, "algorithmId": proposal.algorithmId})
+        self.store.write_snapshot(
+            _client_key(client_order_id),
+            {
+                "executionMode": self.execution_mode,
+                "clientOrderId": client_order_id,
+                "orderIntentId": proposal.orderIntentId,
+                "algorithmId": proposal.algorithmId,
+                "capitalPartitionId": proposal.capitalPartitionId,
+            },
+        )
 
         blocker = self._submission_blocker(intent, proposal, global_application, evaluated_at)
         if blocker:
@@ -223,6 +250,7 @@ class PaperOrderGateway:
             fill = fill.model_copy(
                 update={
                     "algorithmId": verified.algorithmId,
+                    "capitalPartitionId": verified.capitalPartitionId,
                     "orderIntentId": verified.orderIntentId,
                     "symbol": verified.symbol,
                     "side": verified.side,
@@ -282,6 +310,7 @@ class PaperOrderGateway:
             self.store.write_snapshot(key, updated.model_dump(mode="json"))
             results.append(
                 PaperOrderGatewayResult(
+                    executionMode=self.execution_mode,
                     algorithmId=intent.algorithmId,
                     orderIntentId=intent.orderIntentId,
                     clientOrderId=intent.clientOrderId,
@@ -301,7 +330,7 @@ class PaperOrderGateway:
 
     def recover_from_restart(self, *, evaluated_at: datetime) -> dict[str, Any]:
         evaluated_at = _require_utc(evaluated_at)
-        positions = self.broker.refresh_positions()
+        positions = [] if self.execution_mode == "LOCAL_PAPER" else self.broker.refresh_positions()
         known_client_ids = {
             value.get("clientOrderId")
             for key, value in _store_items(self.store)
@@ -314,6 +343,7 @@ class PaperOrderGateway:
         )
         snapshot = {
             "gatewayVersion": PAPER_ORDER_GATEWAY_VERSION,
+            "executionMode": self.execution_mode,
             "recoveredAt": evaluated_at.isoformat(),
             "knownClientOrderIds": sorted(id_ for id_ in known_client_ids if id_),
             "orphanPositionsDetected": orphan_positions,
@@ -350,6 +380,7 @@ class PaperOrderGateway:
     ) -> PaperOrderIntentRecord:
         submitted_quantity = min(proposal.quantity, global_application.globallyAllowedQuantity)
         return PaperOrderIntentRecord(
+            executionMode=self.execution_mode,
             algorithmId=proposal.algorithmId,
             capitalPartitionId=proposal.capitalPartitionId,
             decisionId=proposal.decisionId,
@@ -439,6 +470,7 @@ class PaperOrderGateway:
         protective: PaperGatewayProtectiveOrder | None = None,
     ) -> PaperOrderGatewayResult:
         return PaperOrderGatewayResult(
+            executionMode=self.execution_mode,
             algorithmId=proposal.algorithmId,
             orderIntentId=proposal.orderIntentId,
             clientOrderId=client_order_id,
@@ -503,9 +535,12 @@ def _protective_order(intent: PaperOrderIntentRecord, fill: PaperGatewayFill | N
     if fill is None or fill.filledQuantity <= 0:
         return None
     return PaperGatewayProtectiveOrder(
+        executionMode=intent.executionMode,
         clientOrderId=f"{intent.clientOrderId}-protective",
         parentClientOrderId=intent.clientOrderId,
         algorithmId=intent.algorithmId,
+        capitalPartitionId=intent.capitalPartitionId,
+        accountId=fill.accountId,
         orderIntentId=intent.orderIntentId,
         quantity=fill.filledQuantity,
         stopPrice=intent.stopPrice,

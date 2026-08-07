@@ -4,17 +4,18 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from backend.app.algorithms.voting_ensemble.local_paper_account import VOTING_ENSEMBLE_ALGORITHM_ID
+
 
 VOTING_ENSEMBLE_POSITION_STATE_VERSION = "voting_ensemble_position_state_v1"
-VOTING_ENSEMBLE_ALGORITHM_ID = "voting_ensemble"
 
 
 def position_state_reason_codes() -> tuple[str, ...]:
     return (
         VOTING_ENSEMBLE_POSITION_STATE_VERSION,
         "voting_ensemble.position_state.algorithm_owned",
-        "voting_ensemble.position_state.active_position_scope",
-        "voting_ensemble.position_state.broker_snapshot_attribution",
+        "voting_ensemble.position_state.trade_counter_only",
+        "voting_ensemble.position_state.current_positions_owned_by_local_inventory_ledger",
     )
 
 
@@ -27,13 +28,13 @@ class VotingEnsemblePositionState:
     setupEntryCounts: dict[str, int] = field(default_factory=dict)
     lastEntryAt: datetime | None = None
     lastStopAt: datetime | None = None
+    inventoryLedger: Any | None = None
 
     def active_positions(self, timestamp: datetime, symbol: str) -> list[Any]:
-        return [
-            trade
-            for trade in self.trades
-            if trade.symbol == symbol.upper() and (trade.exitAt is None or trade.exitAt > timestamp)
-        ]
+        if self.inventoryLedger is None:
+            return []
+        position = self.inventoryLedger.position_for_symbol(symbol.upper())
+        return [position] if int(position.get("quantity") or 0) != 0 else []
 
     def record_trade(self, trade: Any, *, setup_key: str, stopped_out: bool) -> None:
         self.trades.append(trade)

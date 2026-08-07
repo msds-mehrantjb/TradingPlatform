@@ -465,8 +465,8 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
         except Exception:
             account_snapshot = None
         account_risk = _account_snapshot_from_backend_account(account_snapshot, inventory, event)
-        if account_snapshot is None or account_risk.get("sourceAuthority") != "broker":
-            failures.append("voting_ensemble.automatic_snapshot.backend_account_snapshot_missing")
+        if account_snapshot is None and account_risk.get("sourceAuthority") != "voting_ensemble_local_paper_account":
+            failures.append("voting_ensemble.automatic_snapshot.local_paper_account_snapshot_missing")
 
         quote = _call_market_provider(self.quote_provider, symbol=event.symbol.upper(), feed=feed)
         trade = _call_market_provider(self.last_trade_provider, symbol=event.symbol.upper(), feed=feed)
@@ -973,7 +973,8 @@ def _account_snapshot_from_backend_account(account: dict[str, Any] | None, inven
         "tradesToday": counters["tradesToday"],
         "observedAt": str(account.get("observedAt") or _iso(event.receivedAt)),
         "sessionDate": _iso(event.barEndTimestamp)[:10],
-        "sourceAuthority": str(account.get("sourceAuthority") or "broker"),
+        "sourceAuthority": str(account.get("sourceAuthority") or fallback.get("sourceAuthority") or "voting_ensemble_local_paper_account"),
+        "capitalPartitionId": str(account.get("capitalPartitionId") or fallback.get("capitalPartitionId") or "voting_ensemble.paper.default"),
     }
 
 
@@ -1085,6 +1086,24 @@ def _server_global_gate(event: VotingEnsembleFinalizedBarMarketEvent, control: d
 
 
 def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEnsembleFinalizedBarMarketEvent) -> dict[str, Any]:
+    account = inventory.get("account") if isinstance(inventory, dict) else None
+    if isinstance(account, dict):
+        return {
+            "algorithmId": "voting_ensemble",
+            "algorithm_id": "voting_ensemble",
+            "capitalPartitionId": str(account.get("capitalPartitionId") or "voting_ensemble.paper.default"),
+            "accountId": str(account.get("accountId") or "voting_ensemble.paper.default.account"),
+            "equity": _positive_or_zero(account.get("equity")),
+            "buyingPower": _positive_or_zero(account.get("buyingPower")),
+            "openPositionNotional": _positive_or_zero(account.get("openPositionNotional")),
+            "realizedPnlToday": float(account.get("realizedPnlToday") or 0.0),
+            "unrealizedPnlToday": float(account.get("unrealizedPnlToday") or 0.0),
+            "estimatedExitCosts": 0.0,
+            "tradesToday": len(inventory.get("fills") or []),
+            "observedAt": str(account.get("observedAt") or _iso(event.receivedAt)),
+            "sessionDate": _iso(event.barEndTimestamp)[:10],
+            "sourceAuthority": str(account.get("sourceAuthority") or "voting_ensemble_local_paper_account"),
+        }
     positions = inventory.get("positions") if isinstance(inventory, dict) else []
     open_notional = 0.0
     if isinstance(positions, list):
@@ -1093,6 +1112,9 @@ def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEns
                 continue
             open_notional += abs(float(position.get("notional") or 0.0))
     return {
+        "algorithmId": "voting_ensemble",
+        "algorithm_id": "voting_ensemble",
+        "capitalPartitionId": "voting_ensemble.paper.default",
         "accountId": "voting-ensemble-paper-account",
         "equity": 0.0,
         "buyingPower": 0.0,
@@ -1103,7 +1125,7 @@ def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEns
         "tradesToday": len(inventory.get("orders") or []) if isinstance(inventory, dict) else 0,
         "observedAt": _iso(event.receivedAt),
         "sessionDate": _iso(event.barEndTimestamp)[:10],
-        "sourceAuthority": "voting_ensemble_inventory_fallback",
+        "sourceAuthority": "voting_ensemble_local_paper_account",
     }
 
 

@@ -23,9 +23,10 @@ from backend.app.algorithms.voting_ensemble.finalized_bar_producer import (
 )
 from backend.app.algorithms.voting_ensemble.paper_execution import (
     VOTING_ENSEMBLE_ALGORITHM_ID,
+    VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+    VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
     VOTING_ENSEMBLE_PAPER_EXECUTION_RUNTIME,
     VotingEnsemblePaperExecutionRuntime,
-    is_approved_alpaca_paper_endpoint,
 )
 from backend.app.algorithms.voting_ensemble.runtime.events import FinalizedOneMinuteBarEvent
 from backend.app.algorithms.voting_ensemble.runtime.orchestrator import VOTING_ENSEMBLE_RUNTIME, VotingEnsembleRuntimeOrchestrator
@@ -496,9 +497,9 @@ class VotingEnsembleRuntimeSupervisor:
             evaluation_worker_healthy=evaluation_worker_healthy,
             execution_worker_healthy=execution_worker_healthy,
             reconciliation_healthy=reconciliation_healthy,
-            paper_broker_verified=bool(checks.get("alpacaPaperUrlVerified")) and bool(checks.get("paperCredentialsConfigured")),
-            alpaca_paper_broker_client_configured=broker_client_configured,
-            durable_execution_state_active=bool(paper_summary.get("durableExecutionStateActive")),
+            local_paper_account_verified=bool(checks.get("localPaperAccountConfigured")) and bool(checks.get("localPaperInventoryIsolated")),
+            external_broker_client_configured=True,
+            durable_execution_state_active=bool(paper_summary.get("persistencePath")) or bool(paper_summary.get("durableExecutionStateActive")),
             persistence_healthy=paper_summary.get("persistenceHealthy") is not False,
             new_entries_allowed=bool(effective["newEntriesEnabled"]) and bool(readiness["ready"]),
             active_entry_blocks=active_entry_blocks,
@@ -518,7 +519,7 @@ class VotingEnsembleRuntimeSupervisor:
             "requestedPaperTradingEnabled": self.control_store.control.requestedPaperTradingEnabled,
             "effectivePaperTradingEnabled": effective["effectivePaperTradingEnabled"],
             "liveTradingEnabled": False,
-            "paperBrokerVerified": bool(checks.get("alpacaPaperUrlVerified")) and bool(checks.get("paperCredentialsConfigured")),
+            "paperBrokerVerified": bool(checks.get("localPaperAccountConfigured")) and bool(checks.get("localPaperInventoryIsolated")),
             "marketOpen": bool(checks.get("backendBrokerClockOpen")),
             "marketDataReady": bool(checks.get("marketDataHealthy")),
             "inventoryReconciled": bool(checks.get("inventoryReconciled")) and not bool(inventory.get("reconciliationBlocks")),
@@ -704,8 +705,8 @@ class VotingEnsembleRuntimeSupervisor:
             "globalMasterPaperEnabled": self.config.global_master_paper_enabled,
             "requestedPaperTradingEnabled": control.requestedPaperTradingEnabled,
             "liveTradingDisabled": not control.liveTradingEnabled,
-            "alpacaPaperUrlVerified": is_approved_alpaca_paper_endpoint(self.settings.alpaca_trading_base_url),
-            "paperCredentialsConfigured": bool(self.settings.has_alpaca_credentials),
+            "localPaperAccountConfigured": True,
+            "localPaperInventoryIsolated": self.paper_inventory().get("capitalPartitionId") == VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
             "backendBrokerClockOpen": bool(clock.get("isOpen")),
             "workerHealthy": bool(runtime_summary.get("workerAlive")) and bool(paper_summary.get("workerAlive")) and not bool(self.metrics.lastError),
             "marketDataHealthy": self.config.market_data_healthy_default,
@@ -770,32 +771,28 @@ class VotingEnsembleRuntimeSupervisor:
         }
 
     def _default_account_snapshot(self) -> dict[str, Any] | None:
-        if not self.settings.has_alpaca_credentials:
-            return None
-        try:
-            import httpx
-
-            with httpx.Client(timeout=httpx.Timeout(4.0, connect=2.0), trust_env=False) as client:
-                response = client.get(
-                    f"{self.settings.alpaca_trading_base_url}/account",
-                    headers={
-                        "APCA-API-KEY-ID": self.settings.alpaca_key_id,
-                        "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
-        except Exception:
-            return None
-        if not isinstance(payload, dict):
-            return None
+        inventory = self.paper_inventory()
+        account = inventory.get("account") if isinstance(inventory, dict) else None
+        if isinstance(account, dict):
+            return {
+                **account,
+                "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+                "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+                "accountId": str(account.get("accountId") or VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID),
+                "sourceAuthority": "voting_ensemble_local_paper_account",
+                "paperAccount": True,
+                "liveTradingEnabled": False,
+            }
         return {
-            **payload,
-            "accountId": str(payload.get("id") or payload.get("account_number") or "alpaca-paper-account"),
-            "equity": float(payload.get("equity") or payload.get("portfolio_value") or 0.0),
-            "buyingPower": float(payload.get("buying_power") or 0.0),
+            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+            "equity": 100_000.0,
+            "buyingPower": 100_000.0,
             "observedAt": _now(),
-            "sourceAuthority": "broker",
+            "sourceAuthority": "voting_ensemble_local_paper_account",
             "paperAccount": True,
             "liveTradingEnabled": False,
         }
@@ -988,7 +985,7 @@ def _order_is_open(record: dict[str, Any]) -> bool:
 
 
 def _open_position_records(inventory: dict[str, Any]) -> list[dict[str, Any]]:
-    records = inventory.get("brokerPositions") or inventory.get("positions") or []
+    records = inventory.get("positions") or []
     open_positions: list[dict[str, Any]] = []
     for record in records:
         if not isinstance(record, dict):
@@ -1045,8 +1042,8 @@ def _paper_ready_blocking_reason_codes(
     evaluation_worker_healthy: bool,
     execution_worker_healthy: bool,
     reconciliation_healthy: bool,
-    paper_broker_verified: bool,
-    alpaca_paper_broker_client_configured: bool,
+    local_paper_account_verified: bool,
+    external_broker_client_configured: bool,
     durable_execution_state_active: bool,
     persistence_healthy: bool,
     new_entries_allowed: bool,
@@ -1065,10 +1062,8 @@ def _paper_ready_blocking_reason_codes(
         blockers.append("voting_ensemble.paper_ready.execution_worker_not_healthy")
     if not reconciliation_healthy:
         blockers.append("voting_ensemble.paper_ready.reconciliation_not_healthy")
-    if not paper_broker_verified:
-        blockers.append("voting_ensemble.paper_ready.alpaca_paper_broker_not_verified")
-    if not alpaca_paper_broker_client_configured:
-        blockers.append("voting_ensemble.paper_ready.alpaca_paper_client_not_configured")
+    if not local_paper_account_verified:
+        blockers.append("voting_ensemble.paper_ready.local_paper_account_not_verified")
     if not durable_execution_state_active:
         blockers.append("voting_ensemble.paper_ready.execution_state_not_durable")
     if not persistence_healthy:
