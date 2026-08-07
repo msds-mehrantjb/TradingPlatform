@@ -137,6 +137,72 @@ class GlobalPortfolioRiskManagerPhase12Test(unittest.TestCase):
         self.assertIn("paper_gateway.global_portfolio_risk_denied", result.reasonCodes)
         self.assertEqual(store.snapshots[f"paper_order_gateway.global_risk.{proposal.orderIntentId}"]["status"], "denied")
 
+    def test_voting_ensemble_local_gateway_requires_authoritative_account_snapshot(self) -> None:
+        broker = Phase12Broker()
+        store = MemoryStore()
+        gateway = PaperOrderGateway(broker, store, execution_mode="LOCAL_PAPER")
+        proposal = global_proposal(order_intent_id="ve-local-no-account").model_copy(
+            update={
+                "algorithmId": "voting_ensemble",
+                "capitalPartitionId": "voting_ensemble.paper.default",
+            }
+        )
+
+        result = gateway.submit(
+            proposal=proposal,
+            global_application=global_application(proposal),
+            local_gate_passed=True,
+            mode="automatic",
+            evaluated_at=NOW,
+        )
+
+        self.assertFalse(result.submitted)
+        self.assertEqual(broker.submit_count, 0)
+        self.assertIn("paper_gateway.global_portfolio_risk_denied", result.reasonCodes)
+        risk = store.snapshots[f"paper_order_gateway.global_risk.{proposal.orderIntentId}"]
+        self.assertEqual(risk["status"], "denied")
+        self.assertEqual(risk["failedGates"][0]["reason"], "paper_gateway.authoritative_account_snapshot_missing")
+        self.assertNotIn(f"paper_order_gateway.global_risk_account.{proposal.orderIntentId}", store.snapshots)
+
+    def test_gateway_uses_authoritative_provider_account_instead_of_synthetic_notional(self) -> None:
+        broker = Phase12Broker()
+        store = MemoryStore()
+        proposal = global_proposal(quantity=10, order_intent_id="ve-local-provider").model_copy(
+            update={
+                "algorithmId": "voting_ensemble",
+                "capitalPartitionId": "voting_ensemble.paper.default",
+            }
+        )
+        gateway = PaperOrderGateway(
+            broker,
+            store,
+            execution_mode="LOCAL_PAPER",
+            account_snapshot_provider=lambda **_: {
+                "accountSnapshotId": "ve-local-real-account",
+                "accountId": "voting_ensemble.paper.default.account",
+                "equity": 100.0,
+                "intradayEquityHigh": 100.0,
+                "buyingPower": 100.0,
+                "cash": 100.0,
+                "observedAt": NOW.isoformat().replace("+00:00", "Z"),
+            },
+            portfolio_snapshot_provider=lambda **_: {"positions": [], "orders": [], "pendingOrders": []},
+        )
+
+        gateway.submit(
+            proposal=proposal,
+            global_application=global_application(proposal),
+            local_gate_passed=True,
+            mode="automatic",
+            evaluated_at=NOW,
+        )
+
+        risk_account = store.snapshots[f"paper_order_gateway.global_risk_account.{proposal.orderIntentId}"]
+        self.assertEqual(risk_account["accountSnapshotId"], "ve-local-real-account")
+        self.assertEqual(risk_account["equity"], 100.0)
+        self.assertEqual(risk_account["availableBuyingPower"], 100.0)
+        self.assertNotEqual(risk_account["equity"], 10000.0)
+
     def test_global_risk_api_evaluates_server_side(self) -> None:
         client = TestClient(app)
         response = client.post(

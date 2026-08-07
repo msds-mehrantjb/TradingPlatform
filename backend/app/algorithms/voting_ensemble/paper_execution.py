@@ -1639,6 +1639,8 @@ class VotingEnsemblePaperExecutionRuntime:
             VotingEnsembleLocalPaperBroker(self.repository) if self.execution_mode == "LOCAL_PAPER" else _default_paper_broker(),
             self.repository,
             execution_mode=self.execution_mode,
+            account_snapshot_provider=_local_gateway_account_snapshot_provider(self.repository) if self.execution_mode == "LOCAL_PAPER" else None,
+            portfolio_snapshot_provider=_local_gateway_portfolio_snapshot_provider(self.repository) if self.execution_mode == "LOCAL_PAPER" else None,
         )
         self.broker_client = broker_client if self.execution_mode == "BROKER_PAPER" else None
         self.execution_adapter = execution_adapter or _default_execution_adapter_for_runtime(repository=self.repository, broker_client=self.broker_client)
@@ -3797,6 +3799,29 @@ def _normalize_execution_mode(value: str) -> VotingEnsembleExecutionMode:
 def _gateway_is_local_paper(gateway: PaperOrderGateway) -> bool:
     broker = getattr(gateway, "broker", None)
     return getattr(gateway, "execution_mode", None) == "LOCAL_PAPER" and getattr(broker, "broker_kind", None) == "voting_ensemble_local_paper"
+
+
+def _local_gateway_account_snapshot_provider(repository: VotingEnsemblePaperExecutionRepository):
+    def provider(**_: Any) -> dict[str, Any] | None:
+        inventory = repository.inventory_snapshot()
+        account = inventory.get("account") if isinstance(inventory, dict) else None
+        return dict(account) if isinstance(account, dict) else None
+
+    return provider
+
+
+def _local_gateway_portfolio_snapshot_provider(repository: VotingEnsemblePaperExecutionRepository):
+    def provider(**_: Any) -> dict[str, Any]:
+        inventory = repository.inventory_snapshot()
+        return {
+            "positions": list(inventory.get("positions") or []),
+            "orders": list(inventory.get("orders") or []),
+            "pendingOrders": list(inventory.get("outbox") or []),
+            "tradesToday": int((inventory.get("account") or {}).get("tradesToday") or 0),
+            "algorithmTradesToday": {VOTING_ENSEMBLE_ALGORITHM_ID: int((inventory.get("account") or {}).get("tradesToday") or 0)},
+        }
+
+    return provider
 
 
 def _execution_state_key(client_order_id: str) -> str:
