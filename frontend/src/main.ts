@@ -9000,59 +9000,24 @@ function updateTradeToggleButton() {
   tradeToggleButton.dataset.status = loading ? "requested" : error ? "error" : blocked ? "blocked" : effective ? "effective" : requested ? "requested" : "off";
   tradeToggleButton.dataset.algorithm = selected.mode;
   const runtime = state.votingEnsembleRuntimeStatus;
-  const votingRequested = votingEnsemblePaperRequested();
-  const votingEffective = votingEnsemblePaperEffective();
-  const wcaRequested = wcaPaperRequested();
-  const wcaEffective = wcaPaperEffective();
-  const wcaEntriesEffective = wcaAutomaticEntriesEffective();
-  const regimeRequested = regimePaperRequested();
-  const regimeEffective = regimePaperEffective();
-  const metaRequested = metaStrategyPaperRequested();
-  const metaEffective = metaStrategyPaperEffective();
-  const wcaControl = wcaRuntimeControlRecord();
-  const wcaReasons = arrayFromUnknown(wcaControl?.reasonCodes ?? wcaControl?.reason_codes).map((value) => String(value)).join(", ");
-  const regimeControl = regimeRuntimeControlRecord();
-  const regimeBlockers = arrayFromUnknown(regimeControl?.paperEffectiveBlockers).map((value) => String(value)).join(", ");
-  const regimeReasonCodes = arrayFromUnknown(regimeControl?.paperEffectiveBlockerReasonCodes).map((value) => String(value)).join(", ");
-  const metaControl = metaStrategyPaperControlRecord();
-  const metaReasonCodes = arrayFromUnknown(metaControl?.reasonCodes).map((value) => String(value)).join(", ");
-  const activeBlocks = runtime?.activeEntryBlocks?.length ? runtime.activeEntryBlocks.join(", ") : "";
-  const paperReadyBlocks = runtime?.paperReadyBlockingReasonCodes?.length ? runtime.paperReadyBlockingReasonCodes.join(", ") : "";
   const selectedReason = selected.reasonCodes.length ? selected.reasonCodes.join(", ") : selected.warning;
-  const reason = selectedReason || activeBlocks || state.votingEnsembleRuntimeControl?.reasonCodes?.join(", ") || state.votingEnsembleRuntimeControlWarning;
+  const ensemblePaperReadyBlocks = selected.mode === "ensemble" && runtime?.paperReadyBlockingReasonCodes?.length
+    ? runtime.paperReadyBlockingReasonCodes.join(", ")
+    : "";
+  const ensembleActiveBlocks = selected.mode === "ensemble" && runtime?.activeEntryBlocks?.length
+    ? runtime.activeEntryBlocks.join(", ")
+    : "";
+  const reason = selectedReason || ensembleActiveBlocks || ensemblePaperReadyBlocks;
   const controlLabel = [
-    `Selected algorithm: ${selected.label}`,
-    `Selected paper requested: ${requested ? "ON" : "OFF"}`,
-    `Selected paper effective: ${effective ? "ON" : "OFF"}`,
-    `Voting Ensemble requested: ${votingRequested ? "ON" : "OFF"}`,
-    `Voting Ensemble effective: ${votingEffective ? "ON" : "OFF"}`,
-    `WCA requested: ${wcaRequested ? "ON" : "OFF"}`,
-    `WCA effective paper: ${wcaEffective ? "ON" : "OFF"}`,
-    `WCA automatic entries: ${wcaEntriesEffective ? "ARMED" : "BLOCKED"}`,
-    `Regime requested: ${regimeRequested ? "ON" : "OFF"}`,
-    `Regime effective: ${regimeEffective ? "ON" : "OFF"}`,
-    `Meta-Strategy entries: ${metaRequested ? "ON" : "OFF"}`,
-    metaControl ? `Meta-Strategy version: ${metaControl.version}` : "Meta-Strategy control unavailable",
-    regimePaperBlocked() ? "Regime is ON but blocked." : "",
-    metaStrategyPaperBlocked() ? "Meta-Strategy is ON but blocked." : "",
-    regimeBlockers ? `Regime blockers: ${regimeBlockers}` : "",
-    runtime ? `Paper ready: ${runtime.paperReady ? "true" : "false"}` : "",
-    runtime ? `Market: ${runtime.marketOpen ? "open" : "closed"}` : "",
-    runtime ? `Workers: eval ${runtime.evaluationWorkerHealthy ? "healthy" : "blocked"}, exec ${runtime.executionWorkerHealthy ? "healthy" : "blocked"}, recon ${runtime.reconciliationHealthy ? "healthy" : "blocked"}` : "",
-    runtime ? `Broker: ${runtime.paperBrokerVerified ? "paper verified" : "not ready"}` : "",
-    runtime ? `Inventory: ${runtime.inventoryReconciled ? "reconciled" : "reconciliation required"}` : "",
-    runtime ? `Last bar: ${describeVotingEnsembleRuntimeRecord(runtime.lastFinalizedBar, ["barEndTimestamp", "barEnd", "finalizedAt", "receivedAt"])}` : "",
-    runtime ? `Last decision: ${describeVotingEnsembleRuntimeRecord(runtime.lastDecision, ["decisionId", "signal", "side", "status"])}` : "",
-    runtime ? `Last order: ${describeVotingEnsembleRuntimeRecord(runtime.lastBrokerOrder ?? runtime.lastExecutionIntent, ["clientOrderId", "status", "entryOrderStatus", "brokerOrderId"])}` : "",
-    blocked ? "Backend blocked new entries." : "",
-    paperReadyBlocks,
-    reason,
-    state.wcaRuntimeControlWarning,
-    wcaReasons,
-    state.regimeRuntimeControlWarning,
-    regimeReasonCodes,
-    state.metaStrategyPaperControlWarning,
-    metaReasonCodes,
+    `${selected.label} paper control.`,
+    "Scope: selected algorithm only.",
+    selected.mode === "ensemble" ? "Authority: Voting Ensemble local paper account." : "",
+    `Requested: ${requested ? "ON" : "OFF"}.`,
+    `Effective: ${effective ? "ON" : "OFF"}.`,
+    loading ? "Status: updating." : "",
+    error ? "Status: error." : "",
+    blocked ? "Status: on but blocked by local/backend gates." : "",
+    reason ? `Reason: ${reason}.` : "",
   ].filter(Boolean).join(" ");
   tradeToggleButton.title = controlLabel;
   tradeToggleButton.setAttribute("aria-label", controlLabel);
