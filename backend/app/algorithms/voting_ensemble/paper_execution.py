@@ -3692,9 +3692,9 @@ def _local_recovery_accounting_failures(
             expected_cash += quantity * price - fee
             expected_quantities[symbol] = expected_quantities.get(symbol, 0) - quantity
         expected_realized += _float(fill.get("realizedPnl"))
-    if local_fills and abs(expected_cash - _float(account.get("cash"))) > 0.02:
+    if abs(expected_cash - _float(account.get("cash"))) > 0.02:
         failures.append("voting_ensemble.local_paper_recovery.cash_fill_invariant_failed")
-    if local_fills and abs(expected_realized - _float(account.get("realizedPnl"))) > 0.02:
+    if abs(expected_realized - _float(account.get("realizedPnl"))) > 0.02:
         failures.append("voting_ensemble.local_paper_recovery.realized_pnl_fill_invariant_failed")
     persisted_quantities: dict[str, int] = {}
     for key, payload in snapshots.items():
@@ -3723,7 +3723,7 @@ def _local_consistency_invariant_failures(*, account: Mapping[str, Any], snapsho
     risk_snapshots = _records_with_prefix(snapshots, f"{VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE}.local_risk_snapshot.")
 
     expected_equity = _signed_float(account.get("cash")) + sum(_signed_float(position.get("marketValue", position.get("notional"))) for position in local_positions)
-    if local_positions and abs(expected_equity - _signed_float(account.get("equity"))) > 0.05:
+    if abs(expected_equity - _signed_float(account.get("equity"))) > 0.05:
         failures.append("voting_ensemble.local_paper_consistency.account_equity_invariant_failed")
     if _signed_float(account.get("buyingPower")) - _signed_float(account.get("cash")) > 0.05:
         failures.append("voting_ensemble.local_paper_consistency.buying_power_exceeds_cash_without_margin")
