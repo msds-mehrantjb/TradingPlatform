@@ -439,6 +439,7 @@ class VotingEnsembleRuntimeSupervisor:
     def entry_permission_snapshot(self) -> dict[str, Any]:
         self._refresh_readiness()
         control = self.control_store.control
+        local_paper_mode = _is_local_paper_mode(self.paper_execution_runtime)
         return {
             **control.snapshot(),
             "newEntriesAllowed": control.newEntriesEnabled,
@@ -450,7 +451,9 @@ class VotingEnsembleRuntimeSupervisor:
             "endOfDayLiquidationEnabled": True,
             "fillProcessingEnabled": True,
             "cancelReplaceProcessingEnabled": True,
-            "brokerReconciliationEnabled": True,
+            "brokerReconciliationEnabled": not local_paper_mode,
+            "localInventoryRecoveryEnabled": local_paper_mode,
+            "localInventoryAuthority": "voting_ensemble.local_paper_account" if local_paper_mode else "broker_paper",
         }
 
     def status(self) -> dict[str, Any]:
@@ -484,23 +487,31 @@ class VotingEnsembleRuntimeSupervisor:
         evaluation_worker_healthy = bool(runtime_summary.get("workerAlive")) and self.metrics.workerStatus.get("evaluation_worker") != "failed"
         execution_worker_healthy = bool(paper_summary.get("workerAlive")) and self.metrics.workerStatus.get("execution_worker") != "failed"
         checks = effective.get("checks", {})
+        local_paper_mode = _is_local_paper_mode(self.paper_execution_runtime)
         reconciliation_healthy = (
             self.metrics.workerStatus.get("reconciliation_loop") != "failed"
-            and bool(checks.get("inventoryReconciled"))
+            and bool(checks.get("inventoryHealthy") if local_paper_mode else checks.get("inventoryReconciled"))
             and not bool(inventory.get("reconciliationBlocks"))
         )
-        broker_client_configured = getattr(self.paper_execution_runtime, "broker_client", None) is not None
         paper_ready_blocking_reason_codes = _paper_ready_blocking_reason_codes(
+            local_paper_mode=local_paper_mode,
             supervisor_running=self.metrics.supervisorStarted,
             finalized_bar_producer_configured=self.finalized_bar_producer is not None,
             finalized_bar_event_consumer_healthy=self.metrics.workerStatus.get("finalized_bar_event_consumer") == "running",
             evaluation_worker_healthy=evaluation_worker_healthy,
             execution_worker_healthy=execution_worker_healthy,
             reconciliation_healthy=reconciliation_healthy,
-            local_paper_account_verified=bool(checks.get("localPaperAccountConfigured")) and bool(checks.get("localPaperInventoryIsolated")),
-            external_broker_client_configured=True,
+            local_paper_account_loaded=bool(checks.get("localPaperAccountLoaded")),
+            local_paper_account_verified=bool(checks.get("localPaperAccountLoaded")) and bool(checks.get("localPaperInventoryIsolated")),
+            inventory_healthy=bool(checks.get("inventoryHealthy")),
+            persistence_healthy=bool(checks.get("persistenceHealthy")),
+            market_data_healthy=bool(checks.get("marketDataHealthy")),
+            market_data_fresh=bool(checks.get("marketDataFresh")),
+            market_clock_healthy=bool(checks.get("marketClockHealthy")),
+            automatic_execution_enabled=bool(checks.get("automaticExecutionEnabled")),
+            kill_switch_off=bool(checks.get("killSwitchOff")),
+            external_broker_client_configured=getattr(self.paper_execution_runtime, "broker_client", None) is not None,
             durable_execution_state_active=bool(paper_summary.get("persistencePath")) or bool(paper_summary.get("durableExecutionStateActive")),
-            persistence_healthy=paper_summary.get("persistenceHealthy") is not False,
             new_entries_allowed=bool(effective["newEntriesEnabled"]) and bool(readiness["ready"]),
             active_entry_blocks=active_entry_blocks,
         )
@@ -519,10 +530,18 @@ class VotingEnsembleRuntimeSupervisor:
             "requestedPaperTradingEnabled": self.control_store.control.requestedPaperTradingEnabled,
             "effectivePaperTradingEnabled": effective["effectivePaperTradingEnabled"],
             "liveTradingEnabled": False,
-            "paperBrokerVerified": bool(checks.get("localPaperAccountConfigured")) and bool(checks.get("localPaperInventoryIsolated")),
-            "marketOpen": bool(checks.get("backendBrokerClockOpen")),
-            "marketDataReady": bool(checks.get("marketDataHealthy")),
-            "inventoryReconciled": bool(checks.get("inventoryReconciled")) and not bool(inventory.get("reconciliationBlocks")),
+            "paperBrokerVerified": bool(checks.get("localPaperAccountLoaded")) and bool(checks.get("localPaperInventoryIsolated")),
+            "localPaperAccountLoaded": bool(checks.get("localPaperAccountLoaded")),
+            "inventoryHealthy": bool(checks.get("inventoryHealthy")),
+            "persistenceHealthy": bool(checks.get("persistenceHealthy")),
+            "marketDataHealthy": bool(checks.get("marketDataHealthy")),
+            "marketDataFresh": bool(checks.get("marketDataFresh")),
+            "marketClockHealthy": bool(checks.get("marketClockHealthy")),
+            "killSwitchOff": bool(checks.get("killSwitchOff")),
+            "automaticExecutionEnabled": bool(checks.get("automaticExecutionEnabled")),
+            "marketOpen": bool(checks.get("marketClockHealthy")),
+            "marketDataReady": bool(checks.get("marketDataHealthy")) and bool(checks.get("marketDataFresh")),
+            "inventoryReconciled": bool(checks.get("inventoryHealthy")) and not bool(inventory.get("reconciliationBlocks")),
             "newEntriesAllowed": bool(effective["newEntriesEnabled"]) and bool(readiness["ready"]),
             "activeEntryBlocks": active_entry_blocks,
             "lastFinalizedBar": self.metrics.lastFinalizedBarEvent or self.metrics.lastFinalizedBarProducerResult,
@@ -701,21 +720,58 @@ class VotingEnsembleRuntimeSupervisor:
     def _effective_control(self, runtime_summary: dict[str, Any], paper_summary: dict[str, Any]) -> dict[str, Any]:
         control = self.control_store.control
         clock = self.market_clock_provider()
+        inventory = self.paper_inventory()
+        account = inventory.get("account") if isinstance(inventory, dict) else None
+        local_paper_mode = _is_local_paper_mode(self.paper_execution_runtime)
+        local_account_loaded = _local_paper_account_loaded(account)
+        inventory_healthy = _local_inventory_healthy(inventory)
+        persistence_healthy = paper_summary.get("persistenceHealthy") is not False and inventory.get("persistenceHealthy") is not False
+        market_data_healthy = bool(self.config.market_data_healthy_default)
+        market_data_fresh = _local_market_data_fresh(inventory)
+        market_clock_healthy = bool(clock.get("isOpen"))
+        kill_switch_off = not control.killSwitchActive
+        automatic_execution_enabled = (
+            bool(self.config.global_master_paper_enabled)
+            and bool(control.requestedPaperTradingEnabled)
+            and not bool(control.liveTradingEnabled)
+        )
         checks = {
             "globalMasterPaperEnabled": self.config.global_master_paper_enabled,
             "requestedPaperTradingEnabled": control.requestedPaperTradingEnabled,
             "liveTradingDisabled": not control.liveTradingEnabled,
-            "localPaperAccountConfigured": True,
-            "localPaperInventoryIsolated": self.paper_inventory().get("capitalPartitionId") == VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
-            "backendBrokerClockOpen": bool(clock.get("isOpen")),
+            "localPaperAccountLoaded": local_account_loaded,
+            "localPaperAccountConfigured": local_account_loaded,
+            "localPaperInventoryIsolated": inventory.get("capitalPartitionId") == VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+            "inventoryHealthy": inventory_healthy,
+            "persistenceHealthy": persistence_healthy,
+            "marketDataHealthy": market_data_healthy,
+            "marketDataFresh": market_data_fresh,
+            "marketClockHealthy": market_clock_healthy,
+            "killSwitchOff": kill_switch_off,
+            "automaticExecutionEnabled": automatic_execution_enabled,
+            "backendBrokerClockOpen": market_clock_healthy,
             "workerHealthy": bool(runtime_summary.get("workerAlive")) and bool(paper_summary.get("workerAlive")) and not bool(self.metrics.lastError),
-            "marketDataHealthy": self.config.market_data_healthy_default,
-            "inventoryReconciled": self.metrics.lastReconciliation is not None and paper_summary.get("persistenceHealthy") is not False,
-            "globalKillSwitchInactive": not control.killSwitchActive,
+            "inventoryReconciled": inventory_healthy if local_paper_mode else self.metrics.lastReconciliation is not None and persistence_healthy,
+            "globalKillSwitchInactive": kill_switch_off,
             "localEntryBlockInactive": not control.localEntryBlockActive,
-            "executionPersistenceHealthy": paper_summary.get("persistenceHealthy") is not False,
+            "executionPersistenceHealthy": persistence_healthy,
         }
-        blockers = [f"voting_ensemble.control.{key}" for key, passed in checks.items() if not passed]
+        blocking_keys = [
+            "automaticExecutionEnabled",
+            "localPaperAccountLoaded",
+            "localPaperInventoryIsolated",
+            "inventoryHealthy",
+            "persistenceHealthy",
+            "marketDataHealthy",
+            "marketDataFresh",
+            "marketClockHealthy",
+            "killSwitchOff",
+            "workerHealthy",
+            "localEntryBlockInactive",
+        ]
+        if not local_paper_mode:
+            blocking_keys.append("inventoryReconciled")
+        blockers = [f"voting_ensemble.control.{key}" for key in blocking_keys if not checks.get(key)]
         effective = not blockers
         if not control.requestedPaperTradingEnabled:
             blockers.append("voting_ensemble.control.paper_requested_off")
@@ -745,6 +801,13 @@ class VotingEnsembleRuntimeSupervisor:
 
     def _default_market_clock(self) -> dict[str, Any]:
         if not self.settings.has_alpaca_credentials:
+            if _is_local_paper_mode(self.paper_execution_runtime):
+                return {
+                    "isOpen": False,
+                    "status": "unconfigured",
+                    "sourceAuthority": "voting_ensemble.local_market_clock",
+                    "reasonCodes": ["voting_ensemble.control.marketClockHealthy"],
+                }
             return {"isOpen": False, "status": "unconfigured", "reasonCodes": ["voting_ensemble.control.paper_credentials_missing"]}
         try:
             import httpx
@@ -1024,18 +1087,70 @@ def _settings_hash(
     return None
 
 
+def _is_local_paper_mode(paper_execution_runtime: Any) -> bool:
+    return str(getattr(paper_execution_runtime, "execution_mode", "LOCAL_PAPER") or "LOCAL_PAPER").upper() == "LOCAL_PAPER"
+
+
+def _local_paper_account_loaded(account: Any) -> bool:
+    if not isinstance(account, dict):
+        return False
+    return (
+        account.get("algorithmId", account.get("algorithm_id")) == VOTING_ENSEMBLE_ALGORITHM_ID
+        and account.get("capitalPartitionId") == VOTING_ENSEMBLE_CAPITAL_PARTITION_ID
+        and account.get("accountId") == VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID
+        and str(account.get("executionMode") or "LOCAL_PAPER").upper() == "LOCAL_PAPER"
+    )
+
+
+def _local_inventory_healthy(inventory: dict[str, Any]) -> bool:
+    if not isinstance(inventory, dict):
+        return False
+    if inventory.get("capitalPartitionId") != VOTING_ENSEMBLE_CAPITAL_PARTITION_ID:
+        return False
+    if inventory.get("persistenceHealthy") is False:
+        return False
+    if inventory.get("reconciliationBlocks"):
+        return False
+    recovery = inventory.get("localRecovery")
+    if isinstance(recovery, dict):
+        status = str(recovery.get("status") or recovery.get("recoveryStatus") or "").upper()
+        if status in {"FAILED", "RECOVERY_FAILED", "CORRUPTED", "CORRUPT", "BLOCKED"}:
+            return False
+    return True
+
+
+def _local_market_data_fresh(inventory: dict[str, Any]) -> bool:
+    statuses = inventory.get("marketData") if isinstance(inventory, dict) else None
+    if not statuses:
+        return True
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        if status.get("marketDataFresh") is False or status.get("fresh") is False:
+            return False
+    return True
+
+
 def _paper_ready_blocking_reason_codes(
     *,
+    local_paper_mode: bool,
     supervisor_running: bool,
     finalized_bar_producer_configured: bool,
     finalized_bar_event_consumer_healthy: bool,
     evaluation_worker_healthy: bool,
     execution_worker_healthy: bool,
     reconciliation_healthy: bool,
+    local_paper_account_loaded: bool,
     local_paper_account_verified: bool,
+    inventory_healthy: bool,
+    persistence_healthy: bool,
+    market_data_healthy: bool,
+    market_data_fresh: bool,
+    market_clock_healthy: bool,
+    automatic_execution_enabled: bool,
+    kill_switch_off: bool,
     external_broker_client_configured: bool,
     durable_execution_state_active: bool,
-    persistence_healthy: bool,
     new_entries_allowed: bool,
     active_entry_blocks: list[str],
 ) -> list[str]:
@@ -1050,12 +1165,30 @@ def _paper_ready_blocking_reason_codes(
         blockers.append("voting_ensemble.paper_ready.evaluation_worker_not_healthy")
     if not execution_worker_healthy:
         blockers.append("voting_ensemble.paper_ready.execution_worker_not_healthy")
-    if not reconciliation_healthy:
-        blockers.append("voting_ensemble.paper_ready.reconciliation_not_healthy")
-    if not local_paper_account_verified:
-        blockers.append("voting_ensemble.paper_ready.local_paper_account_not_verified")
-    if not durable_execution_state_active:
-        blockers.append("voting_ensemble.paper_ready.execution_state_not_durable")
+    if local_paper_mode:
+        if not local_paper_account_loaded:
+            blockers.append("voting_ensemble.paper_ready.local_paper_account_not_loaded")
+        if not local_paper_account_verified:
+            blockers.append("voting_ensemble.paper_ready.local_paper_account_not_verified")
+        if not inventory_healthy:
+            blockers.append("voting_ensemble.paper_ready.inventory_not_healthy")
+        if not market_data_healthy:
+            blockers.append("voting_ensemble.paper_ready.market_data_not_healthy")
+        if not market_data_fresh:
+            blockers.append("voting_ensemble.paper_ready.market_data_not_fresh")
+        if not market_clock_healthy:
+            blockers.append("voting_ensemble.paper_ready.market_clock_not_healthy")
+        if not kill_switch_off:
+            blockers.append("voting_ensemble.paper_ready.kill_switch_active")
+        if not automatic_execution_enabled:
+            blockers.append("voting_ensemble.paper_ready.automatic_execution_not_enabled")
+    else:
+        if not reconciliation_healthy:
+            blockers.append("voting_ensemble.paper_ready.reconciliation_not_healthy")
+        if not external_broker_client_configured:
+            blockers.append("voting_ensemble.paper_ready.alpaca_paper_client_not_configured")
+        if not durable_execution_state_active:
+            blockers.append("voting_ensemble.paper_ready.execution_state_not_durable")
     if not persistence_healthy:
         blockers.append("voting_ensemble.paper_ready.persistence_unhealthy")
     if not new_entries_allowed:

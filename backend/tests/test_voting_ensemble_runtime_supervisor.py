@@ -159,8 +159,9 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["supervisorRunning"])
         self.assertFalse(status["paperReady"])
         self.assertNotIn("voting_ensemble.paper_ready.alpaca_paper_client_not_configured", status["paperReadyBlockingReasonCodes"])
+        self.assertNotIn("voting_ensemble.paper_ready.reconciliation_not_healthy", status["paperReadyBlockingReasonCodes"])
+        self.assertNotIn("voting_ensemble.paper_ready.execution_state_not_durable", status["paperReadyBlockingReasonCodes"])
         self.assertIn("voting_ensemble.paper_ready.backend_finalized_bar_producer_not_configured", status["paperReadyBlockingReasonCodes"])
-        self.assertIn("voting_ensemble.paper_ready.execution_state_not_durable", status["paperReadyBlockingReasonCodes"])
         self.assertTrue(status["evaluationWorkerHealthy"])
         self.assertTrue(status["executionWorkerHealthy"])
         self.assertTrue(status["reconciliationHealthy"])
@@ -168,7 +169,16 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(status["effectivePaperTradingEnabled"])
         self.assertFalse(status["liveTradingEnabled"])
         self.assertTrue(status["paperBrokerVerified"])
+        self.assertTrue(status["localPaperAccountLoaded"])
+        self.assertTrue(status["inventoryHealthy"])
+        self.assertTrue(status["persistenceHealthy"])
+        self.assertTrue(status["marketDataHealthy"])
+        self.assertTrue(status["marketDataFresh"])
+        self.assertTrue(status["marketClockHealthy"])
+        self.assertTrue(status["killSwitchOff"])
+        self.assertTrue(status["automaticExecutionEnabled"])
         self.assertTrue(status["marketOpen"])
+        self.assertTrue(status["marketDataReady"])
         self.assertTrue(status["inventoryReconciled"])
         self.assertTrue(status["newEntriesAllowed"])
         self.assertEqual(status["activeEntryBlocks"], [])
@@ -260,6 +270,20 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("voting_ensemble.control.alpacaPaperUrlVerified", enabled["reasonCodes"])
         self.assertIn("voting_ensemble.control.effective_paper_on", enabled["reasonCodes"])
 
+    async def test_local_paper_readiness_without_alpaca_credentials_blocks_on_local_clock_only(self) -> None:
+        self.supervisor = supervisor_with_runtime(settings=no_alpaca_settings())
+        await self.supervisor.start()
+
+        enabled = self.supervisor.update_control(requested_paper_trading_enabled=True, updated_by="test")
+        status = self.supervisor.status()
+
+        self.assertFalse(enabled["effectivePaperTradingEnabled"])
+        self.assertIn("voting_ensemble.control.marketClockHealthy", enabled["reasonCodes"])
+        self.assertFalse(status["marketClockHealthy"])
+        self.assertIn("voting_ensemble.paper_ready.market_clock_not_healthy", status["paperReadyBlockingReasonCodes"])
+        self.assertNotIn("voting_ensemble.control.paper_credentials_missing", enabled["reasonCodes"])
+        self.assertNotIn("voting_ensemble.paper_ready.alpaca_paper_client_not_configured", status["paperReadyBlockingReasonCodes"])
+
     async def test_paper_off_blocks_new_entries_but_not_exit_and_reconciliation_work(self) -> None:
         self.supervisor = supervisor_with_runtime(settings=paper_settings(), market_clock_provider=lambda: {"isOpen": True})
         await self.supervisor.start()
@@ -279,7 +303,9 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(permission["endOfDayLiquidationEnabled"])
         self.assertTrue(permission["fillProcessingEnabled"])
         self.assertTrue(permission["cancelReplaceProcessingEnabled"])
-        self.assertTrue(permission["brokerReconciliationEnabled"])
+        self.assertFalse(permission["brokerReconciliationEnabled"])
+        self.assertTrue(permission["localInventoryRecoveryEnabled"])
+        self.assertEqual(permission["localInventoryAuthority"], "voting_ensemble.local_paper_account")
 
     async def test_broker_submission_rechecks_control_after_intent_exists(self) -> None:
         repository = VotingEnsemblePaperExecutionRepository()
@@ -679,6 +705,20 @@ def paper_settings() -> Settings:
     return Settings(
         alpaca_key_id="paper-key",
         alpaca_secret_key="paper-secret",
+        alpaca_data_base_url="https://data.alpaca.markets/v2",
+        alpaca_trading_base_url="https://paper-api.alpaca.markets/v2",
+        ollama_base_url="http://127.0.0.1:11434",
+        ollama_model="llama3",
+        database_url="sqlite:///:memory:",
+        allowed_origins=[],
+        application_config=ApplicationConfig(),
+    )
+
+
+def no_alpaca_settings() -> Settings:
+    return Settings(
+        alpaca_key_id="",
+        alpaca_secret_key="",
         alpaca_data_base_url="https://data.alpaca.markets/v2",
         alpaca_trading_base_url="https://paper-api.alpaca.markets/v2",
         ollama_base_url="http://127.0.0.1:11434",
