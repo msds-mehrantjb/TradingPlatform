@@ -11,6 +11,15 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from .alpaca import AlpacaClient, demo_bars, local_market_status
+from .algorithms.voting_ensemble.strategies.registry import (
+    STRATEGY_ALIAS_MAP as VOTING_ENSEMBLE_ALIAS_MAP,
+    VOTING_ENSEMBLE_AGGREGATOR_STRATEGIES,
+    VOTING_ENSEMBLE_CONTEXT_STRATEGIES,
+    VOTING_ENSEMBLE_DIRECTIONAL_STRATEGIES,
+    VOTING_ENSEMBLE_REGIME_STRATEGIES,
+    VOTING_ENSEMBLE_SAFETY_STRATEGIES,
+    resolve_strategy as resolve_voting_ensemble_strategy,
+)
 from .config import get_settings
 from .database import CandleStore
 from .market_context import compute_market_context
@@ -184,6 +193,22 @@ async def market_context(
     return _write_response_cache(cache_key, context)
 
 
+@app.get("/api/v2/algorithms/strategy-fit/inventory")
+def strategy_fit_inventory() -> dict[str, Any]:
+    modules = _voting_ensemble_strategy_catalog_modules()
+    return {
+        "algorithmId": "strategy_fit",
+        "engineVersion": "strategy_fit_inventory_v1",
+        "contractVersion": "strategy_fit_inventory_contract_v1",
+        "displayName": "Strategy Fit",
+        "sourceAlgorithmId": "voting_ensemble",
+        "sourceEngineVersion": "voting_ensemble_v2",
+        "sourceAuthority": "lightweight_market_data_service.voting_ensemble.strategy_catalog",
+        "sourceEndpoint": "/api/v2/algorithms/strategy-fit/inventory",
+        "modules": modules,
+    }
+
+
 async def _context_bars(
     *,
     symbol: str,
@@ -248,6 +273,46 @@ def _latest_quote_from_cached_or_demo_candle(*, symbol: str, feed: str) -> dict[
         "referenceCandleTimestamp": candle.get("timestamp"),
         "referenceClose": close,
     }
+
+
+def _voting_ensemble_strategy_catalog_modules() -> dict[str, list[dict[str, Any]]]:
+    return {
+        "directional": [_voting_ensemble_strategy_module_payload(entry) for entry in VOTING_ENSEMBLE_DIRECTIONAL_STRATEGIES if entry.enabled],
+        "context": [_voting_ensemble_strategy_module_payload(entry) for entry in VOTING_ENSEMBLE_CONTEXT_STRATEGIES],
+        "regime": [_voting_ensemble_strategy_module_payload(entry) for entry in VOTING_ENSEMBLE_REGIME_STRATEGIES],
+        "safety": [_voting_ensemble_strategy_module_payload(entry) for entry in VOTING_ENSEMBLE_SAFETY_STRATEGIES],
+        "aggregator": [_voting_ensemble_strategy_module_payload(entry) for entry in VOTING_ENSEMBLE_AGGREGATOR_STRATEGIES],
+    }
+
+
+def _voting_ensemble_strategy_module_payload(entry: Any) -> dict[str, Any]:
+    return {
+        "id": entry.strategyId,
+        "name": entry.strategyName,
+        "version": entry.strategyVersion,
+        "family": entry.family,
+        "role": entry.role,
+        "collection": _enum_value(entry.collection).lower(),
+        "status": entry.status,
+        "enabled": entry.enabled,
+        "requiredInputs": list(entry.requiredInputs),
+        "evidence": list(entry.evidence),
+        "aliases": _voting_ensemble_strategy_alias_metadata(entry.strategyId),
+    }
+
+
+def _voting_ensemble_strategy_alias_metadata(target_id: str) -> list[dict[str, Any]]:
+    aliases: list[dict[str, Any]] = []
+    for alias, canonical_id in VOTING_ENSEMBLE_ALIAS_MAP.items():
+        entry = resolve_voting_ensemble_strategy(canonical_id)
+        if entry.strategyId != target_id or alias in {entry.strategyId, entry.strategyName}:
+            continue
+        aliases.append({"name": alias, "status": "deprecated_alias", "aliasFor": entry.strategyId})
+    return aliases
+
+
+def _enum_value(value: Any) -> Any:
+    return value.value if hasattr(value, "value") else value
 
 
 async def _store_latest(*, symbol: str, timeframe: str, feed: str, limit: int) -> list[dict[str, Any]]:

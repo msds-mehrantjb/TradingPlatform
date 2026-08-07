@@ -127,6 +127,7 @@ class ApiV2EndpointsTest(unittest.TestCase):
         self.assertEqual(body["sourceAlgorithmId"], "voting_ensemble")
         self.assertEqual(body["sourceEngineVersion"], "voting_ensemble_v2")
         self.assertEqual(body["sourceEndpoint"], "/api/v2/algorithms/voting-ensemble/inventory")
+        self.assertEqual(body["sourceAuthority"], "voting_ensemble.strategy_catalog")
         self.assertEqual(body["modules"], source["modules"])
 
     def test_market_forecast_inventory_endpoint_has_named_dashboard_contract(self) -> None:

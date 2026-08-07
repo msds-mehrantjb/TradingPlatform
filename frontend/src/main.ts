@@ -16060,7 +16060,7 @@ async function loadVotingEnsembleInventory() {
   state.votingEnsembleInventoryStatus = state.votingEnsembleInventoryStatus === "ready" ? "ready" : "loading";
   state.votingEnsembleInventoryWarning = "";
   let lastMessage = "Strategy Fit inventory route unavailable";
-  for (const baseUrl of BACKTEST_API_CANDIDATES) {
+  for (const baseUrl of MARKET_DATA_API_CANDIDATES) {
     try {
       const response = await fetchWithTimeout(`${baseUrl}${TRADING_ALGORITHM_INVENTORY_ENDPOINTS.strategyFit}`, STRATEGY_INVENTORY_TIMEOUT_MS);
       if (loadId !== votingEnsembleInventoryLoadId) {

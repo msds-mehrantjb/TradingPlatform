@@ -38,3 +38,16 @@ def test_lightweight_market_data_quote_has_bid_ask_fallback() -> None:
     assert payload["quote"]["symbol"] == "SPY"
     assert payload["quote"]["bid"] > 0
     assert payload["quote"]["ask"] >= payload["quote"]["bid"]
+
+
+def test_lightweight_strategy_fit_inventory_returns_active_catalog_without_heavy_runtime() -> None:
+    client = TestClient(app)
+
+    response = client.get("/api/v2/algorithms/strategy-fit/inventory")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["algorithmId"] == "strategy_fit"
+    assert payload["sourceAuthority"] == "lightweight_market_data_service.voting_ensemble.strategy_catalog"
+    assert payload["modules"]["directional"]
+    assert payload["modules"]["directional"][0]["status"] == "active"

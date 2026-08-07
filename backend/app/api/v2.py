@@ -198,7 +198,7 @@ def voting_ensemble_inventory() -> dict[str, Any]:
 
 @router.get("/algorithms/strategy-fit/inventory")
 def strategy_fit_inventory() -> dict[str, Any]:
-    source = _voting_ensemble_inventory_payload()
+    source = _voting_ensemble_catalog_inventory_payload()
     return {
         "algorithmId": "strategy_fit",
         "engineVersion": "strategy_fit_inventory_v1",
@@ -207,7 +207,19 @@ def strategy_fit_inventory() -> dict[str, Any]:
         "sourceAlgorithmId": source["algorithmId"],
         "sourceEngineVersion": source["engineVersion"],
         "sourceEndpoint": "/api/v2/algorithms/voting-ensemble/inventory",
+        "sourceAuthority": "voting_ensemble.strategy_catalog",
         "modules": source["modules"],
+    }
+
+
+def _voting_ensemble_catalog_inventory_payload() -> dict[str, Any]:
+    return {
+        "algorithmId": "voting_ensemble",
+        "engineVersion": "voting_ensemble_v2",
+        "contractVersion": "voting_ensemble_strategy_catalog_inventory_contract_v1",
+        "displayName": "Voting Ensemble Strategy Catalog",
+        "strategyCounts": _voting_ensemble_strategy_counts(),
+        "modules": _voting_ensemble_module_inventory_payload(),
     }
 
 
@@ -248,19 +260,23 @@ def _voting_ensemble_inventory_payload() -> dict[str, Any]:
         },
         "executionReadiness": execution_readiness,
         "strategyCounts": _voting_ensemble_strategy_counts(),
-        "modules": {
-            "directional": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_DIRECTIONAL_STRATEGIES if entry.enabled],
-            "context": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_CONTEXT_STRATEGIES],
-            "regime": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_REGIME_STRATEGIES],
-            "safety": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_SAFETY_STRATEGIES],
-            "aggregator": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_AGGREGATOR_STRATEGIES],
-            "tradingSettings": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_TRADING_SETTINGS_RESOLVERS],
-            "riskBudget": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_RISK_BUDGET_MODULES],
-            "orderPlanner": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_ORDER_PLANNER_MODULES],
-            "executionAdapter": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_EXECUTION_ADAPTERS],
-            "backtestReplay": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_BACKTEST_REPLAY_ADAPTERS],
-            "backgroundWorker": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_BACKGROUND_WORKERS],
-        },
+        "modules": _voting_ensemble_module_inventory_payload(),
+    }
+
+
+def _voting_ensemble_module_inventory_payload() -> dict[str, list[dict[str, Any]]]:
+    return {
+        "directional": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_DIRECTIONAL_STRATEGIES if entry.enabled],
+        "context": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_CONTEXT_STRATEGIES],
+        "regime": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_REGIME_STRATEGIES],
+        "safety": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_SAFETY_STRATEGIES],
+        "aggregator": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_AGGREGATOR_STRATEGIES],
+        "tradingSettings": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_TRADING_SETTINGS_RESOLVERS],
+        "riskBudget": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_RISK_BUDGET_MODULES],
+        "orderPlanner": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_ORDER_PLANNER_MODULES],
+        "executionAdapter": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_EXECUTION_ADAPTERS],
+        "backtestReplay": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_BACKTEST_REPLAY_ADAPTERS],
+        "backgroundWorker": [_voting_ensemble_module_payload(entry) for entry in VOTING_ENSEMBLE_BACKGROUND_WORKERS],
     }
 
 
