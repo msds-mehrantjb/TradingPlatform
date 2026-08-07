@@ -710,13 +710,39 @@ class VotingEnsembleRuntimeSupervisor:
     async def _finalized_bar_producer_loop(self) -> None:
         assert self.finalized_bar_producer is not None
         while not self.stop_event.is_set():
-            results = await self.finalized_bar_producer.poll_once()
+            try:
+                results = await self.finalized_bar_producer.poll_once()
+            except Exception as exc:
+                self.metrics.lastError = str(exc) or type(exc).__name__
+                self.metrics.lastErrorAt = _now()
+                self.metrics.workerStatus["finalized_bar_producer"] = "running"
+                self.metrics.lastFinalizedBarProducerResult = {
+                    "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+                    "producerVersion": VOTING_ENSEMBLE_RUNTIME_SUPERVISOR_VERSION,
+                    "status": "transient_error",
+                    "accepted": False,
+                    "duplicate": False,
+                    "stale": False,
+                    "recordedAt": _now(),
+                    "error": self.metrics.lastError,
+                    "reasonCodes": ["voting_ensemble.finalized_bar_producer.transient_poll_error"],
+                }
+                await asyncio.sleep(self.finalized_bar_producer.config.poll_seconds)
+                continue
             for result in results:
                 if result.get("duplicate"):
                     self.metrics.duplicateFinalizedBarEvents += 1
                 if result.get("stale"):
                     self.metrics.staleFinalizedBarEvents += 1
                 self.metrics.lastFinalizedBarProducerResult = result
+            if results:
+                self.metrics.workerStatus["finalized_bar_producer"] = "running"
+                if self.metrics.lastError and all(
+                    "transient" not in str(result.get("status", "")).lower()
+                    for result in results
+                ):
+                    self.metrics.lastError = None
+                    self.metrics.lastErrorAt = None
             await asyncio.sleep(self.finalized_bar_producer.config.poll_seconds)
 
     async def _execution_worker_loop(self) -> None:
@@ -1000,7 +1026,10 @@ class VotingEnsembleRuntimeSupervisor:
     def _refresh_local_market_data_mark(self, *, symbol: str, feed: str) -> dict[str, Any] | None:
         if not _is_local_paper_mode(self.paper_execution_runtime):
             return None
-        quote = self._latest_quote(symbol=symbol, feed=feed)
+        try:
+            quote = self._latest_quote(symbol=symbol, feed=feed)
+        except Exception:
+            return None
         if not quote:
             return None
         marker = getattr(self.paper_execution_runtime, "mark_to_market_from_payload", None)

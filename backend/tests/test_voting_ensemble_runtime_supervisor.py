@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 import json
 from datetime import UTC, datetime, timedelta
@@ -488,6 +489,31 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("voting_ensemble.runtime.worker_failure_recorded", status["paperReadyBlockingReasonCodes"])
         control_path.unlink(missing_ok=True)
 
+    async def test_finalized_bar_producer_poll_error_is_transient_not_worker_failure(self) -> None:
+        self.supervisor = supervisor_with_runtime(settings=paper_settings(), market_clock_provider=lambda: {"isOpen": True, "status": "open"})
+        producer = OneTransientErrorFinalizedBarProducer(self.supervisor.stop_event)
+        self.supervisor.finalized_bar_producer = producer
+        self.supervisor.metrics.workerStatus["finalized_bar_producer"] = "running"
+
+        await self.supervisor._finalized_bar_producer_loop()
+
+        self.assertEqual(producer.calls, 2)
+        self.assertEqual(self.supervisor.metrics.workerStatus["finalized_bar_producer"], "running")
+        self.assertIsNone(self.supervisor.metrics.lastError)
+        self.assertNotEqual(self.supervisor.metrics.lastFinalizedBarProducerResult["status"], "transient_error")
+
+    async def test_local_market_data_mark_ignores_transient_quote_provider_failure(self) -> None:
+        self.supervisor = supervisor_with_runtime(
+            settings=paper_settings(),
+            market_clock_provider=lambda: {"isOpen": True, "status": "open"},
+            market_data_client=FailingQuoteMarketDataClient([]),
+            candle_store=MemoryCandleStore(),
+        )
+
+        result = self.supervisor._refresh_local_market_data_mark(symbol="SPY", feed="iex")
+
+        self.assertIsNone(result)
+
     async def test_local_paper_readiness_refreshes_stale_market_data_mark_from_quote_provider(self) -> None:
         quote_time = datetime.now(UTC) + timedelta(seconds=1)
         self.supervisor = supervisor_with_runtime(
@@ -916,12 +942,42 @@ class FakeMarketDataClient:
         return dict(self.quote) if self.quote is not None else None
 
 
+class FailingQuoteMarketDataClient(FakeMarketDataClient):
+    def get_latest_quote_sync(self, **kwargs: Any) -> dict[str, Any] | None:
+        raise RuntimeError("429 Too Many Requests")
+
+
 class FailingMarketDataClient:
     def __init__(self, message: str) -> None:
         self.message = message
 
     async def get_bars(self, **kwargs: Any) -> list[dict[str, Any]]:
         raise RuntimeError(self.message)
+
+
+class OneTransientErrorFinalizedBarProducer:
+    def __init__(self, stop_event: asyncio.Event) -> None:
+        self.stop_event = stop_event
+        self.config = VotingEnsembleFinalizedBarProducerConfig(poll_seconds=0)
+        self.calls = 0
+
+    async def poll_once(self) -> tuple[dict[str, Any], ...]:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("429 Too Many Requests")
+        self.stop_event.set()
+        return (
+            {
+                "algorithmId": "voting_ensemble",
+                "producerVersion": "test",
+                "eventId": None,
+                "status": "blocked",
+                "accepted": False,
+                "duplicate": False,
+                "stale": False,
+                "reasonCodes": ["voting_ensemble.finalized_bar_event.no_complete_one_minute_bar"],
+            },
+        )
 
 
 class MemoryCandleStore:
