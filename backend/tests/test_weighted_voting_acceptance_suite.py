@@ -34,6 +34,7 @@ from backend.tests.test_weighted_voting_runtime_supervisor import (
     seeded_inventory,
     validated_rollout_flags,
     validated_rollout_validation,
+    weighted_voting_local_gateway,
 )
 
 
@@ -158,7 +159,7 @@ def acceptance_supervisor(store: MemoryStore, broker: FakePaperBroker) -> tuple[
         store=store,
         config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
         event_bus=WeightedVotingEventBus(maxsize=8),
-        paper_gateway=PaperOrderGateway(broker, store),
+        paper_gateway=weighted_voting_local_gateway(broker, store),
         inventory_repository=inventory,
         rollout_flags=validated_rollout_flags(),
         rollout_validation=validated_rollout_validation(),
@@ -265,7 +266,7 @@ class WeightedVotingAcceptanceSuiteTest(unittest.TestCase):
         for offset in range(5):
             store = MemoryStore()
             broker = FakePaperBroker()
-            gateway = PaperOrderGateway(broker, store)
+            gateway = weighted_voting_local_gateway(broker, store)
             supervisor = WeightedVotingRuntimeSupervisor(
                 service=AcceptedExecutionService(store=store),
                 store=store,

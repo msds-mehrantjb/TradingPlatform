@@ -487,6 +487,16 @@ class WeightedDefaultSettings(WeightedContractModel):
     session_cutoff_minutes: int = Field(default=15, ge=0)
     slippage_allowance_per_share: float = Field(default=0.01, ge=0)
     fee_per_share: float = Field(default=0.01, ge=0)
+    paper_execution_mode: Literal["LOCAL_PAPER", "BROKER_PAPER"] = "LOCAL_PAPER"
+    local_paper_initial_capital: float = Field(default=100000.0, ge=0)
+    local_paper_buy_slippage_per_share: float = Field(default=0.01, ge=0)
+    local_paper_sell_slippage_per_share: float = Field(default=0.01, ge=0)
+    local_paper_commission_per_share: float = Field(default=0.01, ge=0)
+    local_paper_regulatory_fee_per_share: float = Field(default=0.0, ge=0)
+    local_paper_spread_impact_per_share: float = Field(default=0.0, ge=0)
+    local_paper_spread_impact_percent: float = Field(default=0.0001, ge=0)
+    local_paper_allow_shorting: bool = False
+    local_paper_partial_fill_mode: Literal["DETERMINISTIC_LIQUIDITY", "ALL_OR_NONE"] = "DETERMINISTIC_LIQUIDITY"
     cooldown_seconds: int = Field(default=300, ge=0)
     stale_data_threshold_seconds: int = Field(default=75, ge=0)
     quote_freshness_threshold_seconds: int = Field(default=75, ge=0)
@@ -681,6 +691,16 @@ class WeightedEffectiveSettings(WeightedContractModel):
     session_cutoff_minutes: int = Field(default=15, ge=0)
     slippage_allowance_per_share: float = Field(default=0.01, ge=0)
     fee_per_share: float = Field(default=0.01, ge=0)
+    paper_execution_mode: Literal["LOCAL_PAPER", "BROKER_PAPER"] = "LOCAL_PAPER"
+    local_paper_initial_capital: float = Field(default=100000.0, ge=0)
+    local_paper_buy_slippage_per_share: float = Field(default=0.01, ge=0)
+    local_paper_sell_slippage_per_share: float = Field(default=0.01, ge=0)
+    local_paper_commission_per_share: float = Field(default=0.01, ge=0)
+    local_paper_regulatory_fee_per_share: float = Field(default=0.0, ge=0)
+    local_paper_spread_impact_per_share: float = Field(default=0.0, ge=0)
+    local_paper_spread_impact_percent: float = Field(default=0.0001, ge=0)
+    local_paper_allow_shorting: bool = False
+    local_paper_partial_fill_mode: Literal["DETERMINISTIC_LIQUIDITY", "ALL_OR_NONE"] = "DETERMINISTIC_LIQUIDITY"
     cooldown_seconds: int = Field(default=300, ge=0)
     stale_data_threshold_seconds: int = Field(default=75, ge=0)
     quote_freshness_threshold_seconds: int = Field(default=75, ge=0)

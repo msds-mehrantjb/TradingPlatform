@@ -45,6 +45,9 @@ class WeightedVotingBrokerOrderObservation:
     replaced_by_client_order_id: str | None = None
     protective: bool = False
 
+    def __post_init__(self) -> None:
+        _require_weighted_voting_or_unattributed(self.algorithm_id, "broker order observation")
+
 
 @dataclass(frozen=True)
 class WeightedVotingBrokerFillObservation:
@@ -58,6 +61,9 @@ class WeightedVotingBrokerFillObservation:
     filled_at: datetime
     broker_order_id: str | None = None
 
+    def __post_init__(self) -> None:
+        _require_weighted_voting_or_unattributed(self.algorithm_id, "broker fill observation")
+
 
 @dataclass(frozen=True)
 class WeightedVotingBrokerPositionObservation:
@@ -70,6 +76,9 @@ class WeightedVotingBrokerPositionObservation:
     broker_position_id: str | None = None
     unrealised_pnl: float | None = None
     realised_pnl: float | None = None
+
+    def __post_init__(self) -> None:
+        _require_weighted_voting_or_unattributed(self.algorithm_id, "broker position observation")
 
 
 @dataclass(frozen=True)
@@ -354,7 +363,7 @@ def _local_weighted_voting_intents(store: WeightedVotingStateStore) -> dict[str,
         if not (
             key.startswith("weighted_voting.runtime.order_intents.")
             or key.startswith("weighted_voting.execution_gateway.order_intent_index.")
-            or key.startswith("paper_order_gateway.intent.")
+            or key.startswith("weighted_voting.execution_gateway.local_paper.intent.")
         ):
             continue
         if str(payload.get("algorithmId") or payload.get("algorithm_id") or WEIGHTED_VOTING_ALGORITHM_ID) != WEIGHTED_VOTING_ALGORITHM_ID:
@@ -370,8 +379,10 @@ def _local_weighted_voting_fills(store: WeightedVotingStateStore) -> dict[str, d
     for key, payload in _store_items(store):
         if not (
             key.startswith("weighted_voting.execution_gateway.fills.")
+            or key.startswith("weighted_voting.execution_gateway.fill.")
+            or key.startswith("weighted_voting.execution_gateway.local_paper.fill.")
+            or key.startswith("weighted_voting.local_paper.fills.")
             or key.startswith("weighted_voting.broker_reconciliation.fills.")
-            or key.startswith("paper_order_gateway.fill.")
         ):
             continue
         if str(payload.get("algorithmId") or payload.get("algorithm_id") or WEIGHTED_VOTING_ALGORITHM_ID) != WEIGHTED_VOTING_ALGORITHM_ID:
@@ -439,6 +450,11 @@ def _discrepancy(
 
 def _is_weighted_voting_attributed(algorithm_id: str | None) -> bool:
     return algorithm_id == WEIGHTED_VOTING_ALGORITHM_ID
+
+
+def _require_weighted_voting_or_unattributed(algorithm_id: str | None, model_name: str) -> None:
+    if algorithm_id is not None and algorithm_id != WEIGHTED_VOTING_ALGORITHM_ID:
+        raise ValueError(f"Weighted Voting reconciliation rejects foreign {model_name}")
 
 
 def _severity_value(value: WeightedVotingReconciliationDiscrepancySeverity | str) -> str:

@@ -124,6 +124,9 @@ class WeightedVotingAlgorithmPerformance:
     average_hold_minutes: float
     trade_frequency: float
 
+    def __post_init__(self) -> None:
+        _require_weighted_voting_performance_owner(self.algorithm_id, "algorithm performance")
+
     def as_dict(self) -> dict[str, Any]:
         return _camel_payload(asdict(self))
 
@@ -143,6 +146,9 @@ class WeightedVotingStrategyPerformance:
     confidence_calibration: float
     weight_contribution: float
     marginal_contribution: float
+
+    def __post_init__(self) -> None:
+        _require_weighted_voting_performance_owner(self.algorithm_id, "strategy performance")
 
     def as_dict(self) -> dict[str, Any]:
         return _camel_payload(asdict(self))
@@ -172,6 +178,9 @@ class WeightedVotingMarketConditionPerformance:
     by_session_period: dict[str, WeightedVotingPerformanceBucket]
     by_long_short_direction: dict[str, WeightedVotingPerformanceBucket]
 
+    def __post_init__(self) -> None:
+        _require_weighted_voting_performance_owner(self.algorithm_id, "market-condition performance")
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "algorithmId": self.algorithm_id,
@@ -195,6 +204,9 @@ class WeightedVotingWeightVersionPerformance:
     profit_factor: float
     maximum_drawdown: float
 
+    def __post_init__(self) -> None:
+        _require_weighted_voting_performance_owner(self.algorithm_id, "weight-version performance")
+
     def as_dict(self) -> dict[str, Any]:
         return _camel_payload(asdict(self))
 
@@ -210,6 +222,15 @@ class WeightedVotingPerformanceReport:
     weight_version_level: dict[str, WeightedVotingWeightVersionPerformance]
     reason_codes: tuple[str, ...]
     explanation: str
+
+    def __post_init__(self) -> None:
+        _require_weighted_voting_performance_owner(self.algorithm_id, "performance report")
+        _require_weighted_voting_performance_owner(self.algorithm_level.algorithm_id, "algorithm performance")
+        _require_weighted_voting_performance_owner(self.market_condition_level.algorithm_id, "market-condition performance")
+        for item in self.strategy_level.values():
+            _require_weighted_voting_performance_owner(item.algorithm_id, "strategy performance")
+        for item in self.weight_version_level.values():
+            _require_weighted_voting_performance_owner(item.algorithm_id, "weight-version performance")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -421,6 +442,11 @@ def _validate_owned_inputs(
     for item in (*trades, *signal_observations, *weight_snapshots):
         if getattr(item, "algorithm_id", None) != WEIGHTED_VOTING_ALGORITHM_ID:
             raise ValueError("Weighted Voting performance tracker received foreign algorithm input")
+
+
+def _require_weighted_voting_performance_owner(algorithm_id: str, model_name: str) -> None:
+    if algorithm_id != WEIGHTED_VOTING_ALGORITHM_ID:
+        raise ValueError(f"foreign algorithm {model_name} cannot enter Weighted Voting performance tracking")
 
 
 def _allocated_trade_return(trade: WeightedVotingTrackedTrade) -> float:

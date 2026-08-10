@@ -782,20 +782,34 @@ def _call_central_global_risk_service(
 
 
 def _current_account_exposure(context: WeightedVotingRuntimeContext) -> float:
-    if context.read_only_account_equity is None or context.read_only_broker_buying_power is None:
-        return 0.0
-    return max(0.0, float(context.read_only_account_equity) - float(context.read_only_broker_buying_power))
+    return context.inventory_snapshot.gross_exposure
 
 
 def _account_level_risk_observations(context: WeightedVotingRuntimeContext) -> dict[str, Any]:
+    inventory = context.inventory_snapshot
     return {
-        "accountEquity": context.read_only_account_equity,
-        "brokerBuyingPower": context.read_only_broker_buying_power,
+        "localEquity": inventory.equity,
+        "localCash": inventory.cash_available,
+        "localBuyingPower": inventory.buying_power,
+        "localReservedCash": inventory.reserved_cash,
+        "localReservedBuyingPower": inventory.reserved_buying_power,
+        "localPositions": [_json_ready(position) for position in inventory.open_positions],
+        "localPendingOrders": [_json_ready(order) for order in inventory.pending_orders],
+        "localGrossExposure": inventory.gross_exposure,
+        "localNetExposure": inventory.net_exposure,
+        "localDailyPnl": inventory.daily_realised_pnl + inventory.daily_unrealised_pnl,
+        "localDailyRealizedPnl": inventory.daily_realised_pnl,
+        "localDailyUnrealizedPnl": inventory.daily_unrealised_pnl,
+        "localDailyLoss": inventory.daily_loss,
+        "localDailyTradeCount": inventory.daily_trade_count,
+        "localRemainingRisk": inventory.remaining_daily_risk,
+        "localRiskUsed": inventory.daily_risk_used,
+        "inventorySnapshotVersion": inventory.snapshot_version,
         "globalRiskServiceAvailable": context.global_risk_service_availability,
         "globalAvailableRisk": context.global_risk_state.global_available_risk,
         "globalMaxShares": context.global_risk_state.global_max_shares,
         "accountExposure": _current_account_exposure(context),
-        "source": context.global_risk_state.source_id,
+        "source": "weighted_voting.local_inventory",
         "reasonCodes": context.global_risk_state.reason_codes,
     }
 

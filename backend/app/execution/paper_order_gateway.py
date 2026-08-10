@@ -56,6 +56,13 @@ class PaperGatewayFill(DomainModel):
     side: Signal
     filledQuantity: int = Field(ge=0)
     averageFillPrice: float | None = Field(default=None, gt=0)
+    marketReferencePrice: float | None = Field(default=None, gt=0)
+    slippagePerShare: float = Field(default=0.0, ge=0)
+    spreadImpactPerShare: float = Field(default=0.0, ge=0)
+    commission: float = Field(default=0.0, ge=0)
+    regulatoryFees: float = Field(default=0.0, ge=0)
+    totalExecutionCost: float = Field(default=0.0, ge=0)
+    executionCostBreakdown: dict[str, Any] = Field(default_factory=dict)
     status: GatewayOrderStatus
     filledAt: datetime
 
@@ -208,6 +215,18 @@ class PaperOrderGateway:
     ) -> PaperOrderGatewayResult:
         evaluated_at = _require_utc(evaluated_at)
         client_order_id = _client_order_id_for_proposal(proposal)
+        if proposal.algorithmId == "weighted_voting":
+            return self._result(
+                proposal,
+                client_order_id,
+                mode,
+                False,
+                False,
+                "NOT_SUBMITTED",
+                ("weighted_voting.local_paper.shared_gateway_forbidden",),
+                "Weighted Voting orders must use the dedicated Weighted Voting local paper broker.",
+                evaluated_at,
+            )
         duplicate = _read_optional(self.store, _intent_key(proposal.orderIntentId)) is not None
         if duplicate:
             return self._result(proposal, client_order_id, mode, False, True, "DUPLICATE", ("paper_gateway.duplicate_intent",), "Duplicate order intent was not resubmitted.", evaluated_at)

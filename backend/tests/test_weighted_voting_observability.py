@@ -132,7 +132,7 @@ class WeightedVotingObservabilityTest(unittest.TestCase):
     def test_paper_order_execution_records_eventual_outcome_traceable_to_decision(self) -> None:
         store = MemoryStore()
         broker = FakePaperBroker()
-        gateway = PaperOrderGateway(broker, store)
+        gateway = weighted_voting_local_gateway(broker, store)
         proposal = global_proposal()
         response = GlobalGateResponse(
             action="ALLOW",
@@ -190,6 +190,15 @@ def validated_rollout_validation() -> WeightedVotingRolloutValidation:
         paper_broker_e2e_validated=True,
         reconciliation_validated=True,
         restart_recovery_validated=True,
+        local_paper_broker_validated=True,
+        local_inventory_reconciled=True,
+        local_balance_accounting_validated=True,
+        local_fill_simulation_validated=True,
+        local_restart_recovery_validated=True,
+        no_cross_algorithm_mutation_validated=True,
+        no_alpaca_dependency_validated=True,
+        risk_fail_closed_validated=True,
+        protective_exits_validated=True,
         persisted_operator_approval=True,
         validation_record_id="weighted_voting.rollout.validation.observability_test",
         source_authority="backend.weighted_voting.observability_test_validation",
@@ -213,7 +222,13 @@ class MemoryStore:
 
 
 class FakePaperBroker:
-    base_url = "https://paper-api.alpaca.markets/v2"
+    broker_kind = "weighted_voting_local_paper"
+    paper_endpoint = True
+    live_trading_enabled = False
+    base_url = "local-paper://weighted_voting"
+
+    def verify_paper_endpoint(self) -> bool:
+        return True
 
     def verify_paper_account(self) -> bool:
         return True
@@ -244,6 +259,10 @@ class FakePaperBroker:
 
     def refresh_positions(self) -> list[dict]:
         return []
+
+
+def weighted_voting_local_gateway(broker: FakePaperBroker, store: MemoryStore) -> PaperOrderGateway:
+    return PaperOrderGateway(broker, store, execution_mode="LOCAL_PAPER")
 
 
 def evaluate_payload(count: int = 95) -> dict:

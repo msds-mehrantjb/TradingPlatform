@@ -217,6 +217,26 @@ class WeightedVotingPersistenceTest(unittest.TestCase):
                     created_at=TS,
                 )
 
+    def test_weighted_voting_store_rejects_cross_algorithm_snapshot_keys_and_payloads(self) -> None:
+        with workspace_temp_dir() as temp_dir:
+            store = WeightedVotingFilesystemStateStore(root=Path(temp_dir) / "data" / "algorithms" / "weighted_voting")
+
+            with self.assertRaisesRegex(ValueError, "non-weighted_voting snapshot keys"):
+                store.write_snapshot(
+                    "voting_ensemble.positions.SPY",
+                    {"algorithmId": "weighted_voting", "symbol": "SPY", "quantity": 1},
+                )
+            with self.assertRaisesRegex(ValueError, "foreign algorithm payloads"):
+                store.write_snapshot(
+                    "weighted_voting.inventory.snapshot.current",
+                    {
+                        "algorithmId": "weighted_voting",
+                        "position": {"algorithmId": "voting_ensemble", "symbol": "SPY", "quantity": 1},
+                    },
+                )
+            with self.assertRaisesRegex(ValueError, "non-weighted_voting snapshot keys"):
+                snapshot_collection_for_key("voting_ensemble.inventory.snapshot.current")
+
     def test_artifact_hash_validation_detects_tampering(self) -> None:
         with workspace_temp_dir() as temp_dir:
             store = WeightedVotingFilesystemStateStore(root=Path(temp_dir) / "data" / "algorithms" / "weighted_voting")

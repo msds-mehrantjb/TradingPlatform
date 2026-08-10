@@ -87,6 +87,14 @@ class WeightedVotingPerformanceTrackerTest(unittest.TestCase):
                 effective_at=NOW,
                 strategy_weights={"foreign": 1.0},
             )
+        report = build_weighted_voting_performance_report(
+            trades=(trade("t2", "d2", 10.0, 9.0, 1.0, ("wv_orb",), "weights-v1"),),
+            evaluated_at=NOW,
+        )
+        with self.assertRaises(ValueError):
+            replace(report.algorithm_level, algorithm_id="voting_ensemble")
+        with self.assertRaises(ValueError):
+            replace(report, algorithm_id="voting_ensemble")
 
     def test_performance_report_persists_under_weighted_voting_namespace(self) -> None:
         store = MemoryStore()

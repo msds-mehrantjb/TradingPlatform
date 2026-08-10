@@ -20,8 +20,7 @@ from backend.app.risk import (
 from backend.app.risk.order_gates import global_intent_key
 from backend.app.risk.portfolio_gates import portfolio_metrics
 from backend.app.main import app
-from backend.tests.test_weighted_voting_paper_order_gateway import NOW, global_application, global_proposal, local_gate, validated_rollout_flags, validated_rollout_validation
-from backend.app.algorithms.weighted_voting.execution_gateway import submit_weighted_voting_paper_order
+from backend.tests.test_weighted_voting_paper_order_gateway import NOW, global_application, global_proposal
 
 
 class GlobalPortfolioRiskManagerPhase12Test(unittest.TestCase):
@@ -137,17 +136,20 @@ class GlobalPortfolioRiskManagerPhase12Test(unittest.TestCase):
         store = MemoryStore()
         manager = GlobalPortfolioRiskManager(settings=GlobalRiskSettings(masterNewEntryEnabled=False))
         gateway = PaperOrderGateway(broker, store, global_risk_manager=manager)
-        proposal = global_proposal()
+        proposal = global_proposal(order_intent_id="shared-global-risk-denied").model_copy(
+            update={
+                "algorithmId": "voting_ensemble",
+                "capitalPartitionId": "voting_ensemble.paper.default",
+                "decisionId": "shared-global-risk-denied.decision",
+            }
+        )
 
-        result = submit_weighted_voting_paper_order(
-            gateway=gateway,
+        result = gateway.submit(
             proposal=proposal,
             global_application=global_application(proposal),
-            local_gate_result=local_gate(True),
+            local_gate_passed=True,
             mode="automatic",
             evaluated_at=NOW,
-            rollout_flags=validated_rollout_flags(),
-            rollout_validation=validated_rollout_validation(),
         )
 
         self.assertFalse(result.submitted)

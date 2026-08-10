@@ -44,6 +44,8 @@ class WeightedVotingPositionSizingTest(unittest.TestCase):
             result.risk_based_quantity,
             result.capital_partition_quantity,
             result.buying_power_quantity,
+            next(cap.quantity for cap in result.caps if cap.cap_id == "order_allocation"),
+            next(cap.quantity for cap in result.caps if cap.cap_id == "maximum_position"),
             result.liquidity_quantity,
             result.volume_participation_quantity,
             result.algorithm_maximum_quantity,
@@ -162,6 +164,72 @@ class WeightedVotingPositionSizingTest(unittest.TestCase):
         self.assertLess(single_family.size_multiplier, multi_family.size_multiplier)
         self.assertLess(single_family.quantity, multi_family.quantity)
         self.assertIn("weighted_voting.sizing.partial_size_independent_family_support", single_family.reason_codes)
+
+    def test_local_risk_capital_and_buying_power_formulas_remain_one_way_capped(self) -> None:
+        settings = effective_settings(
+            base_risk_per_trade_percent=1.0,
+            order_allocation_percent=100.0,
+            maximum_position_percent=5.0,
+            maximum_shares=100000,
+            maximum_participation_rate=1.0,
+            minimum_edge=0.12,
+        )
+        context = base_context(
+            effective_settings=settings,
+            account_equity=50_000.0,
+            available_buying_power=12_000.0,
+            remaining_weighted_daily_risk=50_000.0,
+            remaining_weighted_capital_partition=50_000.0,
+            global_available_risk=50_000.0,
+            global_max_shares=100000,
+            structural_invalidation_price=99.05,
+            atr=0.1,
+            average_one_minute_volume=1000000.0,
+        )
+
+        uncapped = calculate_weighted_voting_position_size(context)
+        reduced = calculate_weighted_voting_position_size(base_context(**{**context.__dict__, "global_max_shares": 7}))
+        entry_price = context.market_snapshot.ask
+        expected_risk = context.account_equity * (settings.base_risk_per_trade_percent / 100.0) * uncapped.size_multiplier
+        expected_max_position = int((context.account_equity * (settings.maximum_position_percent / 100.0)) // entry_price)
+        expected_buying_power = int(context.available_buying_power // entry_price)
+
+        self.assertAlmostEqual(uncapped.effective_risk_dollars, expected_risk)
+        self.assertEqual(uncapped.risk_based_quantity, int(expected_risk // uncapped.stop_distance))
+        self.assertEqual(next(cap.quantity for cap in uncapped.caps if cap.cap_id == "maximum_position"), expected_max_position)
+        self.assertEqual(uncapped.buying_power_quantity, expected_buying_power)
+        self.assertEqual(uncapped.requested_quantity, min(uncapped.risk_based_quantity, uncapped.capital_partition_quantity, uncapped.buying_power_quantity, expected_max_position, uncapped.liquidity_quantity, uncapped.volume_participation_quantity, uncapped.algorithm_maximum_quantity))
+        self.assertEqual(reduced.quantity, 7)
+        self.assertLess(reduced.quantity, uncapped.requested_quantity)
+        self.assertEqual(reduced.global_maximum_quantity, 7)
+
+    def test_insufficient_buying_power_and_max_position_reached_produce_zero_new_entry_size(self) -> None:
+        no_buying_power = calculate_weighted_voting_position_size(
+            base_context(
+                available_buying_power=0.0,
+                remaining_weighted_capital_partition=100000.0,
+                global_available_risk=100000.0,
+                global_max_shares=100000,
+            )
+        )
+        max_position_reached = calculate_weighted_voting_position_size(
+            base_context(
+                effective_settings=effective_settings(maximum_position_percent=0.0),
+                available_buying_power=100000.0,
+                remaining_weighted_capital_partition=100000.0,
+                global_available_risk=100000.0,
+                global_max_shares=100000,
+            )
+        )
+
+        self.assertEqual(no_buying_power.quantity, 0)
+        self.assertEqual(no_buying_power.requested_quantity, 0)
+        self.assertEqual(no_buying_power.limiting_factor, "buying_power_quantity")
+        self.assertIn("weighted_voting.sizing.cap.available_buying_power", no_buying_power.reason_codes)
+        self.assertEqual(max_position_reached.quantity, 0)
+        self.assertEqual(max_position_reached.requested_quantity, 0)
+        self.assertEqual(max_position_reached.limiting_factor, "maximum_position_quantity")
+        self.assertIn("weighted_voting.sizing.cap.maximum_position", max_position_reached.reason_codes)
 
 
 def base_context(**overrides) -> WeightedVotingSizingContext:

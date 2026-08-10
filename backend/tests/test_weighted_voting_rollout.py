@@ -109,6 +109,8 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertFalse(limited.automatic_submission_allowed)
         self.assertTrue(paper.automatic_submission_allowed)
         self.assertTrue(production_ready.production_ready)
+        self.assertFalse(production_ready.live_trading_allowed)
+        self.assertTrue(production_ready.automatic_submission_allowed)
         self.assertFalse(paused.trading_allowed)
         self.assertFalse(emergency.trading_allowed)
 
@@ -182,6 +184,33 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertIn("weighted_voting.rollout.auto_submit_flag_disabled", automatic_blocked.reason_codes)
         self.assertTrue(automatic_enabled.enabled)
 
+    def test_automatic_submission_requires_local_paper_readiness_evidence(self) -> None:
+        flags = WeightedVotingRolloutFlags(v2_enabled=True, shadow_mode=False, dynamic_reduction_enabled=True, dynamic_increase_enabled=False, auto_submit_enabled=True)
+        validation = fully_validated_rollout()
+        missing_local = WeightedVotingRolloutValidation(
+            **{
+                **validation.model_dump(),
+                "local_paper_broker_validated": False,
+                "local_balance_accounting_validated": False,
+                "local_fill_simulation_validated": False,
+                "no_cross_algorithm_mutation_validated": False,
+                "no_alpaca_dependency_validated": False,
+                "risk_fail_closed_validated": False,
+                "protective_exits_validated": False,
+            }
+        )
+
+        status = evaluate_rollout_stage("automatic_paper_submission", flags=flags, validation=missing_local)
+
+        self.assertFalse(status.enabled)
+        self.assertIn("weighted_voting.rollout.local_paper_broker_not_validated", status.reason_codes)
+        self.assertIn("weighted_voting.rollout.local_balance_accounting_not_validated", status.reason_codes)
+        self.assertIn("weighted_voting.rollout.local_fill_simulation_not_validated", status.reason_codes)
+        self.assertIn("weighted_voting.rollout.cross_algorithm_mutation_not_validated_absent", status.reason_codes)
+        self.assertIn("weighted_voting.rollout.no_alpaca_dependency_not_validated", status.reason_codes)
+        self.assertIn("weighted_voting.rollout.risk_fail_closed_not_validated", status.reason_codes)
+        self.assertIn("weighted_voting.rollout.protective_exits_not_validated", status.reason_codes)
+
     def test_live_trading_blocks_every_stage_even_when_flags_and_metrics_pass(self) -> None:
         flags = WeightedVotingRolloutFlags(v2_enabled=True, shadow_mode=True, dynamic_reduction_enabled=True, dynamic_increase_enabled=False, auto_submit_enabled=True)
         validation = fully_validated_rollout(live_trading_enabled=True)
@@ -202,6 +231,8 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertEqual(len(status["stages"]), len(ROLLOUT_STAGES))
         self.assertTrue(status["automatic_submission_allowed"])
         self.assertFalse(status["live_trading_allowed"])
+        self.assertFalse(status["control"]["live_trading_allowed"])
+        self.assertIn("never grants live trading", status["control"]["explanation"])
 
     def test_automatic_submission_requires_persisted_backend_validation_and_env_flag(self) -> None:
         store = MemoryStore()
@@ -393,6 +424,38 @@ class WeightedVotingRolloutTest(unittest.TestCase):
         self.assertTrue(store.snapshots[ROLLOUT_STATE_KEY]["automatic_paper_submission_allowed"])
         self.assertEqual(store.snapshots[ROLLOUT_STATE_KEY]["small_allocation_guardrails"]["cap_quantity"], 10)
 
+    def test_controlled_automatic_promotion_requires_local_paper_readiness_evidence(self) -> None:
+        evidence = passing_evidence()
+        missing = WeightedVotingControlledRolloutEvidence(
+            **{
+                **evidence.model_dump(),
+                "local_paper_broker_validated": False,
+                "local_balance_accounting_validated": False,
+                "local_fill_simulation_validated": False,
+                "local_restart_recovery_validated": False,
+                "no_cross_algorithm_mutation": False,
+                "no_alpaca_dependency": False,
+                "global_risk_fail_closed_tests_passing": False,
+                "protective_order_reliability_ok": False,
+            }
+        )
+
+        promoted, blockers = evaluate_controlled_rollout_promotion(
+            current_stage="manual_paper_submission",
+            target_stage="automatic_paper_small_allocation",
+            evidence=missing,
+        )
+
+        self.assertFalse(promoted)
+        self.assertIn("weighted_voting.rollout.local_paper_broker_not_validated", blockers)
+        self.assertIn("weighted_voting.rollout.local_balance_accounting_not_validated", blockers)
+        self.assertIn("weighted_voting.rollout.local_fill_simulation_not_validated", blockers)
+        self.assertIn("weighted_voting.rollout.local_restart_recovery_not_validated", blockers)
+        self.assertIn("weighted_voting.rollout.cross_algorithm_mutation_not_validated_absent", blockers)
+        self.assertIn("weighted_voting.rollout.no_alpaca_dependency_not_validated", blockers)
+        self.assertIn("weighted_voting.rollout.risk_fail_closed_not_validated", blockers)
+        self.assertIn("weighted_voting.rollout.protective_order_reliability_unverified", blockers)
+
     def test_controlled_rollback_is_immediate_and_safe(self) -> None:
         store = MemoryStore()
         store.write_snapshot(
@@ -454,6 +517,15 @@ def fully_validated_rollout(*, live_trading_enabled: bool = False) -> WeightedVo
         paper_broker_e2e_validated=True,
         reconciliation_validated=True,
         restart_recovery_validated=True,
+        local_paper_broker_validated=True,
+        local_inventory_reconciled=True,
+        local_balance_accounting_validated=True,
+        local_fill_simulation_validated=True,
+        local_restart_recovery_validated=True,
+        no_cross_algorithm_mutation_validated=True,
+        no_alpaca_dependency_validated=True,
+        risk_fail_closed_validated=True,
+        protective_exits_validated=True,
         persisted_operator_approval=True,
         validation_record_id="weighted_voting.rollout.validation.test",
         source_authority="backend.weighted_voting.test_validation_worker",
@@ -474,6 +546,12 @@ def passing_evidence(*, shadow_opportunity_count: int = 100, manual_paper_sample
         data_freshness_stable=True,
         global_risk_fail_closed_tests_passing=True,
         restart_recovery_successful=True,
+        local_paper_broker_validated=True,
+        local_balance_accounting_validated=True,
+        local_fill_simulation_validated=True,
+        local_restart_recovery_validated=True,
+        no_cross_algorithm_mutation=True,
+        no_alpaca_dependency=True,
         shadow_opportunity_count=shadow_opportunity_count,
         manual_paper_sample_count=manual_paper_sample_count,
         transaction_cost_adjusted_paper_stability_ok=True,
@@ -510,6 +588,14 @@ def shadow_report(*, decisions: int) -> dict:
         },
         "protectiveOrderBehavior": {
             "passed": True,
+        },
+        "localPaperReadiness": {
+            "localPaperBrokerValidated": True,
+            "localBalanceAccountingValidated": True,
+            "localFillSimulationValidated": True,
+            "localRestartRecoveryValidated": True,
+            "noCrossAlgorithmMutation": True,
+            "noAlpacaDependency": True,
         },
         "runtimeContexts": {
             "items": [

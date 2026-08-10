@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timezone
 
 from backend.app.algorithms.weighted_voting.aggregation import aggregate_weighted_signals
+from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.decision_gates import (
     WeightedFiveMinuteAlignment,
     WeightedGateEvaluationMode,
@@ -68,6 +69,17 @@ class WeightedVotingDecisionGatesTest(unittest.TestCase):
         self.assertFalse(gate.blocks_order)
         self.assertNotEqual(gate.status, WeightedGateStatus.PASS.value)
         self.assertTrue(result.permission_granted)
+
+    def test_existing_position_blocks_additional_entry_unless_pyramiding_enabled(self) -> None:
+        inputs = valid_gate_inputs(current_position=WeightedPositionState(symbol="SPY", quantity=50, average_entry_price=600.0, data_timestamp=TS, explanation="Open position."))
+
+        blocked = evaluate_local_decision_gates(inputs, config=WeightedVotingConfig(allow_weighted_pyramiding=False))
+        allowed = evaluate_local_decision_gates(inputs, config=WeightedVotingConfig(allow_weighted_pyramiding=True))
+
+        self.assertFalse(blocked.permission_granted)
+        self.assertIn("weighted_voting.gate.pyramiding_not_allowed", blocked.reason_codes)
+        self.assertTrue(allowed.permission_granted)
+        self.assertNotIn("weighted_voting.gate.pyramiding_not_allowed", allowed.reason_codes)
 
     def test_unacceptable_strategy_data_quality_rejects_with_stable_reason_code(self) -> None:
         inputs = valid_gate_inputs(signals=tuple([strategy_signal("S1", WeightedStrategyFamily.BREAKOUT, data_ready=False)]))

@@ -9,7 +9,8 @@ from typing import Any, Literal
 
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedVotingGatePipelineResult
 from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ALGORITHM_ID
-from backend.app.algorithms.weighted_voting.inventory import CURRENT_SNAPSHOT_KEY, WeightedVotingInventoryEventType, WeightedVotingInventoryRepository
+from backend.app.algorithms.weighted_voting.inventory import CURRENT_SNAPSHOT_KEY, WeightedVotingInventoryEventType, WeightedVotingInventoryRepository, WeightedVotingInventorySnapshot
+from backend.app.algorithms.weighted_voting.local_paper_logging import record_weighted_voting_local_paper_lifecycle_event
 from backend.app.algorithms.weighted_voting.observability import record_order_execution_observability
 from backend.app.algorithms.weighted_voting.order_proposal import WeightedVotingOrderProposal
 from backend.app.algorithms.weighted_voting.persistence import WeightedVotingStateStore
@@ -18,13 +19,20 @@ from backend.app.algorithms.weighted_voting.rollout import (
     WeightedVotingRolloutValidation,
     automatic_submission_allowed,
 )
-from backend.app.execution import PaperOrderGateway, PaperOrderGatewayResult, deterministic_gateway_client_order_id
+from backend.app.domain.models import Signal
+from backend.app.execution import (
+    PaperGatewayProtectiveOrder,
+    PaperOrderGateway,
+    PaperOrderGatewayResult,
+    PaperOrderIntentRecord,
+    deterministic_gateway_client_order_id,
+)
 from backend.app.gates import AppliedGlobalGateDecision, GlobalOrderProposal
 
 
 WEIGHTED_VOTING_EXECUTION_GATEWAY_VERSION = "weighted_voting_execution_gateway_v2"
 WEIGHTED_VOTING_EXECUTION_NAMESPACE = "weighted_voting.execution_gateway"
-WEIGHTED_VOTING_BROKER_CONNECTION_BOUNDARY = "shared_broker_connection"
+WEIGHTED_VOTING_BROKER_CONNECTION_BOUNDARY = "weighted_voting_local_paper_broker"
 WEIGHTED_VOTING_EXECUTION_OWNERSHIP = "weighted_voting"
 
 WeightedVotingExecutionStatus = Literal[
@@ -124,10 +132,11 @@ class WeightedVotingBrokerCommand:
         payload.update(
             {
                 "commandNamespace": WEIGHTED_VOTING_EXECUTION_NAMESPACE,
-                "commandType": "submit_bracket_order",
+                "commandType": "simulate_local_paper_order",
                 "brokerConnection": WEIGHTED_VOTING_BROKER_CONNECTION_BOUNDARY,
                 "preserveAlgorithmOwnership": True,
                 "ownershipMutationAllowed": False,
+                "executionMode": "LOCAL_PAPER",
             }
         )
         return payload
@@ -264,6 +273,13 @@ class WeightedVotingFillAttribution:
     status: str
     filled_at: datetime
     reason_codes: tuple[str, ...]
+    market_reference_price: float | None = None
+    slippage_per_share: float = 0.0
+    spread_impact_per_share: float = 0.0
+    commission: float = 0.0
+    regulatory_fees: float = 0.0
+    total_execution_cost: float = 0.0
+    execution_cost_breakdown: dict[str, Any] | None = None
     gateway_version: str = WEIGHTED_VOTING_EXECUTION_GATEWAY_VERSION
 
     def __post_init__(self) -> None:
@@ -283,6 +299,13 @@ class WeightedVotingFillAttribution:
             "side": self.side,
             "filledQuantity": self.filled_quantity,
             "averageFillPrice": self.average_fill_price,
+            "marketReferencePrice": self.market_reference_price,
+            "slippagePerShare": self.slippage_per_share,
+            "spreadImpactPerShare": self.spread_impact_per_share,
+            "commission": self.commission,
+            "regulatoryFees": self.regulatory_fees,
+            "totalExecutionCost": self.total_execution_cost,
+            "executionCostBreakdown": self.execution_cost_breakdown or {},
             "status": self.status,
             "filledAt": self.filled_at.isoformat(),
             "reasonCodes": list(self.reason_codes),
@@ -341,6 +364,14 @@ class WeightedVotingExecutionReconciliation:
     reason_codes: tuple[str, ...]
     gateway_version: str = WEIGHTED_VOTING_EXECUTION_GATEWAY_VERSION
 
+    def __post_init__(self) -> None:
+        if self.algorithm_id != WEIGHTED_VOTING_ALGORITHM_ID:
+            raise ValueError("Weighted Voting execution reconciliation cannot be assigned to another algorithm")
+        if self.fill is not None and self.fill.algorithm_id != WEIGHTED_VOTING_ALGORITHM_ID:
+            raise ValueError("Weighted Voting execution reconciliation rejects foreign fill attribution")
+        if self.position is not None and self.position.algorithm_id != WEIGHTED_VOTING_ALGORITHM_ID:
+            raise ValueError("Weighted Voting execution reconciliation rejects foreign position attribution")
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "gatewayVersion": self.gateway_version,
@@ -369,7 +400,7 @@ def build_weighted_voting_broker_command(
     capital_partition_id: str | None = None,
     planned_risk_dollars: float | None = None,
 ) -> WeightedVotingBrokerCommand:
-    """Convert an accepted Weighted Voting proposal into a shared broker command."""
+    """Convert an accepted Weighted Voting proposal into a local paper command."""
 
     if mode not in {"manual", "automatic"}:
         raise ValueError("mode must be manual or automatic")
@@ -385,6 +416,8 @@ def build_weighted_voting_broker_command(
     if _side_value(global_application.side) != side:
         raise ValueError("Weighted Voting execution command side does not match the global application")
     proposed_quantity = _proposal_quantity(proposal)
+    if global_application.globallyAllowedQuantity > proposed_quantity:
+        raise ValueError("Weighted Voting global application cannot increase proposed quantity")
     quantity = min(proposed_quantity, global_application.globallyAllowedQuantity)
     if quantity > proposed_quantity:
         raise ValueError("Weighted Voting execution command cannot increase quantity")
@@ -668,8 +701,15 @@ def submit_queued_weighted_voting_paper_order(
             queue_id=queue_item.queue_id,
         )
         return PaperOrderGatewayResult.model_validate(previous)
+    lifecycle_store = gateway.store if _is_weighted_voting_local_paper_gateway(gateway) else None
     if evaluated_at >= command.expires_at:
-        _release_inventory_reservation(inventory_repository, command=command, occurred_at=evaluated_at, reason_code="weighted_voting.execution.expired_before_submission")
+        _release_inventory_reservation(
+            inventory_repository,
+            command=command,
+            occurred_at=evaluated_at,
+            reason_code="weighted_voting.execution.expired_before_submission",
+            store=lifecycle_store,
+        )
         result = _not_submitted_result(
             command=command,
             proposal=queue_item.proposal,
@@ -682,7 +722,13 @@ def submit_queued_weighted_voting_paper_order(
         _persist_automatic_result(gateway.store, queue_item, result, status="EXPIRED", recorded_at=evaluated_at)
         return result
     if _is_market_order(command):
-        _release_inventory_reservation(inventory_repository, command=command, occurred_at=evaluated_at, reason_code="weighted_voting.execution.market_entry_rejected")
+        _release_inventory_reservation(
+            inventory_repository,
+            command=command,
+            occurred_at=evaluated_at,
+            reason_code="weighted_voting.execution.market_entry_rejected",
+            store=lifecycle_store,
+        )
         result = _not_submitted_result(
             command=command,
             proposal=queue_item.proposal,
@@ -709,7 +755,38 @@ def submit_queued_weighted_voting_paper_order(
         _persist_automatic_result(gateway.store, queue_item, result, status="REJECTED", recorded_at=evaluated_at)
         return result
 
-    _reserve_inventory_for_command(inventory_repository, command=command, occurred_at=evaluated_at, expected_snapshot_version=current_inventory.snapshot_version)
+    short_rejection = _unsupported_open_short_rejection(command, current_inventory)
+    if short_rejection is not None:
+        reason_code, explanation = short_rejection
+        result = _not_submitted_result(
+            command=command,
+            proposal=queue_item.proposal,
+            mode="automatic",
+            status="NOT_SUBMITTED",
+            reason_codes=(reason_code,),
+            explanation=explanation,
+            evaluated_at=evaluated_at,
+        )
+        _persist_automatic_result(gateway.store, queue_item, result, status="REJECTED", recorded_at=evaluated_at)
+        return result
+
+    try:
+        _reserve_inventory_for_command(inventory_repository, command=command, occurred_at=evaluated_at, expected_snapshot_version=current_inventory.snapshot_version)
+    except RuntimeError as exc:
+        reason_codes = ["weighted_voting.execution.inventory_reservation_failed"]
+        if "buying power" in str(exc).lower():
+            reason_codes.append("weighted_voting.execution.insufficient_local_buying_power")
+        result = _not_submitted_result(
+            command=command,
+            proposal=queue_item.proposal,
+            mode="automatic",
+            status="NOT_SUBMITTED",
+            reason_codes=tuple(reason_codes),
+            explanation="Queued Weighted Voting entry order was rejected because local inventory reservation failed.",
+            evaluated_at=evaluated_at,
+        )
+        _persist_automatic_result(gateway.store, queue_item, result, status="REJECTED", recorded_at=evaluated_at)
+        return result
     _record_lifecycle(
         store=gateway.store,
         command=command,
@@ -730,13 +807,14 @@ def submit_queued_weighted_voting_paper_order(
         rollout_validation=rollout_validation,
     )
     if result.fill and result.fill.filledQuantity > 0:
-        _record_inventory_fill(inventory_repository, command=command, result=result, occurred_at=evaluated_at)
-    elif (not result.submitted) or result.status in {"REJECTED", "CANCELED", "NOT_SUBMITTED"}:
+        _record_inventory_fill(inventory_repository, command=command, result=result, occurred_at=evaluated_at, store=lifecycle_store)
+    elif (not result.submitted) or result.status in {"REJECTED", "CANCELED", "EXPIRED", "NOT_SUBMITTED"}:
         _release_inventory_reservation(
             inventory_repository,
             command=command,
             occurred_at=evaluated_at,
             reason_code="weighted_voting.execution.reservation_released_after_terminal_response",
+            store=lifecycle_store,
         )
     _persist_automatic_result(gateway.store, queue_item, result, status=_execution_status_from_gateway_result(result), recorded_at=evaluated_at)
     return result
@@ -752,6 +830,13 @@ def record_weighted_voting_fill(
     status: str = "FILLED",
     broker_order_id: str | None = None,
     broker_fill_id: str | None = None,
+    market_reference_price: float | None = None,
+    slippage_per_share: float = 0.0,
+    spread_impact_per_share: float = 0.0,
+    commission: float = 0.0,
+    regulatory_fees: float = 0.0,
+    total_execution_cost: float = 0.0,
+    execution_cost_breakdown: dict[str, Any] | None = None,
 ) -> tuple[WeightedVotingFillAttribution, WeightedVotingPositionAttribution]:
     _validate_command(command)
     if filled_quantity <= 0:
@@ -768,6 +853,13 @@ def record_weighted_voting_fill(
         side=command.side,
         filled_quantity=filled_quantity,
         average_fill_price=average_fill_price,
+        market_reference_price=market_reference_price,
+        slippage_per_share=slippage_per_share,
+        spread_impact_per_share=spread_impact_per_share,
+        commission=commission,
+        regulatory_fees=regulatory_fees,
+        total_execution_cost=total_execution_cost,
+        execution_cost_breakdown=execution_cost_breakdown,
         status=status,
         filled_at=filled_at,
         reason_codes=("weighted_voting.execution.fill_attributed_to_decision",),
@@ -843,6 +935,13 @@ def reconcile_weighted_voting_broker_result(
             filled_at=_datetime_from_payload(fill_payload.get("filledAt"), reconciled_at),
             status=str(fill_payload.get("status") or status),
             broker_order_id=broker_order_id,
+            market_reference_price=fill_payload.get("marketReferencePrice"),
+            slippage_per_share=float(fill_payload.get("slippagePerShare") or 0.0),
+            spread_impact_per_share=float(fill_payload.get("spreadImpactPerShare") or 0.0),
+            commission=float(fill_payload.get("commission") or 0.0),
+            regulatory_fees=float(fill_payload.get("regulatoryFees") or 0.0),
+            total_execution_cost=float(fill_payload.get("totalExecutionCost") or 0.0),
+            execution_cost_breakdown=_payload(fill_payload.get("executionCostBreakdown") or {}),
         )
         reason_codes.append("weighted_voting.execution.fill_and_position_attributed")
     record = WeightedVotingExecutionReconciliation(
@@ -928,7 +1027,31 @@ def submit_weighted_voting_paper_order(
             mode=mode,
             status="NOT_SUBMITTED",
             reason_codes=("weighted_voting.execution.paper_endpoint_unverified", "paper_gateway.paper_endpoint_unverified"),
-            explanation="Weighted Voting rejected broker submission because the configured endpoint is not verified as paper-only.",
+            explanation="Weighted Voting rejected paper submission because the configured execution boundary is not verified as local paper or paper-only.",
+            evaluated_at=evaluated_at,
+        )
+        record_order_execution_observability(
+            store=gateway.store,
+            decision_id=proposal.decisionId,
+            order_intent_id=proposal.orderIntentId,
+            execution_result=result,
+            recorded_at=evaluated_at,
+        )
+        reconcile_weighted_voting_broker_result(
+            store=gateway.store,
+            command=command,
+            broker_result=result,
+            reconciled_at=evaluated_at,
+        )
+        return result
+    if _is_weighted_voting_local_paper_gateway(gateway):
+        result = _submit_weighted_voting_local_paper_order(
+            gateway=gateway,
+            command=command,
+            proposal=proposal,
+            global_application=global_application,
+            local_gate_result=local_gate_result,
+            mode=mode,
             evaluated_at=evaluated_at,
         )
         record_order_execution_observability(
@@ -968,14 +1091,251 @@ def submit_weighted_voting_paper_order(
     return result
 
 
+def _submit_weighted_voting_local_paper_order(
+    *,
+    gateway: PaperOrderGateway,
+    command: WeightedVotingBrokerCommand,
+    proposal: GlobalOrderProposal,
+    global_application: AppliedGlobalGateDecision,
+    local_gate_result: WeightedVotingGatePipelineResult,
+    mode: str,
+    evaluated_at: datetime,
+) -> PaperOrderGatewayResult:
+    if _read_optional(gateway.store, _local_intent_key(proposal.orderIntentId)):
+        result = PaperOrderGatewayResult(
+            executionMode="LOCAL_PAPER",
+            algorithmId=WEIGHTED_VOTING_ALGORITHM_ID,
+            orderIntentId=proposal.orderIntentId,
+            clientOrderId=command.client_order_id,
+            mode=mode,  # type: ignore[arg-type]
+            submitted=False,
+            duplicate=True,
+            status="DUPLICATE",
+            cancelReplacePolicy="cancel_stale_unfilled_orders_replace_requires_new_intent",
+            reasonCodes=("weighted_voting.local_paper.duplicate_intent",),
+            explanation="Duplicate Weighted Voting local paper intent was not resubmitted.",
+            evaluatedAt=evaluated_at,
+            configurationHash=_hash_json({"clientOrderId": command.client_order_id, "status": "DUPLICATE"}),
+        )
+        gateway.store.write_snapshot(_local_result_key(proposal.orderIntentId), result.model_dump(mode="json"))
+        return result
+    previous = _read_optional(gateway.store, _local_result_key(proposal.orderIntentId))
+    if previous:
+        return PaperOrderGatewayResult.model_validate(previous)
+
+    intent = _local_paper_intent_record(
+        command=command,
+        proposal=proposal,
+        global_application=global_application,
+        local_gate_result=local_gate_result,
+        mode=mode,
+        evaluated_at=evaluated_at,
+    )
+    gateway.store.write_snapshot(_local_intent_key(proposal.orderIntentId), intent.model_dump(mode="json"))
+    gateway.store.write_snapshot(
+        _local_client_order_key(command.client_order_id),
+        {
+            "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+            "executionMode": "LOCAL_PAPER",
+            "orderIntentId": proposal.orderIntentId,
+            "clientOrderId": command.client_order_id,
+            "capitalPartitionId": proposal.capitalPartitionId,
+            "reasonCodes": ("weighted_voting.local_paper.intent_persisted_before_submission",),
+        },
+    )
+
+    blocker = _local_submission_blocker(intent, proposal, global_application, evaluated_at)
+    if blocker:
+        status, reason, explanation = blocker
+        blocked_intent = intent.model_copy(update={"status": status, "reasonCodes": (*intent.reasonCodes, reason)})
+        gateway.store.write_snapshot(_local_intent_key(proposal.orderIntentId), blocked_intent.model_dump(mode="json"))
+        result = PaperOrderGatewayResult(
+            executionMode="LOCAL_PAPER",
+            algorithmId=WEIGHTED_VOTING_ALGORITHM_ID,
+            orderIntentId=proposal.orderIntentId,
+            clientOrderId=command.client_order_id,
+            mode=mode,  # type: ignore[arg-type]
+            submitted=False,
+            duplicate=False,
+            status=status,  # type: ignore[arg-type]
+            cancelReplacePolicy="cancel_stale_unfilled_orders_replace_requires_new_intent",
+            reasonCodes=(reason,),
+            explanation=explanation,
+            evaluatedAt=evaluated_at,
+            configurationHash=_hash_json({"clientOrderId": command.client_order_id, "status": status, "reason": reason}),
+        )
+        gateway.store.write_snapshot(_local_result_key(proposal.orderIntentId), result.model_dump(mode="json"))
+        return result
+
+    verifier = getattr(gateway.broker, "verify_paper_account", None)
+    inventory_unavailable = False
+    account_verified = True
+    if callable(verifier):
+        try:
+            account_verified = bool(verifier())
+        except Exception:
+            account_verified = False
+            inventory_unavailable = True
+    if not account_verified:
+        reason_code = "weighted_voting.local_paper.authoritative_inventory_unavailable" if inventory_unavailable else "weighted_voting.local_paper.account_unverified"
+        rejected_intent = intent.model_copy(update={"status": "NOT_SUBMITTED", "reasonCodes": (*intent.reasonCodes, reason_code)})
+        gateway.store.write_snapshot(_local_intent_key(proposal.orderIntentId), rejected_intent.model_dump(mode="json"))
+        result = PaperOrderGatewayResult(
+            executionMode="LOCAL_PAPER",
+            algorithmId=WEIGHTED_VOTING_ALGORITHM_ID,
+            orderIntentId=proposal.orderIntentId,
+            clientOrderId=command.client_order_id,
+            mode=mode,  # type: ignore[arg-type]
+            submitted=False,
+            duplicate=False,
+            status="NOT_SUBMITTED",
+            cancelReplacePolicy="cancel_stale_unfilled_orders_replace_requires_new_intent",
+            reasonCodes=(reason_code,),
+            explanation="Weighted Voting local paper authoritative inventory is unavailable." if inventory_unavailable else "Weighted Voting local paper account state is unavailable or unverified.",
+            evaluatedAt=evaluated_at,
+            configurationHash=_hash_json({"clientOrderId": command.client_order_id, "status": "NOT_SUBMITTED", "reason": reason_code}),
+        )
+        gateway.store.write_snapshot(_local_result_key(proposal.orderIntentId), result.model_dump(mode="json"))
+        return result
+
+    verified = intent.model_copy(update={"paperAccountVerified": True})
+    gateway.store.write_snapshot(_local_intent_key(proposal.orderIntentId), verified.model_dump(mode="json"))
+    ack = gateway.broker.submit_bracket_order(verified)
+    fill = gateway.broker.refresh_order(command.client_order_id)
+    if fill is not None:
+        fill = fill.model_copy(
+            update={
+                "executionMode": "LOCAL_PAPER",
+                "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+                "capitalPartitionId": command.capital_partition_id,
+                "accountId": command.capital_partition_id,
+                "orderIntentId": command.order_intent_id,
+                "symbol": command.symbol,
+                "side": Signal.SELL if command.side.upper() == "SELL" else Signal.BUY,
+            }
+        )
+        gateway.store.write_snapshot(_local_fill_key(command.client_order_id), fill.model_dump(mode="json"))
+    protective = _local_protective_order(verified, fill)
+    if protective is not None:
+        gateway.store.write_snapshot(_local_protective_key(protective.clientOrderId), protective.model_dump(mode="json"))
+    submitted = ack.status != "REJECTED"
+    status = fill.status if fill else ack.status
+    reason_codes = ["weighted_voting.local_paper.submitted", "paper_gateway.submitted"] if submitted else ["weighted_voting.local_paper.rejected", "paper_gateway.broker_rejected"]
+    if fill and fill.status == "PARTIALLY_FILLED":
+        reason_codes.append("paper_gateway.partial_fill_mapped_to_intent")
+    final_intent = verified.model_copy(update={"status": status, "reasonCodes": tuple(reason_codes)})
+    gateway.store.write_snapshot(_local_intent_key(proposal.orderIntentId), final_intent.model_dump(mode="json"))
+    result = PaperOrderGatewayResult(
+        executionMode="LOCAL_PAPER",
+        algorithmId=WEIGHTED_VOTING_ALGORITHM_ID,
+        orderIntentId=proposal.orderIntentId,
+        clientOrderId=command.client_order_id,
+        mode=mode,  # type: ignore[arg-type]
+        submitted=submitted,
+        duplicate=False,
+        status=status,  # type: ignore[arg-type]
+        brokerAck=ack,
+        fill=fill,
+        protectiveOrder=protective,
+        cancelReplacePolicy="cancel_stale_unfilled_orders_replace_requires_new_intent",
+        reasonCodes=tuple(reason_codes),
+        explanation="Weighted Voting local paper order was simulated and reconciled through Weighted Voting-owned state.",
+        evaluatedAt=evaluated_at,
+        configurationHash=_hash_json({"clientOrderId": command.client_order_id, "status": status, "reasonCodes": reason_codes}),
+    )
+    gateway.store.write_snapshot(_local_result_key(proposal.orderIntentId), result.model_dump(mode="json"))
+    return result
+
+
+def _local_paper_intent_record(
+    *,
+    command: WeightedVotingBrokerCommand,
+    proposal: GlobalOrderProposal,
+    global_application: AppliedGlobalGateDecision,
+    local_gate_result: WeightedVotingGatePipelineResult,
+    mode: str,
+    evaluated_at: datetime,
+) -> PaperOrderIntentRecord:
+    submitted_quantity = min(int(proposal.quantity), int(global_application.globallyAllowedQuantity))
+    return PaperOrderIntentRecord(
+        executionMode="LOCAL_PAPER",
+        algorithmId=WEIGHTED_VOTING_ALGORITHM_ID,
+        capitalPartitionId=command.capital_partition_id,
+        decisionId=command.decision_id,
+        orderIntentId=command.order_intent_id,
+        clientOrderId=command.client_order_id,
+        mode=mode,  # type: ignore[arg-type]
+        symbol=command.symbol,
+        side=Signal.SELL if command.side.upper() == "SELL" else Signal.BUY,
+        proposedQuantity=int(proposal.quantity),
+        globallyAllowedQuantity=int(global_application.globallyAllowedQuantity),
+        submittedQuantity=submitted_quantity,
+        triggerPrice=command.trigger_price,
+        orderType=command.order_type.upper(),
+        timeInForce=command.time_in_force.upper(),
+        limitPrice=command.limit_price,
+        stopPrice=command.stop_price,
+        targetPrice=command.target_price,
+        plannedRiskDollars=float(global_application.maximumAdditionalRiskDollars),
+        globalAction=str(global_application.action),
+        localGatePassed=local_gate_result.permission_granted,
+        globalGatePassed=global_application.globallyAllowedQuantity > 0,
+        paperAccountVerified=False,
+        persistedBeforeSubmission=True,
+        status="PENDING_SUBMISSION",
+        reasonCodes=("weighted_voting.local_paper.intent_persisted_before_submission",),
+        createdAt=evaluated_at,
+        decisionTimestamp=proposal.proposedAt,
+        staleAfterSeconds=int(proposal.settingsSnapshot.get("maximumOrderAgeSeconds") or 300),
+        settingsSnapshot=dict(proposal.settingsSnapshot or {}),
+    )
+
+
+def _local_submission_blocker(
+    intent: PaperOrderIntentRecord,
+    proposal: GlobalOrderProposal,
+    global_application: AppliedGlobalGateDecision,
+    evaluated_at: datetime,
+) -> tuple[str, str, str] | None:
+    if not intent.localGatePassed:
+        return "NOT_SUBMITTED", "paper_gateway.local_gate_failed", "Mandatory Weighted Voting local gates failed."
+    if global_application.action not in {"ALLOW", "REDUCE_QUANTITY"} and proposal.intent == "new_entry":
+        return "NOT_SUBMITTED", "paper_gateway.global_gate_rejected", "Weighted Voting local/global risk application rejected the new entry."
+    if (evaluated_at - proposal.proposedAt) > timedelta(seconds=intent.staleAfterSeconds):
+        return "NOT_SUBMITTED", "paper_gateway.stale_decision", "Decision timestamp is stale."
+    if intent.submittedQuantity <= 0:
+        return "NOT_SUBMITTED", "paper_gateway.zero_quantity", "Zero-quantity orders are not submitted."
+    return None
+
+
+def _local_protective_order(intent: PaperOrderIntentRecord, fill) -> PaperGatewayProtectiveOrder | None:
+    if fill is None or fill.filledQuantity <= 0:
+        return None
+    return PaperGatewayProtectiveOrder(
+        executionMode="LOCAL_PAPER",
+        clientOrderId=f"{intent.clientOrderId}-protective",
+        parentClientOrderId=intent.clientOrderId,
+        algorithmId=WEIGHTED_VOTING_ALGORITHM_ID,
+        capitalPartitionId=intent.capitalPartitionId,
+        accountId=intent.capitalPartitionId,
+        orderIntentId=intent.orderIntentId,
+        quantity=fill.filledQuantity,
+        stopPrice=intent.stopPrice,
+        targetPrice=intent.targetPrice,
+        bracket=intent.stopPrice is not None and intent.targetPrice is not None,
+        reasonCodes=("weighted_voting.local_paper.protective_order_matches_fill",),
+    )
+
+
 def execution_gateway_status() -> dict[str, Any]:
     return {
         "gatewayVersion": WEIGHTED_VOTING_EXECUTION_GATEWAY_VERSION,
         "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
         "namespace": WEIGHTED_VOTING_EXECUTION_NAMESPACE,
         "brokerConnectionBoundary": WEIGHTED_VOTING_BROKER_CONNECTION_BOUNDARY,
+        "executionMode": "LOCAL_PAPER",
         "ownedResponsibilities": [
-            "accepted_proposal_to_shared_broker_command",
+            "accepted_proposal_to_local_paper_command",
             "accepted_proposal_to_execution_queue",
             "deterministic_client_order_id",
             "inventory_reservation_before_submission",
@@ -987,9 +1347,10 @@ def execution_gateway_status() -> dict[str, Any]:
             "pending_acknowledged_rejected_partial_filled_filled_cancelled_expired_replaced_lifecycle",
             "fill_to_decision_attribution",
             "position_to_weighted_voting_attribution",
-            "broker_result_reconciliation_to_weighted_voting_storage",
+            "local_paper_result_reconciliation_to_weighted_voting_storage",
         ],
-        "sharedServices": ["broker_connection"],
+        "sharedServices": [],
+        "localPaperBroker": "weighted_voting.local_paper_broker.WeightedVotingLocalPaperBroker",
     }
 
 
@@ -998,45 +1359,35 @@ def _accepted_for_execution(
     global_application: AppliedGlobalGateDecision,
     local_gate_result: WeightedVotingGatePipelineResult,
 ) -> bool:
-    return (
-        proposal.algorithmId == WEIGHTED_VOTING_ALGORITHM_ID
-        and proposal.intent == "new_entry"
-        and local_gate_result.permission_granted
-        and global_application.action in {"ALLOW", "REDUCE_QUANTITY"}
-        and global_application.globallyAllowedQuantity > 0
-    )
-
-
-def _verify_weighted_voting_paper_endpoint(gateway: PaperOrderGateway) -> bool:
-    broker = gateway.broker
-    verifier = getattr(broker, "verify_paper_endpoint", None)
-    if callable(verifier):
-        return bool(verifier())
-    paper_endpoint = getattr(broker, "paper_endpoint", None)
-    if paper_endpoint is not None:
-        return bool(paper_endpoint)
-    base_url = (
-        getattr(broker, "alpaca_trading_base_url", None)
-        or getattr(broker, "trading_base_url", None)
-        or getattr(broker, "base_url", None)
-        or getattr(broker, "baseUrl", None)
-    )
-    if base_url:
-        return _is_weighted_voting_paper_endpoint(str(base_url))
+    if proposal.algorithmId != WEIGHTED_VOTING_ALGORITHM_ID:
+        return False
+    if proposal.intent == "new_entry":
+        return (
+            local_gate_result.permission_granted
+            and global_application.action in {"ALLOW", "REDUCE_QUANTITY"}
+            and global_application.globallyAllowedQuantity > 0
+        )
+    if proposal.intent in {"protective_exit", "risk_reducing", "end_of_day_liquidation"}:
+        return global_application.riskReducingExitAllowed and global_application.globallyAllowedQuantity > 0
     return False
 
 
-def _is_weighted_voting_paper_endpoint(base_url: str) -> bool:
-    normalized = base_url.lower().strip().rstrip("/")
-    if not normalized:
-        return False
-    if "paper-api.alpaca.markets" in normalized:
+def _verify_weighted_voting_paper_endpoint(gateway: PaperOrderGateway) -> bool:
+    if _is_weighted_voting_local_paper_gateway(gateway):
         return True
-    if "api.alpaca.markets" in normalized:
+    broker = gateway.broker
+    if getattr(gateway, "execution_mode", None) != "BROKER_PAPER" or getattr(broker, "broker_kind", None) != "alpaca_paper":
         return False
-    if "live" in normalized:
+    verifier = getattr(broker, "verify_paper_endpoint", None)
+    return bool(verifier()) if callable(verifier) else False
+
+
+def _is_weighted_voting_local_paper_gateway(gateway: PaperOrderGateway) -> bool:
+    broker = gateway.broker
+    if getattr(gateway, "execution_mode", None) != "LOCAL_PAPER" or getattr(broker, "broker_kind", None) != "weighted_voting_local_paper":
         return False
-    return "paper" in normalized
+    verifier = getattr(broker, "verify_paper_endpoint", None)
+    return bool(verifier()) if callable(verifier) else True
 
 
 def _reserve_inventory_for_command(
@@ -1050,6 +1401,7 @@ def _reserve_inventory_for_command(
     version = snapshot.snapshot_version if expected_snapshot_version is None else expected_snapshot_version
     if snapshot.snapshot_version != version:
         raise RuntimeError("Weighted Voting inventory optimistic version check failed")
+    cash_reservation = round(command.quantity * _entry_price(command), 10) if command.side.upper() == "BUY" else 0.0
     inventory_repository.append_event(
         event_id=f"{command.client_order_id}.reserve",
         event_type=WeightedVotingInventoryEventType.ORDER_RESERVED,
@@ -1059,16 +1411,41 @@ def _reserve_inventory_for_command(
             "symbol": command.symbol,
             "side": command.side,
             "quantity": command.quantity,
-            "reserved_buying_power": round(command.quantity * _entry_price(command), 10),
+            "filled_quantity": 0,
+            "remaining_quantity": command.quantity,
+            "order_type": command.order_type,
+            "limit_price": command.limit_price,
+            "stop_price": command.stop_price,
+            "reserved_buying_power": cash_reservation,
+            "reserved_cash": cash_reservation,
             "planned_risk_dollars": command.planned_risk_dollars,
             "decision_id": command.decision_id,
             "order_intent_id": command.order_intent_id,
             "client_order_id": command.client_order_id,
             "status": "WORKING",
             "created_at": occurred_at.isoformat(),
+            "updated_at": occurred_at.isoformat(),
+            "expiration": command.expires_at.isoformat(),
         },
         occurred_at=occurred_at,
         expected_snapshot_version=version,
+    )
+
+
+def _unsupported_open_short_rejection(command: WeightedVotingBrokerCommand, snapshot: WeightedVotingInventorySnapshot) -> tuple[str, str] | None:
+    if command.side.upper() != "SELL":
+        return None
+    long_quantity = sum(max(0, int(position.quantity)) for position in snapshot.open_positions if position.symbol.upper() == command.symbol.upper())
+    if command.quantity <= long_quantity:
+        return None
+    if long_quantity > 0:
+        return (
+            "weighted_voting.execution.open_short_not_supported",
+            "Weighted Voting local paper does not support opening short inventory; this SELL would exceed the existing long position.",
+        )
+    return (
+        "weighted_voting.execution.open_short_not_supported",
+        "Weighted Voting local paper does not support opening short inventory; SELL orders may only close or reduce an existing long position.",
     )
 
 
@@ -1078,9 +1455,10 @@ def _release_inventory_reservation(
     command: WeightedVotingBrokerCommand,
     occurred_at: datetime,
     reason_code: str,
-) -> None:
+    store: WeightedVotingStateStore | None = None,
+) -> WeightedVotingInventorySnapshot:
     snapshot = inventory_repository.current_snapshot(now=occurred_at)
-    inventory_repository.append_event(
+    updated = inventory_repository.append_event(
         event_id=f"{command.client_order_id}.release.{reason_code}",
         event_type=WeightedVotingInventoryEventType.ORDER_RELEASED,
         payload={
@@ -1093,6 +1471,17 @@ def _release_inventory_reservation(
         occurred_at=occurred_at,
         expected_snapshot_version=snapshot.snapshot_version,
     )
+    if store is not None:
+        _record_local_paper_lifecycle_from_command(
+            store=store,
+            command=command,
+            event_name="weighted_voting.local_paper.reservation_released",
+            occurred_at=occurred_at,
+            inventory_snapshot_version=updated.snapshot_version,
+            status="RELEASED",
+            reason_codes=(reason_code,),
+        )
+    return updated
 
 
 def _record_inventory_fill(
@@ -1101,22 +1490,32 @@ def _record_inventory_fill(
     command: WeightedVotingBrokerCommand,
     result: PaperOrderGatewayResult,
     occurred_at: datetime,
-) -> None:
+    store: WeightedVotingStateStore | None = None,
+) -> WeightedVotingInventorySnapshot | None:
     fill = result.fill
     if fill is None or fill.filledQuantity <= 0 or fill.averageFillPrice is None:
-        return
+        return None
     snapshot = inventory_repository.current_snapshot(now=occurred_at)
     signed_quantity = -fill.filledQuantity if command.side.upper() == "SELL" else fill.filledQuantity
-    inventory_repository.append_event(
+    fill_id = f"{command.client_order_id}.{fill.status}.{int(fill.filledQuantity)}.{fill.filledAt.isoformat()}"
+    updated = inventory_repository.append_event(
         event_id=f"{command.client_order_id}.fill.{fill.status}",
         event_type=WeightedVotingInventoryEventType.FILL_RECORDED,
         payload={
             "algorithm_id": WEIGHTED_VOTING_ALGORITHM_ID,
+            "fill_id": fill_id,
             "position_id": f"weighted_voting.position.{command.symbol}.{command.client_order_id}",
             "symbol": command.symbol,
             "side": "SHORT" if signed_quantity < 0 else "LONG",
             "quantity": signed_quantity,
             "average_entry_price": fill.averageFillPrice,
+            "market_reference_price": fill.marketReferencePrice,
+            "slippage_per_share": fill.slippagePerShare,
+            "spread_impact_per_share": fill.spreadImpactPerShare,
+            "commission": fill.commission,
+            "regulatory_fees": fill.regulatoryFees,
+            "total_execution_cost": fill.totalExecutionCost,
+            "execution_costs": fill.executionCostBreakdown,
             "opened_at": fill.filledAt.isoformat(),
             "decision_id": command.decision_id,
             "order_intent_id": command.order_intent_id,
@@ -1125,6 +1524,67 @@ def _record_inventory_fill(
         },
         occurred_at=occurred_at,
         expected_snapshot_version=snapshot.snapshot_version,
+    )
+    if store is not None:
+        position_id = f"weighted_voting.position.{command.symbol}.{command.client_order_id}"
+        _record_local_paper_lifecycle_from_command(
+            store=store,
+            command=command,
+            event_name="weighted_voting.local_paper.fill_recorded",
+            occurred_at=occurred_at,
+            inventory_snapshot_version=updated.snapshot_version,
+            status=fill.status,
+            reason_codes=("weighted_voting.local_paper.fill_simulated_locally",),
+            position_id=position_id,
+            filled_quantity=fill.filledQuantity,
+        )
+        _record_local_paper_lifecycle_from_command(
+            store=store,
+            command=command,
+            event_name="weighted_voting.local_paper.position_updated",
+            occurred_at=occurred_at,
+            inventory_snapshot_version=updated.snapshot_version,
+            status=fill.status,
+            reason_codes=("weighted_voting.execution_gateway.paper_fill",),
+            position_id=position_id,
+            filled_quantity=fill.filledQuantity,
+        )
+    return updated
+
+
+def _record_local_paper_lifecycle_from_command(
+    *,
+    store: WeightedVotingStateStore,
+    command: WeightedVotingBrokerCommand,
+    event_name: str,
+    occurred_at: datetime,
+    inventory_snapshot_version: int | None,
+    status: str,
+    reason_codes: tuple[str, ...],
+    position_id: str | None = None,
+    filled_quantity: int | None = None,
+) -> None:
+    source = {
+        "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+        "decisionId": command.decision_id,
+        "orderIntentId": command.order_intent_id,
+        "clientOrderId": command.client_order_id,
+        "symbol": command.symbol,
+        "side": command.side,
+        "quantity": command.quantity,
+        "status": status,
+    }
+    if filled_quantity is not None:
+        source["filledQuantity"] = filled_quantity
+    record_weighted_voting_local_paper_lifecycle_event(
+        store,
+        event_name=event_name,
+        source=source,
+        occurred_at=occurred_at,
+        inventory_snapshot_version=inventory_snapshot_version,
+        position_id=position_id,
+        status=status,
+        reason_codes=reason_codes,
     )
 
 
@@ -1528,6 +1988,26 @@ def _order_intent_index_key(idempotency_key: str) -> str:
 
 def _automatic_result_key(client_order_id: str) -> str:
     return f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.automatic_result.{client_order_id}"
+
+
+def _local_intent_key(order_intent_id: str) -> str:
+    return f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.local_paper.intent.{order_intent_id}"
+
+
+def _local_client_order_key(client_order_id: str) -> str:
+    return f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.local_paper.client_order.{client_order_id}"
+
+
+def _local_fill_key(client_order_id: str) -> str:
+    return f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.local_paper.fill.{client_order_id}"
+
+
+def _local_protective_key(client_order_id: str) -> str:
+    return f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.local_paper.protective.{client_order_id}"
+
+
+def _local_result_key(order_intent_id: str) -> str:
+    return f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.local_paper.result.{order_intent_id}"
 
 
 def _lifecycle_key(client_order_id: str, status: str) -> str:

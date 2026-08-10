@@ -118,6 +118,7 @@ class WeightedVotingFilesystemStateStore:
         return dict(envelope["payload"])
 
     def write_snapshot(self, key: str, snapshot: dict) -> None:
+        _validate_weighted_voting_snapshot_write(key, snapshot)
         category, artifact_id = snapshot_collection_for_key(key)
         self.write_artifact(
             category,
@@ -263,6 +264,8 @@ def canonical_weighted_voting_collection(category: str) -> str:
 
 
 def snapshot_collection_for_key(key: str) -> tuple[str, str]:
+    if not key.startswith("weighted_voting."):
+        raise ValueError("Weighted Voting store rejects non-weighted_voting snapshot keys")
     if key == WEIGHTED_VOTING_SETTINGS_KEY or key.startswith("weighted_voting.settings."):
         return "dynamic_settings", key
     if key.startswith("weighted_voting.market_snapshots."):
@@ -318,6 +321,24 @@ def snapshot_collection_for_key(key: str) -> tuple[str, str]:
     if key.startswith("weighted_voting.migration."):
         return "migrations", key
     return "observability", key
+
+
+def _validate_weighted_voting_snapshot_write(key: str, snapshot: dict) -> None:
+    if not key.startswith("weighted_voting."):
+        raise ValueError("Weighted Voting store rejects non-weighted_voting snapshot keys")
+    _reject_foreign_algorithm_payload(snapshot)
+
+
+def _reject_foreign_algorithm_payload(value) -> None:
+    if isinstance(value, dict):
+        algorithm_id = value.get("algorithm_id", value.get("algorithmId"))
+        if algorithm_id is not None and str(algorithm_id) != WEIGHTED_VOTING_ALGORITHM_ID:
+            raise ValueError("Weighted Voting store rejects foreign algorithm payloads")
+        for item in value.values():
+            _reject_foreign_algorithm_payload(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_foreign_algorithm_payload(item)
 
 
 def persist_effective_settings(

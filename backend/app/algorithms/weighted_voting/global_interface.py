@@ -195,6 +195,29 @@ def build_global_order_proposal_from_weighted_voting_proposal(
         "targetPrice": proposal.target_price,
     }
     settings_snapshot = effective_settings.model_dump(mode="json")
+    settings_snapshot["weighted_voting.paper.execution_mode"] = effective_settings.paper_execution_mode
+    settings_snapshot["weighted_voting.local_paper.initial_capital"] = effective_settings.local_paper_initial_capital
+    settings_snapshot["weighted_voting.local_paper.commission"] = effective_settings.local_paper_commission_per_share
+    settings_snapshot["weighted_voting.local_paper.slippage"] = effective_settings.local_paper_buy_slippage_per_share
+    settings_snapshot["weighted_voting.local_paper.allow_shorting"] = effective_settings.local_paper_allow_shorting
+    settings_snapshot["weighted_voting.local_paper.partial_fill_mode"] = effective_settings.local_paper_partial_fill_mode
+    settings_snapshot["localPaperExecutionCosts"] = {
+        "buySlippagePerShare": effective_settings.local_paper_buy_slippage_per_share,
+        "sellSlippagePerShare": effective_settings.local_paper_sell_slippage_per_share,
+        "slippagePerShare": effective_settings.local_paper_buy_slippage_per_share,
+        "commission": effective_settings.local_paper_commission_per_share,
+        "commissionPerShare": effective_settings.local_paper_commission_per_share,
+        "regulatoryFeePerShare": effective_settings.local_paper_regulatory_fee_per_share,
+        "spreadImpactPerShare": effective_settings.local_paper_spread_impact_per_share,
+        "spreadImpactPercent": effective_settings.local_paper_spread_impact_percent,
+    }
+    settings_snapshot["localPaper"] = {
+        "executionMode": effective_settings.paper_execution_mode,
+        "initialCapital": effective_settings.local_paper_initial_capital,
+        "allowShorting": effective_settings.local_paper_allow_shorting,
+        "partialFillMode": effective_settings.local_paper_partial_fill_mode,
+        "executionCosts": dict(settings_snapshot["localPaperExecutionCosts"]),
+    }
     settings_snapshot["weightedOrderProposal"] = proposal.as_dict()
     strategy_state_hash = _hash_json(
         {

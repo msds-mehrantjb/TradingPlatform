@@ -60,6 +60,9 @@ WEIGHTED_VOTING_SHARED_SERVICE_FORBIDDEN_ACTIONS: Final[tuple[str, ...]] = (
     "change_strategy_confidence",
     "reverse_trade_direction",
     "increase_requested_quantity",
+    "merge_algorithm_inventories",
+    "write_shared_local_paper_inventory",
+    "send_mutable_portfolio_payload",
     "change_local_settings",
     "update_weighted_voting_performance_using_another_algorithms_results",
     "modify_weighted_voting_positions_without_ownership_authorization",
@@ -132,12 +135,16 @@ def weighted_voting_shared_service_boundary() -> dict[str, object]:
         "forbiddenSharedServiceActions": WEIGHTED_VOTING_SHARED_SERVICE_FORBIDDEN_ACTIONS,
         "ownershipRequiredForPositionMutation": True,
         "globalLimitsMayOnlyReduceRisk": True,
+        "globalRiskMayReadCrossAlgorithmExposure": True,
+        "globalRiskMayMutateWeightedVotingInventory": False,
+        "globalRiskMayMergeAlgorithmInventories": False,
+        "globalRiskResponseMayCarryMutablePortfolioState": False,
         "sharedServicesMayGenerateSignal": False,
         "sharedServicesMayMutateWeights": False,
         "sharedServicesMayMutateLocalSettings": False,
         "sharedServicesMayUseForeignPerformanceForWeightedVoting": False,
         "reasonCodes": ("weighted_voting.shared_services.boundary.ready",),
-        "explanation": "Shared services may provide facts, account-wide limits, execution, and status only through controlled Weighted Voting adapters; they may not generate signals, mutate weights/settings/confidence, reverse direction, increase quantity, or modify positions without Weighted Voting ownership authorization.",
+        "explanation": "Shared services may provide facts, account-wide limits, execution, and status only through controlled Weighted Voting adapters; global risk may read account-wide exposure facts but may not merge inventories, carry mutable portfolio state, generate signals, mutate weights/settings/confidence, reverse direction, increase quantity, or modify positions without Weighted Voting ownership authorization.",
     }
 
 

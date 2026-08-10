@@ -37,6 +37,15 @@ from backend.app.algorithms.weighted_voting.alpaca_paper_broker import (
     WeightedVotingUnavailablePaperBroker,
     build_weighted_voting_paper_gateway_dependencies,
 )
+from backend.app.algorithms.weighted_voting.local_paper_broker import (
+    WEIGHTED_VOTING_LOCAL_PAPER_BROKER_VERSION,
+    WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE,
+    WeightedVotingLocalPaperAccount,
+    WeightedVotingLocalPaperBroker,
+    WeightedVotingLocalPaperRiskPort,
+    WeightedVotingLocalPaperRiskService,
+    build_weighted_voting_local_paper_gateway_dependencies,
+)
 from backend.app.algorithms.weighted_voting.config import (
     WEIGHTED_VOTING_BASELINE_CONFIGURATION_KEY,
     WEIGHTED_VOTING_CONFIG_VERSION,
@@ -469,8 +478,14 @@ __all__ = [
     "WeightedVotingRuntimeFieldSource",
     "WEIGHTED_VOTING_RUNTIME_SUPERVISOR_VERSION",
     "WEIGHTED_VOTING_ALPACA_PAPER_BROKER_VERSION",
+    "WEIGHTED_VOTING_LOCAL_PAPER_BROKER_VERSION",
+    "WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE",
     "WeightedVotingAlpacaPaperBroker",
     "WeightedVotingAlpacaPaperBrokerConfigurationError",
+    "WeightedVotingLocalPaperAccount",
+    "WeightedVotingLocalPaperBroker",
+    "WeightedVotingLocalPaperRiskPort",
+    "WeightedVotingLocalPaperRiskService",
     "WeightedVotingUnavailablePaperBroker",
     "WeightedVotingBarEventWorker",
     "WeightedVotingDecisionWorker",
@@ -509,6 +524,7 @@ __all__ = [
     "build_weighted_voting_market_snapshot",
     "build_weighted_voting_global_risk_request",
     "build_weighted_voting_paper_gateway_dependencies",
+    "build_weighted_voting_local_paper_gateway_dependencies",
     "build_weighted_voting_order_proposal",
     "build_weighted_voting_performance_report",
     "build_weighted_voting_risk_budget",

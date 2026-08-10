@@ -85,6 +85,22 @@ class WeightedVotingRuntimeContextTest(unittest.TestCase):
         self.assertEqual(response["request_id"], request["request_id"])
         self.assertEqual(response["proposal_id"], request["proposal_id"])
 
+    def test_global_risk_request_uses_weighted_voting_local_inventory_not_broker_account(self) -> None:
+        context = valid_fixture_context(account_equity=9_999_999.0, broker_buying_power=9_999_999.0)
+
+        result = WeightedVotingService(store=MemoryStore()).evaluate_context(context)
+
+        observations = result["globalRiskRequest"]["account_level_risk_observations"]
+        self.assertEqual(observations["localEquity"], context.inventory_snapshot.equity)
+        self.assertEqual(observations["localCash"], context.inventory_snapshot.cash_available)
+        self.assertEqual(observations["localBuyingPower"], context.inventory_snapshot.buying_power)
+        self.assertEqual(observations["localReservedBuyingPower"], context.inventory_snapshot.reserved_buying_power)
+        self.assertEqual(observations["localGrossExposure"], context.inventory_snapshot.gross_exposure)
+        self.assertEqual(observations["inventorySnapshotVersion"], context.inventory_snapshot.snapshot_version)
+        self.assertEqual(observations["source"], "weighted_voting.local_inventory")
+        self.assertNotIn("accountEquity", observations)
+        self.assertNotIn("brokerBuyingPower", observations)
+
     def test_stale_quote_is_explicitly_unavailable_not_favourable(self) -> None:
         result = WeightedVotingService(store=MemoryStore()).evaluate_replay_fixture(evaluate_payload(data_freshness_seconds=9999))
 
@@ -169,7 +185,7 @@ class WeightedVotingRuntimeContextTest(unittest.TestCase):
         self.assertIn("weighted_voting.decision_kernel.missing_actual_quote_blocks_trade", result["reasonCodes"])
 
 
-def valid_fixture_context(*, inventory_symbol: str = "SPY"):
+def valid_fixture_context(*, inventory_symbol: str = "SPY", account_equity: float = 100000.0, broker_buying_power: float = 100000.0):
     store = MemoryStore()
     service = WeightedVotingService(store=store)
     payload = evaluate_payload(include_session=True)
@@ -186,7 +202,7 @@ def valid_fixture_context(*, inventory_symbol: str = "SPY"):
     return WeightedVotingRuntimeContextBuilder(
         market_data_port=WeightedVotingStaticMarketDataPort(snapshot),
         inventory_repository=WeightedVotingInventoryRepository(store, symbol=inventory_symbol, allocated_capital=100000.0),
-        account_port=WeightedVotingStaticAccountPort(account_equity=100000.0, broker_buying_power=100000.0),
+        account_port=WeightedVotingStaticAccountPort(account_equity=account_equity, broker_buying_power=broker_buying_power),
         global_risk_port=WeightedVotingStaticGlobalRiskPort(global_available_risk=1000.0, global_max_shares=100000, gate_response=gate_response),
         effective_settings=effective_model,
         active_weight_state=active_weights,

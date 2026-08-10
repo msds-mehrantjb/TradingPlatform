@@ -143,8 +143,8 @@ class WeightedVotingDecisionKernel:
                 decision=decision,
                 effective_settings=effective,
                 market_snapshot=snapshot,
-                account_equity=_required_positive_float(context.read_only_account_equity),
-                available_buying_power=_required_positive_float(context.read_only_broker_buying_power),
+                account_equity=_required_positive_float(inventory.equity),
+                available_buying_power=_required_non_negative_float(inventory.buying_power),
                 remaining_weighted_daily_risk=_required_positive_float(context.remaining_algorithm_daily_risk),
                 remaining_weighted_capital_partition=_required_positive_float(context.remaining_algorithm_capital_partition),
                 global_available_risk=_required_positive_float(context.global_risk_state.global_available_risk),
@@ -424,12 +424,12 @@ def _missing_authoritative_runtime_input_reason_codes(context: WeightedVotingRun
         reasons.append("weighted_voting.decision_kernel.missing_actual_slippage_estimate_blocks_trade")
     if context.estimated_fees is None:
         reasons.append("weighted_voting.decision_kernel.missing_actual_fee_estimate_blocks_trade")
-    if context.read_only_account_equity is None or context.read_only_account_equity <= 0:
-        reasons.append("weighted_voting.decision_kernel.paper_account_equity_unavailable_blocks_trade")
-    if context.read_only_broker_buying_power is None or context.read_only_broker_buying_power < 0:
-        reasons.append("weighted_voting.decision_kernel.paper_buying_power_unavailable_blocks_trade")
     if context.inventory_available is not True:
         reasons.append("weighted_voting.decision_kernel.weighted_inventory_ledger_unavailable_blocks_trade")
+    if context.inventory_snapshot.equity <= 0:
+        reasons.append("weighted_voting.decision_kernel.local_inventory_equity_unavailable_blocks_trade")
+    if context.inventory_snapshot.buying_power < 0:
+        reasons.append("weighted_voting.decision_kernel.local_inventory_buying_power_unavailable_blocks_trade")
     if context.remaining_algorithm_daily_risk is None or context.remaining_algorithm_daily_risk <= 0:
         reasons.append("weighted_voting.decision_kernel.remaining_daily_risk_unavailable_blocks_trade")
     if context.remaining_algorithm_capital_partition is None or context.remaining_algorithm_capital_partition <= 0:

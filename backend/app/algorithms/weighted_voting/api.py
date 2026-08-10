@@ -234,11 +234,16 @@ def status() -> dict[str, Any]:
 @router.get("/runtime/status", summary="Weighted Voting runtime status", description="Return read-only health and lag metrics for the backend background runtime.")
 def runtime_status() -> dict[str, Any]:
     supervisor = get_weighted_voting_runtime_supervisor()
+    health = supervisor.health()
     return {
         "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
         "runtimeContract": runtime_supervisor_status(),
         "control": supervisor.runtime_control(),
-        "health": supervisor.health(),
+        "executionMode": health.get("executionMode"),
+        "brokerKind": health.get("brokerKind"),
+        "inventory": health.get("inventory"),
+        "alpacaDependency": health.get("alpacaDependency"),
+        "health": health,
     }
 
 

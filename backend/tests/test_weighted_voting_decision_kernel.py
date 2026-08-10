@@ -187,12 +187,28 @@ class WeightedVotingDecisionKernelTest(unittest.TestCase):
         self.assertEqual(result.order_proposal.quantity, 0)
         self.assertIn("weighted_voting.decision_kernel.position_limit_blocks_trade", result.reason_codes)
 
+    def test_automatic_sizing_uses_local_inventory_not_broker_account_values(self) -> None:
+        context = valid_context(account_equity=1.0, broker_buying_power=0.01)
+
+        result = WeightedVotingDecisionKernel.evaluate(context, signal_evaluator=buy_signal_evaluator)
+
+        self.assertGreater(result.sizing_result.quantity, 0)
+        self.assertGreater(result.sizing_result.buying_power_quantity, 0)
+        self.assertEqual(result.sizing_result.buying_power_quantity, int(context.inventory_snapshot.buying_power // context.finalised_one_minute_market_snapshot.ask))
+        self.assertNotEqual(result.sizing_result.buying_power_quantity, int(context.read_only_broker_buying_power // context.finalised_one_minute_market_snapshot.ask))
+        expected_inventory_risk = context.inventory_snapshot.equity * (result.effective_settings.base_risk_per_trade_percent / 100.0) * result.sizing_result.size_multiplier
+        broker_account_risk = context.read_only_account_equity * (result.effective_settings.base_risk_per_trade_percent / 100.0) * result.sizing_result.size_multiplier
+        self.assertAlmostEqual(result.sizing_result.effective_risk_dollars, expected_inventory_risk)
+        self.assertNotAlmostEqual(result.sizing_result.effective_risk_dollars, broker_account_risk)
+
 
 def valid_context(
     *,
     daily_trade_count: int = 0,
     open_position: bool = False,
     account_observed_at: datetime | None = None,
+    account_equity: float = 100000.0,
+    broker_buying_power: float = 100000.0,
     effective_settings=None,
     mode: str = "test_fixture",
     global_available_risk: float = 1000.0,
@@ -233,7 +249,7 @@ def valid_context(
     return WeightedVotingRuntimeContextBuilder(
         market_data_port=WeightedVotingStaticMarketDataPort(snapshot),
         inventory_repository=WeightedVotingStaticInventorySnapshotPort(inventory),
-        account_port=WeightedVotingStaticAccountPort(account_equity=100000.0, broker_buying_power=100000.0, observed_at=account_observed_at),
+        account_port=WeightedVotingStaticAccountPort(account_equity=account_equity, broker_buying_power=broker_buying_power, observed_at=account_observed_at),
         global_risk_port=WeightedVotingStaticGlobalRiskPort(global_available_risk=global_available_risk, global_max_shares=global_max_shares, gate_response=global_gate_response),
         effective_settings=effective_settings or resolve_effective_settings(timestamp=snapshot.data_timestamp),
         active_weight_state=create_unseeded_equal_weight_state(timestamp=snapshot.data_timestamp, data_timestamp=snapshot.data_timestamp),

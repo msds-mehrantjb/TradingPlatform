@@ -31,14 +31,20 @@ def _function_body(source: str, function_name: str) -> str:
 def test_weighted_voting_panel_uses_backend_client_not_local_calculation() -> None:
     source = _source()
     body = _function_body(source, "updateWeightedVotingPanel")
+    data_grid = _function_body(source, "renderWeightedBackendDataGrid")
 
     assert "/api/weighted-voting" in source
     assert "refreshWeightedVotingBackendClient" in body
     assert "weightedVotingBackendSummary" in body
+    assert 'fetchWeightedVotingRuntimeControlJson("/runtime/status"' in source
+    assert 'childRecord(weightedVotingBackendState.runtimeStatus, "health")' in data_grid
+    assert 'childRecord(runtimeHealth, "inventory")' in data_grid
+    assert "weightedVotingRuntimeMoney" in data_grid
     assert "calculateWeightedVote(" not in body
     assert "weightedAlphaSignal(" not in body
     assert "weightedTargetOrderRecommendation(" not in body
     assert "maybeAutoSubmitWeightedTargetOrder(" not in body
+    assert "availableBuyingPower =" not in data_grid
 
 
 def test_weighted_voting_config_edits_go_through_api() -> None:

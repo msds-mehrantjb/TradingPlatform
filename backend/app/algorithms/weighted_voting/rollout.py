@@ -114,6 +114,7 @@ class WeightedVotingRolloutControl:
     trading_allowed: bool
     paper_trading_allowed: bool
     automatic_submission_allowed: bool
+    live_trading_allowed: bool
     production_ready: bool
     account_wide_emergency_shutdown: bool
     ignored_external_algorithm_disables: tuple[str, ...]
@@ -129,6 +130,7 @@ class WeightedVotingRolloutControl:
             "trading_allowed": self.trading_allowed,
             "paper_trading_allowed": self.paper_trading_allowed,
             "automatic_submission_allowed": self.automatic_submission_allowed,
+            "live_trading_allowed": self.live_trading_allowed,
             "production_ready": self.production_ready,
             "account_wide_emergency_shutdown": self.account_wide_emergency_shutdown,
             "ignored_external_algorithm_disables": self.ignored_external_algorithm_disables,
@@ -182,6 +184,15 @@ class WeightedVotingRolloutValidation:
     paper_broker_e2e_validated: bool = False
     reconciliation_validated: bool = False
     restart_recovery_validated: bool = False
+    local_paper_broker_validated: bool = False
+    local_inventory_reconciled: bool = False
+    local_balance_accounting_validated: bool = False
+    local_fill_simulation_validated: bool = False
+    local_restart_recovery_validated: bool = False
+    no_cross_algorithm_mutation_validated: bool = False
+    no_alpaca_dependency_validated: bool = False
+    risk_fail_closed_validated: bool = False
+    protective_exits_validated: bool = False
     persisted_operator_approval: bool = False
     live_trading_enabled: bool = False
     validation_record_id: str = ""
@@ -205,6 +216,12 @@ class WeightedVotingControlledRolloutEvidence:
     data_freshness_stable: bool = False
     global_risk_fail_closed_tests_passing: bool = False
     restart_recovery_successful: bool = False
+    local_paper_broker_validated: bool = False
+    local_balance_accounting_validated: bool = False
+    local_fill_simulation_validated: bool = False
+    local_restart_recovery_validated: bool = False
+    no_cross_algorithm_mutation: bool = False
+    no_alpaca_dependency: bool = False
     shadow_opportunity_count: int = 0
     manual_paper_sample_count: int = 0
     transaction_cost_adjusted_paper_stability_ok: bool = False
@@ -379,6 +396,15 @@ def load_persisted_rollout_validation(store: WeightedVotingRolloutStore | None) 
         paper_broker_e2e_validated=bool(record.get("paper_broker_e2e_validated")),
         reconciliation_validated=bool(record.get("reconciliation_validated")),
         restart_recovery_validated=bool(record.get("restart_recovery_validated")),
+        local_paper_broker_validated=bool(record.get("local_paper_broker_validated")),
+        local_inventory_reconciled=bool(record.get("local_inventory_reconciled")),
+        local_balance_accounting_validated=bool(record.get("local_balance_accounting_validated")),
+        local_fill_simulation_validated=bool(record.get("local_fill_simulation_validated")),
+        local_restart_recovery_validated=bool(record.get("local_restart_recovery_validated")),
+        no_cross_algorithm_mutation_validated=bool(record.get("no_cross_algorithm_mutation_validated")),
+        no_alpaca_dependency_validated=bool(record.get("no_alpaca_dependency_validated")),
+        risk_fail_closed_validated=bool(record.get("risk_fail_closed_validated")),
+        protective_exits_validated=bool(record.get("protective_exits_validated")),
         persisted_operator_approval=bool(record.get("persisted_operator_approval") and record.get("approved_by")),
         live_trading_enabled=bool(record.get("live_trading_enabled")),
         validation_record_id=str(record.get("validation_record_id") or ""),
@@ -496,6 +522,7 @@ def controlled_rollout_evidence_from_shadow_report(
     runtime_health = _nested_mapping(reconciliation, "runtimeHealth")
     restart_recovery = _nested_mapping(report, "restartRecovery")
     protective_order_behavior = _nested_mapping(report, "protectiveOrderBehavior")
+    local_paper_readiness = _nested_mapping(report, "localPaperReadiness")
     duplicate_prevented = bool(_nested_value(report, "duplicatePrevention", "duplicateEventPrevented"))
     discrepancy_count = _int_value(reconciliation.get("discrepancyCount"))
     entries_paused = bool(reconciliation.get("entriesPaused"))
@@ -503,6 +530,12 @@ def controlled_rollout_evidence_from_shadow_report(
     recovery_required = bool(runtime_health.get("recoveryRequired"))
     restart_ok = bool(restart_recovery.get("passed")) or bool(restart_recovery_successful)
     protective_ok = bool(protective_order_behavior.get("passed")) or bool(protective_order_reliability_ok)
+    local_paper_broker_ok = bool(local_paper_readiness.get("localPaperBrokerValidated"))
+    balance_accounting_ok = bool(local_paper_readiness.get("localBalanceAccountingValidated"))
+    fill_simulation_ok = bool(local_paper_readiness.get("localFillSimulationValidated"))
+    local_restart_ok = bool(local_paper_readiness.get("localRestartRecoveryValidated")) or restart_ok
+    no_cross_algorithm_mutation = bool(local_paper_readiness.get("noCrossAlgorithmMutation"))
+    no_alpaca_dependency = bool(local_paper_readiness.get("noAlpacaDependency"))
     latency_ok = latency_max_ms is not None and latency_max_ms <= 250.0
     transaction_cost_ok = _nested_value(report, "pnl", "netUnrealizedAfterFees") is not None
     drawdown_ok = _nested_float(report, "pnl", "netUnrealizedAfterFees", default=0.0) >= 0.0
@@ -519,6 +552,12 @@ def controlled_rollout_evidence_from_shadow_report(
             data_ok,
             global_ok,
             restart_ok,
+            local_paper_broker_ok,
+            balance_accounting_ok,
+            fill_simulation_ok,
+            local_restart_ok,
+            no_cross_algorithm_mutation,
+            no_alpaca_dependency,
             protective_ok,
             transaction_cost_ok,
             drawdown_ok,
@@ -535,6 +574,12 @@ def controlled_rollout_evidence_from_shadow_report(
         data_freshness_stable=data_ok,
         global_risk_fail_closed_tests_passing=global_ok,
         restart_recovery_successful=restart_ok,
+        local_paper_broker_validated=local_paper_broker_ok,
+        local_balance_accounting_validated=balance_accounting_ok,
+        local_fill_simulation_validated=fill_simulation_ok,
+        local_restart_recovery_validated=local_restart_ok,
+        no_cross_algorithm_mutation=no_cross_algorithm_mutation,
+        no_alpaca_dependency=no_alpaca_dependency,
         shadow_opportunity_count=decisions,
         manual_paper_sample_count=manual_paper_sample_count,
         transaction_cost_adjusted_paper_stability_ok=transaction_cost_ok,
@@ -633,11 +678,12 @@ def evaluate_weighted_voting_rollout_control(
         trading_allowed=trading_allowed,
         paper_trading_allowed=paper_trading_allowed,
         automatic_submission_allowed=auto_allowed,
+        live_trading_allowed=False,
         production_ready=effective_state == "production_ready",
         account_wide_emergency_shutdown=account_wide_emergency_shutdown,
         ignored_external_algorithm_disables=ignored_disables,
         reason_codes=tuple(dict.fromkeys(reason_codes)),
-        explanation="Weighted Voting rollout control is evaluated only from Weighted Voting state and account-wide emergency shutdown state.",
+        explanation="Weighted Voting rollout control is evaluated only from Weighted Voting state and account-wide emergency shutdown state; it never grants live trading or production broker execution.",
     )
 
 
@@ -829,6 +875,15 @@ def _stage_blockers(stage: WeightedVotingRolloutStage, flags: WeightedVotingRoll
             (validation.paper_broker_e2e_validated, "weighted_voting.rollout.paper_broker_e2e_not_validated"),
             (validation.reconciliation_validated, "weighted_voting.rollout.reconciliation_not_validated"),
             (validation.restart_recovery_validated, "weighted_voting.rollout.restart_recovery_not_validated"),
+            (validation.local_paper_broker_validated, "weighted_voting.rollout.local_paper_broker_not_validated"),
+            (validation.local_inventory_reconciled, "weighted_voting.rollout.local_inventory_not_reconciled"),
+            (validation.local_balance_accounting_validated, "weighted_voting.rollout.local_balance_accounting_not_validated"),
+            (validation.local_fill_simulation_validated, "weighted_voting.rollout.local_fill_simulation_not_validated"),
+            (validation.local_restart_recovery_validated, "weighted_voting.rollout.local_restart_recovery_not_validated"),
+            (validation.no_cross_algorithm_mutation_validated, "weighted_voting.rollout.cross_algorithm_mutation_not_validated_absent"),
+            (validation.no_alpaca_dependency_validated, "weighted_voting.rollout.no_alpaca_dependency_not_validated"),
+            (validation.risk_fail_closed_validated, "weighted_voting.rollout.risk_fail_closed_not_validated"),
+            (validation.protective_exits_validated, "weighted_voting.rollout.protective_exits_not_validated"),
             (validation.persisted_operator_approval, "weighted_voting.rollout.persisted_operator_approval_missing"),
         ),
     }
@@ -875,6 +930,14 @@ def _controlled_stage_blockers(stage: WeightedVotingControlledRolloutStage, evid
             (
                 (evidence.automated_paper_readiness_detected, "weighted_voting.rollout.automated_paper_readiness_not_detected"),
                 (evidence.restart_recovery_successful, "weighted_voting.rollout.restart_recovery_missing"),
+                (evidence.local_paper_broker_validated, "weighted_voting.rollout.local_paper_broker_not_validated"),
+                (evidence.inventory_reconciled, "weighted_voting.rollout.local_inventory_not_reconciled"),
+                (evidence.local_balance_accounting_validated, "weighted_voting.rollout.local_balance_accounting_not_validated"),
+                (evidence.local_fill_simulation_validated, "weighted_voting.rollout.local_fill_simulation_not_validated"),
+                (evidence.local_restart_recovery_validated, "weighted_voting.rollout.local_restart_recovery_not_validated"),
+                (evidence.no_cross_algorithm_mutation, "weighted_voting.rollout.cross_algorithm_mutation_not_validated_absent"),
+                (evidence.no_alpaca_dependency, "weighted_voting.rollout.no_alpaca_dependency_not_validated"),
+                (evidence.global_risk_fail_closed_tests_passing, "weighted_voting.rollout.risk_fail_closed_not_validated"),
                 (evidence.protective_order_reliability_ok, "weighted_voting.rollout.protective_order_reliability_unverified"),
                 (evidence.transaction_cost_adjusted_paper_stability_ok, "weighted_voting.rollout.paper_stability_unacceptable"),
                 (evidence.drawdown_within_limit, "weighted_voting.rollout.drawdown_limit_exceeded"),

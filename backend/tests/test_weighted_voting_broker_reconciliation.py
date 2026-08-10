@@ -101,7 +101,43 @@ class WeightedVotingBrokerReconciliationTest(unittest.TestCase):
         self.assertEqual(snapshot.open_positions[0].quantity, 10)
         self.assertAlmostEqual(snapshot.open_positions[0].average_entry_price, 101.2)
 
-    def test_foreign_and_unattributed_broker_positions_are_excluded_and_flagged(self) -> None:
+    def test_foreign_broker_observations_are_rejected_at_model_boundary(self) -> None:
+        with self.assertRaisesRegex(ValueError, "foreign broker order observation"):
+            WeightedVotingBrokerOrderObservation(
+                client_order_id="foreign-client",
+                algorithm_id="voting_ensemble",
+                symbol="SPY",
+                side="BUY",
+                status="FILLED",
+                quantity=7,
+                filled_quantity=7,
+                average_fill_price=99.0,
+                observed_at=NOW,
+                broker_order_id="foreign-order",
+            )
+        with self.assertRaisesRegex(ValueError, "foreign broker fill observation"):
+            WeightedVotingBrokerFillObservation(
+                fill_id="foreign-fill",
+                client_order_id="foreign-client",
+                algorithm_id="voting_ensemble",
+                symbol="SPY",
+                side="BUY",
+                quantity=7,
+                average_fill_price=99.0,
+                filled_at=NOW,
+            )
+        with self.assertRaisesRegex(ValueError, "foreign broker position observation"):
+            WeightedVotingBrokerPositionObservation(
+                client_order_id="foreign-client",
+                algorithm_id="voting_ensemble",
+                symbol="SPY",
+                quantity=7,
+                average_entry_price=99.0,
+                observed_at=NOW,
+                broker_position_id="foreign-position",
+            )
+
+    def test_unattributed_broker_positions_are_excluded_and_flagged(self) -> None:
         store = MemoryStore()
         inventory = seeded_inventory(store)
         seeded_command(store, inventory)
@@ -110,15 +146,6 @@ class WeightedVotingBrokerReconciliationTest(unittest.TestCase):
             store=store,
             inventory_repository=inventory,
             positions=(
-                WeightedVotingBrokerPositionObservation(
-                    client_order_id="foreign-client",
-                    algorithm_id="voting_ensemble",
-                    symbol="SPY",
-                    quantity=7,
-                    average_entry_price=99.0,
-                    observed_at=NOW,
-                    broker_position_id="foreign-position",
-                ),
                 WeightedVotingBrokerPositionObservation(
                     client_order_id=None,
                     algorithm_id=None,
@@ -132,7 +159,6 @@ class WeightedVotingBrokerReconciliationTest(unittest.TestCase):
             reconciled_at=NOW + timedelta(seconds=1),
         )
 
-        self.assertIn("foreign-position", result.excluded_broker_position_ids)
         self.assertIn("unattributed-position", result.excluded_broker_position_ids)
         self.assertEqual(inventory.current_snapshot(now=NOW).open_positions, ())
         self.assertTrue(any(item.reason_code == "weighted_voting.broker_reconciliation.broker_position_unattributed" for item in result.discrepancies))

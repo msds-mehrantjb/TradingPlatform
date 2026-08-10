@@ -2481,6 +2481,7 @@ const BROWSER_STORAGE_SNAPSHOT_INTERVAL_MS = 5 * 60_000;
 const AUTO_DAILY_ALGORITHM_BACKTESTS = false;
 const WAKE_CHECK_INTERVAL_MS = 15_000;
 const WAKE_GAP_THRESHOLD_MS = 90_000;
+const MARKET_STATUS_POLL_INTERVAL_MS = 30_000;
 const MARKET_FORECAST_TIMEOUT_MS = 4_000;
 const STRATEGY_INVENTORY_TIMEOUT_MS = 3_000;
 const TRADE_SUMMARY_TIMEOUT_MS = 4_000;
@@ -3396,6 +3397,8 @@ const state = {
 };
 
 let refreshTimer: number | undefined;
+let marketStatusTimer: number | undefined;
+let marketStatusRefreshInFlight = false;
 let nextChartRefreshAt = 0;
 let contextTimer: number | undefined;
 let candleStartupTimer: number | undefined;
@@ -3735,12 +3738,6 @@ leftRail.innerHTML = `
         </div>
         <div id="algoVoteCounts" class="algo-vote-grid"></div>
         <div id="algoResultsBody" class="algo-rule-list" hidden></div>
-        <button id="algoTradePlanToggle" class="algo-expand-toggle algo-trade-decision-toggle" type="button" aria-expanded="false" aria-controls="algoTradePlan">
-          <span>Trading Decision</span>
-          <strong id="algoTradePlanToggleMeta">Closed</strong>
-          <b id="algoTradePlanToggleIcon">+</b>
-        </button>
-        <div id="algoTradePlan" class="algo-rule-list" hidden></div>
         <div class="algo-table-wrap">
           <table class="algo-trade-table">
             <thead>
@@ -3755,12 +3752,12 @@ leftRail.innerHTML = `
           </table>
         </div>
         <div id="tradingSettingsMount" class="algo-stable-settings"></div>
-        <button id="algoVotesToggle" class="algo-expand-toggle" type="button" aria-expanded="false" aria-controls="algoVoteList">
-          <span>Strategies</span>
-          <strong id="algoVotesToggleMeta">10 strategies</strong>
-          <b id="algoVotesToggleIcon">+</b>
+        <button id="algoTradePlanToggle" class="algo-expand-toggle algo-trade-decision-toggle" type="button" aria-expanded="false" aria-controls="algoTradePlan">
+          <span>Trading Decision</span>
+          <strong id="algoTradePlanToggleMeta">Closed</strong>
+          <b id="algoTradePlanToggleIcon">+</b>
         </button>
-        <div id="algoVoteList" class="algo-vote-list" hidden></div>
+        <div id="algoTradePlan" class="algo-rule-list" hidden></div>
         <div class="algo-timeframe-toggle" role="group" aria-label="Voting Ensemble backtest timeframe">
           <button id="algoIntradayTradesToggle" class="algo-timeframe-button algo-timeframe-menu-toggle" type="button" aria-expanded="false" aria-controls="algoIntradayTradesPanel">
             <span>1m/5m Trades</span>
@@ -3788,6 +3785,12 @@ leftRail.innerHTML = `
           </div>
           <button id="algoBacktestTradingButton" class="algo-timeframe-button" type="button" hidden>Trading</button>
         </div>
+        <button id="algoVotesToggle" class="algo-expand-toggle" type="button" aria-expanded="false" aria-controls="algoVoteList">
+          <span>Strategies</span>
+          <strong id="algoVotesToggleMeta">10 strategies</strong>
+          <b id="algoVotesToggleIcon">+</b>
+        </button>
+        <div id="algoVoteList" class="algo-vote-list" hidden></div>
       </div>
       <div id="algoWeightedVotingPanel" class="algo-panel" role="tabpanel" aria-labelledby="algoWeightedVotingTabButton" hidden>
         <div class="algo-header">
@@ -4463,7 +4466,7 @@ endInput.value = state.end;
 updateCandleSettingsControls();
 updateOverlayToggleControls();
 updateZoomLevel();
-updateTradeToggleButton();
+queueMicrotask(updateTradeToggleButton);
 const initialAlgoTab = state.algoTab;
 queueMicrotask(() => setAlgoTab(initialAlgoTab));
 
@@ -15775,6 +15778,7 @@ const weightedVotingBackendState = {
   evaluation: null as Record<string, unknown> | null,
   dailyUpdate: null as Record<string, unknown> | null,
   runtimeControl: null as WeightedVotingRuntimeControl | null,
+  runtimeStatus: null as Record<string, unknown> | null,
   updatedAt: "",
   requestKey: "",
 };
@@ -16521,13 +16525,14 @@ async function refreshWeightedVotingBackendClient(options: { force?: boolean } =
   weightedVotingBackendState.status = weightedVotingBackendState.status === "ready" ? "ready" : "loading";
   weightedVotingBackendState.requestKey = requestKey;
   try {
-    const [serviceStatus, config, activeWeights, weightsHistory, dailyUpdate, runtimeControl] = await Promise.all([
+    const [serviceStatus, config, activeWeights, weightsHistory, dailyUpdate, runtimeControl, runtimeStatus] = await Promise.all([
       fetchWeightedVotingJson("/status"),
       fetchWeightedVotingJson("/config"),
       fetchWeightedVotingJson("/weights/active"),
       fetchWeightedVotingJson("/weights/history"),
       fetchWeightedVotingJson("/daily-update/status"),
       fetchWeightedVotingRuntimeControlJson("/runtime/control").catch(() => null),
+      fetchWeightedVotingRuntimeControlJson("/runtime/status").catch(() => null),
     ]);
     weightedVotingBackendState.serviceStatus = serviceStatus;
     weightedVotingBackendState.config = config;
@@ -16535,6 +16540,7 @@ async function refreshWeightedVotingBackendClient(options: { force?: boolean } =
     weightedVotingBackendState.weightHistory = arrayFromUnknown(weightsHistory.history);
     weightedVotingBackendState.dailyUpdate = dailyUpdate;
     weightedVotingBackendState.runtimeControl = runtimeControl ? normalizeWeightedVotingRuntimeControl(runtimeControl) : weightedVotingBackendState.runtimeControl;
+    weightedVotingBackendState.runtimeStatus = runtimeStatus;
     weightedVotingBackendState.evaluation = null;
     weightedVotingBackendState.status = "ready";
     weightedVotingBackendState.warning = "Weighted Voting decisions are produced only by backend finalized-bar ingestion.";
@@ -17462,11 +17468,25 @@ function renderWeightedBackendDataGrid() {
   const sizing = childRecord(weightedVotingBackendState.evaluation, "sizingResult");
   const globalApplication = childRecord(weightedVotingBackendState.evaluation, "globalGateApplication");
   const control = weightedVotingBackendState.runtimeControl;
+  const runtimeHealth = childRecord(weightedVotingBackendState.runtimeStatus, "health");
+  const runtimeInventory = childRecord(runtimeHealth, "inventory");
   const rows = [
     ["Backend paper control", control ? (control.paperTradingEnabled ? "PAPER on" : "PAPER off") : "Unavailable"],
     ["Automatic entries", control ? (control.automaticEntriesEnabled ? "Armed by backend" : "Blocked by backend") : "Unavailable"],
     ["Control updated", control ? `${control.updatedBy || "backend"} ${control.updatedAt || ""}`.trim() : "NA"],
     ["Control reason", control?.reasonCodes?.join(", ") || control?.reason || "NA"],
+    ["Execution mode", stringFromUnknown(runtimeHealth?.executionMode, "Unavailable")],
+    ["Broker kind", stringFromUnknown(runtimeHealth?.brokerKind, "Unavailable")],
+    ["Alpaca dependency", runtimeHealth ? stringFromUnknown(runtimeHealth.alpacaDependency, "false") : "Unavailable"],
+    ["Inventory cash", weightedVotingRuntimeMoney(runtimeInventory, "cash")],
+    ["Reserved cash", weightedVotingRuntimeMoney(runtimeInventory, "reservedCash")],
+    ["Available buying power", weightedVotingRuntimeMoney(runtimeInventory, "availableBuyingPower")],
+    ["Local equity", weightedVotingRuntimeMoney(runtimeInventory, "equity")],
+    ["Realized P/L", weightedVotingRuntimeMoney(runtimeInventory, "realizedPnl")],
+    ["Unrealized P/L", weightedVotingRuntimeMoney(runtimeInventory, "unrealizedPnl")],
+    ["Gross exposure", weightedVotingRuntimeMoney(runtimeInventory, "grossExposure")],
+    ["Open positions", stringFromUnknown(runtimeInventory?.openPositionCount, "NA")],
+    ["Pending orders", stringFromUnknown(runtimeInventory?.pendingOrderCount, "NA")],
     ["Internal condition", weightedVotingMarketConditionLabel()],
     ["Trend", weightedRecordString(condition, "NA", "trend_direction", "trendDirection", "trend")],
     ["Volatility", weightedRecordString(condition, "NA", "volatility_level", "volatilityLevel", "volatility")],
@@ -17489,6 +17509,14 @@ function renderWeightedBackendDataGrid() {
       `,
     )
     .join("");
+}
+
+function weightedVotingRuntimeMoney(source: Record<string, unknown> | null, key: string) {
+  const value = source?.[key];
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "NA";
+  }
+  return moneyWithCents(value);
 }
 
 function renderWeightedBackendGates() {
@@ -19789,7 +19817,7 @@ function renderAlgoResults(
     <span>Actionable Buy ${buyVotes} / Sell ${sellVotes} / Hold ${holdVotes}</span>
     <span>Highest-ranked strategy: ${escapeHtml(strongestLabel)}</span>
     <span>Backtest status: <strong class="algo-backtest-status" data-status="${algoBacktestStatusKind()}">${escapeHtml(algoBacktestStatusLabel())}</strong></span>
-    <span>Paper readiness: ${escapeHtml(backtestQuality?.label ?? "Unknown")}</span>
+    <span>Backtest quality: ${escapeHtml(backtestQuality?.label ?? "Unknown")}</span>
     <span>ML artifact: ${escapeHtml(compactMlArtifactLabel(backtest.timeframe))}</span>
     <span>Backtest timeframe: ${algoBacktestTimeframeLabel(backtest.timeframe)}</span>
     <span>Backtest range: ${escapeHtml(rangeLabel)}</span>
@@ -20289,7 +20317,7 @@ function algoBacktestStatusLabel() {
     return `Loading ${algoBacktestTimeframeLabel(state.algoBacktestTimeframe)} full-range backtest`;
   }
   if (state.algoBacktestStatus === "fallback" && state.algoBacktestWarning) {
-    return `Fallback - ${state.algoBacktestWarning.slice(0, 90)}`;
+    return state.algoBacktestWarning.slice(0, 120);
   }
   if (state.algoBacktestWarning) {
     return state.algoBacktestWarning.slice(0, 90);
@@ -23296,6 +23324,21 @@ function sleepAppUntilMarketWake(status = "sleeping-market-closed") {
   markRefresh(status);
 }
 
+function startMarketStatusMonitor() {
+  if (marketStatusTimer) {
+    window.clearInterval(marketStatusTimer);
+  }
+  marketStatusTimer = window.setInterval(() => {
+    if (marketStatusRefreshInFlight || document.visibilityState === "hidden") {
+      return;
+    }
+    marketStatusRefreshInFlight = true;
+    void loadMarketStatus().finally(() => {
+      marketStatusRefreshInFlight = false;
+    });
+  }, MARKET_STATUS_POLL_INTERVAL_MS);
+}
+
 async function activateAppAfterWake(reason: string) {
   if (appActivationInFlight) {
     return;
@@ -23673,7 +23716,7 @@ function applyBacktestQualityToVotes(votes: AlgoVote[], quality: VotingBacktestQ
       ...vote,
       score: cappedScore,
       status: cappedStatus,
-      detail: `${vote.detail} Backtest economics block paper readiness: ${quality.reason}.`,
+      detail: `${vote.detail} Backtest economics reduce strategy quality: ${quality.reason}.`,
     };
   });
 }
@@ -24338,6 +24381,7 @@ setInterval(tickClock, 1000);
 startBrowserStorageDiskSnapshots();
 scheduleAutoRefresh();
 startWakeActivationMonitor();
+startMarketStatusMonitor();
 setMarketRailTab("summary");
 void loadMarketStatus();
 void loadMacroEvents();

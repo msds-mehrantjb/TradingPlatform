@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -103,6 +104,36 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertEqual(self.store.read_snapshot("weighted_voting.runtime.control")["updated_by"], "api-test")
         self.assertEqual(status.status_code, 200, status.text)
         self.assertEqual(status.json()["control"]["algorithm_id"], "weighted_voting")
+
+    def test_runtime_status_exposes_backend_authoritative_local_paper_inventory(self) -> None:
+        response = self.client.get("/api/weighted-voting/runtime/status")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        health = payload["health"]
+        inventory = health["inventory"]
+
+        self.assertEqual(payload["executionMode"], "LOCAL_PAPER")
+        self.assertEqual(payload["brokerKind"], "weighted_voting_local_paper")
+        self.assertFalse(payload["alpacaDependency"])
+        self.assertEqual(payload["inventory"], inventory)
+        self.assertEqual(health["executionMode"], "LOCAL_PAPER")
+        self.assertEqual(health["brokerKind"], "weighted_voting_local_paper")
+        self.assertFalse(health["alpacaDependency"])
+        self.assertTrue(inventory["available"])
+        self.assertTrue(inventory["authoritative"])
+        self.assertEqual(inventory["cash"], 100000.0)
+        self.assertEqual(inventory["reservedCash"], 0.0)
+        self.assertEqual(inventory["availableBuyingPower"], 100000.0)
+        self.assertEqual(inventory["equity"], 100000.0)
+        self.assertEqual(inventory["realizedPnl"], 0.0)
+        self.assertEqual(inventory["unrealizedPnl"], 0.0)
+        self.assertEqual(inventory["grossExposure"], 0.0)
+        self.assertEqual(inventory["openPositions"], [])
+        self.assertEqual(inventory["pendingOrders"], [])
+        self.assertEqual(health["operationalStatus"]["inventory"], inventory)
+        self.assertNotIn("paper-key", json.dumps(payload))
+        self.assertNotIn("paper-secret", json.dumps(payload))
 
     def test_runtime_control_endpoint_rejects_stale_expected_version(self) -> None:
         current = self.client.get("/api/algorithms/weighted-voting/runtime/control")
@@ -254,6 +285,7 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertTrue(all(abs(weight - 0.25) <= 0.10 + 0.0000001 for weight in weights.values()))
 
     def test_backtest_endpoints_store_and_return_run_collections(self) -> None:
+        inventory_keys_before = {key for key in self.store.snapshots if key.startswith("weighted_voting.inventory.")}
         response = self.client.post("/api/weighted-voting/backtests", json=backtest_payload("api-run-1"))
         self.assertEqual(response.status_code, 200, response.text)
 
@@ -276,7 +308,8 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertIn("strategyPerformance", performance.json())
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(missing.json()["detail"]["algorithm_id"], "weighted_voting")
-        self.assertFalse(any(key.startswith("weighted_voting.inventory.") for key in self.store.snapshots))
+        inventory_keys_after = {key for key in self.store.snapshots if key.startswith("weighted_voting.inventory.")}
+        self.assertEqual(inventory_keys_after, inventory_keys_before)
         self.assertIn("weighted_voting.backtests.api-run-1", self.store.snapshots)
 
     def test_daily_update_endpoints_are_weighted_voting_specific(self) -> None:

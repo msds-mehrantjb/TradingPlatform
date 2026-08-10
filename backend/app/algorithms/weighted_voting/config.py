@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
-from typing import Any
+from typing import Any, Literal
 
 from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_STRATEGY_CATALOG
 from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_CONFIGURATION_VERSION
@@ -64,6 +64,7 @@ class WeightedVotingConfig:
     config_version: str = WEIGHTED_VOTING_CONFIG_VERSION
     configuration_namespace: str = WEIGHTED_VOTING_CONFIGURATION_NAMESPACE
     configuration_key: str = WEIGHTED_VOTING_BASELINE_CONFIGURATION_KEY
+    paper_execution_mode: Literal["LOCAL_PAPER", "BROKER_PAPER"] = "LOCAL_PAPER"
     strategy_enablement: dict[str, bool] = field(default_factory=_strategy_enablement)
     strategy_baseline_weights: dict[str, float] = field(default_factory=_strategy_baseline_weights)
     strategy_minimum_weights: dict[str, float] = field(default_factory=_strategy_minimum_weights)
@@ -115,6 +116,8 @@ class WeightedVotingConfig:
     entry_slippage_per_share: float = 0.01
     exit_slippage_per_share: float = 0.01
     fee_per_share: float = 0.01
+    regulatory_fee_per_share: float = 0.0
+    spread_impact_per_share: float = 0.0
     transaction_cost_buffer_percent: float = 0.0001
     risk_per_trade_baseline_percent: float = 0.50
     daily_risk_baseline_percent: float = 3.0
@@ -123,6 +126,9 @@ class WeightedVotingConfig:
     maximum_position_percent: float = 10.0
     maximum_shares: int = 0
     maximum_participation_rate: float = 0.01
+    local_paper_initial_capital: float = 100000.0
+    local_paper_allow_shorting: bool = False
+    local_paper_partial_fill_mode: Literal["DETERMINISTIC_LIQUIDITY", "ALL_OR_NONE"] = "DETERMINISTIC_LIQUIDITY"
     atr_stop_multiplier: float = 1.5
     minimum_stop_distance_percent: float = 0.001
     maximum_stop_distance_percent: float = 0.05
@@ -223,6 +229,20 @@ class WeightedVotingConfig:
             "maximumWeightedDailyLossPercent": self.maximum_weighted_daily_loss_percent,
             "maximumWeightedDailyTrades": self.maximum_weighted_daily_trades,
             "minimumCapitalAvailable": self.minimum_capital_available,
+            "paperExecutionMode": self.paper_execution_mode,
+            "weighted_voting.paper.execution_mode": self.paper_execution_mode,
+            "localPaperInitialCapital": self.local_paper_initial_capital,
+            "weighted_voting.local_paper.initial_capital": self.local_paper_initial_capital,
+            "weighted_voting.local_paper.commission": self.fee_per_share,
+            "weighted_voting.local_paper.slippage": self.entry_slippage_per_share,
+            "weighted_voting.local_paper.allow_shorting": self.local_paper_allow_shorting,
+            "weighted_voting.local_paper.partial_fill_mode": self.local_paper_partial_fill_mode,
+            "weighted_voting.local_paper.execution_costs.buy_slippage_per_share": self.entry_slippage_per_share,
+            "weighted_voting.local_paper.execution_costs.sell_slippage_per_share": self.entry_slippage_per_share,
+            "weighted_voting.local_paper.execution_costs.commission_per_share": self.fee_per_share,
+            "weighted_voting.local_paper.execution_costs.regulatory_fee_per_share": self.regulatory_fee_per_share,
+            "weighted_voting.local_paper.execution_costs.spread_impact_per_share": self.spread_impact_per_share,
+            "weighted_voting.local_paper.execution_costs.spread_impact_percent": self.transaction_cost_buffer_percent,
             "allowWeightedPyramiding": self.allow_weighted_pyramiding,
             "baselineSettings": {
                 "strategyEnablement": strategy_enablement,
@@ -263,12 +283,33 @@ class WeightedVotingConfig:
                 "entrySlippagePerShare": self.entry_slippage_per_share,
                 "exitSlippagePerShare": self.exit_slippage_per_share,
                 "feePerShare": self.fee_per_share,
+                "regulatoryFeePerShare": self.regulatory_fee_per_share,
+                "spreadImpactPerShare": self.spread_impact_per_share,
                 "costBufferPercent": self.transaction_cost_buffer_percent,
             },
             "riskBudget": {
                 "riskPerTradeBaselinePercent": self.risk_per_trade_baseline_percent,
                 "dailyRiskBaselinePercent": self.daily_risk_baseline_percent,
                 "maximumWeightedDailyLossPercent": self.maximum_weighted_daily_loss_percent,
+            },
+            "localPaper": {
+                "executionMode": self.paper_execution_mode,
+                "initialCapital": self.local_paper_initial_capital,
+                "capitalPartitionId": "weighted_voting.paper.default",
+                "configurationKey": "weighted_voting.local_paper.initial_capital",
+                "owner": "weighted_voting",
+                "allowShorting": self.local_paper_allow_shorting,
+                "partialFillMode": self.local_paper_partial_fill_mode,
+                "executionCosts": {
+                    "slippagePerShare": self.entry_slippage_per_share,
+                    "commission": self.fee_per_share,
+                    "buySlippagePerShare": self.entry_slippage_per_share,
+                    "sellSlippagePerShare": self.entry_slippage_per_share,
+                    "commissionPerShare": self.fee_per_share,
+                    "regulatoryFeePerShare": self.regulatory_fee_per_share,
+                    "spreadImpactPerShare": self.spread_impact_per_share,
+                    "spreadImpactPercent": self.transaction_cost_buffer_percent,
+                },
             },
             "positionLimits": {
                 "orderAllocationPercent": self.order_allocation_percent,
@@ -320,6 +361,7 @@ class WeightedVotingConfig:
                 "entrySlippagePerShare": self.entry_slippage_per_share,
                 "exitSlippagePerShare": self.exit_slippage_per_share,
                 "feePerShare": self.fee_per_share,
+                "regulatoryFeePerShare": self.regulatory_fee_per_share,
                 "usePerformanceWeights": self.backtest_use_performance_weights,
                 "useDynamicSettings": self.backtest_use_dynamic_settings,
             },

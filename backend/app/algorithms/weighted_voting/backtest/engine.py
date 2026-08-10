@@ -383,7 +383,7 @@ def run_weighted_voting_backtest(
     open_position: _OpenBacktestPosition | None = None
     allocated_capital = config.account_equity * config.weighted_config.daily_allocation_percent / 100.0
     inventory_store = _RunScopedInventoryStore()
-    inventory_repository = WeightedVotingInventoryRepository(inventory_store, symbol=config.symbol, allocated_capital=allocated_capital)
+    inventory_repository = WeightedVotingInventoryRepository(inventory_store, symbol=config.symbol, allocated_capital=allocated_capital, allow_shorting=config.allow_short)
     if ordered_candles:
         inventory_repository.initialize_session(
             session_date=ordered_candles[0].timestamp.date(),
@@ -814,12 +814,21 @@ def _reserve_backtest_order(
             "symbol": inventory_repository.symbol,
             "side": str(order.side),
             "quantity": order.requested_quantity,
+            "filled_quantity": 0,
+            "remaining_quantity": order.requested_quantity,
+            "order_type": str(order.entry_policy.entry_type),
+            "limit_price": order.entry_policy.limit_price,
+            "stop_price": order.entry_policy.trigger_price,
             "reserved_buying_power": round(notional, 10),
+            "reserved_cash": round(notional, 10),
             "planned_risk_dollars": round(float(sizing.effective_risk_dollars or sizing.risk_dollars or 0.0), 10),
             "decision_id": decision.decision_id,
             "order_intent_id": order.order_id,
             "client_order_id": order.order_id,
+            "status": "WORKING",
             "created_at": occurred_at.isoformat(),
+            "updated_at": occurred_at.isoformat(),
+            "expiration": order.entry_policy.entry_expiration.isoformat() if order.entry_policy.entry_expiration else None,
         },
         occurred_at=occurred_at,
         expected_snapshot_version=snapshot.snapshot_version,
@@ -850,6 +859,7 @@ def _record_backtest_fill(
             "symbol": inventory_repository.symbol,
             "side": str(order.side),
             "quantity": signed_quantity,
+            "allow_open_short": bool(order.side == WeightedSide.SELL.value),
             "average_entry_price": fill_price,
             "opened_at": occurred_at.isoformat(),
             "decision_id": decision.decision_id,

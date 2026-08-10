@@ -37,6 +37,8 @@ EXPECTED_FILES = {
     "entry_policy.py",
     "exit_policy.py",
     "order_proposal.py",
+    "execution_gateway.py",
+    "local_paper_broker.py",
     "performance_tracker.py",
     "persistence.py",
     "scheduler.py",
@@ -177,7 +179,7 @@ class WeightedVotingPackageArchitectureTest(unittest.TestCase):
         self.assertIn("configuration_status_inspection_pause_resume_and_manual_paper_testing_only", contract.api_role)
         self.assertEqual(set(stages), REQUIRED_ARCHITECTURE_STAGES)
         self.assertEqual(set(contract.owned_mutable_domains), REQUIRED_OWNED_MUTABLE_DOMAINS)
-        self.assertEqual(contract.broker_account_role, "shared_external_resource_not_algorithm_inventory")
+        self.assertEqual(contract.broker_account_role, "not_used_for_local_paper; weighted_voting_inventory_is_account_authority")
         self.assertEqual(contract.inventory_owner, "weighted_voting")
         self.assertEqual(contract.supported_modes, ("backtesting", "replay", "shadow_evaluation", "automatic_paper_trading"))
         for port in ports.values():

@@ -106,6 +106,14 @@ class GlobalDecisionInterfaceTest(unittest.TestCase):
         self.assertEqual(proposal.targetPrice, 101.05)
         self.assertEqual(proposal.plannedRiskDollars, 280.0)
         self.assertIn("base_risk_per_trade_percent", proposal.settingsSnapshot)
+        self.assertEqual(proposal.settingsSnapshot["weighted_voting.paper.execution_mode"], "LOCAL_PAPER")
+        self.assertEqual(proposal.settingsSnapshot["weighted_voting.local_paper.initial_capital"], settings.local_paper_initial_capital)
+        self.assertEqual(proposal.settingsSnapshot["weighted_voting.local_paper.commission"], settings.local_paper_commission_per_share)
+        self.assertEqual(proposal.settingsSnapshot["weighted_voting.local_paper.slippage"], settings.local_paper_buy_slippage_per_share)
+        self.assertEqual(proposal.settingsSnapshot["weighted_voting.local_paper.allow_shorting"], settings.local_paper_allow_shorting)
+        self.assertEqual(proposal.settingsSnapshot["weighted_voting.local_paper.partial_fill_mode"], settings.local_paper_partial_fill_mode)
+        self.assertEqual(proposal.settingsSnapshot["localPaper"]["executionMode"], "LOCAL_PAPER")
+        self.assertEqual(proposal.settingsSnapshot["localPaper"]["executionCosts"]["commission"], settings.local_paper_commission_per_share)
         self.assertTrue(proposal.strategyStateHash)
 
     def test_weighted_voting_adapter_applies_response_without_changing_side_or_hash(self) -> None:
@@ -194,6 +202,12 @@ class GlobalDecisionInterfaceTest(unittest.TestCase):
         self.assertNotIn("REDUCE_QUANTITY", status["allowedActions"])
         self.assertFalse(status["clientPayloadGlobalRiskAccepted"])
         self.assertIn("weighted_voting.global_interface.active_weights_not_mutated", status["immutabilityChecks"])
+        self.assertTrue(status["sharedServiceBoundary"]["globalRiskMayReadCrossAlgorithmExposure"])
+        self.assertFalse(status["sharedServiceBoundary"]["globalRiskMayMutateWeightedVotingInventory"])
+        self.assertFalse(status["sharedServiceBoundary"]["globalRiskMayMergeAlgorithmInventories"])
+        self.assertFalse(status["sharedServiceBoundary"]["globalRiskResponseMayCarryMutablePortfolioState"])
+        self.assertIn("merge_algorithm_inventories", status["sharedServiceForbiddenActions"])
+        self.assertIn("write_shared_local_paper_inventory", status["sharedServiceForbiddenActions"])
 
         tampered_payload = proposal.model_dump(mode="json")
         tampered_payload["capitalPartitionId"] = "wca.paper.default"

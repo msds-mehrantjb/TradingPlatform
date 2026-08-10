@@ -133,6 +133,8 @@ def calculate_weighted_voting_position_size(context: WeightedVotingSizingContext
     risk_based_quantity = floor(effective_risk_dollars / stop_distance)
     capital_partition_quantity = floor(_remaining_capital_partition(context) / entry_price)
     buying_power_quantity = floor(context.available_buying_power / entry_price)
+    order_allocation_quantity = floor((context.account_equity * (context.effective_settings.order_allocation_percent / 100.0)) / entry_price)
+    maximum_position_quantity = floor((context.account_equity * (context.effective_settings.maximum_position_percent / 100.0)) / entry_price)
     liquidity_quantity = _liquidity_quantity(context)
     volume_participation_quantity = _participation_quantity(context)
     local_capacity_ceiling = max(0, risk_based_quantity, capital_partition_quantity, buying_power_quantity, liquidity_quantity, volume_participation_quantity)
@@ -140,8 +142,8 @@ def calculate_weighted_voting_position_size(context: WeightedVotingSizingContext
     global_maximum_quantity = min(context.global_max_shares, floor(context.global_available_risk / stop_distance) if stop_distance > 0 else 0)
     caps = (
         _cap("risk", risk_based_quantity, "weighted_voting.sizing.cap.risk", "Shares capped by effective risk dollars and stop distance."),
-        _cap("order_allocation", floor((context.account_equity * (context.effective_settings.order_allocation_percent / 100.0)) / entry_price), "weighted_voting.sizing.cap.order_allocation", "Shares capped by order allocation."),
-        _cap("maximum_position", floor((context.account_equity * (context.effective_settings.maximum_position_percent / 100.0)) / entry_price), "weighted_voting.sizing.cap.maximum_position", "Shares capped by maximum position size."),
+        _cap("order_allocation", order_allocation_quantity, "weighted_voting.sizing.cap.order_allocation", "Shares capped by order allocation."),
+        _cap("maximum_position", maximum_position_quantity, "weighted_voting.sizing.cap.maximum_position", "Shares capped by maximum position size."),
         _cap("available_buying_power", buying_power_quantity, "weighted_voting.sizing.cap.available_buying_power", "Shares capped by available buying power."),
         _cap("liquidity_participation", volume_participation_quantity, "weighted_voting.sizing.cap.liquidity_participation", "Shares capped by liquidity participation policy."),
         _cap("maximum_shares", algorithm_maximum_quantity, "weighted_voting.sizing.cap.maximum_shares", "Shares capped by effective maximum shares."),
@@ -152,6 +154,8 @@ def calculate_weighted_voting_position_size(context: WeightedVotingSizingContext
         "risk_based_quantity": risk_based_quantity,
         "capital_partition_quantity": capital_partition_quantity,
         "buying_power_quantity": buying_power_quantity,
+        "order_allocation_quantity": order_allocation_quantity,
+        "maximum_position_quantity": maximum_position_quantity,
         "liquidity_quantity": liquidity_quantity,
         "volume_participation_quantity": volume_participation_quantity,
         "algorithm_maximum_quantity": algorithm_maximum_quantity,
@@ -199,7 +203,7 @@ def calculate_weighted_voting_position_size(context: WeightedVotingSizingContext
 def _effective_risk_dollars(context: WeightedVotingSizingContext, size_multiplier: float) -> float:
     raw = (
         context.account_equity
-        * (context.effective_settings.default_settings.base_risk_per_trade_percent / 100.0)
+        * (context.effective_settings.base_risk_per_trade_percent / 100.0)
         * size_multiplier
         * context.market_quality_multiplier
         * context.voting_quality_multiplier
@@ -289,6 +293,8 @@ def _legacy_limiting_cap(limiting_name: str, caps: tuple[WeightedVotingSizingCap
         "risk_based_quantity": "risk",
         "capital_partition_quantity": "order_allocation",
         "buying_power_quantity": "available_buying_power",
+        "order_allocation_quantity": "order_allocation",
+        "maximum_position_quantity": "maximum_position",
         "liquidity_quantity": "liquidity_participation",
         "volume_participation_quantity": "liquidity_participation",
         "algorithm_maximum_quantity": "maximum_shares",

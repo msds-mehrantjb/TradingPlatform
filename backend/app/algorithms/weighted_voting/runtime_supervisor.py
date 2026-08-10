@@ -11,7 +11,6 @@ from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Any, Literal, Protocol
 from zoneinfo import ZoneInfo
 
-from backend.app.algorithms.weighted_voting.alpaca_paper_broker import build_weighted_voting_paper_gateway_dependencies
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.broker_reconciliation import (
     WeightedVotingBrokerFillObservation,
@@ -40,6 +39,7 @@ from backend.app.algorithms.weighted_voting.global_interface import (
 )
 from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_ALGORITHM_ID
 from backend.app.algorithms.weighted_voting.inventory import CURRENT_SNAPSHOT_KEY, WeightedVotingInventoryRepository
+from backend.app.algorithms.weighted_voting.local_paper_broker import WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE, build_weighted_voting_local_paper_gateway_dependencies
 from backend.app.algorithms.weighted_voting.market_condition import classify_market_condition
 from backend.app.algorithms.weighted_voting.market_snapshot import WeightedVotingCandle, build_weighted_voting_market_snapshot
 from backend.app.algorithms.weighted_voting.models import WeightedEffectiveSettings, WeightedMarketSnapshot, WeightedWeightState
@@ -406,6 +406,7 @@ class WeightedVotingFinalisedBarEvent:
 @dataclass(frozen=True)
 class WeightedVotingRuntimeConfig:
     symbols: tuple[str, ...] = ("SPY",)
+    paper_execution_mode: Literal["LOCAL_PAPER", "BROKER_PAPER"] = "LOCAL_PAPER"
     queue_maxsize: int = 256
     max_queue_lag_seconds: int = 75
     finalized_bar_gap_tolerance: int = 0
@@ -1052,18 +1053,53 @@ class WeightedVotingRuntimeSupervisor:
     ) -> None:
         self.store = store or WeightedVotingFilesystemStateStore()
         self.weighted_config = weighted_config or WeightedVotingConfig()
-        self.service = service or WeightedVotingService(config=self.weighted_config, store=self.store)
-        self.config = config or WeightedVotingRuntimeConfig()
+        self.config = config or WeightedVotingRuntimeConfig(paper_execution_mode=self.weighted_config.paper_execution_mode)
         self.event_bus = event_bus or WeightedVotingEventBus(maxsize=self.config.queue_maxsize)
         self.risk_queue: asyncio.Queue[WeightedVotingRiskQueueItem] = asyncio.Queue(maxsize=self.config.queue_maxsize)
         self.execution_queue: asyncio.Queue[WeightedVotingExecutionQueueItem] = asyncio.Queue(maxsize=self.config.queue_maxsize)
         self.calendar = calendar or WeightedVotingMarketCalendar()
+        self.inventory_repository = inventory_repository or WeightedVotingInventoryRepository(
+            self.store,
+            allocated_capital=self.weighted_config.local_paper_initial_capital,
+            allow_shorting=self.weighted_config.local_paper_allow_shorting,
+        )
         resolved_account_port = account_port
+        resolved_global_risk_port = global_risk_port
+        resolved_central_risk_service = None
         if paper_gateway is _DEFAULT_PAPER_GATEWAY:
-            broker, broker_account_port = build_weighted_voting_paper_gateway_dependencies()
-            self.paper_gateway = PaperOrderGateway(broker, self.store)
-            if resolved_account_port is None:
-                resolved_account_port = broker_account_port
+            if self.config.paper_execution_mode == "LOCAL_PAPER":
+                if inventory_repository is None:
+                    _ensure_weighted_voting_local_paper_session(
+                        store=self.store,
+                        inventory_repository=self.inventory_repository,
+                        initial_capital=self.weighted_config.local_paper_initial_capital,
+                    )
+                broker, local_risk_port, local_risk_service = build_weighted_voting_local_paper_gateway_dependencies(self.store, self.inventory_repository)
+                self.paper_gateway = PaperOrderGateway(
+                    broker,
+                    self.store,
+                    execution_mode="LOCAL_PAPER",
+                    account_snapshot_provider=broker.gateway_account_snapshot,
+                    portfolio_snapshot_provider=broker.gateway_portfolio_snapshot,
+                )
+                if resolved_account_port is None:
+                    resolved_account_port = broker
+                if resolved_global_risk_port is None:
+                    resolved_global_risk_port = local_risk_port
+                resolved_central_risk_service = local_risk_service
+            elif self.config.paper_execution_mode == "BROKER_PAPER":
+                from backend.app.algorithms.weighted_voting.alpaca_paper_broker import build_weighted_voting_paper_gateway_dependencies
+
+                broker, broker_account_port = build_weighted_voting_paper_gateway_dependencies()
+                self.paper_gateway = PaperOrderGateway(
+                    broker,
+                    self.store,
+                    execution_mode="BROKER_PAPER",
+                )
+                if resolved_account_port is None:
+                    resolved_account_port = broker_account_port
+            else:
+                raise ValueError(f"Unsupported Weighted Voting paper execution mode: {self.config.paper_execution_mode}")
         elif paper_gateway is None:
             self.paper_gateway = None
         else:
@@ -1071,9 +1107,9 @@ class WeightedVotingRuntimeSupervisor:
             broker_account_port = getattr(paper_gateway.broker, "account_observation", None)
             if resolved_account_port is None and callable(broker_account_port):
                 resolved_account_port = paper_gateway.broker
-        self.inventory_repository = inventory_repository or WeightedVotingInventoryRepository(self.store, allocated_capital=0.0)
+        self.service = service or WeightedVotingService(config=self.weighted_config, store=self.store, central_risk_service=resolved_central_risk_service)
         self.account_port = resolved_account_port or WeightedVotingUnavailableAccountPort()
-        self.global_risk_port = global_risk_port or WeightedVotingUnavailableGlobalRiskPort()
+        self.global_risk_port = resolved_global_risk_port or WeightedVotingUnavailableGlobalRiskPort()
         self.rollout_flags = rollout_flags
         self.rollout_validation = rollout_validation
         self.position_manager = position_manager or WeightedVotingPositionManagerService(store=self.store, inventory_repository=self.inventory_repository)
@@ -1521,6 +1557,7 @@ class WeightedVotingRuntimeSupervisor:
         return audit
 
     def recover_from_checkpoints(self) -> None:
+        self._recover_weighted_voting_local_paper_state()
         for symbol in self.config.symbols:
             checkpoint = _read_optional(self.store, _checkpoint_key(symbol))
             if checkpoint:
@@ -1530,6 +1567,69 @@ class WeightedVotingRuntimeSupervisor:
         self.recover_pending_execution_outbox()
         self.perform_recovery_safety_check(reason="weighted_voting.runtime.recovery.checkpoints_scanned")
         self.restore_position_management()
+
+    def _recover_weighted_voting_local_paper_state(self) -> dict[str, Any] | None:
+        if self.paper_gateway is None or getattr(self.paper_gateway, "execution_mode", None) != "LOCAL_PAPER":
+            return None
+        broker = getattr(self.paper_gateway, "broker", None)
+        if getattr(broker, "broker_kind", None) != "weighted_voting_local_paper":
+            return None
+        recovered_at = _now()
+        snapshot = self.inventory_repository.recover_current_snapshot()
+        local_orders = [
+            payload
+            for key, payload in _store_items(self.store)
+            if key.startswith(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.orders.") and payload.get("algorithmId") == WEIGHTED_VOTING_ALGORITHM_ID
+        ]
+        local_fills = [
+            payload
+            for key, payload in _store_items(self.store)
+            if key.startswith(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.fills.") and payload.get("algorithmId") == WEIGHTED_VOTING_ALGORITHM_ID
+        ]
+        local_protective = [
+            payload
+            for key, payload in _store_items(self.store)
+            if key.startswith(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.protective_orders.") and payload.get("algorithmId") == WEIGHTED_VOTING_ALGORITHM_ID
+        ]
+        record = {
+            "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
+            "executionMode": "LOCAL_PAPER",
+            "runtimeVersion": WEIGHTED_VOTING_RUNTIME_SUPERVISOR_VERSION,
+            "inventorySnapshotVersion": snapshot.snapshot_version,
+            "lastEventSequence": snapshot.last_event_sequence,
+            "cash": snapshot.cash,
+            "reservedCash": snapshot.reserved_cash,
+            "buyingPower": snapshot.buying_power,
+            "realizedPnl": snapshot.realized_pnl,
+            "unrealizedPnl": snapshot.unrealized_pnl,
+            "dailyRealizedPnl": snapshot.daily_realized_pnl,
+            "dailyUnrealizedPnl": snapshot.daily_unrealized_pnl,
+            "dailyLoss": snapshot.daily_loss,
+            "dailyTradeCount": snapshot.daily_trade_count,
+            "riskUsed": snapshot.risk_used,
+            "riskRemaining": snapshot.risk_remaining,
+            "positionCount": len(snapshot.open_positions),
+            "pendingOrderCount": len(snapshot.pending_orders),
+            "partialFillCount": len(snapshot.partially_filled_orders),
+            "protectiveOrderCount": len(local_protective),
+            "localOrderCount": len(local_orders),
+            "localFillCount": len(local_fills),
+            "orderIds": [str(order.get("clientOrderId") or "") for order in local_orders],
+            "fillIds": [str(fill.get("fillId") or fill.get("clientOrderId") or "") for fill in local_fills],
+            "processedFillIds": list(snapshot.processed_fill_ids),
+            "lastPrice": snapshot.last_price,
+            "pnlRecalculatedFromCurrentPrice": bool(snapshot.open_positions and snapshot.last_price),
+            "protectiveOrderMonitoringResumed": bool(local_protective),
+            "recoveredAt": recovered_at.isoformat(),
+            "reasonCodes": (
+                "weighted_voting.local_paper.restart_recovery.rebuilt_from_weighted_voting_inventory_events",
+                "weighted_voting.local_paper.restart_recovery.loaded_local_orders_and_fills",
+                "weighted_voting.local_paper.restart_recovery.no_alpaca_positions_queried",
+            ),
+        }
+        self.store.write_snapshot(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.recovery.latest", record)
+        self.store.write_snapshot(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.recovery.{_hash_payload(record)}", record)
+        return record
 
     def recover_pending_execution_outbox(self) -> dict[str, Any]:
         recovered = 0
@@ -1609,6 +1709,7 @@ class WeightedVotingRuntimeSupervisor:
         unresolved: list[dict[str, Any]] = []
         quarantined: list[dict[str, Any]] = []
         restored: list[str] = []
+        local_entry_risk_blocks: list[dict[str, Any]] = []
         now = _now()
 
         try:
@@ -1627,9 +1728,9 @@ class WeightedVotingRuntimeSupervisor:
                 unresolved.append({"boundary": "finalized_bar_sequence_gap", "reasonCode": "weighted_voting.runtime.circuit_breaker.finalized_bar_gap_tolerance_exceeded", "gapCount": self.metrics.finalized_bar_event_gaps})
             snapshot = self.inventory_repository.current_snapshot(now=now)
             if float(snapshot.daily_loss_percent or 0.0) >= float(self.weighted_config.maximum_weighted_daily_loss_percent):
-                unresolved.append({"boundary": "daily_loss_limit", "reasonCode": "weighted_voting.runtime.circuit_breaker.daily_loss_limit_reached", "dailyLossPercent": snapshot.daily_loss_percent})
+                local_entry_risk_blocks.append({"boundary": "daily_loss_limit", "reasonCode": "weighted_voting.runtime.control.daily_loss_limit_reached", "dailyLossPercent": snapshot.daily_loss_percent})
             if int(snapshot.daily_trade_count or 0) >= int(self.weighted_config.maximum_weighted_daily_trades):
-                unresolved.append({"boundary": "daily_trade_limit", "reasonCode": "weighted_voting.runtime.circuit_breaker.daily_trade_limit_reached", "dailyTradeCount": snapshot.daily_trade_count})
+                local_entry_risk_blocks.append({"boundary": "daily_trade_limit", "reasonCode": "weighted_voting.runtime.control.daily_trade_limit_reached", "dailyTradeCount": snapshot.daily_trade_count})
             for worker_id, failures in self.metrics.worker_failures.items():
                 if failures >= self.config.worker_restart_failure_threshold:
                     unresolved.append({"boundary": "worker_crash_threshold", "workerId": worker_id, "failures": failures, "reasonCode": "weighted_voting.runtime.circuit_breaker.repeated_worker_crashes"})
@@ -1644,13 +1745,18 @@ class WeightedVotingRuntimeSupervisor:
         if recovery_required:
             self.metrics.automatic_order_creation_paused = True
             self.metrics.pause_reason = "weighted_voting.runtime.recovery.unresolved_blocks_new_entries"
+        elif local_entry_risk_blocks:
+            self.metrics.automatic_order_creation_paused = True
+            self.metrics.pause_reason = str(local_entry_risk_blocks[0]["reasonCode"])
+            self.metrics.risk_reducing_exits_allowed = True
         state = {
             "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
             "runtimeVersion": WEIGHTED_VOTING_RUNTIME_SUPERVISOR_VERSION,
             "recoveryRequired": recovery_required,
-            "newEntriesBlocked": recovery_required or self.metrics.automatic_order_creation_paused,
+            "newEntriesBlocked": recovery_required or self.metrics.automatic_order_creation_paused or bool(local_entry_risk_blocks),
             "protectiveExitsMayContinue": True,
             "unresolvedBoundaries": unresolved,
+            "localEntryRiskBoundaries": local_entry_risk_blocks,
             "quarantinedSnapshots": quarantined,
             "restoredAuthoritativeSnapshots": restored,
             "checkedAt": now.isoformat(),
@@ -1854,6 +1960,10 @@ class WeightedVotingRuntimeSupervisor:
         broker_connectivity = self._paper_broker_connectivity_status()
         account_mode = self._paper_account_mode_status()
         protective_health = self._protective_order_health(inventory)
+        execution_mode = str(getattr(self.paper_gateway, "execution_mode", self.config.paper_execution_mode))
+        broker_kind = str(getattr(getattr(self.paper_gateway, "broker", None), "broker_kind", "unavailable"))
+        alpaca_dependency = execution_mode != "LOCAL_PAPER" or broker_kind != "weighted_voting_local_paper"
+        local_inventory_status = _runtime_inventory_status(inventory=inventory, error=inventory_error)
         current_position = _json_ready(asdict(inventory.open_positions[0])) if inventory and inventory.open_positions else None
         control = self._runtime_control()
         self._evaluate_circuit_breaker_conditions(
@@ -1877,6 +1987,10 @@ class WeightedVotingRuntimeSupervisor:
             "queueLagSeconds": self.metrics.queue_lag_seconds,
             "paperBrokerConnectivity": broker_connectivity,
             "accountModeVerification": account_mode,
+            "executionMode": execution_mode,
+            "brokerKind": broker_kind,
+            "alpacaDependency": alpaca_dependency,
+            "inventory": local_inventory_status,
             "lastDecision": self.metrics.last_decision or {"decisionId": self.metrics.last_decision_id},
             "lastLocalGateResult": self.metrics.last_local_gate_result,
             "lastAcceptedProposal": self.metrics.last_accepted_proposal,
@@ -1944,6 +2058,10 @@ class WeightedVotingRuntimeSupervisor:
         payload = {
             "algorithmId": WEIGHTED_VOTING_ALGORITHM_ID,
             "runtimeVersion": WEIGHTED_VOTING_RUNTIME_SUPERVISOR_VERSION,
+            "executionMode": execution_mode,
+            "brokerKind": broker_kind,
+            "alpacaDependency": alpaca_dependency,
+            "inventory": local_inventory_status,
             "started": self.metrics.supervisor_started,
             "paused": self.metrics.paused,
             "automaticOrderCreationPaused": self.metrics.automatic_order_creation_paused,
@@ -2190,19 +2308,13 @@ class WeightedVotingRuntimeSupervisor:
             )
             return
         if inventory is not None and float(inventory.daily_loss_percent or 0.0) >= float(self.weighted_config.maximum_weighted_daily_loss_percent):
-            self._trip_circuit_breaker(
-                "weighted_voting.runtime.circuit_breaker.daily_loss_limit_reached",
-                trigger="daily_loss_limit",
-                details={"dailyLossPercent": inventory.daily_loss_percent, "limit": self.weighted_config.maximum_weighted_daily_loss_percent},
-            )
-            return
+            self.metrics.automatic_order_creation_paused = True
+            self.metrics.pause_reason = "weighted_voting.runtime.control.daily_loss_limit_reached"
+            self.metrics.risk_reducing_exits_allowed = True
         if inventory is not None and int(inventory.daily_trade_count or 0) >= int(self.weighted_config.maximum_weighted_daily_trades):
-            self._trip_circuit_breaker(
-                "weighted_voting.runtime.circuit_breaker.daily_trade_limit_reached",
-                trigger="daily_trade_limit",
-                details={"dailyTradeCount": inventory.daily_trade_count, "limit": self.weighted_config.maximum_weighted_daily_trades},
-            )
-            return
+            self.metrics.automatic_order_creation_paused = True
+            self.metrics.pause_reason = "weighted_voting.runtime.control.daily_trade_limit_reached"
+            self.metrics.risk_reducing_exits_allowed = True
         if protective_health.get("healthy") is False and _safe_int(protective_health.get("unprotectedPositionCount")) > 0:
             self._trip_circuit_breaker(
                 "weighted_voting.runtime.circuit_breaker.unprotected_position_exists",
@@ -2323,6 +2435,7 @@ class WeightedVotingRuntimeSupervisor:
                 "reason_codes": ("weighted_voting.runtime.market_event_idempotency_claimed",),
             },
         )
+        self._mark_inventory_from_market_snapshot(snapshot, market_event_id=market_event_id)
         weight_state = self.service.active_weight_state()
         condition = classify_market_condition(snapshot, config=self.weighted_config)
         effective = self._active_effective_settings()
@@ -2470,6 +2583,26 @@ class WeightedVotingRuntimeSupervisor:
             },
         )
         return context
+
+    def _mark_inventory_from_market_snapshot(self, snapshot: WeightedMarketSnapshot, *, market_event_id: str) -> None:
+        price = _market_snapshot_mark_price(snapshot)
+        if price is None:
+            return
+        self.inventory_repository.mark_to_market(
+            symbol=snapshot.symbol,
+            price=price,
+            occurred_at=snapshot.data_timestamp,
+            market_event_id=market_event_id,
+            source="weighted_voting.runtime.finalized_bar_mark_to_market",
+        )
+        broker = getattr(self.paper_gateway, "broker", None)
+        processor = getattr(broker, "process_market_data", None)
+        if callable(processor):
+            processor(
+                symbol=snapshot.symbol,
+                market_data=_local_paper_market_data_from_snapshot(snapshot),
+                observed_at=snapshot.data_timestamp,
+            )
 
     def process_execution_queue_item(self, item: WeightedVotingExecutionQueueItem) -> dict[str, Any]:
         self.metrics.execution_queue_depth = self.execution_queue.qsize()
@@ -2831,6 +2964,15 @@ class WeightedVotingRuntimeSupervisor:
         trades: list[dict[str, Any]] = []
         mismatches: list[dict[str, Any]] = []
         for position in snapshot.open_positions:
+            if str(getattr(position, "algorithm_id", "")) != WEIGHTED_VOTING_ALGORITHM_ID:
+                mismatches.append(
+                    {
+                        "algorithmId": getattr(position, "algorithm_id", None),
+                        "positionId": getattr(position, "position_id", None),
+                        "reasonCode": "weighted_voting.runtime.position_manager.foreign_position_ignored",
+                    }
+                )
+                continue
             management = self.position_manager.ensure_position_protection(
                 position=position,
                 effective_settings=effective,
@@ -3826,11 +3968,17 @@ class WeightedVotingRuntimeSupervisor:
         for key, payload in _store_items(self.store):
             if not key.startswith(f"{WEIGHTED_VOTING_EXECUTION_NAMESPACE}.queue."):
                 continue
+            if str(payload.get("algorithmId") or payload.get("algorithm_id") or "") != WEIGHTED_VOTING_ALGORITHM_ID:
+                continue
             status = str(payload.get("status") or "")
             if status not in {"PENDING", "PENDING_SUBMISSION", ""}:
                 continue
             command = payload.get("command") if isinstance(payload.get("command"), dict) else {}
             proposal = payload.get("proposal") if isinstance(payload.get("proposal"), dict) else {}
+            if str(command.get("algorithmId") or command.get("algorithm_id") or "") != WEIGHTED_VOTING_ALGORITHM_ID:
+                continue
+            if str(proposal.get("algorithmId") or proposal.get("algorithm_id") or "") != WEIGHTED_VOTING_ALGORITHM_ID:
+                continue
             if str(proposal.get("intent") or "new_entry") != "new_entry":
                 continue
             client_order_id = str(command.get("clientOrderId") or payload.get("clientOrderId") or key.rsplit(".", 1)[-1])
@@ -4338,6 +4486,28 @@ def weighted_voting_bar_event_idempotency_key(
     )
 
 
+def _ensure_weighted_voting_local_paper_session(
+    *,
+    store: WeightedVotingStateStore,
+    inventory_repository: WeightedVotingInventoryRepository,
+    initial_capital: float,
+) -> None:
+    try:
+        store.read_snapshot(CURRENT_SNAPSHOT_KEY)
+        return
+    except KeyError:
+        pass
+    timestamp = datetime.now(UTC)
+    inventory_repository.initialize_session(
+        session_date=timestamp.date(),
+        allocated_capital=float(initial_capital),
+        cash_available=float(initial_capital),
+        occurred_at=timestamp,
+        expected_snapshot_version=0,
+        event_id="weighted_voting.local_paper.initial_capital.session",
+    )
+
+
 def runtime_supervisor_status() -> dict[str, Any]:
     return {
         "version": WEIGHTED_VOTING_RUNTIME_SUPERVISOR_VERSION,
@@ -4679,6 +4849,8 @@ def _broker_observations_from_gateway(
     tuple[WeightedVotingBrokerFillObservation, ...],
     tuple[WeightedVotingBrokerPositionObservation, ...],
 ]:
+    if getattr(gateway, "execution_mode", None) == "LOCAL_PAPER" and getattr(getattr(gateway, "broker", None), "broker_kind", None) == "weighted_voting_local_paper":
+        return _local_paper_observations_from_store(gateway, store, observed_at=observed_at)
     orders: list[WeightedVotingBrokerOrderObservation] = []
     fills: list[WeightedVotingBrokerFillObservation] = []
     listed_orders = _broker_order_payloads(gateway.broker)
@@ -4748,6 +4920,82 @@ def _broker_observations_from_gateway(
             )
         )
     return tuple(orders), tuple(fills), tuple(positions)
+
+
+def _local_paper_observations_from_store(
+    gateway: PaperOrderGateway,
+    store: WeightedVotingStateStore,
+    *,
+    observed_at: datetime,
+) -> tuple[
+    tuple[WeightedVotingBrokerOrderObservation, ...],
+    tuple[WeightedVotingBrokerFillObservation, ...],
+    tuple[WeightedVotingBrokerPositionObservation, ...],
+]:
+    orders: list[WeightedVotingBrokerOrderObservation] = []
+    fills: list[WeightedVotingBrokerFillObservation] = []
+    for key, payload in _store_items(store):
+        if key.startswith(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.orders.") or key.startswith(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.protective_orders."):
+            order_payload = dict(payload)
+            if key.startswith(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.protective_orders.") and order_payload.get("parentClientOrderId"):
+                order_payload["clientOrderId"] = order_payload["parentClientOrderId"]
+                order_payload["protective"] = True
+            order = _broker_order_observation_from_payload(order_payload, observed_at=observed_at)
+            if order is not None and order.algorithm_id == WEIGHTED_VOTING_ALGORITHM_ID:
+                orders.append(order)
+        elif key.startswith(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.fills."):
+            fill = _local_paper_fill_observation_from_payload(key, payload, observed_at=observed_at)
+            if fill is not None:
+                fills.append(fill)
+
+    positions: list[WeightedVotingBrokerPositionObservation] = []
+    snapshot_getter = getattr(getattr(gateway, "broker", None), "inventory_repository", None)
+    inventory_repository = snapshot_getter if snapshot_getter is not None else None
+    if inventory_repository is not None:
+        try:
+            snapshot = inventory_repository.current_snapshot(now=observed_at)
+        except Exception:
+            snapshot = None
+        if snapshot is not None:
+            for position in snapshot.open_positions:
+                positions.append(
+                    WeightedVotingBrokerPositionObservation(
+                        client_order_id=position.client_order_id,
+                        algorithm_id=position.algorithm_id,
+                        symbol=position.symbol,
+                        quantity=position.quantity,
+                        average_entry_price=position.average_entry_price,
+                        observed_at=observed_at,
+                        broker_position_id=position.position_id,
+                        unrealised_pnl=position.unrealised_pnl,
+                        realised_pnl=position.realised_pnl,
+                    )
+                )
+    return tuple(orders), tuple(fills), tuple(positions)
+
+
+def _local_paper_fill_observation_from_payload(key: str, payload: dict[str, Any], *, observed_at: datetime) -> WeightedVotingBrokerFillObservation | None:
+    if payload.get("algorithmId") != WEIGHTED_VOTING_ALGORITHM_ID:
+        return None
+    client_order_id = str(payload.get("clientOrderId") or payload.get("client_order_id") or "")
+    if not client_order_id:
+        return None
+    filled_at = _parse_optional_datetime(payload.get("filledAt") or payload.get("filled_at")) or observed_at
+    quantity = _safe_int(_first_present(payload.get("filledQuantity"), payload.get("filled_quantity"), payload.get("quantity")))
+    average_fill_price = _optional_float(_first_present(payload.get("averageFillPrice"), payload.get("average_fill_price")))
+    if quantity <= 0 or average_fill_price is None:
+        return None
+    return WeightedVotingBrokerFillObservation(
+        fill_id=str(payload.get("fillId") or f"{key.rsplit('.', 1)[-1]}.{quantity}.{filled_at.isoformat()}"),
+        client_order_id=client_order_id,
+        algorithm_id=WEIGHTED_VOTING_ALGORITHM_ID,
+        symbol=str(payload.get("symbol") or "SPY"),
+        side=str(payload.get("side") or "BUY"),
+        quantity=quantity,
+        average_fill_price=float(average_fill_price),
+        filled_at=filled_at,
+        broker_order_id=payload.get("brokerOrderId"),
+    )
 
 
 def _broker_order_payloads(broker: Any) -> tuple[dict[str, Any], ...]:
@@ -5031,20 +5279,65 @@ def _safe_float(value: Any) -> float:
 
 
 def _runtime_current_account_exposure(context: WeightedVotingRuntimeContext) -> float:
-    if context.read_only_account_equity is None or context.read_only_broker_buying_power is None:
-        return 0.0
-    return max(0.0, float(context.read_only_account_equity) - float(context.read_only_broker_buying_power))
+    return context.inventory_snapshot.gross_exposure
+
+
+def _market_snapshot_mark_price(snapshot: WeightedMarketSnapshot) -> float | None:
+    if snapshot.one_minute_candles:
+        price = float(snapshot.one_minute_candles[-1].close)
+        return price if price > 0 else None
+    return None
+
+
+def _local_paper_market_data_from_snapshot(snapshot: WeightedMarketSnapshot) -> dict[str, Any]:
+    if snapshot.bid is not None and snapshot.ask is not None:
+        return {
+            "source": "quote",
+            "bid": snapshot.bid,
+            "ask": snapshot.ask,
+            "timestamp": snapshot.data_timestamp.isoformat(),
+            "reasonCode": "weighted_voting.runtime.finalized_bar_quote_for_local_paper_protective_exits",
+        }
+    candle = snapshot.one_minute_candles[-1] if snapshot.one_minute_candles else None
+    close = float(candle.close) if candle is not None else _market_snapshot_mark_price(snapshot)
+    return {
+        "source": "bar",
+        "open": float(candle.open) if candle is not None else close,
+        "high": float(candle.high) if candle is not None else close,
+        "low": float(candle.low) if candle is not None else close,
+        "close": close,
+        "timestamp": snapshot.data_timestamp.isoformat(),
+        "barEndTimestamp": snapshot.data_timestamp.isoformat(),
+        "timeframe": "1Min",
+        "reasonCode": "weighted_voting.runtime.finalized_bar_close_for_local_paper_protective_exits",
+    }
 
 
 def _runtime_account_level_risk_observations(context: WeightedVotingRuntimeContext) -> dict[str, Any]:
+    inventory = context.inventory_snapshot
     return {
-        "accountEquity": context.read_only_account_equity,
-        "brokerBuyingPower": context.read_only_broker_buying_power,
+        "localEquity": inventory.equity,
+        "localCash": inventory.cash_available,
+        "localBuyingPower": inventory.buying_power,
+        "localReservedCash": inventory.reserved_cash,
+        "localReservedBuyingPower": inventory.reserved_buying_power,
+        "localPositions": [_json_ready(position) for position in inventory.open_positions],
+        "localPendingOrders": [_json_ready(order) for order in inventory.pending_orders],
+        "localGrossExposure": inventory.gross_exposure,
+        "localNetExposure": inventory.net_exposure,
+        "localDailyPnl": inventory.daily_realised_pnl + inventory.daily_unrealised_pnl,
+        "localDailyRealizedPnl": inventory.daily_realised_pnl,
+        "localDailyUnrealizedPnl": inventory.daily_unrealised_pnl,
+        "localDailyLoss": inventory.daily_loss,
+        "localDailyTradeCount": inventory.daily_trade_count,
+        "localRemainingRisk": inventory.remaining_daily_risk,
+        "localRiskUsed": inventory.daily_risk_used,
+        "inventorySnapshotVersion": inventory.snapshot_version,
         "globalRiskServiceAvailable": context.global_risk_state.service_available,
         "globalAvailableRisk": context.global_risk_state.global_available_risk,
         "globalMaxShares": context.global_risk_state.global_max_shares,
         "accountExposure": _runtime_current_account_exposure(context),
-        "source": "weighted_voting.runtime_context",
+        "source": "weighted_voting.local_inventory",
     }
 
 
@@ -5113,6 +5406,12 @@ def _runtime_global_risk_response_from_payload(
         if isinstance(value, WeightedVotingGlobalRiskResponse):
             return value
         payload = value.model_dump(mode="json") if hasattr(value, "model_dump") else dict(value)
+        if _runtime_global_risk_payload_contains_mutable_inventory(payload):
+            return fail_closed_global_risk_response(
+                request,
+                reason_codes=("weighted_voting.global_risk.mutable_inventory_payload_rejected",),
+                evaluated_at=evaluated_at,
+            )
         payload = _normalize_runtime_global_risk_payload(payload, request=request, evaluated_at=evaluated_at)
         return WeightedVotingGlobalRiskResponse.model_validate(payload).with_hash()
     except Exception:
@@ -5121,6 +5420,40 @@ def _runtime_global_risk_response_from_payload(
             reason_codes=("weighted_voting.global_risk.malformed_response_reject",),
             evaluated_at=evaluated_at,
         )
+
+
+_RUNTIME_GLOBAL_RISK_MUTABLE_INVENTORY_KEYS = frozenset(
+    {
+        "account",
+        "accountSnapshot",
+        "algorithmCash",
+        "availableCash",
+        "buyingPower",
+        "cash",
+        "equity",
+        "fills",
+        "inventory",
+        "inventorySnapshot",
+        "localPaperAccount",
+        "localPaperInventory",
+        "mergedInventory",
+        "pendingOrders",
+        "portfolio",
+        "portfolioSnapshot",
+        "positions",
+        "reservedCash",
+        "sharedPaperPortfolio",
+        "strategyState",
+        "unrealizedPnl",
+        "unrealizedPnL",
+    }
+)
+
+
+def _runtime_global_risk_payload_contains_mutable_inventory(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        return any(key in _RUNTIME_GLOBAL_RISK_MUTABLE_INVENTORY_KEYS for key in payload)
+    return False
 
 
 def _normalize_runtime_global_risk_payload(payload: dict[str, Any], *, request: Any, evaluated_at: datetime) -> dict[str, Any]:
@@ -5330,6 +5663,37 @@ def _last_decision_observation(result: dict[str, Any]) -> dict[str, Any]:
             "dataTimestamp": decision.get("data_timestamp") or decision.get("dataTimestamp"),
         }
     )
+
+
+def _runtime_inventory_status(*, inventory: Any | None, error: str | None = None) -> dict[str, Any]:
+    if inventory is None:
+        return {
+            "available": False,
+            "authoritative": False,
+            "error": error,
+            "reasonCodes": ("weighted_voting.runtime.inventory_unavailable",),
+        }
+    return {
+        "available": True,
+        "authoritative": True,
+        "algorithmId": inventory.algorithm_id,
+        "cash": inventory.cash,
+        "reservedCash": inventory.reserved_cash,
+        "availableBuyingPower": inventory.available_cash,
+        "buyingPower": inventory.buying_power,
+        "equity": inventory.equity,
+        "realizedPnl": inventory.realized_pnl,
+        "unrealizedPnl": inventory.unrealized_pnl,
+        "grossExposure": inventory.gross_exposure,
+        "netExposure": inventory.net_exposure,
+        "openPositions": [_sanitize_for_observability(asdict(position)) for position in inventory.open_positions],
+        "openPositionCount": len(inventory.open_positions),
+        "pendingOrders": [_sanitize_for_observability(asdict(order)) for order in inventory.pending_orders],
+        "pendingOrderCount": len(inventory.pending_orders),
+        "snapshotVersion": inventory.snapshot_version,
+        "lastUpdatedAt": inventory.last_updated_at.isoformat(),
+        "reasonCodes": ("weighted_voting.runtime.inventory_authoritative",),
+    }
 
 
 def _sanitize_for_observability(value: Any) -> Any:

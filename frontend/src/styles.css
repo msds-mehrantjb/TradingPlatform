@@ -1003,11 +1003,20 @@ select {
 
 .algo-trade-decision-toggle[aria-expanded="true"] {
   border-color: #0ea5e9;
+  border-radius: 6px 6px 0 0;
   background: #cffafe;
 }
 
 .algo-trade-decision-toggle strong {
   color: #075985;
+}
+
+.algo-trade-decision-toggle[aria-expanded="true"] + #algoTradePlan {
+  border: 1px solid #0ea5e9;
+  border-top: 0;
+  border-radius: 0 0 6px 6px;
+  padding: 8px;
+  background: #f8fcff;
 }
 
 .algo-expand-toggle span,
@@ -1260,7 +1269,7 @@ select {
   margin-top: 6px;
   display: grid;
   grid-template-columns: 1fr;
-  gap: 6px;
+  gap: 0;
 }
 
 .algo-timeframe-button {
@@ -1283,6 +1292,12 @@ select {
   gap: 6px;
   padding: 0 9px;
   text-align: left;
+}
+
+.algo-timeframe-menu-toggle[aria-expanded="true"] {
+  border-color: #93c5fd;
+  border-radius: 5px 5px 0 0;
+  background: #eff6ff;
 }
 
 .algo-timeframe-menu-toggle span {
@@ -1310,6 +1325,10 @@ select {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
+  border: 1px solid #93c5fd;
+  border-top: 0;
+  border-radius: 0 0 5px 5px;
+  padding: 6px;
 }
 
 .algo-timeframe-subtoggle[hidden] {

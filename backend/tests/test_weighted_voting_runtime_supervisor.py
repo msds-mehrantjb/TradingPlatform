@@ -11,6 +11,7 @@ from backend.app.algorithms.weighted_voting.dynamic_settings import DynamicSetti
 from backend.app.algorithms.weighted_voting.market_condition import classify_market_condition
 from backend.app.algorithms.weighted_voting.market_snapshot import build_weighted_voting_market_snapshot
 from backend.app.algorithms.weighted_voting.inventory import WeightedVotingInventoryEventType, WeightedVotingInventoryRepository
+from backend.app.algorithms.weighted_voting.local_paper_broker import WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE, WeightedVotingLocalPaperBroker
 from backend.app.algorithms.weighted_voting.rollout import WeightedVotingRolloutFlags, WeightedVotingRolloutValidation
 from backend.app.algorithms.weighted_voting.runtime_supervisor import (
     WeightedVotingBarEventWorker,
@@ -51,7 +52,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
         self.assertIn("await get_weighted_voting_runtime_supervisor().start()", main_source)
         self.assertIn("await get_weighted_voting_runtime_supervisor().shutdown()", main_source)
 
-    def test_default_supervisor_constructs_backend_paper_dependencies_fail_closed(self) -> None:
+    def test_default_supervisor_constructs_local_paper_dependencies_fail_closed_without_alpaca_credentials(self) -> None:
         with patch.dict(
             "os.environ",
             {
@@ -68,14 +69,28 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             )
 
         self.assertIsNotNone(supervisor.paper_gateway)
-        self.assertEqual(supervisor.paper_gateway.broker.broker_kind, "alpaca_paper")
+        self.assertEqual(supervisor.paper_gateway.broker.broker_kind, "weighted_voting_local_paper")
+        self.assertEqual(supervisor.paper_gateway.execution_mode, "LOCAL_PAPER")
+        self.assertEqual(
+            supervisor.paper_gateway.account_snapshot_provider(evaluated_at=SESSION_OPEN).accountId,
+            supervisor.paper_gateway.broker.gateway_account_snapshot(evaluated_at=SESSION_OPEN).accountId,
+        )
+        self.assertEqual(
+            supervisor.paper_gateway.portfolio_snapshot_provider(evaluated_at=SESSION_OPEN).algorithmTradesToday,
+            supervisor.paper_gateway.broker.gateway_portfolio_snapshot(evaluated_at=SESSION_OPEN).algorithmTradesToday,
+        )
         self.assertFalse(supervisor.paper_gateway.broker.live_trading_enabled)
-        self.assertFalse(supervisor.paper_gateway.broker.verify_paper_account())
+        self.assertTrue(supervisor.paper_gateway.broker.verify_paper_account())
         account = supervisor.account_port.account_observation(as_of=SESSION_OPEN)
-        self.assertFalse(account.available)
-        self.assertFalse(supervisor.runtime_control()["readiness"]["entry_submission_allowed"])
+        self.assertTrue(account.available)
+        self.assertEqual(account.account_equity, 100000.0)
+        self.assertEqual(account.broker_buying_power, 100000.0)
+        self.assertIn("weighted_voting.local_paper.account_from_dedicated_inventory", account.reason_codes)
+        snapshot = supervisor.inventory_repository.current_snapshot(now=SESSION_OPEN)
+        self.assertEqual(snapshot.initial_capital, 100000.0)
+        self.assertIn("weighted_voting.inventory.snapshot.current", supervisor.store.snapshots)
 
-    def test_default_supervisor_rejects_live_broker_endpoint_before_activation(self) -> None:
+    def test_runtime_health_exposes_local_paper_inventory_without_alpaca_dependency(self) -> None:
         with patch.dict(
             "os.environ",
             {
@@ -91,11 +106,116 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
                 event_bus=WeightedVotingEventBus(maxsize=8),
             )
 
-        self.assertEqual(supervisor.paper_gateway.broker.broker_kind, "unavailable")
-        self.assertFalse(supervisor.paper_gateway.broker.verify_paper_account())
+        health = supervisor.health()
+        inventory = health["inventory"]
+
+        self.assertEqual(health["executionMode"], "LOCAL_PAPER")
+        self.assertEqual(health["brokerKind"], "weighted_voting_local_paper")
+        self.assertFalse(health["alpacaDependency"])
+        self.assertEqual(health["operationalStatus"]["inventory"], inventory)
+        self.assertTrue(inventory["available"])
+        self.assertTrue(inventory["authoritative"])
+        self.assertEqual(inventory["cash"], 100000.0)
+        self.assertEqual(inventory["reservedCash"], 0.0)
+        self.assertEqual(inventory["availableBuyingPower"], 100000.0)
+        self.assertEqual(inventory["equity"], 100000.0)
+        self.assertEqual(inventory["realizedPnl"], 0.0)
+        self.assertEqual(inventory["unrealizedPnl"], 0.0)
+        self.assertEqual(inventory["grossExposure"], 0.0)
+        self.assertEqual(inventory["openPositions"], [])
+        self.assertEqual(inventory["pendingOrders"], [])
+        serialized = json.dumps(health)
+        self.assertNotIn("paper-key", serialized)
+        self.assertNotIn("paper-secret", serialized)
+
+    def test_default_supervisor_ignores_live_alpaca_endpoint_for_local_paper(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "ALPACA_TRADING_BASE_URL": "https://api.alpaca.markets/v2",
+                "APCA_API_KEY_ID": "paper-key",
+                "APCA_API_SECRET_KEY": "paper-secret",
+            },
+            clear=False,
+        ):
+            supervisor = WeightedVotingRuntimeSupervisor(
+                store=MemoryStore(),
+                config=WeightedVotingRuntimeConfig(heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
+                event_bus=WeightedVotingEventBus(maxsize=8),
+            )
+
+        self.assertEqual(supervisor.paper_gateway.broker.broker_kind, "weighted_voting_local_paper")
+        self.assertEqual(supervisor.paper_gateway.execution_mode, "LOCAL_PAPER")
+        self.assertEqual(
+            supervisor.paper_gateway.account_snapshot_provider(evaluated_at=SESSION_OPEN).accountId,
+            supervisor.paper_gateway.broker.gateway_account_snapshot(evaluated_at=SESSION_OPEN).accountId,
+        )
+        self.assertEqual(
+            supervisor.paper_gateway.portfolio_snapshot_provider(evaluated_at=SESSION_OPEN).algorithmTradesToday,
+            supervisor.paper_gateway.broker.gateway_portfolio_snapshot(evaluated_at=SESSION_OPEN).algorithmTradesToday,
+        )
+        self.assertTrue(supervisor.paper_gateway.broker.verify_paper_endpoint())
+        self.assertFalse(supervisor.paper_gateway.broker.live_trading_enabled)
         readiness = supervisor.runtime_control()["readiness"]
-        self.assertFalse(readiness["entry_submission_allowed"])
-        self.assertIn("weighted_voting.runtime.control.paper_endpoint_unverified", readiness["blocking_reason_codes"])
+        self.assertNotIn("weighted_voting.runtime.control.paper_endpoint_unverified", readiness["blocking_reason_codes"])
+
+    def test_default_supervisor_does_not_construct_alpaca_paper_dependencies(self) -> None:
+        with patch(
+            "backend.app.algorithms.weighted_voting.alpaca_paper_broker.build_weighted_voting_paper_gateway_dependencies",
+            side_effect=AssertionError("Alpaca paper dependencies must not be built for LOCAL_PAPER"),
+        ):
+            supervisor = WeightedVotingRuntimeSupervisor(
+                store=MemoryStore(),
+                config=WeightedVotingRuntimeConfig(heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
+                event_bus=WeightedVotingEventBus(maxsize=8),
+            )
+
+        self.assertEqual(supervisor.config.paper_execution_mode, "LOCAL_PAPER")
+        self.assertIsInstance(supervisor.paper_gateway.broker, WeightedVotingLocalPaperBroker)
+        self.assertEqual(supervisor.paper_gateway.execution_mode, "LOCAL_PAPER")
+
+    def test_explicit_broker_paper_mode_constructs_alpaca_adapter_branch(self) -> None:
+        broker = ExplicitBrokerPaperBroker()
+        broker_account_port = WeightedVotingStaticAccountPort(
+            account_equity=125000.0,
+            broker_buying_power=100000.0,
+            source_id="weighted_voting.test.explicit_broker_paper",
+        )
+        with patch(
+            "backend.app.algorithms.weighted_voting.alpaca_paper_broker.build_weighted_voting_paper_gateway_dependencies",
+            return_value=(broker, broker_account_port),
+        ) as build_dependencies:
+            supervisor = WeightedVotingRuntimeSupervisor(
+                store=MemoryStore(),
+                config=WeightedVotingRuntimeConfig(
+                    paper_execution_mode="BROKER_PAPER",
+                    heartbeat_interval_seconds=999.0,
+                    maintenance_interval_seconds=999.0,
+                ),
+                event_bus=WeightedVotingEventBus(maxsize=8),
+            )
+
+        build_dependencies.assert_called_once_with()
+        self.assertIs(supervisor.paper_gateway.broker, broker)
+        self.assertEqual(supervisor.paper_gateway.execution_mode, "BROKER_PAPER")
+        self.assertIs(supervisor.account_port, broker_account_port)
+
+    def test_weighted_voting_config_selects_broker_paper_when_runtime_config_omitted(self) -> None:
+        broker = ExplicitBrokerPaperBroker()
+        with patch(
+            "backend.app.algorithms.weighted_voting.alpaca_paper_broker.build_weighted_voting_paper_gateway_dependencies",
+            return_value=(broker, broker),
+        ) as build_dependencies:
+            supervisor = WeightedVotingRuntimeSupervisor(
+                store=MemoryStore(),
+                weighted_config=WeightedVotingConfig(paper_execution_mode="BROKER_PAPER"),
+                event_bus=WeightedVotingEventBus(maxsize=8),
+            )
+
+        build_dependencies.assert_called_once_with()
+        self.assertEqual(supervisor.config.paper_execution_mode, "BROKER_PAPER")
+        self.assertIs(supervisor.paper_gateway.broker, broker)
+        self.assertEqual(supervisor.paper_gateway.execution_mode, "BROKER_PAPER")
 
     def test_finalised_bar_event_automatically_persists_one_decision(self) -> None:
         store = MemoryStore()
@@ -107,6 +227,92 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(len([key for key in store.snapshots if key.startswith("weighted_voting.decisions.")]), 1)
         self.assertTrue(any(key.startswith("weighted_voting.runtime.checkpoints.SPY") for key in store.snapshots))
         self.assertEqual(supervisor.health()["persistedDecisions"], 1)
+
+    def test_finalised_bar_event_marks_weighted_voting_inventory_to_local_close(self) -> None:
+        store = MemoryStore()
+        inventory = seeded_inventory(store)
+        initial = inventory.current_snapshot(now=SESSION_OPEN)
+        inventory.append_event(
+            event_id="runtime-mark-to-market-position",
+            event_type=WeightedVotingInventoryEventType.FILL_RECORDED,
+            payload=position_payload(position_id="runtime-mark-position", quantity=10, average_entry_price=100.0),
+            occurred_at=SESSION_OPEN + timedelta(seconds=1),
+            expected_snapshot_version=initial.snapshot_version,
+        )
+        supervisor = supervisor_for(store, inventory_repository=inventory)
+        payload = evaluate_payload()
+        expected_close = payload["candles"][-1]["close"]
+
+        record = asyncio.run(supervisor.process_finalised_bar_event(event_from_payload(payload)))
+        marked = inventory.current_snapshot(now=SESSION_OPEN)
+        context_records = [snapshot for key, snapshot in store.snapshots.items() if key.startswith("weighted_voting.runtime.contexts.")]
+
+        self.assertEqual(record["status"], "decision_persisted")
+        self.assertEqual(marked.last_price, expected_close)
+        self.assertEqual(marked.open_positions[0].mark_price, expected_close)
+        self.assertAlmostEqual(marked.unrealised_pnl, (expected_close - 100.0) * 10)
+        self.assertAlmostEqual(marked.market_value, expected_close * 10)
+        self.assertAlmostEqual(marked.equity, 25_000.0 + marked.unrealised_pnl)
+        self.assertTrue(any("mark-to-market-SPY" in key for key in store.snapshots))
+        self.assertEqual(context_records[-1]["inventory_snapshot_version"], marked.snapshot_version)
+
+    def test_finalised_bar_triggers_weighted_voting_local_protective_stop(self) -> None:
+        store = MemoryStore()
+        inventory = seeded_inventory(store)
+        initial = inventory.current_snapshot(now=SESSION_OPEN)
+        inventory.append_event(
+            event_id="runtime-local-stop-entry-fill",
+            event_type=WeightedVotingInventoryEventType.FILL_RECORDED,
+            payload=position_payload(position_id="runtime-local-stop-position", quantity=3, average_entry_price=100.0),
+            occurred_at=SESSION_OPEN + timedelta(seconds=1),
+            expected_snapshot_version=initial.snapshot_version,
+        )
+        store.write_snapshot(
+            f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.protective_orders.runtime-local-stop",
+            {
+                "algorithmId": "weighted_voting",
+                "executionMode": "LOCAL_PAPER",
+                "clientOrderId": "runtime-local-stop",
+                "parentClientOrderId": "runtime-local-stop-client",
+                "parentPositionId": "runtime-local-stop-position",
+                "decisionId": "runtime-local-stop-decision",
+                "orderIntentId": "runtime-local-stop-intent",
+                "symbol": "SPY",
+                "side": "SELL",
+                "quantity": 3,
+                "filledQuantity": 0,
+                "remainingQuantity": 3,
+                "protectiveKind": "stop_loss",
+                "orderType": "STOP",
+                "stopPrice": 99.0,
+                "status": "OPEN",
+                "createdAt": SESSION_OPEN.isoformat(),
+                "updatedAt": SESSION_OPEN.isoformat(),
+                "reasonCodes": ("weighted_voting.test.local_protective_stop_active",),
+            },
+        )
+        foreign_key = f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.protective_orders.foreign-runtime-stop"
+        store.write_snapshot(foreign_key, {"algorithmId": "voting_ensemble", "clientOrderId": "foreign-runtime-stop", "symbol": "SPY", "status": "OPEN"})
+        broker = WeightedVotingLocalPaperBroker(store, inventory)
+        supervisor = WeightedVotingRuntimeSupervisor(
+            service=WeightedVotingService(store=store),
+            store=store,
+            inventory_repository=inventory,
+            paper_gateway=weighted_voting_local_gateway(broker, store),
+            config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
+            event_bus=WeightedVotingEventBus(maxsize=8),
+        )
+        payload = evaluate_payload(offset_minutes=3)
+        payload["bid"] = 98.9
+        payload["ask"] = 99.0
+
+        asyncio.run(supervisor.process_finalised_bar_event(event_from_payload(payload)))
+        snapshot = inventory.current_snapshot(now=SESSION_OPEN)
+        stop_order = store.read_snapshot(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.protective_orders.runtime-local-stop")
+
+        self.assertEqual(snapshot.open_positions, ())
+        self.assertEqual(stop_order["status"], "FILLED")
+        self.assertEqual(store.read_snapshot(foreign_key)["status"], "OPEN")
 
     def test_runtime_builds_full_context_from_completed_bar_event(self) -> None:
         store = MemoryStore()
@@ -245,6 +451,100 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
 
         self.assertEqual(recovered.health()["lastEventTimestampBySymbol"]["SPY"], event.finalised_candle_timestamp.isoformat())
         self.assertTrue(recovered.health()["lastCheckpointBySymbol"]["SPY"])
+
+    def test_local_paper_restart_rebuilds_inventory_orders_fills_and_resumes_protective_monitoring_without_alpaca_positions(self) -> None:
+        store = MemoryStore()
+        inventory = seeded_inventory(store)
+        broker = WeightedVotingLocalPaperBroker(store, inventory)
+        supervisor = WeightedVotingRuntimeSupervisor(
+            service=WeightedVotingService(store=store),
+            store=store,
+            inventory_repository=inventory,
+            paper_gateway=weighted_voting_local_gateway(broker, store),
+            config=WeightedVotingRuntimeConfig(queue_maxsize=8, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
+            event_bus=WeightedVotingEventBus(maxsize=8),
+            rollout_flags=validated_rollout_flags(),
+            rollout_validation=validated_rollout_validation(),
+        )
+        enable_automatic_entries(supervisor)
+        proposal = global_proposal_for_snapshot(evaluate_payload(offset_minutes=6)).model_copy(
+            update={
+                "orderIntentId": "runtime-local-restart-intent",
+                "settingsSnapshot": {
+                    "settings_version": "runtime-local-restart",
+                    "localPaperQuote": {"bid": 100.0, "ask": 100.0, "timestamp": SESSION_OPEN.isoformat()},
+                    "localPaperAvailableQuantity": 2,
+                },
+            }
+        )
+        application = apply_global_gate_response(
+            proposal,
+            GlobalGateResponse(
+                action="ALLOW",
+                maximumAllowedQuantity=3,
+                maximumAdditionalRiskDollars=50.0,
+                evaluatedAt=SESSION_OPEN,
+                configurationHash="runtime-local-restart-global",
+            ),
+        )
+        item = supervisor._enqueue_execution_from_result(
+            {
+                "decision": {"decision_id": proposal.decisionId},
+                "gateResult": {"permission_granted": True, "mode": "automatic", "reason_codes": ("weighted_voting.test.local_restart",)},
+                "globalOrderProposal": proposal.model_dump(mode="json"),
+                "globalGateApplication": application.model_dump(mode="json"),
+            },
+            idempotency_key="weighted_voting.test.local_restart",
+            evaluated_at=SESSION_OPEN,
+            inventory_snapshot_version=inventory.current_snapshot(now=SESSION_OPEN).snapshot_version,
+        )
+        self.assertIsNotNone(item)
+        supervisor.process_execution_queue_item(item)
+        before_restart = inventory.current_snapshot(now=SESSION_OPEN)
+        self.assertEqual(len(before_restart.open_positions), 1)
+        self.assertEqual(before_restart.open_positions[0].quantity, 2)
+        self.assertEqual(before_restart.partially_filled_orders[0].remaining_quantity, 1)
+        self.assertTrue(any(key.startswith(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.fills.") for key in store.snapshots))
+        self.assertTrue(any(key.startswith(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.protective_orders.") for key in store.snapshots))
+        del store.snapshots["weighted_voting.inventory.snapshot.current"]
+
+        recovered_inventory = WeightedVotingInventoryRepository(store, symbol="SPY", allocated_capital=25_000.0)
+        no_position_query_broker = NoPositionQueryLocalPaperBroker(store, recovered_inventory)
+        recovered = WeightedVotingRuntimeSupervisor(
+            service=WeightedVotingService(store=store),
+            store=store,
+            inventory_repository=recovered_inventory,
+            paper_gateway=weighted_voting_local_gateway(no_position_query_broker, store),
+            config=WeightedVotingRuntimeConfig(queue_maxsize=8, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
+            event_bus=WeightedVotingEventBus(maxsize=8),
+        )
+        recovered.recover_from_checkpoints()
+        recovery = store.read_snapshot(f"{WEIGHTED_VOTING_LOCAL_PAPER_NAMESPACE}.recovery.latest")
+        recovered.reconcile_broker_inventory(startup=True, trigger="restart_test")
+        rebuilt = recovered_inventory.current_snapshot(now=SESSION_OPEN)
+
+        self.assertEqual(recovery["inventorySnapshotVersion"], before_restart.snapshot_version)
+        self.assertGreaterEqual(rebuilt.snapshot_version, before_restart.snapshot_version)
+        self.assertEqual(rebuilt.cash, before_restart.cash)
+        self.assertEqual(rebuilt.reserved_cash, before_restart.reserved_cash)
+        self.assertEqual(rebuilt.open_positions[0].average_entry_price, before_restart.open_positions[0].average_entry_price)
+        self.assertEqual(rebuilt.partially_filled_orders[0].filled_quantity, 2)
+        self.assertEqual(recovery["pendingOrderCount"], 1)
+        self.assertEqual(recovery["partialFillCount"], 1)
+        self.assertEqual(recovery["localFillCount"], 1)
+        self.assertTrue(recovery["fillIds"][0])
+        self.assertTrue(recovery["protectiveOrderMonitoringResumed"])
+        self.assertEqual(no_position_query_broker.refresh_positions_calls, 0)
+        self.assertIn("weighted_voting.local_paper.restart_recovery.no_alpaca_positions_queried", recovery["reasonCodes"])
+
+        stop_payload = evaluate_payload(offset_minutes=7)
+        stop_payload["bid"] = float(proposal.stopPrice) - 0.05
+        stop_payload["ask"] = float(proposal.stopPrice)
+        asyncio.run(recovered.process_finalised_bar_event(event_from_payload(stop_payload)))
+
+        flattened = recovered_inventory.current_snapshot(now=SESSION_OPEN)
+        self.assertEqual(flattened.open_positions, ())
+        self.assertEqual(no_position_query_broker.refresh_positions_calls, 0)
 
     def test_out_of_order_events_are_rejected_without_replay_recovery(self) -> None:
         store = MemoryStore()
@@ -478,7 +778,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
     def test_accepted_finalised_bar_decision_can_reach_paper_gateway_through_execution_queue(self) -> None:
         store = MemoryStore()
         broker = FakePaperBroker()
-        gateway = PaperOrderGateway(broker, store)
+        gateway = weighted_voting_local_gateway(broker, store)
         inventory = seeded_inventory(store)
         supervisor = WeightedVotingRuntimeSupervisor(
             service=AcceptedExecutionService(store=store),
@@ -511,7 +811,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
     def test_risk_worker_persists_global_boundary_before_execution_outbox(self) -> None:
         store = MemoryStore()
         broker = FakePaperBroker()
-        gateway = PaperOrderGateway(broker, store)
+        gateway = weighted_voting_local_gateway(broker, store)
         inventory = seeded_inventory(store)
         service = DecisionOnlyExecutionService(store=store, central_risk_service=ApproveExternalRiskService())
         supervisor = WeightedVotingRuntimeSupervisor(
@@ -553,7 +853,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
     def test_execution_outbox_recovers_pending_intent_after_restart(self) -> None:
         store = MemoryStore()
         broker = NoFillPaperBroker()
-        gateway = PaperOrderGateway(broker, store)
+        gateway = weighted_voting_local_gateway(broker, store)
         inventory = seeded_inventory(store)
         supervisor = WeightedVotingRuntimeSupervisor(
             service=AcceptedExecutionService(store=store),
@@ -590,7 +890,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
     def test_retry_recovery_queries_broker_before_resubmitting_order(self) -> None:
         store = MemoryStore()
         broker = NoFillPaperBroker()
-        gateway = PaperOrderGateway(broker, store)
+        gateway = weighted_voting_local_gateway(broker, store)
         inventory = seeded_inventory(store)
         supervisor = WeightedVotingRuntimeSupervisor(
             service=AcceptedExecutionService(store=store),
@@ -615,7 +915,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             store=store,
             config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
             event_bus=WeightedVotingEventBus(maxsize=8),
-            paper_gateway=PaperOrderGateway(lookup_broker, store),
+            paper_gateway=weighted_voting_local_gateway(lookup_broker, store),
             inventory_repository=inventory,
             rollout_flags=validated_rollout_flags(),
             rollout_validation=validated_rollout_validation(),
@@ -639,7 +939,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             store=store,
             config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
             event_bus=WeightedVotingEventBus(maxsize=8),
-            paper_gateway=PaperOrderGateway(broker, store),
+            paper_gateway=weighted_voting_local_gateway(broker, store),
             inventory_repository=inventory,
             rollout_flags=validated_rollout_flags(),
             rollout_validation=validated_rollout_validation(),
@@ -666,7 +966,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             store=store,
             config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
             event_bus=WeightedVotingEventBus(maxsize=8),
-            paper_gateway=PaperOrderGateway(broker, store),
+            paper_gateway=weighted_voting_local_gateway(broker, store),
             inventory_repository=seeded_inventory(store),
             rollout_flags=validated_rollout_flags(),
             rollout_validation=validated_rollout_validation(),
@@ -690,6 +990,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
         cases = (
             (None, "weighted_voting.global_risk.missing_response"),
             (IncreasingExternalRiskService(), "weighted_voting.global_risk.quantity_increase_rejected"),
+            (MutableInventoryExternalRiskService(), "weighted_voting.global_risk.mutable_inventory_payload_rejected"),
         )
         for central_service, expected_reason in cases:
             with self.subTest(reason=expected_reason):
@@ -701,7 +1002,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
                     store=store,
                     config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
                     event_bus=WeightedVotingEventBus(maxsize=8),
-                    paper_gateway=PaperOrderGateway(broker, store),
+                    paper_gateway=weighted_voting_local_gateway(broker, store),
                     inventory_repository=seeded_inventory(store),
                     rollout_flags=validated_rollout_flags(),
                     rollout_validation=validated_rollout_validation(),
@@ -718,7 +1019,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
     def test_repeated_market_event_after_settings_change_is_noop_and_does_not_resubmit(self) -> None:
         store = MemoryStore()
         broker = FakePaperBroker()
-        gateway = PaperOrderGateway(broker, store)
+        gateway = weighted_voting_local_gateway(broker, store)
         inventory = seeded_inventory(store)
         supervisor = WeightedVotingRuntimeSupervisor(
             service=AcceptedExecutionService(store=store),
@@ -872,7 +1173,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             store=store,
             config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
             event_bus=WeightedVotingEventBus(maxsize=8),
-            paper_gateway=PaperOrderGateway(broker, store),
+            paper_gateway=weighted_voting_local_gateway(broker, store),
             inventory_repository=seeded_inventory(store),
             account_port=WeightedVotingStaticAccountPort(account_equity=100000.0, broker_buying_power=75000.0, source_id="weighted_voting.test.paper_account"),
             rollout_flags=validated_rollout_flags(),
@@ -908,7 +1209,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             store=store,
             config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
             event_bus=WeightedVotingEventBus(maxsize=8),
-            paper_gateway=PaperOrderGateway(FakePaperBroker(), store),
+            paper_gateway=weighted_voting_local_gateway(FakePaperBroker(), store),
             inventory_repository=seeded_inventory(store),
             account_port=WeightedVotingStaticAccountPort(account_equity=100000.0, broker_buying_power=75000.0, source_id="weighted_voting.test.account_port"),
             rollout_flags=validated_rollout_flags(),
@@ -958,6 +1259,149 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             }.issubset(hot["dependency_health"]),
             True,
         )
+
+    def test_local_daily_loss_blocks_new_entries_but_keeps_risk_reducing_exits_available(self) -> None:
+        store, _broker, supervisor = activation_supervisor(inventory=loss_limit_inventory)
+        prepare_runtime_dependencies(supervisor)
+        supervisor.update_runtime_control(
+            paper_trading_enabled=True,
+            automatic_entries_enabled=True,
+            updated_by="weighted_voting.test",
+            reason="weighted_voting.test.local_daily_loss_requested_auto",
+        )
+
+        health = supervisor.health()
+        readiness = supervisor.runtime_control()["readiness"]
+
+        self.assertTrue(health["automaticOrderCreationPaused"])
+        self.assertFalse(health["circuitBreakerOpen"])
+        self.assertTrue(health["riskReducingExitsAllowed"])
+        self.assertEqual(health["operationalStatus"]["pauseReason"], "weighted_voting.runtime.control.daily_loss_limit_reached")
+        self.assertFalse(readiness["entry_submission_allowed"])
+        self.assertTrue(readiness["risk_reducing_exits_allowed"])
+        self.assertIn("weighted_voting.runtime.control.daily_loss_limit_reached", readiness["blocking_reason_codes"])
+        self.assertTrue(any(key.startswith("weighted_voting.inventory.") for key in store.snapshots))
+        self.assertFalse(any(key.startswith("voting_ensemble.") for key in store.snapshots))
+        self.assertFalse(any(key.startswith("weighted_confidence_aggregation.") for key in store.snapshots))
+        self.assertFalse(any(key.startswith("regime_based.") for key in store.snapshots))
+        self.assertFalse(any(key.startswith("meta_model.") for key in store.snapshots))
+
+    def test_entry_daily_loss_gate_does_not_block_risk_reducing_sell_close(self) -> None:
+        store, _broker, supervisor = activation_supervisor(inventory=open_loss_limit_inventory)
+        prepare_runtime_dependencies(supervisor)
+        supervisor.update_runtime_control(
+            paper_trading_enabled=True,
+            automatic_entries_enabled=True,
+            updated_by="weighted_voting.test",
+            reason="weighted_voting.test.local_daily_loss_requested_auto",
+        )
+        health = supervisor.health()
+        inventory = supervisor.inventory_repository.current_snapshot(now=SESSION_OPEN)
+        proposal = GlobalOrderProposal(
+            algorithmId="weighted_voting",
+            capitalPartitionId="weighted_voting.paper.default",
+            decisionId="runtime-risk-reducing-exit-decision",
+            orderIntentId="runtime-risk-reducing-exit-intent",
+            intent="risk_reducing",
+            symbol="SPY",
+            side="SELL",
+            quantity=100,
+            triggerPrice=90.0,
+            limitPrice=90.0,
+            stopPrice=None,
+            targetPrice=None,
+            plannedRiskDollars=0.0,
+            settingsSnapshot={"settings_version": "runtime-test", "intentRevision": 1},
+            entryFormula={"kind": "risk_reducing_exit"},
+            stopFormula={},
+            targetFormula={},
+            strategyStateHash="runtime-risk-reducing-state",
+            proposedAt=SESSION_OPEN + timedelta(minutes=95),
+            sessionDate=SESSION_OPEN.date(),
+            configurationHash="runtime-risk-reducing-config",
+        )
+        application = apply_global_gate_response(
+            proposal,
+            GlobalGateResponse(
+                action="EXIT_ONLY",
+                maximumAllowedQuantity=100,
+                maximumAdditionalRiskDollars=0.0,
+                rejectionReasons=("weighted_voting.test.entries_blocked_exit_only",),
+                evaluatedAt=SESSION_OPEN + timedelta(minutes=95),
+                configurationHash="runtime-risk-reducing-global",
+            ),
+        )
+
+        item = supervisor._enqueue_execution_from_result(
+            {
+                "decision": {"decision_id": proposal.decisionId},
+                "gateResult": {
+                    "permission_granted": False,
+                    "mode": "automatic",
+                    "reason_codes": ("weighted_voting.gate.daily_loss_limit_exceeded",),
+                    "explanation": "Synthetic entry gate failure.",
+                },
+                "globalOrderProposal": proposal.model_dump(mode="json"),
+                "globalGateApplication": application.model_dump(mode="json"),
+            },
+            idempotency_key="weighted_voting.test.risk_reducing_exit_daily_loss",
+            evaluated_at=SESSION_OPEN + timedelta(minutes=95),
+            inventory_snapshot_version=inventory.snapshot_version,
+        )
+
+        self.assertTrue(health["automaticOrderCreationPaused"])
+        self.assertTrue(health["riskReducingExitsAllowed"])
+        self.assertIsNotNone(item)
+        self.assertEqual(item.command.side, "SELL")
+        self.assertEqual(item.proposal.intent, "risk_reducing")
+        self.assertFalse(item.local_gate_passed)
+        self.assertEqual(supervisor.execution_queue.qsize(), 1)
+        self.assertFalse(any(key.startswith("weighted_voting.runtime.execution.blocked.runtime-risk-reducing-exit-intent") for key in store.snapshots))
+
+    def test_local_risk_blocks_fail_closed_for_entries_but_allow_risk_reducing_exits(self) -> None:
+        cases = (
+            (
+                "insufficient_local_buying_power",
+                lambda: activation_supervisor(seed=seed_full_capital_reservation),
+                "weighted_voting.runtime.control.remaining_algorithm_risk_exhausted",
+            ),
+            (
+                "daily_loss_reached",
+                lambda: activation_supervisor(inventory=loss_limit_inventory),
+                "weighted_voting.runtime.control.daily_loss_limit_reached",
+            ),
+            (
+                "max_trade_count_reached",
+                lambda: activation_supervisor(inventory=trade_limit_inventory),
+                "weighted_voting.runtime.control.daily_trade_limit_reached",
+            ),
+        )
+        for name, build, expected_reason in cases:
+            with self.subTest(name=name):
+                store, broker, supervisor = build()
+                prepare_runtime_dependencies(supervisor)
+                control = supervisor.update_runtime_control(
+                    paper_trading_enabled=True,
+                    automatic_entries_enabled=True,
+                    updated_by="weighted_voting.test",
+                    reason=f"weighted_voting.test.{name}",
+                )
+
+                record = asyncio.run(supervisor.process_finalised_bar_event(event_from_payload(evaluate_payload(offset_minutes=70))))
+                self.assertEqual(supervisor.execution_queue.qsize(), 0)
+                exit_item = enqueue_runtime_risk_reducing_exit(supervisor, suffix=name)
+
+                self.assertFalse(control["automatic_entries_enabled"])
+                self.assertFalse(control["readiness"]["entrySubmissionAllowed"])
+                self.assertTrue(supervisor.health()["riskReducingExitsAllowed"])
+                self.assertIn(expected_reason, control["readiness"]["blockingReasonCodes"])
+                self.assertEqual(record["status"], "decision_persisted")
+                self.assertTrue(any(key.startswith("weighted_voting.runtime.executions.blocked.runtime-auto-intent") for key in store.snapshots))
+                self.assertEqual(supervisor.execution_queue.qsize(), 1)
+                self.assertIsNotNone(exit_item)
+                self.assertEqual(exit_item.proposal.intent, "risk_reducing")
+                self.assertEqual(exit_item.command.side, "SELL")
+                self.assertEqual(getattr(broker, "submit_count", 0), 0)
 
     def test_required_activation_matrix_blocks_entry_orders(self) -> None:
         def with_requested_auto_entries(supervisor, _store, _broker):
@@ -1065,7 +1509,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             store=store,
             config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
             event_bus=WeightedVotingEventBus(maxsize=8),
-            paper_gateway=PaperOrderGateway(broker, store),
+            paper_gateway=weighted_voting_local_gateway(broker, store),
             inventory_repository=WeightedVotingInventoryRepository(store, symbol="SPY", allocated_capital=25_000.0),
             rollout_flags=validated_rollout_flags(),
             rollout_validation=validated_rollout_validation(),
@@ -1097,7 +1541,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             store=store,
             config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
             event_bus=WeightedVotingEventBus(maxsize=8),
-            paper_gateway=PaperOrderGateway(FakePaperBroker(), store),
+            paper_gateway=weighted_voting_local_gateway(FakePaperBroker(), store),
             inventory_repository=seeded_inventory(store),
             rollout_flags=validated_rollout_flags(),
             rollout_validation=validated_rollout_validation(),
@@ -1152,7 +1596,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             store=store,
             config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
             event_bus=WeightedVotingEventBus(maxsize=8),
-            paper_gateway=PaperOrderGateway(ClosedClockPaperBroker(), store),
+            paper_gateway=weighted_voting_local_gateway(ClosedClockPaperBroker(), store),
             inventory_repository=seeded_inventory(store),
             rollout_flags=validated_rollout_flags(),
             rollout_validation=validated_rollout_validation(),
@@ -1168,7 +1612,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
     def test_runtime_control_off_blocks_entries_cancels_working_orders_and_preserves_exits(self) -> None:
         store = MemoryStore()
         broker = NoFillPaperBroker()
-        gateway = PaperOrderGateway(broker, store)
+        gateway = weighted_voting_local_gateway(broker, store)
         supervisor = WeightedVotingRuntimeSupervisor(
             service=AcceptedExecutionService(store=store),
             store=store,
@@ -1197,7 +1641,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
         self.assertTrue(control["transition"]["riskReducingExitsEnabled"])
         self.assertTrue(control["transition"]["protectiveOrdersEnabled"])
         self.assertTrue(control["transition"]["reconciliationContinues"])
-        self.assertGreaterEqual(broker.cancel_count, 1)
+        self.assertFalse(any(key.startswith("paper_order_gateway.") for key in store.snapshots))
         self.assertTrue(supervisor.health()["automaticOrderCreationPaused"])
         self.assertTrue(supervisor.health()["riskReducingExitsAllowed"])
 
@@ -1209,7 +1653,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             store=store,
             config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
             event_bus=WeightedVotingEventBus(maxsize=8),
-            paper_gateway=PaperOrderGateway(broker, store),
+            paper_gateway=weighted_voting_local_gateway(broker, store),
             inventory_repository=seeded_inventory(store),
             rollout_flags=validated_rollout_flags(),
             rollout_validation=validated_rollout_validation(),
@@ -1230,6 +1674,68 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(queue_payload["status"], "CANCELLED")
         self.assertEqual(broker.submit_count, 0)
         self.assertTrue(control["transition"]["riskReducingExitsEnabled"])
+
+    def test_end_of_day_cancels_only_weighted_voting_entries_and_flattens_owned_inventory(self) -> None:
+        store = MemoryStore()
+        inventory = seeded_inventory(store)
+        snapshot = inventory.current_snapshot(now=SESSION_OPEN)
+        inventory.append_event(
+            event_id="runtime-eod-owned-fill",
+            event_type=WeightedVotingInventoryEventType.FILL_RECORDED,
+            payload=position_payload(position_id="runtime-eod-owned-position", quantity=3, average_entry_price=100.0),
+            occurred_at=SESSION_OPEN + timedelta(seconds=1),
+            expected_snapshot_version=snapshot.snapshot_version,
+        )
+        weighted_key = "weighted_voting.execution_gateway.queue.weighted-entry-client"
+        foreign_key = "weighted_voting.execution_gateway.queue.foreign-entry-client"
+        store.write_snapshot(
+            weighted_key,
+            {
+                "algorithmId": "weighted_voting",
+                "status": "PENDING",
+                "command": {
+                    "algorithmId": "weighted_voting",
+                    "clientOrderId": "weighted-entry-client",
+                    "orderIntentId": "weighted-entry-intent",
+                    "decisionId": "weighted-entry-decision",
+                },
+                "proposal": {"algorithmId": "weighted_voting", "intent": "new_entry"},
+                "reasonCodes": ("weighted_voting.test.pending_entry",),
+            },
+        )
+        store.write_snapshot(
+            foreign_key,
+            {
+                "algorithmId": "voting_ensemble",
+                "status": "PENDING",
+                "command": {
+                    "algorithmId": "voting_ensemble",
+                    "clientOrderId": "foreign-entry-client",
+                    "orderIntentId": "foreign-entry-intent",
+                    "decisionId": "foreign-entry-decision",
+                },
+                "proposal": {"algorithmId": "voting_ensemble", "intent": "new_entry"},
+                "reasonCodes": ("voting_ensemble.test.pending_entry",),
+            },
+        )
+        supervisor = WeightedVotingRuntimeSupervisor(
+            service=WeightedVotingService(store=store),
+            store=store,
+            config=WeightedVotingRuntimeConfig(heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
+            event_bus=WeightedVotingEventBus(maxsize=8),
+            inventory_repository=inventory,
+        )
+        supervisor.metrics.last_bar_processed = {"close": 100.25, "ohlcv": {"close": 100.25}}
+
+        record = supervisor.manage_positions_once(trigger="eod_test", managed_at=datetime(2026, 7, 14, 19, 59, tzinfo=timezone.utc))
+        final_snapshot = inventory.current_snapshot(now=SESSION_OPEN)
+
+        self.assertTrue(record["endOfDayExitDue"])
+        self.assertEqual(record["closedTradeCount"], 1)
+        self.assertEqual(final_snapshot.open_positions, ())
+        self.assertEqual(store.read_snapshot(weighted_key)["status"], "CANCELLED")
+        self.assertEqual(store.read_snapshot(foreign_key)["status"], "PENDING")
+        self.assertEqual(record["entryCancellationTransition"]["cancelledUnsubmittedEntryClientOrderIds"], ["weighted-entry-client"])
 
     def test_runtime_control_repeated_requests_are_idempotent_and_stale_versions_conflict(self) -> None:
         store, _broker, supervisor = activation_supervisor()
@@ -1338,7 +1844,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
                     store=store,
                     config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
                     event_bus=WeightedVotingEventBus(maxsize=8),
-                    paper_gateway=PaperOrderGateway(broker, store),
+                    paper_gateway=weighted_voting_local_gateway(broker, store),
                     inventory_repository=WeightedVotingInventoryRepository(store, symbol="SPY", allocated_capital=25_000.0),
                     rollout_flags=validated_rollout_flags(),
                     rollout_validation=validated_rollout_validation(),
@@ -1362,7 +1868,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             store=protected_store,
             config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
             event_bus=WeightedVotingEventBus(maxsize=8),
-            paper_gateway=PaperOrderGateway(FakePaperBroker(), protected_store),
+            paper_gateway=weighted_voting_local_gateway(FakePaperBroker(), protected_store),
             inventory_repository=WeightedVotingInventoryRepository(protected_store, symbol="SPY", allocated_capital=25_000.0),
             rollout_flags=validated_rollout_flags(),
             rollout_validation=validated_rollout_validation(),
@@ -1559,7 +2065,7 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
             store=store,
             config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
             event_bus=WeightedVotingEventBus(maxsize=8),
-            paper_gateway=PaperOrderGateway(broker, store),
+            paper_gateway=PaperOrderGateway(broker, store, execution_mode="BROKER_PAPER"),
             inventory_repository=seeded_inventory(store),
         )
 
@@ -1646,10 +2152,17 @@ class WeightedVotingRuntimeSupervisorTest(unittest.TestCase):
         self.assertIn(f"{PUBLISHED_WEIGHT_PREFIX}2026-11-30", store.snapshots)
 
 
-def supervisor_for(store: "MemoryStore", *, queue_maxsize: int = 8, max_queue_lag_seconds: int = 75) -> WeightedVotingRuntimeSupervisor:
+def supervisor_for(
+    store: "MemoryStore",
+    *,
+    queue_maxsize: int = 8,
+    max_queue_lag_seconds: int = 75,
+    inventory_repository: WeightedVotingInventoryRepository | None = None,
+) -> WeightedVotingRuntimeSupervisor:
     return WeightedVotingRuntimeSupervisor(
         service=WeightedVotingService(store=store),
         store=store,
+        inventory_repository=inventory_repository,
         config=WeightedVotingRuntimeConfig(queue_maxsize=queue_maxsize, max_queue_lag_seconds=max_queue_lag_seconds, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
         event_bus=WeightedVotingEventBus(maxsize=queue_maxsize),
         paper_gateway=None,
@@ -1682,13 +2195,17 @@ def activation_supervisor(
         store=store,
         config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
         event_bus=WeightedVotingEventBus(maxsize=8),
-        paper_gateway=PaperOrderGateway(active_broker, store),
+        paper_gateway=weighted_voting_local_gateway(active_broker, store),
         inventory_repository=inventory_repository,
         account_port=WeightedVotingStaticAccountPort(account_equity=100000.0, broker_buying_power=75000.0, source_id="weighted_voting.test.paper_account"),
         rollout_flags=rollout_flags or validated_rollout_flags(),
         rollout_validation=rollout_validation or validated_rollout_validation(),
     )
     return store, active_broker, supervisor
+
+
+def weighted_voting_local_gateway(broker, store, **kwargs) -> PaperOrderGateway:
+    return PaperOrderGateway(broker, store, execution_mode="LOCAL_PAPER", **kwargs)
 
 
 def prepare_runtime_dependencies(supervisor: WeightedVotingRuntimeSupervisor) -> None:
@@ -1839,6 +2356,60 @@ def global_proposal_for_market_snapshot(snapshot) -> GlobalOrderProposal:
     )
 
 
+def enqueue_runtime_risk_reducing_exit(supervisor: WeightedVotingRuntimeSupervisor, *, suffix: str):
+    inventory = supervisor.inventory_repository.current_snapshot(now=SESSION_OPEN + timedelta(minutes=95))
+    proposal = GlobalOrderProposal(
+        algorithmId="weighted_voting",
+        capitalPartitionId="weighted_voting.paper.default",
+        decisionId=f"runtime-risk-exit-{suffix}-decision",
+        orderIntentId=f"runtime-risk-exit-{suffix}-intent",
+        intent="risk_reducing",
+        symbol="SPY",
+        side="SELL",
+        quantity=1,
+        triggerPrice=100.0,
+        limitPrice=100.0,
+        stopPrice=None,
+        targetPrice=None,
+        plannedRiskDollars=0.0,
+        settingsSnapshot={"settings_version": "runtime-test", "intentRevision": 1},
+        entryFormula={"kind": "risk_reducing_exit"},
+        stopFormula={},
+        targetFormula={},
+        strategyStateHash=f"runtime-risk-exit-{suffix}-state",
+        proposedAt=SESSION_OPEN + timedelta(minutes=95),
+        sessionDate=SESSION_OPEN.date(),
+        configurationHash=f"runtime-risk-exit-{suffix}-config",
+    )
+    application = apply_global_gate_response(
+        proposal,
+        GlobalGateResponse(
+            action="EXIT_ONLY",
+            maximumAllowedQuantity=1,
+            maximumAdditionalRiskDollars=0.0,
+            rejectionReasons=(f"weighted_voting.test.{suffix}.entries_blocked_exit_only",),
+            evaluatedAt=SESSION_OPEN + timedelta(minutes=95),
+            configurationHash=f"runtime-risk-exit-{suffix}-global",
+        ),
+    )
+    return supervisor._enqueue_execution_from_result(
+        {
+            "decision": {"decision_id": proposal.decisionId},
+            "gateResult": {
+                "permission_granted": False,
+                "mode": "automatic",
+                "reason_codes": (f"weighted_voting.test.{suffix}.entry_risk_blocked",),
+                "explanation": "Synthetic entry gate failure with risk-reducing exit permitted.",
+            },
+            "globalOrderProposal": proposal.model_dump(mode="json"),
+            "globalGateApplication": application.model_dump(mode="json"),
+        },
+        idempotency_key=f"weighted_voting.test.risk_reducing_exit.{suffix}",
+        evaluated_at=SESSION_OPEN + timedelta(minutes=95),
+        inventory_snapshot_version=inventory.snapshot_version,
+    )
+
+
 def validated_rollout_flags() -> WeightedVotingRolloutFlags:
     return WeightedVotingRolloutFlags(
         v2_enabled=True,
@@ -1864,6 +2435,15 @@ def validated_rollout_validation() -> WeightedVotingRolloutValidation:
         paper_broker_e2e_validated=True,
         reconciliation_validated=True,
         restart_recovery_validated=True,
+        local_paper_broker_validated=True,
+        local_inventory_reconciled=True,
+        local_balance_accounting_validated=True,
+        local_fill_simulation_validated=True,
+        local_restart_recovery_validated=True,
+        no_cross_algorithm_mutation_validated=True,
+        no_alpaca_dependency_validated=True,
+        risk_fail_closed_validated=True,
+        protective_exits_validated=True,
         persisted_operator_approval=True,
         validation_record_id="weighted_voting.rollout.validation.runtime_test",
         source_authority="backend.weighted_voting.runtime_test_validation",
@@ -1973,6 +2553,26 @@ def loss_limit_inventory(store: "MemoryStore") -> WeightedVotingInventoryReposit
     return inventory
 
 
+def open_loss_limit_inventory(store: "MemoryStore") -> WeightedVotingInventoryRepository:
+    inventory = seeded_inventory(store)
+    snapshot = inventory.current_snapshot(now=SESSION_OPEN)
+    snapshot = inventory.append_event(
+        event_id="runtime-open-loss-limit-fill",
+        event_type=WeightedVotingInventoryEventType.FILL_RECORDED,
+        payload=position_payload(position_id="runtime-open-loss-limit", quantity=100, average_entry_price=100.0),
+        occurred_at=SESSION_OPEN + timedelta(seconds=1),
+        expected_snapshot_version=snapshot.snapshot_version,
+    )
+    inventory.mark_to_market(
+        symbol="SPY",
+        price=90.0,
+        occurred_at=SESSION_OPEN + timedelta(seconds=2),
+        market_event_id="runtime-open-loss-limit-mark",
+        expected_snapshot_version=snapshot.snapshot_version,
+    )
+    return inventory
+
+
 def trade_limit_inventory(store: "MemoryStore") -> WeightedVotingInventoryRepository:
     inventory = seeded_inventory(store)
     snapshot = inventory.current_snapshot(now=SESSION_OPEN)
@@ -2054,7 +2654,7 @@ def seed_queued_order_without_submission(store: "MemoryStore"):
         store=store,
         config=WeightedVotingRuntimeConfig(queue_maxsize=8, max_queue_lag_seconds=75, heartbeat_interval_seconds=999.0, maintenance_interval_seconds=999.0),
         event_bus=WeightedVotingEventBus(maxsize=8),
-        paper_gateway=PaperOrderGateway(FakePaperBroker(), store),
+        paper_gateway=weighted_voting_local_gateway(FakePaperBroker(), store),
         inventory_repository=seeded_inventory(store),
         rollout_flags=validated_rollout_flags(),
         rollout_validation=validated_rollout_validation(),
@@ -2285,6 +2885,22 @@ class IncreasingExternalRiskService:
         }
 
 
+class MutableInventoryExternalRiskService:
+    def evaluate(self, request):
+        return {
+            "action": "APPROVE",
+            "maximumAllowedQuantity": request.proposed_quantity,
+            "maximumAdditionalRiskDollars": request.planned_risk,
+            "configurationHash": "weighted_voting.test.external_mutable_inventory",
+            "configurationVersion": "weighted_voting.test.external_mutable_inventory_v1",
+            "evaluatedAt": request.request_timestamp.isoformat(),
+            "expiresAt": (request.request_timestamp + timedelta(seconds=30)).isoformat(),
+            "reasonCodes": ("weighted_voting.test.external_global_risk_mutable_inventory",),
+            "mergedInventory": {"cash": 1_000_000.0},
+            "positions": {"SPY": {"quantity": 999}},
+        }
+
+
 class RejectExternalRiskService:
     def evaluate(self, request):
         return {
@@ -2315,10 +2931,17 @@ class GlobalRiskOutageService(WeightedVotingService):
 
 
 class FakePaperBroker:
+    broker_kind = "weighted_voting_local_paper"
+    paper_endpoint = True
+    live_trading_enabled = False
+
     def __init__(self) -> None:
         self.submit_count = 0
         self.cancel_count = 0
-        self.base_url = "https://paper-api.alpaca.markets/v2"
+        self.base_url = "local-paper://weighted_voting"
+
+    def verify_paper_endpoint(self) -> bool:
+        return self.base_url == "local-paper://weighted_voting"
 
     def verify_paper_account(self) -> bool:
         return True
@@ -2351,6 +2974,39 @@ class FakePaperBroker:
 
     def refresh_positions(self) -> list[dict]:
         return []
+
+
+class ExplicitBrokerPaperBroker:
+    broker_kind = "alpaca_paper"
+    paper_endpoint = True
+    live_trading_enabled = False
+
+    def __init__(self) -> None:
+        self.base_url = "https://paper-api.alpaca.markets/v2"
+
+    def verify_paper_endpoint(self) -> bool:
+        return True
+
+    def verify_paper_account(self) -> bool:
+        return True
+
+    def submit_bracket_order(self, intent) -> PaperGatewayBrokerAck:
+        return PaperGatewayBrokerAck(
+            clientOrderId=intent.clientOrderId,
+            brokerOrderId=f"broker-paper-{intent.clientOrderId}",
+            status="ACCEPTED",
+            acceptedAt=SESSION_OPEN,
+        )
+
+
+class NoPositionQueryLocalPaperBroker(WeightedVotingLocalPaperBroker):
+    def __init__(self, store, inventory_repository) -> None:
+        super().__init__(store, inventory_repository)
+        self.refresh_positions_calls = 0
+
+    def refresh_positions(self) -> list[dict]:
+        self.refresh_positions_calls += 1
+        raise AssertionError("LOCAL_PAPER restart recovery must not query broker positions")
 
 
 class UnverifiedPaperBroker(FakePaperBroker):
