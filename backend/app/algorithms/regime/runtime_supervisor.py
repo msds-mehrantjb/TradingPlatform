@@ -654,9 +654,9 @@ class RegimeRuntimeSupervisor:
             identities = self.service.repository.active_execution_outbox_identities(fallback)
         except AttributeError:
             identities = [fallback]
-        if not identities and fallback.get("runtimeMode") == "paper":
+        if not identities and fallback.get("runtimeMode") in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}:
             identities = [fallback]
-        return [dict(identity) for identity in identities if str(identity.get("runtimeMode") or "") == "paper"]
+        return [dict(identity) for identity in identities if str(identity.get("runtimeMode") or "") in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}]
 
     def _execution_gateway_for_rollout(
         self,
@@ -728,7 +728,7 @@ class RegimeRuntimeSupervisor:
                 details={"stage": "process_execution_outbox_once"},
             )
             return {"algorithmId": "regime", "processed": False, "reasonCodes": ["regime.execution.outbox_read_failed"]}
-        if not records and self.config.default_runtime_mode == RegimeRuntimeMode.PAPER.value and self.paper_gateway is None and not operational_stage_uses_simulated_broker(rollout_stage):
+        if not records and self.config.default_runtime_mode in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value} and self.paper_gateway is None and not operational_stage_uses_simulated_broker(rollout_stage):
             self._block_new_entries("regime.execution.paper_gateway_unavailable")
             self._record_component_failure(
                 "paper_broker",
@@ -984,6 +984,9 @@ class RegimeRuntimeSupervisor:
             self._persist_event(event, "processing")
             self._record_stage(event, "snapshot_validated", {"settingsVersion": settings_context.get("settingsVersion")})
             await self._maybe_crash("snapshot_validated")
+            local_paper_market_update = await asyncio.to_thread(self._process_local_paper_market_update, event)
+            if local_paper_market_update.get("processed"):
+                self._record_stage(event, "local_paper_market_update", local_paper_market_update, status="completed")
             account_snapshot = await asyncio.to_thread(self._load_shared_account_snapshot, event)
             self._mark_component("database", "healthy", reason_codes=("regime.health.database.event_processing_ready",))
             paper_control = self._load_automatic_paper_control(event.identity, rollout_snapshot=rollout_snapshot)
@@ -1007,7 +1010,7 @@ class RegimeRuntimeSupervisor:
             }
             real_paper_stage_allowed = operational_stage_allows_real_paper_submission(rollout_stage, evidence=self.service.repository.read_regime_rollout_promotion_evidence(event.identity))
             automatic_paper_enabled = (
-                event.runtime_mode == "paper"
+                event.runtime_mode in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}
                 and rollout_stage in {"limited_paper", "normal_paper"}
                 and paper_button_requested
                 and paper_button_effective
@@ -1037,9 +1040,9 @@ class RegimeRuntimeSupervisor:
                 "paperButtonEffective": paper_button_effective,
                 "requestedAutomaticPaperTradingEnabled": paper_button_requested,
                 "automaticPaperSubmissionEnabled": paper_button_effective,
-                "requireAutomaticPaperControlForEntry": event.runtime_mode == "paper" and rollout_stage in {"limited_paper", "normal_paper"},
+                "requireAutomaticPaperControlForEntry": event.runtime_mode in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value} and rollout_stage in {"limited_paper", "normal_paper"},
                 "rolloutStageAllowsRealPaperExecution": real_paper_stage_allowed,
-                "requireRealPaperExecutionStage": event.runtime_mode == "paper" and rollout_stage in {"limited_paper", "normal_paper"},
+                "requireRealPaperExecutionStage": event.runtime_mode == RegimeRuntimeMode.PAPER.value and rollout_stage in {"limited_paper", "normal_paper"},
                 "marketDataCurrentAndComplete": not bool(operational_blockers and any("market_data" in code or "queue_lag" in code for code in operational_blockers)),
                 "marketRegularSessionOpen": market_regular_session_open,
                 "finalizedBarCurrent": finalized_bar_current,
@@ -1160,7 +1163,7 @@ class RegimeRuntimeSupervisor:
                     "timestamp": _utc_now(),
                 }
         else:
-            if self.config.default_runtime_mode == "paper":
+            if self.config.default_runtime_mode in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}:
                 self._block_new_entries("regime.runtime.reconciliation.paper_gateway_unavailable")
                 result = {
                     "algorithmId": "regime",
@@ -1208,6 +1211,8 @@ class RegimeRuntimeSupervisor:
 
     def _broker_positions_for_recovery(self) -> list[dict[str, Any]]:
         if self.paper_gateway is None:
+            return []
+        if self.config.default_runtime_mode == RegimeRuntimeMode.LOCAL_PAPER.value:
             return []
         return list(self.paper_gateway.broker.refresh_positions())
 
@@ -1803,6 +1808,79 @@ class RegimeRuntimeSupervisor:
             data_manifest_hash = deterministic_data_manifest_hash(snapshot, inventory_snapshot)
         return event.with_runtime_identity(data_manifest_hash=data_manifest_hash, settings_version=str(settings_context["settingsVersion"])), settings_context
 
+    def _process_local_paper_market_update(self, event: RegimeFinalisedBarEvent) -> dict[str, Any]:
+        if event.runtime_mode != RegimeRuntimeMode.LOCAL_PAPER.value:
+            return {"algorithmId": "regime", "processed": False, "reasonCodes": ["regime.local_paper.market_update.skipped_non_local_mode"]}
+        if self.paper_gateway is None:
+            return {"algorithmId": "regime", "processed": False, "reasonCodes": ["regime.local_paper.market_update.paper_gateway_unavailable"]}
+        broker = getattr(self.paper_gateway, "broker", None)
+        processor = getattr(broker, "process_market_update", None)
+        if not callable(processor):
+            return {"algorithmId": "regime", "processed": False, "reasonCodes": ["regime.local_paper.market_update.processor_unavailable"]}
+        market_update = _local_paper_market_update_from_event(event)
+        if market_update is None:
+            return {"algorithmId": "regime", "processed": False, "reasonCodes": ["regime.local_paper.market_update.unavailable"]}
+        try:
+            fills = tuple(processor(market_update) or ())
+        except Exception as exc:
+            self._record_component_failure(
+                "paper_broker",
+                exc,
+                reason_code="regime.local_paper.market_update_failed",
+                details={"eventId": event.event_id},
+            )
+            return {"algorithmId": "regime", "processed": False, "reasonCodes": ["regime.local_paper.market_update_failed"]}
+        recorded = []
+        for fill in fills:
+            fill_payload = fill.model_dump(mode="json") if hasattr(fill, "model_dump") else dict(fill)
+            recorded.append(fill_payload)
+            self._record_local_paper_market_fill(event, fill_payload)
+        if fills:
+            self.metrics.filled_orders += sum(1 for fill in fills if str(getattr(fill, "status", "") or "").upper() == "FILLED")
+            self._mark_component("paper_broker", "healthy", reason_codes=("regime.local_paper.market_update_processed",), details={"fillCount": len(fills)})
+        return {
+            "algorithmId": "regime",
+            "processed": True,
+            "runtimeMode": event.runtime_mode,
+            "symbol": event.symbol,
+            "marketUpdate": market_update,
+            "fillCount": len(fills),
+            "fills": recorded,
+            "reasonCodes": ["regime.local_paper.market_update_processed"],
+        }
+
+    def _record_local_paper_market_fill(self, event: RegimeFinalisedBarEvent, fill_payload: dict[str, Any]) -> None:
+        order_intent_id = str(fill_payload.get("orderIntentId") or "")
+        if not order_intent_id:
+            return
+        status = "filled" if str(fill_payload.get("status") or "").upper() == "FILLED" else "partially_filled"
+        existing = self.service.repository.read_execution_outbox_record(event.identity, order_intent_id) or {}
+        self.service.repository.update_execution_outbox_status(
+            event.identity,
+            order_intent_id,
+            status=status,
+            payload={
+                **existing,
+                "localPaperMarketFill": fill_payload,
+                "gatewayResult": {**dict(existing.get("gatewayResult") or {}), "fill": fill_payload, "status": str(fill_payload.get("status") or "FILLED")},
+                "reasonCodes": ["regime.local_paper.market_fill_observed"],
+            },
+        )
+        self.service.repository.record_runtime_event(
+            {
+                **event.identity,
+                "eventId": f"regime-local-paper-fill-{order_intent_id}-{event.event_id}",
+                "eventType": "local_paper_market_fill",
+                "processingStatus": status,
+                "payload": {
+                    "algorithmId": "regime",
+                    "orderIntentId": order_intent_id,
+                    "fill": fill_payload,
+                    "reasonCodes": ["regime.local_paper.market_fill_observed"],
+                },
+            }
+        )
+
     def _load_shared_account_snapshot(self, event: RegimeFinalisedBarEvent) -> dict[str, Any]:
         return self._load_shared_account_snapshot_for_identity({key: str(value) for key, value in event.identity.items()})
 
@@ -2394,10 +2472,10 @@ class RegimeRuntimeSupervisor:
                 self._unblock_new_entries("regime.health.paper_broker.not_verified")
                 self._unblock_new_entries("regime.execution.paper_broker_unhealthy")
                 return
-            self.metrics.broker_paper_mode_verified = self.config.default_runtime_mode != "paper"
-            self.metrics.broker_connectivity_ok = self.config.default_runtime_mode != "paper"
+            self.metrics.broker_paper_mode_verified = self.config.default_runtime_mode not in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}
+            self.metrics.broker_connectivity_ok = self.config.default_runtime_mode not in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}
             self.metrics.broker_connectivity = {"paperGatewayPresent": False, "runtimeMode": self.config.default_runtime_mode}
-            if self.config.default_runtime_mode == "paper":
+            if self.config.default_runtime_mode in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}:
                 self._mark_component("paper_broker", "unhealthy", reason_codes=("regime.execution.paper_gateway_unavailable",), details=self.metrics.broker_connectivity)
                 self._block_new_entries("regime.execution.paper_gateway_unavailable")
             return
@@ -2419,7 +2497,7 @@ class RegimeRuntimeSupervisor:
             self._unblock_new_entries("regime.health.paper_broker.not_verified")
             self._unblock_new_entries("regime.execution.paper_broker_unhealthy")
             self._unblock_new_entries("regime.execution.paper_broker_safety_failed")
-        elif self.config.default_runtime_mode == "paper":
+        elif self.config.default_runtime_mode in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}:
             for reason_code in safety.get("reasonCodes") or ():
                 self._block_new_entries(str(reason_code))
             self._block_new_entries("regime.execution.paper_broker_safety_failed")
@@ -2429,7 +2507,14 @@ class RegimeRuntimeSupervisor:
             inventory = self.service.repository.current_inventory_snapshot(identity)
             self.metrics.current_inventory = inventory
             self.metrics.inventory_available = True
-            self._mark_component("inventory", "healthy" if self.metrics.inventory_reconciled else "unknown", reason_codes=("regime.health.inventory.loaded",), details={"stateVersion": inventory.get("stateVersion")})
+            local_inventory_blockers = _local_paper_inventory_blockers(inventory, identity=identity)
+            if local_inventory_blockers:
+                for reason in local_inventory_blockers:
+                    self._block_new_entries(reason)
+                self.metrics.inventory_reconciled = False
+                self._mark_component("inventory", "unhealthy", reason_codes=tuple(local_inventory_blockers), details={"stateVersion": inventory.get("stateVersion")})
+            else:
+                self._mark_component("inventory", "healthy" if self.metrics.inventory_reconciled else "unknown", reason_codes=("regime.health.inventory.loaded",), details={"stateVersion": inventory.get("stateVersion")})
         except Exception as exc:
             self.metrics.inventory_available = False
             self._record_component_failure("inventory", exc, reason_code="regime.health.inventory.unavailable")
@@ -2582,6 +2667,32 @@ def _instance_symbol_key(event: RegimeFinalisedBarEvent) -> str:
     return f"{event.algorithm_instance_id}:{event.symbol}"
 
 
+def _local_paper_market_update_from_event(event: RegimeFinalisedBarEvent) -> dict[str, Any] | None:
+    payload = event.market_payload if isinstance(event.market_payload, dict) else {}
+    candles = payload.get("primaryCandles") or payload.get("oneMinuteCandles") or payload.get("candles") or ()
+    latest = dict(candles[-1]) if isinstance(candles, list) and candles else {}
+    context = payload.get("contextFeeds") if isinstance(payload.get("contextFeeds"), dict) else {}
+    quote = context.get("quoteFreshness") if isinstance(context.get("quoteFreshness"), dict) else {}
+    timestamp = (
+        payload.get("completedBarTimestamp")
+        or payload.get("timestamp")
+        or latest.get("timestamp")
+        or event.completed_bar_timestamp.isoformat().replace("+00:00", "Z")
+    )
+    update = {
+        "symbol": str(payload.get("symbol") or event.symbol or "SPY").upper(),
+        "timestamp": timestamp,
+        "bid": quote.get("bid") or payload.get("bid") or payload.get("bidPrice"),
+        "ask": quote.get("ask") or payload.get("ask") or payload.get("askPrice"),
+        "last": payload.get("last") or payload.get("lastPrice") or latest.get("close"),
+        "high": latest.get("high") or payload.get("high"),
+        "low": latest.get("low") or payload.get("low"),
+        "volume": latest.get("volume") or payload.get("volume") or quote.get("expectedFillQuantity") or 0,
+    }
+    if update["bid"] is None and update["ask"] is None and update["last"] is None and update["high"] is None and update["low"] is None:
+        return None
+    return update
+
 def _processing_lock_key(event: RegimeFinalisedBarEvent) -> tuple[str, str, str, str]:
     return (event.algorithm_instance_id, event.account_id, event.runtime_mode, event.symbol)
 
@@ -2676,10 +2787,10 @@ def _decision_operational_blockers(
     orders_reconciled: bool,
     real_paper_stage_allowed: bool,
 ) -> list[str]:
-    if runtime_mode != RegimeRuntimeMode.PAPER.value or rollout_stage not in {"limited_paper", "normal_paper"}:
+    if runtime_mode not in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value} or rollout_stage not in {"limited_paper", "normal_paper"}:
         return []
     blockers: list[str] = []
-    if runtime_mode != RegimeRuntimeMode.PAPER.value:
+    if runtime_mode not in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}:
         blockers.append("regime.runtime.paper_runtime_required")
     if not metrics.supervisor_started:
         blockers.append("regime.runtime.paper_runtime_not_running")
@@ -2735,7 +2846,7 @@ def _automatic_entry_submission_blockers(
 ) -> list[str]:
     blockers: list[str] = []
     order_intent = _outbox_order_intent(outbox_record)
-    if identity.get("runtimeMode") != RegimeRuntimeMode.PAPER.value or _outbox_runtime_mode(outbox_record) != RegimeRuntimeMode.PAPER.value:
+    if identity.get("runtimeMode") not in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value} or _outbox_runtime_mode(outbox_record) not in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}:
         blockers.append("regime.execution.paper_runtime_required")
     if str(identity.get("algorithmInstanceId") or "") == REGIME_DEFAULT_SHADOW_ALGORITHM_INSTANCE_ID:
         blockers.append("regime.execution.paper_identity_required")
@@ -2815,7 +2926,7 @@ def _paper_effective_activation_evaluation(
         and bool(rollout_snapshot.get("automaticPaperSubmissionEnabled"))
         and operational_stage_allows_real_paper_submission(stage, evidence=promotion_evidence)
     )
-    paper_identity = str(identity.get("runtimeMode") or "") == RegimeRuntimeMode.PAPER.value
+    paper_identity = str(identity.get("runtimeMode") or "") in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}
     if paper_identity:
         account_snapshot = supervisor._load_shared_account_snapshot_for_identity({key: str(value) for key, value in identity.items()})
         account_blockers = _account_snapshot_preflight_blockers(account_snapshot)
@@ -2831,7 +2942,7 @@ def _paper_effective_activation_evaluation(
     open_orders_reconciled = bool(not paper_identity or (account_snapshot.get("openOrdersReconciled") is True and latest_reconciliation.get("reconciled") is True and not metrics.reconciliation_discrepancies))
     runtime_identity_valid = (
         str(identity.get("algorithmId") or "") == "regime"
-        and str(identity.get("runtimeMode") or "") == RegimeRuntimeMode.PAPER.value
+        and str(identity.get("runtimeMode") or "") in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}
         and str(identity.get("algorithmInstanceId") or "") != REGIME_DEFAULT_SHADOW_ALGORITHM_INSTANCE_ID
         and str(identity.get("accountId") or "") != REGIME_DEFAULT_SHADOW_ACCOUNT_ID
         and str(identity.get("symbol") or "").upper() == "SPY"
@@ -2882,6 +2993,37 @@ def _paper_effective_activation_evaluation(
         },
     }
 
+
+def _local_paper_inventory_blockers(snapshot: dict[str, Any], *, identity: dict[str, Any]) -> list[str]:
+    if str(identity.get("runtimeMode") or "") != RegimeRuntimeMode.LOCAL_PAPER.value:
+        return []
+    blockers: list[str] = []
+    if not snapshot:
+        return ["regime.local_paper.inventory_missing_fail_closed"]
+    if str(snapshot.get("algorithmId") or "") != "regime":
+        blockers.append("regime.local_paper.inventory_algorithm_mismatch")
+    if str(snapshot.get("runtimeMode") or "") != RegimeRuntimeMode.LOCAL_PAPER.value:
+        blockers.append("regime.local_paper.inventory_runtime_mode_mismatch")
+    if str(snapshot.get("accountId") or "") != str(identity.get("accountId") or ""):
+        blockers.append("regime.local_paper.inventory_account_id_mismatch")
+    if str(snapshot.get("algorithmInstanceId") or "") != str(identity.get("algorithmInstanceId") or ""):
+        blockers.append("regime.local_paper.inventory_instance_mismatch")
+    if str(snapshot.get("symbol") or "").upper() != str(identity.get("symbol") or "SPY").upper():
+        blockers.append("regime.local_paper.inventory_symbol_mismatch")
+    state_version = _optional_float(snapshot.get("stateVersion") or snapshot.get("sequenceVersion"))
+    if state_version is None or state_version <= 0:
+        blockers.append("regime.local_paper.inventory_missing_fail_closed")
+    quantity = int(_optional_float(snapshot.get("quantity")) or 0)
+    average = _optional_float(snapshot.get("averageEntryPrice"))
+    market_price = _optional_float(snapshot.get("marketPrice"))
+    if quantity != 0 and (average is None or average <= 0):
+        blockers.append("regime.local_paper.inventory_average_entry_impossible")
+    if quantity != 0 and (market_price is None or market_price <= 0):
+        blockers.append("regime.local_paper.inventory_market_price_impossible")
+    for field in ("reservedQuantity", "openOrderQuantity", "realizedPnl", "unrealizedPnl"):
+        if _optional_float(snapshot.get(field)) is None:
+            blockers.append(f"regime.local_paper.inventory_{field}_missing")
+    return list(dict.fromkeys(blockers))
 
 def _account_snapshot_preflight_blockers(snapshot: dict[str, Any]) -> list[str]:
     blockers = [

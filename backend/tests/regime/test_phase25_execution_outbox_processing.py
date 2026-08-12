@@ -5,6 +5,8 @@ from pathlib import Path
 from uuid import uuid4
 
 from backend.app.algorithms.regime.execution_gateway import RegimePaperGatewayStore
+from backend.app.algorithms.regime.local_paper_account import RegimeLocalPaperAccount
+from backend.app.algorithms.regime.local_paper_broker import RegimeLocalPaperBroker
 import backend.app.algorithms.regime.runtime_supervisor as regime_runtime_supervisor
 from backend.app.algorithms.regime.repository import RegimeRepository
 from backend.app.algorithms.regime.rollout import (
@@ -79,6 +81,114 @@ def test_phase25_real_paper_rollout_processes_configured_paper_identity_not_defa
     assert latest["algorithmInstanceId"] == "regime-paper-default"
 
 
+def test_phase25_local_paper_runtime_blocks_entries_when_account_missing(monkeypatch) -> None:
+    repository, identity = _repository("local_paper")
+    _record_stage_evidence(repository, identity)
+    _activate_stage(repository, identity, "simulated_execution")
+    _activate_stage(repository, identity, "limited_paper")
+    _insert_intent(repository, identity)
+    broker = RegimeLocalPaperBroker(repository=repository, identity=identity)
+    gateway = PaperOrderGateway(
+        broker,
+        RegimePaperGatewayStore(repository, identity),
+        execution_mode="LOCAL_PAPER",
+        account_snapshot_provider=broker.gateway_account_snapshot,
+        portfolio_snapshot_provider=broker.gateway_portfolio_snapshot,
+    )
+    supervisor = RegimeRuntimeSupervisor(
+        service=RegimeApplicationService(repository),
+        config=_config("local_paper"),
+        paper_gateway=gateway,
+        account_snapshot_provider=lambda _: broker.refresh_account_snapshot(),
+    )
+    _mark_ready(supervisor)
+    monkeypatch.setattr(regime_runtime_supervisor, "exchange_session", lambda _: _RegularSession())
+    repository.write_runtime_snapshot(
+        identity,
+        "automatic_paper_control",
+        {
+            "requestedAutomaticPaperTradingEnabled": True,
+            "automaticPaperTradingEnabled": True,
+            "automaticPaperSubmissionEnabled": True,
+            "paperButtonRequested": True,
+            "paperButtonEffective": True,
+            "rolloutStage": "limited_paper",
+        },
+    )
+
+    result = supervisor.process_execution_outbox_once()
+
+    assert result["processed"] is False
+    assert "regime.account_snapshot.local_paper_account_missing" in result["reasonCodes"]
+    assert broker.get_open_orders("SPY") == []
+    assert repository.read_local_paper_account_snapshot(identity) is None
+
+def test_phase25_local_paper_runtime_submits_and_fills_from_finalized_bar(monkeypatch) -> None:
+    repository, identity = _repository("local_paper")
+    _record_stage_evidence(repository, identity)
+    _activate_stage(repository, identity, "simulated_execution")
+    _activate_stage(repository, identity, "limited_paper")
+    _insert_intent(repository, identity)
+    _seed_local_paper_account(repository, identity)
+    broker = RegimeLocalPaperBroker(repository=repository, identity=identity)
+    gateway = PaperOrderGateway(
+        broker,
+        RegimePaperGatewayStore(repository, identity),
+        execution_mode="LOCAL_PAPER",
+        account_snapshot_provider=broker.gateway_account_snapshot,
+        portfolio_snapshot_provider=broker.gateway_portfolio_snapshot,
+    )
+    supervisor = RegimeRuntimeSupervisor(
+        service=RegimeApplicationService(repository),
+        config=_config("local_paper"),
+        paper_gateway=gateway,
+        account_snapshot_provider=lambda _: broker.refresh_account_snapshot(),
+    )
+    _mark_ready(supervisor)
+    monkeypatch.setattr(regime_runtime_supervisor, "exchange_session", lambda _: _RegularSession())
+    repository.write_runtime_snapshot(
+        identity,
+        "automatic_paper_control",
+        {
+            "requestedAutomaticPaperTradingEnabled": True,
+            "automaticPaperTradingEnabled": True,
+            "automaticPaperSubmissionEnabled": True,
+            "paperButtonRequested": True,
+            "paperButtonEffective": True,
+            "rolloutStage": "limited_paper",
+        },
+    )
+
+    submitted = supervisor.process_execution_outbox_once()
+
+    assert submitted["processed"] is True
+    assert submitted["submitted"] is True
+    assert submitted["status"] == "acknowledged"
+    assert broker.get_open_orders("SPY")
+    reserved = repository.read_local_paper_account_snapshot(identity)
+    assert reserved is not None
+    assert reserved["reservedCash"] > 0
+    fill_event = _local_paper_bar_event(identity, bid=99.9, ask=100.0, close=100.0)
+
+    filled = supervisor._process_local_paper_market_update(fill_event)
+
+    assert filled["processed"] is True
+    assert filled["fillCount"] == 1
+    latest = repository.read_execution_outbox_record(identity, "phase25-intent-1")
+    assert latest is not None
+    assert latest["processingStatus"] == "filled"
+    account = repository.read_local_paper_account_snapshot(identity)
+    assert account is not None
+    assert account["cash"] == 99_900.0
+    assert account["equity"] == 100_000.0
+    assert account["reservedCash"] == 0.0
+    assert account["positions"][0]["quantity"] == 1
+    inventory = repository.current_inventory_snapshot(identity)
+    assert inventory["algorithmId"] == "regime"
+    assert inventory["runtimeMode"] == "local_paper"
+    assert inventory["quantity"] == 1
+
+
 def test_phase25_outbox_claim_is_exclusive_for_configured_paper_identity() -> None:
     repository, identity = _repository()
     _insert_intent(repository, identity)
@@ -92,24 +202,24 @@ def test_phase25_outbox_claim_is_exclusive_for_configured_paper_identity() -> No
     assert second is None
 
 
-def _repository() -> tuple[RegimeRepository, dict[str, str]]:
+def _repository(runtime_mode: str = "paper") -> tuple[RegimeRepository, dict[str, str]]:
     TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
     repository = RegimeRepository(f"sqlite:///{TEST_TMP_ROOT / f'{uuid4().hex}.sqlite3'}")
     identity = {
         "algorithmId": "regime",
-        "algorithmInstanceId": "regime-paper-default",
-        "accountId": "paper-account-123",
-        "runtimeMode": "paper",
+        "algorithmInstanceId": "regime-paper-default" if runtime_mode == "paper" else "regime-local-paper-default",
+        "accountId": "paper-account-123" if runtime_mode == "paper" else "local-paper-account-123",
+        "runtimeMode": runtime_mode,
         "symbol": "SPY",
     }
     return repository, identity
 
 
-def _config() -> RegimeRuntimeSupervisorConfig:
+def _config(runtime_mode: str = "paper") -> RegimeRuntimeSupervisorConfig:
     return RegimeRuntimeSupervisorConfig(
-        default_algorithm_instance_id="regime-paper-default",
-        default_account_id="paper-account-123",
-        default_runtime_mode="paper",
+        default_algorithm_instance_id="regime-paper-default" if runtime_mode == "paper" else "regime-local-paper-default",
+        default_account_id="paper-account-123" if runtime_mode == "paper" else "local-paper-account-123",
+        default_runtime_mode=runtime_mode,
         symbol="SPY",
     )
 
@@ -178,6 +288,51 @@ def _mark_ready(supervisor: RegimeRuntimeSupervisor) -> None:
     supervisor.metrics.component_health["database"]["status"] = "healthy"
     supervisor.metrics.component_health["paper_broker"]["status"] = "healthy"
     supervisor.metrics.component_health["broker_connectivity"]["status"] = "healthy"
+
+
+def _seed_local_paper_account(repository: RegimeRepository, identity: dict[str, str]) -> None:
+    RegimeLocalPaperAccount(
+        algorithmInstanceId=identity["algorithmInstanceId"],
+        accountId=identity["accountId"],
+        runtimeMode=identity["runtimeMode"],
+        initialBalance=100_000.0,
+    ).persist(repository, symbol=identity["symbol"])
+
+def _local_paper_bar_event(identity: dict[str, str], *, bid: float, ask: float, close: float):
+    timestamp = (datetime.now(UTC) + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    candles = [
+        {
+            "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+            "open": close,
+            "high": max(bid, ask, close),
+            "low": min(bid, ask, close),
+            "close": close,
+            "volume": 100_000,
+        }
+    ]
+
+    return type(
+        "Event",
+        (),
+        {
+            "algorithm_id": "regime",
+            "algorithm_instance_id": identity["algorithmInstanceId"],
+            "account_id": identity["accountId"],
+            "runtime_mode": "local_paper",
+            "symbol": "SPY",
+            "completed_bar_timestamp": timestamp,
+            "published_at": timestamp,
+            "event_id": "phase25-local-paper-fill-event",
+            "identity": identity,
+            "market_payload": {
+                "symbol": "SPY",
+                "timeframe": "1Min",
+                "completedBarTimestamp": timestamp.isoformat().replace("+00:00", "Z"),
+                "primaryCandles": candles,
+                "contextFeeds": {"quoteFreshness": {"status": "fresh", "bid": bid, "ask": ask, "spreadBps": 1.0, "expectedFillQuantity": 100}},
+            },
+        },
+    )()
 
 
 def _fresh_account(identity: dict[str, str]) -> dict:

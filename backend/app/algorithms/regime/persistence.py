@@ -70,6 +70,7 @@ REGIME_OWNED_TABLES = (
     "regime_ml_artifacts",
     "regime_runtime_state",
     "regime_bar_processing",
+    "regime_local_paper_accounts",
     "regime_inventory_events",
     "regime_inventory_snapshots",
     "regime_daily_risk_state",
@@ -111,6 +112,7 @@ REGIME_MUTABLE_STATE_TABLES = (
     "regime_strategy_performance",
     "regime_positions",
     "regime_runtime_state",
+    "regime_local_paper_accounts",
     "regime_inventory_snapshots",
 )
 REGIME_PROCESSING_STATUS_TABLES = (
@@ -248,6 +250,12 @@ def migrate_regime_sqlite_database(path: str | Path) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_regime_inventory_snapshots_current
             ON regime_inventory_snapshots(algorithm_instance_id, account_id, runtime_mode, symbol, sequence_version)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_regime_local_paper_accounts_current
+            ON regime_local_paper_accounts(algorithm_instance_id, account_id, runtime_mode, symbol, sequence_version)
             """
         )
         conn.execute(
@@ -885,6 +893,8 @@ class RegimeSqliteRepository:
         return {"inserted": True, "orderIntentId": order_intent_id}
 
     def insert_execution_outbox_record(self, identity: dict[str, Any], outbox_record: dict[str, Any]) -> dict[str, Any]:
+        _require_full_ownership_identity(identity)
+        _require_regime_algorithm_payload(outbox_record, label="execution outbox record")
         payload = {**outbox_record, "algorithmId": REGIME_ALGORITHM_ID}
         common = _common_metadata({}, {**identity, **payload}, {**identity, **payload})
         _validate_common_metadata(common)
@@ -919,9 +929,12 @@ class RegimeSqliteRepository:
         return {"inserted": True, "orderIntentId": order_intent_id}
 
     def record_runtime_event(self, event: dict[str, Any]) -> dict[str, Any]:
-        event = {"algorithmId": REGIME_ALGORITHM_ID, **event}
+        _require_regime_algorithm_payload(event, label="runtime event")
         if isinstance(event.get("payload"), dict):
-            event["payload"] = {"algorithmId": REGIME_ALGORITHM_ID, **event["payload"]}
+            _require_regime_algorithm_payload(event["payload"], label="runtime event payload")
+        event = {**event, "algorithmId": REGIME_ALGORITHM_ID}
+        if isinstance(event.get("payload"), dict):
+            event["payload"] = {**event["payload"], "algorithmId": REGIME_ALGORITHM_ID}
         common = _common_metadata({}, event, event)
         _validate_common_metadata(common)
         event_id = str(event.get("eventId") or event.get("event_id") or common["decision_id"])
@@ -1317,7 +1330,7 @@ class RegimeSqliteRepository:
         identities: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         if fallback_identity:
             fallback = regime_settings_identity_from_payload(fallback_identity)
-            if fallback["runtimeMode"] == "paper" and fallback["algorithmInstanceId"] != "regime-default":
+            if fallback["runtimeMode"] in {"paper", "local_paper"} and fallback["algorithmInstanceId"] != "regime-default":
                 identities[(fallback["algorithmInstanceId"], fallback["accountId"], fallback["runtimeMode"], fallback["symbol"])] = fallback
         with self.connect() as conn:
             rows = conn.execute(
@@ -1341,7 +1354,7 @@ class RegimeSqliteRepository:
             instance_id = str(row["algorithm_instance_id"] or "")
             account_id = str(row["account_id"] or "")
             symbol = str(row["symbol"] or "SPY").upper()
-            if runtime_mode != "paper" or instance_id == "regime-default":
+            if runtime_mode not in {"paper", "local_paper"} or instance_id == "regime-default":
                 continue
             key = (instance_id, account_id, runtime_mode, symbol)
             identities[key] = {
@@ -1546,6 +1559,8 @@ class RegimeSqliteRepository:
         status: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        _require_full_ownership_identity(identity)
+        _require_regime_algorithm_payload(payload, label="execution outbox status payload")
         existing = self.read_execution_outbox_record(identity, order_intent_id) or {}
         common = _common_metadata({}, {**identity, **existing, **payload, "orderIntentId": order_intent_id}, {**identity, **existing, **payload, "orderIntentId": order_intent_id})
         _validate_common_metadata(common)
@@ -1727,6 +1742,282 @@ class RegimeSqliteRepository:
         payload = json.loads(str(row["payload_json"]))
         return _record(payload.get("snapshot"))
 
+    def write_local_paper_account_snapshot(self, identity: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+        common = _common_metadata({}, identity, identity)
+        _validate_common_metadata(common)
+        account_snapshot = _require_regime_local_paper_account_snapshot(snapshot, identity=identity)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            latest = self._latest_mutable_row(conn, "regime_local_paper_accounts", common)
+            next_version = int(latest["sequence_version"] if latest else 0) + 1
+            payload = {
+                **account_snapshot,
+                "sequenceVersion": next_version,
+                "persistedAt": _utc_now(),
+                "persistenceKey": {
+                    "algorithmId": REGIME_ALGORITHM_ID,
+                    "algorithmInstanceId": common["algorithm_instance_id"],
+                    "accountId": common["account_id"],
+                    "runtimeMode": common["runtime_mode"],
+                    "symbol": common["symbol"],
+                },
+            }
+            self._insert(
+                conn,
+                "regime_local_paper_accounts",
+                {**common, "decision_id": "regime-local-paper-account"},
+                f"local-paper-account-{account_snapshot.get('stateVersion') or next_version}",
+                payload,
+                processing_status="current",
+                sequence_version=next_version,
+            )
+            if self._latest_mutable_row(conn, "regime_inventory_snapshots", common) is None:
+                inventory_now = _utc_now()
+                inventory = {
+                    **_base_inventory_snapshot(identity, common),
+                    "stateVersion": 1,
+                    "inventoryStatus": "flat",
+                    "updatedAt": inventory_now,
+                    "lastUpdatedAt": inventory_now,
+                }
+                self._insert(
+                    conn,
+                    "regime_inventory_snapshots",
+                    {**common, "decision_id": "regime-local-paper-inventory"},
+                    "local-paper-inventory-initialized",
+                    inventory,
+                    processing_status="current",
+                    sequence_version=1,
+                )
+        return {"recorded": True, "sequenceVersion": next_version, "snapshot": payload}
+
+    def read_local_paper_account_snapshot(self, identity: dict[str, Any]) -> dict[str, Any] | None:
+        common = _common_metadata({}, identity, identity)
+        _validate_common_metadata(common)
+        with self.connect() as conn:
+            row = self._latest_mutable_row(conn, "regime_local_paper_accounts", common)
+        if row is None:
+            return None
+        return _require_regime_local_paper_account_snapshot(_row_payload(row), identity=identity)
+
+    def apply_local_paper_order_reservation(
+        self,
+        identity: dict[str, Any],
+        *,
+        order: dict[str, Any],
+        orders_snapshot: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        starting_balance: float = 100_000.0,
+        action: str = "reserve",
+    ) -> dict[str, Any]:
+        from backend.app.algorithms.regime.local_paper_account import RegimeLocalPaperAccount
+
+        _require_full_ownership_identity(identity)
+        _require_regime_algorithm_payload(order, label="local paper order")
+        order_payload = {**identity, **order, "algorithmId": REGIME_ALGORITHM_ID}
+        _require_matching_ownership_identity(identity, order_payload)
+        common = _common_metadata({}, {**identity, **order_payload}, {**identity, **order_payload})
+        _validate_common_metadata(common)
+        normalized_orders = [_require_regime_local_broker_record(record, identity=identity, record_type="order") for record in orders_snapshot]
+        reservation_amount = max(0.0, _float(order_payload.get("reservedCash") or order_payload.get("reservationAmount") or order_payload.get("estimatedOrderCost")))
+        side = str(order_payload.get("side") or "").upper()
+        action = str(action or "reserve").lower()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            account_row = self._latest_mutable_row(conn, "regime_local_paper_accounts", common)
+            if account_row is None:
+                raise ValueError("regime.local_paper.account_missing_fail_closed")
+            account = RegimeLocalPaperAccount.from_snapshot(_row_payload(account_row))
+            if side == "BUY" and reservation_amount > 0:
+                if action == "reserve":
+                    account.reserve_cash(reservation_amount, algorithmId=REGIME_ALGORITHM_ID)
+                elif action == "release":
+                    releasable = min(reservation_amount, float(account.get_account_snapshot().reservedCash))
+                    if releasable > 0:
+                        account.release_cash(releasable, algorithmId=REGIME_ALGORITHM_ID)
+            account_snapshot = _require_regime_local_paper_account_snapshot(account.get_account_snapshot().to_dict(), identity=identity)
+            latest_account_row = self._latest_mutable_row(conn, "regime_local_paper_accounts", common)
+            account_version = int(latest_account_row["sequence_version"] if latest_account_row else 0) + 1
+            account_payload = {
+                **account_snapshot,
+                "sequenceVersion": account_version,
+                "persistedAt": _utc_now(),
+                "persistenceKey": {
+                    "algorithmId": REGIME_ALGORITHM_ID,
+                    "algorithmInstanceId": common["algorithm_instance_id"],
+                    "accountId": common["account_id"],
+                    "runtimeMode": common["runtime_mode"],
+                    "symbol": common["symbol"],
+                },
+            }
+            self._insert(
+                conn,
+                "regime_local_paper_accounts",
+                {**common, "decision_id": "regime-local-paper-account"},
+                f"local-paper-account-{account_payload.get('stateVersion') or account_version}",
+                account_payload,
+                processing_status="current",
+                sequence_version=account_version,
+            )
+            order_observation = {
+                **order_payload,
+                "type": "order",
+                "processingStatus": str(order_payload.get("status") or ("ACCEPTED" if action == "reserve" else "CANCELED")).lower(),
+                "timestamp": order_payload.get("updatedAt") or order_payload.get("createdAt") or _utc_now(),
+            }
+            inserted = self._copy_broker_observation_in_transaction(conn, order_observation, common)
+            event = _inventory_event_from_order_status(order_observation)
+            if inserted == "regime_orders" and not self._inventory_event_exists(conn, common, event["inventoryEventId"]):
+                previous = _require_regime_inventory_snapshot(self._latest_inventory_snapshot(conn, identity, common), identity=identity)
+                next_snapshot = _apply_order_status_to_inventory_snapshot(previous, event)
+                self._insert_inventory_event_and_snapshot(conn, common, event, next_snapshot, processing_status=str(event["orderStatus"]))
+            self._insert_runtime_snapshot_in_transaction(conn, common, "local_paper_broker.orders", {"brokerVersion": "regime_local_paper_broker_v1", "orders": normalized_orders})
+        return {"updated": True, "accountSnapshot": account_snapshot, "reservedCash": account_snapshot["reservedCash"], "availableBuyingPower": account_snapshot["availableBuyingPower"]}
+
+    def apply_local_paper_fill_transaction(
+        self,
+        identity: dict[str, Any],
+        *,
+        order: dict[str, Any],
+        fill: dict[str, Any],
+        orders_snapshot: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        fills_snapshot: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        starting_balance: float = 100_000.0,
+        settings_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        from backend.app.algorithms.regime.local_paper_account import RegimeLocalPaperAccount
+
+        _require_full_ownership_identity(identity)
+        _require_regime_algorithm_payload(fill, label="local paper fill")
+        _require_regime_algorithm_payload(order, label="local paper order")
+        fill_payload = {**identity, **fill, "algorithmId": REGIME_ALGORITHM_ID}
+        order_payload = {**identity, **order, "algorithmId": REGIME_ALGORITHM_ID}
+        _require_matching_ownership_identity(identity, fill_payload)
+        _require_matching_ownership_identity(identity, order_payload)
+        common = _common_metadata({}, {**identity, **fill_payload}, {**identity, **fill_payload})
+        _validate_common_metadata(common)
+        event = _inventory_event_from_fill(identity, fill_payload, settings_snapshot=settings_snapshot)
+        fill_id = str(event["fillId"])
+        normalized_orders = [_require_regime_local_broker_record(record, identity=identity, record_type="order") for record in orders_snapshot]
+        normalized_fills = [_require_regime_local_broker_record(record, identity=identity, record_type="fill") for record in fills_snapshot]
+        if not any(str(record.get("fillId")) == fill_id for record in normalized_fills):
+            normalized_fills.append({**fill_payload, "fillId": fill_id})
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_event = self._inventory_event_payload(conn, common, event["inventoryEventId"])
+            if existing_event is not None:
+                if not _same_local_paper_fill_event(existing_event, event):
+                    raise ValueError("Regime local paper duplicate fill ambiguity")
+                account_row = self._latest_mutable_row(conn, "regime_local_paper_accounts", common)
+                if account_row is None:
+                    raise ValueError("regime.local_paper.account_missing_fail_closed")
+                account_snapshot = _require_regime_local_paper_account_snapshot(_row_payload(account_row), identity=identity)
+                inventory_snapshot = _require_regime_inventory_snapshot(self._latest_inventory_snapshot(conn, identity, common), identity=identity)
+                return {
+                    "updated": False,
+                    "duplicate": True,
+                    "reason": "regime.local_paper.duplicate_fill_ignored",
+                    "fillId": fill_id,
+                    "accountSnapshot": account_snapshot,
+                    "inventorySnapshot": inventory_snapshot,
+                }
+
+            previous_inventory = _require_regime_inventory_snapshot(self._latest_inventory_snapshot(conn, identity, common), identity=identity)
+            fill_signed_quantity = _int(event.get("signedQuantity"))
+            previous_quantity = _int(previous_inventory.get("quantity"))
+            if (
+                previous_quantity != 0
+                and fill_signed_quantity != 0
+                and ((previous_quantity > 0 and fill_signed_quantity < 0) or (previous_quantity < 0 and fill_signed_quantity > 0))
+                and abs(fill_signed_quantity) > abs(previous_quantity)
+            ):
+                raise ValueError("Regime local paper atomic fill rejects exit quantity above owned inventory")
+
+            account_row = self._latest_mutable_row(conn, "regime_local_paper_accounts", common)
+            if account_row is None:
+                raise ValueError("regime.local_paper.account_missing_fail_closed")
+            account = RegimeLocalPaperAccount.from_snapshot(_row_payload(account_row))
+            account.apply_fill(fill_payload)
+            extra_release = max(0.0, _float(fill_payload.get("reservationReleaseAmount")))
+            if extra_release > 0:
+                releasable = min(extra_release, float(account.get_account_snapshot().reservedCash))
+                if releasable > 0:
+                    account.release_cash(releasable, algorithmId=REGIME_ALGORITHM_ID)
+            account_snapshot = _require_regime_local_paper_account_snapshot(account.get_account_snapshot().to_dict(), identity=identity)
+            next_inventory = _require_regime_inventory_snapshot(_apply_fill_to_inventory_snapshot(previous_inventory, event), identity=identity)
+
+            fill_observation = {
+                **fill_payload,
+                "fillId": fill_id,
+                "type": "fill",
+                "processingStatus": str(fill_payload.get("status") or "FILLED").lower(),
+            }
+            self._copy_broker_observation_in_transaction(conn, fill_observation, common)
+            self._insert_inventory_event_and_snapshot(conn, common, event, next_inventory, processing_status="local_paper_fill_applied")
+
+            latest_account_row = self._latest_mutable_row(conn, "regime_local_paper_accounts", common)
+            account_version = int(latest_account_row["sequence_version"] if latest_account_row else 0) + 1
+            account_payload = {
+                **account_snapshot,
+                "sequenceVersion": account_version,
+                "persistedAt": _utc_now(),
+                "persistenceKey": {
+                    "algorithmId": REGIME_ALGORITHM_ID,
+                    "algorithmInstanceId": common["algorithm_instance_id"],
+                    "accountId": common["account_id"],
+                    "runtimeMode": common["runtime_mode"],
+                    "symbol": common["symbol"],
+                },
+            }
+            self._insert(
+                conn,
+                "regime_local_paper_accounts",
+                {**common, "decision_id": "regime-local-paper-account"},
+                f"local-paper-account-{account_payload.get('stateVersion') or account_version}",
+                account_payload,
+                processing_status="current",
+                sequence_version=account_version,
+            )
+
+            position = _position_state_from_local_paper_fill(conn, common, identity, previous_inventory, next_inventory, fill_payload, event, settings_snapshot or {})
+            position_id = str(position["positionId"])
+            position_sequence = _next_sequence_version_for_id(conn, "regime_positions", common, "position_id", position_id)
+            position["sequenceVersion"] = position_sequence
+            position_status = str(position.get("positionStatus") or "open").lower()
+            self._insert(
+                conn,
+                "regime_positions",
+                {**common, "position_id": position_id},
+                f"position-state-{position_id}-{position_sequence}",
+                position,
+                processing_status=position_status,
+                sequence_version=position_sequence,
+            )
+            trade = {**position, "tradeStatus": "closed" if position_status == "closed" else "open"}
+            trade_id = str(trade["tradeId"])
+            trade_sequence = _next_sequence_version_for_id(conn, "regime_trades", common, "trade_id", trade_id)
+            trade["sequenceVersion"] = trade_sequence
+            self._insert(
+                conn,
+                "regime_trades",
+                {**common, "trade_id": trade_id},
+                f"trade-state-{trade_id}-{trade_sequence}",
+                trade,
+                processing_status=str(trade["tradeStatus"]),
+                sequence_version=trade_sequence,
+            )
+
+            self._insert_runtime_snapshot_in_transaction(conn, common, "local_paper_broker.orders", {"brokerVersion": "regime_local_paper_broker_v1", "orders": normalized_orders})
+            self._insert_runtime_snapshot_in_transaction(conn, common, "local_paper_broker.fills", {"brokerVersion": "regime_local_paper_broker_v1", "fills": normalized_fills})
+
+        return {
+            "updated": True,
+            "fillId": fill_id,
+            "inventoryEventId": event["inventoryEventId"],
+            "accountSnapshot": account_snapshot,
+            "inventorySnapshot": next_inventory,
+            "position": position,
+        }
     def read_decision_snapshot_by_id(self, identity: dict[str, Any], decision_id: str) -> dict[str, Any] | None:
         common = _common_metadata({}, {**identity, "decisionId": decision_id}, {**identity, "decisionId": decision_id})
         _validate_common_metadata(common)
@@ -1773,7 +2064,8 @@ class RegimeSqliteRepository:
         _validate_common_metadata(common)
         with self.connect() as conn:
             row = self._latest_mutable_row(conn, "regime_inventory_snapshots", common)
-        return _row_payload(row) if row else _base_inventory_snapshot(identity, common)
+        snapshot = _row_payload(row) if row else _base_inventory_snapshot(identity, common)
+        return _require_regime_inventory_snapshot(snapshot, identity=identity)
 
     def apply_inventory_fill(
         self,
@@ -1792,7 +2084,7 @@ class RegimeSqliteRepository:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if self._inventory_event_exists(conn, common, event["inventoryEventId"]):
-                snapshot = self._latest_inventory_snapshot(conn, identity, common)
+                snapshot = _require_regime_inventory_snapshot(self._latest_inventory_snapshot(conn, identity, common), identity=identity)
                 return {
                     "updated": False,
                     "duplicate": True,
@@ -1800,7 +2092,7 @@ class RegimeSqliteRepository:
                     "inventoryEventId": event["inventoryEventId"],
                     "snapshot": snapshot,
                 }
-            previous = self._latest_inventory_snapshot(conn, identity, common)
+            previous = _require_regime_inventory_snapshot(self._latest_inventory_snapshot(conn, identity, common), identity=identity)
             fill_signed_quantity = _int(event.get("signedQuantity"))
             previous_quantity = _int(previous.get("quantity"))
             if (
@@ -1825,7 +2117,7 @@ class RegimeSqliteRepository:
             conn.execute("BEGIN IMMEDIATE")
             if self._inventory_event_exists(conn, common, event["inventoryEventId"]):
                 return {"recorded": False, "duplicate": True, "inventoryEventId": event["inventoryEventId"]}
-            previous = self._latest_inventory_snapshot(conn, observation, common)
+            previous = _require_regime_inventory_snapshot(self._latest_inventory_snapshot(conn, observation, common), identity=observation)
             next_snapshot = _apply_order_status_to_inventory_snapshot(previous, event)
             self._insert_inventory_event_and_snapshot(conn, common, event, next_snapshot, processing_status=str(event["orderStatus"]))
         return {"recorded": True, "inventoryEventId": event["inventoryEventId"], "snapshot": next_snapshot}
@@ -1841,7 +2133,7 @@ class RegimeSqliteRepository:
             conn.execute("BEGIN IMMEDIATE")
             if self._inventory_event_exists(conn, common, event["inventoryEventId"]):
                 return {"recorded": False, "duplicate": True, "inventoryEventId": event["inventoryEventId"]}
-            previous = self._latest_inventory_snapshot(conn, identity, common)
+            previous = _require_regime_inventory_snapshot(self._latest_inventory_snapshot(conn, identity, common), identity=identity)
             next_snapshot = _apply_fill_to_inventory_snapshot(previous, event)
             self._insert_inventory_event_and_snapshot(conn, common, event, next_snapshot, processing_status="broker_correction_applied")
         return {"recorded": True, "inventoryEventId": event["inventoryEventId"], "snapshot": next_snapshot}
@@ -1857,8 +2149,8 @@ class RegimeSqliteRepository:
         _validate_common_metadata(common)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            rebuilt = self._rebuild_inventory_snapshot_from_events(conn, identity, common)
-            current = self._latest_inventory_snapshot(conn, identity, common)
+            rebuilt = _require_regime_inventory_snapshot(self._rebuild_inventory_snapshot_from_events(conn, identity, common), identity=identity)
+            current = _require_regime_inventory_snapshot(self._latest_inventory_snapshot(conn, identity, common), identity=identity)
             snapshot_matches = _inventory_snapshots_equivalent(current, rebuilt)
             if not snapshot_matches:
                 rebuilt = {**rebuilt, "rebuildReason": "ledger_verification_mismatch"}
@@ -1938,6 +2230,7 @@ class RegimeSqliteRepository:
         return {"recorded": True, "status": status}
 
     def record_position_state(self, identity: dict[str, Any], position: dict[str, Any]) -> dict[str, Any]:
+        _require_regime_algorithm_payload(position, label="position state")
         payload = {**position, "algorithmId": REGIME_ALGORITHM_ID}
         _require_full_ownership_identity(identity)
         _require_matching_ownership_identity(identity, payload)
@@ -1953,6 +2246,7 @@ class RegimeSqliteRepository:
         return {"recorded": True, "positionId": position_id, "status": status}
 
     def record_trade_state(self, identity: dict[str, Any], trade: dict[str, Any]) -> dict[str, Any]:
+        _require_regime_algorithm_payload(trade, label="trade state")
         payload = {**trade, "algorithmId": REGIME_ALGORITHM_ID}
         _require_full_ownership_identity(identity)
         _require_matching_ownership_identity(identity, payload)
@@ -2409,6 +2703,9 @@ class RegimeSqliteRepository:
         return _row_payload(row) if row else _base_inventory_snapshot(identity, common)
 
     def _inventory_event_exists(self, conn: sqlite3.Connection, common: dict[str, str | None], inventory_event_id: str) -> bool:
+        return self._inventory_event_payload(conn, common, inventory_event_id) is not None
+
+    def _inventory_event_payload(self, conn: sqlite3.Connection, common: dict[str, str | None], inventory_event_id: str) -> dict[str, Any] | None:
         rows = conn.execute(
             """
             SELECT payload_json
@@ -2425,8 +2722,8 @@ class RegimeSqliteRepository:
         for row in rows:
             payload = json.loads(str(row["payload_json"]))
             if isinstance(payload, dict) and str(payload.get("inventoryEventId") or "") == inventory_event_id:
-                return True
-        return False
+                return payload
+        return None
 
     def _insert_inventory_event_and_snapshot(
         self,
@@ -2496,6 +2793,17 @@ class RegimeSqliteRepository:
             elif event_type == "broker_order_status":
                 snapshot = _apply_order_status_to_inventory_snapshot(snapshot, event)
         return snapshot
+
+    def _insert_runtime_snapshot_in_transaction(self, conn: sqlite3.Connection, common: dict[str, str | None], key: str, snapshot: dict[str, Any]) -> None:
+        snapshot_id = f"runtime-snapshot:{_stable_snapshot_key(key)}"
+        self._insert(
+            conn,
+            "regime_runtime_events",
+            {**common, "decision_id": snapshot_id},
+            snapshot_id,
+            {"eventType": "runtime_snapshot", "snapshotKey": key, "snapshot": sanitize_persistence_payload({"algorithmId": REGIME_ALGORITHM_ID, **snapshot}), "timestamp": _utc_now()},
+            processing_status="recorded",
+        )
 
     def _copy_broker_observation_in_transaction(self, conn: sqlite3.Connection, observation: dict[str, Any], common: dict[str, str | None]) -> str | None:
         table = _regime_ledger_table_for_observation(observation)
@@ -2649,6 +2957,7 @@ def _validate_common_metadata(common: dict[str, str | None]) -> None:
 def _require_full_ownership_identity(identity: dict[str, Any] | None) -> None:
     if not isinstance(identity, dict):
         raise ValueError("Regime repository requires explicit ownership identity")
+    _require_regime_algorithm_payload(identity, label="ownership identity")
     required = {
         "algorithm_id": ("algorithmId", "algorithm_id"),
         "algorithm_instance_id": ("algorithmInstanceId", "algorithm_instance_id"),
@@ -2659,6 +2968,12 @@ def _require_full_ownership_identity(identity: dict[str, Any] | None) -> None:
     missing = [canonical for canonical, aliases in required.items() if not any(identity.get(alias) for alias in aliases)]
     if missing:
         raise ValueError(f"Regime repository requires full ownership key: {', '.join(missing)}")
+
+
+def _require_regime_algorithm_payload(payload: dict[str, Any], *, label: str = "payload") -> None:
+    for key in ("algorithmId", "algorithm_id"):
+        if key in payload and payload.get(key) is not None and str(payload.get(key)) != REGIME_ALGORITHM_ID:
+            raise ValueError(f"Regime repository rejects cross-algorithm {label}")
 
 
 def _require_matching_ownership_identity(identity: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -2755,40 +3070,354 @@ def _string_or_none(value: Any) -> str | None:
     return text if text else None
 
 
-def _base_inventory_snapshot(identity: dict[str, Any], common: dict[str, str | None]) -> dict[str, Any]:
-    return {
+def _require_regime_local_paper_account_snapshot(
+    snapshot: dict[str, Any], *, identity: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    if str(snapshot.get("algorithmId") or snapshot.get("algorithm_id") or "") != REGIME_ALGORITHM_ID:
+        raise ValueError("Regime local paper account snapshot requires algorithmId='regime'")
+    identity = identity or {}
+    normalized = {
+        **snapshot,
         "algorithmId": REGIME_ALGORITHM_ID,
-        "algorithmInstanceId": common["algorithm_instance_id"],
-        "accountId": common["account_id"],
-        "runtimeMode": common["runtime_mode"],
-        "symbol": common["symbol"],
-        "quantity": 0,
-        "averageEntryPrice": 0.0,
-        "realizedPnl": 0.0,
-        "unrealizedPnl": 0.0,
-        "reservedCash": 0.0,
-        "reservedRisk": 0.0,
-        "openOrderQuantity": 0,
-        "positionId": None,
-        "tradeId": None,
-        "lastBrokerReconciliationTime": None,
-        "stateVersion": 0,
-        "inventoryStatus": "flat",
-        "lastDecisionId": None,
-        "lastOrderIntentId": None,
-        "lastOrderId": None,
-        "lastBrokerOrderId": None,
-        "lastFillId": None,
-        "lastInventoryEventId": None,
+        "algorithmInstanceId": str(
+            snapshot.get("algorithmInstanceId")
+            or snapshot.get("algorithm_instance_id")
+            or identity.get("algorithmInstanceId")
+            or identity.get("algorithm_instance_id")
+            or "regime-default"
+        ),
+        "accountId": str(
+            snapshot.get("accountId")
+            or snapshot.get("account_id")
+            or identity.get("accountId")
+            or identity.get("account_id")
+            or "regime-local-paper"
+        ),
+        "runtimeMode": str(
+            snapshot.get("runtimeMode")
+            or snapshot.get("runtime_mode")
+            or identity.get("runtimeMode")
+            or identity.get("runtime_mode")
+            or "paper"
+        ),
+        "symbol": str(snapshot.get("symbol") or identity.get("symbol") or "SPY").upper(),
+        "initialBalance": round(_float(snapshot.get("initialBalance") or snapshot.get("initial_balance") or 100000.0), 8),
+        "cash": round(_float(snapshot.get("cash")), 8),
+        "equity": round(_float(snapshot.get("equity")), 8),
+        "buyingPower": round(_float(snapshot.get("buyingPower") or snapshot.get("buying_power")), 8),
+        "availableBuyingPower": round(
+            _float(snapshot.get("availableBuyingPower") or snapshot.get("available_buying_power") or snapshot.get("buyingPower")), 8
+        ),
+        "reservedCash": round(_float(snapshot.get("reservedCash") or snapshot.get("reserved_cash")), 8),
+        "realizedPnl": round(_float(snapshot.get("realizedPnl") or snapshot.get("realized_pnl")), 8),
+        "unrealizedPnl": round(_float(snapshot.get("unrealizedPnl") or snapshot.get("unrealized_pnl")), 8),
+        "dailyRealizedPnl": round(_float(snapshot.get("dailyRealizedPnl") or snapshot.get("daily_realized_pnl")), 8),
+        "dailyUnrealizedPnl": round(_float(snapshot.get("dailyUnrealizedPnl") or snapshot.get("daily_unrealized_pnl")), 8),
+        "grossExposure": round(_float(snapshot.get("grossExposure") or snapshot.get("gross_exposure")), 8),
+        "netExposure": round(_float(snapshot.get("netExposure") or snapshot.get("net_exposure")), 8),
+        "feesPaid": round(_float(snapshot.get("feesPaid") or snapshot.get("fees_paid")), 8),
+        "slippagePaid": round(_float(snapshot.get("slippagePaid") or snapshot.get("slippage_paid")), 8),
+        "tradeCount": _int(snapshot.get("tradeCount") or snapshot.get("trade_count")),
+        "winningTrades": _int(snapshot.get("winningTrades") or snapshot.get("winning_trades")),
+        "losingTrades": _int(snapshot.get("losingTrades") or snapshot.get("losing_trades")),
+        "consecutiveLosses": _int(snapshot.get("consecutiveLosses") or snapshot.get("consecutive_losses")),
+        "sessionStartEquity": round(_float(snapshot.get("sessionStartEquity") or snapshot.get("session_start_equity")), 8),
+        "highWaterMark": round(_float(snapshot.get("highWaterMark") or snapshot.get("high_water_mark")), 8),
+        "drawdown": round(_float(snapshot.get("drawdown")), 8),
+        "positions": _list(snapshot.get("positions")),
+        "openOrders": _list(snapshot.get("openOrders") or snapshot.get("open_orders")),
+        "reservations": _list(snapshot.get("reservations")),
+        "lots": _list(snapshot.get("lots")),
+        "fills": _list(snapshot.get("fills")),
+        "dailyCounters": _record(snapshot.get("dailyCounters") or snapshot.get("daily_counters")),
+        "riskState": _record(snapshot.get("riskState") or snapshot.get("risk_state")),
+        "sourceAuthority": str(snapshot.get("sourceAuthority") or "regime_local_paper_account"),
+        "accountVersion": str(snapshot.get("accountVersion") or "regime_local_paper_account_v1"),
+        "stateVersion": str(snapshot.get("stateVersion") or snapshot.get("state_version") or ""),
+        "observedAt": snapshot.get("observedAt") or snapshot.get("observed_at") or _utc_now(),
+    }
+    if normalized["initialBalance"] <= 0:
+        raise ValueError("Regime local paper account snapshot requires positive initialBalance")
+    if normalized["cash"] < -1e-8 or normalized["equity"] < -1e-8:
+        raise ValueError("Regime local paper account snapshot rejects negative cash/equity")
+    if identity:
+        _require_matching_ownership_identity(identity, normalized)
+    _require_regime_owned_children(normalized, "positions")
+    _require_regime_owned_children(normalized, "openOrders")
+    _require_regime_owned_children(normalized, "reservations")
+    _require_regime_owned_children(normalized, "lots")
+    _require_regime_owned_children(normalized, "fills")
+    return normalized
+
+
+def _require_regime_owned_children(snapshot: dict[str, Any], key: str) -> None:
+    for item in _list(snapshot.get(key)):
+        algorithm_id = str(item.get("algorithmId") or item.get("algorithm_id") or REGIME_ALGORITHM_ID)
+        if algorithm_id != REGIME_ALGORITHM_ID:
+            raise ValueError(f"Regime local paper account snapshot rejects cross-algorithm {key}")
+        if item.get("accountId") is not None and str(item.get("accountId")) != str(snapshot.get("accountId")):
+            raise ValueError(f"Regime local paper account snapshot rejects account mismatch in {key}")
+        if item.get("account_id") is not None and str(item.get("account_id")) != str(snapshot.get("accountId")):
+            raise ValueError(f"Regime local paper account snapshot rejects account mismatch in {key}")
+
+
+def _require_regime_local_broker_record(record: dict[str, Any], *, identity: dict[str, Any], record_type: str) -> dict[str, Any]:
+    _require_regime_algorithm_payload(record, label=f"local paper broker {record_type}")
+    payload = {**record, "algorithmId": REGIME_ALGORITHM_ID}
+    _require_matching_ownership_identity(identity, payload)
+    if str(payload.get("runtimeMode") or payload.get("runtime_mode") or identity.get("runtimeMode")) != str(identity.get("runtimeMode") or identity.get("runtime_mode")):
+        raise ValueError(f"Regime local paper broker rejects runtime mismatch in {record_type}")
+    return payload
+
+
+def _position_state_from_local_paper_fill(
+    conn: sqlite3.Connection,
+    common: dict[str, str | None],
+    identity: dict[str, Any],
+    previous_inventory: dict[str, Any],
+    next_inventory: dict[str, Any],
+    fill: dict[str, Any],
+    event: dict[str, Any],
+    settings_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    fill_id = str(event.get("fillId") or fill.get("fillId") or "")
+    order_intent_id = str(event.get("orderIntentId") or fill.get("orderIntentId") or fill.get("order_intent_id") or "")
+    position_id = str(next_inventory.get("positionId") or previous_inventory.get("positionId") or fill.get("positionId") or f"regime-position-{common['symbol']}-{order_intent_id or fill_id}")
+    trade_id = str(next_inventory.get("tradeId") or previous_inventory.get("tradeId") or fill.get("tradeId") or f"regime-trade-{common['symbol']}-{order_intent_id or fill_id}")
+    existing = _latest_position_by_id_in_transaction(conn, common, position_id)
+    applied = list(existing.get("appliedFillIds") or [])
+    if fill_id and fill_id not in applied:
+        applied.append(fill_id)
+    quantity = abs(_int(next_inventory.get("quantity")))
+    previous_quantity = abs(_int(previous_inventory.get("quantity")))
+    fill_quantity = abs(_int(event.get("quantity")))
+    requested_quantity = _int(fill.get("submittedQuantity") or fill.get("requestedQuantity") or existing.get("requestedQuantity") or max(quantity, previous_quantity, fill_quantity))
+    remaining = max(0, requested_quantity - quantity) if quantity else 0
+    timestamp = event.get("timestamp") or fill.get("filledAt") or _utc_now()
+    next_side = str(next_inventory.get("side") or "Flat")
+    side = next_side if next_side != "Flat" else str(previous_inventory.get("side") or existing.get("side") or "Long")
+    position_status = "closed" if quantity == 0 else "open"
+    average = _float(next_inventory.get("averageEntryPrice"))
+    market_price = _float(next_inventory.get("marketPrice") or event.get("price"))
+    return {
+        **identity,
+        "algorithmId": REGIME_ALGORITHM_ID,
+        "positionManagerVersion": "regime_local_paper_atomic_fill_v1",
+        "positionId": position_id,
+        "tradeId": trade_id,
+        "decisionId": event.get("decisionId") or fill.get("decisionId") or existing.get("decisionId") or "",
+        "orderIntentId": order_intent_id,
+        "brokerOrderId": fill.get("brokerOrderId") or fill.get("broker_order_id") or existing.get("brokerOrderId"),
+        "side": side,
+        "entryState": existing.get("entryState") or ("partially_filled" if remaining else "filled"),
+        "positionStatus": position_status,
+        "averageFillPrice": round(average, 8),
+        "averageEntryPrice": round(average, 8),
+        "marketPrice": round(market_price, 8),
+        "marketValue": round(_float(next_inventory.get("marketValue")), 8),
+        "reservedQuantity": max(0, remaining),
+        "openOrderQuantity": max(0, _int(next_inventory.get("openOrderQuantity"))),
+        "filledQuantity": quantity,
+        "quantity": quantity,
+        "remainingQuantity": remaining,
+        "requestedQuantity": requested_quantity,
+        "stopPrice": next_inventory.get("stopPrice"),
+        "targetPrice": next_inventory.get("targetPrice"),
+        "initialProtectiveStopRequired": next_inventory.get("stopPrice") is not None,
+        "initialProfitTargetPresent": next_inventory.get("targetPrice") is not None,
+        "protectiveOrderQuantity": int(existing.get("protectiveOrderQuantity") or 0),
+        "partialFillProtectionState": existing.get("partialFillProtectionState") or "not_required",
+        "filledQuantityProtected": bool(existing.get("filledQuantityProtected", False)),
+        "highestFavorablePrice": max(_float(existing.get("highestFavorablePrice") or market_price), market_price),
+        "lowestFavorablePrice": min(_float(existing.get("lowestFavorablePrice") or market_price), market_price),
+        "realizedPnl": round(_float(next_inventory.get("realizedPnl")), 8),
+        "unrealizedPnl": round(_float(next_inventory.get("unrealizedPnl")), 8),
+        "holdingBars": int(existing.get("holdingBars") or 0),
+        "exitState": existing.get("exitState") or "none",
+        "reconciliationState": existing.get("reconciliationState") or "reconciled",
+        "authoritativeInventorySnapshot": next_inventory,
+        "appliedFillIds": tuple(applied),
+        "stopTargetHistory": list(existing.get("stopTargetHistory") or []),
+        "settingsVersion": settings_snapshot.get("settingsVersion") or fill.get("settingsVersion") or existing.get("settingsVersion"),
+        "openedAt": None if quantity == 0 else existing.get("openedAt") or previous_inventory.get("openedAt") or timestamp,
+        "updatedAt": timestamp,
     }
 
 
-def _inventory_event_from_fill(identity: dict[str, Any], fill: dict[str, Any], *, settings_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+def _latest_position_by_id_in_transaction(conn: sqlite3.Connection, common: dict[str, str | None], position_id: str) -> dict[str, Any]:
+    if not position_id:
+        return {}
+    row = conn.execute(
+        """
+        SELECT payload_json
+        FROM regime_positions
+        WHERE algorithm_id = 'regime'
+          AND algorithm_instance_id = ?
+          AND account_id = ?
+          AND runtime_mode = ?
+          AND symbol = ?
+          AND position_id = ?
+        ORDER BY sequence_version DESC, rowid DESC
+        LIMIT 1
+        """,
+        (common["algorithm_instance_id"], common["account_id"], common["runtime_mode"], common["symbol"], position_id),
+    ).fetchone()
+    if row is None:
+        return {}
+    payload = json.loads(str(row["payload_json"]))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _base_inventory_snapshot(identity: dict[str, Any], common: dict[str, str | None]) -> dict[str, Any]:
+    now = _utc_now()
+    return _require_regime_inventory_snapshot(
+        {
+            "algorithmId": REGIME_ALGORITHM_ID,
+            "algorithmInstanceId": common["algorithm_instance_id"],
+            "accountId": common["account_id"],
+            "runtimeMode": common["runtime_mode"],
+            "symbol": common["symbol"],
+            "quantity": 0,
+            "side": "Flat",
+            "averageEntryPrice": 0.0,
+            "marketPrice": 0.0,
+            "marketValue": 0.0,
+            "reservedQuantity": 0,
+            "openOrderQuantity": 0,
+            "realizedPnl": 0.0,
+            "unrealizedPnl": 0.0,
+            "reservedCash": 0.0,
+            "reservedRisk": 0.0,
+            "stopPrice": None,
+            "targetPrice": None,
+            "openedAt": None,
+            "updatedAt": now,
+            "lastUpdatedAt": now,
+            "positionId": None,
+            "tradeId": None,
+            "lastBrokerReconciliationTime": None,
+            "stateVersion": 0,
+            "inventoryStatus": "flat",
+            "lastDecisionId": None,
+            "lastOrderIntentId": None,
+            "lastOrderId": None,
+            "lastBrokerOrderId": None,
+            "lastFillId": None,
+            "lastInventoryEventId": None,
+        },
+        identity=identity,
+    )
+
+
+def _require_regime_inventory_snapshot(
+    snapshot: dict[str, Any], *, identity: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    if str(snapshot.get("algorithmId") or snapshot.get("algorithm_id") or "") != REGIME_ALGORITHM_ID:
+        raise ValueError("Regime inventory snapshot requires algorithmId='regime'")
+    identity = identity or {}
+    quantity = _int(snapshot.get("quantity"))
+    market_price = _float(
+        snapshot.get("marketPrice")
+        or snapshot.get("market_price")
+        or snapshot.get("averageEntryPrice")
+        or snapshot.get("average_entry_price")
+    )
+    updated_at = (
+        snapshot.get("updatedAt")
+        or snapshot.get("updated_at")
+        or snapshot.get("lastUpdatedAt")
+        or snapshot.get("last_updated_at")
+        or _utc_now()
+    )
+    normalized = {
+        **snapshot,
+        "algorithmId": REGIME_ALGORITHM_ID,
+        "algorithmInstanceId": str(
+            snapshot.get("algorithmInstanceId")
+            or snapshot.get("algorithm_instance_id")
+            or identity.get("algorithmInstanceId")
+            or identity.get("algorithm_instance_id")
+            or "regime-default"
+        ),
+        "accountId": str(
+            snapshot.get("accountId")
+            or snapshot.get("account_id")
+            or identity.get("accountId")
+            or identity.get("account_id")
+            or "paper-account"
+        ),
+        "runtimeMode": str(
+            snapshot.get("runtimeMode")
+            or snapshot.get("runtime_mode")
+            or identity.get("runtimeMode")
+            or identity.get("runtime_mode")
+            or "paper"
+        ),
+        "symbol": str(snapshot.get("symbol") or identity.get("symbol") or "SPY").upper(),
+        "quantity": quantity,
+        "side": str(snapshot.get("side") or _inventory_side_from_quantity(quantity)),
+        "averageEntryPrice": _float(
+            snapshot.get("averageEntryPrice") or snapshot.get("average_entry_price")
+        ),
+        "marketPrice": market_price,
+        "marketValue": round(abs(quantity) * market_price, 8),
+        "reservedQuantity": max(
+            0, _int(snapshot.get("reservedQuantity") or snapshot.get("reserved_quantity"))
+        ),
+        "openOrderQuantity": max(
+            0, _int(snapshot.get("openOrderQuantity") or snapshot.get("open_order_quantity"))
+        ),
+        "realizedPnl": round(
+            _float(snapshot.get("realizedPnl") or snapshot.get("realized_pnl")), 8
+        ),
+        "unrealizedPnl": round(
+            _float(snapshot.get("unrealizedPnl") or snapshot.get("unrealized_pnl")), 8
+        ),
+        "stopPrice": snapshot.get("stopPrice")
+        if snapshot.get("stopPrice") is not None
+        else snapshot.get("stop_price"),
+        "targetPrice": snapshot.get("targetPrice")
+        if snapshot.get("targetPrice") is not None
+        else snapshot.get("target_price"),
+        "openedAt": snapshot.get("openedAt") or snapshot.get("opened_at"),
+        "updatedAt": updated_at,
+        "lastUpdatedAt": updated_at,
+    }
+    if identity:
+        _require_matching_ownership_identity(identity, normalized)
+    return normalized
+
+
+def _same_local_paper_fill_event(existing: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    keys = ("fillId", "orderIntentId", "brokerOrderId", "symbol", "side", "quantity", "signedQuantity", "price", "fillPrice", "commission", "fees", "slippage")
+    for key in keys:
+        if str(existing.get(key) or "") != str(candidate.get(key) or ""):
+            return False
+    return True
+
+
+def _inventory_side_from_quantity(quantity: int) -> str:
+    if quantity > 0:
+        return "Long"
+    if quantity < 0:
+        return "Short"
+    return "Flat"
+
+
+def _inventory_event_from_fill(
+    identity: dict[str, Any], fill: dict[str, Any], *, settings_snapshot: dict[str, Any] | None = None
+) -> dict[str, Any]:
     quantity = abs(_int(fill.get("filledQuantity") or fill.get("filled_quantity") or fill.get("quantity")))
     price = _float(fill.get("averageFillPrice") or fill.get("average_fill_price") or fill.get("fillPrice") or fill.get("price"))
     side = _normal_inventory_side(fill.get("side") or fill.get("orderSide") or "Buy")
-    fill_id = str(fill.get("fillId") or fill.get("fill_id") or f"{fill.get('orderIntentId') or fill.get('order_intent_id')}:{fill.get('filledAt') or fill.get('timestamp')}:{quantity}:{price}")
+    fill_id = str(
+        fill.get("fillId")
+        or fill.get("fill_id")
+        or f"{fill.get('orderIntentId') or fill.get('order_intent_id')}:"
+        f"{fill.get('filledAt') or fill.get('timestamp')}:{quantity}:{price}"
+    )
     event_id = f"regime-inventory-fill-{_stable_snapshot_key(fill_id)}"
+    settings_snapshot = settings_snapshot or {}
     return {
         "algorithmId": REGIME_ALGORITHM_ID,
         "eventType": "broker_fill",
@@ -2807,9 +3436,25 @@ def _inventory_event_from_fill(identity: dict[str, Any], fill: dict[str, Any], *
         "quantity": quantity,
         "price": price,
         "timestamp": fill.get("filledAt") or fill.get("timestamp") or _utc_now(),
-        "settingsVersion": (settings_snapshot or {}).get("settingsVersion") or fill.get("settingsVersion") or fill.get("settings_version"),
-        "profileVersion": (settings_snapshot or {}).get("profileVersion") or fill.get("profileVersion") or fill.get("profile_version"),
+        "settingsVersion": settings_snapshot.get("settingsVersion")
+        or fill.get("settingsVersion")
+        or fill.get("settings_version"),
+        "profileVersion": settings_snapshot.get("profileVersion")
+        or fill.get("profileVersion")
+        or fill.get("profile_version"),
         "submittedQuantity": _int(fill.get("submittedQuantity") or fill.get("submitted_quantity")),
+        "stopPrice": fill.get("stopPrice")
+        or fill.get("stop_price")
+        or settings_snapshot.get("stopPrice")
+        or settings_snapshot.get("stop_price"),
+        "targetPrice": fill.get("targetPrice")
+        or fill.get("target_price")
+        or settings_snapshot.get("targetPrice")
+        or settings_snapshot.get("target_price"),
+        "commission": _float(fill.get("commission") or fill.get("commissions")),
+        "fees": _float(fill.get("fees") or fill.get("regulatoryFees") or fill.get("regulatory_fees")),
+        "slippage": _float(fill.get("slippage") or fill.get("slippagePaid") or fill.get("slippage_paid")),
+        "totalExecutionCost": _float(fill.get("totalExecutionCost") or fill.get("total_execution_cost")),
         "brokerStatus": fill.get("status") or fill.get("fillStatus") or fill.get("processingStatus"),
     }
 
@@ -2860,6 +3505,7 @@ def _inventory_event_from_broker_correction(identity: dict[str, Any], correction
 
 
 def _apply_fill_to_inventory_snapshot(snapshot: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    snapshot = _require_regime_inventory_snapshot(snapshot)
     previous_quantity = _int(snapshot.get("quantity"))
     previous_average = _float(snapshot.get("averageEntryPrice"))
     fill_signed_quantity = _int(event.get("signedQuantity"))
@@ -2874,7 +3520,10 @@ def _apply_fill_to_inventory_snapshot(snapshot: dict[str, Any], event: dict[str,
         average = ((previous_average * abs(previous_quantity)) + (fill_price * fill_quantity)) / total_quantity if total_quantity else 0.0
     else:
         closing_quantity = min(abs(previous_quantity), fill_quantity)
-        realized_delta = (fill_price - previous_average) * closing_quantity * (1 if previous_quantity > 0 else -1)
+        execution_cost = _float(event.get("totalExecutionCost")) or (
+            _float(event.get("commission")) + _float(event.get("fees")) + _float(event.get("slippage"))
+        )
+        realized_delta = ((fill_price - previous_average) * closing_quantity * (1 if previous_quantity > 0 else -1)) - execution_cost
         if new_quantity == 0:
             average = 0.0
         elif (previous_quantity > 0 and new_quantity > 0) or (previous_quantity < 0 and new_quantity < 0):
@@ -2885,13 +3534,23 @@ def _apply_fill_to_inventory_snapshot(snapshot: dict[str, Any], event: dict[str,
     open_order_quantity = max(0, _int(snapshot.get("openOrderQuantity")) - fill_quantity)
     position_id = event.get("positionId") or snapshot.get("positionId") or f"regime-position-{event.get('symbol', 'SPY')}-{event.get('orderIntentId') or event.get('fillId')}"
     trade_id = event.get("tradeId") or snapshot.get("tradeId") or f"regime-trade-{event.get('symbol', 'SPY')}-{event.get('orderIntentId') or event.get('fillId')}"
-    return {
+    updated_at = event.get("timestamp") or _utc_now()
+    next_snapshot = {
         **snapshot,
         "quantity": new_quantity,
+        "side": _inventory_side_from_quantity(new_quantity),
         "averageEntryPrice": round(average, 8),
+        "marketPrice": round(fill_price, 8),
+        "marketValue": round(abs(new_quantity) * fill_price, 8),
+        "reservedQuantity": max(0, min(_int(snapshot.get("reservedQuantity")), abs(new_quantity))),
         "realizedPnl": round(_float(snapshot.get("realizedPnl")) + realized_delta, 8),
         "unrealizedPnl": 0.0 if new_quantity == 0 else round((fill_price - average) * abs(new_quantity) * (1 if new_quantity > 0 else -1), 8),
         "openOrderQuantity": open_order_quantity,
+        "stopPrice": None if new_quantity == 0 else event.get("stopPrice") or snapshot.get("stopPrice"),
+        "targetPrice": None if new_quantity == 0 else event.get("targetPrice") or snapshot.get("targetPrice"),
+        "openedAt": None if new_quantity == 0 else snapshot.get("openedAt") or updated_at,
+        "updatedAt": updated_at,
+        "lastUpdatedAt": updated_at,
         "positionId": None if new_quantity == 0 else position_id,
         "tradeId": trade_id,
         "inventoryStatus": "flat" if new_quantity == 0 else "open",
@@ -2902,11 +3561,12 @@ def _apply_fill_to_inventory_snapshot(snapshot: dict[str, Any], event: dict[str,
         "lastBrokerOrderId": event.get("brokerOrderId") or snapshot.get("lastBrokerOrderId"),
         "lastFillId": event.get("fillId"),
         "lastInventoryEventId": event.get("inventoryEventId"),
-        "lastUpdatedAt": event.get("timestamp") or _utc_now(),
     }
+    return _require_regime_inventory_snapshot(next_snapshot)
 
 
 def _apply_order_status_to_inventory_snapshot(snapshot: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    snapshot = _require_regime_inventory_snapshot(snapshot)
     status = str(event.get("orderStatus") or "").lower()
     terminal = {"cancelled", "canceled", "rejected", "expired"}
     open_status = {"acknowledged", "accepted", "new", "partially_filled", "replaced", "submitted"}
@@ -2917,17 +3577,21 @@ def _apply_order_status_to_inventory_snapshot(snapshot: dict[str, Any], event: d
         quantity = _int(event.get("remainingQuantity")) or _int(event.get("quantity"))
         next_open_quantity = max(next_open_quantity, quantity)
     state_version = _int(snapshot.get("stateVersion")) + 1
-    return {
+    updated_at = event.get("timestamp") or _utc_now()
+    next_snapshot = {
         **snapshot,
         "openOrderQuantity": next_open_quantity,
+        "reservedQuantity": next_open_quantity,
         "stateVersion": state_version,
         "lastDecisionId": event.get("decisionId") or snapshot.get("lastDecisionId"),
         "lastOrderIntentId": event.get("orderIntentId") or snapshot.get("lastOrderIntentId"),
         "lastOrderId": event.get("orderId") or snapshot.get("lastOrderId"),
         "lastBrokerOrderId": event.get("brokerOrderId") or snapshot.get("lastBrokerOrderId"),
         "lastInventoryEventId": event.get("inventoryEventId"),
-        "lastUpdatedAt": event.get("timestamp") or _utc_now(),
+        "updatedAt": updated_at,
+        "lastUpdatedAt": updated_at,
     }
+    return _require_regime_inventory_snapshot(next_snapshot)
 
 
 def _inventory_snapshots_equivalent(left: dict[str, Any], right: dict[str, Any]) -> bool:

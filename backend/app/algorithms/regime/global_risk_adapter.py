@@ -145,6 +145,18 @@ def regime_global_risk_adapter_inventory() -> dict[str, object]:
         "mayRewriteSignals": False,
         "mayRewriteSettings": False,
         "mayRewriteStops": False,
+        "mayMutateRegimeAccount": False,
+        "mayMutateRegimeInventory": False,
+        "mayMutateRegimePositions": False,
+        "mayMutateRegimeTradeHistory": False,
+        "allowedEffects": ("approve", "reject", "reduce_quantity", "emergency_stop"),
+        "notAuthoritativeFor": (
+            "regime_cash",
+            "regime_equity",
+            "regime_positions",
+            "regime_inventory",
+            "regime_trade_history",
+        ),
         "requiresAttribution": (
             "algorithm_id",
             "decision_id",
@@ -283,6 +295,9 @@ def _regime_exposure_position(payload: Mapping[str, Any] | float | int | None, s
     if payload is None:
         return None
     if isinstance(payload, Mapping):
+        algorithm_id = _lookup(payload, "algorithmId", "algorithm_id")
+        if algorithm_id is not None and str(algorithm_id) != "regime":
+            raise ValueError("existing_regime_exposure must belong to regime")
         quantity = int(_number(_lookup(payload, "quantity", "qty")) or 0)
         market_value = _nonnegative_or_none(_lookup(payload, "marketValue", "notional", "positionNotional"))
         open_risk = max(0.0, float(_lookup(payload, "openRiskDollars", "reservedRisk", "riskDollars", default=0.0) or 0.0))

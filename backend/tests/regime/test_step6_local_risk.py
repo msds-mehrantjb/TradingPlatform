@@ -110,6 +110,215 @@ def test_local_risk_reduces_quantity_with_stable_reason_codes(mutate, expected_q
     assert any(reduction["reasonCode"] == expected_reason for reduction in result.reductions)
 
 
+def test_local_paper_risk_requires_regime_local_account_authority() -> None:
+    context = _context()
+    context.update(
+        {
+            "runtimeMode": "local_paper",
+            "expectedAccountId": "regime-local-paper-account",
+            "expectedAlgorithmInstanceId": "regime-local-paper-default",
+            "accountSnapshot": {
+                "algorithmId": "regime",
+                "algorithmInstanceId": "regime-local-paper-default",
+                "accountId": "regime-local-paper-account",
+                "runtimeMode": "local_paper",
+                "sourceAuthority": "broker",
+                "equity": 100_000.0,
+                "cash": 100_000.0,
+                "buyingPower": 100_000.0,
+                "availableBuyingPower": 100_000.0,
+                "accountSnapshotFresh": True,
+                "buyingPowerCurrent": True,
+            },
+            "inventorySnapshot": _local_inventory(),
+        }
+    )
+
+    result = evaluate_regime_local_risk(
+        decision_id="regime-local-paper-authority",
+        order_intent_id="regime-local-paper-authority-intent",
+        settings_version="regime-settings-v1",
+        requested_quantity=10,
+        entry_price=100.0,
+        aggregation=_aggregation(),
+        classification=_classification(),
+        state=None,
+        settings=_settings(),
+        runtime_context=context,
+        evaluated_at=NOW,
+    )
+
+    assert result.passed is False
+    assert "regime.local_risk.local_account_not_authoritative" in result.blockers
+
+
+def test_local_paper_risk_rejects_non_regime_inventory() -> None:
+    context = _local_paper_context()
+    context["inventorySnapshot"] = {
+        **_local_inventory(),
+        "algorithmId": "weighted_voting",
+    }
+
+    result = evaluate_regime_local_risk(
+        decision_id="regime-local-paper-cross-inventory",
+        order_intent_id="regime-local-paper-cross-inventory-intent",
+        settings_version="regime-settings-v1",
+        requested_quantity=10,
+        entry_price=100.0,
+        aggregation=_aggregation(),
+        classification=_classification(),
+        state=None,
+        settings=_settings(),
+        runtime_context=context,
+        evaluated_at=NOW,
+    )
+
+    assert result.passed is False
+    assert "regime.local_risk.inventory_snapshot_unavailable" in result.blockers
+
+
+def test_local_paper_risk_fails_closed_on_impossible_account_and_missing_inventory_state() -> None:
+    context = _local_paper_context(cash=10_000.0, available_buying_power=10_000.0)
+    context["accountSnapshot"] = {**context["accountSnapshot"], "reservedCash": 20_000.0}
+    context["inventorySnapshot"] = {**context["inventorySnapshot"], "stateVersion": 0}
+
+    result = evaluate_regime_local_risk(
+        decision_id="regime-local-paper-impossible-account",
+        order_intent_id="regime-local-paper-impossible-account-intent",
+        settings_version="regime-settings-v1",
+        requested_quantity=10,
+        entry_price=100.0,
+        aggregation=_aggregation(),
+        classification=_classification(),
+        state=None,
+        settings=_settings(),
+        runtime_context=context,
+        evaluated_at=NOW,
+    )
+
+    assert result.passed is False
+    assert "regime.local_risk.local_account_reserved_cash_exceeds_cash" in result.blockers
+    assert "regime.local_risk.inventory_snapshot_unavailable" in result.blockers
+
+@pytest.mark.parametrize(
+    ("cash", "available_buying_power", "expected"),
+    [
+        (500.0, 10_000.0, "regime.local_risk.insufficient_cash"),
+        (10_000.0, 500.0, "regime.local_risk.insufficient_buying_power"),
+    ],
+)
+def test_local_paper_risk_blocks_insufficient_local_cash_or_buying_power(cash, available_buying_power, expected) -> None:
+    context = _local_paper_context(cash=cash, available_buying_power=available_buying_power)
+
+    result = evaluate_regime_local_risk(
+        decision_id="regime-local-paper-funds",
+        order_intent_id="regime-local-paper-funds-intent",
+        settings_version="regime-settings-v1",
+        requested_quantity=10,
+        entry_price=100.0,
+        aggregation=_aggregation(),
+        classification=_classification(),
+        state=None,
+        settings=_settings(),
+        runtime_context=context,
+        evaluated_at=NOW,
+    )
+
+    assert result.passed is False
+    assert expected in result.blockers
+
+def test_local_paper_risk_uses_local_available_buying_power_without_double_counting_reserved_cash() -> None:
+    context = _local_paper_context(available_buying_power=1_000.0, cash=10_000.0, reserved_cash=500.0)
+
+    result = evaluate_regime_local_risk(
+        decision_id="regime-local-paper-buying-power",
+        order_intent_id="regime-local-paper-buying-power-intent",
+        settings_version="regime-settings-v1",
+        requested_quantity=10,
+        entry_price=100.0,
+        aggregation=_aggregation(),
+        classification=_classification(),
+        state=None,
+        settings=_settings(),
+        runtime_context=context,
+        evaluated_at=NOW,
+    )
+
+    assert result.passed is True
+    assert result.approvedQuantity == 10
+    assert not any(reduction["reasonCode"] == "regime.local_risk.reduce.buying_power" for reduction in result.reductions)
+
+
+def test_regime_local_paper_daily_loss_limit_stops_new_entries() -> None:
+    context = _local_paper_context(equity=99_400.0, cash=99_400.0, daily_realized_pnl=-600.0)
+    settings = {**_settings(), "maxDailyLossPercent": 0.005}
+
+    result = evaluate_regime_local_risk(
+        decision_id="regime-local-paper-daily-loss",
+        order_intent_id="regime-local-paper-daily-loss-intent",
+        settings_version="regime-settings-v1",
+        requested_quantity=10,
+        entry_price=100.0,
+        aggregation=_aggregation(),
+        classification=_classification(),
+        state=None,
+        settings=settings,
+        runtime_context=context,
+        evaluated_at=NOW,
+    )
+
+    assert result.passed is False
+    assert "regime.local_risk.daily_loss_limit" in result.blockers
+    assert result.approvedQuantity == 0
+
+def test_local_paper_risk_blocks_local_daily_loss_drawdown_and_consecutive_losses() -> None:
+    context = _local_paper_context(equity=95_000.0, cash=95_000.0, daily_realized_pnl=-600.0, drawdown=6_000.0, high_water=101_000.0, consecutive_losses=3)
+    settings = {**_settings(), "maxDailyLossPercent": 0.005, "maxDrawdownPercent": 0.05, "maxConsecutiveLosses": 3}
+
+    result = evaluate_regime_local_risk(
+        decision_id="regime-local-paper-daily",
+        order_intent_id="regime-local-paper-daily-intent",
+        settings_version="regime-settings-v1",
+        requested_quantity=1,
+        entry_price=100.0,
+        aggregation=_aggregation(),
+        classification=_classification(),
+        state=None,
+        settings=settings,
+        runtime_context=context,
+        evaluated_at=NOW,
+    )
+
+    assert result.passed is False
+    assert "regime.local_risk.daily_loss_limit" in result.blockers
+    assert "regime.local_risk.drawdown_limit" in result.blockers
+    assert "regime.local_risk.consecutive_loss_breaker" in result.blockers
+
+
+def test_local_paper_risk_uses_local_equity_for_position_percent_and_risk_per_trade() -> None:
+    context = _local_paper_context(equity=10_000.0, cash=10_000.0)
+    context["plannedRiskDollars"] = 200.0
+    settings = {**_settings(), "baseRiskPercent": 0.01, "maxPositionPercent": 0.10}
+
+    result = evaluate_regime_local_risk(
+        decision_id="regime-local-paper-equity",
+        order_intent_id="regime-local-paper-equity-intent",
+        settings_version="regime-settings-v1",
+        requested_quantity=20,
+        entry_price=100.0,
+        aggregation=_aggregation(),
+        classification=_classification(),
+        state=None,
+        settings=settings,
+        runtime_context=context,
+        evaluated_at=NOW,
+    )
+
+    assert result.passed is False
+    assert "regime.local_risk.max_risk_per_trade" in result.blockers
+    assert any(reduction["reasonCode"] == "regime.local_risk.reduce.maximum_position_percent" and reduction["approvedQuantity"] == 10 for reduction in result.reductions)
+
+
 @pytest.mark.parametrize(
     ("risk_payload", "expected_reason"),
     [
@@ -300,3 +509,69 @@ class _FakeBroker:
 
     def refresh_positions(self) -> list[dict]:
         return []
+
+
+def _local_paper_context(
+    *,
+    equity: float = 100_000.0,
+    cash: float = 100_000.0,
+    buying_power: float | None = None,
+    available_buying_power: float | None = None,
+    reserved_cash: float = 0.0,
+    daily_realized_pnl: float = 0.0,
+    daily_unrealized_pnl: float = 0.0,
+    drawdown: float = 0.0,
+    high_water: float | None = None,
+    consecutive_losses: int = 0,
+) -> dict:
+    context = _context()
+    context.update(
+        {
+            "runtimeMode": "local_paper",
+            "expectedAccountId": "regime-local-paper-account",
+            "expectedAlgorithmInstanceId": "regime-local-paper-default",
+            "accountSnapshot": {
+                "algorithmId": "regime",
+                "algorithmInstanceId": "regime-local-paper-default",
+                "accountId": "regime-local-paper-account",
+                "runtimeMode": "local_paper",
+                "sourceAuthority": "regime_local_paper_account",
+                "equity": equity,
+                "cash": cash,
+                "buyingPower": buying_power if buying_power is not None else cash - reserved_cash,
+                "availableBuyingPower": available_buying_power if available_buying_power is not None else cash - reserved_cash,
+                "reservedCash": reserved_cash,
+                "dailyRealizedPnl": daily_realized_pnl,
+                "dailyUnrealizedPnl": daily_unrealized_pnl,
+                "tradeCount": 0,
+                "consecutiveLosses": consecutive_losses,
+                "sessionStartEquity": 100_000.0,
+                "highWaterMark": high_water if high_water is not None else equity,
+                "drawdown": drawdown,
+                "accountSnapshotFresh": True,
+                "buyingPowerCurrent": True,
+            },
+            "inventorySnapshot": _local_inventory(reserved_cash=reserved_cash),
+        }
+    )
+    return context
+
+
+def _local_inventory(*, quantity: int = 0, open_order_quantity: int = 0, reserved_cash: float = 0.0) -> dict:
+    return {
+        "algorithmId": "regime",
+        "algorithmInstanceId": "regime-local-paper-default",
+        "accountId": "regime-local-paper-account",
+        "runtimeMode": "local_paper",
+        "symbol": "SPY",
+        "quantity": quantity,
+        "averageEntryPrice": 100.0 if quantity else 0.0,
+        "marketPrice": 100.0 if quantity else 0.0,
+        "openOrderQuantity": open_order_quantity,
+        "reservedQuantity": open_order_quantity,
+        "reservedCash": reserved_cash,
+        "realizedPnl": 0.0,
+        "unrealizedPnl": 0.0,
+        "stateVersion": 1,
+        "inventoryReconciled": True,
+    }

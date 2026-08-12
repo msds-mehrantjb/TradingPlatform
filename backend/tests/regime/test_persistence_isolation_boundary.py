@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 from uuid import uuid4
 
+from backend.app.algorithms.regime.local_paper_account import RegimeLocalPaperAccount
 from backend.app.algorithms.regime.persistence import REGIME_OWNED_TABLES, RegimeSqliteRepository
 
 
@@ -158,6 +159,179 @@ def test_broker_observations_copy_to_regime_owned_ledgers_with_stable_ids_and_re
     assert "secret-value" not in payload
 
 
+def test_local_auto_paper_inventory_snapshot_contract_and_payload_algorithm_assertion() -> None:
+    path = _temp_db_path()
+    repository = RegimeSqliteRepository(f"sqlite:///{path}")
+    identity = _identity()
+
+    update = repository.apply_inventory_fill(
+        identity,
+        {
+            **identity,
+            "type": "fill",
+            "decisionId": "decision-local-contract",
+            "orderIntentId": "intent-local-contract",
+            "fillId": "fill-local-contract",
+            "side": "Buy",
+            "filledQuantity": 7,
+            "averageFillPrice": 101.25,
+            "stopPrice": 99.5,
+            "targetPrice": 104.0,
+            "filledAt": "2026-07-23T16:00:00Z",
+        },
+    )
+
+    snapshot = update["snapshot"]
+    for key in (
+        "algorithmId",
+        "algorithmInstanceId",
+        "accountId",
+        "runtimeMode",
+        "symbol",
+        "quantity",
+        "side",
+        "averageEntryPrice",
+        "marketPrice",
+        "marketValue",
+        "reservedQuantity",
+        "openOrderQuantity",
+        "realizedPnl",
+        "unrealizedPnl",
+        "stopPrice",
+        "targetPrice",
+        "openedAt",
+        "updatedAt",
+    ):
+        assert key in snapshot
+    assert snapshot["algorithmId"] == "regime"
+    assert snapshot["quantity"] == 7
+    assert snapshot["side"] == "Long"
+    assert snapshot["averageEntryPrice"] == 101.25
+    assert snapshot["marketPrice"] == 101.25
+    assert snapshot["marketValue"] == 708.75
+    assert snapshot["stopPrice"] == 99.5
+    assert snapshot["targetPrice"] == 104.0
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO regime_inventory_snapshots (
+                record_id, algorithm_id, algorithm_instance_id, account_id, runtime_mode,
+                algorithm_version, settings_version, strategy_version, profile_version,
+                timestamp, event_timestamp, symbol, data_timestamp, decision_id,
+                position_id, trade_id, processing_status, sequence_version, payload_json
+            )
+            VALUES (?, 'regime', ?, ?, ?, 'v', 's', 'strategy', 'profile', ?, ?, ?, ?, ?, ?, ?, 'forged', 99, ?)
+            """,
+            (
+                "forged-foreign-inventory-payload",
+                identity["algorithmInstanceId"],
+                identity["accountId"],
+                identity["runtimeMode"],
+                "2026-07-23T16:01:00Z",
+                "2026-07-23T16:01:00Z",
+                identity["symbol"],
+                "2026-07-23T16:01:00Z",
+                "forged-decision",
+                "forged-position",
+                "forged-trade",
+                '{"algorithmId":"weighted_voting","algorithmInstanceId":"regime-a","accountId":"paper-a","runtimeMode":"paper","symbol":"SPY","quantity":999}',
+            ),
+        )
+
+    with pytest_raises(ValueError):
+        repository.current_inventory_snapshot(identity)
+
+def test_regime_repository_rejects_cross_algorithm_mutation_payloads_before_normalization() -> None:
+    repository = RegimeSqliteRepository(f"sqlite:///{_temp_db_path()}")
+    identity = _identity("strict-isolation", "local_paper")
+
+    with pytest_raises(ValueError):
+        repository.insert_execution_outbox_record(identity, {**identity, "algorithmId": "weighted_voting", "decisionId": "decision-x", "orderIntentId": "intent-x"})
+    with pytest_raises(ValueError):
+        repository.update_execution_outbox_status(identity, "intent-x", status="rejected", payload={"algorithmId": "voting_ensemble"})
+    with pytest_raises(ValueError):
+        repository.record_runtime_event({**identity, "eventId": "event-x", "payload": {"algorithmId": "wca"}})
+    with pytest_raises(ValueError):
+        repository.record_position_state(identity, {"algorithmId": "meta_model", "positionId": "other-position", "quantity": 1})
+    with pytest_raises(ValueError):
+        repository.record_trade_state(identity, {"algorithmId": "weighted_voting", "tradeId": "other-trade", "quantity": 1})
+
+    assert repository.read_owned_records("regime_execution_outbox", identity) == []
+    assert repository.latest_regime_positions(identity) == []
+    assert repository.read_owned_records("regime_trades", identity) == []
+
+
+def test_regime_local_paper_transactions_reject_cross_algorithm_orders_and_fills() -> None:
+    repository = RegimeSqliteRepository(f"sqlite:///{_temp_db_path()}")
+    identity = _identity("strict-local-paper", "local_paper")
+    order = _local_order(identity)
+    fill = _local_fill(identity)
+
+    with pytest_raises(ValueError):
+        repository.apply_local_paper_order_reservation(
+            identity,
+            order={**order, "algorithmId": "voting_ensemble"},
+            orders_snapshot=[order],
+            action="reserve",
+        )
+    with pytest_raises(ValueError):
+        repository.apply_local_paper_order_reservation(
+            identity,
+            order=order,
+            orders_snapshot=[{**order, "algorithmId": "weighted_voting"}],
+            action="reserve",
+        )
+    with pytest_raises(ValueError):
+        repository.apply_local_paper_fill_transaction(
+            identity,
+            order=order,
+            fill={**fill, "algorithmId": "wca"},
+            orders_snapshot=[order],
+            fills_snapshot=[fill],
+        )
+    with pytest_raises(ValueError):
+        repository.apply_local_paper_fill_transaction(
+            identity,
+            order={**order, "algorithmId": "meta_model"},
+            fill=fill,
+            orders_snapshot=[order],
+            fills_snapshot=[fill],
+        )
+
+    snapshot = repository.read_local_paper_account_snapshot(identity)
+    assert snapshot is None
+    assert repository.current_inventory_snapshot(identity)["quantity"] == 0
+
+def test_regime_local_paper_duplicate_fill_ambiguity_fails_closed() -> None:
+    repository = RegimeSqliteRepository(f"sqlite:///{_temp_db_path()}")
+    identity = _identity("ambiguous-local-paper", "local_paper")
+    RegimeLocalPaperAccount(
+        algorithmInstanceId=identity["algorithmInstanceId"],
+        accountId=identity["accountId"],
+        runtimeMode=identity["runtimeMode"],
+        initialBalance=100_000,
+    ).persist(repository, symbol=identity["symbol"])
+    order = _local_order(identity)
+    fill = _local_fill(identity)
+    repository.apply_local_paper_order_reservation(identity, order=order, orders_snapshot=[order], action="reserve")
+    repository.apply_local_paper_fill_transaction(
+        identity,
+        order={**order, "remainingQuantity": 0, "status": "FILLED"},
+        fill=fill,
+        orders_snapshot=[{**order, "remainingQuantity": 0, "status": "FILLED"}],
+        fills_snapshot=[fill],
+    )
+
+    with pytest_raises(ValueError):
+        repository.apply_local_paper_fill_transaction(
+            identity,
+            order={**order, "remainingQuantity": 0, "status": "FILLED"},
+            fill={**fill, "averageFillPrice": 101.0},
+            orders_snapshot=[{**order, "remainingQuantity": 0, "status": "FILLED"}],
+            fills_snapshot=[fill],
+        )
+
 def _decision_snapshot(decision_id: str) -> dict[str, object]:
     return {
         "algorithmId": "regime",
@@ -194,6 +368,47 @@ def _identity(instance: str = "regime-a", runtime_mode: str = "paper") -> dict[s
         "symbol": "SPY",
     }
 
+
+def _local_order(identity: dict[str, str]) -> dict[str, object]:
+    return {
+        **identity,
+        "algorithmId": "regime",
+        "localOrderId": "regime-local-order-strict",
+        "clientOrderId": "client-strict",
+        "orderIntentId": "intent-strict",
+        "decisionId": "decision-strict",
+        "side": "BUY",
+        "orderType": "LIMIT",
+        "timeInForce": "DAY",
+        "symbol": identity["symbol"],
+        "quantity": 1,
+        "submittedQuantity": 1,
+        "remainingQuantity": 1,
+        "limitPrice": 100.0,
+        "reservedCash": 100.0,
+        "status": "ACCEPTED",
+        "createdAt": "2026-07-23T16:00:00Z",
+        "updatedAt": "2026-07-23T16:00:00Z",
+    }
+
+
+def _local_fill(identity: dict[str, str]) -> dict[str, object]:
+    return {
+        **identity,
+        "algorithmId": "regime",
+        "fillId": "regime-local-fill-strict",
+        "clientOrderId": "client-strict",
+        "orderIntentId": "intent-strict",
+        "decisionId": "decision-strict",
+        "side": "Buy",
+        "symbol": identity["symbol"],
+        "filledQuantity": 1,
+        "averageFillPrice": 100.0,
+        "commission": 0.0,
+        "fees": 0.0,
+        "slippage": 0.0,
+        "filledAt": "2026-07-23T16:00:01Z",
+    }
 
 def _temp_db_path() -> Path:
     root = Path(__file__).resolve().parent / "tmp" / "regime_persistence_boundary"

@@ -1,4 +1,4 @@
-"""Explicit production composition root for the Regime paper runtime."""
+﻿"""Explicit production composition root for the Regime paper runtime."""
 
 from __future__ import annotations
 
@@ -10,13 +10,18 @@ from typing import Any, Callable
 
 import httpx
 
-from backend.app.algorithms.regime.account_snapshot import build_regime_authoritative_account_snapshot_provider
+from backend.app.algorithms.regime.account_snapshot import build_regime_authoritative_account_snapshot_provider, normalize_regime_account_snapshot
 from backend.app.algorithms.regime.contracts import (
     REGIME_UNCONFIGURED_PAPER_ACCOUNT_ID,
     RegimeRuntimeMode,
 )
 from backend.app.algorithms.regime.execution_gateway import RegimePaperGatewayStore
+from backend.app.algorithms.regime.local_paper_broker import (
+    REGIME_LOCAL_PAPER_BROKER_VERSION,
+    RegimeLocalPaperBroker,
+)
 from backend.app.algorithms.regime.global_risk_adapter import REGIME_SHARED_GLOBAL_RISK_MANAGER
+from backend.app.algorithms.regime.local_paper_account import REGIME_DEFAULT_LOCAL_PAPER_INITIAL_BALANCE
 from backend.app.algorithms.regime.runtime_publisher import RegimeFinalizedOneMinutePublisher, RegimeFinalizedOneMinutePublisherConfig
 from backend.app.algorithms.regime.runtime_supervisor import RegimeRuntimeSupervisor, RegimeRuntimeSupervisorConfig
 from backend.app.algorithms.regime.service import RegimeApplicationService
@@ -53,7 +58,6 @@ class RegimeRuntimeFactoryDiagnostics:
             "symbol": self.symbol,
             "dependencyBlockers": list(self.dependency_blockers),
         }
-
 
 class RegimeAlpacaPaperBroker:
     """Regime-owned adapter that can only target Alpaca Paper endpoints."""
@@ -413,17 +417,32 @@ def build_regime_paper_runtime(
 ) -> RegimeRuntimeSupervisor:
     settings = settings or get_settings()
     config = config or RegimeRuntimeSupervisorConfig.paper_runtime_from_env()
-    if config.default_runtime_mode != RegimeRuntimeMode.PAPER.value:
+    if config.default_runtime_mode not in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}:
         raise ValueError("regime.runtime_factory.paper_runtime_mode_required")
     service = service or RegimeApplicationService()
     identity = _identity_from_config(config)
+    if broker is None and config.default_runtime_mode == RegimeRuntimeMode.LOCAL_PAPER.value:
+        broker = RegimeLocalPaperBroker(
+            repository=service.repository,
+            identity=identity,
+            starting_balance=_env_float("REGIME_LOCAL_PAPER_INITIAL_BALANCE", REGIME_DEFAULT_LOCAL_PAPER_INITIAL_BALANCE),
+        )
     broker = broker or RegimeAlpacaPaperBroker(account_id=identity["accountId"], settings=settings, http_client=http_client)
     paper_gateway = paper_gateway or PaperOrderGateway(
         broker,
         RegimePaperGatewayStore(service.repository, identity),
         max_decision_age_seconds=_env_int("REGIME_RUNTIME_MAX_DECISION_AGE_SECONDS", 300),
+        execution_mode="LOCAL_PAPER" if config.default_runtime_mode == RegimeRuntimeMode.LOCAL_PAPER.value else "BROKER_PAPER",
+        account_snapshot_provider=getattr(broker, "gateway_account_snapshot", None)
+        if config.default_runtime_mode == RegimeRuntimeMode.LOCAL_PAPER.value
+        else None,
+        portfolio_snapshot_provider=getattr(broker, "gateway_portfolio_snapshot", None)
+        if config.default_runtime_mode == RegimeRuntimeMode.LOCAL_PAPER.value
+        else None,
     )
     shared_global_risk_manager = getattr(paper_gateway, "global_risk_manager", None) or REGIME_SHARED_GLOBAL_RISK_MANAGER
+    if account_snapshot_provider is None and config.default_runtime_mode == RegimeRuntimeMode.LOCAL_PAPER.value:
+        account_snapshot_provider = _local_paper_account_snapshot_provider(broker)
     account_snapshot_provider = account_snapshot_provider or _broker_account_snapshot_provider(
         broker,
         global_risk_manager=shared_global_risk_manager,
@@ -490,6 +509,14 @@ def set_regime_runtime_supervisor_for_tests(supervisor: RegimeRuntimeSupervisor 
     _REGIME_RUNTIME_SUPERVISOR = supervisor
 
 
+def _local_paper_account_snapshot_provider(broker: Any) -> Callable[[dict[str, str]], dict[str, Any]]:
+    def provider(identity: dict[str, str]) -> dict[str, Any]:
+        snapshot_provider = getattr(broker, "refresh_account_snapshot", None)
+        raw = dict(snapshot_provider() if callable(snapshot_provider) else {})
+        return normalize_regime_account_snapshot(raw, identity=identity, max_age_seconds=None)
+
+    return provider
+
 def _broker_account_snapshot_provider(
     broker: Any,
     *,
@@ -504,24 +531,25 @@ def _broker_account_snapshot_provider(
 
 def _dependency_blockers(config: RegimeRuntimeSupervisorConfig, broker: Any) -> tuple[str, ...]:
     blockers: list[str] = []
-    if config.default_runtime_mode != RegimeRuntimeMode.PAPER.value:
+    if config.default_runtime_mode not in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}:
         blockers.append("regime.runtime_factory.paper_runtime_mode_required")
     if config.symbol.upper() != "SPY":
         blockers.append("regime.runtime_factory.spy_symbol_required")
-    if config.default_account_id == REGIME_UNCONFIGURED_PAPER_ACCOUNT_ID:
+    if config.default_runtime_mode == RegimeRuntimeMode.PAPER.value and config.default_account_id == REGIME_UNCONFIGURED_PAPER_ACCOUNT_ID:
         blockers.append("regime.runtime_factory.paper_account_id_unconfigured")
     startup_verification = getattr(broker, "startup_verification", None)
     configuration = dict(startup_verification() if callable(startup_verification) else {})
     if not configuration and callable(getattr(broker, "paper_trading_configuration", None)):
         configuration = dict(broker.paper_trading_configuration())
+    local_paper = config.default_runtime_mode == RegimeRuntimeMode.LOCAL_PAPER.value
     if configuration.get("paperOnly") is not True:
-        blockers.append("regime.runtime_factory.alpaca_paper_endpoint_required")
+        blockers.append("regime.runtime_factory.local_paper_endpoint_required" if local_paper else "regime.runtime_factory.alpaca_paper_endpoint_required")
     if configuration.get("liveTradingEnabled") is True:
         blockers.append("regime.runtime_factory.live_trading_endpoint_rejected")
     if configuration.get("configured") is not True:
-        blockers.append("regime.runtime_factory.alpaca_paper_credentials_or_account_unavailable")
+        blockers.append("regime.runtime_factory.local_paper_account_unavailable" if local_paper else "regime.runtime_factory.alpaca_paper_credentials_or_account_unavailable")
     if configuration.get("verified") is False:
-        blockers.append("regime.runtime_factory.alpaca_paper_account_unverified")
+        blockers.append("regime.runtime_factory.local_paper_account_unverified" if local_paper else "regime.runtime_factory.alpaca_paper_account_unverified")
     blockers.extend(str(reason) for reason in configuration.get("reasonCodes") or () if reason)
     return tuple(dict.fromkeys(blockers))
 
@@ -741,8 +769,10 @@ def _env_float_any(names: tuple[str, ...], default: float) -> float:
 
 __all__ = [
     "REGIME_ALPACA_PAPER_BROKER_VERSION",
+    "REGIME_LOCAL_PAPER_BROKER_VERSION",
     "REGIME_RUNTIME_FACTORY_VERSION",
     "RegimeAlpacaPaperBroker",
+    "RegimeLocalPaperBroker",
     "RegimeAlpacaPaperSubmissionUncertain",
     "RegimeRuntimeFactoryDiagnostics",
     "build_regime_paper_runtime",

@@ -23,10 +23,11 @@ class RegimePaperOnlyAuthorityBoundaryTest(unittest.TestCase):
     def test_runtime_mode_contract_rejects_live_and_unknown_modes(self) -> None:
         self.assertEqual(
             REGIME_ALLOWED_RUNTIME_MODE_VALUES,
-            ("shadow", "paper", "backtest", "replay"),
+            ("shadow", "paper", "local_paper", "backtest", "replay"),
         )
         self.assertEqual(normalize_regime_runtime_mode("shadow"), RegimeRuntimeMode.SHADOW)
         self.assertEqual(normalize_regime_runtime_mode("paper"), RegimeRuntimeMode.PAPER)
+        self.assertEqual(normalize_regime_runtime_mode("local_paper"), RegimeRuntimeMode.LOCAL_PAPER)
         self.assertEqual(normalize_regime_runtime_mode("backtest"), RegimeRuntimeMode.BACKTEST)
         self.assertEqual(normalize_regime_runtime_mode("replay"), RegimeRuntimeMode.REPLAY)
 
@@ -78,7 +79,7 @@ class RegimePaperOnlyAuthorityBoundaryTest(unittest.TestCase):
         self.assertEqual(inventory["productionDecisionCore"], "backend.app.algorithms.regime.execution_pipeline.execute_regime_pipeline")
         self.assertEqual(inventory["productionBacktestCore"], "backend.app.algorithms.regime.backtest.engine.run_regime_backtest")
         self.assertEqual(inventory["frontendDecisionSubmissionAllowed"], False)
-        self.assertEqual(tuple(inventory["allowedRuntimeModes"]), ("shadow", "paper", "backtest", "replay"))
+        self.assertEqual(tuple(inventory["allowedRuntimeModes"]), ("shadow", "paper", "local_paper", "backtest", "replay"))
 
     def test_frontend_regime_transport_does_not_send_settings_account_or_authoritative_results(self) -> None:
         main_source = (ROOT / "frontend" / "src" / "main.ts").read_text(encoding="utf-8")

@@ -1,4 +1,4 @@
-"""Backend-owned Regime contracts.
+﻿"""Backend-owned Regime contracts.
 
 These contracts intentionally live in Python so the backend runtime is the
 source of truth for Regime classification, decisions, orders, and backtests.
@@ -20,6 +20,8 @@ REGIME_PROFILE_VERSION = "regime_profile_matrix_v3_backend"
 REGIME_DEFAULT_SHADOW_ALGORITHM_INSTANCE_ID = "regime-default"
 REGIME_DEFAULT_SHADOW_ACCOUNT_ID = "default"
 REGIME_DEFAULT_PAPER_ALGORITHM_INSTANCE_ID = "regime-paper-default"
+REGIME_DEFAULT_LOCAL_PAPER_ALGORITHM_INSTANCE_ID = "regime-local-paper-default"
+REGIME_DEFAULT_LOCAL_PAPER_ACCOUNT_ID = "regime-local-paper-account"
 REGIME_UNCONFIGURED_PAPER_ACCOUNT_ID = "regime-paper-account-unconfigured"
 REGIME_PAPER_ALGORITHM_INSTANCE_ID_ENV = "REGIME_PAPER_ALGORITHM_INSTANCE_ID"
 REGIME_ALPACA_PAPER_ACCOUNT_ID_ENV = "REGIME_ALPACA_PAPER_ACCOUNT_ID"
@@ -30,6 +32,7 @@ GENERIC_ALPACA_PAPER_ACCOUNT_ID_ENV = "ALPACA_PAPER_ACCOUNT_ID"
 class RegimeRuntimeMode(str, Enum):
     SHADOW = "shadow"
     PAPER = "paper"
+    LOCAL_PAPER = "local_paper"
     BACKTEST = "backtest"
     REPLAY = "replay"
 
@@ -54,6 +57,8 @@ def default_regime_algorithm_instance_id(runtime_mode: str | RegimeRuntimeMode |
     mode = normalize_regime_runtime_mode(runtime_mode).value if runtime_mode not in {None, ""} else RegimeRuntimeMode.SHADOW.value
     if mode == RegimeRuntimeMode.PAPER.value:
         return _clean_env(REGIME_PAPER_ALGORITHM_INSTANCE_ID_ENV) or REGIME_DEFAULT_PAPER_ALGORITHM_INSTANCE_ID
+    if mode == RegimeRuntimeMode.LOCAL_PAPER.value:
+        return _clean_env("REGIME_LOCAL_PAPER_ALGORITHM_INSTANCE_ID") or REGIME_DEFAULT_LOCAL_PAPER_ALGORITHM_INSTANCE_ID
     return REGIME_DEFAULT_SHADOW_ALGORITHM_INSTANCE_ID
 
 
@@ -70,6 +75,8 @@ def default_regime_account_id(runtime_mode: str | RegimeRuntimeMode | None = Non
     mode = normalize_regime_runtime_mode(runtime_mode).value if runtime_mode not in {None, ""} else RegimeRuntimeMode.SHADOW.value
     if mode == RegimeRuntimeMode.PAPER.value:
         return configured_regime_paper_account_id()
+    if mode == RegimeRuntimeMode.LOCAL_PAPER.value:
+        return _clean_env("REGIME_LOCAL_PAPER_ACCOUNT_ID") or REGIME_DEFAULT_LOCAL_PAPER_ACCOUNT_ID
     return REGIME_DEFAULT_SHADOW_ACCOUNT_ID
 
 

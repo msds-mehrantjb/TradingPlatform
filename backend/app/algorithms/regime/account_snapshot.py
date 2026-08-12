@@ -9,6 +9,7 @@ REGIME_ACCOUNT_SNAPSHOT_SOURCE_AUTHORITY = "backend_account_and_global_risk_serv
 REGIME_ACCOUNT_SNAPSHOT_ALLOWED_AUTHORITIES = {
     REGIME_ACCOUNT_SNAPSHOT_SOURCE_AUTHORITY,
     "shared_backend_service",
+    "regime_local_paper_account",
 }
 REGIME_ACCOUNT_SNAPSHOT_FORBIDDEN_FIELDS = {
     "settings",
@@ -173,6 +174,23 @@ def authoritative_regime_account_snapshot_blockers(
         return ["regime.account_snapshot.missing"]
     if source not in REGIME_ACCOUNT_SNAPSHOT_ALLOWED_AUTHORITIES:
         blockers.append("regime.account_snapshot.source_not_authoritative")
+    if runtime_mode == "local_paper":
+        if source != "regime_local_paper_account":
+            blockers.append("regime.account_snapshot.local_paper_source_not_authoritative")
+        if str(record.get("algorithmId") or record.get("algorithm_id") or "") != "regime":
+            blockers.append("regime.account_snapshot.local_paper_algorithm_mismatch")
+        if not record.get("stateVersion"):
+            blockers.append("regime.account_snapshot.local_paper_state_version_missing")
+        for field in ("cash", "equity", "buyingPower", "availableBuyingPower", "reservedCash"):
+            value = _number(record.get(field))
+            if value is None:
+                blockers.append(f"regime.account_snapshot.local_paper_{field}_missing")
+            elif value < 0:
+                blockers.append(f"regime.account_snapshot.local_paper_{field}_impossible")
+        cash = _number(record.get("cash"))
+        reserved_cash = _number(record.get("reservedCash"))
+        if cash is not None and reserved_cash is not None and reserved_cash > cash + 1e-9:
+            blockers.append("regime.account_snapshot.local_paper_reserved_cash_exceeds_cash")
     if identity is not None:
         expected_account_id = str(identity.get("accountId") or "")
         if expected_account_id and str(record.get("accountId") or "") != expected_account_id:

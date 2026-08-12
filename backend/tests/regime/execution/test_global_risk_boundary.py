@@ -48,13 +48,57 @@ class GlobalRiskBoundaryTest(unittest.TestCase):
         self.assertEqual(approval.approved_quantity, 0)
         self.assertIn("regime.global_risk_adapter.request_invalid", approval.reason_codes)
 
+    def test_global_risk_does_not_accept_other_algorithm_as_regime_exposure(self):
+        manager = GlobalPortfolioRiskManager()
+        approval = evaluate_regime_global_risk_request(
+            _request(existing_regime_exposure={"algorithmId": "weighted_voting", "quantity": 999, "marketValue": 99_900.0}),
+            manager=manager,
+        )
+
+        self.assertTrue(approval.rejected)
+        self.assertEqual(approval.approved_quantity, 0)
+        self.assertIsNone(approval.reservation_id)
+        self.assertEqual(manager.reservations.all(), ())
+        self.assertIn("regime.global_risk_adapter.request_invalid", approval.reason_codes)
+
+    def test_global_risk_can_observe_other_algorithm_exposure_without_returning_regime_state(self):
+        manager = GlobalPortfolioRiskManager()
+        approval = evaluate_regime_global_risk_request(
+            _request(
+                account_snapshot={"accountSnapshotId": "acct-1", "equity": 100_000, "availableBuyingPower": 10_000, "observedAt": NOW},
+                portfolio_snapshot={
+                    "positions": [
+                        {"algorithmId": "weighted_voting", "symbol": "SPY", "quantity": 100, "marketValue": 10_000.0},
+                    ],
+                    "pendingOrders": [
+                        {"algorithmId": "voting_ensemble", "symbol": "SPY", "side": "Buy", "quantity": 10, "notional": 1_000.0},
+                    ],
+                },
+            ),
+            manager=manager,
+        )
+
+        approval_payload = dict(approval.__dict__)
+        self.assertEqual(approval.algorithm_id, "regime")
+        self.assertNotIn("cash", approval_payload)
+        self.assertNotIn("equity", approval_payload)
+        self.assertNotIn("positions", approval_payload)
+        self.assertNotIn("inventory", approval_payload)
+        self.assertNotIn("tradeHistory", approval_payload)
+
     def test_inventory_declares_shared_boundary(self):
         inventory = regime_global_risk_adapter_inventory()
         self.assertEqual(inventory["algorithmId"], "regime")
         self.assertFalse(inventory["mayRewriteSignals"])
+        self.assertFalse(inventory["mayMutateRegimeAccount"])
+        self.assertFalse(inventory["mayMutateRegimeInventory"])
+        self.assertFalse(inventory["mayMutateRegimePositions"])
+        self.assertFalse(inventory["mayMutateRegimeTradeHistory"])
+        self.assertIn("reduce_quantity", inventory["allowedEffects"])
+        self.assertIn("regime_cash", inventory["notAuthoritativeFor"])
+        self.assertIn("regime_inventory", inventory["notAuthoritativeFor"])
         self.assertIn("decision_id", inventory["requiresAttribution"])
         self.assertIn("release_on_cancellation", inventory["reservationLifecycle"])
-
 
 def _request(**overrides) -> RegimeGlobalRiskRequest:
     account_snapshot = overrides.pop("account_snapshot", {"accountSnapshotId": "acct-1", "equity": 100_000, "availableBuyingPower": 2_500, "observedAt": NOW})

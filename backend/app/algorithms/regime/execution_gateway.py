@@ -140,7 +140,7 @@ def submit_regime_outbox_record(
             ("regime.execution.runtime_mode_rejected",),
             {"paperOnly": True},
         )
-    if mode != RegimeRuntimeMode.PAPER.value:
+    if mode not in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}:
         return _terminal(
             repository,
             identity,
@@ -393,10 +393,14 @@ def reconcile_regime_paper_gateway_result(
     repository.copy_broker_observation({**observation_base, "type": "order", "status": result.status, "brokerAck": ack})
     if result.fill and result.fill.filledQuantity > 0:
         fill_payload = result.fill.model_dump(mode="json")
+        local_fill_id = fill_payload.get("fillId")
+        if not local_fill_id and isinstance(fill_payload.get("executionCostBreakdown"), dict):
+            local_fill_id = fill_payload["executionCostBreakdown"].get("fillId")
         enriched_fill = {
             **observation_base,
             "type": "fill",
             **fill_payload,
+            "fillId": local_fill_id or fill_payload.get("fillId"),
             "decisionId": proposal.decisionId,
             "submittedQuantity": proposal.quantity,
             "stopPrice": proposal.stopPrice,
@@ -405,9 +409,12 @@ def reconcile_regime_paper_gateway_result(
             "profileVersion": proposal.settingsSnapshot.get("profileVersion"),
         }
         repository.copy_broker_observation(enriched_fill)
-        manager = RegimePositionManager(repository)
-        fill_update = manager.apply_fill_observation(identity, enriched_fill, settings_snapshot=proposal.settingsSnapshot)
-        if result.protectiveOrder and result.status == "PARTIALLY_FILLED":
+        local_paper_fill = result.executionMode == "LOCAL_PAPER" or fill_payload.get("executionMode") == "LOCAL_PAPER"
+        manager = None if local_paper_fill else RegimePositionManager(repository)
+        fill_update = {"updated": False, "reason": "regime.local_paper.fill_already_applied_atomically"}
+        if not local_paper_fill:
+            fill_update = manager.apply_fill_observation(identity, enriched_fill, settings_snapshot=proposal.settingsSnapshot)
+        if result.protectiveOrder and result.status == "PARTIALLY_FILLED" and manager is not None:
             protective_payload = {
                 **observation_base,
                 "type": "protective_guard",
@@ -417,7 +424,7 @@ def reconcile_regime_paper_gateway_result(
             }
             repository.copy_broker_observation(protective_payload)
             manager.apply_protective_order_observation(identity, protective_payload)
-        elif result.status == "PARTIALLY_FILLED":
+        elif result.status == "PARTIALLY_FILLED" and not local_paper_fill:
             position = dict(fill_update.get("position") or {})
             if position:
                 repository.record_position_state(
@@ -508,7 +515,7 @@ def validate_regime_paper_broker_safety(paper_gateway: PaperOrderGateway, *, mod
             reasons.append("regime.execution.paper_broker.account_verification_failed")
     else:
         reasons.append("regime.execution.paper_broker.account_verifier_missing")
-    if mode != RegimeRuntimeMode.PAPER.value:
+    if mode not in {RegimeRuntimeMode.PAPER.value, RegimeRuntimeMode.LOCAL_PAPER.value}:
         reasons.append("regime.execution.paper_broker.mode_not_paper")
     if details.get("liveTradingEnabled") is True:
         reasons.append("regime.execution.paper_broker.live_trading_enabled")

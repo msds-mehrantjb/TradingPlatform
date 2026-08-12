@@ -67,6 +67,12 @@ def evaluate_regime_local_risk(
     daily = _record(context.get("dailyCounters") or context.get("daily_counters"))
     account = _record(context.get("accountSnapshot") or context.get("account"))
     inventory = _record(context.get("inventorySnapshot") or context.get("inventory"))
+    runtime_mode = str(context.get("runtimeMode") or account.get("runtimeMode") or inventory.get("runtimeMode") or "").lower()
+    local_paper = runtime_mode == "local_paper"
+    if local_paper:
+        account = _regime_local_paper_account(account, context)
+        inventory = _regime_local_inventory(inventory, context)
+        daily = _regime_local_daily_state(daily, account)
     open_position = _record(context.get("openPosition") or inventory.get("openPosition") or account.get("position"))
     strategy_id = str(context.get("strategyId") or context.get("strategy_id") or _selected_strategy_id(aggregation))
     family_id = str(context.get("familyId") or context.get("family_id") or _selected_family_id(aggregation))
@@ -78,15 +84,15 @@ def evaluate_regime_local_risk(
 
     if not context.get("completedPrimaryCandle", context.get("completedBar", True)):
         blockers.append("regime.local_risk.completed_bar_required")
-    if context.get("runtimeMode") == "paper" and context.get("supervisorStarted") is False:
+    if runtime_mode in {"paper", "local_paper"} and context.get("supervisorStarted") is False:
         blockers.append("regime.local_risk.paper_runtime_not_running")
-    if context.get("runtimeMode") == "paper" and context.get("paperButtonRequested") is False:
+    if runtime_mode in {"paper", "local_paper"} and context.get("paperButtonRequested") is False:
         blockers.append("regime.local_risk.paper_button_requested_off")
-    if context.get("runtimeMode") == "paper" and context.get("paperButtonEffective") is False:
+    if runtime_mode in {"paper", "local_paper"} and context.get("paperButtonEffective") is False:
         blockers.append("regime.local_risk.paper_button_effective_off")
-    if context.get("runtimeMode") == "paper" and context.get("requireAutomaticPaperControlForEntry") and not context.get("automaticPaperTradingEnabled"):
+    if runtime_mode in {"paper", "local_paper"} and context.get("requireAutomaticPaperControlForEntry") and not context.get("automaticPaperTradingEnabled"):
         blockers.append("regime.local_risk.automatic_paper_control_off")
-    if context.get("runtimeMode") == "paper" and context.get("requireRealPaperExecutionStage") and not context.get("rolloutStageAllowsRealPaperExecution"):
+    if runtime_mode == "paper" and context.get("requireRealPaperExecutionStage") and not context.get("rolloutStageAllowsRealPaperExecution"):
         blockers.append("regime.local_risk.rollout_stage_blocks_real_paper")
     if context.get("marketRegularSessionOpen") is False:
         blockers.append("regime.local_risk.market_not_regular_session")
@@ -110,7 +116,9 @@ def evaluate_regime_local_risk(
         blockers.append("regime.local_risk.account_snapshot_unavailable")
     if account.get("buyingPowerCurrent") is False or account.get("accountSnapshotFresh") is False:
         blockers.append("regime.local_risk.account_snapshot_stale")
-    if context.get("runtimeMode") == "paper" and context.get("requireAccountSnapshot", True):
+    if local_paper:
+        blockers.extend(_local_paper_authority_blockers(account, inventory, context))
+    elif runtime_mode == "paper" and context.get("requireAccountSnapshot", True):
         blockers.extend(
             authoritative_regime_account_snapshot_blockers(
                 account,
@@ -183,12 +191,18 @@ def evaluate_regime_local_risk(
         blockers.append("regime.local_risk.per_strategy_daily_limit")
     if _daily_count(daily, "familyTradeCounts", family_id) >= _family_limit(settings, family_id):
         blockers.append("regime.local_risk.per_family_daily_limit")
-    if int(_number(daily.get("entryCount") or daily.get("tradeCount") or daily.get("totalTrades")) or 0) >= int(settings.get("maxEntriesPerDay", settings.get("maxTradesPerDay", 0))):
+    max_trades = int(settings.get("maxEntriesPerDay", settings.get("maxTradesPerDay", 0)))
+    if max_trades > 0 and int(_number(daily.get("entryCount") or daily.get("tradeCount") or daily.get("totalTrades")) or 0) >= max_trades:
         blockers.append("regime.local_risk.total_daily_trade_limit")
-    if int(_number(daily.get("consecutiveLosses")) or 0) >= int(settings.get("maxConsecutiveLosses", 0)):
+    max_consecutive_losses = int(settings.get("maxConsecutiveLosses", 0))
+    if max_consecutive_losses > 0 and int(_number(daily.get("consecutiveLosses")) or 0) >= max_consecutive_losses:
         blockers.append("regime.local_risk.consecutive_loss_breaker")
-    if _number(daily.get("dailyLossPercent")) is not None and _number(daily.get("dailyLossPercent")) >= float(settings.get("maxDailyLossPercent", 0.0)):
+    max_daily_loss_percent = float(settings.get("maxDailyLossPercent", 0.0))
+    if max_daily_loss_percent > 0 and _number(daily.get("dailyLossPercent")) is not None and _number(daily.get("dailyLossPercent")) >= max_daily_loss_percent:
         blockers.append("regime.local_risk.daily_loss_limit")
+    max_drawdown_percent = float(settings.get("maxDrawdownPercent", settings.get("maxAccountDrawdownPercent", 0.0)))
+    if max_drawdown_percent > 0 and _number(daily.get("drawdownPercent")) is not None and _number(daily.get("drawdownPercent")) >= max_drawdown_percent:
+        blockers.append("regime.local_risk.drawdown_limit")
     if int(_number(aggregation.get("activeStrategyCount")) or 0) < int(settings.get("minimumActiveStrategies", 0)):
         blockers.append("regime.local_gate.minimum_active_strategies")
     if int(_number(aggregation.get("activeFamilyCount")) or 0) < int(settings.get("minimumIndependentFamilies", 0)):
@@ -210,9 +224,21 @@ def evaluate_regime_local_risk(
     if float(_number(aggregation.get("abstentionRate")) or 0.0) > float(settings.get("maximumAbstentionRate", 1.0)):
         blockers.append("regime.local_gate.maximum_abstention_rate")
 
+    equity = max(0.0, _number(account.get("equity") or account.get("accountEquity")) or 0.0)
+    planned_risk = _number(context.get("plannedRiskDollars") or context.get("requestedRiskDollars") or context.get("riskDollars"))
+    base_risk_percent = _number(settings.get("baseRiskPercent"))
+    max_risk_per_trade = _number(settings.get("maxRiskPerTradeDollars") or settings.get("maximumRiskPerTradeDollars"))
+    if max_risk_per_trade is None and base_risk_percent is not None and equity > 0:
+        max_risk_per_trade = equity * (base_risk_percent / 100.0 if base_risk_percent > 1 else base_risk_percent)
+    if planned_risk is not None and max_risk_per_trade is not None and max_risk_per_trade > 0 and planned_risk > max_risk_per_trade:
+        blockers.append("regime.local_risk.max_risk_per_trade")
     quantity = _reduce_quantity(quantity, int(settings.get("maxAllowedShares", 0)), "regime.local_risk.reduce.maximum_shares", reductions)
     quantity = _reduce_notional(quantity, entry_price, float(settings.get("maxOrderNotionalDollars", settings.get("maxNotionalDollars", 0.0))), "regime.local_risk.reduce.maximum_order_notional", reductions)
-    current_position_notional = _number(open_position.get("notional") or open_position.get("marketValue")) or 0.0
+    max_position_percent = _number(settings.get("maxPositionPercent"))
+    if max_position_percent is not None and max_position_percent > 0 and equity > 0:
+        percent_notional_cap = equity * (max_position_percent / 100.0 if max_position_percent > 1 else max_position_percent)
+        quantity = _reduce_notional(quantity, entry_price, percent_notional_cap, "regime.local_risk.reduce.maximum_position_percent", reductions)
+    current_position_notional = _number(open_position.get("notional") or open_position.get("marketValue") or inventory.get("marketValue")) or 0.0
     max_position_notional = float(settings.get("maxPositionNotionalDollars", settings.get("maxNotionalDollars", 0.0)))
     if max_position_notional > 0:
         remaining_position_quantity = int(max(0.0, (max_position_notional - current_position_notional) / max(entry_price, 0.01)))
@@ -223,9 +249,19 @@ def evaluate_regime_local_risk(
         max_participation_quantity = 0 if participation <= 0 else max(1, int(expected_fill_quantity * participation))
         quantity = _reduce_quantity(quantity, max_participation_quantity, "regime.local_risk.reduce.maximum_participation", reductions)
     buying_power = _number(account.get("availableBuyingPower") or account.get("buyingPower"))
+    cash = _number(account.get("cash"))
     if buying_power is not None:
-        reserved_cash = max(0.0, _number(inventory.get("reservedCash") or inventory.get("reserved_cash")) or 0.0)
-        quantity = _reduce_quantity(quantity, int(max(0.0, (buying_power - reserved_cash) / max(entry_price, 0.01))), "regime.local_risk.reduce.buying_power", reductions)
+        available_for_order = buying_power
+        if not local_paper:
+            reserved_cash = max(0.0, _number(inventory.get("reservedCash") or inventory.get("reserved_cash")) or 0.0)
+            available_for_order = max(0.0, available_for_order - reserved_cash)
+        if side.lower().startswith("buy") and cash is not None:
+            available_for_order = min(available_for_order, cash)
+        quantity = _reduce_quantity(quantity, int(max(0.0, available_for_order / max(entry_price, 0.01))), "regime.local_risk.reduce.buying_power", reductions)
+        if local_paper and side.lower().startswith("buy") and cash is not None and (requested_quantity * entry_price) > cash + 1e-9:
+            blockers.append("regime.local_risk.insufficient_cash")
+        if local_paper and side.lower().startswith("buy") and (requested_quantity * entry_price) > buying_power + 1e-9:
+            blockers.append("regime.local_risk.insufficient_buying_power")
     elif context.get("requireBuyingPower", True):
         blockers.append("regime.local_risk.buying_power_unavailable")
 
@@ -397,6 +433,7 @@ def _local_gate_compatibility_codes(result: RegimeLocalRiskResult, settings: dic
         "regime.local_risk.reduce.maximum_shares": "regime.local_gate.maximum_shares",
         "regime.local_risk.reduce.maximum_order_notional": "regime.local_gate.maximum_notional",
         "regime.local_risk.reduce.maximum_position_notional": "regime.local_gate.maximum_notional",
+        "regime.local_risk.reduce.maximum_position_percent": "regime.local_gate.maximum_notional",
         "regime.local_risk.reduce.maximum_participation": "regime.local_gate.maximum_participation",
     }
     for reduction in result.reductions:
@@ -413,6 +450,107 @@ def _local_gate_compatibility_codes(result: RegimeLocalRiskResult, settings: dic
     if _number(context.get("proposedParticipationRate")) is not None and _number(context.get("proposedParticipationRate")) > float(settings.get("maxParticipationPercent", 0.0)):
         codes.append("regime.local_gate.maximum_participation")
     return tuple(codes)
+
+
+def _regime_local_paper_account(account: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(account)
+    if context.get("expectedAccountId") and not normalized.get("accountId"):
+        normalized["accountId"] = context["expectedAccountId"]
+    if context.get("expectedAlgorithmInstanceId") and not normalized.get("algorithmInstanceId"):
+        normalized["algorithmInstanceId"] = context["expectedAlgorithmInstanceId"]
+    if normalized.get("availableBuyingPower") is None and normalized.get("buyingPower") is not None:
+        normalized["availableBuyingPower"] = normalized["buyingPower"]
+    if normalized.get("buyingPower") is None and normalized.get("availableBuyingPower") is not None:
+        normalized["buyingPower"] = normalized["availableBuyingPower"]
+    return normalized
+
+
+def _regime_local_inventory(inventory: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    if not inventory:
+        return {}
+    normalized = dict(inventory)
+    if context.get("expectedAccountId") and not normalized.get("accountId"):
+        normalized["accountId"] = context["expectedAccountId"]
+    if context.get("expectedAlgorithmInstanceId") and not normalized.get("algorithmInstanceId"):
+        normalized["algorithmInstanceId"] = context["expectedAlgorithmInstanceId"]
+    if context.get("symbol") and not normalized.get("symbol"):
+        normalized["symbol"] = context["symbol"]
+    return normalized
+
+
+def _regime_local_daily_state(daily: dict[str, Any], account: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(daily)
+    trade_count = _number(account.get("tradeCount") or account.get("tradesToday"))
+    if trade_count is not None:
+        normalized["tradeCount"] = int(trade_count)
+        normalized["entryCount"] = int(trade_count)
+    consecutive = _number(account.get("consecutiveLosses"))
+    if consecutive is not None:
+        normalized["consecutiveLosses"] = int(consecutive)
+    daily_realized = _number(account.get("dailyRealizedPnl")) or 0.0
+    daily_unrealized = _number(account.get("dailyUnrealizedPnl")) or 0.0
+    daily_pnl = _number(account.get("dailyPnl") or account.get("dailyAccountPnl"))
+    if daily_pnl is None:
+        daily_pnl = daily_realized + daily_unrealized
+    normalized["dailyPnl"] = daily_pnl
+    equity = _number(account.get("equity")) or 0.0
+    session_start = _number(account.get("sessionStartEquity")) or equity
+    if daily_pnl < 0 and session_start > 0:
+        normalized["dailyLossPercent"] = abs(daily_pnl) / session_start
+    elif session_start > 0:
+        normalized["dailyLossPercent"] = 0.0
+    drawdown = _number(account.get("drawdown"))
+    high_water = _number(account.get("highWaterMark"))
+    if drawdown is not None and high_water and high_water > 0:
+        normalized["drawdownPercent"] = drawdown / high_water
+    return normalized
+
+
+def _local_paper_authority_blockers(account: dict[str, Any], inventory: dict[str, Any], context: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    if str(account.get("sourceAuthority") or "").lower() != "regime_local_paper_account":
+        blockers.append("regime.local_risk.local_account_not_authoritative")
+    if str(account.get("algorithmId") or "") != "regime":
+        blockers.append("regime.local_risk.local_account_algorithm_mismatch")
+    if str(account.get("runtimeMode") or "") != "local_paper":
+        blockers.append("regime.local_risk.local_account_runtime_mode_mismatch")
+    if str(inventory.get("algorithmId") or "") != "regime":
+        blockers.append("regime.local_risk.inventory_snapshot_unavailable")
+    if str(inventory.get("runtimeMode") or "") != "local_paper":
+        blockers.append("regime.local_risk.inventory_runtime_mode_mismatch")
+    expected_account_id = str(context.get("expectedAccountId") or "")
+    if expected_account_id and str(account.get("accountId") or "") != expected_account_id:
+        blockers.append("regime.local_risk.local_account_id_mismatch")
+    if expected_account_id and str(inventory.get("accountId") or "") not in {"", expected_account_id}:
+        blockers.append("regime.local_risk.inventory_account_id_mismatch")
+    expected_instance = str(context.get("expectedAlgorithmInstanceId") or "")
+    if expected_instance and str(account.get("algorithmInstanceId") or "") not in {"", expected_instance}:
+        blockers.append("regime.local_risk.local_account_instance_mismatch")
+    if expected_instance and str(inventory.get("algorithmInstanceId") or "") not in {"", expected_instance}:
+        blockers.append("regime.local_risk.inventory_instance_mismatch")
+    if _number(account.get("equity")) is None or _number(account.get("availableBuyingPower")) is None:
+        blockers.append("regime.local_risk.local_account_values_missing")
+    for field in ("cash", "equity", "buyingPower", "availableBuyingPower", "reservedCash"):
+        value = _number(account.get(field))
+        if value is None:
+            blockers.append(f"regime.local_risk.local_account_{field}_missing")
+        elif value < 0:
+            blockers.append(f"regime.local_risk.local_account_{field}_impossible")
+    cash = _number(account.get("cash"))
+    reserved_cash = _number(account.get("reservedCash"))
+    if cash is not None and reserved_cash is not None and reserved_cash > cash + 1e-9:
+        blockers.append("regime.local_risk.local_account_reserved_cash_exceeds_cash")
+    state_version = _number(inventory.get("stateVersion") or inventory.get("sequenceVersion"))
+    if state_version is None or state_version <= 0:
+        blockers.append("regime.local_risk.inventory_snapshot_unavailable")
+    quantity = int(_number(inventory.get("quantity")) or 0)
+    average = _number(inventory.get("averageEntryPrice"))
+    market_price = _number(inventory.get("marketPrice"))
+    if quantity != 0 and (average is None or average <= 0):
+        blockers.append("regime.local_risk.inventory_average_entry_impossible")
+    if quantity != 0 and (market_price is None or market_price <= 0):
+        blockers.append("regime.local_risk.inventory_market_price_impossible")
+    return blockers
 
 
 def _merged_context(settings: dict, runtime_context: dict[str, Any] | None) -> dict[str, Any]:

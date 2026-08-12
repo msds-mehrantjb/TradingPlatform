@@ -63,7 +63,7 @@ class RegimePositionManager:
         self.repository = repository
 
     def restore_open_positions(self, identity: dict[str, Any]) -> list[dict[str, Any]]:
-        return self.repository.latest_open_regime_positions(identity)
+        return [_require_regime_position_state(position, identity=identity) for position in self.repository.latest_open_regime_positions(identity)]
 
     def apply_fill_observation(
         self,
@@ -85,7 +85,7 @@ class RegimePositionManager:
         fill_id = str(fill.get("fillId") or fill.get("fill_id") or f"{order_intent_id}:{fill.get('filledAt') or fill.get('timestamp') or filled_quantity}")
         side = _normal_side(fill.get("side") or "Buy")
         position_effect = str(fill.get("positionEffect") or fill.get("position_effect") or "")
-        all_positions = self.repository.latest_regime_positions(identity)
+        all_positions = [_require_regime_position_state(position, identity=identity) for position in self.repository.latest_regime_positions(identity)]
         supplied_position_id = str(fill.get("positionId") or fill.get("position_id") or "")
         existing = (
             _latest_by_id(all_positions, supplied_position_id)
@@ -126,6 +126,11 @@ class RegimePositionManager:
             "entryState": existing.get("entryState") or ("partially_filled" if remaining else "filled"),
             "positionStatus": "closed" if closes_existing and new_quantity == 0 else "open",
             "averageFillPrice": round(average, 8),
+            "averageEntryPrice": round(average, 8),
+            "marketPrice": round(fill_price, 8),
+            "marketValue": round(abs(new_quantity) * fill_price, 8),
+            "reservedQuantity": max(0, remaining),
+            "openOrderQuantity": max(0, remaining),
             "filledQuantity": new_quantity,
             "quantity": new_quantity,
             "remainingQuantity": remaining,
@@ -161,7 +166,7 @@ class RegimePositionManager:
         order_intent_id = str(protective_order.get("orderIntentId") or protective_order.get("order_intent_id") or "")
         if not order_intent_id:
             raise ValueError("Regime protective order requires orderIntentId")
-        positions = self.repository.latest_open_regime_positions(identity)
+        positions = [_require_regime_position_state(position, identity=identity) for position in self.repository.latest_open_regime_positions(identity)]
         position = next((item for item in positions if str(item.get("orderIntentId")) == order_intent_id), None)
         if position is None:
             return {"updated": False, "reason": "regime.position.protective_order_without_owned_position"}
@@ -176,6 +181,7 @@ class RegimePositionManager:
             "partialFillProtectionState": "protected" if protected_quantity >= filled_quantity > 0 else "under_protected",
             "stopPrice": protective_order.get("stopPrice") or position.get("stopPrice"),
             "targetPrice": protective_order.get("targetPrice") or position.get("targetPrice"),
+            "reservedQuantity": protected_quantity,
             "updatedAt": _iso(datetime.now(timezone.utc)),
         }
         self.repository.record_position_state(identity, updated)
@@ -193,8 +199,7 @@ class RegimePositionManager:
         entry_paused: bool = False,
         global_emergency_flatten: bool = False,
     ) -> dict[str, Any]:
-        if position.get("algorithmId") not in {None, "regime"}:
-            raise ValueError("Regime position manager rejects cross-algorithm position state")
+        position = _require_regime_position_state(position, identity=identity)
         if not _has_fill_level_regime_attribution(position):
             protected_position = {**position, "positionStatus": "blocked", "reconciliationState": "missing_fill_attribution"}
             self.repository.record_position_state(identity, protected_position)
@@ -226,6 +231,7 @@ class RegimePositionManager:
         settings_version: str,
         timestamp: str | None = None,
     ) -> dict[str, Any]:
+        position = _require_regime_position_state(position, identity=identity)
         side = str(position.get("side") or "Long")
         current_stop = _number(position.get("stopPrice"))
         if stop_price is not None and current_stop is not None:
@@ -257,7 +263,10 @@ class RegimePositionManager:
         return {"updated": True, "position": updated}
 
     def reconcile_broker_observations(self, identity: dict[str, Any], broker_positions: list[dict[str, Any]]) -> dict[str, Any]:
-        own_positions = {str(position.get("positionId")): position for position in self.repository.latest_open_regime_positions(identity)}
+        own_positions = {
+            str(position.get("positionId")): position
+            for position in (_require_regime_position_state(item, identity=identity) for item in self.repository.latest_open_regime_positions(identity))
+        }
         discrepancies: list[str] = []
         for broker_position in broker_positions:
             if str(broker_position.get("algorithmId") or broker_position.get("algorithm_id") or "") != "regime":
@@ -292,8 +301,12 @@ class RegimePositionManager:
             **position,
             "highestFavorablePrice": max(float(position.get("highestFavorablePrice") or favourable), favourable),
             "lowestFavorablePrice": min(float(position.get("lowestFavorablePrice") or adverse), adverse),
+            "averageEntryPrice": entry,
+            "marketPrice": close,
+            "marketValue": round(abs(quantity) * close, 8),
             "unrealizedPnl": round((close - entry) * quantity * multiplier, 6),
             "holdingBars": int(position.get("holdingBars") or 0) + 1,
+            "updatedAt": str(candle.get("timestamp") or candle.get("barTimestamp") or _iso(datetime.now(timezone.utc))),
             "lastProcessedBarTimestamp": str(candle.get("timestamp") or candle.get("barTimestamp") or ""),
         }
 
@@ -383,6 +396,11 @@ def _closed_position(position: dict[str, Any], exit_action: RegimeExitAction, ca
         "exitAt": str(candle.get("timestamp") or candle.get("barTimestamp") or _iso(datetime.now(timezone.utc))),
         "realizedPnl": realized,
         "unrealizedPnl": 0.0,
+        "marketPrice": exit_action.exit_price,
+        "marketValue": 0.0,
+        "reservedQuantity": 0,
+        "openOrderQuantity": 0,
+        "side": "Flat",
         "remainingQuantity": 0,
         "quantity": 0,
     }
@@ -458,7 +476,7 @@ def _exit_on_regime_transition(settings_snapshot: dict[str, Any]) -> bool:
 
 
 def _has_fill_level_regime_attribution(position: dict[str, Any]) -> bool:
-    if str(position.get("algorithmId") or "regime") != "regime":
+    if str(position.get("algorithmId") or position.get("algorithm_id") or "") != "regime":
         return False
     return bool(
         position.get("positionId")
@@ -468,7 +486,24 @@ def _has_fill_level_regime_attribution(position: dict[str, Any]) -> bool:
     )
 
 
+def _require_regime_position_state(
+    position: dict[str, Any], *, identity: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    algorithm_id = str(position.get("algorithmId") or position.get("algorithm_id") or "")
+    if algorithm_id != "regime":
+        raise ValueError("Regime position manager rejects cross-algorithm position state")
+    normalized = {**position, "algorithmId": "regime"}
+    if identity is not None:
+        _require_matching_identity(identity, normalized)
+    return normalized
+
+
 def _require_matching_identity(identity: dict[str, Any], payload: dict[str, Any]) -> None:
+    if str(identity.get("algorithmId") or identity.get("algorithm_id") or "regime") != "regime":
+        raise ValueError("Regime position manager rejects cross-algorithm identity")
+    payload_algorithm = payload.get("algorithmId") or payload.get("algorithm_id")
+    if payload_algorithm is not None and str(payload_algorithm) != "regime":
+        raise ValueError("Regime position manager rejects cross-algorithm observation")
     aliases = {
         "algorithmInstanceId": ("algorithmInstanceId", "algorithm_instance_id"),
         "accountId": ("accountId", "account_id"),

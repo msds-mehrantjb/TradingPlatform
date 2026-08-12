@@ -9,8 +9,9 @@ import httpx
 
 from backend.app.algorithms.regime.execution_gateway import validate_regime_paper_broker_safety
 from backend.app.algorithms.regime.account_snapshot import REGIME_ACCOUNT_SNAPSHOT_SOURCE_AUTHORITY
+from backend.app.algorithms.regime.local_paper_account import RegimeLocalPaperAccount
 from backend.app.algorithms.regime.repository import RegimeRepository
-from backend.app.algorithms.regime.runtime_factory import RegimeAlpacaPaperBroker, build_regime_paper_runtime
+from backend.app.algorithms.regime.runtime_factory import RegimeAlpacaPaperBroker, RegimeLocalPaperBroker, build_regime_paper_runtime
 from backend.app.algorithms.regime.runtime_supervisor import RegimeRuntimeSupervisorConfig
 from backend.app.algorithms.regime.service import RegimeApplicationService
 from backend.app.config import ApplicationConfig, Settings
@@ -69,6 +70,49 @@ def test_phase23_factory_composes_explicit_regime_paper_runtime() -> None:
     assert broker_safety["verified"] is True
     assert supervisor.runtime_factory_diagnostics["dependencyBlockers"] == []
 
+
+def test_phase23_factory_composes_local_paper_runtime_without_alpaca_trading_credentials(monkeypatch) -> None:
+    monkeypatch.delenv("REGIME_ALPACA_PAPER_ACCOUNT_ID", raising=False)
+    monkeypatch.delenv("REGIME_PAPER_ACCOUNT_ID", raising=False)
+    monkeypatch.delenv("ALPACA_PAPER_ACCOUNT_ID", raising=False)
+    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    repository = RegimeRepository(f"sqlite:///{TEST_TMP_ROOT / f'{uuid4().hex}.sqlite3'}")
+    service = RegimeApplicationService(repository)
+    config = RegimeRuntimeSupervisorConfig(
+        default_algorithm_instance_id="regime-local-paper-default",
+        default_account_id="regime-local-paper-account",
+        default_runtime_mode="local_paper",
+        symbol="SPY",
+    )
+    http_client = _ExplodingAlpacaHttpClient()
+    RegimeLocalPaperAccount(algorithmInstanceId="regime-local-paper-default", accountId="regime-local-paper-account", runtimeMode="local_paper").persist(repository, symbol="SPY")
+
+    supervisor = build_regime_paper_runtime(
+        service=service,
+        settings=_settings_without_alpaca(),
+        config=config,
+        http_client=http_client,
+    )
+    account = supervisor.account_snapshot_provider(
+        {
+            "algorithmId": "regime",
+            "algorithmInstanceId": "regime-local-paper-default",
+            "accountId": "regime-local-paper-account",
+            "runtimeMode": "local_paper",
+            "symbol": "SPY",
+        }
+    )
+
+    assert supervisor.config.default_runtime_mode == "local_paper"
+    assert isinstance(supervisor.paper_gateway.broker, RegimeLocalPaperBroker)
+    assert supervisor.paper_gateway.broker.base_url == "local-paper://regime"
+    assert account["sourceAuthority"] == "regime_local_paper_account"
+    assert account["cash"] == 100_000.0
+    assert account["equity"] == 100_000.0
+    assert account["availableBuyingPower"] == 100_000.0
+    assert account["accountSnapshotFresh"] is True
+    assert supervisor.runtime_factory_diagnostics["dependencyBlockers"] == []
+    assert http_client.calls == []
 
 def test_phase23_factory_fails_closed_without_configured_paper_dependencies(monkeypatch) -> None:
     monkeypatch.delenv("REGIME_ALPACA_PAPER_ACCOUNT_ID", raising=False)
@@ -302,6 +346,22 @@ class _FakeAlpacaHttpResponse:
             response = httpx.Response(self.status_code, request=request, text=self.text)
             raise httpx.HTTPStatusError("fake alpaca error", request=request, response=response)
 
+
+class _ExplodingAlpacaHttpClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def get(self, url: str, **kwargs):
+        self.calls.append(("GET", url))
+        raise AssertionError(f"LOCAL_PAPER must not GET Alpaca trading endpoint: {url}")
+
+    def post(self, url: str, **kwargs):
+        self.calls.append(("POST", url))
+        raise AssertionError(f"LOCAL_PAPER must not POST Alpaca trading endpoint: {url}")
+
+    def delete(self, url: str, **kwargs):
+        self.calls.append(("DELETE", url))
+        raise AssertionError(f"LOCAL_PAPER must not DELETE Alpaca trading endpoint: {url}")
 
 class _FakeAlpacaHttpClient:
     def __init__(

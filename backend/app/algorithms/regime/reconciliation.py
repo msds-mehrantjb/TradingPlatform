@@ -50,6 +50,15 @@ def run_regime_broker_reconciliation(
     evaluated_at = _as_utc(evaluated_at or datetime.now(UTC))
     observed_at = _iso(evaluated_at)
     context = _reconciliation_context(repository, identity)
+    if str(identity.get("runtimeMode") or identity.get("runtime_mode") or "") == "local_paper":
+        return _run_regime_local_paper_reconciliation(
+            repository=repository,
+            identity=identity,
+            evaluated_at=evaluated_at,
+            observed_at=observed_at,
+            trigger=trigger,
+            context=context,
+        )
     broker_orders_available = broker_open_orders is not None or _broker_observation_available(broker, ("refresh_open_orders", "list_open_orders", "open_orders"))
     broker_fills_available = broker_fills is not None or _broker_observation_available(broker, ("refresh_fills", "list_fills", "fills"))
     broker_positions = broker_positions if broker_positions is not None else _optional_broker_call(broker, ("refresh_positions", "list_positions"))
@@ -195,11 +204,163 @@ def run_regime_broker_reconciliation(
     return result
 
 
+def _run_regime_local_paper_reconciliation(
+    *,
+    repository: RegimeSqliteRepository,
+    identity: dict[str, Any],
+    evaluated_at: datetime,
+    observed_at: str,
+    trigger: str,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    discrepancies: list[str] = []
+    reason_codes: list[str] = [f"regime.reconciliation.trigger.{trigger}", "regime.reconciliation.local_paper"]
+    deterministic_recoveries: list[dict[str, Any]] = []
+    account: dict[str, Any] = {}
+    inventory: dict[str, Any] = {}
+    try:
+        account = repository.read_local_paper_account_snapshot(identity) or {}
+    except Exception as exc:
+        discrepancies.append(f"regime.local_paper.reconciliation.account_load_failed:{type(exc).__name__}")
+    try:
+        inventory = repository.current_inventory_snapshot(identity)
+    except Exception as exc:
+        discrepancies.append(f"regime.local_paper.reconciliation.inventory_load_failed:{type(exc).__name__}")
+
+    if not account:
+        discrepancies.append("regime.local_paper.reconciliation.account_missing")
+    if not inventory or not inventory.get("stateVersion"):
+        discrepancies.append("regime.local_paper.reconciliation.inventory_missing_or_unversioned")
+
+    _local_owned_state_discrepancies(account, identity, "account", discrepancies)
+    _local_owned_state_discrepancies(inventory, identity, "inventory", discrepancies)
+
+    runtime_orders = _runtime_snapshot_records(repository, identity, "local_paper_broker.orders", "orders")
+    runtime_fills = _runtime_snapshot_records(repository, identity, "local_paper_broker.fills", "fills")
+    regime_fills = context["regimeFills"]
+    inventory_events = context["inventoryEvents"]
+    regime_positions = context["regimePositions"]
+    regime_trades = _latest_by_id(context.get("regimeTrades") or [], "tradeId")
+    latest_positions = _latest_by_id(regime_positions, "positionId")
+
+    for record_type, records in (("order", runtime_orders), ("fill", runtime_fills)):
+        for record in records:
+            _local_owned_state_discrepancies(record, identity, record_type, discrepancies)
+
+    account_cash = _number(account.get("cash"))
+    account_equity = _number(account.get("equity"))
+    inventory_market_value = _number(inventory.get("marketValue")) or 0.0
+    if account_cash is not None and account_equity is not None:
+        expected_equity = round(account_cash + abs(inventory_market_value), 8)
+        if not _close_enough(account_equity, expected_equity):
+            discrepancies.append(f"regime.local_paper.reconciliation.equity_mismatch:account={account_equity}:expected={expected_equity}")
+
+    account_position_quantity = sum(_signed_position_quantity(position) for position in _records(account.get("positions")))
+    inventory_quantity = _signed_inventory_quantity(inventory)
+    latest_position_quantity = sum(_signed_position_quantity(position) for position in latest_positions.values())
+    if account and inventory and account_position_quantity != inventory_quantity:
+        discrepancies.append(f"regime.local_paper.reconciliation.account_inventory_quantity_mismatch:account={account_position_quantity}:inventory={inventory_quantity}")
+    if latest_positions and latest_position_quantity != inventory_quantity:
+        discrepancies.append(f"regime.local_paper.reconciliation.position_inventory_quantity_mismatch:positions={latest_position_quantity}:inventory={inventory_quantity}")
+
+    local_fills = _unique_fill_records(runtime_fills or regime_fills)
+    local_fill_ids = {str(fill.get("fillId") or fill.get("fill_id") or _fill_fallback_id(fill)) for fill in local_fills}
+    regime_fill_ids = {str(fill.get("fillId") or fill.get("fill_id") or _fill_fallback_id(fill)) for fill in regime_fills}
+    inventory_fill_ids = {str(event.get("fillId") or event.get("fill_id") or "") for event in inventory_events if str(event.get("eventType") or event.get("type") or "").lower() in {"fill", "local_paper_fill"} or event.get("fillId") or event.get("fill_id")}
+    trade_fill_ids = {str(fill_id) for trade in regime_trades.values() for fill_id in (trade.get("appliedFillIds") or trade.get("applied_fill_ids") or [])}
+    if local_fill_ids and not local_fill_ids.issubset(regime_fill_ids):
+        missing = sorted(local_fill_ids - regime_fill_ids)
+        discrepancies.append(f"regime.local_paper.reconciliation.local_fill_missing_regime_fill:{','.join(missing)}")
+    if local_fill_ids and not local_fill_ids.issubset(inventory_fill_ids):
+        missing = sorted(local_fill_ids - inventory_fill_ids)
+        discrepancies.append(f"regime.local_paper.reconciliation.local_fill_missing_inventory_event:{','.join(missing)}")
+    if local_fill_ids and regime_trades and not local_fill_ids.issubset(trade_fill_ids):
+        missing = sorted(local_fill_ids - trade_fill_ids)
+        discrepancies.append(f"regime.local_paper.reconciliation.local_fill_missing_trade_record:{','.join(missing)}")
+    if local_fill_ids and not regime_trades:
+        discrepancies.append("regime.local_paper.reconciliation.trade_records_missing")
+
+    fill_quantity = sum(_signed_fill_quantity(fill) for fill in local_fills)
+    if local_fills and fill_quantity != inventory_quantity:
+        discrepancies.append(f"regime.local_paper.reconciliation.fill_inventory_quantity_mismatch:fills={fill_quantity}:inventory={inventory_quantity}")
+
+    account_realized = _number(account.get("realizedPnl"))
+    inventory_realized = _number(inventory.get("realizedPnl"))
+    trade_realized = sum(_number(trade.get("realizedPnl")) or 0.0 for trade in regime_trades.values())
+    if account_realized is not None and inventory_realized is not None and not _close_enough(account_realized, inventory_realized):
+        discrepancies.append(f"regime.local_paper.reconciliation.realized_pnl_mismatch:account={account_realized}:inventory={inventory_realized}")
+    if regime_trades and account_realized is not None and not _close_enough(account_realized, trade_realized):
+        discrepancies.append(f"regime.local_paper.reconciliation.trade_realized_pnl_mismatch:account={account_realized}:trades={round(trade_realized, 8)}")
+
+    initial_balance = _number(account.get("initialBalance"))
+    if initial_balance is not None and account_cash is not None and local_fills:
+        expected_cash = round(initial_balance + sum(_fill_cash_delta(fill) for fill in local_fills), 8)
+        if not _close_enough(account_cash, expected_cash):
+            discrepancies.append(f"regime.local_paper.reconciliation.cash_ledger_mismatch:account={account_cash}:expected={expected_cash}")
+
+    open_order_quantity = sum(int(_number(order.get("remainingQuantity") or order.get("quantity")) or 0) for order in runtime_orders if str(order.get("status") or "").upper() in {"ACCEPTED", "NEW", "OPEN", "PARTIALLY_FILLED"})
+    inventory_open_order_quantity = int(_number(inventory.get("openOrderQuantity")) or 0)
+    if runtime_orders and open_order_quantity != inventory_open_order_quantity:
+        discrepancies.append(f"regime.local_paper.reconciliation.open_order_quantity_mismatch:orders={open_order_quantity}:inventory={inventory_open_order_quantity}")
+
+    unresolved = bool(dict.fromkeys(discrepancies))
+    result = {
+        **identity,
+        "algorithmId": "regime",
+        "reconciliationVersion": REGIME_BROKER_RECONCILIATION_VERSION,
+        "trigger": trigger,
+        "timestamp": observed_at,
+        "runtimeMode": "local_paper",
+        "localPaper": True,
+        "reconciled": not unresolved,
+        "reconciliationRequired": unresolved,
+        "blockNewEntries": unresolved,
+        "newEntriesPaused": unresolved,
+        "riskReducingExitsAllowed": True,
+        "manualReviewRequired": unresolved,
+        "deterministicRecoveries": deterministic_recoveries,
+        "discrepancies": tuple(dict.fromkeys(discrepancies)),
+        "counts": {
+            "outbox": len(context["latestOutbox"]),
+            "regimeOrders": len(context["regimeOrders"]),
+            "regimeFills": len(regime_fills),
+            "regimePositions": len(regime_positions),
+            "regimeTrades": len(regime_trades),
+            "localOrders": len(runtime_orders),
+            "localFills": len(local_fills),
+            "inventoryEvents": len(inventory_events),
+            "brokerOpenOrders": 0,
+            "brokerFills": 0,
+            "brokerPositions": 0,
+        },
+        "inventorySnapshot": inventory,
+        "accountSnapshot": account,
+        "reasonCodes": tuple(dict.fromkeys(reason_codes + (["regime.reconciliation.unresolved_discrepancy"] if unresolved else ["regime.reconciliation.completed"]))),
+    }
+    repository.record_reconciliation_run(result, status="unresolved_discrepancy" if unresolved else "reconciled")
+    if unresolved:
+        repository.record_runtime_alert(
+            identity,
+            {
+                "alertType": "local_paper_reconciliation_mismatch",
+                "trigger": trigger,
+                "manualReviewRequired": True,
+                "discrepancies": result["discrepancies"],
+                "newEntriesBlocked": True,
+                "riskReducingExitsAllowed": True,
+                "timestamp": observed_at,
+                "reasonCodes": result["reasonCodes"],
+            },
+            status="active",
+        )
+    return result
+
 def _reconciliation_context(repository: RegimeSqliteRepository, identity: dict[str, Any]) -> dict[str, Any]:
     latest_outbox = _latest_by_intent(repository.read_owned_records("regime_execution_outbox", identity))
     regime_orders = repository.read_owned_records("regime_orders", identity)
     regime_fills = repository.read_owned_records("regime_fills", identity)
     regime_positions = repository.latest_regime_positions(identity)
+    regime_trades = repository.read_owned_records("regime_trades", identity)
     inventory_events = repository.read_owned_records("regime_inventory_events", identity)
     known_intents = set(latest_outbox)
     known_client_ids = {str(item.get("brokerClientOrderId") or "") for item in latest_outbox.values()}
@@ -214,6 +375,7 @@ def _reconciliation_context(repository: RegimeSqliteRepository, identity: dict[s
         "regimeOrders": regime_orders,
         "regimeFills": regime_fills,
         "regimePositions": regime_positions,
+        "regimeTrades": regime_trades,
         "inventoryEvents": inventory_events,
         "knownIntents": {item for item in known_intents if item},
         "knownClientIds": {item for item in known_client_ids if item},
@@ -452,6 +614,112 @@ def _intent_for_trade_id(trade_id: str, context: dict[str, Any]) -> str:
 def _observation_id(observation: dict[str, Any]) -> str:
     return str(observation.get("clientOrderId") or observation.get("brokerOrderId") or observation.get("positionId") or observation.get("tradeId") or observation.get("fillId") or "unknown")
 
+
+def _runtime_snapshot_records(repository: RegimeSqliteRepository, identity: dict[str, Any], key: str, field: str) -> list[dict[str, Any]]:
+    reader = getattr(repository, "read_runtime_snapshot", None)
+    if not callable(reader):
+        return []
+    try:
+        snapshot = reader(identity, key) or {}
+    except Exception:
+        return []
+    records = snapshot.get(field) if isinstance(snapshot, dict) else None
+    return [_record(item) for item in records or []]
+
+
+def _latest_by_id(records: list[dict[str, Any]], key: str) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    snake = "".join(["_" + char.lower() if char.isupper() else char for char in key]).lstrip("_")
+    for record in records:
+        record_id = str(record.get(key) or record.get(snake) or "")
+        if record_id:
+            latest[record_id] = record
+    return latest
+
+
+def _records(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, (list, tuple)):
+        return [_record(item) for item in value]
+    return []
+
+
+def _unique_fill_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: dict[str, dict[str, Any]] = {}
+    for record in records:
+        key = str(record.get("fillId") or record.get("fill_id") or _fill_fallback_id(record))
+        if key:
+            unique[key] = record
+    return list(unique.values())
+
+
+def _fill_fallback_id(fill: dict[str, Any]) -> str:
+    return ":".join(
+        str(fill.get(key) or "")
+        for key in ("orderIntentId", "clientOrderId", "filledAt", "timestamp", "averageFillPrice", "filledQuantity")
+    )
+
+
+def _local_owned_state_discrepancies(record: dict[str, Any], identity: dict[str, Any], label: str, discrepancies: list[str]) -> None:
+    if not record:
+        return
+    if str(record.get("algorithmId") or record.get("algorithm_id") or "") != "regime":
+        discrepancies.append(f"regime.local_paper.reconciliation.{label}_algorithm_mismatch")
+    if str(record.get("runtimeMode") or record.get("runtime_mode") or "") != "local_paper":
+        discrepancies.append(f"regime.local_paper.reconciliation.{label}_runtime_mode_mismatch")
+    for field in ("algorithmInstanceId", "accountId"):
+        if str(record.get(field) or "") and str(record.get(field) or "") != str(identity.get(field) or ""):
+            discrepancies.append(f"regime.local_paper.reconciliation.{label}_{field}_mismatch")
+    if str(record.get("symbol") or "").upper() and str(record.get("symbol") or "").upper() != str(identity.get("symbol") or "SPY").upper():
+        discrepancies.append(f"regime.local_paper.reconciliation.{label}_symbol_mismatch")
+
+
+def _signed_inventory_quantity(inventory: dict[str, Any]) -> int:
+    quantity = int(_number(inventory.get("quantity")) or 0)
+    side = str(inventory.get("side") or "").lower()
+    if quantity > 0 and side in {"short", "sell"}:
+        return -quantity
+    return quantity
+
+
+def _signed_position_quantity(position: dict[str, Any]) -> int:
+    quantity = int(_number(position.get("quantity") or position.get("filledQuantity")) or 0)
+    side = str(position.get("side") or "").lower()
+    status = str(position.get("positionStatus") or position.get("processingStatus") or "open").lower()
+    if status in {"closed", "flat", "cancelled", "canceled"}:
+        return 0
+    if quantity > 0 and side in {"short", "sell"}:
+        return -quantity
+    return quantity
+
+
+def _signed_fill_quantity(fill: dict[str, Any]) -> int:
+    quantity = int(_number(fill.get("filledQuantity") or fill.get("quantity")) or 0)
+    side = str(fill.get("side") or fill.get("orderSide") or "").lower()
+    return -quantity if side in {"sell", "short"} else quantity
+
+
+def _fill_cash_delta(fill: dict[str, Any]) -> float:
+    quantity = abs(int(_number(fill.get("filledQuantity") or fill.get("quantity")) or 0))
+    price = _number(fill.get("averageFillPrice") or fill.get("fillPrice") or fill.get("price")) or 0.0
+    cost = _number(fill.get("totalExecutionCost"))
+    if cost is None:
+        cost = (_number(fill.get("commission")) or 0.0) + (_number(fill.get("regulatoryFees") or fill.get("fees")) or 0.0) + (_number(fill.get("slippage")) or 0.0)
+    notional = quantity * price
+    side = str(fill.get("side") or fill.get("orderSide") or "").lower()
+    return round((notional - cost) if side in {"sell", "short"} else -(notional + cost), 8)
+
+
+def _number(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _close_enough(left: float, right: float, tolerance: float = 0.01) -> bool:
+    return abs(float(left) - float(right)) <= tolerance
 
 def _record(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
