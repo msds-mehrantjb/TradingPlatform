@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.app.domain.models import Signal
-from backend.app.execution import PaperGatewayBrokerAck, PaperOrderGateway
+from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill, PaperOrderGateway
 from backend.app.execution import cost_model
 from backend.app.execution.paper_order_gateway import deterministic_gateway_client_order_id
 from backend.app.gates import GlobalGateResponse, GlobalOrderProposal, apply_global_gate_response
@@ -89,6 +89,35 @@ class SharedPaperOrderGatewayBrokerPaperRegressionTest(unittest.TestCase):
         self.assertFalse(any(key.startswith("weighted_voting.") for key in store.snapshots))
 
 
+    def test_broker_fill_missing_ownership_is_enriched_from_submitted_intent(self) -> None:
+        broker = OwnershipOmittingFillBroker()
+        store = MemoryStore()
+        gateway = PaperOrderGateway(broker, store, execution_mode="BROKER_PAPER")
+        proposal = global_proposal(
+            algorithm_id="regime",
+            capital_partition_id="regime.paper-account.paper",
+            order_intent_id="regime-fill-ownership-normalized",
+        )
+
+        result = gateway.submit(
+            proposal=proposal,
+            global_application=global_application(proposal),
+            local_gate_passed=True,
+            mode="automatic",
+            evaluated_at=NOW,
+        )
+
+        self.assertTrue(result.submitted)
+        self.assertIsNotNone(result.fill)
+        assert result.fill is not None
+        self.assertEqual(result.fill.algorithmId, "regime")
+        self.assertEqual(result.fill.capitalPartitionId, "regime.paper-account.paper")
+        self.assertEqual(result.fill.accountId, "paper-account")
+        self.assertIsNotNone(result.protectiveOrder)
+        assert result.protectiveOrder is not None
+        self.assertEqual(result.protectiveOrder.capitalPartitionId, "regime.paper-account.paper")
+        self.assertEqual(result.protectiveOrder.accountId, "paper-account")
+
 class RecordingPaperBroker:
     def __init__(self) -> None:
         self.verified = False
@@ -120,6 +149,21 @@ class RecordingPaperBroker:
     def refresh_positions(self) -> list[dict[str, Any]]:
         return []
 
+
+class OwnershipOmittingFillBroker(RecordingPaperBroker):
+    def refresh_order(self, client_order_id: str):
+        self.refresh_order_ids.append(client_order_id)
+        return PaperGatewayFill(
+            clientOrderId=client_order_id,
+            algorithmId="regime",
+            orderIntentId="regime-fill-ownership-normalized",
+            symbol="SPY",
+            side=Signal.BUY,
+            filledQuantity=1,
+            averageFillPrice=100.0,
+            status="FILLED",
+            filledAt=NOW,
+        )
 
 class MemoryStore:
     def __init__(self) -> None:

@@ -12,7 +12,8 @@ from typing import Any
 from uuid import uuid4
 
 from backend.app.algorithms.wca.broker_reconciliation import reconcile_wca_broker
-from backend.app.algorithms.wca.alpaca_paper_broker import WcaAlpacaPaperBroker, WcaAlpacaPaperBrokerConfigurationError
+from backend.app.algorithms.wca.local_paper_account import WCA_DEFAULT_LOCAL_PAPER_STARTING_BALANCE, WCA_LOCAL_PAPER_SOURCE_AUTHORITY, WcaLocalPaperAccount, WcaLocalPaperAccountValidation
+from backend.app.algorithms.wca.local_paper_broker import WcaLocalPaperBroker, WcaLocalPaperBrokerConfigurationError
 from backend.app.algorithms.wca.contracts import (
     GlobalGateResult,
     WcaPaperExecutionRequest,
@@ -34,7 +35,6 @@ from backend.app.algorithms.wca.contracts import (
 from backend.app.algorithms.wca.configuration import default_effective_settings
 from backend.app.algorithms.wca.execution_pipeline import WcaExecutionPipelineInput, run_wca_paper_pipeline_adapter
 from backend.app.algorithms.wca.global_risk import WCA_GLOBAL_RISK_ADAPTER_VERSION, WcaGlobalRiskAdapter, build_wca_global_risk_proposal
-from backend.app.algorithms.wca.paper_account import validate_wca_automatic_paper_account
 from backend.app.algorithms.wca.paper_broker import WcaPaperBrokerOrderRequest, WcaPaperBrokerOutboxAdapter, WcaPaperBrokerTimeout, build_wca_paper_broker_request, place_or_replace_wca_protective_orders
 from backend.app.algorithms.wca.position_management import manage_wca_position
 from backend.app.algorithms.wca.market_calendar import WcaMarketCalendar
@@ -94,6 +94,7 @@ WCA_RUNTIME_COMMAND_CONSUMERS = {
     WcaRuntimeCommandType.PAUSE_NEW_ENTRIES: "runtime_control_worker",
     WcaRuntimeCommandType.RESUME_NEW_ENTRIES: "runtime_control_worker",
     WcaRuntimeCommandType.SET_AUTOMATIC_PAPER: "runtime_control_worker",
+    WcaRuntimeCommandType.RESET_LOCAL_PAPER_ACCOUNT: "runtime_control_worker",
     WcaRuntimeCommandType.CONFIGURATION_ACTIVATION: "configuration_activation_worker",
     WcaRuntimeCommandType.CONFIGURATION_ROLLBACK: "configuration_rollback_worker",
     WcaRuntimeCommandType.POSITION_PROTECTIVE_EXIT: "position_and_protective_exit_worker",
@@ -132,6 +133,8 @@ class WcaRuntimeSettings:
     market_readiness_interval_seconds: int = 60
     entry_cutoff_interval_seconds: int = 60
     end_of_session_flatten_buffer_minutes: int = 5
+    end_of_session_flatten_enabled: bool = True
+    local_paper_starting_balance: float = WCA_DEFAULT_LOCAL_PAPER_STARTING_BALANCE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "runtime_mode", coerce_wca_runtime_mode(self.runtime_mode))
@@ -553,6 +556,7 @@ class RuntimeSchedulerWorker(RuntimeWorker):
                 "session_date": session_date,
                 "entry_cutoff_reached": entry_cutoff_reached,
                 "flatten_due": flatten_due,
+                "end_of_session_flatten_enabled": self.supervisor.settings.end_of_session_flatten_enabled,
                 "end_of_session_actions": (
                     "cancel_unfilled_entries",
                     "flatten_wca_exposure",
@@ -656,12 +660,15 @@ class DecisionWorker(RuntimeWorker):
         if event.snapshot is None:
             self.runtime_repository.block_command(command.command_id, reason_codes=("wca.runtime.snapshot_missing",))
             return {"status": "blocked", "commandId": command.command_id, "reasonCodes": ["wca.runtime.snapshot_missing"]}
+        local_refresh = _refresh_local_auto_paper_state_for_event(self.supervisor, event)
         state = load_wca_authoritative_runtime_state(
             self.repository,
             broker_account_id=self.supervisor.settings.account_id,
             symbol=event.symbol,
             state_timestamp=event.finalized_candle_timestamp,
             maximum_permitted_state_age_seconds=int(self.supervisor.settings.max_authoritative_account_state_age_seconds or self.supervisor.settings.max_state_age_seconds),
+            runtime_mode=self.supervisor.settings.runtime_mode,
+            market_data=_market_update_from_finalized_event(event),
         )
         if not state.fresh or not state.account_wide_entry_permission:
             control = self.supervisor.resolve_runtime_control(
@@ -694,6 +701,7 @@ class DecisionWorker(RuntimeWorker):
                 "commandId": command.command_id,
                 "decisionId": decision.decision_id,
                 "authoritativeStateHash": state.state_hash,
+                "localPaperRefresh": local_refresh,
                 "reasonCodes": ["wca.runtime.fail_closed.authoritative_state_blocked", *state.reason_codes],
             }
         entry_health = _evaluate_entry_health(
@@ -787,7 +795,7 @@ class DecisionWorker(RuntimeWorker):
             }
         )
         self.runtime_repository.write_runtime_health(health)
-        return {"status": "completed", "commandId": command.command_id, "decisionId": decision.decision_id, "pausedNewEntries": pause_new_entries, "reasonCodes": list(entry_block_reasons or ("wca.runtime.healthy",))}
+        return {"status": "completed", "commandId": command.command_id, "decisionId": decision.decision_id, "pausedNewEntries": pause_new_entries, "localPaperRefresh": local_refresh, "reasonCodes": list(entry_block_reasons or ("wca.runtime.healthy",))}
 
     def _hold_decision(self, command: WcaRuntimeCommand, event: WcaFinalizedBarEvent, state: WcaAuthoritativeRuntimeState, *, configuration_hash: str, weight_version: str) -> WcaDecision:
         if event.snapshot is None:
@@ -934,6 +942,7 @@ class ManualPaperCommandWorker(RuntimeWorker):
             symbol=command.symbol,
             state_timestamp=timestamp,
             maximum_permitted_state_age_seconds=int(self.supervisor.settings.max_authoritative_account_state_age_seconds or self.supervisor.settings.max_state_age_seconds),
+            runtime_mode=self.supervisor.settings.runtime_mode,
         )
         if not state.fresh:
             reasons = ("wca.runtime.manual_paper_command.authoritative_state_unavailable", *state.reason_codes)
@@ -1052,6 +1061,7 @@ class GlobalRiskRequestWorker(RuntimeWorker):
             symbol=command.symbol,
             state_timestamp=decision.decision_timestamp,
             maximum_permitted_state_age_seconds=int(self.supervisor.settings.max_authoritative_account_state_age_seconds or self.supervisor.settings.max_state_age_seconds),
+            runtime_mode=self.supervisor.settings.runtime_mode,
         )
         if not state.fresh or not state.account_wide_entry_permission:
             reasons = ("wca.runtime.global_risk_request.authoritative_state_blocked", *state.reason_codes)
@@ -1182,25 +1192,25 @@ class ExecutionOutboxWorker(RuntimeWorker):
         proposed = decision.proposed_order.model_copy(update={"idempotency_key": decision.proposed_order.idempotency_key or idempotency_key, "account_id": command.account_id})
         decision = decision.model_copy(update={"proposed_order": proposed})
         request = build_wca_paper_broker_request(proposed)
-        paper_account = validate_wca_automatic_paper_account(account_id=command.account_id)
+        paper_account = _paper_account_validation_for_runtime(self.supervisor, account_id=command.account_id)
         if not paper_account.verified:
-            self.runtime_repository.block_command(command.command_id, reason_codes=("wca.runtime.execution_outbox.automatic_paper_account_blocked", *paper_account.reason_codes))
+            self.runtime_repository.block_command(command.command_id, reason_codes=("wca.runtime.execution_outbox.local_paper_account_blocked", *paper_account.reason_codes))
             self.runtime_repository.write_runtime_health(
-                self.supervisor.health_snapshot(paused_new_entries=True, reason_codes=("wca.runtime.execution_outbox.automatic_paper_account_blocked", *paper_account.reason_codes))
+                self.supervisor.health_snapshot(paused_new_entries=True, reason_codes=("wca.runtime.execution_outbox.local_paper_account_blocked", *paper_account.reason_codes))
             )
             return {
                 "status": "blocked",
                 "commandId": command.command_id,
                 "submitted": False,
-                "reasonCodes": ["wca.runtime.execution_outbox.automatic_paper_account_blocked", *paper_account.reason_codes],
+                "reasonCodes": ["wca.runtime.execution_outbox.local_paper_account_blocked", *paper_account.reason_codes],
             }
-        broker: WcaAlpacaPaperBroker | None = None
+        broker: WcaLocalPaperBroker | None = None
         broker_clock: WcaBrokerClock | None = None
         try:
-            broker = WcaAlpacaPaperBroker.from_env(account_id=command.account_id)
+            broker = _build_wca_runtime_local_paper_broker(self.supervisor, account_id=command.account_id, symbol=command.symbol)
             verified, broker_reason_codes = broker.verify_account_and_endpoint_identity()
             if not verified:
-                reasons = ("wca.runtime.execution_outbox.alpaca_paper_broker_blocked", *broker_reason_codes)
+                reasons = ("wca.runtime.execution_outbox.local_paper_broker_blocked", *broker_reason_codes)
                 self.runtime_repository.block_command(command.command_id, reason_codes=reasons)
                 self.runtime_repository.write_runtime_health(
                     self.supervisor.health_snapshot(paused_new_entries=True, reason_codes=reasons)
@@ -1212,10 +1222,10 @@ class ExecutionOutboxWorker(RuntimeWorker):
                     "reasonCodes": list(reasons),
                 }
             broker_clock = broker.read_clock()
-        except WcaAlpacaPaperBrokerConfigurationError as exc:
+        except WcaLocalPaperBrokerConfigurationError as exc:
             reason_text = str(exc)
             broker_reason_codes = tuple(code for code in reason_text.split(";") if code)
-            reasons = ("wca.runtime.execution_outbox.alpaca_paper_broker_blocked", *broker_reason_codes)
+            reasons = ("wca.runtime.execution_outbox.local_paper_broker_blocked", *broker_reason_codes)
             self.runtime_repository.block_command(command.command_id, reason_codes=reasons)
             self.runtime_repository.write_runtime_health(
                 self.supervisor.health_snapshot(paused_new_entries=True, reason_codes=reasons)
@@ -1229,7 +1239,7 @@ class ExecutionOutboxWorker(RuntimeWorker):
                 "reasonCodes": list(reasons),
             }
         except Exception as exc:
-            reasons = ("wca.runtime.execution_outbox.alpaca_paper_clock_blocked", type(exc).__name__)
+            reasons = ("wca.runtime.execution_outbox.local_paper_clock_blocked", type(exc).__name__)
             self.runtime_repository.block_command(command.command_id, reason_codes=reasons)
             self.runtime_repository.write_runtime_health(
                 self.supervisor.health_snapshot(paused_new_entries=True, reason_codes=reasons)
@@ -1326,10 +1336,10 @@ class ExecutionOutboxWorker(RuntimeWorker):
                     runtime_control=current_control,
                 ),
             )
-        except WcaAlpacaPaperBrokerConfigurationError as exc:
+        except WcaLocalPaperBrokerConfigurationError as exc:
             reason_text = str(exc)
             broker_reason_codes = tuple(code for code in reason_text.split(";") if code)
-            reasons = ("wca.runtime.execution_outbox.alpaca_paper_broker_blocked", *broker_reason_codes)
+            reasons = ("wca.runtime.execution_outbox.local_paper_broker_blocked", *broker_reason_codes)
             self.runtime_repository.block_command(command.command_id, reason_codes=reasons)
             self.runtime_repository.write_runtime_health(
                 self.supervisor.health_snapshot(paused_new_entries=True, reason_codes=reasons)
@@ -1382,19 +1392,19 @@ class BrokerReconciliationWorker(RuntimeWorker):
             )
             reconciliation_due = reconciliation_age is None or reconciliation_age > self.supervisor.settings.max_reconciliation_age_seconds
             if reconciliation_due or self.repository.reconciliation_blocks_new_entries(account_id=self.supervisor.settings.account_id, symbol=self.supervisor.settings.symbol):
-                paper_account = validate_wca_automatic_paper_account(account_id=self.supervisor.settings.account_id)
+                paper_account = _paper_account_validation_for_runtime(self.supervisor, account_id=self.supervisor.settings.account_id)
                 if paper_account.verified:
                     return self._run_reconciliation(None, account_id=self.supervisor.settings.account_id)
             return {"status": "idle", "reasonCodes": ["wca.runtime.broker_reconciliation_worker.idle"]}
         return self._run_reconciliation(command, account_id=command.account_id)
 
     def _run_reconciliation(self, command: WcaRuntimeCommand | None, *, account_id: str) -> dict[str, Any]:
-        broker: WcaAlpacaPaperBroker | None = None
+        broker: WcaLocalPaperBroker | None = None
         try:
-            broker = WcaAlpacaPaperBroker.from_env(account_id=account_id)
+            broker = _build_wca_runtime_local_paper_broker(self.supervisor, account_id=account_id, symbol=self.supervisor.settings.symbol)
             verified, broker_reason_codes = broker.verify_account_and_endpoint_identity()
             if not verified:
-                reasons = ("wca.runtime.broker_reconciliation.alpaca_paper_broker_blocked", *broker_reason_codes)
+                reasons = ("wca.runtime.broker_reconciliation.local_paper_broker_blocked", *broker_reason_codes)
                 if command is not None:
                     self.runtime_repository.block_command(command.command_id, reason_codes=reasons)
                 self.runtime_repository.write_runtime_health(self.supervisor.health_snapshot(paused_new_entries=True, reason_codes=reasons))
@@ -1407,9 +1417,9 @@ class BrokerReconciliationWorker(RuntimeWorker):
                 account_id=account_id,
                 evaluated_at=_utc_now(),
             )
-        except WcaAlpacaPaperBrokerConfigurationError as exc:
+        except WcaLocalPaperBrokerConfigurationError as exc:
             broker_reason_codes = tuple(code for code in str(exc).split(";") if code)
-            reasons = ("wca.runtime.broker_reconciliation.alpaca_paper_broker_blocked", *broker_reason_codes)
+            reasons = ("wca.runtime.broker_reconciliation.local_paper_broker_blocked", *broker_reason_codes)
             if command is not None:
                 self.runtime_repository.block_command(command.command_id, reason_codes=reasons)
             self.runtime_repository.write_runtime_health(self.supervisor.health_snapshot(paused_new_entries=True, reason_codes=reasons))
@@ -1633,6 +1643,7 @@ class RuntimeControlWorker(RuntimeWorker):
     def run_once(self) -> dict[str, Any]:
         for command_type in (
             WcaRuntimeCommandType.SET_AUTOMATIC_PAPER,
+            WcaRuntimeCommandType.RESET_LOCAL_PAPER_ACCOUNT,
             WcaRuntimeCommandType.PAUSE_NEW_ENTRIES,
             WcaRuntimeCommandType.RESUME_NEW_ENTRIES,
         ):
@@ -1692,6 +1703,44 @@ class RuntimeControlWorker(RuntimeWorker):
                 "paperOnly": True,
                 "liveTradingEnabled": False,
                 "reasonCodes": list(control.reason_codes),
+            }
+        if command.command_type == WcaRuntimeCommandType.RESET_LOCAL_PAPER_ACCOUNT:
+            reason = str(command.payload.get("reason") or "wca.local_paper.reset_requested")
+            force = bool(command.payload.get("force"))
+            requested_balance = command.payload.get("starting_balance") or command.payload.get("startingBalance")
+            local_paper = _local_paper_settings_for_runtime(self.supervisor)
+            starting_balance = float(requested_balance) if requested_balance is not None else _local_paper_starting_balance(self.supervisor, local_paper)
+            broker = WcaLocalPaperBroker(repository=self.repository, account_id=command.account_id, symbol=command.symbol, starting_balance=starting_balance)
+            try:
+                reset = broker.reset_local_paper_account(
+                    starting_balance=starting_balance,
+                    reset_at=_utc_now(),
+                    force=force,
+                    reason=reason,
+                    command_id=command.command_id,
+                )
+            finally:
+                broker.close()
+            result_reasons = tuple(reset.get("reasonCodes") or reset.get("reason_codes") or ())
+            if reset.get("status") == "blocked":
+                self.runtime_repository.block_command(command.command_id, reason_codes=result_reasons)
+                return {
+                    "status": "blocked",
+                    "commandId": command.command_id,
+                    "reset": reset,
+                    "reasonCodes": list(result_reasons),
+                }
+            self.runtime_repository.complete_command(command.command_id, reason_codes=result_reasons)
+            self.runtime_repository.write_runtime_health(
+                self.supervisor.health_snapshot(paused_new_entries=False, reason_codes=result_reasons)
+            )
+            return {
+                "status": "completed",
+                "commandId": command.command_id,
+                "reset": reset,
+                "paperOnly": True,
+                "liveTradingEnabled": False,
+                "reasonCodes": list(result_reasons),
             }
         if command.command_type == WcaRuntimeCommandType.PAUSE_NEW_ENTRIES:
             reason = str(command.payload.get("reason") or "api_pause")
@@ -1809,13 +1858,13 @@ class EmergencyRiskReductionWorker(RuntimeWorker):
             "wca.runtime.emergency_risk_reduction.reconciliation_scheduled",
         ]
         broker_evidence: dict[str, Any] = {}
-        broker: WcaAlpacaPaperBroker | None = None
+        broker: WcaLocalPaperBroker | None = None
         terminal = "completed"
         try:
-            broker = WcaAlpacaPaperBroker.from_env(account_id=command.account_id)
+            broker = _build_wca_runtime_local_paper_broker(self.supervisor, account_id=command.account_id, symbol=command.symbol)
             verified, broker_reason_codes = broker.verify_account_and_endpoint_identity()
             if not verified:
-                reasons.extend(("wca.runtime.emergency_risk_reduction.alpaca_paper_broker_blocked", *broker_reason_codes))
+                reasons.extend(("wca.runtime.emergency_risk_reduction.local_paper_broker_blocked", *broker_reason_codes))
                 terminal = "blocked"
             else:
                 broker_cancelled = broker.cancel_all_wca_entry_orders() if hasattr(broker, "cancel_all_wca_entry_orders") else ()
@@ -1828,8 +1877,8 @@ class EmergencyRiskReductionWorker(RuntimeWorker):
                 else:
                     reasons.append(f"wca.runtime.emergency_risk_reduction.flatten_{flatten['status']}")
                     terminal = "blocked"
-        except WcaAlpacaPaperBrokerConfigurationError as exc:
-            reasons.extend(("wca.runtime.emergency_risk_reduction.alpaca_paper_broker_blocked", *(code for code in str(exc).split(";") if code)))
+        except WcaLocalPaperBrokerConfigurationError as exc:
+            reasons.extend(("wca.runtime.emergency_risk_reduction.local_paper_broker_blocked", *(code for code in str(exc).split(";") if code)))
             terminal = "blocked"
         finally:
             if broker is not None:
@@ -1980,12 +2029,12 @@ class EndOfSessionWorker(RuntimeWorker):
         command = self.runtime_repository.claim_next_command(WcaRuntimeCommandType.END_OF_SESSION, owner_id=self.supervisor.owner_id)
         if command is None:
             return {"status": "idle", "reasonCodes": ["wca.runtime.end_of_session_worker.idle"]}
-        broker: WcaAlpacaPaperBroker | None = None
+        broker: WcaLocalPaperBroker | None = None
         try:
-            broker = WcaAlpacaPaperBroker.from_env(account_id=command.account_id)
+            broker = _build_wca_runtime_local_paper_broker(self.supervisor, account_id=command.account_id, symbol=command.symbol)
             verified, broker_reason_codes = broker.verify_account_and_endpoint_identity()
             if not verified:
-                reasons = ("wca.runtime.end_of_session.alpaca_paper_broker_blocked", *broker_reason_codes)
+                reasons = ("wca.runtime.end_of_session.local_paper_broker_blocked", *broker_reason_codes)
                 return _fail_end_of_session(self.supervisor, command, reasons, evidence={"stage": "broker_identity"})
             result = process_wca_end_of_session(
                 repository=self.repository,
@@ -1995,8 +2044,8 @@ class EndOfSessionWorker(RuntimeWorker):
                 max_queue_depth=self.supervisor.settings.max_command_queue_depth,
                 now=_payload_datetime(command.payload.get("evaluated_at")) or _utc_now(),
             )
-        except WcaAlpacaPaperBrokerConfigurationError as exc:
-            reasons = ("wca.runtime.end_of_session.alpaca_paper_broker_blocked", *(code for code in str(exc).split(";") if code))
+        except WcaLocalPaperBrokerConfigurationError as exc:
+            reasons = ("wca.runtime.end_of_session.local_paper_broker_blocked", *(code for code in str(exc).split(";") if code))
             return _fail_end_of_session(self.supervisor, command, reasons, evidence={"stage": "broker_configuration"})
         finally:
             if broker is not None:
@@ -2031,6 +2080,7 @@ def process_wca_end_of_session(
         local_evaluated = evaluated.astimezone(session.market_close.tzinfo)
         cutoff_reached = (local_evaluated.hour * 60 + local_evaluated.minute) >= cutoff_minutes or market_calendar.should_flatten(evaluated, buffer_minutes=5)
     reasons: list[str] = ["wca.runtime.end_of_session.started", "wca.runtime.end_of_session.entries_paused"]
+    flatten_enabled = _payload_bool(command.payload.get("end_of_session_flatten_enabled", command.payload.get("flatten_enabled")), True)
     evidence: dict[str, Any] = {
         "command_id": command.command_id,
         "account_id": command.account_id,
@@ -2041,6 +2091,7 @@ def process_wca_end_of_session(
         "market_holiday_or_closed": session is None,
         "entry_cutoff_minutes": cutoff_minutes,
         "entry_cutoff_reached": cutoff_reached,
+        "end_of_session_flatten_enabled": flatten_enabled,
     }
     _enqueue_reconciliation(runtime_repository, command, max_queue_depth=max_queue_depth, marker="before_end_of_session_flatten", priority=1)
     first_reconciliation = reconcile_wca_broker(repository=repository, broker=broker, account_id=command.account_id, evaluated_at=evaluated)
@@ -2060,7 +2111,10 @@ def process_wca_end_of_session(
     _mark_local_entry_orders_cancelled(repository, account_id=command.account_id, symbol=command.symbol, evidence={"phase": "end_of_session"})
     processed_fills = _process_observed_fills(repository, broker)
     evidence["processed_fills"] = processed_fills
-    flattened = _flatten_local_wca_position(repository, broker, command=command, evaluated_at=evaluated, record_inventory_event=True)
+    if flatten_enabled:
+        flattened = _flatten_local_wca_position(repository, broker, command=command, evaluated_at=evaluated, record_inventory_event=True)
+    else:
+        flattened = {"status": "disabled", "closed_quantity": 0, "remaining_quantity": repository.open_wca_position_quantity(account_id=command.account_id, symbol=command.symbol)}
     evidence["flatten"] = flattened
     if flattened["status"] == "filled":
         _record_end_of_session_flatten_event(repository, command=command, evaluated_at=evaluated, flatten={**flattened, "ledger_quantity": 0})
@@ -2072,6 +2126,8 @@ def process_wca_end_of_session(
         reasons.append("wca.runtime.end_of_session.flatten_failed")
     elif flattened["status"] == "already_flat":
         reasons.append("wca.runtime.end_of_session.already_flat")
+    elif flattened["status"] == "disabled":
+        reasons.append("wca.runtime.end_of_session.flatten_disabled")
     else:
         reasons.append("wca.runtime.end_of_session.flatten_submitted")
     second_reconciliation = reconcile_wca_broker(repository=repository, broker=broker, account_id=command.account_id, evaluated_at=evaluated + timedelta(microseconds=1))
@@ -2079,6 +2135,7 @@ def process_wca_end_of_session(
     evidence["final_discrepancies"] = [row.model_dump(mode="json") for row in second_reconciliation.discrepancies]
     verification = _verify_end_of_session(repository, broker, command=command)
     evidence["verification"] = verification
+    evidence["final_local_account_snapshot"] = _final_local_account_snapshot(repository, broker, command=command, evaluated_at=evaluated)
     if verification["verified"]:
         _record_end_of_session_evidence(repository, command=command, evaluated_at=evaluated, evidence=evidence, verified=True)
         reasons.append("wca.runtime.end_of_session.verified_flat")
@@ -2342,8 +2399,12 @@ def _flatten_local_wca_position(repository: WcaSqliteRepository, broker: Any, *,
         return {"status": "already_flat", "closed_quantity": 0}
     side = lots[0]["side"]
     client_order_id = f"wca-eos-{command.account_id}-{command.symbol}-{command.command_id}"[:48]
+    mark_price = _payload_float(command.payload.get("mark_price", command.payload.get("eod_mark_price")), _average_mark_from_lots(lots))
     try:
-        ack = broker.close_or_reduce_wca_position(symbol=command.symbol, quantity=quantity, side=side, client_order_id=client_order_id)
+        try:
+            ack = broker.close_or_reduce_wca_position(symbol=command.symbol, quantity=quantity, side=side, client_order_id=client_order_id, price=mark_price, evaluated_at=evaluated_at)
+        except TypeError:
+            ack = broker.close_or_reduce_wca_position(symbol=command.symbol, quantity=quantity, side=side, client_order_id=client_order_id)
     except WcaPaperBrokerTimeout as exc:
         return {"status": "timeout", "closed_quantity": 0, "error": str(exc)}
     except Exception as exc:
@@ -2359,7 +2420,8 @@ def _flatten_local_wca_position(repository: WcaSqliteRepository, broker: Any, *,
             cancelled_protective = ()
     fill_quantity = ack.fill.filled_quantity if ack.fill is not None else 0
     fill_price = ack.fill.average_fill_price if ack.fill is not None and ack.fill.average_fill_price is not None else _average_mark_from_lots(lots)
-    if fill_quantity > 0:
+    local_inventory_already_closed = bool((ack.response_payload or {}).get("local_inventory_already_closed"))
+    if fill_quantity > 0 and not local_inventory_already_closed:
         repository.close_wca_attributed_position_quantity(
             account_id=command.account_id,
             symbol=command.symbol,
@@ -2511,6 +2573,54 @@ def _record_end_of_session_evidence(repository: WcaSqliteRepository, *, command:
         )
     )
 
+
+def _final_local_account_snapshot(repository: WcaSqliteRepository, broker: Any, *, command: WcaRuntimeCommand, evaluated_at: datetime) -> dict[str, Any]:
+    snapshot_payload: dict[str, Any] = {}
+    try:
+        if hasattr(broker, "_account"):
+            account = broker._account(session_date=evaluated_at.date())
+            snapshot = account.get_account_snapshot()
+            repository.write_broker_account_snapshot(
+                account.to_broker_account_snapshot(symbol=command.symbol, observed_at=evaluated_at),
+                symbol=command.symbol,
+                cash=snapshot.cash,
+                configuration_version="wca_end_of_session",
+                decision_id=command.decision_id or command.command_id,
+                run_id=command.run_id,
+            )
+        inventory = repository.read_wca_local_inventory_snapshot(local_account_id=command.account_id, symbol=command.symbol)
+        if inventory is not None:
+            snapshot_payload = dict(inventory.get("account_snapshot") or {})
+    except Exception as exc:
+        return {"status": "failed", "reason": str(exc)}
+    realized = float(snapshot_payload.get("realized_pnl") or 0.0)
+    daily_realized = float(snapshot_payload.get("daily_realized_pnl") or 0.0)
+    return {
+        "status": "persisted" if snapshot_payload else "unavailable",
+        "account_id": command.account_id,
+        "symbol": command.symbol,
+        "cash": float(snapshot_payload.get("cash") or 0.0),
+        "equity": float(snapshot_payload.get("equity") or 0.0),
+        "realized_pnl": realized,
+        "daily_realized_pnl": daily_realized,
+        "daily_loss": float(snapshot_payload.get("daily_loss") or 0.0),
+        "trades_today": int(snapshot_payload.get("trades_today") or 0),
+        "last_mark_timestamp": snapshot_payload.get("last_mark_timestamp"),
+    }
+
+
+def _mark_price_from_broker(broker: Any, symbol: str) -> float:
+    try:
+        snapshot = broker.refresh_account_snapshot()
+    except Exception:
+        return 0.0
+    for position in getattr(snapshot, "positions", ()):
+        if str(getattr(position, "symbol", "") or "").upper() == symbol.upper():
+            try:
+                return float(getattr(position, "markPrice", None) or getattr(position, "averageEntryPrice", None) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
 
 def _enqueue_reconciliation(runtime_repository: WcaRuntimeRepository, command: WcaRuntimeCommand, *, max_queue_depth: int, marker: str, priority: int) -> None:
     runtime_repository.enqueue_command(
@@ -2717,6 +2827,26 @@ def _emergency_mark_price(repository: WcaSqliteRepository, *, command: WcaRuntim
     return 0.01
 
 
+def _payload_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+def _payload_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError):
+        return float(default)
+
 def _payload_datetime(value: Any) -> datetime | None:
     if not value:
         return None
@@ -2745,12 +2875,173 @@ def _required_int(value: int | None, field_name: str) -> int:
     return int(value)
 
 
+def _is_explicit_local_auto_paper_mode(mode: WcaRuntimeMode | str) -> bool:
+    return coerce_wca_runtime_mode(mode) == WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER
+
+
+def _paper_account_validation_for_runtime(supervisor: WcaRuntimeSupervisor, *, account_id: str) -> WcaLocalPaperAccountValidation:
+    if _is_explicit_local_auto_paper_mode(supervisor.settings.runtime_mode):
+        local_paper = _local_paper_settings_for_runtime(supervisor)
+        enabled = bool(getattr(local_paper, "enabled", True))
+        reasons = ["wca.local_paper_account.validation"]
+        if enabled:
+            reasons.append("wca.local_paper_account.local_runtime_verified")
+        else:
+            reasons.append("wca.local_paper_account.disabled")
+        return WcaLocalPaperAccountValidation(
+            verified=enabled,
+            account_id=account_id,
+            base_url=None,
+            automatic_paper_enabled=enabled,
+            starting_balance=_local_paper_starting_balance(supervisor, local_paper),
+            source_authority=WCA_LOCAL_PAPER_SOURCE_AUTHORITY,
+            reason_codes=tuple(reasons),
+        )
+    from backend.app.algorithms.wca.paper_account import validate_wca_automatic_paper_account
+
+    return validate_wca_automatic_paper_account(account_id=account_id)
+
+
+def _build_wca_runtime_local_paper_broker(supervisor: WcaRuntimeSupervisor, *, account_id: str, symbol: str) -> WcaLocalPaperBroker:
+    if _is_explicit_local_auto_paper_mode(supervisor.settings.runtime_mode):
+        local_paper = _local_paper_settings_for_runtime(supervisor)
+        fill_costs = _local_paper_fill_costs(local_paper)
+        return WcaLocalPaperBroker(
+            repository=supervisor.repository,
+            account_id=account_id,
+            symbol=symbol,
+            starting_balance=_local_paper_starting_balance(supervisor, local_paper),
+            commission_per_share=float(getattr(local_paper, "commission_per_share", 0.0) or 0.0),
+            minimum_commission=float(getattr(local_paper, "minimum_commission", 0.0) or 0.0),
+            slippage_bps=fill_costs["slippage_bps"],
+            spread_cost_bps=fill_costs["spread_cost_bps"],
+            buying_power_multiplier=float(getattr(local_paper, "buying_power_multiplier", 1.0) or 1.0),
+            allow_short=bool(getattr(local_paper, "allow_short", False)),
+        )
+    return WcaLocalPaperBroker.from_env(repository=supervisor.repository, account_id=account_id, symbol=symbol)
+
+
+def _local_paper_settings_for_runtime(supervisor: WcaRuntimeSupervisor) -> Any:
+    configuration = supervisor.repository.read_active_configuration()
+    return getattr(configuration, "local_paper", None) if configuration is not None else None
+
+
+def _local_paper_starting_balance(supervisor: WcaRuntimeSupervisor, local_paper: Any | None = None) -> float:
+    configured = getattr(local_paper, "starting_balance", None)
+    if configured is None:
+        configured = supervisor.settings.local_paper_starting_balance
+    return float(configured or WCA_DEFAULT_LOCAL_PAPER_STARTING_BALANCE)
+
+
+def _local_paper_fill_costs(local_paper: Any | None) -> dict[str, float]:
+    model = str(getattr(local_paper, "slippage_model", "none") or "none").lower()
+    if model == "fixed_bps":
+        return {"slippage_bps": 1.0, "spread_cost_bps": 0.0}
+    if model == "spread_aware":
+        return {"slippage_bps": 0.0, "spread_cost_bps": 1.0}
+    return {"slippage_bps": 0.0, "spread_cost_bps": 0.0}
+
+
+def _local_paper_runtime_event_id(prefix: str, event_id: str) -> str:
+    suffix = hashlib.sha256(f"{event_id}:{_utc_now().isoformat()}".encode("utf-8")).hexdigest()[:12]
+    return f"{prefix}-{event_id}-{suffix}"
+
+
+def _refresh_local_auto_paper_state_for_event(supervisor: WcaRuntimeSupervisor, event: WcaFinalizedBarEvent) -> dict[str, Any]:
+    if not _is_explicit_local_auto_paper_mode(supervisor.settings.runtime_mode):
+        return {"enabled": False, "reasonCodes": ["wca.runtime.local_paper_refresh.not_local_mode"]}
+    local_paper = _local_paper_settings_for_runtime(supervisor)
+    if not bool(getattr(local_paper, "enabled", True)):
+        return {"enabled": False, "reasonCodes": ["wca.runtime.local_paper_refresh.disabled"]}
+    starting_balance = _local_paper_starting_balance(supervisor, local_paper)
+    broker = _build_wca_runtime_local_paper_broker(supervisor, account_id=supervisor.settings.account_id, symbol=event.symbol)
+    try:
+        market_update = _market_update_from_finalized_event(event)
+        mark_price = _mark_price_from_market_update(market_update)
+        marked = False
+        if mark_price is not None:
+            account = WcaLocalPaperAccount.restore(
+                supervisor.repository,
+                account_id=supervisor.settings.account_id,
+                symbol=event.symbol,
+                starting_balance=starting_balance,
+                session_date=event.finalized_candle_timestamp.date(),
+            )
+            account.mark_to_market(symbol=event.symbol, mark_price=mark_price, marked_at=event.finalized_candle_timestamp)
+            account.persist(
+                supervisor.repository,
+                symbol=event.symbol,
+                event_id=_local_paper_runtime_event_id("wca-runtime-local-paper-mark", event.event_id),
+                timestamp=event.finalized_candle_timestamp,
+            )
+            marked = True
+        pending_fills = broker.process_market_update(market_update)
+        protective_fills = broker.process_protective_orders(market_update)
+        refreshed_account = WcaLocalPaperAccount.restore(
+            supervisor.repository,
+            account_id=supervisor.settings.account_id,
+            symbol=event.symbol,
+            starting_balance=starting_balance,
+            session_date=event.finalized_candle_timestamp.date(),
+        )
+        snapshot = refreshed_account.persist(
+            supervisor.repository,
+            symbol=event.symbol,
+            event_id=_local_paper_runtime_event_id("wca-runtime-local-paper-state", event.event_id),
+            timestamp=event.finalized_candle_timestamp,
+        )
+        return {
+            "enabled": True,
+            "markedToMarket": marked,
+            "pendingFillsProcessed": len(pending_fills),
+            "protectiveFillsProcessed": len(protective_fills),
+            "equity": snapshot.equity,
+            "buyingPower": snapshot.buying_power,
+            "cash": snapshot.cash,
+            "sourceAuthority": WCA_LOCAL_PAPER_SOURCE_AUTHORITY,
+            "reasonCodes": ["wca.runtime.local_paper_refresh.completed"],
+        }
+    finally:
+        broker.close()
+
+
+def _market_update_from_finalized_event(event: WcaFinalizedBarEvent) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "symbol": event.symbol,
+        "timestamp": event.finalized_candle_timestamp.isoformat(),
+        "completed_bar": True,
+        "allow_bar_execution": False,
+    }
+    snapshot = event.snapshot
+    if snapshot is None:
+        return payload
+    if snapshot.candles:
+        candle = snapshot.candles[-1]
+        payload.update({"price": candle.close, "high": candle.high, "low": candle.low, "volume": int(candle.volume)})
+    if snapshot.quote is not None:
+        payload.update({"bid": snapshot.quote.bid, "ask": snapshot.quote.ask})
+    return payload
+
+
+def _mark_price_from_market_update(market_update: dict[str, Any]) -> float | None:
+    price = market_update.get("price")
+    if price is not None:
+        return float(price)
+    bid = market_update.get("bid")
+    ask = market_update.get("ask")
+    if bid is not None and ask is not None:
+        return max(0.01, (float(bid) + float(ask)) / 2.0)
+    return None
+
 def _runtime_mode_for_rollout_control(control: WcaRuntimeControl, fallback: WcaRuntimeMode | str) -> WcaRuntimeMode:
+    fallback_mode = coerce_wca_runtime_mode(fallback)
+    if fallback_mode == WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER:
+        return WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER
     if control.rollout_stage == "LIMITED_AUTOMATIC_PAPER":
         return WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER
     if control.rollout_stage == "AUTOMATIC_PAPER":
         return WcaRuntimeMode.AUTOMATIC_PAPER
-    return coerce_wca_runtime_mode(fallback)
+    return fallback_mode
 
 
 def _rollout_caps_from_configuration(configuration: Any | None) -> WcaLimitedAutomaticPaperCaps:
@@ -3039,6 +3330,7 @@ def _global_risk_submission_block_reasons(
         symbol=command.symbol,
         state_timestamp=now,
         maximum_permitted_state_age_seconds=int(supervisor.settings.max_authoritative_account_state_age_seconds or supervisor.settings.max_state_age_seconds),
+        runtime_mode=supervisor.settings.runtime_mode,
     )
     if not state.fresh:
         reasons.extend(("wca.runtime.execution_outbox.authoritative_state_blocked", *state.reason_codes))
@@ -3090,7 +3382,7 @@ def _runtime_control_evidence(
     health: WcaRuntimeHealthSnapshot | None,
 ) -> WcaRuntimeControlEvidence:
     checked_at = event.publication_timestamp if event is not None else _utc_now()
-    paper_account = validate_wca_automatic_paper_account(account_id=prior.broker_account_id)
+    paper_account = _paper_account_validation_for_runtime(supervisor, account_id=prior.broker_account_id)
     rollout_flags = wca_rollout_feature_flags()
     rollout_decision = evaluate_wca_automatic_paper_rollout(
         flags=rollout_flags,
@@ -3271,7 +3563,7 @@ def _pre_submit_market_session_check(
     record: Any,
     broker_request: WcaPaperBrokerOrderRequest,
     *,
-    broker: WcaAlpacaPaperBroker,
+    broker: WcaLocalPaperBroker,
     runtime_control: WcaRuntimeControl,
 ) -> tuple[bool, tuple[str, ...]]:
     if _is_risk_reducing_exit(record.decision):

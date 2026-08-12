@@ -15,6 +15,7 @@ WCA_ORDER_VALIDATION_EXIT_CRITICAL_ALERT = "wca.order_validation.critical_exit_a
 WCA_FINAL_PRE_OUTBOX_VALIDATION_PASSED = "wca.order_validation.final_pre_outbox.passed"
 WCA_FINAL_PRE_OUTBOX_VALIDATION_FAILED = "wca.order_validation.final_pre_outbox.failed"
 WCA_AUTOMATIC_PAPER_ORDER_STAGES = {"LIMITED_AUTOMATIC_PAPER", "AUTOMATIC_PAPER"}
+WCA_AUTOMATIC_PAPER_RUNTIME_MODES = {WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}
 
 
 def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationContext) -> WcaOrderValidationResult:
@@ -81,9 +82,9 @@ def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationC
     if context.requires_executable_paper_stage:
         if context.broker_endpoint != "paper":
             reasons.append("wca.order_validation.paper_endpoint_required")
-        if runtime_mode not in {WcaRuntimeMode.MANUAL_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}:
+        if runtime_mode not in {WcaRuntimeMode.MANUAL_PAPER, *WCA_AUTOMATIC_PAPER_RUNTIME_MODES}:
             reasons.append("wca.order_validation.runtime_stage_not_executable_paper")
-        if runtime_mode in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER} and not context.automatic_paper_enabled:
+        if runtime_mode in WCA_AUTOMATIC_PAPER_RUNTIME_MODES and not context.automatic_paper_enabled:
             reasons.append("wca.order_validation.automatic_paper_feature_flag_disabled")
         rollout_policy_required = bool(
             context.rollout_policy_required
@@ -91,7 +92,7 @@ def validate_wca_final_order(decision: WcaDecision, context: WcaOrderValidationC
             or decision.rollout_stage
             or (order.rollout_stage if order is not None else "")
         )
-        if entry_order and rollout_policy_required and runtime_mode in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}:
+        if entry_order and rollout_policy_required and runtime_mode in WCA_AUTOMATIC_PAPER_RUNTIME_MODES:
             rollout_stage = str(context.rollout_stage or "").upper()
             if rollout_stage not in WCA_AUTOMATIC_PAPER_ORDER_STAGES:
                 reasons.append("wca.order_validation.rollout_stage_not_automatic_paper")

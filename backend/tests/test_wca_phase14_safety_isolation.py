@@ -97,10 +97,10 @@ PHASE14_REQUIRED_MARKERS = {
     "Daily loss is authoritative": ("test_wca_phase2_runtime_state.py", "test_daily_loss_limits_use_persisted_wca_state"),
     "Daily trade count is authoritative": ("test_wca_phase2_runtime_state.py", "test_daily_trade_limits_use_persisted_wca_state"),
     "Reserved risk is authoritative": ("test_wca_phase9_position_protection.py", "reserved_risk"),
-    "Buying power is broker-derived": ("test_wca_phase2_runtime_state.py", "test_buying_power_uses_broker_snapshot"),
+    "Buying power is WCA local-paper-authoritative": ("test_wca_phase2_runtime_state.py", "test_buying_power_uses_wca_local_paper_account_snapshot"),
     "Global risk is read-only": ("test_wca_step12_global_gate_engine.py", "cannot_rewrite_wca_state"),
     "Entries and exits have separate permission": ("test_wca_phase5_final_order_validation.py", "test_risk_reducing_exit_ignores_entry_only_blocks_and_optional_context"),
-    "Startup recovery": ("test_wca_phase8_broker_reconciliation_recovery.py", "test_startup_reconciliation_uses_real_alpaca_adapter_and_clears_startup_entry_gate"),
+    "Startup recovery": ("test_wca_phase8_broker_reconciliation_recovery.py", "test_startup_reconciliation_uses_local_paper_account_and_clears_startup_entry_gate"),
     "Worker crash": ("test_wca_phase7_atomic_order_submission.py", "crash"),
     "Database restart": ("test_wca_phase8_broker_reconciliation_recovery.py", "test_restart_reconciles_from_every_order_state_without_submission"),
     "Broker timeout": ("test_wca_phase7_atomic_order_submission.py", "timeout"),
@@ -274,7 +274,8 @@ def test_wca_inventory_settings_weights_and_credentials_are_algorithm_isolated()
         },
     )
     assert shared.verified is False
-    assert "wca.paper_account.shared_alpaca_credentials_rejected" in shared.reason_codes
+    assert "wca.local_paper_account.alpaca_paper_execution_disabled" in shared.reason_codes
+    assert "wca.local_paper_account.shared_alpaca_credentials_rejected" in shared.reason_codes
 
 
 def test_wca_orders_always_use_wca_account_identity_and_final_validation_marker() -> None:

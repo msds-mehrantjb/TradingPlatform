@@ -81,6 +81,16 @@ WCA_PIPELINE_MODULE_VERSIONS = {
 }
 
 WcaPipelineRuntimeMode = WcaRuntimeMode | str
+WCA_LOCAL_AUTOMATIC_PAPER_MODES = frozenset({WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER})
+WCA_LEGACY_BROKER_PAPER_MODES = frozenset({WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER})
+WCA_AUTOMATIC_PAPER_MODES = WCA_LOCAL_AUTOMATIC_PAPER_MODES | WCA_LEGACY_BROKER_PAPER_MODES
+WCA_PAPER_RUNTIME_MODES = frozenset(
+    {
+        WcaRuntimeMode.PAPER_RECOMMENDATION,
+        WcaRuntimeMode.MANUAL_PAPER,
+        *WCA_AUTOMATIC_PAPER_MODES,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -364,7 +374,7 @@ def run_wca_execution_pipeline(
     decision = _apply_broker_rounding(decision, pipeline_input)
     exit_order = exit_evaluation is not None and exit_evaluation.should_exit
     runtime_mode = coerce_wca_runtime_mode(pipeline_input.runtime_mode)
-    automatic_paper_mode = runtime_mode in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}
+    automatic_paper_mode = _is_automatic_paper_mode(runtime_mode)
     session = (
         validate_wca_entry_session(
             timestamp=snapshot.decision_timestamp,
@@ -532,27 +542,33 @@ def _validate_command(pipeline_input: WcaExecutionPipelineInput, snapshot: WcaMa
         raise ValueError("WCA pipeline snapshot timestamp must match the latest completed bar")
     if snapshot.decision_timestamp < snapshot.data_timestamp:
         raise ValueError("WCA pipeline cannot decide before the completed bar timestamp")
-    automatic_modes = {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}
-    if coerce_wca_runtime_mode(pipeline_input.runtime_mode) in automatic_modes and not pipeline_input.authoritative_account_values:
-        raise ValueError("automatic WCA paper requires authoritative broker equity and buying power")
-    if coerce_wca_runtime_mode(pipeline_input.runtime_mode) in automatic_modes and (
+    runtime_mode = coerce_wca_runtime_mode(pipeline_input.runtime_mode)
+    if _is_local_automatic_paper_mode(runtime_mode) and not pipeline_input.authoritative_account_values:
+        raise ValueError("local automatic WCA paper requires authoritative WCA local paper account values")
+    if _is_local_automatic_paper_mode(runtime_mode) and (
         pipeline_input.account_equity is None or pipeline_input.available_buying_power is None
     ):
-        raise ValueError("automatic WCA paper requires broker equity and buying power")
-    if snapshot.quote is None and pipeline_input.runtime_mode in {WcaRuntimeMode.PAPER_RECOMMENDATION, WcaRuntimeMode.MANUAL_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER} and not pipeline_input.synthetic_quote_allowed:
+        raise ValueError("local automatic WCA paper requires WCA local paper equity and buying power")
+    if _is_legacy_broker_paper_mode(runtime_mode) and not pipeline_input.authoritative_account_values:
+        raise ValueError("legacy broker WCA paper requires authoritative broker equity and buying power")
+    if _is_legacy_broker_paper_mode(runtime_mode) and (
+        pipeline_input.account_equity is None or pipeline_input.available_buying_power is None
+    ):
+        raise ValueError("legacy broker WCA paper requires broker equity and buying power")
+    if snapshot.quote is None and pipeline_input.runtime_mode in WCA_PAPER_RUNTIME_MODES and not pipeline_input.synthetic_quote_allowed:
         return
     if snapshot.quote is None and not pipeline_input.synthetic_quote_allowed:
         return
 
 
 def _validate_runtime_configuration_controls(configuration: WcaConfiguration, pipeline_input: WcaExecutionPipelineInput) -> None:
-    if coerce_wca_runtime_mode(configuration.runtime.runtime_mode) != WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER or not configuration.limited_automatic_paper.enabled:
+    if coerce_wca_runtime_mode(configuration.runtime.runtime_mode) not in {WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER} or not configuration.limited_automatic_paper.enabled:
         return
     controls = configuration.limited_automatic_paper
     if pipeline_input.snapshot.symbol.upper() != controls.symbol.upper():
         raise ValueError("limited automatic paper configuration is SPY-only")
     if pipeline_input.account_id != controls.broker_account_id:
-        raise ValueError("limited automatic paper requires the configured WCA broker account")
+        raise ValueError("limited automatic paper requires the configured WCA local paper account")
 
 
 def _apply_runtime_strategy_permissions(
@@ -560,7 +576,7 @@ def _apply_runtime_strategy_permissions(
     effective_settings,
     runtime_mode: WcaPipelineRuntimeMode,
 ) -> tuple[WcaStrategyEvaluation, ...]:
-    if coerce_wca_runtime_mode(runtime_mode) != WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER:
+    if coerce_wca_runtime_mode(runtime_mode) not in {WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER}:
         return evaluations
     permitted = set(effective_settings.final_permitted_strategy_ids or ())
     if not permitted:
@@ -608,7 +624,7 @@ def _allowed_entry_window(timestamp, effective_settings) -> bool:
 
 def _paper_runtime_mode(runtime_mode: WcaPipelineRuntimeMode) -> WcaRuntimeMode:
     mode = coerce_wca_runtime_mode(runtime_mode)
-    if mode not in {WcaRuntimeMode.PAPER_RECOMMENDATION, WcaRuntimeMode.MANUAL_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}:
+    if mode not in WCA_PAPER_RUNTIME_MODES:
         raise ValueError(f"WCA paper adapter cannot execute runtime mode {mode.value}")
     return mode
 
@@ -808,17 +824,35 @@ def _daily_loss_budget(pipeline_input: WcaExecutionPipelineInput, effective_sett
 def _account_equity_for_pipeline(pipeline_input: WcaExecutionPipelineInput) -> float:
     if pipeline_input.account_equity is not None:
         return float(pipeline_input.account_equity)
-    if coerce_wca_runtime_mode(pipeline_input.runtime_mode) in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}:
-        raise ValueError("automatic WCA paper requires broker account equity")
+    runtime_mode = coerce_wca_runtime_mode(pipeline_input.runtime_mode)
+    if _is_local_automatic_paper_mode(runtime_mode):
+        raise ValueError("local automatic WCA paper requires WCA local paper account equity")
+    if _is_legacy_broker_paper_mode(runtime_mode):
+        raise ValueError("legacy broker WCA paper requires broker account equity")
     return 100_000.0
 
 
 def _buying_power_for_pipeline(pipeline_input: WcaExecutionPipelineInput) -> float:
     if pipeline_input.available_buying_power is not None:
         return float(pipeline_input.available_buying_power)
-    if coerce_wca_runtime_mode(pipeline_input.runtime_mode) in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}:
-        raise ValueError("automatic WCA paper requires broker buying power")
+    runtime_mode = coerce_wca_runtime_mode(pipeline_input.runtime_mode)
+    if _is_local_automatic_paper_mode(runtime_mode):
+        raise ValueError("local automatic WCA paper requires WCA local paper buying power")
+    if _is_legacy_broker_paper_mode(runtime_mode):
+        raise ValueError("legacy broker WCA paper requires broker buying power")
     return _account_equity_for_pipeline(pipeline_input)
+
+
+def _is_local_automatic_paper_mode(runtime_mode: WcaPipelineRuntimeMode) -> bool:
+    return coerce_wca_runtime_mode(runtime_mode) in WCA_LOCAL_AUTOMATIC_PAPER_MODES
+
+
+def _is_legacy_broker_paper_mode(runtime_mode: WcaPipelineRuntimeMode) -> bool:
+    return coerce_wca_runtime_mode(runtime_mode) in WCA_LEGACY_BROKER_PAPER_MODES
+
+
+def _is_automatic_paper_mode(runtime_mode: WcaPipelineRuntimeMode) -> bool:
+    return coerce_wca_runtime_mode(runtime_mode) in WCA_AUTOMATIC_PAPER_MODES
 
 
 def _minutes(value: str) -> int:

@@ -338,7 +338,7 @@ def test_existing_outbox_persists_decision_intent_idempotency_client_and_broker_
     assert broker_order == ("alpaca-map-order", decision.decision_id, proposed.order_intent_id, request.idempotency_key, request.client_order_id, WcaOrderStatus.BROKER_ACKNOWLEDGED.value)
 
 
-def test_runtime_blocks_automatic_paper_when_alpaca_adapter_is_unavailable_without_deterministic_fallback() -> None:
+def test_runtime_blocks_automatic_paper_when_alpaca_execution_env_is_configured_without_deterministic_fallback() -> None:
     repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")
     runtime_repository = WcaRuntimeRepository(repository)
     supervisor = WcaRuntimeSupervisor(
@@ -401,7 +401,7 @@ def test_runtime_blocks_automatic_paper_when_alpaca_adapter_is_unavailable_witho
         "backend.app.algorithms.wca.runtime_supervisor._global_risk_submission_block_reasons",
         return_value=((), None),
     ), patch(
-        "backend.app.algorithms.wca.runtime_supervisor.WcaAlpacaPaperBroker.from_env",
+        "backend.app.algorithms.wca.runtime_supervisor.WcaLocalPaperBroker.from_env",
         side_effect=WcaAlpacaPaperBrokerConfigurationError("wca.alpaca_paper.account_id_mismatch"),
     ), patch.object(
         WcaPaperBrokerOutboxAdapter,
@@ -412,8 +412,8 @@ def test_runtime_blocks_automatic_paper_when_alpaca_adapter_is_unavailable_witho
 
     assert result["status"] == "blocked"
     assert result["submitted"] is False
-    assert "wca.runtime.execution_outbox.alpaca_paper_broker_blocked" in result["reasonCodes"]
-    assert "wca.alpaca_paper.account_id_mismatch" in result["reasonCodes"]
+    assert "wca.runtime.execution_outbox.local_paper_account_blocked" in result["reasonCodes"]
+    assert "wca.local_paper_account.alpaca_paper_execution_disabled" in result["reasonCodes"]
 
 
 def phase6_request(*, suffix: str = "accepted"):

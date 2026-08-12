@@ -9,13 +9,15 @@ from uuid import uuid4
 
 from backend.app.algorithms.wca.configuration import default_wca_configuration, validate_wca_configuration
 from backend.app.algorithms.wca.execution_pipeline import WcaExecutionPipelineInput, run_wca_paper_pipeline_adapter
+from backend.app.algorithms.wca.local_paper_account import WcaLocalPaperAccount, WcaLocalPaperLotSnapshot, WcaLocalPaperOrderSnapshot
+from backend.app.algorithms.wca.paper_account import WCA_LOCAL_PAPER_SOURCE_AUTHORITY
 from backend.app.algorithms.wca.repository import WcaInventoryLedgerEvent, WcaSqliteRepository
 from backend.app.algorithms.wca.runtime_events import WcaFinalizedBarEvent
 from backend.app.algorithms.wca.runtime_repository import WcaRuntimeRepository
 from backend.app.algorithms.wca.runtime_state import load_wca_authoritative_runtime_state
 from backend.app.algorithms.wca.runtime_supervisor import WcaRuntimeSettings, WcaRuntimeSupervisor
 from backend.app.algorithms.wca.weights import baseline_weight_snapshot
-from backend.app.algorithms.wca.contracts import WcaBrokerReconciliationResult, WcaSide
+from backend.app.algorithms.wca.contracts import WcaBrokerReconciliationResult, WcaRuntimeMode, WcaSide
 from backend.app.domain.models import Signal
 from backend.app.gates import BrokerAccountSnapshot, BrokerPositionState
 from backend.tests.test_wca_step5_production_pipeline import FakeVoter, market_snapshot
@@ -78,7 +80,7 @@ class WcaPhase2RuntimeStateTests(unittest.TestCase):
         self.assertEqual(decision.aggregation.post_local_gate_decision, "HOLD")
         self.assertIn("wca.local_gate.daily_loss_allocation", gate_reasons(decision))
 
-    def test_buying_power_uses_broker_snapshot(self) -> None:
+    def test_buying_power_uses_wca_local_paper_account_snapshot(self) -> None:
         repository, snapshot = seeded_repository(buying_power=1)
         state = load_state(repository, snapshot)
 
@@ -87,6 +89,131 @@ class WcaPhase2RuntimeStateTests(unittest.TestCase):
         self.assertEqual(state.buying_power, 1)
         self.assertLessEqual(decision.sizing.shares_by_buying_power, 1)
         self.assertEqual(decision.authoritative_state_hash, state.state_hash)
+    def test_local_automatic_paper_state_uses_local_account_inventory_and_orders_not_broker_snapshot(self) -> None:
+        repository, snapshot = seeded_repository(seed_runtime_state=False)
+        timestamp = snapshot.decision_timestamp.astimezone(UTC)
+        opened_at = timestamp - timedelta(seconds=30)
+        local_account = WcaLocalPaperAccount(
+            account_id="paper",
+            starting_balance=50_000,
+            cash=49_000,
+            session_date=timestamp.date(),
+            reserved_risk=250,
+            trades_today=2,
+            lots=(
+                WcaLocalPaperLotSnapshot(
+                    lot_id="wca-local-runtime-state-lot",
+                    algorithm_id="wca",
+                    account_id="paper",
+                    symbol="SPY",
+                    side="BUY",
+                    quantity=10,
+                    remaining_quantity=10,
+                    entry_price=100,
+                    entry_timestamp=opened_at,
+                    opened_at=opened_at,
+                    decision_id="local-entry-decision",
+                    order_intent_id="local-entry-intent",
+                    stop_price=98,
+                    target_price=104,
+                ),
+            ),
+            open_orders=(
+                WcaLocalPaperOrderSnapshot(
+                    algorithm_id="wca",
+                    account_id="paper",
+                    symbol="SPY",
+                    side="BUY",
+                    quantity=3,
+                    status="SUBMITTED",
+                    client_order_id="wca-local-entry-order",
+                    order_intent_id="local-entry-intent-2",
+                    order_type="LIMIT",
+                    limit_price=99,
+                    submitted_at=timestamp,
+                    local_order_id="wca-local-entry-order-id",
+                    remaining_quantity=3,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                    decision_id="local-pending-entry-decision",
+                    idempotency_key="local-entry-key",
+                ),
+                WcaLocalPaperOrderSnapshot(
+                    algorithm_id="wca",
+                    account_id="paper",
+                    symbol="SPY",
+                    side="SELL",
+                    quantity=10,
+                    status="SUBMITTED",
+                    client_order_id="wca-protection-stop-order",
+                    order_intent_id="local-entry-intent",
+                    order_type="STOP_LIMIT",
+                    limit_price=97.9,
+                    stop_price=98,
+                    target_price=104,
+                    submitted_at=timestamp,
+                    position_owner="wca",
+                    exit_owner="wca",
+                    local_order_id="wca-protection-stop-order-id",
+                    remaining_quantity=10,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                    decision_id="local-protection-decision",
+                    idempotency_key="local-protection-key",
+                ),
+            ),
+        )
+        local_account.mark_to_market(symbol="SPY", mark_price=101, marked_at=timestamp)
+        local_account.persist(repository, symbol="SPY", timestamp=timestamp)
+        repository.write_broker_account_snapshot(
+            BrokerAccountSnapshot(
+                accountId="paper",
+                equity=1,
+                buyingPower=1,
+                realizedPnlToday=-999,
+                positions=[
+                    BrokerPositionState(
+                        algorithmId="weighted_voting",
+                        symbol="SPY",
+                        side=Signal.BUY,
+                        quantity=999,
+                        averageEntryPrice=1,
+                        markPrice=1,
+                    )
+                ],
+                pendingOrders=[],
+                partiallyFilledOrders=[],
+                observedAt=timestamp + timedelta(seconds=1),
+                sessionDate=timestamp.date(),
+                sourceAuthority="broker",
+                positionsReconciled=True,
+                openOrdersReconciled=True,
+            ),
+            cash=1,
+            configuration_version=default_wca_configuration().configuration_version,
+            run_id="phase2-misleading-broker-state",
+        )
+
+        state = load_state(repository, snapshot, runtime_mode=WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER, market_data={"price": 102})
+
+        self.assertTrue(state.fresh)
+        self.assertEqual(state.broker_source_authority, WCA_LOCAL_PAPER_SOURCE_AUTHORITY)
+        self.assertEqual(state.local_account["starting_balance"], 50_000)
+        self.assertEqual(state.cash, 49_000)
+        self.assertEqual(state.equity, 50_020)
+        self.assertEqual(state.buying_power, 48_750)
+        self.assertEqual(state.inventory["quantity"], 10)
+        self.assertEqual(state.inventory["average_entry"], 100)
+        self.assertEqual(state.inventory["stop"], 98)
+        self.assertEqual(state.inventory["target"], 104)
+        self.assertEqual(state.risk["reserved_risk"], 250)
+        self.assertEqual(state.risk["trades_today"], 2)
+        self.assertEqual(state.risk["circuit_breaker"], "closed")
+        self.assertFalse(state.risk["cooldown"]["active"])
+        self.assertEqual(len(state.orders["pending_entries"]), 1)
+        self.assertEqual(len(state.orders["protective_orders"]), 1)
+        self.assertEqual(state.current_broker_positions[0]["algorithmId"], "wca")
+        self.assertNotIn("wca.runtime_state.shared_physical_account_position_conflict", state.reason_codes)
 
     def test_missing_state_blocks_entries_and_persists_hold_decision(self) -> None:
         repository, snapshot = seeded_repository(seed_runtime_state=False)
@@ -120,7 +247,8 @@ class WcaPhase2RuntimeStateTests(unittest.TestCase):
 
         self.assertEqual(state.current_quantity, 0)
         self.assertEqual(state.wca_inventory["open_quantity"], 0)
-        self.assertEqual(state.current_broker_positions[0]["algorithmId"], "weighted_voting")
+        self.assertEqual(state.current_broker_positions, ())
+        self.assertIn("wca.runtime_state.shared_physical_account_position_conflict", state.reason_codes)
 
     def test_every_runtime_decision_records_authoritative_state_version(self) -> None:
         repository, snapshot = seeded_repository()
@@ -292,7 +420,7 @@ def seed_authoritative_state(
             partiallyFilledOrders=[],
             observedAt=timestamp - timedelta(seconds=broker_observed_offset_seconds),
             sessionDate=timestamp.date(),
-            sourceAuthority="broker",
+            sourceAuthority=WCA_LOCAL_PAPER_SOURCE_AUTHORITY,
             positionsReconciled=True,
             openOrdersReconciled=True,
         ),
@@ -315,13 +443,15 @@ def seed_authoritative_state(
     )
 
 
-def load_state(repository: WcaSqliteRepository, snapshot):
+def load_state(repository: WcaSqliteRepository, snapshot, *, runtime_mode: WcaRuntimeMode | str | None = None, market_data: dict | None = None):
     return load_wca_authoritative_runtime_state(
         repository,
         broker_account_id="paper",
         symbol="SPY",
         state_timestamp=snapshot.decision_timestamp,
         maximum_permitted_state_age_seconds=120,
+        runtime_mode=runtime_mode,
+        market_data=market_data,
     )
 
 

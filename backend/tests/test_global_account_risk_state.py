@@ -63,6 +63,37 @@ class GlobalAccountRiskStateTest(unittest.TestCase):
         self.assertEqual(decision.hardBlockers, [])
         self.assertIn("gate.risk.daily_loss", decision.reasonCodes)
 
+    def test_existing_broker_and_alpaca_paper_authorities_remain_authoritative(self) -> None:
+        for source_authority in ("broker", "alpaca_paper_broker"):
+            with self.subTest(source_authority=source_authority):
+                risk = aggregate_global_account_risk(
+                    broker_snapshot(source_authority=source_authority),
+                    candidateSymbol="SPY",
+                    candidateSide=Signal.BUY,
+                )
+
+                self.assertTrue(risk.brokerState["brokerConnected"])
+                self.assertTrue(risk.brokerState["paperAccountActive"])
+                self.assertTrue(risk.brokerState["buyingPowerCurrent"])
+                self.assertTrue(risk.brokerState["positionsReconciled"])
+                self.assertEqual(risk.riskState["authority"], source_authority)
+                self.assertIn("risk.authority.broker", risk.reasonCodes)
+                self.assertNotIn("risk.authority.wca_local_paper_account", risk.reasonCodes)
+
+    def test_wca_local_paper_authority_is_additive_only(self) -> None:
+        risk = aggregate_global_account_risk(
+            broker_snapshot(source_authority="wca_local_paper_account"),
+            candidateSymbol="SPY",
+            candidateSide=Signal.BUY,
+        )
+
+        self.assertTrue(risk.brokerState["brokerConnected"])
+        self.assertTrue(risk.brokerState["paperAccountActive"])
+        self.assertTrue(risk.brokerState["buyingPowerCurrent"])
+        self.assertTrue(risk.brokerState["positionsReconciled"])
+        self.assertEqual(risk.riskState["authority"], "wca_local_paper_account")
+        self.assertIn("risk.authority.wca_local_paper_account", risk.reasonCodes)
+
     def test_broker_state_not_local_ui_history_is_final_authority(self) -> None:
         risk = aggregate_global_account_risk(
             broker_snapshot(source_authority="local_ui_history"),

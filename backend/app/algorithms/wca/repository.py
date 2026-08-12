@@ -6,7 +6,7 @@ import sqlite3
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Protocol
 
@@ -46,7 +46,7 @@ from backend.app.config import get_settings
 from backend.app.database import _sqlite_path
 from backend.app.gates import BrokerAccountSnapshot
 
-WCA_PERSISTENCE_MIGRATION_VERSION = "wca_authoritative_persistence_005"
+WCA_PERSISTENCE_MIGRATION_VERSION = "wca_authoritative_persistence_007"
 WCA_IGNORED_LOCAL_STORAGE_KEYS = frozenset(
     {
         "weighted-confidence-decision-settings-v1",
@@ -123,6 +123,11 @@ WCA_PERSISTENCE_RECORD_INVENTORY: tuple[WcaPersistenceRecordDefinition, ...] = (
     WcaPersistenceRecordDefinition("inventory_projection", "wca_inventory_projection", "Restartable WCA inventory projection by account and symbol."),
     WcaPersistenceRecordDefinition("daily_state_projection", "wca_daily_state", "Authoritative WCA daily-state projection by account, symbol, and session."),
     WcaPersistenceRecordDefinition("broker_account_snapshots", "wca_broker_account_snapshots", "WCA-owned broker account observations for runtime decisions."),
+    WcaPersistenceRecordDefinition("local_paper_account", "wca_local_paper_account", "Dedicated WCA-local paper account authority."),
+    WcaPersistenceRecordDefinition("local_positions", "wca_local_positions", "Dedicated WCA-local paper position authority."),
+    WcaPersistenceRecordDefinition("local_lots", "wca_local_lots", "Dedicated WCA-local paper lot authority."),
+    WcaPersistenceRecordDefinition("local_orders", "wca_local_orders", "Dedicated WCA-local paper open-order authority."),
+    WcaPersistenceRecordDefinition("local_fills", "wca_local_fills", "Dedicated WCA-local paper fill history."),
     WcaPersistenceRecordDefinition("exit_state", "wca_exit_state", "WCA exit-state records."),
     WcaPersistenceRecordDefinition("reconciliation_results", "wca_broker_reconciliations", "WCA reconciliation result records."),
     WcaPersistenceRecordDefinition("runtime_health", "wca_runtime_health", "WCA runtime health records."),
@@ -148,6 +153,9 @@ class WcaRepository(Protocol):
         ...
 
     def read_runtime_control(self, *, broker_account_id: str = "paper", symbol: str = "SPY") -> WcaRuntimeControl:
+        ...
+
+    def reset_wca_local_paper_account(self, *, local_account_id: str, symbol: str, starting_balance: float, reset_at: datetime | str | None = None, force: bool = False, reason: str = "wca.local_paper.reset_requested", command_id: str | None = None) -> dict[str, Any]:
         ...
 
     def write_runtime_control(self, control: WcaRuntimeControl) -> WcaRuntimeControl:
@@ -239,7 +247,6 @@ class WcaRepository(Protocol):
 
     def apply_fill_and_update_position(self, decision: WcaDecision, *, fill_id: str, account_id: str, quantity: int, broker_order_id: str | None = None, payload: dict[str, Any] | None = None) -> bool:
         ...
-
     def record_inventory_event(self, event: WcaInventoryLedgerEvent) -> bool:
         ...
 
@@ -261,6 +268,11 @@ class WcaRepository(Protocol):
     def read_latest_broker_account_snapshot(self, *, algorithm_id: str, broker_account_id: str) -> BrokerAccountSnapshot | None:
         ...
 
+    def write_wca_local_inventory_snapshot(self, snapshot: Any, *, symbol: str = "SPY", timestamp: datetime | str | None = None, inventory_event: WcaInventoryLedgerEvent | None = None) -> None:
+        ...
+
+    def read_wca_local_inventory_snapshot(self, *, local_account_id: str, symbol: str) -> dict[str, Any] | None:
+        ...
     def authorize_wca_lot_reduction(self, *, lot_id: str, account_id: str, symbol: str, quantity: int) -> WcaInventoryOwnershipDecision:
         ...
 
@@ -1153,6 +1165,106 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS wca_local_paper_account (
+            algorithm_id TEXT NOT NULL DEFAULT 'wca' CHECK (algorithm_id = 'wca'),
+            local_account_id TEXT NOT NULL CHECK (local_account_id <> ''),
+            symbol TEXT NOT NULL CHECK (symbol <> ''),
+            starting_balance REAL NOT NULL CHECK (starting_balance >= 0),
+            cash REAL NOT NULL CHECK (cash >= 0),
+            equity REAL NOT NULL CHECK (equity >= 0),
+            buying_power REAL NOT NULL CHECK (buying_power >= 0),
+            realized_pnl REAL NOT NULL DEFAULT 0,
+            unrealized_pnl REAL NOT NULL DEFAULT 0,
+            daily_realized_pnl REAL NOT NULL DEFAULT 0,
+            daily_unrealized_pnl REAL NOT NULL DEFAULT 0,
+            daily_loss REAL NOT NULL DEFAULT 0 CHECK (daily_loss >= 0),
+            gross_exposure REAL NOT NULL DEFAULT 0 CHECK (gross_exposure >= 0),
+            net_exposure REAL NOT NULL DEFAULT 0,
+            reserved_risk REAL NOT NULL DEFAULT 0 CHECK (reserved_risk >= 0),
+            trades_today INTEGER NOT NULL DEFAULT 0 CHECK (trades_today >= 0),
+            session_date TEXT NOT NULL CHECK (session_date <> ''),
+            circuit_breaker_state TEXT NOT NULL DEFAULT 'closed',
+            cooldown_until TEXT,
+            last_mark_timestamp TEXT,
+            state_version TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (algorithm_id, local_account_id, symbol)
+        );
+        CREATE TABLE IF NOT EXISTS wca_local_positions (
+            position_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL DEFAULT 'wca' CHECK (algorithm_id = 'wca'),
+            local_account_id TEXT NOT NULL CHECK (local_account_id <> ''),
+            symbol TEXT NOT NULL CHECK (symbol <> ''),
+            side TEXT NOT NULL CHECK (side <> ''),
+            quantity INTEGER NOT NULL CHECK (quantity >= 0),
+            average_entry_price REAL NOT NULL CHECK (average_entry_price >= 0),
+            opened_at TEXT,
+            last_updated_at TEXT NOT NULL CHECK (last_updated_at <> ''),
+            stop_price REAL,
+            target_price REAL,
+            realized_pnl REAL NOT NULL DEFAULT 0,
+            unrealized_pnl REAL NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_local_lots (
+            lot_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL DEFAULT 'wca' CHECK (algorithm_id = 'wca'),
+            local_account_id TEXT NOT NULL CHECK (local_account_id <> ''),
+            symbol TEXT NOT NULL CHECK (symbol <> ''),
+            side TEXT NOT NULL CHECK (side <> ''),
+            quantity INTEGER NOT NULL CHECK (quantity >= 0),
+            remaining_quantity INTEGER NOT NULL CHECK (remaining_quantity >= 0),
+            entry_price REAL NOT NULL CHECK (entry_price >= 0),
+            entry_timestamp TEXT NOT NULL CHECK (entry_timestamp <> ''),
+            decision_id TEXT,
+            order_intent_id TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_local_orders (
+            local_order_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL DEFAULT 'wca' CHECK (algorithm_id = 'wca'),
+            local_account_id TEXT NOT NULL CHECK (local_account_id <> ''),
+            client_order_id TEXT NOT NULL CHECK (client_order_id <> ''),
+            symbol TEXT NOT NULL CHECK (symbol <> ''),
+            side TEXT NOT NULL CHECK (side <> ''),
+            order_type TEXT NOT NULL CHECK (order_type <> ''),
+            quantity INTEGER NOT NULL CHECK (quantity >= 0),
+            remaining_quantity INTEGER NOT NULL CHECK (remaining_quantity >= 0),
+            limit_price REAL,
+            stop_price REAL,
+            target_price REAL,
+            status TEXT NOT NULL CHECK (status <> ''),
+            created_at TEXT NOT NULL CHECK (created_at <> ''),
+            updated_at TEXT NOT NULL CHECK (updated_at <> ''),
+            decision_id TEXT,
+            idempotency_key TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+        CREATE TABLE IF NOT EXISTS wca_local_fills (
+            fill_id TEXT PRIMARY KEY,
+            algorithm_id TEXT NOT NULL DEFAULT 'wca' CHECK (algorithm_id = 'wca'),
+            local_account_id TEXT NOT NULL CHECK (local_account_id <> ''),
+            order_id TEXT NOT NULL CHECK (order_id <> ''),
+            symbol TEXT NOT NULL CHECK (symbol <> ''),
+            side TEXT NOT NULL CHECK (side <> ''),
+            quantity INTEGER NOT NULL CHECK (quantity >= 0),
+            fill_price REAL NOT NULL CHECK (fill_price >= 0),
+            commissions REAL NOT NULL DEFAULT 0 CHECK (commissions >= 0),
+            fees REAL NOT NULL DEFAULT 0 CHECK (fees >= 0),
+            slippage REAL NOT NULL DEFAULT 0 CHECK (slippage >= 0),
+            timestamp TEXT NOT NULL CHECK (timestamp <> ''),
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS wca_broker_reconciliations (
             reconciliation_id TEXT PRIMARY KEY,
             algorithm_id TEXT NOT NULL,
@@ -1456,6 +1568,16 @@ def apply_wca_persistence_migrations(conn: sqlite3.Connection) -> None:
             ON wca_inventory_ledger(algorithm_id, broker_account_id, symbol, trade_date, event_timestamp);
         CREATE INDEX IF NOT EXISTS idx_wca_broker_account_snapshots_scope
             ON wca_broker_account_snapshots(algorithm_id, broker_account_id, symbol, observed_at);
+        CREATE INDEX IF NOT EXISTS idx_wca_local_paper_account_scope
+            ON wca_local_paper_account(algorithm_id, local_account_id, symbol, session_date);
+        CREATE INDEX IF NOT EXISTS idx_wca_local_positions_scope
+            ON wca_local_positions(algorithm_id, local_account_id, symbol);
+        CREATE INDEX IF NOT EXISTS idx_wca_local_lots_scope
+            ON wca_local_lots(algorithm_id, local_account_id, symbol, remaining_quantity);
+        CREATE INDEX IF NOT EXISTS idx_wca_local_orders_scope
+            ON wca_local_orders(algorithm_id, local_account_id, symbol, status);
+        CREATE INDEX IF NOT EXISTS idx_wca_local_fills_scope
+            ON wca_local_fills(algorithm_id, local_account_id, symbol, timestamp);
         CREATE INDEX IF NOT EXISTS idx_wca_runtime_event_queue_symbol_status
             ON wca_runtime_event_queue(symbol, status, finalized_candle_timestamp);
         CREATE INDEX IF NOT EXISTS idx_wca_runtime_command_queue_type_status
@@ -2473,6 +2595,7 @@ class WcaSqliteRepository:
         return cursor.rowcount == 1
 
     def record_broker_order(self, decision: WcaDecision, *, broker_order_id: str, account_id: str, idempotency_key: str, status: str, payload: dict[str, Any] | None = None) -> bool:
+        _require_wca_decision_identity(decision, account_id=account_id)
         if decision.proposed_order is None:
             raise ValueError("cannot record WCA broker order without an order intent")
         common = _decision_common(decision, decision.decision_id)
@@ -2481,6 +2604,7 @@ class WcaSqliteRepository:
         request_payload = record.get("request", {}) if isinstance(record, dict) else {}
         response_payload = record.get("response", {}) if isinstance(record, dict) else {}
         client_order_id = str(record.get("client_order_id", "")) if isinstance(record, dict) else ""
+        status_value = coerce_wca_order_status(status)
         with self.connect() as conn:
             cursor = conn.execute(
                 """
@@ -2492,47 +2616,134 @@ class WcaSqliteRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (broker_order_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], proposed.order_intent_id, idempotency_key, _value(proposed.side), proposed.quantity, coerce_wca_order_status(status), client_order_id, _json(request_payload), _json(response_payload), _json(record)),
+                (broker_order_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], proposed.order_intent_id, idempotency_key, _value(proposed.side), proposed.quantity, status_value, client_order_id, _json(request_payload), _json(response_payload), _json(record)),
             )
+            if status_value not in {WcaOrderStatus.FILLED.value, WcaOrderStatus.REJECTED.value, WcaOrderStatus.CANCELLED.value, WcaOrderStatus.RECONCILED.value}:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO wca_local_orders (
+                        local_order_id, algorithm_id, local_account_id, client_order_id,
+                        symbol, side, order_type, quantity, remaining_quantity,
+                        limit_price, stop_price, target_price, status, created_at,
+                        updated_at, decision_id, idempotency_key, payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        broker_order_id,
+                        WCA_ALGORITHM_ID,
+                        account_id,
+                        client_order_id or broker_order_id,
+                        common["symbol"],
+                        _value(proposed.side),
+                        str(request_payload.get("order_type") or request_payload.get("type") or "LIMIT").upper(),
+                        int(proposed.quantity),
+                        int(proposed.quantity),
+                        request_payload.get("limit_price") or request_payload.get("limitPrice") or proposed.limit_price or proposed.trigger_price,
+                        request_payload.get("stop_price") or request_payload.get("stopPrice") or proposed.stop_price,
+                        request_payload.get("target_price") or request_payload.get("targetPrice") or proposed.target_price,
+                        status_value,
+                        common["timestamp"],
+                        common["timestamp"],
+                        proposed.decision_id,
+                        idempotency_key,
+                        _json({"snapshot": {**record, "order_intent_id": proposed.order_intent_id}, "account_snapshot": {"algorithm_id": WCA_ALGORITHM_ID, "local_account_id": account_id, "account_id": account_id, "symbol": common["symbol"]}}),
+                    ),
+                )
         return cursor.rowcount == 1
 
     def apply_fill_and_update_position(self, decision: WcaDecision, *, fill_id: str, account_id: str, quantity: int, broker_order_id: str | None = None, payload: dict[str, Any] | None = None) -> bool:
+        _require_wca_decision_identity(decision, account_id=account_id)
         if decision.proposed_order is None:
             raise ValueError("cannot apply WCA fill without an order intent")
         if quantity < 0:
             raise ValueError("WCA fill quantity cannot be negative")
         common = _decision_common(decision, decision.decision_id)
         proposed = decision.proposed_order
-        position_id = f"wca-position-{account_id}-{proposed.symbol}-{proposed.order_intent_id}"
+        selected_symbol = proposed.symbol
+        side = _value(proposed.side)
+        position_id = f"wca-position-{account_id}-{selected_symbol}-{proposed.order_intent_id}"
         lot_id = f"wca-lot-{fill_id}"
-        virtual_position_id = f"wca-virtual-{account_id}-{proposed.symbol}"
+        virtual_position_id = f"wca-virtual-{account_id}-{selected_symbol}"
         record = dict(payload or {})
         record.setdefault("fill_id", fill_id)
         record.setdefault("broker_order_id", broker_order_id)
         record.setdefault("order_intent_id", proposed.order_intent_id)
         record.setdefault("decision_id", proposed.decision_id)
         record.setdefault("account_id", account_id)
-        record.setdefault("symbol", proposed.symbol)
-        record.setdefault("side", _value(proposed.side))
+        record.setdefault("symbol", selected_symbol)
+        record.setdefault("side", side)
         record.setdefault("entry_price", _entry_price_from_payload(record, proposed))
         record.setdefault("stop_price", proposed.stop_price)
         record.setdefault("target_price", proposed.target_price)
         record.setdefault("opened_at", _dt(_fill_timestamp_from_payload(record) or decision.decision_timestamp))
         record.setdefault("position_effect", "entry")
+        fill_timestamp = _dt(record["opened_at"])
+        entry_price = float(record["entry_price"])
+        remaining_quantity = max(0, int(record.get("remaining_quantity") or proposed.quantity - quantity))
+        fill_event_type = "PARTIAL_FILL_RECEIVED" if quantity < proposed.quantity or remaining_quantity > 0 else "FILL_RECEIVED"
+        target_order_status = WcaOrderStatus.PARTIALLY_FILLED if fill_event_type == "PARTIAL_FILL_RECEIVED" else WcaOrderStatus.FILLED
+        client_order_id = str(record.get("client_order_id") or "")
+        charges = _local_fill_charges(record)
+
         with self.connect() as conn:
+            order_row = conn.execute(
+                """
+                SELECT outbox_id, status, idempotency_key, client_order_id
+                FROM wca_execution_outbox
+                WHERE algorithm_id = ? AND account_id = ? AND symbol = ? AND order_intent_id = ?
+                """,
+                (WCA_ALGORITHM_ID, account_id, selected_symbol, proposed.order_intent_id),
+            ).fetchone()
+            if order_row is None:
+                order_outbox_id = f"wca-local-order-{account_id}-{selected_symbol}-{proposed.order_intent_id}"
+                order_idempotency_key = proposed.idempotency_key
+                order_client_order_id = client_order_id or proposed.idempotency_key or order_outbox_id
+            else:
+                order_outbox_id = str(order_row["outbox_id"])
+                order_idempotency_key = str(order_row["idempotency_key"] or "")
+                order_client_order_id = str(order_row["client_order_id"] or "")
+            if order_idempotency_key != proposed.idempotency_key:
+                raise ValueError("WCA fill idempotency key does not match the WCA order")
+            if not client_order_id:
+                client_order_id = order_client_order_id
+                record["client_order_id"] = client_order_id
+            duplicate = conn.execute(
+                """
+                SELECT 1 FROM wca_attributed_fills WHERE fill_id = ?
+                UNION ALL
+                SELECT 1 FROM wca_local_fills WHERE fill_id = ?
+                UNION ALL
+                SELECT 1 FROM wca_inventory_ledger WHERE fill_id = ?
+                LIMIT 1
+                """,
+                (fill_id, fill_id, fill_id),
+            ).fetchone()
+            if duplicate is not None:
+                return False
+
             cursor = conn.execute(
                 """
-                INSERT OR IGNORE INTO wca_attributed_fills (
+                INSERT INTO wca_attributed_fills (
                     fill_id, algorithm_id, account_id, symbol, timestamp, configuration_version,
                     engine_version, market_snapshot_id, decision_id, run_id, side,
                     quantity, payload_json
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (fill_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], _value(proposed.side), quantity, _json(record)),
+                (fill_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], side, quantity, _json(record)),
             )
             if cursor.rowcount != 1:
                 return False
+            conn.execute(
+                """
+                UPDATE wca_broker_orders
+                SET status = ?, response_payload_json = CASE WHEN response_payload_json = '{}' THEN response_payload_json ELSE response_payload_json END
+                WHERE algorithm_id = ? AND account_id = ? AND symbol = ?
+                  AND (broker_order_id = ? OR idempotency_key = ? OR client_order_id = ?)
+                """,
+                (coerce_wca_order_status(target_order_status), WCA_ALGORITHM_ID, account_id, selected_symbol, broker_order_id or "", proposed.idempotency_key, client_order_id),
+            )
             conn.execute(
                 """
                 INSERT OR REPLACE INTO wca_positions (
@@ -2542,7 +2753,7 @@ class WcaSqliteRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (position_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], _value(proposed.side), quantity, _json(record)),
+                (position_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], side, quantity, _json(record)),
             )
             conn.execute(
                 """
@@ -2553,7 +2764,7 @@ class WcaSqliteRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (lot_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], position_id, _value(proposed.side), quantity, "open", _json(record)),
+                (lot_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], position_id, side, quantity, "open", _json(record)),
             )
             conn.execute(
                 """
@@ -2564,7 +2775,7 @@ class WcaSqliteRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (virtual_position_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], _value(proposed.side), quantity, _json(record)),
+                (virtual_position_id, common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], side, quantity, _json(record)),
             )
             conn.execute(
                 """
@@ -2577,71 +2788,325 @@ class WcaSqliteRepository:
                 """,
                 (f"wca-exit-{position_id}", common["algorithm_id"], account_id, common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], position_id, "monitoring", _json(record)),
             )
-        remaining_quantity = max(0, int(record.get("remaining_quantity") or proposed.quantity - quantity))
-        fill_event_type = "PARTIAL_FILL_RECEIVED" if quantity < proposed.quantity or remaining_quantity > 0 else "FILL_RECEIVED"
-        self.record_inventory_event(
-            WcaInventoryLedgerEvent(
+
+            fill_event = WcaInventoryLedgerEvent(
                 inventory_event_id=f"wca-fill-event-{fill_id}",
                 event_type=fill_event_type,
                 broker_account_id=account_id,
-                symbol=proposed.symbol,
-                event_timestamp=record["opened_at"],
-                trade_date=str(record["opened_at"])[:10],
+                symbol=selected_symbol,
+                event_timestamp=fill_timestamp,
+                trade_date=fill_timestamp[:10],
                 order_intent_id=proposed.order_intent_id,
-                client_order_id=str(record.get("client_order_id") or ""),
+                client_order_id=client_order_id,
                 broker_order_id=broker_order_id,
                 fill_id=fill_id,
-                side=_value(proposed.side),
+                side=side,
                 quantity=proposed.quantity,
                 filled_quantity=quantity,
                 remaining_quantity=remaining_quantity,
-                average_entry_price=float(record["entry_price"]),
-                fill_price=float(record["entry_price"]),
+                average_entry_price=entry_price,
+                fill_price=entry_price,
                 configuration_version=common["configuration_version"],
                 decision_id=common["decision_id"],
                 run_id=common["run_id"],
                 source_authority="wca_repository",
                 payload=record,
             )
-        )
-        released_risk = _reserved_risk_release_for_fill(self, decision, account_id=account_id, quantity=quantity)
-        if released_risk > 0:
-            self.record_inventory_event(
-                WcaInventoryLedgerEvent(
-                    inventory_event_id=f"wca-risk-released-fill-event-{fill_id}",
-                    event_type="RISK_RELEASED",
-                    broker_account_id=account_id,
-                    symbol=proposed.symbol,
-                    event_timestamp=record["opened_at"],
-                    trade_date=str(record["opened_at"])[:10],
-                    order_intent_id=proposed.order_intent_id,
-                    client_order_id=str(record.get("client_order_id") or ""),
-                    broker_order_id=broker_order_id,
-                    fill_id=None,
-                    side=_value(proposed.side),
-                    quantity=proposed.quantity,
-                    filled_quantity=quantity,
-                    remaining_quantity=remaining_quantity,
-                    reserved_risk=released_risk,
-                    configuration_version=common["configuration_version"],
-                    decision_id=common["decision_id"],
-                    run_id=common["run_id"],
-                    source_authority="wca_repository",
-                    payload={**record, "reserved_risk_released": released_risk},
-                )
-            )
-        self.record_protective_order_created(
-            decision.model_copy(update={"proposed_order": proposed}),
-            account_id=account_id,
-            client_order_id=str(record.get("client_order_id") or ""),
-            broker_order_id=broker_order_id,
-            source_fill_id=fill_id,
-            protected_quantity=quantity,
-            event_timestamp=record["opened_at"],
-            payload=record,
-        )
-        return True
+            self._record_inventory_event_in_conn(conn, fill_event)
 
+            released_risk = _reserved_risk_release_for_fill_in_conn(conn, decision, account_id=account_id, quantity=quantity)
+            risk_release_timestamp = fill_timestamp
+            if risk_release_timestamp <= common["timestamp"]:
+                base_timestamp = _parse_datetime_optional(common["timestamp"]) or _parse_datetime_optional(fill_timestamp) or datetime.now(timezone.utc)
+                risk_release_timestamp = _dt(base_timestamp + timedelta(microseconds=1))
+            if released_risk > 0:
+                self._record_inventory_event_in_conn(
+                    conn,
+                    WcaInventoryLedgerEvent(
+                        inventory_event_id=f"wca-risk-released-fill-event-{fill_id}",
+                        event_type="RISK_RELEASED",
+                        broker_account_id=account_id,
+                        symbol=selected_symbol,
+                        event_timestamp=risk_release_timestamp,
+                        trade_date=risk_release_timestamp[:10],
+                        order_intent_id=proposed.order_intent_id,
+                        client_order_id=client_order_id,
+                        broker_order_id=broker_order_id,
+                        fill_id=None,
+                        side=side,
+                        quantity=proposed.quantity,
+                        filled_quantity=quantity,
+                        remaining_quantity=remaining_quantity,
+                        reserved_risk=released_risk,
+                        configuration_version=common["configuration_version"],
+                        decision_id=common["decision_id"],
+                        run_id=common["run_id"],
+                        source_authority="wca_repository",
+                        payload={**record, "reserved_risk_released": released_risk},
+                    ),
+                )
+
+            if proposed.stop_price is not None or proposed.target_price is not None:
+                protective_order_id = f"wca-protection-{account_id}-{selected_symbol}-{proposed.order_intent_id}"
+                self._record_inventory_event_in_conn(
+                    conn,
+                    WcaInventoryLedgerEvent(
+                        inventory_event_id=f"wca-protective-order-event-{proposed.order_intent_id}-{fill_id}",
+                        event_type="PROTECTIVE_ORDER_CREATED",
+                        broker_account_id=account_id,
+                        symbol=selected_symbol,
+                        event_timestamp=fill_timestamp,
+                        trade_date=fill_timestamp[:10],
+                        order_intent_id=proposed.order_intent_id,
+                        client_order_id=client_order_id,
+                        broker_order_id=broker_order_id,
+                        side=side,
+                        quantity=quantity,
+                        remaining_quantity=0,
+                        average_entry_price=entry_price,
+                        source_authority="wca_position_management",
+                        configuration_version=decision.configuration_version,
+                        decision_id=decision.decision_id,
+                        run_id=decision.decision_id,
+                        payload={
+                            **record,
+                            "protective_order_id": protective_order_id,
+                            "protective_state": "created",
+                            "source_fill_id": fill_id,
+                            "stop_price": proposed.stop_price,
+                            "target_price": proposed.target_price,
+                            "protected_quantity": quantity,
+                        },
+                    ),
+                )
+
+            projection_row = conn.execute(
+                """
+                SELECT * FROM wca_inventory_projection
+                WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ?
+                """,
+                (WCA_ALGORITHM_ID, account_id, selected_symbol),
+            ).fetchone()
+            daily_row = conn.execute(
+                """
+                SELECT * FROM wca_daily_state
+                WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ? AND session_date = ?
+                """,
+                (WCA_ALGORITHM_ID, account_id, selected_symbol, fill_timestamp[:10]),
+            ).fetchone()
+            seed = _local_paper_account_seed_in_conn(conn, account_id=account_id, symbol=selected_symbol)
+            prior_cash = float(seed.get("cash", seed.get("starting_balance", 0.0)) or 0.0)
+            cash = max(0.0, round(prior_cash - (quantity * entry_price) - charges["total"], 10))
+            open_quantity = int(projection_row["open_quantity"] if projection_row is not None else quantity)
+            average_entry = float(projection_row["average_entry_price"] if projection_row is not None else entry_price)
+            realized_pnl = float(projection_row["realized_pnl"] if projection_row is not None else 0.0)
+            unrealized_pnl = float(projection_row["unrealized_pnl"] if projection_row is not None else 0.0)
+            reserved_risk = float(projection_row["reserved_risk"] if projection_row is not None else 0.0)
+            gross_exposure = round(abs(open_quantity * average_entry), 10)
+            net_exposure = gross_exposure if side == "BUY" else -gross_exposure
+            equity = round(cash + gross_exposure + unrealized_pnl, 10)
+            buying_power = max(0.0, round(cash - reserved_risk, 10))
+            daily_realized = float(daily_row["realized_pnl_today"] if daily_row is not None else 0.0)
+            trades_today = int(daily_row["trades_completed_today"] if daily_row is not None else 0)
+            daily_loss = float(daily_row["daily_loss"] if daily_row is not None else max(0.0, -daily_realized))
+            circuit_breaker_state = str(daily_row["circuit_breaker_state"] if daily_row is not None else seed.get("circuit_breaker_state", "closed") or "closed")
+            cooldown_until = daily_row["cooldown_until"] if daily_row is not None else seed.get("cooldown_until")
+            account_payload = {
+                "algorithm_id": WCA_ALGORITHM_ID,
+                "local_account_id": account_id,
+                "account_id": account_id,
+                "symbol": selected_symbol,
+                "starting_balance": float(seed.get("starting_balance", 0.0) or 0.0),
+                "cash": cash,
+                "equity": equity,
+                "buying_power": buying_power,
+                "realized_pnl": realized_pnl,
+                "unrealized_pnl": unrealized_pnl,
+                "daily_realized_pnl": daily_realized,
+                "daily_unrealized_pnl": unrealized_pnl,
+                "daily_loss": daily_loss,
+                "gross_exposure": gross_exposure,
+                "net_exposure": net_exposure,
+                "reserved_risk": reserved_risk,
+                "trades_today": trades_today,
+                "session_date": fill_timestamp[:10],
+                "circuit_breaker_state": circuit_breaker_state,
+                "cooldown_until": cooldown_until,
+                "last_mark_timestamp": fill_timestamp,
+                "state_version": _hash_json((account_id, selected_symbol, fill_id, cash, equity, buying_power, open_quantity, reserved_risk)),
+                "updated_at": fill_timestamp,
+            }
+            conn.execute(
+                """
+                INSERT INTO wca_local_paper_account (
+                    algorithm_id, local_account_id, symbol, starting_balance, cash,
+                    equity, buying_power, realized_pnl, unrealized_pnl,
+                    daily_realized_pnl, daily_unrealized_pnl, daily_loss,
+                    gross_exposure, net_exposure, reserved_risk, trades_today,
+                    session_date, circuit_breaker_state, cooldown_until,
+                    last_mark_timestamp, state_version, payload_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(algorithm_id, local_account_id, symbol) DO UPDATE SET
+                    starting_balance = excluded.starting_balance,
+                    cash = excluded.cash,
+                    equity = excluded.equity,
+                    buying_power = excluded.buying_power,
+                    realized_pnl = excluded.realized_pnl,
+                    unrealized_pnl = excluded.unrealized_pnl,
+                    daily_realized_pnl = excluded.daily_realized_pnl,
+                    daily_unrealized_pnl = excluded.daily_unrealized_pnl,
+                    daily_loss = excluded.daily_loss,
+                    gross_exposure = excluded.gross_exposure,
+                    net_exposure = excluded.net_exposure,
+                    reserved_risk = excluded.reserved_risk,
+                    trades_today = excluded.trades_today,
+                    session_date = excluded.session_date,
+                    circuit_breaker_state = excluded.circuit_breaker_state,
+                    cooldown_until = excluded.cooldown_until,
+                    last_mark_timestamp = excluded.last_mark_timestamp,
+                    state_version = excluded.state_version,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    WCA_ALGORITHM_ID,
+                    account_id,
+                    selected_symbol,
+                    account_payload["starting_balance"],
+                    cash,
+                    equity,
+                    buying_power,
+                    realized_pnl,
+                    unrealized_pnl,
+                    daily_realized,
+                    unrealized_pnl,
+                    daily_loss,
+                    gross_exposure,
+                    net_exposure,
+                    reserved_risk,
+                    trades_today,
+                    fill_timestamp[:10],
+                    circuit_breaker_state,
+                    cooldown_until,
+                    fill_timestamp,
+                    account_payload["state_version"],
+                    _json({"account_snapshot": account_payload}),
+                    fill_timestamp,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM wca_local_positions WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?",
+                (WCA_ALGORITHM_ID, account_id, selected_symbol),
+            )
+            if open_quantity > 0:
+                conn.execute(
+                    """
+                    INSERT INTO wca_local_positions (
+                        position_id, algorithm_id, local_account_id, symbol, side, quantity,
+                        average_entry_price, opened_at, last_updated_at, stop_price,
+                        target_price, realized_pnl, unrealized_pnl, payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"wca-local-position-{account_id}-{selected_symbol}",
+                        WCA_ALGORITHM_ID,
+                        account_id,
+                        selected_symbol,
+                        side,
+                        open_quantity,
+                        average_entry,
+                        fill_timestamp,
+                        fill_timestamp,
+                        proposed.stop_price,
+                        proposed.target_price,
+                        realized_pnl,
+                        unrealized_pnl,
+                        _json({"account_snapshot": account_payload, "snapshot": {"mark_price": average_entry}}),
+                    ),
+                )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO wca_local_lots (
+                    lot_id, algorithm_id, local_account_id, symbol, side, quantity,
+                    remaining_quantity, entry_price, entry_timestamp, decision_id,
+                    order_intent_id, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lot_id,
+                    WCA_ALGORITHM_ID,
+                    account_id,
+                    selected_symbol,
+                    side,
+                    quantity,
+                    quantity,
+                    entry_price,
+                    fill_timestamp,
+                    proposed.decision_id,
+                    proposed.order_intent_id,
+                    _json({"account_snapshot": account_payload, "snapshot": record}),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO wca_local_orders (
+                    local_order_id, algorithm_id, local_account_id, client_order_id,
+                    symbol, side, order_type, quantity, remaining_quantity,
+                    limit_price, stop_price, target_price, status, created_at,
+                    updated_at, decision_id, idempotency_key, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(broker_order_id or order_outbox_id),
+                    WCA_ALGORITHM_ID,
+                    account_id,
+                    client_order_id,
+                    selected_symbol,
+                    side,
+                    str(record.get("order_type") or "LIMIT"),
+                    proposed.quantity,
+                    remaining_quantity,
+                    proposed.limit_price or proposed.trigger_price,
+                    proposed.stop_price,
+                    proposed.target_price,
+                    coerce_wca_order_status(target_order_status),
+                    common["timestamp"],
+                    fill_timestamp,
+                    proposed.decision_id,
+                    proposed.idempotency_key,
+                    _json({"account_snapshot": account_payload, "snapshot": record}),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO wca_local_fills (
+                    fill_id, algorithm_id, local_account_id, order_id, symbol, side,
+                    quantity, fill_price, commissions, fees, slippage, timestamp,
+                    payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fill_id,
+                    WCA_ALGORITHM_ID,
+                    account_id,
+                    str(broker_order_id or order_outbox_id),
+                    selected_symbol,
+                    side,
+                    quantity,
+                    entry_price,
+                    charges["commissions"],
+                    charges["fees"],
+                    charges["slippage"],
+                    fill_timestamp,
+                    _json({"account_snapshot": account_payload, "snapshot": record}),
+                ),
+            )
+        return True
     def record_inventory_event(self, event: WcaInventoryLedgerEvent) -> bool:
         _require_wca_identity(event.algorithm_id)
         _require_broker_account_identity(event.broker_account_id)
@@ -2661,6 +3126,7 @@ class WcaSqliteRepository:
         event_timestamp: datetime | str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> bool:
+        _require_wca_decision_identity(decision, account_id=account_id)
         proposed = decision.proposed_order
         if proposed is None:
             raise ValueError("cannot record WCA protective order without an order intent")
@@ -2712,6 +3178,7 @@ class WcaSqliteRepository:
         event_timestamp: datetime | str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> bool:
+        _require_wca_decision_identity(decision, account_id=account_id)
         if event_type not in {"ORDER_REJECTED", "ORDER_CANCELLED"}:
             raise ValueError("WCA terminal order inventory event must be ORDER_REJECTED or ORDER_CANCELLED")
         proposed = decision.proposed_order
@@ -2940,6 +3407,514 @@ class WcaSqliteRepository:
         payload = json.loads(row["payload_json"] or "{}")
         return BrokerAccountSnapshot.model_validate(payload["snapshot"])
 
+    def write_wca_local_inventory_snapshot(self, snapshot: Any, *, symbol: str = "SPY", timestamp: datetime | str | None = None, inventory_event: WcaInventoryLedgerEvent | None = None) -> None:
+        """Replace the WCA-local paper inventory authority for one account/symbol scope."""
+        if getattr(snapshot, "algorithm_id", None) != WCA_ALGORITHM_ID:
+            raise ValueError("WCA local inventory snapshot requires algorithm_id='wca'")
+        local_account_id = str(getattr(snapshot, "account_id", "") or "").strip()
+        _require_broker_account_identity(local_account_id)
+        selected_symbol = str(symbol or "").upper()
+        if not selected_symbol:
+            raise ValueError("WCA local inventory snapshot requires symbol")
+        now = _dt(timestamp)
+        positions = tuple(position for position in getattr(snapshot, "positions", ()) if str(getattr(position, "symbol", "")).upper() == selected_symbol)
+        lots = tuple(lot for lot in getattr(snapshot, "lots", ()) if str(getattr(lot, "symbol", "")).upper() == selected_symbol)
+        orders = tuple(order for order in getattr(snapshot, "open_orders", ()) if str(getattr(order, "symbol", "")).upper() == selected_symbol)
+        fills = tuple(fill for fill in getattr(snapshot, "fills", ()) if str(getattr(fill, "symbol", "")).upper() == selected_symbol)
+        for collection_name, collection in (("positions", positions), ("lots", lots), ("orders", orders), ("fills", fills)):
+            for item in collection:
+                if getattr(item, "algorithm_id", None) != WCA_ALGORITHM_ID or getattr(item, "account_id", local_account_id) != local_account_id:
+                    raise ValueError(f"WCA local inventory cannot persist non-WCA {collection_name}")
+
+        account_payload = _wca_local_inventory_jsonable(
+            {
+                "algorithm_id": WCA_ALGORITHM_ID,
+                "local_account_id": local_account_id,
+                "account_id": local_account_id,
+                "symbol": selected_symbol,
+                "starting_balance": getattr(snapshot, "starting_balance", 0.0),
+                "cash": getattr(snapshot, "cash", 0.0),
+                "equity": getattr(snapshot, "equity", 0.0),
+                "buying_power": getattr(snapshot, "buying_power", 0.0),
+                "realized_pnl": getattr(snapshot, "realized_pnl", 0.0),
+                "unrealized_pnl": getattr(snapshot, "unrealized_pnl", 0.0),
+                "daily_realized_pnl": getattr(snapshot, "daily_realized_pnl", 0.0),
+                "daily_unrealized_pnl": getattr(snapshot, "daily_unrealized_pnl", 0.0),
+                "daily_loss": getattr(snapshot, "daily_loss", 0.0),
+                "gross_exposure": getattr(snapshot, "gross_exposure", 0.0),
+                "net_exposure": getattr(snapshot, "net_exposure", 0.0),
+                "reserved_risk": getattr(snapshot, "reserved_risk", 0.0),
+                "trades_today": getattr(snapshot, "trades_today", 0),
+                "session_date": getattr(snapshot, "session_date", None),
+                "circuit_breaker_state": getattr(snapshot, "circuit_breaker_state", "closed"),
+                "cooldown_until": getattr(snapshot, "cooldown_until", None),
+                "last_mark_timestamp": getattr(snapshot, "last_mark_timestamp", None),
+                "state_version": getattr(snapshot, "state_version", ""),
+                "updated_at": now,
+            }
+        )
+
+        def payload_for(item: Any) -> str:
+            return _json({"account_snapshot": account_payload, "snapshot": _wca_local_inventory_jsonable(item)})
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO wca_local_paper_account (
+                    algorithm_id, local_account_id, symbol, starting_balance, cash,
+                    equity, buying_power, realized_pnl, unrealized_pnl,
+                    daily_realized_pnl, daily_unrealized_pnl, daily_loss,
+                    gross_exposure, net_exposure, reserved_risk, trades_today,
+                    session_date, circuit_breaker_state, cooldown_until,
+                    last_mark_timestamp, state_version, payload_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(algorithm_id, local_account_id, symbol) DO UPDATE SET
+                    starting_balance = excluded.starting_balance,
+                    cash = excluded.cash,
+                    equity = excluded.equity,
+                    buying_power = excluded.buying_power,
+                    realized_pnl = excluded.realized_pnl,
+                    unrealized_pnl = excluded.unrealized_pnl,
+                    daily_realized_pnl = excluded.daily_realized_pnl,
+                    daily_unrealized_pnl = excluded.daily_unrealized_pnl,
+                    daily_loss = excluded.daily_loss,
+                    gross_exposure = excluded.gross_exposure,
+                    net_exposure = excluded.net_exposure,
+                    reserved_risk = excluded.reserved_risk,
+                    trades_today = excluded.trades_today,
+                    session_date = excluded.session_date,
+                    circuit_breaker_state = excluded.circuit_breaker_state,
+                    cooldown_until = excluded.cooldown_until,
+                    last_mark_timestamp = excluded.last_mark_timestamp,
+                    state_version = excluded.state_version,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    WCA_ALGORITHM_ID,
+                    local_account_id,
+                    selected_symbol,
+                    float(account_payload["starting_balance"]),
+                    float(account_payload["cash"]),
+                    float(account_payload["equity"]),
+                    float(account_payload["buying_power"]),
+                    float(account_payload["realized_pnl"]),
+                    float(account_payload["unrealized_pnl"]),
+                    float(account_payload["daily_realized_pnl"]),
+                    float(account_payload["daily_unrealized_pnl"]),
+                    float(account_payload["daily_loss"]),
+                    float(account_payload["gross_exposure"]),
+                    float(account_payload["net_exposure"]),
+                    float(account_payload["reserved_risk"]),
+                    int(account_payload["trades_today"]),
+                    str(account_payload["session_date"]),
+                    str(account_payload["circuit_breaker_state"]),
+                    account_payload.get("cooldown_until"),
+                    account_payload.get("last_mark_timestamp"),
+                    str(account_payload["state_version"]),
+                    _json({"account_snapshot": account_payload}),
+                    now,
+                ),
+            )
+            for table in ("wca_local_positions", "wca_local_lots", "wca_local_orders", "wca_local_fills"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?",
+                    (WCA_ALGORITHM_ID, local_account_id, selected_symbol),
+                )
+            for position in positions:
+                position_id = str(getattr(position, "position_id", "") or f"wca-local-position-{local_account_id}-{selected_symbol}")
+                last_updated_at = _dt(getattr(position, "last_updated_at", None) or getattr(snapshot, "last_mark_timestamp", None) or now)
+                conn.execute(
+                    """
+                    INSERT INTO wca_local_positions (
+                        position_id, algorithm_id, local_account_id, symbol, side, quantity,
+                        average_entry_price, opened_at, last_updated_at, stop_price,
+                        target_price, realized_pnl, unrealized_pnl, payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        position_id,
+                        WCA_ALGORITHM_ID,
+                        local_account_id,
+                        selected_symbol,
+                        str(getattr(position, "side", "")),
+                        int(getattr(position, "quantity", 0) or 0),
+                        float(getattr(position, "average_entry_price", 0.0) or 0.0),
+                        _dt(getattr(position, "opened_at", None)) if getattr(position, "opened_at", None) else None,
+                        last_updated_at,
+                        getattr(position, "stop_price", None),
+                        getattr(position, "target_price", None),
+                        float(getattr(position, "realized_pnl", getattr(snapshot, "realized_pnl", 0.0)) or 0.0),
+                        float(getattr(position, "unrealized_pnl", 0.0) or 0.0),
+                        payload_for(position),
+                    ),
+                )
+            for lot in lots:
+                entry_timestamp = _dt(getattr(lot, "entry_timestamp", None) or getattr(lot, "opened_at", None) or now)
+                remaining_quantity = int(getattr(lot, "remaining_quantity", getattr(lot, "quantity", 0)) or 0)
+                conn.execute(
+                    """
+                    INSERT INTO wca_local_lots (
+                        lot_id, algorithm_id, local_account_id, symbol, side, quantity,
+                        remaining_quantity, entry_price, entry_timestamp, decision_id,
+                        order_intent_id, payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(getattr(lot, "lot_id", "")),
+                        WCA_ALGORITHM_ID,
+                        local_account_id,
+                        selected_symbol,
+                        str(getattr(lot, "side", "")),
+                        int(getattr(lot, "quantity", 0) or 0),
+                        remaining_quantity,
+                        float(getattr(lot, "entry_price", 0.0) or 0.0),
+                        entry_timestamp,
+                        getattr(lot, "decision_id", None),
+                        getattr(lot, "order_intent_id", None),
+                        payload_for(lot),
+                    ),
+                )
+            for order in orders:
+                local_order_id = str(getattr(order, "local_order_id", "") or getattr(order, "broker_order_id", "") or getattr(order, "client_order_id", ""))
+                created_at = _dt(getattr(order, "created_at", None) or getattr(order, "submitted_at", None) or now)
+                updated_at = _dt(getattr(order, "updated_at", None) or created_at)
+                conn.execute(
+                    """
+                    INSERT INTO wca_local_orders (
+                        local_order_id, algorithm_id, local_account_id, client_order_id,
+                        symbol, side, order_type, quantity, remaining_quantity,
+                        limit_price, stop_price, target_price, status, created_at,
+                        updated_at, decision_id, idempotency_key, payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        local_order_id,
+                        WCA_ALGORITHM_ID,
+                        local_account_id,
+                        str(getattr(order, "client_order_id", "")),
+                        selected_symbol,
+                        str(getattr(order, "side", "")),
+                        str(getattr(order, "order_type", "LIMIT")),
+                        int(getattr(order, "quantity", 0) or 0),
+                        int(getattr(order, "remaining_quantity", getattr(order, "quantity", 0)) or 0),
+                        getattr(order, "limit_price", None),
+                        getattr(order, "stop_price", None),
+                        getattr(order, "target_price", None),
+                        str(getattr(order, "status", "")),
+                        created_at,
+                        updated_at,
+                        getattr(order, "decision_id", None) or getattr(order, "order_intent_id", None),
+                        getattr(order, "idempotency_key", None) or getattr(order, "client_order_id", None),
+                        payload_for(order),
+                    ),
+                )
+            for fill in fills:
+                conn.execute(
+                    """
+                    INSERT INTO wca_local_fills (
+                        fill_id, algorithm_id, local_account_id, order_id, symbol, side,
+                        quantity, fill_price, commissions, fees, slippage, timestamp,
+                        payload_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(getattr(fill, "fill_id", "")),
+                        WCA_ALGORITHM_ID,
+                        local_account_id,
+                        str(getattr(fill, "order_id", "")),
+                        selected_symbol,
+                        str(getattr(fill, "side", "")),
+                        int(getattr(fill, "quantity", 0) or 0),
+                        float(getattr(fill, "fill_price", 0.0) or 0.0),
+                        float(getattr(fill, "commissions", 0.0) or 0.0),
+                        float(getattr(fill, "fees", 0.0) or 0.0),
+                        float(getattr(fill, "slippage", 0.0) or 0.0),
+                        _dt(getattr(fill, "timestamp", None) or now),
+                        payload_for(fill),
+                    ),
+                )
+            if inventory_event is not None:
+                self._record_inventory_event_in_conn(conn, inventory_event)
+
+    def reset_wca_local_paper_account(
+        self,
+        *,
+        local_account_id: str,
+        symbol: str,
+        starting_balance: float,
+        reset_at: datetime | str | None = None,
+        force: bool = False,
+        reason: str = "wca.local_paper.reset_requested",
+        command_id: str | None = None,
+    ) -> dict[str, Any]:
+        _require_broker_account_identity(local_account_id)
+        selected_symbol = str(symbol or "").upper()
+        if not selected_symbol:
+            raise ValueError("WCA local paper reset requires symbol")
+        balance = float(starting_balance)
+        if balance <= 0:
+            raise ValueError("WCA local paper reset requires positive starting_balance")
+        reset_timestamp = _dt(reset_at)
+        trade_date = reset_timestamp[:10]
+        with self.connect() as conn:
+            blockers = _wca_local_paper_reset_blockers_in_conn(conn, account_id=local_account_id, symbol=selected_symbol)
+            blocker_reasons = tuple(blockers["reason_codes"])
+            if blocker_reasons and not force:
+                return {
+                    "algorithmId": WCA_ALGORITHM_ID,
+                    "accountId": local_account_id,
+                    "symbol": selected_symbol,
+                    "status": "blocked",
+                    "reset": False,
+                    "force": False,
+                    "startingBalance": balance,
+                    "blockedState": blockers,
+                    "reasonCodes": blocker_reasons,
+                }
+            reset_id_seed = command_id or f"{local_account_id}:{selected_symbol}:{reset_timestamp}"
+            event_id = f"wca-local-paper-account-reset-{_hash_json((local_account_id, selected_symbol, reset_id_seed))[:24]}"
+            account_payload = {
+                "algorithm_id": WCA_ALGORITHM_ID,
+                "local_account_id": local_account_id,
+                "account_id": local_account_id,
+                "symbol": selected_symbol,
+                "starting_balance": balance,
+                "cash": balance,
+                "equity": balance,
+                "buying_power": balance,
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "daily_realized_pnl": 0.0,
+                "daily_unrealized_pnl": 0.0,
+                "daily_loss": 0.0,
+                "gross_exposure": 0.0,
+                "net_exposure": 0.0,
+                "reserved_risk": 0.0,
+                "trades_today": 0,
+                "session_date": trade_date,
+                "circuit_breaker_state": "closed",
+                "cooldown_until": None,
+                "last_mark_timestamp": reset_timestamp,
+                "state_version": _hash_json((WCA_ALGORITHM_ID, local_account_id, selected_symbol, balance, reset_timestamp, "reset")),
+                "updated_at": reset_timestamp,
+            }
+            terminal = ("FILLED", "REJECTED", "CANCELLED", "CANCELED", "RECONCILED")
+            conn.execute(
+                """
+                UPDATE wca_execution_outbox
+                SET status = ?, updated_at = ?, version = version + 1
+                WHERE algorithm_id = ? AND account_id = ? AND symbol = ?
+                  AND UPPER(status) NOT IN (?, ?, ?, ?, ?)
+                """,
+                (WcaOrderStatus.CANCELLED.value, reset_timestamp, WCA_ALGORITHM_ID, local_account_id, selected_symbol, *terminal),
+            )
+            conn.execute(
+                """
+                UPDATE wca_broker_orders
+                SET status = ?
+                WHERE algorithm_id = ? AND account_id = ? AND symbol = ?
+                  AND UPPER(status) NOT IN (?, ?, ?, ?, ?)
+                """,
+                (WcaOrderStatus.CANCELLED.value, WCA_ALGORITHM_ID, local_account_id, selected_symbol, *terminal),
+            )
+            for table in ("wca_local_positions", "wca_local_lots", "wca_local_orders", "wca_local_fills"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?",
+                    (WCA_ALGORITHM_ID, local_account_id, selected_symbol),
+                )
+            conn.execute(
+                """
+                INSERT INTO wca_local_paper_account (
+                    algorithm_id, local_account_id, symbol, starting_balance, cash,
+                    equity, buying_power, realized_pnl, unrealized_pnl,
+                    daily_realized_pnl, daily_unrealized_pnl, daily_loss,
+                    gross_exposure, net_exposure, reserved_risk, trades_today,
+                    session_date, circuit_breaker_state, cooldown_until,
+                    last_mark_timestamp, state_version, payload_json, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(algorithm_id, local_account_id, symbol) DO UPDATE SET
+                    starting_balance = excluded.starting_balance,
+                    cash = excluded.cash,
+                    equity = excluded.equity,
+                    buying_power = excluded.buying_power,
+                    realized_pnl = excluded.realized_pnl,
+                    unrealized_pnl = excluded.unrealized_pnl,
+                    daily_realized_pnl = excluded.daily_realized_pnl,
+                    daily_unrealized_pnl = excluded.daily_unrealized_pnl,
+                    daily_loss = excluded.daily_loss,
+                    gross_exposure = excluded.gross_exposure,
+                    net_exposure = excluded.net_exposure,
+                    reserved_risk = excluded.reserved_risk,
+                    trades_today = excluded.trades_today,
+                    session_date = excluded.session_date,
+                    circuit_breaker_state = excluded.circuit_breaker_state,
+                    cooldown_until = excluded.cooldown_until,
+                    last_mark_timestamp = excluded.last_mark_timestamp,
+                    state_version = excluded.state_version,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    WCA_ALGORITHM_ID,
+                    local_account_id,
+                    selected_symbol,
+                    balance,
+                    balance,
+                    balance,
+                    balance,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0,
+                    trade_date,
+                    "closed",
+                    None,
+                    reset_timestamp,
+                    account_payload["state_version"],
+                    _json({"account_snapshot": account_payload}),
+                    reset_timestamp,
+                ),
+            )
+            reset_event = WcaInventoryLedgerEvent(
+                inventory_event_id=event_id,
+                event_type="DAILY_STATE_RESET",
+                broker_account_id=local_account_id,
+                symbol=selected_symbol,
+                event_timestamp=reset_timestamp,
+                trade_date=trade_date,
+                source_authority="wca.local_paper.reset_local_paper_account",
+                configuration_version="wca_local_paper_account_reset_v1",
+                decision_id=command_id or event_id,
+                run_id=command_id or event_id,
+                payload={
+                    **account_payload,
+                    "account_reset": True,
+                    "explicit_reset_command": "reset_local_paper_account",
+                    "force": bool(force),
+                    "reason": reason,
+                    "blocked_state_before_reset": blockers,
+                    "reset_scope": (
+                        "wca_local_cash",
+                        "wca_local_positions",
+                        "wca_local_lots",
+                        "wca_local_orders",
+                        "wca_local_fills",
+                        "wca_local_pnl",
+                        "wca_local_daily_risk_state",
+                    ),
+                },
+            )
+            _record_wca_local_paper_reset_event_in_conn(conn, reset_event)
+            _write_wca_local_paper_reset_projection_in_conn(conn, account_payload=account_payload, event=reset_event)
+        return {
+            "algorithmId": WCA_ALGORITHM_ID,
+            "accountId": local_account_id,
+            "symbol": selected_symbol,
+            "status": "completed",
+            "reset": True,
+            "force": bool(force),
+            "resetAt": reset_timestamp,
+            "startingBalance": balance,
+            "cash": balance,
+            "equity": balance,
+            "buyingPower": balance,
+            "blockedStateBeforeReset": blockers,
+            "reasonCodes": tuple(
+                dict.fromkeys(
+                    (
+                        "wca.local_paper.reset.explicit_command_received",
+                        "wca.local_paper.reset.force_applied" if force and blocker_reasons else "wca.local_paper.reset.no_active_state",
+                        "wca.local_paper.reset.completed",
+                    )
+                )
+            ),
+        }
+    def read_wca_local_inventory_snapshot(self, *, local_account_id: str, symbol: str) -> dict[str, Any] | None:
+        _require_broker_account_identity(local_account_id)
+        selected_symbol = str(symbol or "").upper()
+        if not selected_symbol:
+            raise ValueError("WCA local inventory snapshot requires symbol")
+        with self.connect() as conn:
+            account = conn.execute(
+                """
+                SELECT *
+                FROM wca_local_paper_account
+                WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?
+                """,
+                (WCA_ALGORITHM_ID, local_account_id, selected_symbol),
+            ).fetchone()
+            positions = conn.execute(
+                """
+                SELECT *
+                FROM wca_local_positions
+                WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?
+                ORDER BY opened_at, position_id
+                """,
+                (WCA_ALGORITHM_ID, local_account_id, selected_symbol),
+            ).fetchall()
+            lots = conn.execute(
+                """
+                SELECT *
+                FROM wca_local_lots
+                WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?
+                ORDER BY entry_timestamp, lot_id
+                """,
+                (WCA_ALGORITHM_ID, local_account_id, selected_symbol),
+            ).fetchall()
+            orders = conn.execute(
+                """
+                SELECT *
+                FROM wca_local_orders
+                WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?
+                  AND status NOT IN ('FILLED', 'REJECTED', 'CANCELLED', 'RECONCILED')
+                ORDER BY created_at, local_order_id
+                """,
+                (WCA_ALGORITHM_ID, local_account_id, selected_symbol),
+            ).fetchall()
+            fills = conn.execute(
+                """
+                SELECT *
+                FROM wca_local_fills
+                WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?
+                ORDER BY timestamp, fill_id
+                """,
+                (WCA_ALGORITHM_ID, local_account_id, selected_symbol),
+            ).fetchall()
+        if account is None and not positions and not lots and not orders and not fills:
+            return None
+
+        def row_payload(row: sqlite3.Row) -> dict[str, Any]:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            return payload if isinstance(payload, dict) else {}
+
+        payloads = [row_payload(row) for row in ((account,) if account is not None else ()) + (*positions, *lots, *orders, *fills)]
+        account_snapshot = next((payload.get("account_snapshot") for payload in payloads if isinstance(payload.get("account_snapshot"), dict)), {})
+        return {
+            "algorithm_id": WCA_ALGORITHM_ID,
+            "local_account_id": local_account_id,
+            "symbol": selected_symbol,
+            "account": _row_dict(account) if account is not None else None,
+            "account_snapshot": dict(account_snapshot) if account_snapshot else (_local_paper_account_payload_from_row(account) if account is not None else {}),
+            "positions": tuple(_row_dict(row) for row in positions),
+            "lots": tuple(_row_dict(row) for row in lots),
+            "orders": tuple(_row_dict(row) for row in orders),
+            "fills": tuple(_row_dict(row) for row in fills),
+        }
     def authorize_wca_lot_reduction(self, *, lot_id: str, account_id: str, symbol: str, quantity: int) -> WcaInventoryOwnershipDecision:
         if quantity <= 0:
             return WcaInventoryOwnershipDecision(False, ("wca.invalid_reduction_quantity",))
@@ -3189,6 +4164,8 @@ class WcaSqliteRepository:
                     (f"wca-trade-close-{row['lot_id']}-{int(row['version'])}", common["algorithm_id"], common["account_id"], common["symbol"], common["timestamp"], common["configuration_version"], common["engine_version"], common["market_snapshot_id"], common["decision_id"], common["run_id"], close_side, close_qty, pnl, _json(trade_payload)),
                 )
                 remaining -= close_qty
+            exit_charges = _local_fill_charges(exit_payload)
+            total_realized_pnl = round(total_realized_pnl - exit_charges["total"], 10)
             event_type = "POSITION_CLOSED" if available == quantity else "POSITION_REDUCED"
             if record_inventory_event:
                 self._record_inventory_event_in_conn(
@@ -3216,6 +4193,20 @@ class WcaSqliteRepository:
                         payload=exit_payload,
                     ),
                 )
+            _sync_wca_local_paper_account_after_close_in_conn(
+                conn,
+                account_id=account_id,
+                symbol=symbol,
+                evaluated_at=_dt(evaluated_at),
+                close_side=close_side,
+                quantity=quantity,
+                exit_price=exit_price,
+                realized_pnl=total_realized_pnl,
+                fill_id=fill_id,
+                broker_order_id=broker_order_id,
+                client_order_id=client_order_id,
+                payload=exit_payload,
+            )
         return True
 
     def realized_pnl_for_wca_position(self, *, account_id: str, symbol: str) -> float:
@@ -4096,6 +5087,13 @@ class WcaSqliteRepository:
             event_realized = float(event.realized_pnl)
 
             if event.event_type == "DAILY_STATE_RESET":
+                if bool(payload.get("account_reset")):
+                    open_quantity = 0
+                    average_entry_price = 0.0
+                    realized_pnl = 0.0
+                    unrealized_pnl = 0.0
+                    reserved_risk = 0.0
+                    reconciliation_watermark = None
                 daily.pop(event.trade_date, None)
                 daily[event.trade_date] = daily_state(event.trade_date)
                 state = daily[event.trade_date]
@@ -4141,6 +5139,11 @@ class WcaSqliteRepository:
                         raise ValueError("WCA reconciliation correction cannot set negative quantity")
                     open_quantity = corrected_quantity
                     average_entry_price = float(payload.get("average_entry_price") or event.average_entry_price or average_entry_price)
+                if "reserved_risk" in payload:
+                    corrected_reserved = float(payload["reserved_risk"])
+                    if corrected_reserved < 0:
+                        raise ValueError("WCA reconciliation correction cannot set negative reserved risk")
+                    reserved_risk = corrected_reserved
                 state["last_successful_reconciliation"] = _dt(event.event_timestamp)
 
             if event_realized:
@@ -4293,6 +5296,7 @@ def _runtime_control_key(broker_account_id: str, symbol: str) -> str:
 
 
 def _decision_common(decision: WcaDecision, run_id: str, *, engine_version: str | None = None) -> dict[str, str]:
+    _require_wca_decision_identity(decision)
     return _common_row(
         symbol=decision.market_snapshot.symbol,
         timestamp=_dt(decision.decision_timestamp),
@@ -4377,6 +5381,55 @@ def _unique_gate_results(decision: WcaDecision):
         yield gate
 
 
+def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
+
+
+def _local_paper_account_payload_from_row(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        return {}
+    return {
+        "algorithm_id": row["algorithm_id"],
+        "local_account_id": row["local_account_id"],
+        "account_id": row["local_account_id"],
+        "symbol": row["symbol"],
+        "starting_balance": float(row["starting_balance"]),
+        "cash": float(row["cash"]),
+        "equity": float(row["equity"]),
+        "buying_power": float(row["buying_power"]),
+        "realized_pnl": float(row["realized_pnl"]),
+        "unrealized_pnl": float(row["unrealized_pnl"]),
+        "daily_realized_pnl": float(row["daily_realized_pnl"]),
+        "daily_unrealized_pnl": float(row["daily_unrealized_pnl"]),
+        "daily_loss": float(row["daily_loss"]),
+        "gross_exposure": float(row["gross_exposure"]),
+        "net_exposure": float(row["net_exposure"]),
+        "reserved_risk": float(row["reserved_risk"]),
+        "trades_today": int(row["trades_today"]),
+        "session_date": row["session_date"],
+        "circuit_breaker_state": row["circuit_breaker_state"],
+        "cooldown_until": row["cooldown_until"],
+        "last_mark_timestamp": row["last_mark_timestamp"],
+        "state_version": row["state_version"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _wca_local_inventory_jsonable(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat()
+    if hasattr(value, "isoformat") and value.__class__.__name__ == "date":
+        return value.isoformat()
+    if isinstance(value, tuple):
+        return [_wca_local_inventory_jsonable(item) for item in value]
+    if isinstance(value, list):
+        return [_wca_local_inventory_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _wca_local_inventory_jsonable(item) for key, item in value.items()}
+    if hasattr(value, "__dict__"):
+        return {key: _wca_local_inventory_jsonable(item) for key, item in value.__dict__.items()}
+    return value
+
 def _json(payload: Any) -> str:
     if hasattr(payload, "model_dump_json"):
         return payload.model_dump_json()
@@ -4427,6 +5480,16 @@ def _require_wca_identity(algorithm_id: str) -> None:
 def _require_broker_account_identity(broker_account_id: str) -> None:
     if not broker_account_id:
         raise ValueError("WCA repository requires a broker account identity")
+
+
+def _require_wca_decision_identity(decision: WcaDecision, *, account_id: str | None = None) -> None:
+    _require_wca_identity(decision.algorithm_id)
+    proposed = decision.proposed_order
+    if proposed is None:
+        return
+    _require_wca_identity(proposed.algorithm_id)
+    if account_id is not None and proposed.account_id != account_id:
+        raise ValueError("WCA decision account_id does not match target local paper account")
 
 
 def _inventory_event_from_row(row: sqlite3.Row) -> WcaInventoryLedgerEvent:
@@ -4514,6 +5577,557 @@ def _reserved_risk_from_decision(decision: WcaDecision) -> float:
         return float(decision.sizing.risk_dollars)
     return 0.0
 
+
+def _sync_wca_local_paper_account_after_close_in_conn(
+    conn: sqlite3.Connection,
+    *,
+    account_id: str,
+    symbol: str,
+    evaluated_at: str,
+    close_side: str,
+    quantity: int,
+    exit_price: float,
+    realized_pnl: float,
+    fill_id: str | None,
+    broker_order_id: str | None,
+    client_order_id: str | None,
+    payload: dict[str, Any],
+) -> None:
+    projection_row = conn.execute(
+        """
+        SELECT * FROM wca_inventory_projection
+        WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ?
+        """,
+        (WCA_ALGORITHM_ID, account_id, symbol),
+    ).fetchone()
+    daily_row = conn.execute(
+        """
+        SELECT * FROM wca_daily_state
+        WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ? AND session_date = ?
+        """,
+        (WCA_ALGORITHM_ID, account_id, symbol, evaluated_at[:10]),
+    ).fetchone()
+    seed = _local_paper_account_seed_in_conn(conn, account_id=account_id, symbol=symbol)
+    prior_cash = float(seed.get("cash", seed.get("starting_balance", 0.0)) or 0.0)
+    charges = _local_fill_charges(payload)
+    cash_delta = quantity * exit_price if close_side == "SELL" else -(quantity * exit_price)
+    cash = max(0.0, round(prior_cash + cash_delta - charges["total"], 10))
+    open_quantity = int(projection_row["open_quantity"] if projection_row is not None else 0)
+    average_entry = float(projection_row["average_entry_price"] if projection_row is not None else 0.0)
+    total_realized = float(projection_row["realized_pnl"] if projection_row is not None else realized_pnl - charges["total"])
+    unrealized_pnl = float(projection_row["unrealized_pnl"] if projection_row is not None else 0.0)
+    reserved_risk = float(projection_row["reserved_risk"] if projection_row is not None else 0.0)
+    gross_exposure = round(abs(open_quantity * average_entry), 10)
+    net_exposure = gross_exposure if close_side == "BUY" else -gross_exposure if open_quantity else 0.0
+    equity = round(cash + gross_exposure + unrealized_pnl, 10)
+    buying_power = max(0.0, round(cash - reserved_risk, 10))
+    daily_realized = float(daily_row["realized_pnl_today"] if daily_row is not None else realized_pnl)
+    daily_loss = float(daily_row["daily_loss"] if daily_row is not None else max(0.0, -daily_realized))
+    trades_today = int(daily_row["trades_completed_today"] if daily_row is not None else (1 if open_quantity == 0 else 0))
+    circuit_breaker_state = str(daily_row["circuit_breaker_state"] if daily_row is not None else seed.get("circuit_breaker_state", "closed") or "closed")
+    cooldown_until = daily_row["cooldown_until"] if daily_row is not None else seed.get("cooldown_until")
+    account_payload = {
+        "algorithm_id": WCA_ALGORITHM_ID,
+        "local_account_id": account_id,
+        "account_id": account_id,
+        "symbol": symbol,
+        "starting_balance": float(seed.get("starting_balance", 0.0) or 0.0),
+        "cash": cash,
+        "equity": equity,
+        "buying_power": buying_power,
+        "realized_pnl": total_realized,
+        "unrealized_pnl": unrealized_pnl,
+        "daily_realized_pnl": daily_realized,
+        "daily_unrealized_pnl": unrealized_pnl,
+        "daily_loss": daily_loss,
+        "gross_exposure": gross_exposure,
+        "net_exposure": net_exposure,
+        "reserved_risk": reserved_risk,
+        "trades_today": trades_today,
+        "session_date": evaluated_at[:10],
+        "circuit_breaker_state": circuit_breaker_state,
+        "cooldown_until": cooldown_until,
+        "last_mark_timestamp": evaluated_at,
+        "state_version": _hash_json((account_id, symbol, fill_id, cash, equity, buying_power, open_quantity, total_realized)),
+        "updated_at": evaluated_at,
+    }
+    conn.execute(
+        """
+        INSERT INTO wca_local_paper_account (
+            algorithm_id, local_account_id, symbol, starting_balance, cash,
+            equity, buying_power, realized_pnl, unrealized_pnl,
+            daily_realized_pnl, daily_unrealized_pnl, daily_loss,
+            gross_exposure, net_exposure, reserved_risk, trades_today,
+            session_date, circuit_breaker_state, cooldown_until,
+            last_mark_timestamp, state_version, payload_json, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(algorithm_id, local_account_id, symbol) DO UPDATE SET
+            cash = excluded.cash,
+            equity = excluded.equity,
+            buying_power = excluded.buying_power,
+            realized_pnl = excluded.realized_pnl,
+            unrealized_pnl = excluded.unrealized_pnl,
+            daily_realized_pnl = excluded.daily_realized_pnl,
+            daily_unrealized_pnl = excluded.daily_unrealized_pnl,
+            daily_loss = excluded.daily_loss,
+            gross_exposure = excluded.gross_exposure,
+            net_exposure = excluded.net_exposure,
+            reserved_risk = excluded.reserved_risk,
+            trades_today = excluded.trades_today,
+            session_date = excluded.session_date,
+            circuit_breaker_state = excluded.circuit_breaker_state,
+            cooldown_until = excluded.cooldown_until,
+            last_mark_timestamp = excluded.last_mark_timestamp,
+            state_version = excluded.state_version,
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            WCA_ALGORITHM_ID,
+            account_id,
+            symbol,
+            account_payload["starting_balance"],
+            cash,
+            equity,
+            buying_power,
+            total_realized,
+            unrealized_pnl,
+            daily_realized,
+            unrealized_pnl,
+            daily_loss,
+            gross_exposure,
+            net_exposure,
+            reserved_risk,
+            trades_today,
+            evaluated_at[:10],
+            circuit_breaker_state,
+            cooldown_until,
+            evaluated_at,
+            account_payload["state_version"],
+            _json({"account_snapshot": account_payload}),
+            evaluated_at,
+        ),
+    )
+    conn.execute("DELETE FROM wca_local_positions WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?", (WCA_ALGORITHM_ID, account_id, symbol))
+    conn.execute("DELETE FROM wca_local_lots WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?", (WCA_ALGORITHM_ID, account_id, symbol))
+    remaining_lots = conn.execute(
+        """
+        SELECT lot_id, side, quantity, timestamp, decision_id, payload_json
+        FROM wca_owned_lots
+        WHERE algorithm_id = ? AND account_id = ? AND symbol = ? AND status = 'open' AND quantity > 0
+        ORDER BY created_at, lot_id
+        """,
+        (WCA_ALGORITHM_ID, account_id, symbol),
+    ).fetchall()
+    for lot in remaining_lots:
+        lot_payload = json.loads(lot["payload_json"] or "{}")
+        entry_price = _optional_positive_float(lot_payload.get("entry_price")) or average_entry or exit_price
+        conn.execute(
+            """
+            INSERT INTO wca_local_lots (
+                lot_id, algorithm_id, local_account_id, symbol, side, quantity,
+                remaining_quantity, entry_price, entry_timestamp, decision_id,
+                order_intent_id, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                lot["lot_id"],
+                WCA_ALGORITHM_ID,
+                account_id,
+                symbol,
+                lot["side"],
+                int(lot["quantity"]),
+                int(lot["quantity"]),
+                entry_price,
+                lot_payload.get("opened_at") or lot["timestamp"],
+                lot["decision_id"],
+                lot_payload.get("order_intent_id"),
+                _json({"account_snapshot": account_payload, "snapshot": lot_payload}),
+            ),
+        )
+    if open_quantity > 0:
+        conn.execute(
+            """
+            INSERT INTO wca_local_positions (
+                position_id, algorithm_id, local_account_id, symbol, side, quantity,
+                average_entry_price, opened_at, last_updated_at, realized_pnl,
+                unrealized_pnl, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"wca-local-position-{account_id}-{symbol}",
+                WCA_ALGORITHM_ID,
+                account_id,
+                symbol,
+                close_side,
+                open_quantity,
+                average_entry,
+                evaluated_at,
+                evaluated_at,
+                total_realized,
+                unrealized_pnl,
+                _json({"account_snapshot": account_payload, "snapshot": {"mark_price": average_entry}}),
+            ),
+        )
+    if fill_id:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO wca_local_fills (
+                fill_id, algorithm_id, local_account_id, order_id, symbol, side,
+                quantity, fill_price, commissions, fees, slippage, timestamp,
+                payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fill_id,
+                WCA_ALGORITHM_ID,
+                account_id,
+                str(broker_order_id or client_order_id or fill_id),
+                symbol,
+                close_side,
+                quantity,
+                exit_price,
+                charges["commissions"],
+                charges["fees"],
+                charges["slippage"],
+                evaluated_at,
+                _json({"account_snapshot": account_payload, "snapshot": payload}),
+            ),
+        )
+
+def _reserved_risk_release_for_fill_in_conn(conn: sqlite3.Connection, decision: WcaDecision, *, account_id: str, quantity: int) -> float:
+    order = decision.proposed_order
+    total_risk = _reserved_risk_from_decision(decision)
+    if order is None or order.quantity <= 0 or quantity <= 0 or total_risk <= 0:
+        return 0.0
+    intended_release = total_risk * min(int(quantity), int(order.quantity)) / int(order.quantity)
+    row = conn.execute(
+        """
+        SELECT reserved_risk
+        FROM wca_inventory_projection
+        WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ?
+        """,
+        (WCA_ALGORITHM_ID, account_id, order.symbol),
+    ).fetchone()
+    currently_reserved = max(0.0, float(row["reserved_risk"])) if row is not None else intended_release
+    return round(max(0.0, min(intended_release, currently_reserved)), 10)
+
+
+def _wca_local_paper_reset_blockers_in_conn(conn: sqlite3.Connection, *, account_id: str, symbol: str) -> dict[str, Any]:
+    terminal = ("FILLED", "REJECTED", "CANCELLED", "CANCELED", "RECONCILED")
+    projection = conn.execute(
+        """
+        SELECT open_quantity
+        FROM wca_inventory_projection
+        WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ?
+        """,
+        (WCA_ALGORITHM_ID, account_id, symbol),
+    ).fetchone()
+    projected_quantity = int(projection["open_quantity"] if projection is not None else 0)
+    local_position_count = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM wca_local_positions
+        WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ? AND quantity > 0
+        """,
+        (WCA_ALGORITHM_ID, account_id, symbol),
+    ).fetchone()[0]
+    open_position_count = max(int(local_position_count), 1 if projected_quantity > 0 else 0)
+    current_side_row = conn.execute(
+        """
+        SELECT side
+        FROM wca_local_positions
+        WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ? AND quantity > 0
+        ORDER BY last_updated_at DESC, position_id DESC
+        LIMIT 1
+        """,
+        (WCA_ALGORITHM_ID, account_id, symbol),
+    ).fetchone()
+    current_side = str(current_side_row["side"] or "").upper() if current_side_row is not None else ""
+    order_rows: list[dict[str, Any]] = []
+    for row in conn.execute(
+        """
+        SELECT client_order_id, side, order_type, status, payload_json
+        FROM wca_local_orders
+        WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?
+          AND UPPER(status) NOT IN (?, ?, ?, ?, ?)
+        """,
+        (WCA_ALGORITHM_ID, account_id, symbol, *terminal),
+    ).fetchall():
+        order_rows.append(_wca_reset_order_row(row, source="local_orders"))
+    for row in conn.execute(
+        """
+        SELECT payload_json, side, status
+        FROM wca_broker_orders
+        WHERE algorithm_id = ? AND account_id = ? AND symbol = ?
+          AND UPPER(status) NOT IN (?, ?, ?, ?, ?)
+        """,
+        (WCA_ALGORITHM_ID, account_id, symbol, *terminal),
+    ).fetchall():
+        order_rows.append(_wca_reset_order_row(row, source="broker_orders"))
+    for row in conn.execute(
+        """
+        SELECT payload_json, status
+        FROM wca_execution_outbox
+        WHERE algorithm_id = ? AND account_id = ? AND symbol = ?
+          AND UPPER(status) NOT IN (?, ?, ?, ?, ?)
+        """,
+        (WCA_ALGORITHM_ID, account_id, symbol, *terminal),
+    ).fetchall():
+        order_rows.append(_wca_reset_order_row(row, source="execution_outbox"))
+    unique_orders: dict[str, dict[str, Any]] = {}
+    for row in order_rows:
+        key = str(row.get("client_order_id") or row.get("idempotency_key") or f"{row.get('source')}:{len(unique_orders)}")
+        unique_orders.setdefault(key, row)
+    pending_entries = 0
+    pending_exits = 0
+    protective_orders = 0
+    for row in unique_orders.values():
+        client_id = str(row.get("client_order_id") or "")
+        side = str(row.get("side") or "").upper()
+        protective = client_id.startswith("wca-protection-") or bool(row.get("protective"))
+        if protective:
+            protective_orders += 1
+            continue
+        is_exit = bool(current_side and side and current_side != side and open_position_count > 0)
+        if is_exit:
+            pending_exits += 1
+        else:
+            pending_entries += 1
+    reasons: list[str] = []
+    if open_position_count > 0:
+        reasons.append("wca.local_paper.reset_blocked.open_positions")
+    if pending_entries > 0:
+        reasons.append("wca.local_paper.reset_blocked.pending_entry_orders")
+    if pending_exits > 0:
+        reasons.append("wca.local_paper.reset_blocked.pending_exit_orders")
+    if protective_orders > 0:
+        reasons.append("wca.local_paper.reset_blocked.protective_orders")
+    return {
+        "open_position_count": open_position_count,
+        "projected_open_quantity": projected_quantity,
+        "pending_entry_order_count": pending_entries,
+        "pending_exit_order_count": pending_exits,
+        "protective_order_count": protective_orders,
+        "open_order_count": len(unique_orders),
+        "reason_codes": tuple(reasons),
+    }
+
+
+def _wca_reset_order_row(row: sqlite3.Row, *, source: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except (KeyError, TypeError, json.JSONDecodeError):
+        payload = {}
+    proposed = payload.get("proposed_order") if isinstance(payload.get("proposed_order"), dict) else payload
+    request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    return {
+        "source": source,
+        "client_order_id": row["client_order_id"] if "client_order_id" in row.keys() else proposed.get("client_order_id") or proposed.get("clientOrderId") or request.get("client_order_id") or request.get("clientOrderId"),
+        "idempotency_key": proposed.get("idempotency_key") or proposed.get("idempotencyKey") or request.get("idempotency_key") or request.get("idempotencyKey"),
+        "side": (row["side"] if "side" in row.keys() else None) or proposed.get("side") or request.get("side"),
+        "order_type": (row["order_type"] if "order_type" in row.keys() else None) or proposed.get("order_type") or proposed.get("orderType") or request.get("order_type") or request.get("orderType"),
+        "status": row["status"] if "status" in row.keys() else "",
+        "protective": bool(proposed.get("protective") or request.get("protective") or str(proposed.get("client_order_id") or proposed.get("clientOrderId") or "").startswith("wca-protection-")),
+    }
+
+def _record_wca_local_paper_reset_event_in_conn(conn: sqlite3.Connection, event: WcaInventoryLedgerEvent) -> bool:
+    _validate_inventory_event(event)
+    existing = conn.execute(
+        "SELECT 1 FROM wca_inventory_ledger WHERE inventory_event_id = ?",
+        (event.inventory_event_id,),
+    ).fetchone()
+    if existing is not None:
+        return False
+    conn.execute(
+        """
+        INSERT INTO wca_inventory_ledger (
+            inventory_event_id, event_type, algorithm_id, broker_account_id, symbol,
+            order_intent_id, client_order_id, broker_order_id, fill_id, side,
+            quantity, filled_quantity, remaining_quantity, average_entry_price,
+            fill_price, realized_pnl, unrealized_pnl, reserved_risk, trade_date,
+            event_timestamp, source_authority, reconciliation_watermark,
+            configuration_version, decision_id, run_id, payload_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.inventory_event_id,
+            event.event_type,
+            event.algorithm_id,
+            event.broker_account_id,
+            event.symbol,
+            event.order_intent_id,
+            event.client_order_id,
+            event.broker_order_id,
+            event.fill_id,
+            event.side,
+            int(event.quantity),
+            int(event.filled_quantity),
+            int(event.remaining_quantity),
+            float(event.average_entry_price),
+            float(event.fill_price),
+            float(event.realized_pnl),
+            float(event.unrealized_pnl),
+            float(event.reserved_risk),
+            event.trade_date,
+            _dt(event.event_timestamp),
+            event.source_authority,
+            event.reconciliation_watermark,
+            event.configuration_version,
+            event.decision_id,
+            event.run_id,
+            _json(event.payload or {}),
+        ),
+    )
+    return True
+
+
+def _write_wca_local_paper_reset_projection_in_conn(conn: sqlite3.Connection, *, account_payload: dict[str, Any], event: WcaInventoryLedgerEvent) -> None:
+    payload_json = _json({"account_snapshot": account_payload, "reset_event_id": event.inventory_event_id})
+    conn.execute(
+        """
+        INSERT INTO wca_inventory_projection (
+            algorithm_id, broker_account_id, symbol, open_quantity, average_entry_price,
+            realized_pnl, unrealized_pnl, reserved_risk, last_event_timestamp,
+            reconciliation_watermark, configuration_version, decision_id, run_id, payload_json,
+            updated_at
+        )
+        VALUES (?, ?, ?, 0, 0, 0, 0, 0, ?, NULL, ?, ?, ?, ?, ?)
+        ON CONFLICT(algorithm_id, broker_account_id, symbol) DO UPDATE SET
+            open_quantity = 0,
+            average_entry_price = 0,
+            realized_pnl = 0,
+            unrealized_pnl = 0,
+            reserved_risk = 0,
+            last_event_timestamp = excluded.last_event_timestamp,
+            reconciliation_watermark = NULL,
+            configuration_version = excluded.configuration_version,
+            decision_id = excluded.decision_id,
+            run_id = excluded.run_id,
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            WCA_ALGORITHM_ID,
+            event.broker_account_id,
+            event.symbol,
+            _dt(event.event_timestamp),
+            event.configuration_version,
+            event.decision_id,
+            event.run_id,
+            payload_json,
+            _dt(event.event_timestamp),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO wca_daily_state (
+            algorithm_id, broker_account_id, symbol, session_date,
+            trades_completed_today, entries_attempted_today, realized_pnl_today,
+            daily_loss, consecutive_losses, current_reserved_risk,
+            maximum_intraday_exposure, cooldown_until, last_entry_timestamp,
+            last_exit_timestamp, circuit_breaker_state, last_successful_reconciliation,
+            isolation_enforced, payload_json, updated_at
+        )
+        VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, 'closed', NULL, 1, ?, ?)
+        ON CONFLICT(algorithm_id, broker_account_id, symbol, session_date) DO UPDATE SET
+            trades_completed_today = 0,
+            entries_attempted_today = 0,
+            realized_pnl_today = 0,
+            daily_loss = 0,
+            consecutive_losses = 0,
+            current_reserved_risk = 0,
+            maximum_intraday_exposure = 0,
+            cooldown_until = NULL,
+            last_entry_timestamp = NULL,
+            last_exit_timestamp = NULL,
+            circuit_breaker_state = 'closed',
+            last_successful_reconciliation = NULL,
+            isolation_enforced = 1,
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            WCA_ALGORITHM_ID,
+            event.broker_account_id,
+            event.symbol,
+            event.trade_date,
+            payload_json,
+            _dt(event.event_timestamp),
+        ),
+    )
+
+def _local_paper_account_seed_in_conn(conn: sqlite3.Connection, *, account_id: str, symbol: str) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT *
+        FROM wca_local_paper_account
+        WHERE algorithm_id = ? AND local_account_id = ? AND symbol = ?
+        """,
+        (WCA_ALGORITHM_ID, account_id, symbol),
+    ).fetchone()
+    if row is not None:
+        return _local_paper_account_payload_from_row(row)
+    reset_rows = conn.execute(
+        """
+        SELECT payload_json
+        FROM wca_inventory_ledger
+        WHERE algorithm_id = ? AND broker_account_id = ? AND symbol = ? AND event_type = 'DAILY_STATE_RESET'
+        ORDER BY event_timestamp DESC, created_at DESC
+        """,
+        (WCA_ALGORITHM_ID, account_id, symbol),
+    ).fetchall()
+    payload: dict[str, Any] = {}
+    for reset in reset_rows:
+        try:
+            parsed = json.loads(reset["payload_json"] or "{}")
+            candidate = parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            continue
+        if float(candidate.get("starting_balance") or 0.0) > 0:
+            payload = candidate
+            break
+    starting_balance = float(payload.get("starting_balance") or payload.get("cash") or payload.get("equity") or 100000.0)
+    return {
+        "starting_balance": starting_balance,
+        "cash": float(payload.get("cash") or starting_balance),
+        "equity": float(payload.get("equity") or starting_balance),
+        "buying_power": float(payload.get("buying_power") or starting_balance),
+        "realized_pnl": 0.0,
+        "unrealized_pnl": 0.0,
+        "daily_realized_pnl": 0.0,
+        "daily_unrealized_pnl": 0.0,
+        "daily_loss": 0.0,
+        "gross_exposure": 0.0,
+        "net_exposure": 0.0,
+        "reserved_risk": 0.0,
+        "trades_today": 0,
+        "circuit_breaker_state": "closed",
+        "cooldown_until": None,
+    }
+
+
+def _local_fill_charges(record: dict[str, Any]) -> dict[str, float]:
+    fill = record.get("fill") if isinstance(record.get("fill"), dict) else {}
+    response = fill.get("response_payload") if isinstance(fill.get("response_payload"), dict) else {}
+
+    def amount(*keys: str) -> float:
+        for key in keys:
+            for source in (record, fill, response):
+                value = source.get(key) if isinstance(source, dict) else None
+                if value not in (None, ""):
+                    return max(0.0, float(value))
+        return 0.0
+
+    commissions = amount("commissions", "commission")
+    fees = amount("fees", "fee")
+    slippage = amount("slippage")
+    return {"commissions": commissions, "fees": fees, "slippage": slippage, "total": round(commissions + fees + slippage, 10)}
 
 def _reserved_risk_release_for_fill(repository: WcaSqliteRepository, decision: WcaDecision, *, account_id: str, quantity: int) -> float:
     order = decision.proposed_order

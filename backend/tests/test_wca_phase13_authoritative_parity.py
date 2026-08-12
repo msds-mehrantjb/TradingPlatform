@@ -51,6 +51,7 @@ PHASE13_SURFACES: tuple[tuple[str, WcaRuntimeMode, Callable[[WcaExecutionPipelin
     ("shadow_runtime", WcaRuntimeMode.SHADOW, lambda command: run_wca_execution_pipeline(command, voters=fake_voters(WcaSide.BUY)).decision),
     ("paper_recommendation", WcaRuntimeMode.PAPER_RECOMMENDATION, lambda command: run_wca_paper_pipeline_adapter(command, voters=fake_voters(WcaSide.BUY)).decision),
     ("manual_paper", WcaRuntimeMode.MANUAL_PAPER, lambda command: run_wca_paper_pipeline_adapter(command, voters=fake_voters(WcaSide.BUY)).decision),
+    ("local_automatic_paper", WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER, lambda command: run_wca_paper_pipeline_adapter(command, voters=fake_voters(WcaSide.BUY)).decision),
     ("limited_automatic_paper", WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, lambda command: run_wca_paper_pipeline_adapter(command, voters=fake_voters(WcaSide.BUY)).decision),
     ("automatic_paper", WcaRuntimeMode.AUTOMATIC_PAPER, lambda command: run_wca_paper_pipeline_adapter(command, voters=fake_voters(WcaSide.BUY)).decision),
 )
@@ -92,7 +93,7 @@ def test_automatic_surfaces_require_authoritative_account_values() -> None:
     fixture = phase13_golden_fixture()
     command = replace(
         fixture["command"],
-        runtime_mode=WcaRuntimeMode.AUTOMATIC_PAPER,
+        runtime_mode=WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER,
         account_equity=None,
         available_buying_power=None,
         authoritative_account_values=False,
@@ -101,9 +102,9 @@ def test_automatic_surfaces_require_authoritative_account_values() -> None:
     try:
         run_wca_paper_pipeline_adapter(command, voters=fake_voters(WcaSide.BUY))
     except ValueError as exc:
-        assert "authoritative broker equity and buying power" in str(exc)
+        assert "authoritative WCA local paper account values" in str(exc)
     else:
-        raise AssertionError("automatic WCA paper must fail closed without authoritative broker account values")
+        raise AssertionError("local automatic WCA paper must fail closed without authoritative local account values")
 
 
 def test_research_backtest_modes_preserve_integrity_and_production_engine_contracts() -> None:

@@ -239,6 +239,26 @@ class WcaLimitedAutomaticPaperSettings(WcaContractModel):
             raise ValueError("limited automatic paper requires WCA broker account identity")
         return self
 
+class WcaLocalPaperSettings(WcaContractModel):
+    settings_version: str = WCA_SETTINGS_VERSION
+    enabled: bool = True
+    starting_balance: float = Field(default=100_000.00, gt=0)
+    reset_policy: Literal["never", "manual_only", "daily_manual_only"] = "manual_only"
+    commission_per_share: float = Field(default=0.0, ge=0)
+    minimum_commission: float = Field(default=0.0, ge=0)
+    slippage_model: Literal["none", "fixed_bps", "spread_aware"] = "none"
+    buying_power_multiplier: float = Field(default=1.0, ge=0)
+    allow_short: bool = False
+    persist_between_sessions: bool = True
+
+    @model_validator(mode="after")
+    def validate_local_paper(self) -> "WcaLocalPaperSettings":
+        if not self.persist_between_sessions and self.reset_policy == "never":
+            raise ValueError("local paper reset policy cannot be never when persistence between sessions is disabled")
+        if self.buying_power_multiplier == 0:
+            raise ValueError("local paper buying_power_multiplier must be positive")
+        return self
+
 
 class WcaModuleSettings(WcaContractModel):
     settings_version: str = WCA_SETTINGS_VERSION
@@ -673,6 +693,7 @@ class WcaConfiguration(WcaContractModel):
     weights: WcaWeightSettings = Field(default_factory=WcaWeightSettings)
     runtime: WcaRuntimeSettings = Field(default_factory=WcaRuntimeSettings)
     limited_automatic_paper: WcaLimitedAutomaticPaperSettings = Field(default_factory=WcaLimitedAutomaticPaperSettings)
+    local_paper: WcaLocalPaperSettings = Field(default_factory=WcaLocalPaperSettings)
     primary_strategy_settings: WcaPrimaryStrategySettings = Field(default_factory=WcaPrimaryStrategySettings)
     modifier_settings: WcaModifierSettings = Field(default_factory=WcaModifierSettings)
     hard_filter_settings: WcaHardFilterSettings = Field(default_factory=WcaHardFilterSettings)
@@ -705,7 +726,8 @@ class WcaConfiguration(WcaContractModel):
         return WcaConfiguration.model_validate(payload)
 
     def to_baseline_settings(self) -> WcaBaselineSettings:
-        limited_active = coerce_wca_runtime_mode(self.runtime.runtime_mode) == WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER and self.limited_automatic_paper.enabled
+        runtime_mode = coerce_wca_runtime_mode(self.runtime.runtime_mode)
+        limited_active = runtime_mode in {WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER} and self.limited_automatic_paper.enabled
         controls = self.limited_automatic_paper
         return WcaBaselineSettings(
             settings_version=f"{self.configuration_version}:{self.content_hash[:12]}",
@@ -757,7 +779,7 @@ class WcaConfiguration(WcaContractModel):
 
     def for_runtime_mode(self, runtime_mode: WcaRuntimeMode | str) -> "WcaConfiguration":
         mode = coerce_wca_runtime_mode(runtime_mode)
-        if mode != WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER or not self.limited_automatic_paper.enabled:
+        if mode not in {WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER} or not self.limited_automatic_paper.enabled:
             return self
         controls = self.limited_automatic_paper
         payload = self.model_dump(mode="python")

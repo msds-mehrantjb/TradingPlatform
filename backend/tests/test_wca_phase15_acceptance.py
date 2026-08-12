@@ -5,13 +5,9 @@ import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
 from unittest.mock import patch
 from uuid import uuid4
 
-import httpx
-
-from backend.app.algorithms.wca.alpaca_paper_broker import WcaAlpacaPaperBroker
 from backend.app.algorithms.wca.configuration import WcaConfiguration, default_wca_configuration
 from backend.app.algorithms.wca.contracts import (
     WcaBrokerReconciliationResult,
@@ -26,13 +22,10 @@ from backend.app.algorithms.wca.contracts import (
     WcaStrategyEvaluation,
 )
 from backend.app.algorithms.wca.execution_pipeline import run_wca_paper_pipeline_adapter
+from backend.app.algorithms.wca.local_paper_broker import WcaLocalPaperBroker
 from backend.app.algorithms.wca.paper_account import (
-    WCA_ALPACA_PAPER_ACCOUNT_ID,
-    WCA_ALPACA_PAPER_API_KEY_ID,
-    WCA_ALPACA_PAPER_API_SECRET_KEY,
-    WCA_ALPACA_PAPER_BASE_URL,
     WCA_AUTOMATIC_PAPER_ENABLED,
-    WCA_REQUIRED_ALPACA_PAPER_BASE_URL,
+    WCA_LOCAL_PAPER_ACCOUNT_ID,
 )
 from backend.app.algorithms.wca.repository import WcaInventoryLedgerEvent, WcaSqliteRepository
 from backend.app.algorithms.wca.rollout import WCA_PAPER_EXECUTION_ENABLED
@@ -52,7 +45,7 @@ DECISION_TIME = datetime(2026, 7, 20, 14, 49, tzinfo=UTC)
 ENTRY_PRICE = 131.65
 
 
-def test_wca_automatic_paper_acceptance_scenario_with_fake_alpaca_http_transport(monkeypatch) -> None:
+def test_wca_automatic_paper_acceptance_scenario_with_local_paper_account(monkeypatch) -> None:
     clock = {"now": DECISION_TIME + timedelta(seconds=2)}
     repository = acceptance_repository()
     runtime_repository = WcaRuntimeRepository(repository)
@@ -72,28 +65,16 @@ def test_wca_automatic_paper_acceptance_scenario_with_fake_alpaca_http_transport
         owner_id="phase15-acceptance-runtime",
     )
     service = WcaService(repository=repository)
-    fake_http = FakeAlpacaPaperHttpTransport(account_id=ACCOUNT_ID, clock=lambda: clock["now"])
-    real_broker_from_env = WcaAlpacaPaperBroker.from_env
-
     monkeypatch.setattr("backend.app.algorithms.wca.runtime_supervisor._utc_now", lambda: clock["now"])
     monkeypatch.setattr("backend.app.algorithms.wca.runtime_repository._utc_now", lambda: clock["now"])
+    monkeypatch.setattr("backend.app.algorithms.wca.local_paper_broker._utc_now", lambda: clock["now"])
     env = {
         WCA_AUTOMATIC_PAPER_ENABLED: "true",
         WCA_PAPER_EXECUTION_ENABLED: "true",
-        WCA_ALPACA_PAPER_ACCOUNT_ID: ACCOUNT_ID,
-        WCA_ALPACA_PAPER_API_KEY_ID: "wca-acceptance-key",
-        WCA_ALPACA_PAPER_API_SECRET_KEY: "wca-acceptance-secret",
-        WCA_ALPACA_PAPER_BASE_URL: WCA_REQUIRED_ALPACA_PAPER_BASE_URL,
+        WCA_LOCAL_PAPER_ACCOUNT_ID: ACCOUNT_ID,
     }
 
-    def fake_broker_from_env(*, account_id: str, environ=None, http_client=None):
-        assert account_id == ACCOUNT_ID
-        return real_broker_from_env(account_id=account_id, environ=env, http_client=fake_http)
-
     with patch.dict(os.environ, env, clear=False), patch(
-        "backend.app.algorithms.wca.runtime_supervisor.WcaAlpacaPaperBroker.from_env",
-        side_effect=fake_broker_from_env,
-    ), patch(
         "backend.app.algorithms.wca.runtime_supervisor.run_wca_paper_pipeline_adapter",
         side_effect=acceptance_pipeline,
     ):
@@ -167,38 +148,34 @@ def test_wca_automatic_paper_acceptance_scenario_with_fake_alpaca_http_transport
         assert outbox[0].global_risk_decision_id == approval.global_risk_decision_id
         assert outbox[0].runtime_control_revision == effective_control.control_revision
 
-        assert outbox[0].status in {"SUBMITTED", "PARTIALLY_FILLED", "ACCEPTED_FOR_PAPER"}, outbox_debug(repository, outbox[0].outbox_id)
-        entry_posts = fake_http.entry_order_posts()
-        assert len(entry_posts) == 1
-        assert entry_posts[0]["client_order_id"].startswith("wca-")
-        projection = repository.read_inventory_projection(algorithm_id="wca", broker_account_id=ACCOUNT_ID, symbol=SYMBOL)
-        assert projection.open_quantity == 2
-        assert fake_http.position_quantity == 2
-        assert len(fake_http.active_protective_orders()) == 2
-        assert {int(float(order["qty"])) for order in fake_http.active_protective_orders()} == {2}
-
-        fake_http.fill_remaining_entry()
-        clock["now"] = DECISION_TIME + timedelta(seconds=12)
-        runtime_repository.enqueue_command(
-            runtime_command(
-                WcaRuntimeCommandType.BROKER_RECONCILIATION,
-                account_id=ACCOUNT_ID,
-                symbol=SYMBOL,
-                decision_id=decision_id,
-                run_id="phase15-after-remaining-fill",
-                reason_codes=("wca.phase15.remaining_fill_poll",),
-            )
+        assert outbox[0].status == "ACKNOWLEDGED", outbox_debug(repository, outbox[0].outbox_id)
+        local_broker = WcaLocalPaperBroker(repository=repository, account_id=ACCOUNT_ID, symbol=SYMBOL)
+        local_fills = local_broker.process_market_update(
+            {
+                "symbol": SYMBOL,
+                "bid": decision.proposed_order.limit_price - 0.01,
+                "ask": decision.proposed_order.limit_price,
+                "timestamp": (clock["now"] + timedelta(seconds=1)).isoformat(),
+                "volume": decision.sizing.final_quantity * 10,
+            }
         )
-        after_fill = supervisor.run_once()
-        assert after_fill["workers"]["broker_reconciliation_worker"]["fillsProcessed"] == 1
+        assert len(local_fills) == 1
+        outbox = repository.list_execution_outbox_records(account_id=ACCOUNT_ID)
+        assert outbox[0].status == "FILLED", outbox_debug(repository, outbox[0].outbox_id)
+        clock["now"] = clock["now"] + timedelta(seconds=2)
+        post_fill_reconciliation = supervisor.run_once()
+        assert post_fill_reconciliation["workers"]["broker_reconciliation_worker"]["status"] == "completed"
+        local_orders = local_broker_orders(repository)
+        entry_orders = [order for order in local_orders if not str(order["client_order_id"]).startswith("wca-protection-")]
+        assert len(entry_orders) == 1
+        assert entry_orders[0]["client_order_id"].startswith("wca-")
         projection = repository.read_inventory_projection(algorithm_id="wca", broker_account_id=ACCOUNT_ID, symbol=SYMBOL)
         assert projection.open_quantity == 5
-        assert fake_http.position_quantity == 5
-        assert len(fake_http.active_protective_orders()) == 2
-        assert {int(float(order["qty"])) for order in fake_http.active_protective_orders()} == {5}
-        assert fake_http.cancelled_protective_count >= 2
+        protective_orders = local_protective_orders(repository)
+        assert len(protective_orders) == 2
+        assert {int(order["quantity"]) for order in protective_orders} == {5}
         assert repository.reconciliation_blocks_new_entries(account_id=ACCOUNT_ID, symbol=SYMBOL) is False, json.dumps(
-                {**latest_reconciliation_debug(repository), "intents": order_intents_debug(repository), "fakeOrders": fake_http.open_order_debug()},
+            {**latest_reconciliation_debug(repository), "intents": order_intents_debug(repository), "localOrders": local_orders},
             sort_keys=True,
         )
 
@@ -214,16 +191,16 @@ def test_wca_automatic_paper_acceptance_scenario_with_fake_alpaca_http_transport
         assert paper_off["workers"]["runtime_control_worker"]["status"] == "completed"
         assert off_control.paper_trading_requested is False
         assert off_control.effective_automatic_entries_enabled is False
-        assert len(fake_http.active_protective_orders()) == 2
+        assert len(local_protective_orders(repository)) == 2
 
-        before_second_bar_entries = len(fake_http.entry_order_posts())
+        before_second_bar_entries = len([order for order in local_broker_orders(repository) if not str(order["client_order_id"]).startswith("wca-protection-")])
         clock["now"] = DECISION_TIME + timedelta(minutes=1, seconds=2)
         second_event = finalized_event("phase15-bar-2", snapshot=acceptance_snapshot(offset_minutes=1))
         assert runtime_repository.publish_finalized_bar_event(second_event, now=second_event.publication_timestamp).accepted is True
         second_bar = supervisor.run_once()
         assert second_bar["workers"]["execution_outbox_worker"]["status"] in {"blocked", "idle"}
-        assert len(fake_http.entry_order_posts()) == before_second_bar_entries
-        assert len(fake_http.active_protective_orders()) == 2
+        assert len([order for order in local_broker_orders(repository) if not str(order["client_order_id"]).startswith("wca-protection-")]) == before_second_bar_entries
+        assert len(local_protective_orders(repository)) == 2
         pre_eos_projection = repository.read_inventory_projection(algorithm_id="wca", broker_account_id=ACCOUNT_ID, symbol=SYMBOL)
         assert pre_eos_projection.open_quantity == 5
 
@@ -241,19 +218,49 @@ def test_wca_automatic_paper_acceptance_scenario_with_fake_alpaca_http_transport
         )
         end_of_session = supervisor.run_once()
         eos = end_of_session["workers"]["end_of_session_worker"]
-        assert eos["status"] == "completed"
+        assert eos["status"] == "completed", json.dumps(eos, sort_keys=True, default=str)
         assert eos["verified"] is True
         assert "wca.runtime.end_of_session.verified_flat" in eos["reasonCodes"]
 
     final_projection = repository.read_inventory_projection(algorithm_id="wca", broker_account_id=ACCOUNT_ID, symbol=SYMBOL)
     assert final_projection.open_quantity == 0
     assert final_projection.reserved_risk == 0
-    assert fake_http.position_quantity == 0
-    assert fake_http.active_protective_orders() == []
-    assert len(fake_http.entry_order_posts()) == 1
-    assert len({order["client_order_id"] for order in fake_http.orders.values()}) == len(fake_http.orders)
-    assert all(str(order["client_order_id"]).startswith("wca-") for order in fake_http.orders.values())
+    final_local_orders = local_broker_orders(repository)
+    final_entry_orders = [
+        order
+        for order in final_local_orders
+        if str(order["client_order_id"]).startswith("wca-")
+        and not str(order["client_order_id"]).startswith("wca-protection-")
+        and not str(order["client_order_id"]).startswith("wca-eos-")
+    ]
+    final_protective_orders = [
+        order
+        for order in final_local_orders
+        if str(order["client_order_id"]).startswith("wca-protection-") and str(order["status"]) != "CANCELLED"
+    ]
+    assert final_protective_orders == []
+    assert len(final_entry_orders) == 1
+    assert len({order["client_order_id"] for order in final_local_orders}) == len(final_local_orders)
+    assert all(str(order["client_order_id"]).startswith("wca-") for order in final_local_orders)
     assert cross_algorithm_mutation_count(repository) == 0
+
+def local_broker_orders(repository: WcaSqliteRepository) -> list[dict[str, object]]:
+    with sqlite3.connect(repository.path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT broker_order_id, client_order_id, order_intent_id, side, quantity, status
+            FROM wca_broker_orders
+            WHERE algorithm_id = 'wca' AND account_id = ? AND symbol = ?
+            ORDER BY created_at, broker_order_id
+            """,
+            (ACCOUNT_ID, SYMBOL),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def local_protective_orders(repository: WcaSqliteRepository) -> list[dict[str, object]]:
+    return [order for order in local_broker_orders(repository) if str(order["client_order_id"]).startswith("wca-protection-")]
 
 def acceptance_pipeline(pipeline_input):
     return run_wca_paper_pipeline_adapter(pipeline_input, voters=ACCEPTANCE_VOTERS)
@@ -293,158 +300,6 @@ ACCEPTANCE_VOTERS = (
     AcceptanceVoter("C4", "wca_vwap_mean_reversion_v1", "mean_reversion", 0.08),
     AcceptanceVoter("C7", "wca_opening_range_breakout_v1", "breakout", 0.10),
 )
-
-
-class FakeAlpacaPaperHttpTransport:
-    def __init__(self, *, account_id: str, clock) -> None:
-        self.account_id = account_id
-        self.clock = clock
-        self.orders: dict[str, dict[str, object]] = {}
-        self.activities: list[dict[str, object]] = []
-        self.position_quantity = 0
-        self.cancelled_protective_count = 0
-        self._entry_client_order_id = ""
-
-    def request(self, method: str, url: str, **kwargs):
-        path = urlparse(url).path
-        method = method.upper()
-        params = kwargs.get("params") or {}
-        if method == "GET" and path == "/v2/account":
-            return self._response(url, {"id": self.account_id, "account_number": self.account_id, "equity": "100000", "buying_power": "100000", "realized_intraday_pl": "0"})
-        if method == "GET" and path == "/v2/clock":
-            return self._response(url, {"timestamp": self.clock().isoformat(), "is_open": True, "next_open": self.clock().isoformat(), "next_close": datetime(2026, 7, 20, 20, 0, tzinfo=UTC).isoformat()})
-        if method == "GET" and path == "/v2/positions":
-            if self.position_quantity == 0:
-                return self._response(url, [])
-            return self._response(
-                url,
-                [
-                    {
-                        "symbol": SYMBOL,
-                        "qty": str(self.position_quantity),
-                        "avg_entry_price": str(ENTRY_PRICE),
-                        "current_price": str(ENTRY_PRICE + 0.25),
-                        "client_order_id": self._entry_client_order_id,
-                        "decision_id": "wca-decision-phase15-bar-1",
-                        "order_intent_id": "wca-intent-phase15-bar-1",
-                    }
-                ],
-            )
-        if method == "GET" and path == "/v2/orders":
-            status = str(params.get("status") or "open").lower()
-            rows = list(self.orders.values())
-            if status == "open":
-                rows = [row for row in rows if str(row["status"]) in {"accepted", "new", "partially_filled"}]
-            return self._response(url, rows)
-        if method == "GET" and path == "/v2/orders:by_client_order_id":
-            client_order_id = str(params.get("client_order_id") or "")
-            order = self.orders.get(client_order_id)
-            if order is None:
-                return self._response(url, {"message": "not found"}, status_code=404)
-            return self._response(url, order)
-        if method == "GET" and path == "/v2/account/activities/FILL":
-            activities = list(self.activities)
-            self.activities.clear()
-            return self._response(url, activities)
-        if method == "POST" and path == "/v2/orders":
-            return self._response(url, self._create_order(dict(kwargs.get("json") or {})), status_code=201)
-        if method == "DELETE" and path.startswith("/v2/orders/"):
-            broker_id = path.rsplit("/", 1)[-1]
-            for order in self.orders.values():
-                if order["id"] == broker_id:
-                    if str(order["client_order_id"]).startswith("wca-protection-"):
-                        self.cancelled_protective_count += 1
-                    order["status"] = "canceled"
-                    return self._response(url, {"id": broker_id, "status": "canceled"})
-            return self._response(url, {"id": broker_id, "status": "missing"})
-        return self._response(url, {"message": f"Unhandled fake Alpaca route {method} {path}"}, status_code=500)
-
-    def fill_remaining_entry(self) -> None:
-        order = self.orders[self._entry_client_order_id]
-        remaining = int(float(order["qty"])) - int(float(order["filled_qty"]))
-        assert remaining > 0
-        order["filled_qty"] = order["qty"]
-        order["status"] = "filled"
-        self.position_quantity += remaining
-        self.activities.append(
-            {
-                "id": f"activity-{order['id']}-remaining",
-                "order_id": order["id"],
-                "client_order_id": order["client_order_id"],
-                "qty": str(remaining),
-                "price": order["limit_price"],
-                "transaction_time": self.clock().isoformat(),
-            }
-        )
-
-    def entry_order_posts(self) -> list[dict[str, object]]:
-        return [
-            order
-            for order in self.orders.values()
-            if str(order["client_order_id"]).startswith("wca-")
-            and not str(order["client_order_id"]).startswith("wca-protection-")
-            and not str(order["client_order_id"]).startswith("wca-eos-")
-        ]
-
-    def active_protective_orders(self) -> list[dict[str, object]]:
-        return [
-            order
-            for order in self.orders.values()
-            if str(order["client_order_id"]).startswith("wca-protection-") and str(order["status"]) != "canceled"
-        ]
-
-    def open_order_debug(self) -> list[dict[str, object]]:
-        return [
-            {
-                "client": str(order["client_order_id"]),
-                "status": str(order["status"]),
-                "qty": str(order["qty"]),
-                "type": str(order["type"]),
-                "orderIntent": str(order.get("order_intent_id") or ""),
-            }
-            for order in self.orders.values()
-            if str(order["status"]) in {"accepted", "new", "partially_filled"}
-        ]
-
-    def _create_order(self, payload: dict[str, object]) -> dict[str, object]:
-        client_order_id = str(payload["client_order_id"])
-        quantity = int(float(payload["qty"]))
-        broker_order_id = f"alpaca-{client_order_id}"
-        order = {
-            "id": broker_order_id,
-            "client_order_id": client_order_id,
-            "symbol": str(payload.get("symbol") or SYMBOL),
-            "qty": str(quantity),
-            "filled_qty": "0",
-            "filled_avg_price": str(payload.get("limit_price") or ENTRY_PRICE),
-            "limit_price": str(payload.get("limit_price") or ENTRY_PRICE),
-            "stop_price": str(payload.get("stop_price") or ""),
-            "side": str(payload.get("side") or "buy"),
-            "type": str(payload.get("type") or "limit"),
-            "time_in_force": str(payload.get("time_in_force") or "day"),
-            "status": "accepted",
-            "submitted_at": self.clock().isoformat(),
-            "created_at": self.clock().isoformat(),
-            "decision_id": "wca-decision-phase15-bar-1",
-            "order_intent_id": "wca-intent-phase15-bar-1",
-        }
-        if client_order_id.startswith("wca-protection-"):
-            pass
-        elif client_order_id.startswith("wca-eos-"):
-            order["filled_qty"] = str(quantity)
-            order["status"] = "filled"
-            self.position_quantity = max(0, self.position_quantity - quantity)
-        else:
-            partial = min(2, quantity)
-            order["filled_qty"] = str(partial)
-            order["status"] = "partially_filled"
-            self.position_quantity += partial
-            self._entry_client_order_id = client_order_id
-        self.orders[client_order_id] = order
-        return order
-
-    def _response(self, url: str, payload, *, status_code: int = 200) -> httpx.Response:
-        return httpx.Response(status_code=status_code, json=payload, request=httpx.Request("GET", url))
 
 
 def acceptance_repository() -> WcaSqliteRepository:

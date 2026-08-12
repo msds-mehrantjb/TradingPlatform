@@ -210,6 +210,27 @@ def set_wca_automatic_paper_trading(payload: dict[str, Any] = Body(default_facto
     }
 
 
+@router.post("/runtime/local-paper/reset", status_code=202, summary="Enqueue explicit WCA local paper account reset")
+def reset_wca_local_paper_account(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    if not str(payload.get("actor") or "") or not str(payload.get("reason") or ""):
+        raise HTTPException(status_code=422, detail="wca.api.local_paper_reset_requires_audit_metadata")
+    starting_balance = payload.get("startingBalance") if "startingBalance" in payload else payload.get("starting_balance")
+    receipt = WCA_API_SERVICE.enqueue_reset_local_paper_account(
+        account_id=str(payload.get("accountId") or payload.get("account_id") or "paper"),
+        symbol=str(payload.get("symbol") or "SPY"),
+        starting_balance=float(starting_balance) if starting_balance is not None else None,
+        force=bool(payload.get("force")),
+        reason=str(payload["reason"]),
+        actor=str(payload["actor"]),
+    )
+    return {
+        **receipt,
+        "jobKind": "reset_local_paper_account",
+        "paperOnly": True,
+        "liveTradingEnabled": False,
+        "apiHandlersExecuteAuthoritativeTradingLogic": False,
+    }
+
 @router.post("/reconciliation/request", status_code=202, summary="Enqueue WCA broker reconciliation")
 def request_reconciliation(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     body = payload or {}

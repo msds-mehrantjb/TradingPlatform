@@ -22,6 +22,7 @@ class WcaRuntimeCommandType(str, Enum):
     PAUSE_NEW_ENTRIES = "pause_new_entries"
     RESUME_NEW_ENTRIES = "resume_new_entries"
     SET_AUTOMATIC_PAPER = "set_automatic_paper"
+    RESET_LOCAL_PAPER_ACCOUNT = "reset_local_paper_account"
     CONFIGURATION_ACTIVATION = "configuration_activation"
     CONFIGURATION_ROLLBACK = "configuration_rollback"
     POSITION_PROTECTIVE_EXIT = "position_protective_exit"

@@ -54,7 +54,7 @@ from backend.app.algorithms.wca.runtime_repository import WcaRuntimeRepository
 from backend.app.algorithms.wca.runtime_supervisor import _load_persisted_rollout_evidence, get_wca_runtime_supervisor
 from backend.app.algorithms.wca.session_validation import validate_wca_entry_session
 from backend.app.algorithms.wca.rollout import wca_rollout_status
-from backend.app.algorithms.wca.paper_account import validate_wca_automatic_paper_account
+from backend.app.algorithms.wca.local_paper_account import validate_wca_local_paper_account
 from backend.app.algorithms.wca.paper_stability import validate_wca_paper_stability
 from backend.app.algorithms.wca.paper_broker import build_wca_paper_broker_request
 from backend.app.algorithms.wca.shadow_comparison import WcaShadowComparisonTolerance, run_wca_shadow_comparison
@@ -140,7 +140,13 @@ class WcaService:
         latest_reconciliation = self.reconciliation_status(account_id=account_id, symbol=symbol)
         latest_end_of_session = self.latest_end_of_session_result(account_id=account_id, symbol=symbol)
         latest_global_risk = self.latest_global_risk_status(account_id=account_id, symbol=symbol)
-        broker_validation = validate_wca_automatic_paper_account(account_id=account_id)
+        broker_validation = validate_wca_local_paper_account(account_id=account_id)
+        local_paper_status = self.local_paper_status(
+            runtime_mode=runtime_control.get("runtimeMode") or runtime_control.get("runtime_mode"),
+            account_id=account_id,
+            symbol=symbol,
+            starting_balance=broker_validation.starting_balance,
+        )
         session = validate_wca_entry_session(
             timestamp=now,
             entry_cutoff_minutes=active.execution.entry_cutoff_minutes if active is not None else 15 * 60 + 30,
@@ -252,9 +258,21 @@ class WcaService:
                 "verified": bool(broker_validation.verified),
                 "brokerAccountId": broker_validation.account_id,
                 "baseUrl": broker_validation.base_url,
+                "sourceAuthority": broker_validation.source_authority,
                 "automaticPaperEnvEnabled": bool(broker_validation.automatic_paper_enabled),
                 "reasonCodes": list(broker_validation.reason_codes),
+                "status": local_paper_status,
             },
+            "localPaperAccountVerified": bool(broker_validation.verified),
+            "localPaperAccount": {
+                "verified": bool(broker_validation.verified),
+                "accountId": broker_validation.account_id,
+                "sourceAuthority": broker_validation.source_authority,
+                "automaticPaperEnvEnabled": bool(broker_validation.automatic_paper_enabled),
+                "reasonCodes": list(broker_validation.reason_codes),
+                "status": local_paper_status,
+            },
+            "localPaperStatus": local_paper_status,
             "brokerAccountId": account_id,
             "weightVersion": weights.weight_version if weights else "",
             "calibrationVersion": ",".join(sorted({table.calibration_version for table in calibrations})),
@@ -539,6 +557,33 @@ class WcaService:
             priority=30,
         )
 
+    def enqueue_reset_local_paper_account(
+        self,
+        *,
+        account_id: str = "paper",
+        symbol: str = "SPY",
+        starting_balance: float | None = None,
+        force: bool = False,
+        reason: str = "api_request",
+        actor: str = "api",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "force": bool(force),
+            "reason": reason,
+            "actor": actor,
+            "explicit_command": "reset_local_paper_account",
+        }
+        if starting_balance is not None:
+            payload["starting_balance"] = float(starting_balance)
+        return self._enqueue_runtime_control(
+            WcaRuntimeCommandType.RESET_LOCAL_PAPER_ACCOUNT,
+            account_id=account_id,
+            symbol=symbol,
+            payload=payload,
+            reason_codes=("wca.api.local_paper_account_reset.enqueued", "wca.api.no_inline_account_reset"),
+            priority=2,
+        )
+
     def enqueue_reconciliation_request(self, *, account_id: str = "paper", symbol: str = "SPY") -> dict[str, Any]:
         return self._enqueue_runtime_control(
             WcaRuntimeCommandType.BROKER_RECONCILIATION,
@@ -587,6 +632,54 @@ class WcaService:
             "queued": queued.accepted,
             "paperOnly": True,
             "reasonCodes": (*queued.reason_codes, *reason_codes, "wca.api.background_control_surface"),
+        }
+
+    def local_paper_status(
+        self,
+        *,
+        runtime_mode: WcaRuntimeMode | str | None = None,
+        account_id: str = "paper",
+        symbol: str = "SPY",
+        starting_balance: float | None = None,
+    ) -> dict[str, Any]:
+        selected_symbol = str(symbol or "SPY").upper()
+        mode = runtime_mode.value if hasattr(runtime_mode, "value") else str(runtime_mode or "")
+        fallback_balance = float(starting_balance or 0.0)
+        if not hasattr(self._repository, "read_wca_local_inventory_snapshot"):
+            return _empty_local_paper_status(mode=mode, account_id=account_id, symbol=selected_symbol, starting_balance=fallback_balance, source="repository_unavailable")
+        snapshot = self._repository.read_wca_local_inventory_snapshot(local_account_id=account_id, symbol=selected_symbol)
+        if snapshot is None:
+            return _empty_local_paper_status(mode=mode, account_id=account_id, symbol=selected_symbol, starting_balance=fallback_balance, source="wca_local_inventory_missing")
+        account = dict(snapshot.get("account_snapshot") or snapshot.get("account") or {})
+        positions = tuple(row for row in (snapshot.get("positions") or ()) if str(row.get("algorithm_id") or "") == WCA_ALGORITHM_ID and str(row.get("local_account_id") or row.get("account_id") or "") == account_id and str(row.get("symbol") or "").upper() == selected_symbol)
+        orders = tuple(row for row in (snapshot.get("orders") or ()) if str(row.get("algorithm_id") or "") == WCA_ALGORITHM_ID and str(row.get("local_account_id") or row.get("account_id") or "") == account_id and str(row.get("symbol") or "").upper() == selected_symbol)
+        current_position = next((position for position in positions if int(position.get("quantity") or 0) > 0), None)
+        quantity = int((current_position or {}).get("quantity") or 0)
+        realized = _status_float(account.get("realized_pnl"), _status_float((current_position or {}).get("realized_pnl"), 0.0))
+        unrealized = _status_float(account.get("unrealized_pnl"), _status_float((current_position or {}).get("unrealized_pnl"), 0.0))
+        daily_realized = _status_float(account.get("daily_realized_pnl"), 0.0)
+        daily_unrealized = _status_float(account.get("daily_unrealized_pnl"), 0.0)
+        return {
+            "runtime_mode": mode,
+            "local_account_id": str(account.get("local_account_id") or account.get("account_id") or account_id),
+            "starting_balance": _status_float(account.get("starting_balance"), fallback_balance),
+            "cash": _status_float(account.get("cash"), fallback_balance),
+            "equity": _status_float(account.get("equity"), fallback_balance),
+            "buying_power": _status_float(account.get("buying_power"), fallback_balance),
+            "realized_pnl": realized,
+            "unrealized_pnl": unrealized,
+            "daily_pnl": round(daily_realized + daily_unrealized, 10),
+            "position": dict(current_position) if current_position is not None else None,
+            "position_quantity": quantity,
+            "average_entry_price": _status_float((current_position or {}).get("average_entry_price"), 0.0),
+            "open_order_count": len(orders),
+            "reserved_risk": _status_float(account.get("reserved_risk"), 0.0),
+            "daily_loss": _status_float(account.get("daily_loss"), 0.0),
+            "trades_today": int(account.get("trades_today") or 0),
+            "circuit_breaker_state": str(account.get("circuit_breaker_state") or "closed"),
+            "symbol": selected_symbol,
+            "algorithm_id": WCA_ALGORITHM_ID,
+            "sourceAuthority": "wca_local_paper_account",
         }
 
     def latest_decisions(self, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -848,7 +941,7 @@ class WcaService:
                 snapshot=snapshot,
                 configuration_version=configuration.configuration_version,
                 configuration=configuration,
-                runtime_mode=WcaRuntimeMode.AUTOMATIC_PAPER if request.mode == "automatic" else WcaRuntimeMode.MANUAL_PAPER,
+                runtime_mode=WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER if request.mode == "automatic" else WcaRuntimeMode.MANUAL_PAPER,
                 synthetic_quote_allowed=False,
                 account_id=request.account_id,
                 weight_snapshot=self._read_active_weights_as_of(snapshot.decision_timestamp) or baseline_weight_snapshot(cutoff=snapshot.decision_timestamp),
@@ -1193,7 +1286,7 @@ def _paper_order_validation_context(
         paper_only_mode=True,
         account_id=request.account_id,
         broker_endpoint="paper",
-        runtime_mode=WcaRuntimeMode.AUTOMATIC_PAPER if request.mode == "automatic" else WcaRuntimeMode.MANUAL_PAPER,
+        runtime_mode=WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER if request.mode == "automatic" else WcaRuntimeMode.MANUAL_PAPER,
         rollout_stage=rollout_stage,
         rollout_evidence_revision=str(runtime_control.get("rolloutEvidenceRevision") or runtime_control.get("rollout_evidence_revision") or ""),
         rollout_evidence_hash=str(runtime_control.get("rolloutEvidenceHash") or runtime_control.get("rollout_evidence_hash") or ""),
@@ -1421,6 +1514,37 @@ def _status_dataclass_payload(value: Any) -> dict[str, Any]:
     return _redact_status_payload(payload)
 
 
+def _status_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _empty_local_paper_status(*, mode: str, account_id: str, symbol: str, starting_balance: float, source: str) -> dict[str, Any]:
+    return {
+        "runtime_mode": mode,
+        "local_account_id": account_id,
+        "starting_balance": starting_balance,
+        "cash": starting_balance,
+        "equity": starting_balance,
+        "buying_power": starting_balance,
+        "realized_pnl": 0.0,
+        "unrealized_pnl": 0.0,
+        "daily_pnl": 0.0,
+        "position": None,
+        "position_quantity": 0,
+        "average_entry_price": 0.0,
+        "open_order_count": 0,
+        "reserved_risk": 0.0,
+        "daily_loss": 0.0,
+        "trades_today": 0,
+        "circuit_breaker_state": "closed",
+        "symbol": symbol,
+        "algorithm_id": WCA_ALGORITHM_ID,
+        "sourceAuthority": source,
+    }
+
 def _status_timestamp(value: Any) -> str | None:
     if value is None or value == "":
         return None
@@ -1493,7 +1617,7 @@ def _active_entry_block_reasons(
     reasons.extend(str(code) for code in runtime_control.get("reasonCodes") or runtime_control.get("reason_codes") or ())
     reasons.extend(str(code) for code in runtime_health.get("reason_codes") or runtime_health.get("reasonCodes") or ())
     reasons.extend(code for code in session_reason_codes if code != "wca.session.entry_window_open")
-    reasons.extend(code for code in broker_reason_codes if code != "wca.paper_account.verified")
+    reasons.extend(code for code in broker_reason_codes if code not in {"wca.paper_account.verified", "wca.local_paper_account.verified"})
     reasons.extend(rollout_blockers)
     if reconciliation.get("status") == "not_run":
         reasons.append("wca.status.reconciliation_not_run")

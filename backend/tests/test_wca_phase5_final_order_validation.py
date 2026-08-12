@@ -202,7 +202,7 @@ def valid_context(decision, *, runtime_mode: WcaRuntimeMode = WcaRuntimeMode.MAN
             "rollout_evidence_revision": "wca_evidence_rollout_v2:test",
             "rollout_evidence_hash": "test-rollout-evidence-hash",
         }
-        if runtime_mode in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}
+        if runtime_mode in {WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER}
         else {}
     )
     return WcaOrderValidationContext(

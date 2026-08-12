@@ -38,13 +38,13 @@ class WcaDedicatedComponent:
 WCA_SHARED_PLATFORM_COMPONENT_INVENTORY: tuple[WcaSharedPlatformComponent, ...] = (
     WcaSharedPlatformComponent("raw_and_normalized_market_data_services", "Raw and normalized market-data services", "Read-only input."),
     WcaSharedPlatformComponent("clock_and_market_calendar_service", "Clock and market-calendar service", "Read-only input."),
-    WcaSharedPlatformComponent("account_equity_and_buying_power_snapshot", "Account-equity and buying-power snapshot", "Read-only input."),
-    WcaSharedPlatformComponent("broker_api_client", "Broker API client", "Executes approved proposals only."),
-    WcaSharedPlatformComponent("global_account_risk_engine", "Global account-risk engine", "May reduce or reject WCA risk."),
-    WcaSharedPlatformComponent("global_portfolio_risk_ledger", "Global portfolio-risk ledger", "Must preserve algorithm attribution."),
-    WcaSharedPlatformComponent("global_emergency_controls", "Global emergency controls", "May block new entries."),
+    WcaSharedPlatformComponent("account_equity_and_buying_power_snapshot", "Account-equity and buying-power snapshot", "Read-only legacy/global observation; local automatic paper uses WCA local account."),
+    WcaSharedPlatformComponent("broker_api_client", "Broker API client", "Legacy broker modes only; local automatic paper uses WcaLocalPaperBroker."),
+    WcaSharedPlatformComponent("global_account_risk_engine", "Global account-risk engine", "May reduce or reject WCA proposals only; must not own WCA local account or inventory."),
+    WcaSharedPlatformComponent("global_portfolio_risk_ledger", "Global portfolio-risk ledger", "Read-only aggregate observation; must preserve algorithm attribution."),
+    WcaSharedPlatformComponent("global_emergency_controls", "Global emergency controls", "May block new entries or emit explicit WCA risk-reduction commands."),
     WcaSharedPlatformComponent("idempotency_service", "Idempotency service", "Must include WCA algorithm and intent identifiers."),
-    WcaSharedPlatformComponent("broker_reconciliation_infrastructure", "Broker reconciliation infrastructure", "Must preserve WCA ownership."),
+    WcaSharedPlatformComponent("broker_reconciliation_infrastructure", "Broker reconciliation infrastructure", "Legacy broker modes only; must preserve WCA ownership."),
     WcaSharedPlatformComponent("database_connection_path_utilities", "Database connection/path utilities", "Infrastructure only."),
     WcaSharedPlatformComponent("logging_metrics_and_tracing", "Logging, metrics, and tracing", "Must tag records with algorithm_id=wca."),
     WcaSharedPlatformComponent("api_framework_and_authentication", "API framework and authentication", "Transport only."),
@@ -60,6 +60,19 @@ WCA_GLOBAL_RISK_FORBIDDEN_REWRITE_TARGETS = frozenset(
         "wca_dynamic_profiles",
         "wca_stop_logic",
         "wca_backtest_results",
+        "wca_local_cash",
+        "wca_local_equity",
+        "wca_local_buying_power",
+        "wca_local_positions",
+        "wca_local_lots",
+        "wca_local_orders",
+        "wca_local_fills",
+        "wca_inventory_projection",
+        "wca_inventory_ledger",
+        "wca_daily_state",
+        "wca_reserved_risk",
+        "wca_trade_history",
+        "other_algorithm_inventory",
     }
 )
 WCA_GLOBAL_RISK_ALLOWED_CONSTRAINTS = frozenset({"reduce_wca_risk", "reject_wca_entry", "block_new_entries"})
@@ -117,6 +130,7 @@ class WcaRuntimeMode(str, Enum):
     SHADOW = "SHADOW"
     PAPER_RECOMMENDATION = "PAPER_RECOMMENDATION"
     MANUAL_PAPER = "MANUAL_PAPER"
+    LOCAL_AUTOMATIC_PAPER = "LOCAL_AUTOMATIC_PAPER"
     LIMITED_AUTOMATIC_PAPER = "LIMITED_AUTOMATIC_PAPER"
     AUTOMATIC_PAPER = "AUTOMATIC_PAPER"
 
@@ -131,6 +145,8 @@ _WCA_RUNTIME_MODE_ALIASES = {
     "recommendation": WcaRuntimeMode.PAPER_RECOMMENDATION,
     "manual_paper": WcaRuntimeMode.MANUAL_PAPER,
     "manual": WcaRuntimeMode.MANUAL_PAPER,
+    "local_automatic_paper": WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER,
+    "local_automatic": WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER,
     "limited_automatic_paper": WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER,
     "automatic_paper": WcaRuntimeMode.AUTOMATIC_PAPER,
     "automatic": WcaRuntimeMode.AUTOMATIC_PAPER,

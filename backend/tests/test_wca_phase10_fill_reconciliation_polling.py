@@ -54,7 +54,7 @@ def test_broker_reconciliation_worker_polls_orders_fills_updates_inventory_and_r
         owner_id="phase10-worker",
     )
 
-    with patch("backend.app.algorithms.wca.runtime_supervisor.WcaAlpacaPaperBroker.from_env", return_value=broker):
+    with patch("backend.app.algorithms.wca.runtime_supervisor.WcaLocalPaperBroker.from_env", return_value=broker):
         result = next(worker for worker in supervisor.workers if worker.worker_name == "broker_reconciliation_worker").run_once()
 
     projection = repository.read_inventory_projection(algorithm_id="wca", broker_account_id=ACCOUNT_ID, symbol="SPY")

@@ -19,6 +19,7 @@ PARITY_MODES = (
     WcaRuntimeMode.SHADOW,
     WcaRuntimeMode.PAPER_RECOMMENDATION,
     WcaRuntimeMode.MANUAL_PAPER,
+    WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER,
     WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER,
     WcaRuntimeMode.AUTOMATIC_PAPER,
 )
@@ -31,6 +32,7 @@ def test_wca_runtime_mode_enum_is_strict_and_contains_no_live_mode() -> None:
         "SHADOW",
         "PAPER_RECOMMENDATION",
         "MANUAL_PAPER",
+        "LOCAL_AUTOMATIC_PAPER",
         "LIMITED_AUTOMATIC_PAPER",
         "AUTOMATIC_PAPER",
     )
@@ -43,6 +45,7 @@ def test_paper_adapter_preserves_selected_paper_mode_without_downgrading_automat
     for mode in (
         WcaRuntimeMode.PAPER_RECOMMENDATION,
         WcaRuntimeMode.MANUAL_PAPER,
+        WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER,
         WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER,
         WcaRuntimeMode.AUTOMATIC_PAPER,
     ):
@@ -66,12 +69,13 @@ def test_identical_inputs_produce_identical_authoritative_decisions_across_runti
         assert decision.runtime_mode == mode.value
         assert parity_payload(decision) == baseline
 
-    execution_permission = {mode: mode in {WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER} for mode in PARITY_MODES}
+    execution_permission = {mode: mode in {WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER, WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER, WcaRuntimeMode.AUTOMATIC_PAPER} for mode in PARITY_MODES}
     assert execution_permission == {
         WcaRuntimeMode.HISTORICAL_REPLAY: False,
         WcaRuntimeMode.SHADOW: False,
         WcaRuntimeMode.PAPER_RECOMMENDATION: False,
         WcaRuntimeMode.MANUAL_PAPER: False,
+        WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER: True,
         WcaRuntimeMode.LIMITED_AUTOMATIC_PAPER: True,
         WcaRuntimeMode.AUTOMATIC_PAPER: True,
     }

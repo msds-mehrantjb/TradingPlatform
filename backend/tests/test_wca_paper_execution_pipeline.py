@@ -49,7 +49,7 @@ def test_manual_paper_action_uses_shared_execution_pipeline_and_inline_automatic
     try:
         service.execute_automatic_paper(request)
     except ValueError as exc:
-        assert "authoritative broker equity and buying power" in str(exc)
+        assert "authoritative WCA local paper account values" in str(exc)
     else:
         raise AssertionError("inline automatic WCA paper must fail closed without authoritative runtime state")
 

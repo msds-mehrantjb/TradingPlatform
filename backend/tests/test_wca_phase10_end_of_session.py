@@ -7,8 +7,9 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from backend.app.algorithms.wca.contracts import WcaOrderStatus, WcaOrderValidationContext, WcaRuntimeMode, WcaSide
+from backend.app.algorithms.wca.local_paper_broker import WcaLocalPaperBroker
 from backend.app.algorithms.wca.market_calendar import WcaMarketCalendar
-from backend.app.algorithms.wca.paper_broker import WcaPaperBrokerAck, WcaPaperBrokerFill, WcaPaperBrokerTimeout, build_wca_paper_broker_request
+from backend.app.algorithms.wca.paper_broker import WcaPaperBrokerAck, WcaPaperBrokerFill, WcaPaperBrokerOutboxAdapter, WcaPaperBrokerTimeout, build_wca_paper_broker_request
 from backend.app.algorithms.wca.repository import WcaSqliteRepository
 from backend.app.algorithms.wca.runtime_commands import WcaRuntimeCommandType, runtime_command
 from backend.app.algorithms.wca.runtime_repository import WcaRuntimeRepository
@@ -67,7 +68,17 @@ class FakePhase10Broker:
             return WcaPaperBrokerAck(status="REJECTED", client_order_id=client_order_id, broker_order_id="broker-eos-rejected", message="rejected")
         filled = quantity if self.close_status == "filled" else max(1, quantity // 2)
         remaining = max(0, quantity - filled)
-        self.positions = [] if remaining == 0 else [self.positions[0].model_copy(update={"quantity": remaining})]
+        updated_positions = []
+        wca_reduced = False
+        for position in self.positions:
+            owns_wca_position = position.symbol.upper() == "SPY" and (position.algorithmId == "wca" or position.positionOwner == "wca")
+            if owns_wca_position and not wca_reduced:
+                wca_reduced = True
+                if remaining > 0:
+                    updated_positions.append(position.model_copy(update={"quantity": remaining}))
+                continue
+            updated_positions.append(position)
+        self.positions = updated_positions
         return WcaPaperBrokerAck(
             status="ACKNOWLEDGED",
             client_order_id=client_order_id,
@@ -114,6 +125,31 @@ def test_normal_end_of_session_cancels_entries_reconciles_flattens_and_finalizes
     assert ledger_count(repository, "END_OF_SESSION_FLATTEN") == 1
 
 
+def test_local_paper_end_of_session_closes_wca_only_cancels_protection_and_persists_final_snapshot() -> None:
+    repository = phase10_repository()
+    runtime_repository = WcaRuntimeRepository(repository)
+    broker = WcaLocalPaperBroker(repository=repository, account_id=ACCOUNT_ID, symbol="SPY", starting_balance=100_000)
+    stale_request = reserve_entry(repository, "local-stale")
+    stale_result = WcaPaperBrokerOutboxAdapter().process_next_outbox(repository, broker, owner_id="phase10-local-stale")
+    entry_request = reserve_entry(repository, "local-owned")
+    broker.simulate_fill(
+        client_order_id=stale_request.client_order_id,
+        fill_price=100.0,
+        quantity=5,
+        filled_at=NOW - timedelta(minutes=10),
+    )
+    result = process_wca_end_of_session(repository=repository, runtime_repository=runtime_repository, broker=broker, command=eos_command(NOW, mark_price=101.0), max_queue_depth=100, now=NOW)
+
+    assert stale_result.state == WcaOrderStatus.ACKNOWLEDGED
+    assert result["verified"] is True
+    assert repository.open_wca_position_quantity(account_id=ACCOUNT_ID, symbol="SPY") == 0
+    assert result["evidence"]["final_local_account_snapshot"]["status"] == "persisted"
+    assert result["evidence"]["final_local_account_snapshot"]["realized_pnl"] == 5.0
+    assert ledger_count(repository, "END_OF_SESSION_FLATTEN") == 1
+    assert local_open_order_count(repository) == 0
+    assert broker_order_statuses(repository, "wca-protection-%") == [WcaOrderStatus.CANCELLED.value, WcaOrderStatus.CANCELLED.value]
+    assert execution_outbox_status(repository, entry_request.client_order_id) == WcaOrderStatus.CANCELLED.value
+
 def test_early_close_uses_authoritative_calendar() -> None:
     repository = phase10_repository()
     runtime_repository = WcaRuntimeRepository(repository)
@@ -150,6 +186,45 @@ def test_partial_fill_near_close_is_processed_before_flatten() -> None:
     assert ledger_count(repository, "PARTIAL_FILL_RECEIVED") == 1
     assert ledger_count(repository, "END_OF_SESSION_FLATTEN") == 1
 
+
+def test_end_of_session_flatten_disabled_does_not_close_wca_position() -> None:
+    repository = phase10_repository()
+    runtime_repository = WcaRuntimeRepository(repository)
+    seed_open_position(repository, "flatten-disabled", quantity=3)
+    command = eos_command(NOW)
+    command.payload["end_of_session_flatten_enabled"] = False
+    broker = FakePhase10Broker(positions=(broker_position(quantity=3),))
+
+    result = process_wca_end_of_session(repository=repository, runtime_repository=runtime_repository, broker=broker, command=command, max_queue_depth=100, now=NOW)
+
+    assert result["verified"] is False
+    assert "wca.runtime.end_of_session.flatten_disabled" in result["reasonCodes"]
+    assert "wca.runtime.end_of_session.position_not_flat" in result["reasonCodes"]
+    assert broker.close_calls == 0
+    assert repository.open_wca_position_quantity(account_id=ACCOUNT_ID, symbol="SPY") == 3
+
+def test_end_of_session_does_not_flatten_foreign_spy_position() -> None:
+    repository = phase10_repository()
+    runtime_repository = WcaRuntimeRepository(repository)
+    seed_open_position(repository, "foreign-broker", quantity=5)
+    foreign_position = broker_position(quantity=7).model_copy(
+        update={
+            "algorithmId": "weighted_voting",
+            "capitalPartitionId": "weighted_voting.local_paper",
+            "decisionId": "foreign-decision",
+            "orderIntentId": "foreign-intent",
+            "positionOwner": "weighted_voting",
+        }
+    )
+    broker = FakePhase10Broker(positions=(broker_position(quantity=5), foreign_position))
+
+    result = process_wca_end_of_session(repository=repository, runtime_repository=runtime_repository, broker=broker, command=eos_command(NOW), max_queue_depth=100, now=NOW)
+
+    assert result["verified"] is True
+    assert repository.open_wca_position_quantity(account_id=ACCOUNT_ID, symbol="SPY") == 0
+    assert len(broker.positions) == 1
+    assert broker.positions[0].positionOwner == "weighted_voting"
+    assert broker.positions[0].quantity == 7
 
 def test_broker_rejection_fails_session_close_and_keeps_critical_health_path() -> None:
     repository = phase10_repository()
@@ -192,7 +267,7 @@ def test_worker_restart_processes_durable_end_of_session_command() -> None:
         owner_id="phase10-restart",
     )
 
-    with patch("backend.app.algorithms.wca.runtime_supervisor.WcaAlpacaPaperBroker.from_env", return_value=broker):
+    with patch("backend.app.algorithms.wca.runtime_supervisor.WcaLocalPaperBroker.from_env", return_value=broker):
         result = next(worker for worker in restarted_supervisor.workers if worker.worker_name == "end_of_session_worker").run_once()
 
     assert result["status"] == "completed"
@@ -276,13 +351,16 @@ def validation_context(decision, request) -> WcaOrderValidationContext:
     )
 
 
-def eos_command(now: datetime):
+def eos_command(now: datetime, *, mark_price: float | None = None):
+    payload = {"evaluated_at": now.isoformat()}
+    if mark_price is not None:
+        payload["mark_price"] = mark_price
     return runtime_command(
         WcaRuntimeCommandType.END_OF_SESSION,
         account_id=ACCOUNT_ID,
         symbol="SPY",
         run_id="phase10-eos",
-        payload={"evaluated_at": now.isoformat()},
+        payload=payload,
         reason_codes=("wca.runtime.end_of_session.requested",),
     )
 
@@ -328,6 +406,41 @@ def phase10_repository() -> WcaSqliteRepository:
     root.mkdir(exist_ok=True)
     return WcaSqliteRepository(f"sqlite:///{root / f'wca-phase10-{uuid4().hex}.sqlite'}")
 
+
+def local_open_order_count(repository: WcaSqliteRepository) -> int:
+    with sqlite3.connect(repository.path) as conn:
+        return int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM wca_local_orders
+                WHERE algorithm_id = 'wca' AND local_account_id = ? AND symbol = ?
+                  AND status NOT IN ('FILLED', 'REJECTED', 'CANCELLED', 'RECONCILED')
+                """,
+                (ACCOUNT_ID, "SPY"),
+            ).fetchone()[0]
+        )
+
+
+def execution_outbox_status(repository: WcaSqliteRepository, client_order_id: str) -> str:
+    with sqlite3.connect(repository.path) as conn:
+        row = conn.execute(
+            "SELECT status FROM wca_execution_outbox WHERE algorithm_id = 'wca' AND account_id = ? AND symbol = ? AND client_order_id = ?",
+            (ACCOUNT_ID, "SPY", client_order_id),
+        ).fetchone()
+    return str(row[0]) if row is not None else ""
+
+def broker_order_statuses(repository: WcaSqliteRepository, client_order_match: str) -> list[str]:
+    operator = "LIKE" if "%" in client_order_match else "="
+    with sqlite3.connect(repository.path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT status FROM wca_broker_orders
+            WHERE algorithm_id = 'wca' AND account_id = ? AND symbol = ? AND client_order_id {operator} ?
+            ORDER BY client_order_id
+            """,
+            (ACCOUNT_ID, "SPY", client_order_match),
+        ).fetchall()
+    return [str(row[0]) for row in rows]
 
 def ledger_count(repository: WcaSqliteRepository, event_type: str) -> int:
     with sqlite3.connect(repository.path) as conn:

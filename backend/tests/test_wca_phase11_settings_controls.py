@@ -52,6 +52,21 @@ def test_limited_automatic_paper_defaults_are_wca_configuration_not_worker_const
     assert "backend.app.algorithms.weighted" not in Path("backend/app/algorithms/wca/configuration.py").read_text(encoding="utf-8")
 
 
+def test_local_paper_defaults_are_wca_configuration_not_broker_account_state() -> None:
+    configuration = default_wca_configuration()
+    local_paper = configuration.local_paper
+
+    assert local_paper.enabled is True
+    assert local_paper.starting_balance == 100_000.00
+    assert local_paper.reset_policy == "manual_only"
+    assert local_paper.commission_per_share == 0.0
+    assert local_paper.minimum_commission == 0.0
+    assert local_paper.slippage_model == "none"
+    assert local_paper.buying_power_multiplier == 1.0
+    assert local_paper.allow_short is False
+    assert local_paper.persist_between_sessions is True
+    assert "local_paper" in configuration.model_dump(mode="json")
+
 def test_baseline_preservation_and_limited_overlay_bounds() -> None:
     configuration = default_wca_configuration()
     baseline = configuration.to_baseline_settings()

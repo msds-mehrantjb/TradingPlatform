@@ -9,13 +9,23 @@ from uuid import uuid4
 
 from backend.app.algorithms.wca.contracts import WcaCandle, WcaPaperExecutionRequest
 from backend.app.algorithms.wca.contracts import WcaRuntimeMode
+from backend.app.algorithms.wca.local_paper_account import (
+    WCA_ALPACA_PAPER_ACCOUNT_ID,
+    WCA_ALPACA_PAPER_API_KEY_ID,
+    WCA_ALPACA_PAPER_API_SECRET_KEY,
+    WCA_ALPACA_PAPER_BASE_URL,
+    WCA_AUTOMATIC_PAPER_ENABLED,
+    WCA_LOCAL_PAPER_ACCOUNT_ID,
+    WCA_LOCAL_PAPER_SOURCE_AUTHORITY,
+)
 from backend.app.algorithms.wca.repository import WcaSqliteRepository
+from backend.app.algorithms.wca.rollout import WCA_PAPER_EXECUTION_ENABLED
 from backend.app.algorithms.wca.runtime_control import WcaRuntimeControl
 from backend.app.algorithms.wca.runtime_commands import WcaRuntimeCommandType, runtime_command
 from backend.app.algorithms.wca.runtime_repository import WcaRuntimeRepository
 from backend.app.algorithms.wca.runtime_supervisor import WCA_RUNTIME_COMMAND_CONSUMERS, WCA_RUNTIME_COMMAND_RETRY_POLICY, WCA_RUNTIME_WORKERS, WcaRuntimeSettings, WcaRuntimeSupervisor
 from backend.app.algorithms.wca.service import WcaService
-from backend.tests.test_wca_step7_background_runtime import seeded_repository as seeded_runtime_repository
+from backend.tests.test_wca_step7_background_runtime import finalized_event, market_snapshot, seeded_repository as seeded_runtime_repository
 from backend.tests.test_wca_step6_inventory_persistence import decision_with_order
 
 
@@ -182,6 +192,79 @@ def test_wca_runtime_control_on_records_request_but_keeps_effective_off_when_gat
     assert control.effective_automatic_entries_enabled is False
     assert "wca.runtime_control.paper_account_unverified" in control.reason_codes
     assert "wca.runtime_control.rollout_automatic_paper_blocked" in control.reason_codes
+
+
+def test_wca_local_auto_paper_control_verifies_without_alpaca_paper_env(monkeypatch) -> None:
+    _clear_wca_paper_env(monkeypatch)
+    monkeypatch.setenv(WCA_PAPER_EXECUTION_ENABLED, "true")
+    repository = WcaSqliteRepository(f"sqlite:///{temp_db_path()}")
+    runtime_repository = WcaRuntimeRepository(repository)
+    supervisor = WcaRuntimeSupervisor(
+        repository=repository,
+        runtime_repository=runtime_repository,
+        settings=WcaRuntimeSettings(runtime_mode=WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER, poll_seconds=0.01),
+        owner_id="wca-local-runtime-control-test",
+    )
+    command = runtime_command(
+        WcaRuntimeCommandType.SET_AUTOMATIC_PAPER,
+        payload={"enabled": True, "actor": "test", "reason": "wca.test.local_paper_on"},
+        priority=1,
+    )
+
+    runtime_repository.enqueue_command(command)
+    result = supervisor.run_once()
+    control = repository.read_runtime_control()
+
+    assert result["workers"]["runtime_control_worker"]["status"] == "completed"
+    assert control.paper_trading_requested is True
+    assert control.automatic_entries_requested is True
+    assert control.paper_account_verified is True
+    assert "wca.local_paper_account.local_runtime_verified" in control.reason_codes
+    assert "wca.runtime_control.paper_account_unverified" not in control.reason_codes
+
+
+def test_wca_local_auto_paper_finalized_bar_refreshes_wca_only_state_without_alpaca_paper_env(monkeypatch) -> None:
+    _clear_wca_paper_env(monkeypatch)
+    repository = seeded_runtime_repository()
+    runtime_repository = WcaRuntimeRepository(repository)
+    supervisor = WcaRuntimeSupervisor(
+        repository=repository,
+        runtime_repository=runtime_repository,
+        settings=WcaRuntimeSettings(
+            runtime_mode=WcaRuntimeMode.LOCAL_AUTOMATIC_PAPER,
+            max_state_age_seconds=999_999_999,
+            max_authoritative_account_state_age_seconds=999_999_999,
+            poll_seconds=0.01,
+        ),
+        owner_id="wca-local-finalized-bar-test",
+    )
+    event = finalized_event("wca-local-paper-finalized-bar", snapshot=market_snapshot())
+    command = runtime_command(
+        WcaRuntimeCommandType.FINALIZED_BAR_DECISION,
+        payload={"event": event.model_dump(mode="json")},
+        event_id=event.event_id,
+        decision_id="wca-local-paper-decision",
+        run_id="wca-local-paper-run",
+        account_id="paper",
+        symbol="SPY",
+    )
+
+    runtime_repository.enqueue_command(command)
+    decision_worker = next(worker for worker in supervisor.workers if worker.worker_name == "decision_worker")
+    result = decision_worker.run_once()
+    broker_snapshot = repository.read_latest_broker_account_snapshot(algorithm_id="wca", broker_account_id="paper")
+    inventory_snapshot = repository.read_wca_local_inventory_snapshot(local_account_id="paper", symbol="SPY")
+
+    assert result["status"] in {"completed", "blocked"}
+    assert result["localPaperRefresh"]["enabled"] is True
+    assert result["localPaperRefresh"]["sourceAuthority"] == WCA_LOCAL_PAPER_SOURCE_AUTHORITY
+    assert broker_snapshot is not None
+    assert broker_snapshot.sourceAuthority == WCA_LOCAL_PAPER_SOURCE_AUTHORITY
+    assert broker_snapshot.accountId == "paper"
+    assert inventory_snapshot is not None
+    assert inventory_snapshot["algorithm_id"] == "wca"
+    assert inventory_snapshot["local_account_id"] == "paper"
+    assert inventory_snapshot["symbol"] == "SPY"
 
 
 def test_wca_execution_outbox_blocks_stale_runtime_control_before_submission() -> None:
@@ -426,6 +509,7 @@ def test_every_wca_service_api_runtime_command_reaches_terminal_worker_state() -
         service.enqueue_pause_new_entries(reason="api-test-pause"),
         service.enqueue_resume_new_entries(reason="api-test-resume"),
         service.enqueue_automatic_paper_control(enabled=False, actor="test", reason="api-test-paper-off"),
+        service.enqueue_reset_local_paper_account(account_id="paper", symbol="SPY", reason="api-test-reset", actor="test"),
         service.enqueue_configuration_activation(active.configuration_version),
         service.enqueue_configuration_rollback(active.configuration_version),
         service.enqueue_reconciliation_request(account_id="paper", symbol="SPY"),
@@ -436,6 +520,7 @@ def test_every_wca_service_api_runtime_command_reaches_terminal_worker_state() -
         WcaRuntimeCommandType.PAUSE_NEW_ENTRIES.value,
         WcaRuntimeCommandType.RESUME_NEW_ENTRIES.value,
         WcaRuntimeCommandType.SET_AUTOMATIC_PAPER.value,
+        WcaRuntimeCommandType.RESET_LOCAL_PAPER_ACCOUNT.value,
         WcaRuntimeCommandType.CONFIGURATION_ACTIVATION.value,
         WcaRuntimeCommandType.CONFIGURATION_ROLLBACK.value,
         WcaRuntimeCommandType.BROKER_RECONCILIATION.value,
@@ -467,6 +552,19 @@ def test_wca_global_paper_control_route_and_frontend_fanout_are_present() -> Non
     assert "enqueue_automatic_paper_control" in api_source
     assert "syncWcaAutomaticPaperControl" in frontend_source
     assert "setWcaAutomaticPaperTrading" in frontend_api_source
+
+
+def _clear_wca_paper_env(monkeypatch) -> None:
+    for key in (
+        WCA_ALPACA_PAPER_ACCOUNT_ID,
+        WCA_ALPACA_PAPER_API_KEY_ID,
+        WCA_ALPACA_PAPER_API_SECRET_KEY,
+        WCA_ALPACA_PAPER_BASE_URL,
+        WCA_AUTOMATIC_PAPER_ENABLED,
+        WCA_LOCAL_PAPER_ACCOUNT_ID,
+        WCA_PAPER_EXECUTION_ENABLED,
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 def temp_db_path() -> Path:

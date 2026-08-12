@@ -430,6 +430,7 @@ def place_or_replace_wca_protective_orders(
                 "protection_group_id": _protective_group_id(record),
                 "entry_client_order_id": record.client_order_id,
                 "sibling_client_order_ids": sorted(desired_client_ids),
+                "ownership": _protective_ownership_payload(record),
             },
         )
         if ack.status == "REJECTED":
@@ -451,6 +452,7 @@ def place_or_replace_wca_protective_orders(
                 "entry_client_order_id": record.client_order_id,
                 "sibling_client_order_ids": sorted(desired_client_ids),
                 "cancelled_stale_siblings": cancelled,
+                "ownership": _protective_ownership_payload(record),
             },
         )
         accepted.append({"kind": protection_kind, "client_order_id": request.client_order_id, "broker_order_id": broker_order_id})
@@ -515,6 +517,23 @@ def _protective_order_requests(record: WcaExecutionOutboxRecord, quantity: int) 
         configuration_hash=entry.configuration_hash,
     )
     return (("stop", stop_request), ("target", target_request))
+
+
+def _protective_ownership_payload(record: WcaExecutionOutboxRecord) -> dict[str, str]:
+    entry = record.proposed_order
+    return {
+        "algorithm_id": WCA_ALGORITHM_ID,
+        "protected_algorithm_id": WCA_ALGORITHM_ID,
+        "position_owner": WCA_ALGORITHM_ID,
+        "exit_owner": WCA_ALGORITHM_ID,
+        "account_id": record.account_id,
+        "local_account_id": record.account_id,
+        "symbol": record.symbol,
+        "position_id": f"wca-position-{record.account_id}-{record.symbol}-{entry.order_intent_id}",
+        "local_position_id": f"wca-local-position-{record.account_id}-{record.symbol}",
+        "entry_order_intent_id": entry.order_intent_id,
+        "entry_decision_id": entry.decision_id,
+    }
 
 
 def _protective_decision(record: WcaExecutionOutboxRecord, request: WcaPaperBrokerOrderRequest, *, protection_kind: str):

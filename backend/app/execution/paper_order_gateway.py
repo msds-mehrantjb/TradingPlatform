@@ -539,6 +539,8 @@ class PaperOrderGateway:
         fill: PaperGatewayFill | None = None,
         protective: PaperGatewayProtectiveOrder | None = None,
     ) -> PaperOrderGatewayResult:
+        normalized_fill = _fill_with_intent_ownership(fill, proposal)
+        normalized_protective = _protective_with_intent_ownership(protective, proposal, normalized_fill)
         return PaperOrderGatewayResult(
             executionMode=self.execution_mode,
             algorithmId=proposal.algorithmId,
@@ -549,8 +551,8 @@ class PaperOrderGateway:
             duplicate=duplicate,
             status=status,
             brokerAck=ack,
-            fill=fill,
-            protectiveOrder=protective,
+            fill=normalized_fill,
+            protectiveOrder=normalized_protective,
             cancelReplacePolicy="cancel_stale_unfilled_orders_replace_requires_new_intent",
             reasonCodes=reason_codes,
             explanation=explanation,
@@ -746,6 +748,40 @@ def _denied_risk_decision(
         evaluatedAt=evaluated_at,
     )
 
+
+def _fill_with_intent_ownership(fill: PaperGatewayFill | None, proposal: GlobalOrderProposal) -> PaperGatewayFill | None:
+    if fill is None:
+        return None
+    account_id = fill.accountId or _account_id_from_proposal(proposal)
+    capital_partition_id = fill.capitalPartitionId or proposal.capitalPartitionId
+    if fill.accountId == account_id and fill.capitalPartitionId == capital_partition_id:
+        return fill
+    return fill.model_copy(update={"accountId": account_id, "capitalPartitionId": capital_partition_id})
+
+
+def _protective_with_intent_ownership(
+    protective: PaperGatewayProtectiveOrder | None,
+    proposal: GlobalOrderProposal,
+    fill: PaperGatewayFill | None,
+) -> PaperGatewayProtectiveOrder | None:
+    if protective is None:
+        return None
+    account_id = protective.accountId or (fill.accountId if fill is not None else None) or _account_id_from_proposal(proposal)
+    capital_partition_id = protective.capitalPartitionId or proposal.capitalPartitionId
+    if protective.accountId == account_id and protective.capitalPartitionId == capital_partition_id:
+        return protective
+    return protective.model_copy(update={"accountId": account_id, "capitalPartitionId": capital_partition_id})
+
+
+def _account_id_from_proposal(proposal: GlobalOrderProposal) -> str:
+    snapshot = proposal.settingsSnapshot if isinstance(proposal.settingsSnapshot, dict) else {}
+    account_id = snapshot.get("accountId") or snapshot.get("account_id")
+    if account_id:
+        return str(account_id)
+    parts = str(proposal.capitalPartitionId or "").split(".")
+    if len(parts) >= 3 and parts[1]:
+        return parts[1]
+    return "paper-account"
 
 def _client_order_id_for_proposal(proposal: GlobalOrderProposal) -> str:
     configured = proposal.settingsSnapshot.get("clientOrderId") if isinstance(proposal.settingsSnapshot, dict) else None

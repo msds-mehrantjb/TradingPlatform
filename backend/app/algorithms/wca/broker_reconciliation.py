@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import uuid4
 
+from backend.app.algorithms.wca.local_paper_account import WCA_LOCAL_PAPER_SOURCE_AUTHORITY
 from backend.app.algorithms.wca.contracts import (
     WCA_ALGORITHM_ID,
     WCA_BROKER_RECONCILIATION_SCHEMA_VERSION,
@@ -90,8 +91,8 @@ def reconcile_wca_broker(
     known_clients.update(str(getattr(row, "client_order_id", "") or "") for row in outbox_rows)
     discrepancies = []
 
-    if snapshot.sourceAuthority != "broker":
-        discrepancies.append(_account_discrepancy("broker_account_not_active", account, broker_status=snapshot.sourceAuthority, reason="wca.broker_reconciliation.broker_source_not_authoritative", explanation="Broker account snapshot was not sourced from the broker."))
+    if snapshot.sourceAuthority not in {"broker", WCA_LOCAL_PAPER_SOURCE_AUTHORITY}:
+        discrepancies.append(_account_discrepancy("paper_account_not_active", account, broker_status=snapshot.sourceAuthority, reason="wca.broker_reconciliation.account_source_not_authoritative", explanation="WCA paper account snapshot was not sourced from an authoritative WCA account source."))
     if snapshot.equity <= 0 or snapshot.buyingPower <= 0:
         discrepancies.append(_account_discrepancy("broker_account_not_active", account, broker_status="equity_or_buying_power_unavailable", reason="wca.broker_reconciliation.account_not_tradeable", explanation="Broker account equity or buying power is unavailable for WCA reconciliation."))
 
@@ -200,7 +201,7 @@ def reconcile_wca_broker(
     for order in broker_orders:
         if not _is_protective_order(order) and order.clientOrderId and str(order.clientOrderId).startswith("wca-") and order.clientOrderId not in known_clients:
             discrepancies.append(_broker_order_discrepancy("broker_order_missing_locally", account, order, reason="wca.broker_reconciliation.broker_order_missing_locally"))
-        if _is_protective_order(order) and order.orderIntentId not in known_intents:
+        if _is_protective_order(order) and _parent_order_intent_id(order.orderIntentId) not in known_intents:
             discrepancies.append(_broker_order_discrepancy("orphan_protective_order", account, order, reason="wca.broker_reconciliation.orphan_protective_order"))
 
     for position in broker_positions:
@@ -263,7 +264,7 @@ def _result(account: str, evaluated: datetime, snapshot: BrokerAccountSnapshot, 
         discrepancies=tuple(discrepancies),
         hard_operational_warning=any(row.severity == "hard" for row in discrepancies),
         reason_codes=reason_codes,
-        explanation="WCA paper broker account, orders, fills, positions, inventory, protection, and local state were reconciled without assigning sibling algorithm inventory to WCA.",
+        explanation="WCA local paper account, orders, fills, positions, inventory, protection, and local state were reconciled without assigning sibling algorithm inventory to WCA.",
     )
 
 
@@ -521,6 +522,11 @@ def _is_protective_order(order: BrokerOrderState) -> bool:
         or client_order_id.startswith("wca-protection-")
     )
 
+
+def _parent_order_intent_id(order_intent_id: str | None) -> str | None:
+    if not order_intent_id:
+        return order_intent_id
+    return str(order_intent_id).split(":protection:", 1)[0]
 
 def _refresh_broker_order(broker: WcaPaperBrokerReconciliationClient, client_id: str) -> object | None:
     if hasattr(broker, "poll_order_updates"):

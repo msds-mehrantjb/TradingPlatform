@@ -11,12 +11,8 @@ import pytest
 from backend.app.algorithms.wca.broker_reconciliation import reconcile_wca_broker
 from backend.app.algorithms.wca.contracts import WcaOrderStatus, WcaOrderValidationContext, WcaRuntimeMode, WcaSide
 from backend.app.algorithms.wca.paper_account import (
-    WCA_ALPACA_PAPER_ACCOUNT_ID,
-    WCA_ALPACA_PAPER_API_KEY_ID,
-    WCA_ALPACA_PAPER_API_SECRET_KEY,
-    WCA_ALPACA_PAPER_BASE_URL,
     WCA_AUTOMATIC_PAPER_ENABLED,
-    WCA_REQUIRED_ALPACA_PAPER_BASE_URL,
+    WCA_LOCAL_PAPER_ACCOUNT_ID,
 )
 from backend.app.algorithms.wca.paper_broker import build_wca_paper_broker_request
 from backend.app.algorithms.wca.repository import WcaSqliteRepository
@@ -100,7 +96,7 @@ def test_phase8_discrepancy_scenarios_block_entries_and_open_circuit_breaker(nam
     assert repository.wca_position_circuit_breaker_open(account_id=ACCOUNT_ID, symbol="SPY") is True
 
 
-def test_startup_reconciliation_uses_real_alpaca_adapter_and_clears_startup_entry_gate() -> None:
+def test_startup_reconciliation_uses_local_paper_account_and_clears_startup_entry_gate() -> None:
     repository = phase8_repository()
     runtime_repository = WcaRuntimeRepository(repository)
     broker = FakePhase8Broker()
@@ -112,7 +108,7 @@ def test_startup_reconciliation_uses_real_alpaca_adapter_and_clears_startup_entr
     )
 
     assert repository.reconciliation_blocks_new_entries(account_id=ACCOUNT_ID, symbol="SPY") is True
-    with patch.dict("os.environ", valid_env(), clear=True), patch("backend.app.algorithms.wca.runtime_supervisor.WcaAlpacaPaperBroker.from_env", return_value=broker):
+    with patch.dict("os.environ", valid_env(), clear=True), patch("backend.app.algorithms.wca.runtime_supervisor.WcaLocalPaperBroker.from_env", return_value=broker):
         result = next(worker for worker in supervisor.workers if worker.worker_name == "broker_reconciliation_worker").run_once()
 
     assert result["status"] == "completed"
@@ -263,9 +259,6 @@ def table_count(repository: WcaSqliteRepository, table: str) -> int:
 
 def valid_env() -> dict[str, str]:
     return {
-        WCA_ALPACA_PAPER_API_KEY_ID: "wca-key",
-        WCA_ALPACA_PAPER_API_SECRET_KEY: "wca-secret",
-        WCA_ALPACA_PAPER_BASE_URL: WCA_REQUIRED_ALPACA_PAPER_BASE_URL,
-        WCA_ALPACA_PAPER_ACCOUNT_ID: ACCOUNT_ID,
         WCA_AUTOMATIC_PAPER_ENABLED: "true",
+        WCA_LOCAL_PAPER_ACCOUNT_ID: ACCOUNT_ID,
     }

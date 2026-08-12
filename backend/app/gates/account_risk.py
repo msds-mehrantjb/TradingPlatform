@@ -104,7 +104,7 @@ class BrokerAccountSnapshot(DomainModel):
     exitCostPerShare: float = Field(default=0.02, ge=0.0)
     observedAt: datetime
     sessionDate: date
-    sourceAuthority: Literal["broker", "alpaca_paper_broker", "local_ui_history", "unknown"] = "broker"
+    sourceAuthority: Literal["broker", "alpaca_paper_broker", "wca_local_paper_account", "local_ui_history", "unknown"] = "broker"
     positionsReconciled: bool = True
     openOrdersReconciled: bool = True
 
@@ -183,7 +183,7 @@ def aggregate_global_account_risk(
         "capitalPartitionExposure": _capital_partition_exposure(snapshot),
         "authority": snapshot.sourceAuthority,
     }
-    broker_authoritative = snapshot.sourceAuthority in {"broker", "alpaca_paper_broker"}
+    broker_authoritative = snapshot.sourceAuthority in {"broker", "alpaca_paper_broker", "wca_local_paper_account"}
     broker_state = {
         "brokerConnected": broker_authoritative,
         "paperAccountActive": broker_authoritative,
@@ -211,7 +211,7 @@ def aggregate_global_account_risk(
         observedAt=snapshot.observedAt,
         sessionDate=snapshot.sessionDate,
     )
-    reason_codes = ["risk.authority.broker" if broker_authoritative else f"risk.authority.{snapshot.sourceAuthority}"]
+    reason_codes = ["risk.authority.wca_local_paper_account" if snapshot.sourceAuthority == "wca_local_paper_account" else "risk.authority.broker" if broker_authoritative else f"risk.authority.{snapshot.sourceAuthority}"]
     if duplicate_spy_exposure:
         reason_codes.append("risk.duplicate_spy_exposure_detected")
     if conflicting_spy_exposure:
@@ -222,7 +222,7 @@ def aggregate_global_account_risk(
         brokerState=broker_state,
         riskState=risk_state,
         reasonCodes=reason_codes,
-        explanation="Global account risk was aggregated from broker-authoritative positions, pending orders, and partial fills.",
+        explanation="Global account risk was aggregated from WCA local paper account positions, pending orders, and partial fills." if snapshot.sourceAuthority == "wca_local_paper_account" else "Global account risk was aggregated from broker-authoritative positions, pending orders, and partial fills.",
         observedAt=snapshot.observedAt,
         sessionDate=snapshot.sessionDate,
         configurationHash=_configuration_hash(snapshot, side, configurationSalt),

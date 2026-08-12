@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import sqlite3
 import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 
 from pydantic import ValidationError
 
+from backend.app.algorithms.wca.global_risk import SharedGlobalRiskReservationEngine, WcaGlobalRiskAdapter, build_wca_global_risk_proposal
+from backend.app.algorithms.wca.local_paper_broker import WcaLocalPaperBroker
+from backend.app.algorithms.wca.paper_broker import WcaPaperBrokerOutboxAdapter
+from backend.app.algorithms.wca.repository import WcaSqliteRepository
+from backend.tests.test_wca_step10_paper_broker_outbox import fill_local_entry, reserve
 from backend.app.algorithms.wca.contracts import (
     WCA_ALGORITHM_ID,
     WCA_GLOBAL_RISK_ALLOWED_CONSTRAINTS,
     WCA_GLOBAL_RISK_FORBIDDEN_REWRITE_TARGETS,
     WCA_SHARED_PLATFORM_COMPONENT_IDS,
     WCA_SHARED_PLATFORM_COMPONENT_INVENTORY,
+    WcaOrderStatus,
+    WcaSide,
 )
 from backend.app.risk import (
     GLOBAL_GATE_ENGINE_VERSION,
@@ -52,8 +62,18 @@ class WcaStep12GlobalGateEngineTests(unittest.TestCase):
         )
         rules = {component.shared_component: component.sharing_rule for component in WCA_SHARED_PLATFORM_COMPONENT_INVENTORY}
         self.assertEqual(rules["Raw and normalized market-data services"], "Read-only input.")
-        self.assertEqual(rules["Broker API client"], "Executes approved proposals only.")
-        self.assertEqual(rules["Global account-risk engine"], "May reduce or reject WCA risk.")
+        self.assertEqual(
+            rules["Account-equity and buying-power snapshot"],
+            "Read-only legacy/global observation; local automatic paper uses WCA local account.",
+        )
+        self.assertEqual(rules["Broker API client"], "Legacy broker modes only; local automatic paper uses WcaLocalPaperBroker.")
+        self.assertEqual(
+            rules["Global account-risk engine"],
+            "May reduce or reject WCA proposals only; must not own WCA local account or inventory.",
+        )
+        self.assertEqual(rules["Global portfolio-risk ledger"], "Read-only aggregate observation; must preserve algorithm attribution.")
+        self.assertEqual(rules["Global emergency controls"], "May block new entries or emit explicit WCA risk-reduction commands.")
+        self.assertEqual(rules["Broker reconciliation infrastructure"], "Legacy broker modes only; must preserve WCA ownership.")
         self.assertEqual(rules["Idempotency service"], "Must include WCA algorithm and intent identifiers.")
         self.assertEqual(rules["Logging, metrics, and tracing"], "Must tag records with algorithm_id=wca.")
         self.assertEqual(rules["API framework and authentication"], "Transport only.")
@@ -69,6 +89,19 @@ class WcaStep12GlobalGateEngineTests(unittest.TestCase):
                 "wca_dynamic_profiles",
                 "wca_stop_logic",
                 "wca_backtest_results",
+                "wca_local_cash",
+                "wca_local_equity",
+                "wca_local_buying_power",
+                "wca_local_positions",
+                "wca_local_lots",
+                "wca_local_orders",
+                "wca_local_fills",
+                "wca_inventory_projection",
+                "wca_inventory_ledger",
+                "wca_daily_state",
+                "wca_reserved_risk",
+                "wca_trade_history",
+                "other_algorithm_inventory",
             },
         )
         self.assertEqual(WCA_GLOBAL_RISK_ALLOWED_CONSTRAINTS, {"reduce_wca_risk", "reject_wca_entry", "block_new_entries"})
@@ -289,6 +322,100 @@ class WcaStep12GlobalGateEngineTests(unittest.TestCase):
         self.assertEqual(result.account_ledger.open_stop_risk, 150)
         self.assertEqual(result.account_ledger.pending_order_risk, 20)
         self.assertEqual(result.account_ledger.reserved_buying_power, 200)
+
+
+    def test_shared_wca_global_risk_engine_does_not_mutate_local_account_or_inventory(self) -> None:
+        repository = repository_for_step12()
+        before = wca_local_execution_counts(repository)
+        proposal = build_wca_global_risk_proposal(
+            account_id="wca-local-step12",
+            symbol="SPY",
+            side=WcaSide.BUY,
+            requested_quantity=10,
+            requested_risk=20.0,
+            stop_distance=2.0,
+            expected_holding_period_seconds=900,
+            current_wca_attributed_exposure=1_000.0,
+            total_account_exposure_snapshot={
+                "global_gate_quantity_cap": 3,
+                "maximum_open_risk_dollars": 6.0,
+                "current_open_risk_dollars": 0.0,
+                "reserved_open_risk_dollars": 0.0,
+            },
+            configuration_version="config-v1",
+            configuration_hash="hash-v1",
+            decision_id="decision-step12-global",
+            idempotency_key="idem-step12-global",
+        )
+
+        decision = WcaGlobalRiskAdapter(SharedGlobalRiskReservationEngine()).evaluate_wca_proposal(proposal)
+        after = wca_local_execution_counts(repository)
+
+        self.assertEqual(decision.algorithm_id, WCA_ALGORITHM_ID)
+        self.assertEqual(decision.requested_quantity, 10)
+        self.assertEqual(decision.approved_quantity, 3)
+        self.assertEqual(decision.approved_risk, 6.0)
+        self.assertEqual(before, after)
+        proposal_fields = set(proposal.__class__.model_fields)
+        decision_fields = set(decision.__class__.model_fields)
+        self.assertTrue({"current_wca_attributed_exposure", "total_account_exposure_snapshot"}.issubset(proposal_fields))
+        self.assertFalse({"cash", "buying_power", "equity", "positions", "lots", "open_orders"} & proposal_fields)
+        self.assertFalse({"cash", "buying_power", "equity", "positions", "lots", "open_orders"} & decision_fields)
+
+    def test_wca_local_fill_after_global_gate_keeps_execution_state_attributed_to_wca(self) -> None:
+        repository = repository_for_step12()
+        _, request = reserve(repository, suffix="step12-global-isolation")
+        broker = WcaLocalPaperBroker(repository=repository, account_id=request.account_id, symbol=request.symbol)
+
+        result = WcaPaperBrokerOutboxAdapter().process_next_outbox(repository, broker, owner_id="step12")
+        fills = fill_local_entry(repository, broker, request)
+        algorithm_ids = wca_algorithm_ids_by_table(
+            repository,
+            (
+                "wca_local_paper_account",
+                "wca_inventory_projection",
+                "wca_owned_lots",
+                "wca_local_positions",
+                "wca_local_lots",
+                "wca_local_orders",
+                "wca_local_fills",
+                "wca_inventory_ledger",
+            ),
+        )
+
+        self.assertEqual(result.state, WcaOrderStatus.ACKNOWLEDGED)
+        self.assertEqual(len(fills), 1)
+        for table, ids in algorithm_ids.items():
+            self.assertEqual(ids, (WCA_ALGORITHM_ID,), table)
+
+def repository_for_step12() -> WcaSqliteRepository:
+    root = Path.cwd() / "data" / "test_tmp"
+    root.mkdir(exist_ok=True)
+    return WcaSqliteRepository(f"sqlite:///{root / f'wca-step12-{uuid4().hex}.sqlite'}")
+
+
+def wca_local_execution_counts(repository: WcaSqliteRepository) -> dict[str, int]:
+    tables = (
+        "wca_local_paper_account",
+        "wca_inventory_projection",
+        "wca_owned_lots",
+        "wca_local_positions",
+        "wca_local_lots",
+        "wca_local_orders",
+        "wca_local_fills",
+        "wca_inventory_ledger",
+        "wca_daily_state",
+    )
+    with sqlite3.connect(repository.path) as conn:
+        return {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables}
+
+
+def wca_algorithm_ids_by_table(repository: WcaSqliteRepository, tables: tuple[str, ...]) -> dict[str, tuple[str, ...]]:
+    with sqlite3.connect(repository.path) as conn:
+        return {
+            table: tuple(row[0] for row in conn.execute(f"SELECT DISTINCT algorithm_id FROM {table} ORDER BY algorithm_id").fetchall())
+            for table in tables
+        }
 
 
 def global_gate_input(
