@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 from backend.app.domain.models import Signal
 from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill
 from backend.app.gates import GlobalGateResponse, GlobalOrderProposal
@@ -218,7 +219,10 @@ class MetaStrategyLocalPaperBroker:
         return PaperGatewayFill(
             clientOrderId=client_order_id,
             algorithmId="meta_strategy",
+            capitalPartitionId=str(payload.get("capitalPartitionId") or payload.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),
             orderIntentId=str(payload.get("orderIntentId") or payload.get("order_intent_id") or client_order_id),
+            brokerOrderId=str(payload.get("brokerOrderId") or payload.get("broker_order_id") or ""),
+            brokerFillId=str(payload.get("brokerFillId") or payload.get("broker_fill_id") or payload.get("fillId") or payload.get("fill_id") or ""),
             symbol=str(payload.get("symbol") or "UNKNOWN").upper(),
             side=Signal.SELL if str(payload.get("side") or "").lower() == "sell" else Signal.BUY,
             filledQuantity=filled,
@@ -300,8 +304,10 @@ def _event_from_order(order: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "brokerEventId": str(order.get("brokerEventId") or order.get("broker_event_id") or order.get("brokerOrderId") or client_order_id),
         "algorithmId": "meta_strategy",
+        "capitalPartitionId": str(order.get("capitalPartitionId") or order.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),
         "clientOrderId": client_order_id,
         "brokerOrderId": str(order.get("brokerOrderId") or order.get("broker_order_id") or ""),
+        "brokerFillId": str(order.get("brokerFillId") or order.get("broker_fill_id") or order.get("fillId") or order.get("fill_id") or ""),
         "orderIntentId": str(order.get("orderIntentId") or order.get("order_intent_id") or client_order_id),
         "status": _broker_status(str(order.get("status") or "OPEN")),
         "symbol": str(order.get("symbol") or "UNKNOWN").upper(),

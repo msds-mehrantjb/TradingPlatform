@@ -8,14 +8,16 @@ import httpx
 
 from backend.app.algorithms.meta_strategy.local_paper_broker import MetaStrategyLocalPaperBroker
 from backend.app.algorithms.meta_strategy.local_ledger_paper_broker import MetaStrategyLocalLedgerPaperBroker
+from backend.app.algorithms.meta_strategy.jobs import MetaStrategyJobRepository
 from backend.app.algorithms.meta_strategy.repository import MetaStrategyRepositoryPersistenceAdapter, MetaStrategySqliteRepository
 from backend.app.algorithms.meta_strategy.runtime import (
     MetaStrategyRuntimeDependencies,
     MetaStrategyRuntimeMode,
     validate_meta_strategy_runtime_startup,
 )
+from backend.app.algorithms.meta_strategy.runtime_supervisor import _paper_broker_from_env
 from backend.app.algorithms.meta_strategy.settings import MetaStrategySettingsStore, build_meta_strategy_settings
-from backend.app.algorithms.meta_strategy.worker_main import _require_paper_gateway
+from backend.app.algorithms.meta_strategy.worker_main import _paper_gateway, _require_paper_gateway
 from backend.app.domain.models import Signal
 from backend.app.execution import PaperOrderGateway, PaperOrderIntentRecord
 from backend.app.gates import GlobalOrderProposal
@@ -170,6 +172,16 @@ def test_runtime_and_worker_accept_configured_local_paper_gateway() -> None:
     assert _require_paper_gateway(gateway) is gateway
 
 
+def test_missing_paper_broker_env_defaults_to_local_ledger_transport(monkeypatch) -> None:
+    monkeypatch.delenv("META_STRATEGY_PAPER_BROKER", raising=False)
+    store = FakeGatewayStore()
+
+    broker = _paper_broker_from_env(None, store)
+
+    assert isinstance(broker, MetaStrategyLocalLedgerPaperBroker)
+    assert broker.verify_paper_account() is True
+    assert store.snapshots["meta_strategy.local_ledger.paper_account"]["paperOnly"] is True
+
 def test_local_ledger_paper_broker_verifies_writable_paper_ledger_and_never_live() -> None:
     store = FakeGatewayStore()
     broker = MetaStrategyLocalLedgerPaperBroker(store)
@@ -180,7 +192,7 @@ def test_local_ledger_paper_broker_verifies_writable_paper_ledger_and_never_live
     assert account["liveTradingEnabled"] is False
 
 
-def test_local_ledger_paper_broker_records_ack_fill_event_and_position_for_management() -> None:
+def test_local_ledger_paper_broker_records_ack_fill_event_and_position_for_reconciliation_only() -> None:
     store = FakeGatewayStore()
     broker = MetaStrategyLocalLedgerPaperBroker(store, immediate_fills=True)
 
@@ -193,24 +205,44 @@ def test_local_ledger_paper_broker_records_ack_fill_event_and_position_for_manag
     assert ack.brokerOrderId is not None
     assert fill is not None
     assert fill.algorithmId == "meta_strategy"
+    assert fill.executionMode == "LOCAL_PAPER"
+    assert fill.capitalPartitionId == "meta_strategy.paper.default"
     assert fill.orderIntentId == "intent-1"
+    assert fill.brokerOrderId == ack.brokerOrderId
+    assert fill.brokerFillId is not None
     assert fill.filledQuantity == 3
-    assert any(event["status"] == "FILLED" for event in events)
-    assert positions == [
-        {
-            "algorithmId": "meta_strategy",
-            "capitalPartitionId": "meta_strategy.paper.default",
-            "clientOrderId": "client-1",
-            "brokerOrderId": ack.brokerOrderId,
-            "symbol": "SPY",
-            "quantity": 3,
-            "side": "BUY",
-            "averagePrice": 500.0,
-            "paperOnly": True,
-            "updatedAt": positions[0]["updatedAt"],
-        }
-    ]
+    assert any(event["status"] == "FILLED" and event.get("brokerFillId") == fill.brokerFillId for event in events)
+    assert len(positions) == 1
+    position = positions[0]
+    assert position["algorithmId"] == "meta_strategy"
+    assert position["capitalPartitionId"] == "meta_strategy.paper.default"
+    assert position["clientOrderId"] == "client-1"
+    assert position["brokerOrderId"] == ack.brokerOrderId
+    assert position["symbol"] == "SPY"
+    assert position["quantity"] == 3
+    assert position["side"] == "BUY"
+    assert position["averagePrice"] == 500.0
+    assert position["paperOnly"] is True
+    assert position["recordType"] == "broker_simulated_position"
+    assert position["brokerSimulationOnly"] is True
+    assert position["reconciliationOnly"] is True
+    assert position["portfolioAuthority"] is False
+    assert position["inventoryAuthority"] is False
+    assert position["accountAuthority"] == "meta_strategy_inventory.current_inventory_snapshot"
+    assert position["cashAuthority"] is False
+    assert position["pnlAuthority"] is False
+    assert position["riskAuthority"] is False
+    assert "meta_strategy.local_ledger.position_reconciliation_only" in position["reasonCodes"]
 
+
+def test_worker_factory_uses_local_paper_mode_for_local_ledger(monkeypatch) -> None:
+    monkeypatch.setenv("META_STRATEGY_PAPER_BROKER", "LOCAL_LEDGER")
+    repository = MetaStrategyJobRepository(f"sqlite:///{_temp_db_path('local-ledger-worker-gateway')}")
+
+    gateway = _paper_gateway(repository)
+
+    assert gateway.execution_mode == "LOCAL_PAPER"
+    assert getattr(gateway.broker, "broker_kind", None) == "local_paper_ledger"
 
 def test_worker_accepts_configured_local_ledger_paper_gateway() -> None:
     gateway = PaperOrderGateway(MetaStrategyLocalLedgerPaperBroker(FakeGatewayStore()), FakeGatewayStore())

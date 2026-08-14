@@ -209,6 +209,39 @@ class MetaStrategyPhase9PaperExecutionTest(unittest.TestCase):
         self.assertEqual(snapshot.reserved_risk_dollars, 0.0)
         self.assertEqual(outbox["status"], "CANCELLED")
 
+    def test_reconciliation_applies_partial_fills_incrementally_to_one_position(self) -> None:
+        env = RuntimeEnv()
+        env.create_outbox(quantity=100, reserved_risk=1000.0)
+        env.submission_worker().run_once(now=NOW)
+        first = {**env.broker.fill_event(quantity=30, status="PARTIALLY_FILLED", event_id="fill-30"), "averageFillPrice": 100.0}
+        second = {**env.broker.fill_event(quantity=40, status="PARTIALLY_FILLED", event_id="fill-40"), "averageFillPrice": 101.0}
+        final = {**env.broker.fill_event(quantity=30, status="FILLED", event_id="fill-30-final"), "averageFillPrice": 103.0}
+
+        env.broker.events.append(first)
+        env.reconciliation_worker().run_once(now=NOW + timedelta(seconds=10))
+        after_30 = env.inventory.current_inventory_snapshot(mark_prices={"SPY": 104.0})
+        self.assertEqual(after_30.open_positions[0].quantity, 30.0)
+        self.assertEqual(after_30.open_positions[0].average_price, 100.0)
+        self.assertEqual(after_30.reserved_risk_dollars, 700.0)
+
+        env.broker.events.append(second)
+        env.reconciliation_worker().run_once(now=NOW + timedelta(seconds=20))
+        after_70 = env.inventory.current_inventory_snapshot(mark_prices={"SPY": 104.0})
+        self.assertEqual(len(after_70.open_positions), 1)
+        self.assertEqual(after_70.open_positions[0].quantity, 70.0)
+        self.assertEqual(after_70.open_positions[0].average_price, round(((30 * 100.0) + (40 * 101.0)) / 70, 10))
+        self.assertEqual(after_70.reserved_risk_dollars, 300.0)
+
+        env.broker.events.append(final)
+        env.reconciliation_worker().run_once(now=NOW + timedelta(seconds=30))
+        after_100 = env.inventory.current_inventory_snapshot(mark_prices={"SPY": 104.0})
+        self.assertEqual(len(after_100.open_positions), 1)
+        self.assertEqual(after_100.open_positions[0].quantity, 100.0)
+        self.assertEqual(after_100.open_positions[0].average_price, 101.3)
+        self.assertEqual(after_100.unrealised_pnl, 270.0)
+        self.assertEqual(after_100.reserved_risk_dollars, 0.0)
+        self.assertEqual(env.jobs.outbox_for_order_intent("intent-1")["status"], "FILLED")
+
     def test_conflicting_broker_fill_ownership_is_quarantined_without_position_change(self) -> None:
         env = RuntimeEnv()
         env.create_outbox(quantity=10, reserved_risk=100.0)
@@ -244,6 +277,23 @@ class MetaStrategyPhase9PaperExecutionTest(unittest.TestCase):
         self.assertEqual(snapshot.open_positions[0].quantity, 3.0)
         self.assertEqual(env.jobs.broker_event_count(), 2)
 
+    def test_duplicate_broker_fill_id_with_new_event_id_is_idempotent(self) -> None:
+        env = RuntimeEnv()
+        env.create_outbox(quantity=10, reserved_risk=100.0)
+        env.submission_worker().run_once(now=NOW)
+        fill = env.broker.fill_event(quantity=3, status="PARTIALLY_FILLED", event_id="same-fill-id-first-event")
+        duplicate = {**fill, "brokerEventId": "same-fill-id-second-event", "timestamp": (NOW + timedelta(seconds=1)).isoformat()}
+        env.broker.events.extend([fill, duplicate])
+
+        result = env.reconciliation_worker().run_once(now=NOW + timedelta(seconds=10))
+
+        snapshot = env.inventory.current_inventory_snapshot(mark_prices={"SPY": 100.0})
+        self.assertEqual(result["duplicates"], 1)
+        self.assertEqual(len(env.inventory.inventory_records("fills")), 1)
+        self.assertEqual(snapshot.open_positions[0].quantity, 3.0)
+        self.assertEqual(snapshot.reserved_risk_dollars, 70.0)
+        self.assertEqual(snapshot.realised_pnl, 0.0)
+
     def test_reconciliation_matches_known_order_by_broker_order_id_without_frontend_state(self) -> None:
         env = RuntimeEnv()
         env.create_outbox(quantity=10, reserved_risk=100.0)
@@ -253,6 +303,7 @@ class MetaStrategyPhase9PaperExecutionTest(unittest.TestCase):
             {
                 "brokerEventId": "broker-id-only-fill",
                 "brokerOrderId": outbox["brokerOrderId"],
+                "brokerFillId": "broker-id-only-fill-id",
                 "status": "FILLED",
                 "symbol": "SPY",
                 "side": "BUY",
@@ -268,6 +319,35 @@ class MetaStrategyPhase9PaperExecutionTest(unittest.TestCase):
         self.assertEqual(result["quarantined"], 0)
         self.assertEqual(env.jobs.outbox_for_order_intent("intent-1")["status"], "FILLED")
         self.assertEqual(snapshot.open_positions[0].quantity, 10.0)
+
+    def test_malformed_fill_missing_broker_fill_id_is_quarantined_without_position_change(self) -> None:
+        env = RuntimeEnv()
+        env.create_outbox(quantity=10, reserved_risk=100.0)
+        env.submission_worker().run_once(now=NOW)
+        outbox = env.jobs.outbox_for_order_intent("intent-1")
+        env.broker.events.append(
+            {
+                "brokerEventId": "missing-fill-id-event",
+                "brokerOrderId": outbox["brokerOrderId"],
+                "status": "FILLED",
+                "symbol": "SPY",
+                "side": "BUY",
+                "filledQuantity": 10,
+                "averageFillPrice": 100.0,
+                "timestamp": NOW.isoformat(),
+            }
+        )
+
+        result = env.reconciliation_worker().run_once(now=NOW + timedelta(seconds=10))
+
+        quarantine = env.inventory.inventory_records("quarantine", limit=5)[0]
+        snapshot = env.inventory.current_inventory_snapshot(mark_prices={"SPY": 100.0})
+        self.assertEqual(result["processed"], 2)
+        self.assertEqual(result["quarantined"], 1)
+        self.assertEqual(quarantine["payload"]["quarantineReason"], "FILL_MALFORMED_MISSING_BROKER_FILL_ID")
+        self.assertEqual(env.jobs.outbox_for_order_intent("intent-1")["status"], "ACKNOWLEDGED")
+        self.assertEqual(snapshot.open_positions, ())
+        self.assertEqual(snapshot.reserved_risk_dollars, 100.0)
 
     def test_rejected_order_releases_reserved_risk_without_position(self) -> None:
         env = RuntimeEnv(broker=FakePaperBroker(ack_status="REJECTED"))
@@ -463,6 +543,18 @@ class MetaStrategyPhase9PaperExecutionTest(unittest.TestCase):
         outbox = env.jobs.outbox_for_order_intent("intent-1")
         self.assertIn("meta_strategy.paper_control.protective_exit_allowed", outbox["payload"]["reasonCodes"])
 
+    def test_protective_exit_can_submit_when_market_data_readiness_blocks_new_entries(self) -> None:
+        env = RuntimeEnv(readiness_report_source=lambda: readiness_report_with(prerequisite_overrides={"authoritativeMarketDataHealthy": False}))
+        env.record_open_position(quantity=10)
+        env.create_outbox(extra_order_payload={"intent": "protective_exit", "orderIntentType": "protective_exit", "side": "SELL"})
+
+        result = env.submission_worker().run_once(now=NOW)
+
+        self.assertEqual(result["status"], "ACKNOWLEDGED")
+        self.assertEqual(env.broker.submit_count, 1)
+        outbox = env.jobs.outbox_for_order_intent("intent-1")
+        self.assertIn("meta_strategy.paper_control.protective_exit_allowed", outbox["payload"]["reasonCodes"])
+
     def test_end_of_day_liquidation_can_submit_when_entry_control_is_off(self) -> None:
         env = RuntimeEnv()
         env.record_open_position(quantity=10)
@@ -533,6 +625,54 @@ class MetaStrategyPhase9PaperExecutionTest(unittest.TestCase):
                 self.assertEqual(env.broker.submit_count, 0)
                 outbox = env.jobs.outbox_for_order_intent("intent-1")
                 self.assertIn("executionGuard", outbox["payload"])
+
+    def test_duplicate_owned_position_has_explicit_meta_strategy_policy_reason(self) -> None:
+        env = RuntimeEnv()
+        env.create_outbox()
+        env.record_open_position(quantity=3)
+
+        result = env.submission_worker().run_once(now=NOW)
+
+        self.assertEqual(result["status"], "REJECTED")
+        self.assertIn("meta_strategy.execution_guard.existing_meta_strategy_position", result["reasonCodes"])
+        self.assertIn("meta_strategy.execution_guard.existing_position", result["reasonCodes"])
+        self.assertEqual(env.broker.submit_count, 0)
+        guard = env.jobs.outbox_for_order_intent("intent-1")["payload"]["executionGuard"]
+        self.assertEqual(guard["evidence"]["metaStrategyPositionPolicy"]["source"], "meta_strategy_repository.current_inventory_snapshot")
+        self.assertEqual(guard["evidence"]["metaStrategyPositionPolicy"]["action"], "BLOCK_DUPLICATE_META_STRATEGY_ENTRY")
+
+    def test_pyramiding_setting_allows_add_to_owned_meta_strategy_position(self) -> None:
+        env = RuntimeEnv()
+        env.enable_pyramiding()
+        env.record_open_position(quantity=3)
+        env.create_outbox()
+
+        result = env.submission_worker().run_once(now=NOW)
+
+        self.assertEqual(result["status"], "ACKNOWLEDGED")
+        self.assertEqual(env.broker.submit_count, 1)
+        guard = env.jobs.outbox_for_order_intent("intent-1")["payload"]["executionGuard"]
+        self.assertEqual(guard["evidence"]["metaStrategyPositionPolicy"]["action"], "ALLOW_ADD_TO_META_STRATEGY_POSITION")
+        self.assertIn("meta_strategy.execution_guard.new_entry_allowed", guard["reasonCodes"])
+
+    def test_protective_sell_requires_meta_strategy_owned_position(self) -> None:
+        env = RuntimeEnv()
+        env.create_outbox(
+            quantity=3,
+            extra_order_payload={
+                "intent": "protective_exit",
+                "orderIntentType": "protective_exit",
+                "side": "SELL",
+                "foreignBrokerPosition": {"algorithmId": "weighted_voting", "symbol": "SPY", "quantity": 3},
+            },
+        )
+
+        result = env.submission_worker().run_once(now=NOW)
+
+        self.assertEqual(result["status"], "REJECTED")
+        self.assertIn("meta_strategy.execution_guard.protective_order_not_risk_reducing", result["reasonCodes"])
+        self.assertEqual(env.broker.submit_count, 0)
+        self.assertEqual(env.inventory.current_inventory_snapshot().open_positions, ())
 
     def test_wrong_algorithm_outbox_is_rejected_before_broker(self) -> None:
         env = RuntimeEnv()
@@ -772,6 +912,8 @@ class RuntimeEnv:
                 "jobId": "job-open-position",
                 "eventId": "event-open-position",
                 "orderIntentId": "intent-open-position",
+                "clientOrderId": "client-open-position",
+                "brokerOrderId": "broker-open-position",
                 "brokerFillId": f"fill-open-position-{quantity}-{side}",
                 "symbol": "SPY",
                 "side": side,
@@ -808,6 +950,17 @@ class RuntimeEnv:
     def activate_new_settings(self) -> None:
         replacement = self.settings_store.create_baseline(build_meta_strategy_settings(settings_version="phase9-settings-replacement", created_at=NOW), actor="test")
         self.settings_store.activate_settings(replacement.settings_version, actor="test")
+
+    def enable_pyramiding(self) -> None:
+        self.settings = self.settings_store.create_baseline(
+            build_meta_strategy_settings(
+                settings_version="phase9-settings-pyramiding",
+                created_at=NOW,
+                position_management={"one_position_per_symbol": False},
+            ),
+            actor="test",
+        )
+        self.settings_store.activate_settings(self.settings.settings_version, actor="test")
 
     def reserve_all_algorithm_risk(self) -> None:
         self.inventory.record_order_intent(
@@ -1017,7 +1170,10 @@ class FakePaperBroker:
         return PaperGatewayFill(
             clientOrderId=client_order_id,
             algorithmId="meta_strategy",
+            capitalPartitionId="meta_strategy.paper.default",
             orderIntentId="intent-1",
+            brokerOrderId=f"broker-intent-1",
+            brokerFillId=f"fill-{client_order_id}",
             symbol="SPY",
             side=Signal.BUY,
             filledQuantity=10,
@@ -1056,6 +1212,8 @@ class FakePaperBroker:
         return {
             **order,
             "brokerEventId": event_id,
+            "brokerFillId": event_id,
+            "capitalPartitionId": "meta_strategy.paper.default",
             "status": status,
             "filledQuantity": quantity,
             "averageFillPrice": 100.0,

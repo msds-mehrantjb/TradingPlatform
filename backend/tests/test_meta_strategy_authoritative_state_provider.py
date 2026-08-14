@@ -294,6 +294,8 @@ def fill_payload(fill_id: str, *, timestamp: datetime, quantity: float, price: f
         "jobId": f"job-{fill_id}",
         "eventId": f"event-{fill_id}",
         "orderIntentId": f"intent-{fill_id}",
+        "clientOrderId": f"client-{fill_id}",
+        "brokerOrderId": f"broker-{fill_id}",
         "brokerFillId": fill_id,
         "symbol": "SPY",
         "side": "BUY",

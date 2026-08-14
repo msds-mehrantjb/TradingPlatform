@@ -26,7 +26,7 @@ Do not automatically switch from `SHADOW` to `PAPER`. Paper activation must be e
 | `META_STRATEGY_RUNTIME_MODE` | `SHADOW` | Runtime mode; automatic broker submission requires `PAPER`. |
 | `META_STRATEGY_LIVE_TRADING_ENABLED` | `false` | Safety declaration. Live order submission is not implemented or allowed. |
 | `META_STRATEGY_PAPER_NEW_ENTRIES_ENABLED` | `false` | Bootstrap/default documentation for the durable paper toggle; the backend database record is authoritative. |
-| `META_STRATEGY_PAPER_BROKER` | `ALPACA` | Paper order-transport adapter. Use `LOCAL_LEDGER` for the Meta-Strategy local paper ledger, or `LOCAL_PAPER` for an explicitly configured local paper broker service. |
+| `META_STRATEGY_PAPER_BROKER` | `LOCAL_LEDGER` | Paper order-transport adapter. `LOCAL_LEDGER` keeps paper order acknowledgements/fills in the Meta-Strategy local gateway ledger. Use `LOCAL_PAPER` for an explicitly configured local paper broker service, or `ALPACA` only when Alpaca paper is intentionally selected as transport. Meta-Strategy account balance, inventory, P&L, and risk remain local and algorithm-owned. |
 | `META_STRATEGY_LOCAL_LEDGER_MARKET_OPEN` | `false` | Local-ledger broker clock switch for local paper testing. New entries remain blocked unless this is explicitly true. |
 | `META_STRATEGY_LOCAL_LEDGER_IMMEDIATE_FILLS` | `false` | Optional local-ledger paper-fill simulator. Leave false unless testing full position lifecycle locally. |
 | `META_STRATEGY_LOCAL_PAPER_BASE_URL` | blank | Base URL for an optional local PAPER-only broker service. Required when `META_STRATEGY_PAPER_BROKER=LOCAL_PAPER`. |
@@ -67,7 +67,7 @@ Do not automatically switch from `SHADOW` to `PAPER`. Paper activation must be e
 2. Set `META_STRATEGY_RUNTIME_ENABLED=true` only after deployment dependencies are available.
 3. Set `META_STRATEGY_RUNTIME_MODE=PAPER` only for automatic paper trading. `SHADOW` records diagnostics but blocks paper broker submission.
 4. Keep `META_STRATEGY_LIVE_TRADING_ENABLED=false`; this subsystem must never submit live orders.
-5. Confirm `ALPACA_TRADING_BASE_URL` points to the paper endpoint and paper credentials are present in the runtime environment.
+5. Keep `META_STRATEGY_PAPER_BROKER=LOCAL_LEDGER` for fully local automatic paper trading. If `ALPACA` is explicitly selected as transport, confirm `ALPACA_TRADING_BASE_URL` points to the paper endpoint and paper credentials are present in the runtime environment.
 6. Promote active Meta-Strategy settings for paper use.
 7. Verify worker health, queue lag, dead-letter count, market data, authoritative market clock, inventory reconciliation, global risk, and readiness evidence.
 8. Turn the durable Meta-Strategy paper-control state ON through the backend command path only when new paper entries should be allowed.
@@ -78,7 +78,7 @@ For local automatic-paper testing, the Meta-Strategy trading settings panel is t
 
 The local settings risk source is consumed through the existing Meta-Strategy execution pipeline; it does not create a parallel submission path and it does not enable live trading. Missing or zero local paper capital, zero buying power, zero remaining Meta-Strategy risk, stale readiness, or a blocked paper toggle still fail closed.
 
-If you want the local ledger to be the broker transport instead of Alpaca paper, set `META_STRATEGY_PAPER_BROKER=LOCAL_LEDGER`. The local-ledger broker verifies that the Meta-Strategy paper gateway ledger is writable, writes deterministic paper order acknowledgements, exposes broker events to reconciliation, and reports positions back to restart recovery. With `META_STRATEGY_LOCAL_LEDGER_IMMEDIATE_FILLS=true`, it also creates deterministic local paper fills so the Meta-Strategy inventory ledger can open and manage positions end-to-end.
+The default local broker transport is `META_STRATEGY_PAPER_BROKER=LOCAL_LEDGER`. The local-ledger broker verifies that the Meta-Strategy paper gateway ledger is writable, writes deterministic paper order acknowledgements, exposes broker events to reconciliation, and reports positions back to restart recovery. With `META_STRATEGY_LOCAL_LEDGER_IMMEDIATE_FILLS=true`, it also creates deterministic local paper fills so the Meta-Strategy inventory ledger can open and manage positions end-to-end.
 
 Local-ledger paper mode is still paper-only. Every order, fill, and broker event is stamped with `algorithmId=meta_strategy`, the Meta-Strategy capital partition, deterministic client-order ownership, `paperOnly=true`, and `liveTradingEnabled=false`.
 

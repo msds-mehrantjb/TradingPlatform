@@ -24,6 +24,38 @@ META_STRATEGY_REQUIRED_IDENTITY_FIELDS = (
     "settings_version",
     "model_version",
 )
+META_STRATEGY_REJECTED_FOREIGN_ALGORITHM_IDS = (
+    "weighted_voting",
+    "voting_ensemble",
+    "wca",
+    "regime",
+    "session",
+)
+META_STRATEGY_EXPECTED_MUTABLE_OWNER = {
+    "algorithmId": ALGORITHM_ID,
+    "algorithm_id": ALGORITHM_ID,
+    "capitalPartitionId": META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+    "capital_partition_id": META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+}
+
+
+class MetaStrategyOwnershipBoundaryError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_codes: tuple[str, ...],
+        observed_algorithm_id: str | None = None,
+        observed_capital_partition_id: str | None = None,
+        expected_algorithm_id: str = ALGORITHM_ID,
+        expected_capital_partition_id: str = META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+    ) -> None:
+        super().__init__(message)
+        self.reason_codes = reason_codes
+        self.observed_algorithm_id = observed_algorithm_id
+        self.observed_capital_partition_id = observed_capital_partition_id
+        self.expected_algorithm_id = expected_algorithm_id
+        self.expected_capital_partition_id = expected_capital_partition_id
 
 
 @dataclass(frozen=True)
@@ -54,10 +86,58 @@ META_STRATEGY_AUTHORITATIVE_DOMAINS: tuple[MetaStrategyOwnedDomain, ...] = (
 META_STRATEGY_AUTHORITATIVE_DOMAIN_IDS = tuple(domain.domain_id for domain in META_STRATEGY_AUTHORITATIVE_DOMAINS)
 
 
-def assert_meta_strategy_ownership(record: Any) -> None:
+def assert_meta_strategy_ownership(
+    record: Any,
+    *,
+    require_capital_partition: bool = False,
+    scope: str = "ownership",
+) -> None:
+    violation = meta_strategy_ownership_violation(
+        record,
+        require_capital_partition=require_capital_partition,
+        scope=scope,
+    )
+    if violation is None:
+        return
+    observed_owner = violation["observedAlgorithmId"] or "unknown"
+    raise MetaStrategyOwnershipBoundaryError(
+        f"Meta-Strategy cannot mutate records owned by {observed_owner}",
+        reason_codes=tuple(violation["reasonCodes"]),
+        observed_algorithm_id=violation["observedAlgorithmId"],
+        observed_capital_partition_id=violation["observedCapitalPartitionId"],
+    )
+
+
+def meta_strategy_ownership_violation(
+    record: Any,
+    *,
+    require_capital_partition: bool = True,
+    scope: str = "ownership",
+) -> dict[str, Any] | None:
     algorithm_id = _algorithm_id(record)
+    capital_partition_id = _capital_partition_id(record)
+    prefix = f"meta_strategy.{scope}"
     if algorithm_id != ALGORITHM_ID:
-        raise ValueError(f"Meta-Strategy cannot mutate records owned by {algorithm_id or 'unknown'}")
+        reason = f"{prefix}.algorithm_id_required" if algorithm_id in (None, "") else f"{prefix}.foreign_algorithm_rejected"
+        return {
+            "reasonCodes": (reason,),
+            "observedAlgorithmId": algorithm_id,
+            "observedCapitalPartitionId": capital_partition_id,
+            "expectedAlgorithmId": ALGORITHM_ID,
+            "expectedCapitalPartitionId": META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+            "rejectedForeignAlgorithmIds": META_STRATEGY_REJECTED_FOREIGN_ALGORITHM_IDS,
+        }
+    if require_capital_partition and capital_partition_id != META_STRATEGY_DEFAULT_CAPITAL_PARTITION:
+        reason = f"{prefix}.capital_partition_required" if capital_partition_id in (None, "") else f"{prefix}.foreign_capital_partition_rejected"
+        return {
+            "reasonCodes": (reason,),
+            "observedAlgorithmId": algorithm_id,
+            "observedCapitalPartitionId": capital_partition_id,
+            "expectedAlgorithmId": ALGORITHM_ID,
+            "expectedCapitalPartitionId": META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+            "rejectedForeignAlgorithmIds": META_STRATEGY_REJECTED_FOREIGN_ALGORITHM_IDS,
+        }
+    return None
 
 
 def is_meta_strategy_owned(record: Any) -> bool:
@@ -73,6 +153,8 @@ def meta_strategy_ownership_boundary() -> dict[str, Any]:
         "defaultCapitalPartition": META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
         "settingsNamespace": META_STRATEGY_SETTINGS_NAMESPACE,
         "requiredIdentityFields": META_STRATEGY_REQUIRED_IDENTITY_FIELDS,
+        "expectedMutableOwner": META_STRATEGY_EXPECTED_MUTABLE_OWNER,
+        "rejectedForeignAlgorithmIds": META_STRATEGY_REJECTED_FOREIGN_ALGORITHM_IDS,
         "authoritativeDomains": contract["authoritativeDomains"],
         "approvedSharedInterfaces": contract["approvedSharedInterfaces"],
         "mayMutateForeignAlgorithmState": False,
@@ -93,6 +175,8 @@ def meta_strategy_ownership_contract() -> dict[str, Any]:
         "settingsNamespace": META_STRATEGY_SETTINGS_NAMESPACE,
         "defaultCapitalPartition": META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
         "requiredIdentityFields": META_STRATEGY_REQUIRED_IDENTITY_FIELDS,
+        "expectedMutableOwner": META_STRATEGY_EXPECTED_MUTABLE_OWNER,
+        "rejectedForeignAlgorithmIds": META_STRATEGY_REJECTED_FOREIGN_ALGORITHM_IDS,
         "approvedSharedInterfaces": META_STRATEGY_APPROVED_SHARED_INTERFACE_IDS,
         "authoritativeDomains": tuple(asdict(domain) for domain in META_STRATEGY_AUTHORITATIVE_DOMAINS),
         "mayMutateForeignAlgorithmState": False,
@@ -108,15 +192,27 @@ def _algorithm_id(record: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def _capital_partition_id(record: Any) -> str | None:
+    if isinstance(record, dict):
+        value = record.get("capitalPartitionId", record.get("capital_partition_id"))
+    else:
+        value = getattr(record, "capitalPartitionId", getattr(record, "capital_partition_id", None))
+    return str(value) if value is not None else None
+
+
 __all__ = [
     "META_STRATEGY_AUTHORITATIVE_DOMAIN_IDS",
     "META_STRATEGY_AUTHORITATIVE_DOMAINS",
     "META_STRATEGY_DEFAULT_CAPITAL_PARTITION",
+    "META_STRATEGY_EXPECTED_MUTABLE_OWNER",
+    "META_STRATEGY_REJECTED_FOREIGN_ALGORITHM_IDS",
     "META_STRATEGY_REQUIRED_IDENTITY_FIELDS",
     "META_STRATEGY_SETTINGS_NAMESPACE",
     "MetaStrategyOwnedDomain",
+    "MetaStrategyOwnershipBoundaryError",
     "assert_meta_strategy_ownership",
     "is_meta_strategy_owned",
     "meta_strategy_ownership_boundary",
     "meta_strategy_ownership_contract",
+    "meta_strategy_ownership_violation",
 ]

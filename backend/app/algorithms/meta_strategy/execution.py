@@ -340,7 +340,7 @@ def submit_meta_strategy_outbox_record(
         now=evaluated_at,
     )
     if gateway_result.fill and gateway_result.fill.filledQuantity > 0:
-        _apply_fill_event(repository, inventory_repository, outbox_id, {**intent_payload, **gateway_result.fill.model_dump(mode="json")}, evaluated_at=evaluated_at)
+        _apply_fill_event(repository, inventory_repository, outbox_id, _fill_event_with_order_context(intent_payload, gateway_result.fill.model_dump(mode="json")), evaluated_at=evaluated_at)
     return {
         "status": status,
         "submitted": gateway_result.submitted,
@@ -391,7 +391,11 @@ def reconcile_meta_strategy_paper_orders(
                 now=reconciled_at,
             )
             continue
-        _apply_broker_event(repository, inventory_repository, outbox, event, reconciled_at=reconciled_at)
+        event_outcome = _apply_broker_event(repository, inventory_repository, outbox, event, reconciled_at=reconciled_at)
+        if event_outcome == "QUARANTINED":
+            quarantined += 1
+        elif event_outcome == "DUPLICATE_FILL_IGNORED":
+            duplicate += 1
     recovery = paper_gateway.recover_from_restart(evaluated_at=reconciled_at)
     if recovery.get("orphanPositionsDetected"):
         quarantined += len(recovery["orphanPositionsDetected"])
@@ -559,7 +563,7 @@ def _apply_broker_event(
     event: Mapping[str, Any],
     *,
     reconciled_at: datetime,
-) -> None:
+) -> str:
     status = str(event.get("status") or "").upper()
     if status in {"ACCEPTED", "PENDING"}:
         mapped = "ACKNOWLEDGED"
@@ -602,7 +606,28 @@ def _apply_broker_event(
             status="QUARANTINED",
             now=reconciled_at,
         )
-        return
+        return "QUARANTINED"
+    fill_event_payload = _fill_event_with_order_context(outbox["payload"], event)
+    if mapped in {"PARTIALLY_FILLED", "FILLED"}:
+        _, fill_rejection_reason = _meta_strategy_fill_inventory_payload(fill_event_payload, evaluated_at=reconciled_at)
+        if fill_rejection_reason is not None:
+            _quarantine_rejected_fill(
+                repository,
+                inventory_repository,
+                fill_event_payload,
+                reason=fill_rejection_reason,
+                evaluated_at=reconciled_at,
+            )
+            repository.record_reconciliation_evidence(
+                "BROKER_EVENT_FILL_REJECTED",
+                fill_event_payload,
+                client_order_id=str(fill_event_payload.get("clientOrderId") or ""),
+                broker_order_id=str(fill_event_payload.get("brokerOrderId") or ""),
+                order_intent_id=str(fill_event_payload.get("orderIntentId") or ""),
+                status="QUARANTINED",
+                now=reconciled_at,
+            )
+            return "QUARANTINED"
     payload = {**outbox["payload"], **_identity_envelope(outbox["payload"]), "brokerEvent": dict(event), "reasonCodes": [f"meta_strategy.execution.broker_event_{mapped.lower()}"]}
     repository.update_execution_outbox(
         str(outbox["outboxId"]),
@@ -612,9 +637,9 @@ def _apply_broker_event(
         broker_order_id=str(event.get("brokerOrderId") or outbox.get("brokerOrderId") or ""),
         now=reconciled_at,
     )
-    filled_quantity = event.get("filledQuantity")
-    if mapped in {"PARTIALLY_FILLED", "FILLED"} and float(filled_quantity if filled_quantity is not None else 0) > 0:
-        _apply_fill_event(repository, inventory_repository, str(outbox["outboxId"]), {**dict(event), **outbox["payload"]}, evaluated_at=reconciled_at)
+    fill_outcome = None
+    if mapped in {"PARTIALLY_FILLED", "FILLED"}:
+        fill_outcome = _apply_fill_event(repository, inventory_repository, str(outbox["outboxId"]), fill_event_payload, evaluated_at=reconciled_at)
     if mapped in {"CANCELLED", "EXPIRED", "REJECTED"}:
         inventory_repository.record_order_status(
             {
@@ -627,9 +652,10 @@ def _apply_broker_event(
                 "timestamp": reconciled_at.isoformat(),
             }
         )
-    if mapped in {"PARTIALLY_FILLED", "FILLED", "CANCELLED", "EXPIRED", "REJECTED", "REPLACED", "RECONCILIATION_REQUIRED"}:
+    if fill_outcome != "DUPLICATE_FILL_IGNORED" and mapped in {"PARTIALLY_FILLED", "FILLED", "CANCELLED", "EXPIRED", "REJECTED", "REPLACED", "RECONCILIATION_REQUIRED"}:
         _enqueue_position_management_after_execution(repository, payload, trigger=f"broker_event_{mapped.lower()}", now=reconciled_at)
     repository.record_reconciliation_evidence("BROKER_EVENT_RECONCILED", payload, client_order_id=str(event.get("clientOrderId") or ""), broker_order_id=str(event.get("brokerOrderId") or ""), order_intent_id=str(event.get("orderIntentId") or ""), status=mapped, now=reconciled_at)
+    return fill_outcome or mapped
 
 
 def _broker_event_ownership_conflict(outbox: Mapping[str, Any], event: Mapping[str, Any]) -> str | None:
@@ -650,6 +676,11 @@ def _broker_event_ownership_conflict(outbox: Mapping[str, Any], event: Mapping[s
     return None
 
 
+def _fill_event_with_order_context(order_payload: Mapping[str, Any], event: Mapping[str, Any]) -> dict[str, Any]:
+    context = _identity_envelope(order_payload)
+    return {**context, **dict(event)}
+
+
 def _apply_fill_event(
     repository: MetaStrategyJobRepository,
     inventory_repository: MetaStrategySqliteRepository,
@@ -657,31 +688,77 @@ def _apply_fill_event(
     event: Mapping[str, Any],
     *,
     evaluated_at: datetime,
-) -> None:
-    fill_id = str(event.get("brokerFillId") or event.get("fillId") or event.get("brokerEventId") or "")
-    if not fill_id:
-        return
-    fill_ownership_reason = _fill_event_ownership_conflict(event)
-    if fill_ownership_reason is not None:
-        inventory_repository.record_foreign_ownership_quarantine(
-            {
-                **dict(event),
-                "brokerFillId": fill_id,
-                "timestamp": str(event.get("timestamp") or evaluated_at.isoformat()),
-            },
-            reason=fill_ownership_reason,
+) -> str:
+    fill_payload, fill_rejection_reason = _meta_strategy_fill_inventory_payload(event, evaluated_at=evaluated_at)
+    if fill_rejection_reason is not None:
+        _quarantine_rejected_fill(
+            repository,
+            inventory_repository,
+            event,
+            reason=fill_rejection_reason,
+            evaluated_at=evaluated_at,
         )
+        return "QUARANTINED"
+    result = inventory_repository.ingest_broker_fill(fill_payload)
+    if result.get("status") == "DUPLICATE_IGNORED":
         repository.record_reconciliation_evidence(
-            "FILL_OWNERSHIP_CONFLICT",
-            dict(event),
-            client_order_id=str(event.get("clientOrderId") or ""),
-            broker_order_id=str(event.get("brokerOrderId") or ""),
-            order_intent_id=str(event.get("orderIntentId") or ""),
-            status="QUARANTINED",
+            "FILL_DUPLICATE_IGNORED",
+            fill_payload,
+            client_order_id=str(fill_payload.get("clientOrderId") or ""),
+            broker_order_id=str(fill_payload.get("brokerOrderId") or ""),
+            order_intent_id=str(fill_payload.get("orderIntentId") or ""),
+            status="DUPLICATE_IGNORED",
             now=evaluated_at,
         )
-        return
-    capital_partition_id = str(event.get("capitalPartitionId") or event.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+        return "DUPLICATE_FILL_IGNORED"
+    _enqueue_position_management_after_execution(repository, fill_payload, trigger="broker_fill", now=evaluated_at)
+    repository.record_reconciliation_evidence(
+        "FILL_APPLIED_TO_INVENTORY",
+        fill_payload,
+        client_order_id=str(fill_payload.get("clientOrderId") or ""),
+        broker_order_id=str(fill_payload.get("brokerOrderId") or ""),
+        order_intent_id=str(fill_payload.get("orderIntentId") or ""),
+        status="FILLED",
+        now=evaluated_at,
+    )
+    return "FILL_APPLIED"
+
+
+def _meta_strategy_fill_inventory_payload(event: Mapping[str, Any], *, evaluated_at: datetime) -> tuple[dict[str, Any], str | None]:
+    ownership_reason = _fill_event_ownership_conflict(event)
+    if ownership_reason is not None:
+        return {}, ownership_reason
+    fill_id = _required_string(event, "brokerFillId", "broker_fill_id", "fillId", "fill_id")
+    if not fill_id:
+        return {}, "FILL_MALFORMED_MISSING_BROKER_FILL_ID"
+    broker_order_id = _required_string(event, "brokerOrderId", "broker_order_id")
+    order_intent_id = _required_string(event, "orderIntentId", "order_intent_id")
+    client_order_id = _required_string(event, "clientOrderId", "client_order_id")
+    symbol = _required_string(event, "symbol", "ticker").upper()
+    side = _required_string(event, "side").upper()
+    timestamp = _required_string(event, "timestamp", "filledAt", "filled_at")
+    quantity = _positive_number(event, "filledQuantity", "filled_quantity", "quantity")
+    price = _positive_number(event, "averageFillPrice", "average_fill_price", "fillPrice", "fill_price", "price")
+    missing = []
+    if not order_intent_id:
+        missing.append("orderIntentId")
+    if not client_order_id:
+        missing.append("clientOrderId")
+    if not broker_order_id:
+        missing.append("brokerOrderId")
+    if not symbol:
+        missing.append("symbol")
+    if side not in {"BUY", "SELL"}:
+        missing.append("side")
+    if quantity is None:
+        missing.append("quantity")
+    if price is None:
+        missing.append("price")
+    if not timestamp or _parse_datetime_or_none(timestamp) is None:
+        missing.append("timestamp")
+    if missing:
+        return {}, "FILL_MALFORMED_MISSING_" + "_".join(item.upper() for item in missing)
+    capital_partition_id = _required_string(event, "capitalPartitionId", "capital_partition_id")
     settings_version = str(event.get("settingsVersion") or event.get("settings_version") or "")
     effective_settings_hash = str(event.get("effectiveSettingsHash") or event.get("effective_settings_hash") or "")
     strategy_catalog_version = str(event.get("strategyCatalogVersion") or event.get("strategy_catalog_version") or META_STRATEGY_STRATEGY_CATALOG_VERSION)
@@ -690,56 +767,121 @@ def _apply_fill_event(
     decision_id = str(event.get("decisionId") or event.get("decision_id") or "")
     job_id = str(event.get("jobId") or event.get("job_id") or "")
     event_id = str(event.get("brokerEventId") or event.get("broker_event_id") or event.get("eventId") or event.get("event_id") or fill_id)
-    correlation_id = str(event.get("correlationId") or event.get("correlation_id") or event.get("orderIntentId") or decision_id or fill_id)
-    inventory_repository.ingest_broker_fill(
-        {
-            "algorithmId": ALGORITHM_ID,
-            "algorithm_id": ALGORITHM_ID,
-            "capitalPartitionId": capital_partition_id,
-            "capital_partition_id": capital_partition_id,
-            "settingsVersion": settings_version,
-            "settings_version": settings_version,
-            "effectiveSettingsHash": effective_settings_hash,
-            "effective_settings_hash": effective_settings_hash,
-            "strategyCatalogVersion": strategy_catalog_version,
-            "strategy_catalog_version": strategy_catalog_version,
-            "featureSchemaVersion": feature_schema_version,
-            "feature_schema_version": feature_schema_version,
-            "modelVersion": model_version,
-            "model_version": model_version,
-            "decisionId": decision_id,
-            "decision_id": decision_id,
-            "jobId": job_id,
-            "job_id": job_id,
-            "eventId": event_id,
-            "event_id": event_id,
-            "orderIntentId": str(event.get("orderIntentId") or ""),
-            "clientOrderId": str(event.get("clientOrderId") or ""),
-            "brokerOrderId": str(event.get("brokerOrderId") or ""),
-            "brokerFillId": fill_id,
-            "correlationId": correlation_id,
-            "correlation_id": correlation_id,
-            "symbol": str(event.get("symbol") or "UNKNOWN").upper(),
-            "side": str(event.get("side") or "BUY").upper(),
-            "filledQuantity": float(event.get("filledQuantity") if event.get("filledQuantity") is not None else 0),
-            "fillPrice": float(
-                event.get("averageFillPrice")
-                if event.get("averageFillPrice") is not None
-                else (event.get("fillPrice") if event.get("fillPrice") is not None else 0.01)
-            ),
-            "timestamp": str(event.get("timestamp") or evaluated_at.isoformat()),
-        }
+    correlation_id = str(event.get("correlationId") or event.get("correlation_id") or order_intent_id or decision_id or fill_id)
+    return {
+        "algorithmId": ALGORITHM_ID,
+        "algorithm_id": ALGORITHM_ID,
+        "capitalPartitionId": capital_partition_id,
+        "capital_partition_id": capital_partition_id,
+        "settingsVersion": settings_version,
+        "settings_version": settings_version,
+        "effectiveSettingsHash": effective_settings_hash,
+        "effective_settings_hash": effective_settings_hash,
+        "strategyCatalogVersion": strategy_catalog_version,
+        "strategy_catalog_version": strategy_catalog_version,
+        "featureSchemaVersion": feature_schema_version,
+        "feature_schema_version": feature_schema_version,
+        "modelVersion": model_version,
+        "model_version": model_version,
+        "decisionId": decision_id,
+        "decision_id": decision_id,
+        "jobId": job_id,
+        "job_id": job_id,
+        "eventId": event_id,
+        "event_id": event_id,
+        "orderIntentId": order_intent_id,
+        "clientOrderId": client_order_id,
+        "brokerOrderId": broker_order_id,
+        "brokerFillId": fill_id,
+        "correlationId": correlation_id,
+        "correlation_id": correlation_id,
+        "symbol": symbol,
+        "side": side,
+        "filledQuantity": quantity,
+        "quantity": quantity,
+        "fillPrice": price,
+        "price": price,
+        "timestamp": timestamp,
+    }, None
+
+
+def _quarantine_rejected_fill(
+    repository: MetaStrategyJobRepository,
+    inventory_repository: MetaStrategySqliteRepository,
+    event: Mapping[str, Any],
+    *,
+    reason: str,
+    evaluated_at: datetime,
+) -> None:
+    payload = {
+        **dict(event),
+        "brokerFillId": _required_string(event, "brokerFillId", "broker_fill_id", "fillId", "fill_id"),
+        "timestamp": str(event.get("timestamp") or event.get("filledAt") or evaluated_at.isoformat()),
+    }
+    if reason.startswith("FILL_FOREIGN_"):
+        inventory_repository.record_foreign_ownership_quarantine(payload, reason=reason)
+        evidence_type = "FILL_OWNERSHIP_CONFLICT"
+    else:
+        inventory_repository.record_quarantine(
+            {
+                **payload,
+                "algorithmId": ALGORITHM_ID,
+                "capitalPartitionId": META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+            },
+            reason=reason,
+        )
+        evidence_type = "FILL_MALFORMED_QUARANTINED"
+    repository.record_reconciliation_evidence(
+        evidence_type,
+        payload,
+        client_order_id=str(event.get("clientOrderId") or ""),
+        broker_order_id=str(event.get("brokerOrderId") or ""),
+        order_intent_id=str(event.get("orderIntentId") or ""),
+        status="QUARANTINED",
+        now=evaluated_at,
     )
-    _enqueue_position_management_after_execution(repository, event, trigger="broker_fill", now=evaluated_at)
-    repository.record_reconciliation_evidence("FILL_APPLIED_TO_INVENTORY", dict(event), client_order_id=str(event.get("clientOrderId") or ""), broker_order_id=str(event.get("brokerOrderId") or ""), order_intent_id=str(event.get("orderIntentId") or ""), status="FILLED", now=evaluated_at)
+
+
+def _required_string(payload: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and str(value) != "":
+            return str(value)
+    return ""
+
+
+def _positive_number(payload: Mapping[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = payload.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isfinite(number) and number > 0.0:
+            return number
+        return None
+    return None
+
+
+def _parse_datetime_or_none(value: Any) -> datetime | None:
+    try:
+        return _as_utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    except (TypeError, ValueError):
+        return None
 
 
 def _fill_event_ownership_conflict(event: Mapping[str, Any]) -> str | None:
-    observed_algorithm_id = event.get("algorithmId") or event.get("algorithm_id")
-    if observed_algorithm_id is not None and str(observed_algorithm_id) != ALGORITHM_ID:
+    observed_algorithm_id = _required_string(event, "algorithmId", "algorithm_id")
+    if not observed_algorithm_id:
+        return "FILL_MALFORMED_MISSING_ALGORITHM_ID"
+    if observed_algorithm_id != ALGORITHM_ID:
         return "FILL_FOREIGN_ALGORITHM"
-    observed_partition_id = event.get("capitalPartitionId") or event.get("capital_partition_id")
-    if observed_partition_id is not None and str(observed_partition_id) != META_STRATEGY_DEFAULT_CAPITAL_PARTITION:
+    observed_partition_id = _required_string(event, "capitalPartitionId", "capital_partition_id")
+    if not observed_partition_id:
+        return "FILL_MALFORMED_MISSING_CAPITAL_PARTITION_ID"
+    if observed_partition_id != META_STRATEGY_DEFAULT_CAPITAL_PARTITION:
         return "FILL_FOREIGN_PARTITION"
     return None
 
@@ -965,8 +1107,12 @@ def evaluate_meta_strategy_execution_guard(
         reasons.append("meta_strategy.execution_guard.zero_approved_quantity")
     if _duplicate_client_order_id(repository, str(payload.get("clientOrderId") or "")):
         reasons.append("meta_strategy.execution_guard.duplicate_client_order_id")
-    if _has_conflicting_position(inventory, proposal):
-        reasons.append("meta_strategy.execution_guard.existing_position")
+    position_policy = _meta_strategy_position_entry_policy(inventory, proposal, settings)
+    evidence["metaStrategyPositionPolicy"] = position_policy
+    if position_policy["blocked"]:
+        reasons.append(str(position_policy["reasonCode"]))
+        if position_policy["reasonCode"] == "meta_strategy.execution_guard.existing_meta_strategy_position":
+            reasons.append("meta_strategy.execution_guard.existing_position")
     if _has_open_entry_order(repository, proposal, current_order_intent_id=proposal.orderIntentId):
         reasons.append("meta_strategy.execution_guard.existing_open_entry_order")
     if _symbol_allowed(settings, proposal) is not True:
@@ -1204,9 +1350,69 @@ def _duplicate_client_order_id(repository: MetaStrategyJobRepository, client_ord
         return False
 
 
-def _has_conflicting_position(inventory: Any, proposal: GlobalOrderProposal) -> bool:
+def _has_conflicting_position(inventory: Any, proposal: GlobalOrderProposal, settings: Any | None = None) -> bool:
+    return bool(_meta_strategy_position_entry_policy(inventory, proposal, settings)["blocked"])
+
+
+def _meta_strategy_position_entry_policy(inventory: Any, proposal: GlobalOrderProposal, settings: Any | None) -> dict[str, Any]:
     symbol = str(proposal.symbol).upper()
-    return any(str(position.symbol).upper() == symbol and float(position.quantity) > 0 for position in inventory.open_positions)
+    position = _owned_open_position_for_symbol(inventory, symbol)
+    pyramiding_enabled = settings is not None and getattr(settings.position_management, "one_position_per_symbol", True) is not True
+    if position is None:
+        return {
+            "source": "meta_strategy_repository.current_inventory_snapshot",
+            "symbol": symbol,
+            "ownedPositionFound": False,
+            "pyramidingEnabled": pyramiding_enabled,
+            "action": "ALLOW_NEW_META_STRATEGY_ENTRY",
+            "blocked": False,
+            "reasonCode": "meta_strategy.execution_guard.no_owned_position",
+        }
+    side = proposal.side.value if hasattr(proposal.side, "value") else str(proposal.side)
+    position_side = str(position.side).upper()
+    same_direction = (position_side == "LONG" and side.upper() == "BUY") or (position_side == "SHORT" and side.upper() == "SELL")
+    if not pyramiding_enabled:
+        return {
+            "source": "meta_strategy_repository.current_inventory_snapshot",
+            "symbol": symbol,
+            "ownedPositionFound": True,
+            "ownedPositionSide": position_side,
+            "ownedPositionQuantity": float(position.quantity),
+            "pyramidingEnabled": False,
+            "action": "BLOCK_DUPLICATE_META_STRATEGY_ENTRY",
+            "blocked": True,
+            "reasonCode": "meta_strategy.execution_guard.existing_meta_strategy_position",
+        }
+    if not same_direction:
+        return {
+            "source": "meta_strategy_repository.current_inventory_snapshot",
+            "symbol": symbol,
+            "ownedPositionFound": True,
+            "ownedPositionSide": position_side,
+            "ownedPositionQuantity": float(position.quantity),
+            "pyramidingEnabled": True,
+            "action": "BLOCK_META_STRATEGY_REVERSAL_ENTRY",
+            "blocked": True,
+            "reasonCode": "meta_strategy.execution_guard.owned_position_reversal_rejected",
+        }
+    return {
+        "source": "meta_strategy_repository.current_inventory_snapshot",
+        "symbol": symbol,
+        "ownedPositionFound": True,
+        "ownedPositionSide": position_side,
+        "ownedPositionQuantity": float(position.quantity),
+        "pyramidingEnabled": True,
+        "action": "ALLOW_ADD_TO_META_STRATEGY_POSITION",
+        "blocked": False,
+        "reasonCode": "meta_strategy.execution_guard.add_to_owned_position_allowed",
+    }
+
+
+def _owned_open_position_for_symbol(inventory: Any, symbol: str) -> Any | None:
+    for position in getattr(inventory, "open_positions", ()):
+        if str(position.symbol).upper() == symbol and float(position.quantity) > 0:
+            return position
+    return None
 
 
 def _has_open_entry_order(repository: MetaStrategyJobRepository, proposal: GlobalOrderProposal, *, current_order_intent_id: str) -> bool:
@@ -1437,8 +1643,14 @@ def _readiness_prerequisite_reasons(readiness: Mapping[str, Any], runtime: Mappi
         reasons.append("meta_strategy.readiness.paper_orders_blocked")
     checks = (
         ("durableDatabaseAvailable", "meta_strategy.readiness.database_unavailable"),
+        ("inventoryRepositoryAvailable", "meta_strategy.readiness.inventory_repository_unavailable"),
+        ("inventoryConsistencyPasses", "meta_strategy.readiness.inventory_consistency_failed"),
+        ("allocatedCapitalPositive", "meta_strategy.readiness.allocated_capital_missing"),
+        ("accountSnapshotMetaStrategyDerived", "meta_strategy.readiness.account_snapshot_not_meta_strategy_inventory"),
+        ("riskSnapshotMetaStrategyDerived", "meta_strategy.readiness.risk_snapshot_not_meta_strategy_inventory"),
         ("activeSettingsPromotedForPaper", "meta_strategy.readiness.settings_not_promoted_for_paper"),
         ("paperBrokerVerified", "meta_strategy.readiness.paper_broker_unverified"),
+        ("brokerPaperOnly", "meta_strategy.readiness.broker_not_paper_only"),
         ("authoritativeMarketDataHealthy", "meta_strategy.readiness.market_data_unhealthy"),
         ("marketClockHealthy", "meta_strategy.readiness.market_clock_unhealthy"),
         ("requiredWorkersHealthy", "meta_strategy.readiness.worker_unhealthy"),
@@ -1448,6 +1660,9 @@ def _readiness_prerequisite_reasons(readiness: Mapping[str, Any], runtime: Mappi
         ("inventoryReconciliationCurrent", "meta_strategy.readiness.inventory_reconciliation_stale"),
         ("globalRiskSourceCurrent", "meta_strategy.readiness.global_risk_stale"),
         ("requiredAcceptanceTestsPassed", "meta_strategy.readiness.acceptance_evidence_missing_or_failed"),
+        ("paperToggleEnabled", "meta_strategy.readiness.paper_toggle_disabled"),
+        ("runtimeModePaper", "meta_strategy.readiness.runtime_mode_not_paper"),
+        ("liveTradingDisabled", "meta_strategy.readiness.live_trading_enabled"),
     )
     for field, reason in checks:
         if _readiness_prerequisite_value(readiness, prerequisites, field) is not True:

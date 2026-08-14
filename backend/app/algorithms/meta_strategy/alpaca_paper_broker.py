@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from dotenv import load_dotenv
 
+from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 from backend.app.domain.models import Signal
 from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill
 
@@ -188,7 +189,10 @@ class MetaStrategyAlpacaPaperBroker:
         return PaperGatewayFill(
             clientOrderId=client_order_id,
             algorithmId="meta_strategy",
+            capitalPartitionId=META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
             orderIntentId=str(payload.get("client_order_id") or client_order_id),
+            brokerOrderId=str(payload.get("id") or ""),
+            brokerFillId=str(payload.get("fill_id") or payload.get("latest_fill_id") or payload.get("id") or ""),
             symbol=str(payload.get("symbol") or "UNKNOWN").upper(),
             side=Signal.SELL if str(payload.get("side") or "").lower() == "sell" else Signal.BUY,
             filledQuantity=int(filled),
@@ -303,8 +307,10 @@ def _event_from_order(order: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "brokerEventId": str(order.get("id") or client_order_id),
         "algorithmId": "meta_strategy",
+        "capitalPartitionId": META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
         "clientOrderId": client_order_id,
         "brokerOrderId": str(order.get("id") or ""),
+        "brokerFillId": str(order.get("fill_id") or order.get("latest_fill_id") or (order.get("id") if float(order.get("filled_qty") or 0.0) > 0.0 else "") or ""),
         "orderIntentId": client_order_id,
         "status": status,
         "symbol": str(order.get("symbol") or "UNKNOWN").upper(),

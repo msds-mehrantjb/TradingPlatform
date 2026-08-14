@@ -16,6 +16,7 @@ from backend.app.algorithms.meta_strategy.execution import (
     MetaStrategyStaleOrderCancellationWorker,
 )
 from backend.app.algorithms.meta_strategy.jobs import MetaStrategyJobRepository, MetaStrategyWorker
+from backend.app.algorithms.meta_strategy.ownership import ALGORITHM_ID
 from backend.app.algorithms.meta_strategy.repository import MetaStrategySqliteRepository
 from backend.app.algorithms.meta_strategy.state_provider import MetaStrategyCandleStoreStateProvider
 from backend.app.algorithms.meta_strategy.research_workers import (
@@ -120,7 +121,14 @@ class MetaStrategyPositionManagementWorker(MetaStrategyWorker):
             mark_prices = _mark_prices(payload)
             snapshot = self.inventory_repository.current_inventory_snapshot(mark_prices=mark_prices)
             requests = _position_management_requests(payload)
-            explicit_decisions = [_jsonable(manage_meta_strategy_trade(_exit_inputs_from_payload(item))) for item in requests]
+            explicit_decisions = _explicit_position_management_decisions(
+                inventory_repository=self.inventory_repository,
+                job=job,
+                payload=payload,
+                snapshot=snapshot,
+                requests=requests,
+                now=current,
+            )
             managed = _manage_open_positions(
                 repository=self.repository,
                 inventory_repository=self.inventory_repository,
@@ -267,6 +275,106 @@ def _position_management_requests(payload: dict[str, Any]) -> tuple[dict[str, An
     if isinstance(raw, list | tuple):
         return tuple(dict(item) for item in raw if isinstance(item, dict))
     return ()
+
+
+def _explicit_position_management_decisions(
+    *,
+    inventory_repository: MetaStrategySqliteRepository,
+    job,
+    payload: dict[str, Any],
+    snapshot,
+    requests: tuple[dict[str, Any], ...],
+    now: datetime,
+) -> tuple[dict[str, Any], ...]:
+    if not requests:
+        return ()
+    decisions: list[dict[str, Any]] = []
+    positions_by_id = {position.position_id: position for position in snapshot.open_positions}
+    positions_by_symbol = {position.symbol.upper(): position for position in snapshot.open_positions}
+    for index, request in enumerate(requests):
+        requested_position = dict(request.get("position") or {})
+        requested_position_id = str(
+            requested_position.get("positionId")
+            or requested_position.get("position_id")
+            or request.get("positionId")
+            or request.get("position_id")
+            or ""
+        )
+        requested_symbol = str(requested_position.get("symbol") or request.get("symbol") or "").upper()
+        observed_algorithm_id = (
+            requested_position.get("algorithmId")
+            or requested_position.get("algorithm_id")
+            or request.get("algorithmId")
+            or request.get("algorithm_id")
+        )
+        observed_capital_partition_id = (
+            requested_position.get("capitalPartitionId")
+            or requested_position.get("capital_partition_id")
+            or request.get("capitalPartitionId")
+            or request.get("capital_partition_id")
+        )
+        foreign_owner = observed_algorithm_id not in (None, "", ALGORITHM_ID) or observed_capital_partition_id not in (
+            None,
+            "",
+            snapshot.capital_partition_id,
+        )
+        open_position = positions_by_id.get(requested_position_id) if requested_position_id else None
+        if open_position is None and requested_symbol and not requested_position_id:
+            open_position = positions_by_symbol.get(requested_symbol)
+        if foreign_owner or open_position is None:
+            reason = "FOREIGN_POSITION_MANAGEMENT_REQUEST" if foreign_owner else "UNOWNED_POSITION_MANAGEMENT_REQUEST"
+            inventory_repository.record_quarantine(
+                {
+                    "algorithmId": ALGORITHM_ID,
+                    "algorithm_id": ALGORITHM_ID,
+                    "capitalPartitionId": snapshot.capital_partition_id,
+                    "capital_partition_id": snapshot.capital_partition_id,
+                    "settingsVersion": payload.get("settingsVersion") or snapshot.settings_version,
+                    "settings_version": payload.get("settingsVersion") or payload.get("settings_version") or snapshot.settings_version,
+                    "decisionId": payload.get("decisionId") or f"meta_strategy.position_management.explicit.{index}",
+                    "decision_id": payload.get("decisionId") or payload.get("decision_id") or f"meta_strategy.position_management.explicit.{index}",
+                    "jobId": getattr(job, "job_id", None) or payload.get("jobId") or payload.get("job_id") or "",
+                    "job_id": getattr(job, "job_id", None) or payload.get("jobId") or payload.get("job_id") or "",
+                    "eventId": payload.get("eventId") or payload.get("event_id") or f"explicit-position-management-{index}",
+                    "event_id": payload.get("eventId") or payload.get("event_id") or f"explicit-position-management-{index}",
+                    "symbol": requested_symbol or str(request.get("symbol") or "UNKNOWN"),
+                    "status": "BLOCKED",
+                    "timestamp": now.isoformat(),
+                    "observedAlgorithmId": observed_algorithm_id,
+                    "observedCapitalPartitionId": observed_capital_partition_id,
+                    "requestedPositionId": requested_position_id,
+                    "payload": {
+                        "request": request,
+                        "snapshotId": snapshot.snapshot_id,
+                        "openPositionIds": tuple(sorted(positions_by_id)),
+                        "openPositionSymbols": tuple(sorted(positions_by_symbol)),
+                    },
+                },
+                reason=reason,
+            )
+            decisions.append(
+                {
+                    "positionId": requested_position_id,
+                    "symbol": requested_symbol,
+                    "action": "BLOCKED",
+                    "reasonCodes": ("meta_strategy.position_management.foreign_or_unowned_position_request_rejected",),
+                }
+            )
+            continue
+        lifecycle = _position_lifecycle(inventory_repository, payload, open_position, snapshot)
+        if lifecycle is None:
+            decisions.append(
+                {
+                    "positionId": open_position.position_id,
+                    "symbol": open_position.symbol.upper(),
+                    "action": "BLOCKED",
+                    "reasonCodes": ("meta_strategy.position_management.protective_state_missing",),
+                }
+            )
+            continue
+        explicit_payload = {**request, "position": _jsonable(lifecycle)}
+        decisions.append(_jsonable(manage_meta_strategy_trade(_exit_inputs_from_payload(explicit_payload))))
+    return tuple(decisions)
 
 
 def _manage_open_positions(

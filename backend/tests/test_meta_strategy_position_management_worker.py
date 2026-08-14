@@ -178,6 +178,74 @@ class MetaStrategyPositionManagementWorkerTest(unittest.TestCase):
         self.assertEqual(result["createdExitIntentCount"], 1)
         self.assertEqual(outbox["payload"]["quantity"], 10)
 
+    def test_payload_only_foreign_position_request_is_quarantined_without_exit_intent(self) -> None:
+        env = RuntimeEnv()
+        env.enqueue_position_job(
+            candle={"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 101.0, "low": 97.0, "close": 98.0},
+            extra={
+                "positionManagementRequests": [
+                    {
+                        "position": {
+                            "algorithmId": "weighted_voting",
+                            "capitalPartitionId": "weighted_voting.paper.default",
+                            "positionId": "weighted-voting-spy-position",
+                            "symbol": "SPY",
+                            "side": "BUY",
+                            "quantity": 100,
+                            "entryPrice": 100.0,
+                            "openedAt": NOW.isoformat(),
+                            "protectiveStop": 98.0,
+                            "profitTarget": 104.0,
+                            "maximumHoldingMinutes": 30,
+                        },
+                        "candle": {"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 100.5, "low": 97.5, "close": 98.0},
+                    }
+                ]
+            },
+        )
+
+        result = env.worker().run_once(now=NOW + timedelta(minutes=1))
+
+        quarantine = env.inventory.inventory_records("quarantine", limit=5)[0]
+        self.assertEqual(result["createdExitIntentCount"], 0)
+        self.assertEqual(result["openPositionCount"], 0)
+        self.assertEqual(quarantine["payload"]["quarantineReason"], "FOREIGN_POSITION_MANAGEMENT_REQUEST")
+        self.assertEqual(quarantine["payload"]["observedAlgorithmId"], "weighted_voting")
+        with self.assertRaises(KeyError):
+            env.jobs.outbox_for_order_intent("meta_strategy.exit.weighted-voting-spy-position.PROTECTIVE_STOP")
+
+    def test_explicit_position_request_uses_current_meta_strategy_quantity(self) -> None:
+        env = RuntimeEnv()
+        env.seed_long_position(quantity=4)
+        env.enqueue_position_job(
+            candle={"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5},
+            extra={
+                "positionManagementRequests": [
+                    {
+                        "position": {
+                            "positionId": "meta_strategy.position.meta_strategy.paper.default.SPY",
+                            "symbol": "SPY",
+                            "side": "BUY",
+                            "quantity": 100,
+                            "entryPrice": 10.0,
+                            "openedAt": NOW.isoformat(),
+                            "protectiveStop": 9.0,
+                            "profitTarget": 11.0,
+                            "maximumHoldingMinutes": 30,
+                        },
+                        "candle": {"symbol": "SPY", "timestamp": (NOW + timedelta(minutes=1)).isoformat(), "open": 100.0, "high": 104.25, "low": 99.5, "close": 104.0},
+                    }
+                ]
+            },
+        )
+
+        result = env.worker().run_once(now=NOW + timedelta(minutes=1))
+
+        checkpoint = env.inventory.inventory_records("reconciliation_checkpoints", limit=5)[0]
+        explicit = checkpoint["payload"]["payload"]["decisions"][0]
+        self.assertEqual(explicit["exit_decision"]["exit_quantity"], 4)
+        self.assertEqual(explicit["exit_decision"]["exit_reason"], "PROFIT_TARGET")
+
 
 class RuntimeEnv:
     def __init__(self, *, database_url: str | None = None) -> None:

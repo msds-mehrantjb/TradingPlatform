@@ -52,6 +52,8 @@ class PaperGatewayFill(DomainModel):
     capitalPartitionId: str | None = None
     accountId: str | None = None
     orderIntentId: str = Field(min_length=1)
+    brokerOrderId: str | None = None
+    brokerFillId: str | None = None
     symbol: str = Field(min_length=1)
     side: Signal
     filledQuantity: int = Field(ge=0)

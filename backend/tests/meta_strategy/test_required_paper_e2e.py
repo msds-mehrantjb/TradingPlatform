@@ -729,6 +729,7 @@ class E2EPaperBroker:
             {
                 **order,
                 "brokerEventId": event_id,
+                "brokerFillId": event_id,
                 "status": status,
                 "side": side,
                 "filledQuantity": quantity,

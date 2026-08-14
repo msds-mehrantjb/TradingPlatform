@@ -253,6 +253,24 @@ class _PipelineState:
     final_valid: bool = False
 
 
+@dataclass(frozen=True)
+class _PipelineLocalRiskState:
+    account_equity: float | None
+    buying_power: float | None
+    allocated_capital: float | None
+    realized_daily_pnl: float
+    unrealized_pnl: float
+    reserved_risk: float
+    remaining_local_risk: float | None
+    global_available_risk: float | None
+    global_quantity_cap: int | None
+    daily_trade_count: int
+    last_trade_at: datetime | None
+    existing_position_symbols: tuple[str, ...]
+    existing_symbol_exposure: float
+    missing_reason_codes: tuple[str, ...]
+
+
 class InMemoryMetaStrategyPersistenceAdapter:
     def persist(self, payload: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -672,6 +690,7 @@ def _stage_local_gates(state: _PipelineState) -> None:
     candidate = _require(state.deterministic_candidate, "deterministic_candidate")
     inference = _require(state.inference, "inference")
     geometry = _require(state.geometry, "geometry")
+    risk_state = _pipeline_local_risk_state(state)
     state.local_gates = evaluate_meta_strategy_local_gates(
         MetaStrategyLocalGateContext(
             timestamp=snapshot.timestamp,
@@ -691,9 +710,9 @@ def _stage_local_gates(state: _PipelineState) -> None:
             reward_risk_after_costs=_number_or_default(geometry.expected_net_reward_risk, 0.0),
             spread_bps=_number_or_default(snapshot.spread_bps, 0.0),
             liquidity=float((snapshot.liquidity or {}).get("dollarVolume") or snapshot.volume),
-            realized_daily_pnl=request.realized_daily_pnl,
-            daily_trade_count=request.daily_trade_count,
-            last_trade_at=request.last_trade_at,
+            realized_daily_pnl=risk_state.realized_daily_pnl,
+            daily_trade_count=risk_state.daily_trade_count,
+            last_trade_at=risk_state.last_trade_at,
             event_blackout=request.event_blackout,
             session_phase=snapshot.session_phase,
             execution_mode="LIVE" if request.mode == "LIVE" else "PAPER",
@@ -752,7 +771,8 @@ def _stage_sizing(state: _PipelineState) -> None:
     local_gates = _require(state.local_gates, "local_gates")
     entry = geometry.entry_reference or snapshot.last_price
     stop_distance = geometry.stop_distance if geometry.stop_distance > 0 else max(0.0, abs(entry - (geometry.geometry.stop_price or entry)))
-    missing_reasons = _paper_sizing_missing_reasons(request) if request.mode == "PAPER" else ()
+    risk_state = _pipeline_local_risk_state(state)
+    missing_reasons = risk_state.missing_reason_codes if request.mode == "PAPER" else ()
     state.sizing = calculate_meta_strategy_position_size(
         MetaStrategySizingContext(
             side=inference.finalSignal if inference.finalSignal in {"BUY", "SELL"} else "HOLD",
@@ -761,14 +781,20 @@ def _stage_sizing(state: _PipelineState) -> None:
             baseline_settings=config.baseline_settings,
             effective_settings=profile.effective_settings,
             model_risk_multiplier=inference.recommendedRiskMultiplier,
-            account_equity=_pipeline_required_number(request.account_equity, config.default_account_equity, request.mode),
-            available_buying_power=_pipeline_required_number(request.available_buying_power, config.default_buying_power, request.mode),
+            account_equity=risk_state.account_equity if risk_state.account_equity is not None else _pipeline_required_number(None, config.default_account_equity, request.mode),
+            available_buying_power=risk_state.buying_power if risk_state.buying_power is not None else _pipeline_required_number(None, config.default_buying_power, request.mode),
             entry_price=entry,
             stop_distance=stop_distance,
             market_liquidity=float((snapshot.liquidity or {}).get("shareVolume") or snapshot.volume),
-            remaining_algorithm_risk=_pipeline_required_number(request.remaining_algorithm_risk, config.default_remaining_algorithm_risk, request.mode),
-            global_available_risk=_pipeline_required_number(request.global_available_risk, config.default_global_available_risk, request.mode),
-            global_quantity_cap=_pipeline_required_int(request.global_quantity_cap, config.default_global_quantity_cap, request.mode),
+            remaining_algorithm_risk=risk_state.remaining_local_risk if risk_state.remaining_local_risk is not None else _pipeline_required_number(None, config.default_remaining_algorithm_risk, request.mode),
+            global_available_risk=risk_state.global_available_risk,
+            global_quantity_cap=risk_state.global_quantity_cap,
+            existing_symbol_exposure=risk_state.existing_symbol_exposure,
+            realized_daily_pnl=risk_state.realized_daily_pnl,
+            unrealized_pnl=risk_state.unrealized_pnl,
+            reserved_risk=risk_state.reserved_risk,
+            maximum_daily_loss=config.settings.local_risk.maximum_daily_loss,
+            maximum_open_risk=config.settings.local_risk.maximum_open_risk,
         )
     )
     if missing_reasons:
@@ -835,6 +861,7 @@ def _stage_final_validation(state: _PipelineState) -> None:
     global_risk = state.global_risk or {}
     approved_quantity_raw = global_risk.get("approvedQuantity")
     approved_quantity = int(approved_quantity_raw) if approved_quantity_raw is not None else 0
+    risk_state = _pipeline_local_risk_state(state)
     entry = geometry.entry_reference or snapshot.last_price
     stop_distance = geometry.stop_distance if geometry.stop_distance > 0 else abs(entry - (geometry.geometry.stop_price or entry))
     state.order_validation = validate_meta_strategy_order(
@@ -850,15 +877,15 @@ def _stage_final_validation(state: _PipelineState) -> None:
             stop_price=geometry.geometry.stop_price,
             target_price=geometry.geometry.target_price,
             reward_risk=geometry.geometry.risk_reward,
-            available_buying_power=_pipeline_required_number(state.request.available_buying_power, state.config.default_buying_power, state.request.mode),
+            available_buying_power=risk_state.buying_power if risk_state.buying_power is not None else _pipeline_required_number(None, state.config.default_buying_power, state.request.mode),
             reserved_risk_dollars=approved_quantity * stop_distance,
-            maximum_reserved_risk_dollars=_pipeline_required_number(state.request.global_available_risk, state.config.default_global_available_risk, state.request.mode),
+            maximum_reserved_risk_dollars=risk_state.global_available_risk if risk_state.global_available_risk is not None else risk_state.remaining_local_risk if risk_state.remaining_local_risk is not None else _pipeline_required_number(None, state.config.default_global_available_risk, state.request.mode),
             session_allowed=state.request.session_allowed and not (state.request.mode == "LIVE" and not state.config.live_trading_enabled),
             max_quote_age_seconds=state.request.max_quote_age_seconds,
             max_spread_bps=state.dynamic_profile.effective_settings.spread_limit_bps if state.dynamic_profile else 15.0,
             minimum_liquidity=state.dynamic_profile.effective_settings.liquidity_requirement if state.dynamic_profile else 0.0,
-            duplicate_intent_ids=state.request.duplicate_order_intent_ids,
-            existing_position_symbols=state.request.existing_position_symbols if state.config.settings.position_management.one_position_per_symbol else (),
+            duplicate_intent_ids=_duplicate_order_intent_ids_from_inventory(state.request.inventory_snapshot or {}),
+            existing_position_symbols=risk_state.existing_position_symbols if state.config.settings.position_management.one_position_per_symbol else (),
         )
     )
     if state.request.mode == "LIVE" and not state.config.live_trading_enabled:
@@ -1082,7 +1109,7 @@ def _explicit_safety_vetoes(state: _PipelineState) -> tuple[str, ...]:
         vetoes.append("meta_strategy.safety.liquidity_unacceptable")
     if not _operationally_healthy(state):
         vetoes.append("meta_strategy.safety.operational_health_failed")
-    if request.realized_daily_pnl <= -float(state.config.settings.local_risk.maximum_daily_loss):
+    if _pipeline_local_risk_state(state).realized_daily_pnl <= -float(state.config.settings.local_risk.maximum_daily_loss):
         vetoes.append("meta_strategy.safety.daily_loss_limit_reached")
     if _emergency_or_entry_pause_active(state):
         vetoes.append("meta_strategy.safety.emergency_or_entry_pause_active")
@@ -1157,11 +1184,8 @@ def _timeframe_supported(state: _PipelineState) -> bool:
 
 def _has_conflicting_position_state(state: _PipelineState) -> bool:
     snapshot = _require(state.snapshot, "snapshot")
-    existing = {symbol.upper() for symbol in state.request.existing_position_symbols}
-    if snapshot.symbol.upper() in existing and state.config.settings.position_management.one_position_per_symbol:
-        return True
-    position_state = (snapshot.features or {}).get("existingPositionState") or {}
-    return isinstance(position_state, Mapping) and not bool(position_state.get("policyAllowsEntry", True))
+    existing = {symbol.upper() for symbol in _pipeline_local_risk_state(state).existing_position_symbols}
+    return snapshot.symbol.upper() in existing and state.config.settings.position_management.one_position_per_symbol
 
 
 def _family_alignment_from_aggregation(signal: str, family_scores: tuple[Any, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -1207,6 +1231,193 @@ def _coerce_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _pipeline_local_risk_state(state: _PipelineState) -> _PipelineLocalRiskState:
+    request = state.request
+    snapshot = _require(state.snapshot, "snapshot")
+    account = dict(request.account_snapshot or {})
+    inventory = dict(request.inventory_snapshot or {})
+    global_risk = dict(request.global_risk_snapshot or {})
+    paper_mode = request.mode == "PAPER"
+
+    account_equity = _snapshot_float(account, "accountEquity", "account_equity", "equity")
+    buying_power = _snapshot_float(account, "buyingPower", "buying_power", "cashAvailable", "cash_available")
+    allocated_capital = _snapshot_float(account, "allocatedCapital", "allocated_capital")
+    if allocated_capital is None:
+        allocated_capital = _snapshot_float(inventory, "allocatedCapital", "allocated_capital")
+    realized_daily_pnl = _snapshot_float(inventory, "realizedDailyPnl", "realisedDailyPnl", "dailyRealizedPnl", "dailyRealisedPnl", "daily_realized_pnl", "daily_realised_pnl", "realizedPnl", "realisedPnl", "realized_pnl", "realised_pnl")
+    cumulative_realized_pnl = _snapshot_float(inventory, "realizedPnl", "realisedPnl", "realized_pnl", "realised_pnl")
+    unrealized_pnl = _snapshot_float(inventory, "unrealizedPnl", "unrealisedPnl", "unrealized_pnl", "unrealised_pnl")
+    fees_and_slippage = _snapshot_float(account, "feesAndSlippage", "fees_and_slippage")
+    if fees_and_slippage is None:
+        fees_and_slippage = _snapshot_float(inventory, "feesAndSlippage", "fees_and_slippage")
+    reserved_risk = _snapshot_float(inventory, "reservedRiskDollars", "reserved_risk_dollars", "reservedRisk", "reserved_risk")
+    daily_trade_count = _snapshot_int(inventory, "dailyTradeCount", "daily_trade_count")
+
+    if account_equity is None and allocated_capital is not None:
+        account_equity = _account_equity_from_parts(allocated_capital, cumulative_realized_pnl if cumulative_realized_pnl is not None else realized_daily_pnl, unrealized_pnl, fees_and_slippage)
+    if not paper_mode:
+        if account_equity is None:
+            account_equity = _number_or_default(request.account_equity, state.config.default_account_equity)
+        if buying_power is None:
+            buying_power = _number_or_default(request.available_buying_power, state.config.default_buying_power)
+        if daily_trade_count is None:
+            daily_trade_count = int(request.daily_trade_count)
+        if realized_daily_pnl is None:
+            realized_daily_pnl = float(request.realized_daily_pnl)
+        if reserved_risk is None:
+            reserved_risk = 0.0
+
+    realized = float(realized_daily_pnl or 0.0)
+    unrealized = float(unrealized_pnl or 0.0)
+    reserved = float(reserved_risk or 0.0)
+    remaining_local_risk = _remaining_local_risk_from_inventory(state, account_equity, realized, reserved)
+    if not paper_mode and request.remaining_algorithm_risk is not None:
+        remaining_local_risk = min(float(request.remaining_algorithm_risk), remaining_local_risk if remaining_local_risk is not None else float(request.remaining_algorithm_risk))
+
+    global_available_risk = _global_available_risk_from_snapshot(global_risk)
+    global_quantity_cap = _global_quantity_cap_from_snapshot(global_risk)
+    if not paper_mode:
+        if global_available_risk is None:
+            global_available_risk = _number_or_default(request.global_available_risk, state.config.default_global_available_risk)
+        if global_quantity_cap is None:
+            global_quantity_cap = _pipeline_required_int(request.global_quantity_cap, state.config.default_global_quantity_cap, request.mode)
+
+    existing_symbols = _existing_position_symbols_from_inventory(inventory)
+    if not existing_symbols and not paper_mode:
+        existing_symbols = tuple(str(symbol).upper() for symbol in request.existing_position_symbols)
+    missing = []
+    if paper_mode:
+        if account_equity is None:
+            missing.append("meta_strategy.sizing.account_equity_unavailable")
+        if buying_power is None:
+            missing.append("meta_strategy.sizing.buying_power_unavailable")
+        if remaining_local_risk is None:
+            missing.append("meta_strategy.sizing.algorithm_risk_unavailable")
+    return _PipelineLocalRiskState(
+        account_equity=account_equity,
+        buying_power=buying_power,
+        allocated_capital=allocated_capital,
+        realized_daily_pnl=realized,
+        unrealized_pnl=unrealized,
+        reserved_risk=reserved,
+        remaining_local_risk=remaining_local_risk,
+        global_available_risk=global_available_risk,
+        global_quantity_cap=global_quantity_cap,
+        daily_trade_count=int(daily_trade_count or 0),
+        last_trade_at=_last_trade_at_from_inventory(inventory) or (None if paper_mode else request.last_trade_at),
+        existing_position_symbols=existing_symbols,
+        existing_symbol_exposure=_symbol_exposure_from_inventory(inventory, snapshot.symbol),
+        missing_reason_codes=tuple(dict.fromkeys(missing)),
+    )
+
+
+def _account_equity_from_parts(allocated_capital: float | None, realized_pnl: float | None, unrealized_pnl: float | None, fees_and_slippage: float | None) -> float | None:
+    if allocated_capital is None:
+        return None
+    return round(max(0.0, float(allocated_capital) + float(realized_pnl or 0.0) + float(unrealized_pnl or 0.0) - float(fees_and_slippage or 0.0)), 10)
+
+
+def _remaining_local_risk_from_inventory(state: _PipelineState, account_equity: float | None, realized_daily_pnl: float, reserved_risk: float) -> float | None:
+    if account_equity is None:
+        return None
+    settings = state.config.settings.local_risk
+    configured_trade_risk = max(0.0, float(account_equity) * float(settings.risk_percentage))
+    daily_loss_remaining = max(0.0, float(settings.maximum_daily_loss) + float(realized_daily_pnl))
+    open_risk_remaining = max(0.0, float(settings.maximum_open_risk) - float(reserved_risk))
+    return round(max(0.0, min(configured_trade_risk, daily_loss_remaining, open_risk_remaining)), 10)
+
+
+def _global_available_risk_from_snapshot(snapshot: Mapping[str, Any]) -> float | None:
+    if not snapshot:
+        return None
+    if bool(snapshot.get("reject") or snapshot.get("rejected") or snapshot.get("tradingHalt") or snapshot.get("trading_halt")):
+        return 0.0
+    return _snapshot_float(snapshot, "availableRiskDollars", "available_risk_dollars", "globalAvailableRisk", "global_available_risk")
+
+
+def _global_quantity_cap_from_snapshot(snapshot: Mapping[str, Any]) -> int | None:
+    if not snapshot:
+        return None
+    if bool(snapshot.get("reject") or snapshot.get("rejected") or snapshot.get("tradingHalt") or snapshot.get("trading_halt")):
+        return 0
+    return _snapshot_int(snapshot, "maxQuantity", "max_quantity", "globalQuantityCap", "global_quantity_cap", "approvedQuantity", "approved_quantity")
+
+
+def _symbol_exposure_from_inventory(inventory: Mapping[str, Any], symbol: str) -> float:
+    normalized = str(symbol).upper()
+    for key in ("symbolExposure", "symbol_exposure"):
+        exposure = inventory.get(key)
+        if isinstance(exposure, Mapping):
+            value = _snapshot_float(exposure, normalized, normalized.lower(), symbol)
+            if value is not None:
+                return abs(float(value))
+    total = 0.0
+    for position in _inventory_positions(inventory):
+        if str(position.get("symbol") or "").upper() != normalized:
+            continue
+        quantity = _snapshot_float(position, "quantity", "qty") or 0.0
+        price = _snapshot_float(position, "marketPrice", "market_price", "averagePrice", "average_price", "price") or 0.0
+        total += abs(float(quantity) * float(price))
+    return round(total, 10)
+
+
+def _duplicate_order_intent_ids_from_inventory(inventory: Mapping[str, Any]) -> tuple[str, ...]:
+    rows = inventory.get("pendingOrderIntents") or inventory.get("orderIntents") or inventory.get("order_intents") or ()
+    if not isinstance(rows, tuple | list):
+        return ()
+    return tuple(
+        str(row.get("orderIntentId") or row.get("order_intent_id"))
+        for row in rows
+        if isinstance(row, Mapping) and (row.get("orderIntentId") or row.get("order_intent_id"))
+    )
+
+
+def _existing_position_symbols_from_inventory(inventory: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(sorted({str(position.get("symbol") or "").upper() for position in _inventory_positions(inventory) if position.get("symbol")}))
+
+
+def _inventory_positions(inventory: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    rows = inventory.get("positions") or inventory.get("currentVirtualPositions") or inventory.get("openPositions") or inventory.get("open_positions") or ()
+    if not isinstance(rows, tuple | list):
+        return ()
+    return tuple(row for row in rows if isinstance(row, Mapping))
+
+
+def _last_trade_at_from_inventory(inventory: Mapping[str, Any]) -> datetime | None:
+    value = inventory.get("lastTradeAt") or inventory.get("last_trade_at")
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _snapshot_float(payload: Mapping[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = payload.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _snapshot_int(payload: Mapping[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        value = payload.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _build_result(state: _PipelineState) -> MetaStrategyExecutionPipelineResult:

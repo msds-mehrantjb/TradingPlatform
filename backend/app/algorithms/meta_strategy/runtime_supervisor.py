@@ -225,6 +225,23 @@ class MetaStrategyRuntimeSupervisor:
         )
         lag_clear = all(lag <= self.config.max_queue_lag_seconds for lag in self.metrics.queue_lag_seconds.values())
         dead_letters_clear = self.metrics.dead_letter_count <= self.config.max_dead_letter_count
+        required_runtime_prerequisites = (
+            "paperBrokerVerified",
+            "brokerPaperOnly",
+            "authoritativeMarketDataHealthy",
+            "marketClockHealthy",
+            "globalRiskSourceCurrent",
+            "inventoryRepositoryAvailable",
+            "inventoryConsistencyPasses",
+            "allocatedCapitalPositive",
+            "accountSnapshotMetaStrategyDerived",
+            "riskSnapshotMetaStrategyDerived",
+            "restartReconstructionSucceeded",
+            "paperToggleEnabled",
+            "runtimeModePaper",
+            "liveTradingDisabled",
+        )
+        runtime_prerequisites_healthy = all(runtime_prerequisites.get(key) is True for key in required_runtime_prerequisites)
         ready = bool(
             enabled
             and self.config.mode == MetaStrategyRuntimeMode.PAPER
@@ -234,6 +251,7 @@ class MetaStrategyRuntimeSupervisor:
             and market_workers_healthy
             and lag_clear
             and dead_letters_clear
+            and runtime_prerequisites_healthy
         )
         status = "disabled" if not enabled else "ready" if ready else "unavailable" if self.metrics.startup_failed else "shadow" if self.metrics.supervisor_started else "stopped"
         return {
@@ -269,7 +287,6 @@ class MetaStrategyRuntimeSupervisor:
         broker = getattr(self.paper_gateway, "broker", None) if self.paper_gateway is not None else getattr(self.dependencies, "broker_adapter", None)
         paper_verified = False
         clock_healthy = False
-        local_ledger_mode = str(getattr(broker, "broker_kind", "")).lower() == "local_paper_ledger"
         verifier = getattr(broker, "verify_paper_account", None)
         if callable(verifier):
             try:
@@ -283,17 +300,51 @@ class MetaStrategyRuntimeSupervisor:
                 clock_healthy = bool(isinstance(clock, Mapping) and clock.get("fresh") is True)
             except Exception:
                 clock_healthy = False
-        global_risk_current = False
+        account_snapshot: Mapping[str, Any] = {}
+        account_source = getattr(self.dependencies, "account_data_source", None) if self.dependencies is not None else self.account_source
         try:
-            snapshot = _load_global_risk_snapshot(self.global_risk_source)
-            global_risk_current = bool(isinstance(snapshot, Mapping) and snapshot.get("current") is True and snapshot.get("status") == "OK")
+            account_snapshot = _load_account_snapshot(account_source)
         except Exception:
-            global_risk_current = False
+            account_snapshot = {}
+        risk_snapshot: Mapping[str, Any] = {}
+        risk_source = getattr(self.dependencies, "global_risk_source", None) if self.dependencies is not None else self.global_risk_source
+        try:
+            risk_snapshot = _load_global_risk_snapshot(risk_source or self.global_risk_source)
+        except Exception:
+            risk_snapshot = {}
+        global_risk_current = bool(isinstance(risk_snapshot, Mapping) and risk_snapshot.get("current") is True and risk_snapshot.get("status") == "OK")
+        inventory_repository_available = False
+        inventory_consistency_passes = False
+        allocated_capital_positive = False
+        if self.dependencies is not None and self.dependencies.inventory_repository is not None:
+            try:
+                inventory_snapshot = self.dependencies.inventory_repository.current_inventory_snapshot()
+                consistency = self.dependencies.inventory_repository.check_inventory_consistency()
+                inventory_repository_available = (
+                    getattr(inventory_snapshot, "algorithm_id", None) == ALGORITHM_ID
+                    and getattr(inventory_snapshot, "capital_partition_id", None) == "meta_strategy.paper.default"
+                )
+                inventory_consistency_passes = bool(consistency.get("consistent") is True)
+                allocated_capital_positive = float(getattr(inventory_snapshot, "allocated_capital", 0.0) or 0.0) > 0.0
+            except Exception:
+                inventory_repository_available = False
+        control_state = _load_paper_control_state(getattr(self.dependencies, "job_repository", None) if self.dependencies is not None else None)
+        gateway_mode = str(getattr(self.paper_gateway, "execution_mode", "") or "").upper()
         return {
             "paperBrokerVerified": paper_verified,
+            "brokerPaperOnly": bool(gateway_mode in {"LOCAL_PAPER", "BROKER_PAPER"} and paper_verified),
             "marketClockHealthy": clock_healthy,
             "globalRiskSourceCurrent": global_risk_current,
-            "authoritativeMarketDataHealthy": local_ledger_mode or self.metrics.worker_status.get("finalized_candle_producer") == "healthy",
+            "authoritativeMarketDataHealthy": self.metrics.worker_status.get("finalized_candle_producer") == "healthy",
+            "inventoryRepositoryAvailable": inventory_repository_available,
+            "inventoryConsistencyPasses": inventory_consistency_passes,
+            "allocatedCapitalPositive": allocated_capital_positive,
+            "accountSnapshotMetaStrategyDerived": _account_snapshot_meta_strategy_derived(account_snapshot),
+            "riskSnapshotMetaStrategyDerived": _risk_snapshot_meta_strategy_derived(risk_snapshot),
+            "restartReconstructionSucceeded": dict(self.metrics.last_reconstruction or {}).get("status") == "OK",
+            "paperToggleEnabled": control_state.get("newPaperEntriesEnabled") is True and control_state.get("paperOnly") is True,
+            "runtimeModePaper": self.config.mode == MetaStrategyRuntimeMode.PAPER,
+            "liveTradingDisabled": control_state.get("liveExecutionEnabled") is False and self.config.mode != MetaStrategyRuntimeMode.LIVE,
         }
 
     def _construct_dependencies(self) -> None:
@@ -323,7 +374,7 @@ class MetaStrategyRuntimeSupervisor:
             self.global_risk_source = local_settings_risk
         if self.global_risk_source is None:
             raise MetaStrategyRuntimeStartupError(("meta_strategy.runtime.global_risk_source_required",))
-        self.paper_gateway = PaperOrderGateway(broker, job_repository.gateway_store())
+        self.paper_gateway = PaperOrderGateway(broker, job_repository.gateway_store(), execution_mode=_paper_gateway_execution_mode(broker))
         self.dependencies = MetaStrategyRuntimeDependencies(
             mode=self.config.mode,
             persistence_adapter=None,
@@ -493,22 +544,18 @@ class MetaStrategyRuntimeSupervisor:
                 self.metrics.last_worker_result["finalized_candle_producer"] = _plain(result)
             except Exception as exc:
                 self.metrics.last_error = str(exc)
-                if self._local_paper_ledger_mode():
-                    self.metrics.worker_status["finalized_candle_producer"] = "healthy"
-                    self.metrics.worker_iterations["finalized_candle_producer"] = self.metrics.worker_iterations.get("finalized_candle_producer", 0) + 1
-                    self.metrics.last_worker_result["finalized_candle_producer"] = (
-                        {
-                            "algorithmId": "meta_strategy",
-                            "producerVersion": "meta_strategy_finalized_candle_producer_v1",
-                            "status": "BLOCKED",
-                            "reasonCodes": ("meta_strategy.candle.market_data_unavailable",),
-                            "dataQualityState": {"status": "MARKET_DATA_UNAVAILABLE", "detail": str(exc)},
-                        },
-                    )
-                else:
-                    self.metrics.worker_status["finalized_candle_producer"] = "failed"
-                    self.metrics.worker_failures["finalized_candle_producer"] = self.metrics.worker_failures.get("finalized_candle_producer", 0) + 1
-                    self.metrics.unavailable_reason_codes = ("meta_strategy.runtime.candle_producer_failed",)
+                self.metrics.worker_status["finalized_candle_producer"] = "failed"
+                self.metrics.worker_failures["finalized_candle_producer"] = self.metrics.worker_failures.get("finalized_candle_producer", 0) + 1
+                self.metrics.unavailable_reason_codes = ("meta_strategy.runtime.candle_producer_failed",)
+                self.metrics.last_worker_result["finalized_candle_producer"] = (
+                    {
+                        "algorithmId": "meta_strategy",
+                        "producerVersion": "meta_strategy_finalized_candle_producer_v1",
+                        "status": "BLOCKED",
+                        "reasonCodes": ("meta_strategy.candle.market_data_unavailable",),
+                        "dataQualityState": {"status": "MARKET_DATA_UNAVAILABLE", "detail": str(exc)},
+                    },
+                )
             await self._sleep(self.config.candle_poll_seconds)
 
     async def _run_worker_once(self, queue_name: str, worker: Any, *, now: datetime | None = None) -> None:
@@ -541,9 +588,6 @@ class MetaStrategyRuntimeSupervisor:
         )
         self.metrics.scheduled_jobs[job_type] = job.job_id
 
-    def _local_paper_ledger_mode(self) -> bool:
-        broker = getattr(self.paper_gateway, "broker", None) if self.paper_gateway is not None else getattr(self.dependencies, "broker_adapter", None)
-        return str(getattr(broker, "broker_kind", "")).lower() == "local_paper_ledger"
 
     def _monitor_queues(self) -> None:
         if self.dependencies is None or self.dependencies.job_repository is None:
@@ -647,6 +691,35 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
     return max(minimum, value)
 
 
+def _load_paper_control_state(repository: Any | None) -> dict[str, Any]:
+    if repository is None or not hasattr(repository, "read_paper_trading_control"):
+        return {}
+    try:
+        record = repository.read_paper_trading_control(capital_partition_id="meta_strategy.paper.default")
+    except Exception:
+        return {}
+    if record is None:
+        return {}
+    to_dict = getattr(record, "to_dict", None)
+    return dict(to_dict()) if callable(to_dict) else dict(record)
+
+
+def _account_snapshot_meta_strategy_derived(snapshot: Mapping[str, Any]) -> bool:
+    return (
+        snapshot.get("algorithmId") == ALGORITHM_ID
+        and snapshot.get("capitalPartitionId") == "meta_strategy.paper.default"
+        and snapshot.get("accountAuthority") == "meta_strategy_inventory.current_inventory_snapshot"
+    )
+
+
+def _risk_snapshot_meta_strategy_derived(snapshot: Mapping[str, Any]) -> bool:
+    return (
+        snapshot.get("algorithmId") == ALGORITHM_ID
+        and snapshot.get("capitalPartitionId") == "meta_strategy.paper.default"
+        and snapshot.get("source") == "meta_strategy_local_settings_risk"
+    )
+
+
 def _env_int(name: str, default: int, *, minimum: int) -> int:
     raw = os.getenv(name)
     if raw is None:
@@ -687,6 +760,10 @@ def _load_global_risk_snapshot(source: Any | None) -> Mapping[str, Any]:
 def _load_account_snapshot(source: Any | None) -> Mapping[str, Any]:
     if source is None:
         return {"paperBrokerConfigured": False, "reasonCodes": ("meta_strategy.runtime.paper_broker_required",)}
+    if hasattr(source, "load_snapshot"):
+        payload = source.load_snapshot()
+        if isinstance(payload, Mapping):
+            return payload
     reader = getattr(source, "read_account_snapshot", None)
     if callable(reader):
         payload = reader(at=datetime.now(UTC))
@@ -700,8 +777,12 @@ def _load_account_snapshot(source: Any | None) -> Mapping[str, Any]:
     }
 
 
+def _paper_gateway_execution_mode(broker: Any) -> str:
+    broker_kind = str(getattr(broker, "broker_kind", "")).lower()
+    return "LOCAL_PAPER" if broker_kind in {"local_paper_ledger", "local_paper"} else "BROKER_PAPER"
+
 def _paper_broker_from_env(settings: Any | None, store: Any | None = None) -> Any:
-    broker = os.getenv("META_STRATEGY_PAPER_BROKER", "ALPACA").strip().upper()
+    broker = os.getenv("META_STRATEGY_PAPER_BROKER", "LOCAL_LEDGER").strip().upper()
     if broker in {"LOCAL_LEDGER", "LEDGER", "PAPER_LEDGER"}:
         if store is None:
             raise ValueError("meta_strategy.local_ledger.store_required")

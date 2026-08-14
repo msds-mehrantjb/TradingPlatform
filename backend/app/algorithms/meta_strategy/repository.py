@@ -16,6 +16,7 @@ from backend.app.algorithms.meta_strategy.identity import ALGORITHM_ID
 from backend.app.algorithms.meta_strategy.ownership import (
     META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
     META_STRATEGY_REQUIRED_IDENTITY_FIELDS,
+    meta_strategy_ownership_violation,
 )
 from backend.app.algorithms.meta_strategy.versions import (
     META_STRATEGY_ALGORITHM_VERSION,
@@ -113,6 +114,10 @@ META_STRATEGY_INVENTORY_QUERY_TABLES: dict[str, str] = {
     "snapshots": "meta_strategy_inventory_snapshots",
 }
 
+_RESERVATION_RELEASING_ORDER_STATUSES = frozenset(
+    {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "DONE_FOR_DAY", "DEAD_LETTER"}
+)
+
 META_STRATEGY_REQUIRED_ATTRIBUTION_COLUMNS = (
     "algorithm_id",
     "capital_partition_id",
@@ -144,7 +149,22 @@ META_STRATEGY_VERSION_COLUMNS = (
 
 
 class MetaStrategyRepositoryAttributionError(ValueError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_codes: tuple[str, ...] = (),
+        observed_algorithm_id: str | None = None,
+        observed_capital_partition_id: str | None = None,
+        expected_algorithm_id: str = ALGORITHM_ID,
+        expected_capital_partition_id: str = META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+    ) -> None:
+        super().__init__(message)
+        self.reason_codes = reason_codes
+        self.observed_algorithm_id = observed_algorithm_id
+        self.observed_capital_partition_id = observed_capital_partition_id
+        self.expected_algorithm_id = expected_algorithm_id
+        self.expected_capital_partition_id = expected_capital_partition_id
 
 
 class MetaStrategyInventoryOwnershipConflict(ValueError):
@@ -215,6 +235,7 @@ class MetaStrategyInventorySnapshot:
     reserved_risk_dollars: float
     allocated_capital: float
     daily_trade_count: int
+    daily_realised_pnl: float
     strategy_exposure: dict[str, float]
     family_exposure: dict[str, float]
     symbol_exposure: dict[str, float]
@@ -299,14 +320,34 @@ class MetaStrategySqliteRepository:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
+        conn = self._open_connection()
         try:
             yield conn
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
+
+    @contextmanager
+    def inventory_transaction(self) -> Iterator[sqlite3.Connection]:
+        conn = self._open_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _open_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
 
     def persist(self, artifact_type: str, payload: Any, *, record_id: str | None = None) -> MetaStrategyRepositoryRecord:
         with self.connect() as conn:
@@ -380,7 +421,7 @@ class MetaStrategySqliteRepository:
 
     def record_order_intent(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         normalized = _normalize_inventory_payload(payload)
-        with self.connect() as conn:
+        with self.inventory_transaction() as conn:
             self._insert_inventory_record(conn, "meta_strategy_inventory_order_intents", normalized)
             reserved = _float_value(normalized, "reservedRiskDollars", "reserved_risk_dollars")
             outstanding = self._reserved_risk_outstanding(conn, normalized)
@@ -396,7 +437,7 @@ class MetaStrategySqliteRepository:
     def adjust_reserved_risk(self, payload: Mapping[str, Any], *, target_reserved_risk: float, reason: str) -> dict[str, Any]:
         normalized = _normalize_inventory_payload(payload)
         target = round(max(0.0, float(target_reserved_risk)), 10)
-        with self.connect() as conn:
+        with self.inventory_transaction() as conn:
             outstanding = self._reserved_risk_outstanding(conn, normalized)
             delta = round(target - outstanding, 10)
             if abs(delta) > 1e-9:
@@ -415,7 +456,7 @@ class MetaStrategySqliteRepository:
 
     def record_submitted_order(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         normalized = _normalize_inventory_payload(payload)
-        with self.connect() as conn:
+        with self.inventory_transaction() as conn:
             self._insert_inventory_record(conn, "meta_strategy_inventory_submitted_orders", normalized)
             self._insert_inventory_record(conn, "meta_strategy_inventory_order_status_history", normalized)
             self._store_inventory_projection(conn, mark_prices={})
@@ -424,9 +465,9 @@ class MetaStrategySqliteRepository:
     def record_order_status(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         normalized = _normalize_inventory_payload(payload)
         status = _status(normalized)
-        with self.connect() as conn:
+        with self.inventory_transaction() as conn:
             self._insert_inventory_record(conn, "meta_strategy_inventory_order_status_history", normalized)
-            if status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+            if status in _RESERVATION_RELEASING_ORDER_STATUSES:
                 self._release_reserved_risk(conn, normalized, reason=f"ORDER_{status}")
             if status in {"UNKNOWN", "TIMEOUT", "RECONCILIATION_REQUIRED"}:
                 self._quarantine_inventory_record(conn, normalized, reason=f"ORDER_{status}")
@@ -435,10 +476,9 @@ class MetaStrategySqliteRepository:
 
     def ingest_broker_fill(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         normalized = _normalize_inventory_payload(payload)
+        _validate_required_fill_payload(normalized)
         broker_fill_id = _string_value(normalized, "", "brokerFillId", "broker_fill_id")
-        if not broker_fill_id:
-            raise ValueError("Meta-Strategy fill ingestion requires brokerFillId")
-        with self.connect() as conn:
+        with self.inventory_transaction() as conn:
             existing = conn.execute(
                 """
                 SELECT record_id
@@ -449,6 +489,7 @@ class MetaStrategySqliteRepository:
             ).fetchone()
             if existing is not None:
                 return {"algorithmId": ALGORITHM_ID, "status": "DUPLICATE_IGNORED", "brokerFillId": broker_fill_id, "reasonCodes": ("meta_strategy.inventory.duplicate_fill_ignored",)}
+            self._record_trade_for_exit_fill(conn, normalized)
             self._insert_inventory_record(conn, "meta_strategy_inventory_fills", normalized)
             self._release_reserved_risk_for_fill(conn, normalized)
             self._store_inventory_projection(conn, mark_prices={})
@@ -456,21 +497,21 @@ class MetaStrategySqliteRepository:
 
     def record_allocated_capital(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         normalized = _normalize_inventory_payload(payload)
-        with self.connect() as conn:
+        with self.inventory_transaction() as conn:
             self._insert_inventory_record(conn, "meta_strategy_inventory_allocated_capital", normalized)
             self._store_inventory_projection(conn, mark_prices={})
         return {"algorithmId": ALGORITHM_ID, "status": "RECORDED", "reasonCodes": ("meta_strategy.inventory.allocated_capital_recorded",)}
 
     def record_reconciliation_checkpoint(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         normalized = _normalize_inventory_payload(payload)
-        with self.connect() as conn:
+        with self.inventory_transaction() as conn:
             self._insert_inventory_record(conn, "meta_strategy_inventory_reconciliation_checkpoints", normalized)
             self._store_inventory_projection(conn, mark_prices={})
         return {"algorithmId": ALGORITHM_ID, "status": "RECORDED", "reasonCodes": ("meta_strategy.inventory.reconciliation_checkpoint_recorded",)}
 
     def record_position_lifecycle(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         normalized = _normalize_inventory_payload(payload)
-        with self.connect() as conn:
+        with self.inventory_transaction() as conn:
             self._insert_inventory_record(conn, "meta_strategy_inventory_position_lifecycle", normalized)
         return {"algorithmId": ALGORITHM_ID, "status": "RECORDED", "reasonCodes": ("meta_strategy.inventory.position_lifecycle_recorded",)}
 
@@ -502,7 +543,7 @@ class MetaStrategySqliteRepository:
 
     def record_quarantine(self, payload: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
         normalized = _normalize_inventory_payload({**dict(payload), "quarantineReason": reason, "status": "QUARANTINED", "orderStatus": "QUARANTINED"})
-        with self.connect() as conn:
+        with self.inventory_transaction() as conn:
             self._quarantine_inventory_record(conn, normalized, reason=reason)
         return {"algorithmId": ALGORITHM_ID, "status": "QUARANTINED", "reasonCodes": ("meta_strategy.inventory.quarantined",)}
 
@@ -521,23 +562,25 @@ class MetaStrategySqliteRepository:
             "status": "QUARANTINED",
             "orderStatus": "QUARANTINED",
         }
-        with self.connect() as conn:
+        with self.inventory_transaction() as conn:
             self._quarantine_inventory_record(conn, normalized, reason=reason)
         return {"algorithmId": ALGORITHM_ID, "status": "QUARANTINED", "reasonCodes": ("meta_strategy.inventory.ownership_conflict_quarantined",)}
 
-    def current_inventory_snapshot(self, *, mark_prices: Mapping[str, float] | None = None) -> MetaStrategyInventorySnapshot:
+    def current_inventory_snapshot(self, *, mark_prices: Mapping[str, float] | None = None, as_of: datetime | date | str | None = None) -> MetaStrategyInventorySnapshot:
         with self.connect() as conn:
-            snapshot = self._rebuild_inventory_from_ledger(conn, mark_prices=mark_prices or {})
-            self._store_inventory_projection(conn, mark_prices=mark_prices or {}, snapshot=snapshot)
+            effective_mark_prices = self._effective_mark_prices(conn, mark_prices)
+            snapshot = self._rebuild_inventory_from_ledger(conn, mark_prices=effective_mark_prices, session_date=_inventory_session_date(as_of))
+            self._store_inventory_projection(conn, mark_prices=effective_mark_prices, snapshot=snapshot)
         return snapshot
 
-    def rebuild_inventory_from_ledger(self, *, mark_prices: Mapping[str, float] | None = None) -> MetaStrategyInventorySnapshot:
+    def rebuild_inventory_from_ledger(self, *, mark_prices: Mapping[str, float] | None = None, as_of: datetime | date | str | None = None) -> MetaStrategyInventorySnapshot:
         with self.connect() as conn:
-            return self._rebuild_inventory_from_ledger(conn, mark_prices=mark_prices or {})
+            return self._rebuild_inventory_from_ledger(conn, mark_prices=self._effective_mark_prices(conn, mark_prices), session_date=_inventory_session_date(as_of))
 
-    def check_inventory_consistency(self, *, mark_prices: Mapping[str, float] | None = None) -> dict[str, Any]:
+    def check_inventory_consistency(self, *, mark_prices: Mapping[str, float] | None = None, as_of: datetime | date | str | None = None) -> dict[str, Any]:
         with self.connect() as conn:
-            derived = self._rebuild_inventory_from_ledger(conn, mark_prices=mark_prices or {})
+            effective_mark_prices = self._effective_mark_prices(conn, mark_prices)
+            derived = self._rebuild_inventory_from_ledger(conn, mark_prices=effective_mark_prices, session_date=_inventory_session_date(as_of))
             stored_row = conn.execute(
                 """
                 SELECT payload_json
@@ -549,7 +592,7 @@ class MetaStrategySqliteRepository:
                 (ALGORITHM_ID, self.capital_partition_id),
             ).fetchone()
             if stored_row is None:
-                self._store_inventory_projection(conn, mark_prices=mark_prices or {}, snapshot=derived)
+                self._store_inventory_projection(conn, mark_prices=effective_mark_prices, snapshot=derived)
                 stored = derived
             else:
                 stored = _snapshot_from_payload(json.loads(str(stored_row["payload_json"])))
@@ -610,12 +653,72 @@ class MetaStrategySqliteRepository:
             for row in rows
         )
 
+    def _record_trade_for_exit_fill(self, conn: sqlite3.Connection, fill: Mapping[str, Any]) -> None:
+        if _string_value(fill, "", "side").upper() != "SELL":
+            return
+        symbol = _string_value(fill, "", "symbol", "ticker").upper()
+        fill_qty = _fill_quantity(fill)
+        if fill_qty <= 0.0:
+            return
+        exit_price = _float_value(fill, "fillPrice", "price", "averageFillPrice", "average_fill_price")
+        before = self._rebuild_inventory_from_ledger(conn, mark_prices={})
+        symbol_lots = [lot for lot in before.open_lots if lot.symbol == symbol]
+        open_qty = round(sum(lot.quantity for lot in symbol_lots), 10)
+        close_qty = min(fill_qty, open_qty)
+        if close_qty <= 0.0:
+            return
+
+        remaining = close_qty
+        realised = 0.0
+        consumed_lots: list[dict[str, object]] = []
+        for lot in symbol_lots:
+            if remaining <= 0.0:
+                break
+            consumed = min(lot.quantity, remaining)
+            realised += (exit_price - lot.average_price) * consumed
+            consumed_lots.append(
+                {
+                    "lotId": lot.lot_id,
+                    "quantity": round(consumed, 10),
+                    "averagePrice": lot.average_price,
+                    "openedAt": lot.opened_at,
+                    "entryBrokerFillId": lot.broker_fill_id,
+                }
+            )
+            remaining = round(remaining - consumed, 10)
+
+        broker_fill_id = _string_value(fill, "", "brokerFillId", "broker_fill_id")
+        trade_id = f"meta_strategy.trade.{self.capital_partition_id}.{broker_fill_id}"
+        status = "CLOSED" if close_qty >= open_qty - 1e-9 else "PARTIALLY_CLOSED"
+        self._insert_inventory_record(
+            conn,
+            "meta_strategy_inventory_trades",
+            {
+                **dict(fill),
+                "eventId": f"trade-{broker_fill_id}",
+                "tradeId": trade_id,
+                "quantity": close_qty,
+                "filledQuantity": close_qty,
+                "realisedPnl": round(realised, 10),
+                "realizedPnl": round(realised, 10),
+                "status": status,
+                "orderStatus": status,
+                "exitPrice": exit_price,
+                "closedQuantity": close_qty,
+                "entryLots": consumed_lots,
+            },
+            record_id=trade_id,
+        )
     def _insert_inventory_record(self, conn: sqlite3.Connection, table: str, payload: Mapping[str, Any], *, record_id: str | None = None) -> None:
         normalized = _normalize_inventory_payload(payload)
         metadata = _inventory_metadata(normalized)
         if metadata["capital_partition_id"] != self.capital_partition_id:
             raise MetaStrategyRepositoryAttributionError(
-                f"Meta-Strategy inventory partition mismatch: {metadata['capital_partition_id']} != {self.capital_partition_id}"
+                f"Meta-Strategy inventory partition mismatch: {metadata['capital_partition_id']} != {self.capital_partition_id}",
+                reason_codes=("meta_strategy.inventory.repository_capital_partition_mismatch",),
+                observed_algorithm_id=ALGORITHM_ID,
+                observed_capital_partition_id=str(metadata["capital_partition_id"]),
+                expected_capital_partition_id=self.capital_partition_id,
             )
         payload_json = _json_dumps(normalized)
         persisted_record_id = record_id or _inventory_record_id(table, metadata, payload_json)
@@ -794,13 +897,41 @@ class MetaStrategySqliteRepository:
         ).fetchone()
         return None if row is None else str(row["record_id"])
 
-    def _rebuild_inventory_from_ledger(self, conn: sqlite3.Connection, *, mark_prices: Mapping[str, float]) -> MetaStrategyInventorySnapshot:
+    def _effective_mark_prices(self, conn: sqlite3.Connection, mark_prices: Mapping[str, float] | None) -> dict[str, float]:
+        explicit = {str(symbol).upper(): float(price) for symbol, price in dict(mark_prices or {}).items() if price is not None}
+        if explicit:
+            return explicit
+        rows = conn.execute(
+            """
+            SELECT symbol, payload_json
+            FROM meta_strategy_inventory_positions
+            WHERE algorithm_id=? AND capital_partition_id=?
+            """,
+            (ALGORITHM_ID, self.capital_partition_id),
+        ).fetchall()
+        recovered: dict[str, float] = {}
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except json.JSONDecodeError:
+                continue
+            position_payload = payload.get("payload") if isinstance(payload, Mapping) else None
+            if not isinstance(position_payload, Mapping):
+                continue
+            price = _float_value(position_payload, "market_price", "marketPrice")
+            if price > 0.0:
+                recovered[str(row["symbol"]).upper()] = price
+        return recovered
+
+    def _rebuild_inventory_from_ledger(self, conn: sqlite3.Connection, *, mark_prices: Mapping[str, float], session_date: date | None = None) -> MetaStrategyInventorySnapshot:
         fill_rows = conn.execute(
             "SELECT rowid, * FROM meta_strategy_inventory_fills WHERE algorithm_id=? AND capital_partition_id=? ORDER BY timestamp ASC, rowid ASC",
             (ALGORITHM_ID, self.capital_partition_id),
         ).fetchall()
+        daily_session_date = session_date or _latest_inventory_session_date(fill_rows) or datetime.now(UTC).date()
         lots: list[dict[str, Any]] = []
         realised_pnl = 0.0
+        daily_realised_pnl = 0.0
         fees_and_slippage = 0.0
         daily_trade_count = 0
         latest_settings_version = "meta_strategy_settings_v1"
@@ -826,12 +957,16 @@ class MetaStrategySqliteRepository:
                     if lot["symbol"] != symbol or lot["quantity"] <= 0.0:
                         continue
                     consumed = min(float(lot["quantity"]), remaining)
-                    realised_pnl += (price - float(lot["average_price"])) * consumed
+                    realised_delta = (price - float(lot["average_price"])) * consumed
+                    realised_pnl += realised_delta
+                    if _inventory_timestamp_date(row["timestamp"]) == daily_session_date:
+                        daily_realised_pnl += realised_delta
                     lot["quantity"] = round(float(lot["quantity"]) - consumed, 10)
                     remaining = round(remaining - consumed, 10)
                 if remaining > 0.0:
                     lots.append(_lot_payload(row, payload, -remaining, price))
-                daily_trade_count += 1
+                if _inventory_timestamp_date(row["timestamp"]) == daily_session_date:
+                    daily_trade_count += 1
         open_lots = tuple(
             MetaStrategyInventoryLot(
                 lot_id=str(lot["lot_id"]),
@@ -875,6 +1010,7 @@ class MetaStrategySqliteRepository:
             reserved_risk_dollars=reserved_risk,
             allocated_capital=allocated_capital,
             daily_trade_count=daily_trade_count,
+            daily_realised_pnl=round(daily_realised_pnl, 10),
             strategy_exposure=strategy_exposure or {"meta_strategy": round(sum(abs(value) for value in symbol_exposure.values()), 10)},
             family_exposure=family_exposure,
             symbol_exposure=symbol_exposure,
@@ -889,7 +1025,7 @@ class MetaStrategySqliteRepository:
         mark_prices: Mapping[str, float],
         snapshot: MetaStrategyInventorySnapshot | None = None,
     ) -> None:
-        current = snapshot or self._rebuild_inventory_from_ledger(conn, mark_prices=mark_prices)
+        current = snapshot or self._rebuild_inventory_from_ledger(conn, mark_prices=self._effective_mark_prices(conn, mark_prices))
         for table in (
             "meta_strategy_inventory_positions",
             "meta_strategy_inventory_position_lots",
@@ -908,7 +1044,7 @@ class MetaStrategySqliteRepository:
             self._insert_inventory_record(conn, "meta_strategy_inventory_position_lots", _projection_payload(current, asdict(lot), symbol=lot.symbol))
         self._insert_inventory_record(conn, "meta_strategy_inventory_realised_pnl", _projection_payload(current, {"realisedPnl": current.realised_pnl}))
         self._insert_inventory_record(conn, "meta_strategy_inventory_unrealised_pnl_snapshots", _projection_payload(current, {"unrealisedPnl": current.unrealised_pnl}))
-        self._insert_inventory_record(conn, "meta_strategy_inventory_daily_statistics", _projection_payload(current, {"dailyTradeCount": current.daily_trade_count, "realisedPnl": current.realised_pnl, "unrealisedPnl": current.unrealised_pnl}))
+        self._insert_inventory_record(conn, "meta_strategy_inventory_daily_statistics", _projection_payload(current, {"dailyTradeCount": current.daily_trade_count, "dailyRealisedPnl": current.daily_realised_pnl, "dailyRealizedPnl": current.daily_realised_pnl, "realisedPnl": current.realised_pnl, "unrealisedPnl": current.unrealised_pnl}))
         for strategy_id, value in current.strategy_exposure.items():
             self._insert_inventory_record(conn, "meta_strategy_inventory_strategy_exposure", _projection_payload(current, {"strategyId": strategy_id, "exposure": value}))
         for family, value in current.family_exposure.items():
@@ -1128,26 +1264,35 @@ def _normalize_payload(payload: Any) -> dict[str, Any]:
         normalized = dict(payload)
     else:
         raise TypeError("Meta-Strategy repository payload must be a mapping, dataclass, or pydantic model")
-    algorithm_id = _first_value(normalized, "algorithmId", "algorithm_id")
-    if algorithm_id != ALGORITHM_ID:
-        raise MetaStrategyRepositoryAttributionError("Meta-Strategy repository payloads must carry algorithm_id='meta_strategy'")
+    violation = meta_strategy_ownership_violation(normalized, require_capital_partition=False, scope="repository")
+    if violation is not None:
+        raise _attribution_error(
+            "Meta-Strategy repository payloads must carry algorithm_id='meta_strategy'",
+            violation,
+        )
     return _jsonable(normalized)
 
 
 def _normalize_inventory_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     normalized = _jsonable(dict(payload))
-    algorithm_id = _first_value(normalized, "algorithmId", "algorithm_id")
-    if algorithm_id != ALGORITHM_ID:
-        raise MetaStrategyRepositoryAttributionError("Meta-Strategy inventory records must carry algorithm_id='meta_strategy'")
-    capital_partition_id = _first_value(normalized, "capitalPartitionId", "capital_partition_id")
-    if capital_partition_id in (None, ""):
-        raise MetaStrategyRepositoryAttributionError("Meta-Strategy inventory records must carry capital_partition_id")
-    if str(capital_partition_id) != META_STRATEGY_DEFAULT_CAPITAL_PARTITION:
-        raise MetaStrategyRepositoryAttributionError(
-            f"Meta-Strategy inventory records must carry capital_partition_id='{META_STRATEGY_DEFAULT_CAPITAL_PARTITION}'"
+    violation = meta_strategy_ownership_violation(normalized, require_capital_partition=True, scope="inventory")
+    if violation is not None:
+        raise _attribution_error(
+            "Meta-Strategy inventory records must carry algorithm_id='meta_strategy' and capital_partition_id='meta_strategy.paper.default'",
+            violation,
         )
     return normalized
 
+
+def _attribution_error(message: str, violation: Mapping[str, Any]) -> MetaStrategyRepositoryAttributionError:
+    return MetaStrategyRepositoryAttributionError(
+        message,
+        reason_codes=tuple(violation.get("reasonCodes") or ()),
+        observed_algorithm_id=violation.get("observedAlgorithmId"),
+        observed_capital_partition_id=violation.get("observedCapitalPartitionId"),
+        expected_algorithm_id=str(violation.get("expectedAlgorithmId") or ALGORITHM_ID),
+        expected_capital_partition_id=str(violation.get("expectedCapitalPartitionId") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),
+    )
 
 def _metadata(payload: Mapping[str, Any]) -> dict[str, str]:
     return {
@@ -1199,11 +1344,76 @@ def _inventory_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
         "symbol": _string_value(payload, "UNKNOWN", "symbol", "ticker").upper(),
         "side": _string_value(payload, "", "side").upper(),
         "quantity": _fill_quantity(payload) or _float_value(payload, "quantity", "orderQuantity"),
-        "price": _float_value(payload, "fillPrice", "price", "averageFillPrice", "limitPrice"),
+        "price": _float_value(payload, "fillPrice", "price", "averageFillPrice", "average_fill_price", "limitPrice"),
         "status": _status(payload),
         "realised_pnl": _float_value(payload, "realisedPnl", "realizedPnl"),
-        "timestamp": _string_value(payload, datetime.now(tz=UTC).isoformat(), "timestamp", "filledAt", "createdAt"),
+        "timestamp": _string_value(payload, datetime.now(tz=UTC).isoformat(), "timestamp", "filledAt", "filled_at", "createdAt"),
     }
+
+
+def _validate_required_fill_payload(payload: Mapping[str, Any]) -> None:
+    missing = []
+    if not _string_value(payload, "", "orderIntentId", "order_intent_id"):
+        missing.append("orderIntentId")
+    if not _string_value(payload, "", "clientOrderId", "client_order_id"):
+        missing.append("clientOrderId")
+    if not _string_value(payload, "", "brokerOrderId", "broker_order_id"):
+        missing.append("brokerOrderId")
+    if not _string_value(payload, "", "brokerFillId", "broker_fill_id"):
+        missing.append("brokerFillId")
+    if not _string_value(payload, "", "symbol", "ticker"):
+        missing.append("symbol")
+    if _string_value(payload, "", "side").upper() not in {"BUY", "SELL"}:
+        missing.append("side")
+    try:
+        quantity = _fill_quantity(payload)
+    except (TypeError, ValueError):
+        quantity = 0.0
+    if quantity <= 0.0:
+        missing.append("quantity")
+    try:
+        price = _float_value(payload, "fillPrice", "price", "averageFillPrice", "average_fill_price")
+    except (TypeError, ValueError):
+        price = 0.0
+    if price <= 0.0:
+        missing.append("price")
+    timestamp = _string_value(payload, "", "timestamp", "filledAt", "filled_at", "createdAt")
+    if not timestamp or not _valid_inventory_timestamp(timestamp):
+        missing.append("timestamp")
+    if missing:
+        raise ValueError("meta_strategy.inventory.fill_malformed.missing_" + "_".join(item.lower() for item in missing))
+
+
+def _valid_inventory_timestamp(value: Any) -> bool:
+    try:
+        datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    return True
+
+def _inventory_session_date(value: datetime | date | str | None) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return _inventory_timestamp_date(value)
+
+
+def _inventory_timestamp_date(value: Any) -> date | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _latest_inventory_session_date(rows: tuple[sqlite3.Row, ...] | list[sqlite3.Row]) -> date | None:
+    for row in reversed(rows):
+        parsed = _inventory_timestamp_date(row["timestamp"])
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _float_value(payload: Mapping[str, Any], *keys: str) -> float:
@@ -1357,6 +1567,7 @@ def _snapshot_from_payload(payload: Mapping[str, Any]) -> MetaStrategyInventoryS
         reserved_risk_dollars=float(data["reserved_risk_dollars"]),
         allocated_capital=float(data["allocated_capital"]),
         daily_trade_count=int(data["daily_trade_count"]),
+        daily_realised_pnl=float(data.get("daily_realised_pnl", data.get("daily_realized_pnl", data.get("dailyRealisedPnl", data.get("dailyRealizedPnl", data["realised_pnl"]))))),
         strategy_exposure={str(key): float(value) for key, value in dict(data.get("strategy_exposure", {})).items()},
         family_exposure={str(key): float(value) for key, value in dict(data.get("family_exposure", {})).items()},
         symbol_exposure={str(key): float(value) for key, value in dict(data.get("symbol_exposure", {})).items()},
@@ -1395,13 +1606,15 @@ def _hash(value: Any) -> str:
 def _row_to_record(table: str, artifact_type: str, row: sqlite3.Row | None) -> MetaStrategyRepositoryRecord | None:
     if row is None:
         return None
-    if str(row["algorithm_id"]) != ALGORITHM_ID:
-        raise MetaStrategyRepositoryAttributionError(
-            f"Meta-Strategy repository refused {artifact_type} record {row['record_id']} owned by {row['algorithm_id']}"
-        )
-    if str(row["capital_partition_id"]) != META_STRATEGY_DEFAULT_CAPITAL_PARTITION:
-        raise MetaStrategyRepositoryAttributionError(
-            f"Meta-Strategy repository refused {artifact_type} record {row['record_id']} in partition {row['capital_partition_id']}"
+    violation = meta_strategy_ownership_violation(
+        {"algorithmId": str(row["algorithm_id"]), "capitalPartitionId": str(row["capital_partition_id"])},
+        require_capital_partition=True,
+        scope="repository",
+    )
+    if violation is not None:
+        raise _attribution_error(
+            f"Meta-Strategy repository refused {artifact_type} record {row['record_id']} owned by {row['algorithm_id']} in partition {row['capital_partition_id']}",
+            violation,
         )
     return MetaStrategyRepositoryRecord(
         table_name=table,

@@ -22,6 +22,7 @@ from backend.app.algorithms.meta_strategy.execution_pipeline import (
 from backend.app.algorithms.meta_strategy.feature_schema import meta_strategy_feature_schema_hash
 from backend.app.algorithms.meta_strategy.identity import ALGORITHM_ID, ALGORITHM_NAME
 from backend.app.algorithms.meta_strategy.jobs import MetaStrategyJobRecord, MetaStrategyJobRepository
+from backend.app.algorithms.meta_strategy.local_settings_risk import MetaStrategyLocalSettingsRiskSource
 from backend.app.algorithms.meta_strategy.market_snapshot import MetaStrategyMarketSnapshotRequest
 from backend.app.algorithms.meta_strategy.models import load_runtime_model_artifact, load_runtime_model_artifact_data
 from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
@@ -36,6 +37,7 @@ from backend.app.algorithms.meta_strategy.paper_readiness import (
     build_meta_strategy_paper_readiness_acceptance_report,
 )
 from backend.app.algorithms.meta_strategy.repository import MetaStrategyRepositoryPersistenceAdapter, MetaStrategySqliteRepository
+from backend.app.algorithms.meta_strategy.runtime import MetaStrategyRuntimeDependencies, MetaStrategyRuntimeMode, reconstruct_meta_strategy_runtime_state
 from backend.app.algorithms.meta_strategy.settings import (
     MetaStrategyCandidateAggregationSettings,
     MetaStrategyEntryExitSettings,
@@ -56,67 +58,127 @@ MetaStrategyRuntimeReadinessProvider = Callable[[], Mapping[str, Any]]
 
 _CALLER_SUPPLIED_TRADING_STATE_KEYS: frozenset[str] = frozenset(
     {
+        "accountBalance",
         "accountEquity",
+        "accountSnapshot",
+        "account_balance",
         "account_equity",
+        "account_snapshot",
+        "allocatedCapital",
+        "allocated_capital",
         "availableBuyingPower",
+        "availableRiskDollars",
         "available_buying_power",
+        "available_risk_dollars",
+        "balance",
+        "brokerQuantity",
+        "broker_quantity",
         "buyingPower",
         "buying_power",
-        "accountSnapshot",
-        "account_snapshot",
-        "remainingAlgorithmRisk",
-        "remaining_algorithm_risk",
-        "remainingRiskDollars",
-        "remaining_risk_dollars",
+        "cash",
+        "cashAvailability",
+        "cashAvailable",
+        "cash_availability",
+        "cash_available",
+        "dailyTradeCount",
+        "daily_trade_count",
+        "duplicateOrderIntentIds",
+        "duplicate_order_intent_ids",
+        "eventBlackout",
+        "event_blackout",
+        "existingPositionSymbols",
+        "existing_position_symbols",
+        "familyExposure",
+        "family_exposure",
+        "feesAndSlippage",
+        "fees_and_slippage",
+        "fills",
         "globalAvailableRisk",
-        "global_available_risk",
-        "availableRiskDollars",
-        "available_risk_dollars",
-        "globalRiskSnapshot",
-        "global_risk_snapshot",
         "globalQuantityCap",
+        "globalRiskSnapshot",
+        "global_available_risk",
         "global_quantity_cap",
-        "maxQuantity",
-        "max_quantity",
+        "global_risk_snapshot",
         "inventory",
         "inventorySnapshot",
         "inventory_snapshot",
-        "positions",
-        "positionState",
-        "position_state",
-        "openPositions",
-        "open_positions",
-        "openOrders",
-        "open_orders",
-        "orders",
-        "reservedRiskDollars",
-        "reserved_risk_dollars",
-        "reservedRiskLedger",
-        "reserved_risk_ledger",
-        "realizedDailyPnl",
-        "realized_daily_pnl",
-        "dailyTradeCount",
-        "daily_trade_count",
-        "paperTradingPermission",
-        "paper_trading_permission",
         "liveTradingPermission",
         "live_trading_permission",
-        "eventBlackout",
-        "event_blackout",
+        "maxQuantity",
+        "max_quantity",
+        "openOrders",
+        "openPositions",
+        "open_orders",
+        "open_positions",
+        "orderIntents",
+        "order_intents",
+        "orders",
+        "pAndL",
+        "p_and_l",
+        "paperTradingPermission",
+        "paper_trading_permission",
+        "pnl",
+        "pnlSnapshot",
+        "pnl_snapshot",
+        "position",
+        "positionLots",
+        "positionState",
+        "position_lots",
+        "position_state",
+        "positions",
+        "profitAndLoss",
+        "profit_and_loss",
+        "realisedDailyPnl",
+        "realisedPnl",
+        "realised_daily_pnl",
+        "realised_pnl",
+        "realizedDailyPnl",
+        "realizedPnl",
+        "realized_daily_pnl",
+        "realized_pnl",
+        "remainingAlgorithmRisk",
+        "remainingRiskDollars",
+        "remaining_algorithm_risk",
+        "remaining_risk_dollars",
+        "reservedRisk",
+        "reservedRiskDollars",
+        "reservedRiskLedger",
+        "reserved_risk",
+        "reserved_risk_dollars",
+        "reserved_risk_ledger",
         "sessionAllowed",
         "session_allowed",
-        "brokerQuantity",
-        "broker_quantity",
-        "duplicateOrderIntentIds",
-        "duplicate_order_intent_ids",
-        "existingPositionSymbols",
-        "existing_position_symbols",
-        "cashAvailability",
-        "cash_availability",
-        "operationalHealthStatus",
-        "operational_health_status",
+        "strategyExposure",
+        "strategy_exposure",
+        "submittedOrders",
+        "submitted_orders",
+        "symbolExposure",
+        "symbol_exposure",
+        "totalBalance",
+        "total_balance",
+        "trades",
+        "unrealisedPnl",
+        "unrealised_pnl",
+        "unrealizedPnl",
+        "unrealized_pnl",
     }
 )
+
+
+def _caller_supplied_trading_state_fields(value: Any, *, prefix: str = "") -> tuple[str, ...]:
+    fields: list[str] = []
+    if isinstance(value, Mapping):
+        for raw_key, child in value.items():
+            key = str(raw_key)
+            path = f"{prefix}.{key}" if prefix else key
+            if key in _CALLER_SUPPLIED_TRADING_STATE_KEYS:
+                fields.append(path)
+            fields.extend(_caller_supplied_trading_state_fields(child, prefix=path))
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        for index, child in enumerate(value):
+            path = f"{prefix}[{index}]" if prefix else f"[{index}]"
+            fields.extend(_caller_supplied_trading_state_fields(child, prefix=path))
+    return tuple(dict.fromkeys(sorted(fields)))
 
 
 @dataclass(frozen=True)
@@ -678,10 +740,9 @@ class MetaStrategyApplicationService:
                 payload={"rejectedAlgorithmId": algorithm_id},
                 reasonCodes=("meta_strategy.service.foreign_algorithm_rejected",),
             ).to_dict()
-        forbidden = sorted(key for key in data if key in _CALLER_SUPPLIED_TRADING_STATE_KEYS)
+        forbidden = _caller_supplied_trading_state_fields(data)
         nested_settings = data.get("tradingSettings") if isinstance(data.get("tradingSettings"), Mapping) else data.get("settings")
         settings_payload = dict(nested_settings) if isinstance(nested_settings, Mapping) else {}
-        forbidden.extend(sorted(key for key in settings_payload if key in _CALLER_SUPPLIED_TRADING_STATE_KEYS))
         if forbidden:
             return MetaStrategyServiceResult(
                 algorithmId=ALGORITHM_ID,
@@ -761,7 +822,7 @@ class MetaStrategyApplicationService:
             algorithmId=ALGORITHM_ID,
             operation="inventory_query",
             status="OK",
-            payload={"inventory": _plain(snapshot), "consistency": self.repository.check_inventory_consistency()},
+            payload={"inventory": _plain(snapshot), "authoritativeInventoryApi": "current_inventory_snapshot", "consistency": self.repository.check_inventory_consistency()},
             reasonCodes=("meta_strategy.service.inventory_ready",),
         ).to_dict()
 
@@ -780,7 +841,7 @@ class MetaStrategyApplicationService:
             algorithmId=ALGORITHM_ID,
             operation="pnl_query",
             status="OK",
-            payload={"realisedPnl": snapshot.realised_pnl, "unrealisedPnl": snapshot.unrealised_pnl, "dailyTradeCount": snapshot.daily_trade_count},
+            payload={"realisedPnl": snapshot.realised_pnl, "unrealisedPnl": snapshot.unrealised_pnl, "dailyTradeCount": snapshot.daily_trade_count, "dailyRealisedPnl": snapshot.daily_realised_pnl, "dailyRealizedPnl": snapshot.daily_realised_pnl},
             reasonCodes=("meta_strategy.service.pnl_ready",),
         ).to_dict()
 
@@ -917,7 +978,7 @@ class MetaStrategyApplicationService:
             settings_store=self.settings_store,
         )
         report = build_meta_strategy_evidence_acceptance_report(snapshot)
-        runtime = self._runtime_readiness()
+        runtime = self._runtime_with_local_inventory_health(self._runtime_readiness())
         paper_readiness = build_meta_strategy_paper_readiness_acceptance_report(snapshot, runtime)
         entry_prerequisites = build_meta_strategy_paper_entry_readiness_prerequisites(snapshot, runtime, paper_readiness)
         ready = bool(report["complete"] and paper_readiness["paperReady"] and entry_prerequisites["ready"] and not _runtime_blocks_paper(runtime))
@@ -961,6 +1022,87 @@ class MetaStrategyApplicationService:
             },
             reasonCodes=("meta_strategy.service.readiness_report_ready",),
         ).to_dict()
+
+
+    def _runtime_with_local_inventory_health(self, runtime: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+        if runtime is None:
+            return None
+        data = dict(runtime)
+        health = self._local_inventory_readiness_health()
+        existing = dict(data.get("paperReadinessPrerequisites") or {})
+        for key, value in health["prerequisites"].items():
+            current = existing.get(key)
+            existing[key] = bool(current and value) if isinstance(current, bool) else bool(value)
+        data["paperReadinessPrerequisites"] = existing
+        data["localInventoryReadiness"] = health
+        data["accountSnapshot"] = health.get("accountSnapshot")
+        data["riskSnapshot"] = health.get("riskSnapshot")
+        return data
+
+    def _local_inventory_readiness_health(self) -> dict[str, Any]:
+        prerequisites = {
+            "inventoryRepositoryAvailable": False,
+            "inventoryConsistencyPasses": False,
+            "allocatedCapitalPositive": False,
+            "accountSnapshotMetaStrategyDerived": False,
+            "riskSnapshotMetaStrategyDerived": False,
+            "restartReconstructionSucceeded": False,
+            "paperToggleEnabled": False,
+            "runtimeModePaper": True,
+            "liveTradingDisabled": True,
+        }
+        account_snapshot: Mapping[str, Any] = {}
+        risk_snapshot: Mapping[str, Any] = {}
+        errors: list[str] = []
+        try:
+            inventory_snapshot = self.repository.current_inventory_snapshot()
+            consistency = self.repository.check_inventory_consistency()
+            prerequisites["inventoryRepositoryAvailable"] = (
+                getattr(inventory_snapshot, "algorithm_id", None) == ALGORITHM_ID
+                and getattr(inventory_snapshot, "capital_partition_id", None) == META_STRATEGY_DEFAULT_CAPITAL_PARTITION
+            )
+            prerequisites["inventoryConsistencyPasses"] = bool(consistency.get("consistent") is True)
+            prerequisites["allocatedCapitalPositive"] = float(getattr(inventory_snapshot, "allocated_capital", 0.0) or 0.0) > 0.0
+        except Exception as exc:
+            errors.append(f"inventory:{exc}")
+        try:
+            source = MetaStrategyLocalSettingsRiskSource(settings_store=self.settings_store, inventory_repository=self.repository)
+            account_snapshot = source.read_account_snapshot(at=datetime.now(UTC))
+            risk_snapshot = source.read_global_risk_snapshot(at=datetime.now(UTC), capital_partition_id=META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+            prerequisites["accountSnapshotMetaStrategyDerived"] = (
+                account_snapshot.get("algorithmId") == ALGORITHM_ID
+                and account_snapshot.get("capitalPartitionId") == META_STRATEGY_DEFAULT_CAPITAL_PARTITION
+                and account_snapshot.get("accountAuthority") == "meta_strategy_inventory.current_inventory_snapshot"
+            )
+            prerequisites["riskSnapshotMetaStrategyDerived"] = (
+                risk_snapshot.get("algorithmId") == ALGORITHM_ID
+                and risk_snapshot.get("capitalPartitionId") == META_STRATEGY_DEFAULT_CAPITAL_PARTITION
+                and risk_snapshot.get("source") == "meta_strategy_local_settings_risk"
+            )
+        except Exception as exc:
+            errors.append(f"local_risk:{exc}")
+        try:
+            reconstruction = reconstruct_meta_strategy_runtime_state(
+                MetaStrategyRuntimeDependencies(
+                    mode=MetaStrategyRuntimeMode.PAPER,
+                    inventory_repository=self.repository,
+                    job_repository=self.job_repository,
+                )
+            )
+            prerequisites["restartReconstructionSucceeded"] = reconstruction.get("status") == "OK"
+        except Exception as exc:
+            errors.append(f"restart:{exc}")
+        control = self.query_paper_control({}).get("payload")
+        control_state = dict(control or {})
+        prerequisites["paperToggleEnabled"] = control_state.get("newPaperEntriesEnabled") is True and control_state.get("paperOnly") is True
+        prerequisites["liveTradingDisabled"] = control_state.get("liveExecutionEnabled") is False
+        return {
+            "prerequisites": prerequisites,
+            "accountSnapshot": _plain(account_snapshot),
+            "riskSnapshot": _plain(risk_snapshot),
+            "paperControl": control_state,
+            "errors": tuple(errors),
+        }
 
     def _runtime_readiness(self) -> Mapping[str, Any] | None:
         if self.runtime_readiness_provider is None:
@@ -1235,7 +1377,7 @@ class MetaStrategyApplicationService:
                 payload={"rejectedFields": ("mode",), "liveTradingEnabled": False},
                 reasonCodes=("meta_strategy.api.live_mode_rejected",),
             )
-        caller_trading_state_keys = tuple(sorted(key for key in data if key in _CALLER_SUPPLIED_TRADING_STATE_KEYS))
+        caller_trading_state_keys = _caller_supplied_trading_state_fields(data)
         if caller_trading_state_keys:
             return MetaStrategyServiceResult(
                 algorithmId=ALGORITHM_ID,
@@ -1283,7 +1425,7 @@ class MetaStrategyApplicationService:
     ) -> MetaStrategyServiceResult:
         data = dict(payload or {})
         request_settings_override = any(key in data for key in ("settings", "settingsVersion", "settings_version", "effectiveSettings", "effective_settings"))
-        caller_trading_state_keys = sorted(key for key in data if key in _CALLER_SUPPLIED_TRADING_STATE_KEYS)
+        caller_trading_state_keys = _caller_supplied_trading_state_fields(data)
         if caller_trading_state_keys:
             return MetaStrategyServiceResult(
                 algorithmId=ALGORITHM_ID,
@@ -1442,8 +1584,14 @@ def _readiness_blocking_reason_codes(prerequisites: Mapping[str, Any], runtime: 
         reason_codes.append("meta_strategy.readiness.runtime_supervisor_not_ready")
     mapping = {
         "durableDatabaseAvailable": "meta_strategy.readiness.database_unavailable",
+        "inventoryRepositoryAvailable": "meta_strategy.readiness.inventory_repository_unavailable",
+        "inventoryConsistencyPasses": "meta_strategy.readiness.inventory_consistency_failed",
+        "allocatedCapitalPositive": "meta_strategy.readiness.allocated_capital_missing",
+        "accountSnapshotMetaStrategyDerived": "meta_strategy.readiness.account_snapshot_not_meta_strategy_inventory",
+        "riskSnapshotMetaStrategyDerived": "meta_strategy.readiness.risk_snapshot_not_meta_strategy_inventory",
         "activeSettingsPromotedForPaper": "meta_strategy.readiness.settings_not_promoted_for_paper",
         "paperBrokerVerified": "meta_strategy.readiness.paper_broker_unverified",
+        "brokerPaperOnly": "meta_strategy.readiness.broker_not_paper_only",
         "authoritativeMarketDataHealthy": "meta_strategy.readiness.market_data_unhealthy",
         "marketClockHealthy": "meta_strategy.readiness.market_clock_unhealthy",
         "requiredWorkersHealthy": "meta_strategy.readiness.worker_unhealthy",
@@ -1453,6 +1601,9 @@ def _readiness_blocking_reason_codes(prerequisites: Mapping[str, Any], runtime: 
         "inventoryReconciliationCurrent": "meta_strategy.readiness.inventory_reconciliation_stale",
         "globalRiskSourceCurrent": "meta_strategy.readiness.global_risk_stale",
         "requiredAcceptanceTestsPassed": "meta_strategy.readiness.acceptance_evidence_missing_or_failed",
+        "paperToggleEnabled": "meta_strategy.readiness.paper_toggle_disabled",
+        "runtimeModePaper": "meta_strategy.readiness.runtime_mode_not_paper",
+        "liveTradingDisabled": "meta_strategy.readiness.live_trading_enabled",
     }
     for field, reason in mapping.items():
         if prerequisites.get(field) is not True:
@@ -1721,6 +1872,7 @@ def _meta_strategy_trading_settings_view(settings: MetaStrategySettings, *, snap
         },
         "ownership": {
             "inventorySource": "authoritative_meta_strategy_inventory_repository",
+            "authoritativeInventoryApi": "current_inventory_snapshot",
             "algorithmScoped": True,
             "inventoryAlgorithmId": str(snapshot.get("algorithm_id") or ALGORITHM_ID),
             "inventoryCapitalPartitionId": str(snapshot.get("capital_partition_id") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),

@@ -13,6 +13,7 @@ from backend.app.algorithms.meta_strategy import (
 )
 from backend.app.algorithms.meta_strategy.candidate_generator import CandidateComponentEvaluation, CandidateGenerationConfig
 from backend.app.algorithms.meta_strategy.family_aggregation import FamilyAggregationConfig, aggregate_family_scores
+from backend.app.algorithms.meta_strategy.inference import MetaStrategyInferenceResult
 from backend.app.algorithms.meta_strategy.settings import build_meta_strategy_settings
 from backend.app.algorithms.meta_strategy.strategies.base import SnapshotEvaluationResult
 from backend.app.algorithms.meta_strategy.strategy_registry import CONTEXT_STRATEGIES, DIRECTIONAL_STRATEGIES, REGIME_STRATEGIES, SAFETY_STRATEGIES
@@ -126,6 +127,175 @@ class MetaStrategyStep31ExecutionPipelineTest(unittest.TestCase):
         self.assertIn("meta_strategy.pipeline.live_trading_not_enabled", result.reason_codes)
         self.assertEqual(result.broker_result["status"], "NO_ORDER")
         self.assertFalse(result.broker_result["submitted"])
+
+    def test_paper_sizing_uses_authoritative_snapshots_not_numeric_request_overrides(self) -> None:
+        schema_hash = phase6_feature_schema_hash()
+        with patch(
+            "backend.app.algorithms.meta_strategy.execution_pipeline.evaluate_candidate_components",
+            return_value=phase5_components(),
+        ), patch(
+            "backend.app.algorithms.meta_strategy.execution_pipeline.apply_meta_strategy_inference",
+            return_value=MetaStrategyInferenceResult(
+                mode="FILTER",
+                effectiveMode="FILTER",
+                deterministicSignal="BUY",
+                finalSignal="BUY",
+                candidateAccepted=True,
+                mlWouldAcceptCandidate=True,
+                appliedToOrder=True,
+                hardGatesPassed=True,
+                deterministicRiskMultiplier=1.0,
+                recommendedRiskMultiplier=1.0,
+                decisionAction="ACCEPT",
+                candidateSide="BUY",
+                probabilityOfSuccess=0.99,
+                calibratedProbability=0.99,
+                uncertainty=0.01,
+                featureMissingness=0.0,
+                modelHealth={"score": 1.0},
+                reasonCodes=("test.inference.accepted",),
+            ),
+        ):
+            result = run_meta_strategy_execution_pipeline(
+                MetaStrategyExecutionPipelineRequest(
+                    mode="PAPER",
+                    snapshot_request=request_with(),
+                    model_artifact=phase6_artifact(schema_hash=schema_hash, probabilities={"BUY": 0.99, "SELL": 0.0, "HOLD": 0.01}, promoted=True),
+                    inventory_snapshot={
+                        "allocatedCapital": 100_000.0,
+                        "realizedPnl": 0.0,
+                        "unrealizedPnl": 0.0,
+                        "reservedRiskDollars": 0.0,
+                        "dailyTradeCount": 0,
+                        "positions": (),
+                        "symbolExposure": {},
+                    },
+                    account_snapshot={
+                        "authoritativeReadOnly": True,
+                        "accountEquity": 0.0,
+                        "buyingPower": 100_000.0,
+                        "allocatedCapital": 100_000.0,
+                    },
+                    global_risk_snapshot={
+                        "authoritativeReadOnly": True,
+                        "availableRiskDollars": 100_000.0,
+                        "maxQuantity": 10_000,
+                        "reject": False,
+                    },
+                    account_equity=100_000.0,
+                    available_buying_power=100_000.0,
+                    remaining_algorithm_risk=100_000.0,
+                    global_available_risk=100_000.0,
+                    global_quantity_cap=10_000,
+                ),
+                config=phase6_config("FILTER", fallback_behavior="NO_TRADE"),
+                global_risk_adapter=ReducingGlobalRisk(cap=99),
+            )
+
+        self.assertEqual(result.sizing.quantity, 0)
+        self.assertIsNone(result.order_intent)
+        self.assertIn("meta_strategy.sizing.zero_account_equity", result.reason_codes)
+
+    def test_paper_duplicate_entry_policy_uses_inventory_positions_only(self) -> None:
+        schema_hash = phase6_feature_schema_hash()
+        with patch(
+            "backend.app.algorithms.meta_strategy.execution_pipeline.evaluate_candidate_components",
+            return_value=phase5_components(),
+        ), patch(
+            "backend.app.algorithms.meta_strategy.execution_pipeline.apply_meta_strategy_inference",
+            return_value=MetaStrategyInferenceResult(
+                mode="FILTER",
+                effectiveMode="FILTER",
+                deterministicSignal="BUY",
+                finalSignal="BUY",
+                candidateAccepted=True,
+                mlWouldAcceptCandidate=True,
+                appliedToOrder=True,
+                hardGatesPassed=True,
+                deterministicRiskMultiplier=1.0,
+                recommendedRiskMultiplier=1.0,
+                decisionAction="ACCEPT",
+                candidateSide="BUY",
+                probabilityOfSuccess=0.99,
+                calibratedProbability=0.99,
+                uncertainty=0.01,
+                featureMissingness=0.0,
+                modelHealth={"score": 1.0},
+                reasonCodes=("test.inference.accepted",),
+            ),
+        ):
+            result = run_meta_strategy_execution_pipeline(
+                MetaStrategyExecutionPipelineRequest(
+                    mode="PAPER",
+                    snapshot_request=request_with(),
+                    model_artifact=phase6_artifact(schema_hash=schema_hash, probabilities={"BUY": 0.99, "SELL": 0.0, "HOLD": 0.01}, promoted=True),
+                    inventory_snapshot=paper_inventory_snapshot(
+                        positions=({"symbol": "SPY", "side": "LONG", "quantity": 1.0, "marketPrice": 100.0, "averagePrice": 100.0},),
+                        symbol_exposure={"SPY": 100.0},
+                    ),
+                    account_snapshot=paper_account_snapshot(),
+                    global_risk_snapshot=paper_global_risk_snapshot(),
+                    existing_position_symbols=(),
+                ),
+                config=phase6_config("FILTER", fallback_behavior="NO_TRADE"),
+                global_risk_adapter=ReducingGlobalRisk(cap=99),
+            )
+
+        self.assertIsNone(result.order_intent)
+        self.assertIn("meta_strategy.safety.conflicting_position_state", result.reason_codes)
+
+    def test_paper_pyramiding_can_add_only_to_meta_strategy_owned_position(self) -> None:
+        schema_hash = phase6_feature_schema_hash()
+        settings = build_meta_strategy_settings(
+            status="ACTIVE",
+            position_management={"one_position_per_symbol": False},
+            ml_inference={"mode": "FILTER", "fallback_behavior": "NO_TRADE", "model_probability_threshold": 0.55},
+        )
+        config = MetaStrategyExecutionPipelineConfig(settings=settings, baseline_settings=settings.to_baseline_settings(), submit_to_broker=False)
+        with patch(
+            "backend.app.algorithms.meta_strategy.execution_pipeline.evaluate_candidate_components",
+            return_value=phase5_components(),
+        ), patch(
+            "backend.app.algorithms.meta_strategy.execution_pipeline.apply_meta_strategy_inference",
+            return_value=MetaStrategyInferenceResult(
+                mode="FILTER",
+                effectiveMode="FILTER",
+                deterministicSignal="BUY",
+                finalSignal="BUY",
+                candidateAccepted=True,
+                mlWouldAcceptCandidate=True,
+                appliedToOrder=True,
+                hardGatesPassed=True,
+                deterministicRiskMultiplier=1.0,
+                recommendedRiskMultiplier=1.0,
+                decisionAction="ACCEPT",
+                candidateSide="BUY",
+                probabilityOfSuccess=0.99,
+                calibratedProbability=0.99,
+                uncertainty=0.01,
+                featureMissingness=0.0,
+                modelHealth={"score": 1.0},
+                reasonCodes=("test.inference.accepted",),
+            ),
+        ):
+            result = run_meta_strategy_execution_pipeline(
+                MetaStrategyExecutionPipelineRequest(
+                    mode="PAPER",
+                    snapshot_request=request_with(),
+                    model_artifact=phase6_artifact(schema_hash=schema_hash, probabilities={"BUY": 0.99, "SELL": 0.0, "HOLD": 0.01}, promoted=True),
+                    inventory_snapshot=paper_inventory_snapshot(
+                        positions=({"symbol": "SPY", "side": "LONG", "quantity": 1.0, "marketPrice": 100.0, "averagePrice": 100.0},),
+                        symbol_exposure={"SPY": 100.0},
+                    ),
+                    account_snapshot=paper_account_snapshot(),
+                    global_risk_snapshot=paper_global_risk_snapshot(),
+                ),
+                config=config,
+                global_risk_adapter=ReducingGlobalRisk(cap=99),
+            )
+
+        self.assertNotIn("meta_strategy.safety.conflicting_position_state", result.reason_codes)
+        self.assertIsNotNone(result.order_intent)
 
     def test_global_risk_and_broker_stages_cannot_bypass_zero_sizing(self) -> None:
         result = run_meta_strategy_execution_pipeline(
@@ -339,6 +509,44 @@ class MetaStrategyStep31ExecutionPipelineTest(unittest.TestCase):
         self.assertFalse(result.inference.appliedToOrder)
         self.assertTrue(result.inference.candidateAccepted)
 
+
+def paper_inventory_snapshot(
+    *,
+    positions: tuple[dict, ...] = (),
+    symbol_exposure: dict[str, float] | None = None,
+) -> dict:
+    return {
+        "algorithmId": "meta_strategy",
+        "capitalPartitionId": "meta_strategy.paper.default",
+        "allocatedCapital": 100_000.0,
+        "realizedPnl": 0.0,
+        "unrealizedPnl": 0.0,
+        "reservedRiskDollars": 0.0,
+        "dailyTradeCount": 0,
+        "positions": positions,
+        "symbolExposure": symbol_exposure or {},
+    }
+
+
+def paper_account_snapshot() -> dict:
+    return {
+        "authoritativeReadOnly": True,
+        "algorithmId": "meta_strategy",
+        "capitalPartitionId": "meta_strategy.paper.default",
+        "accountEquity": 100_000.0,
+        "buyingPower": 100_000.0,
+        "cashAvailable": 100_000.0,
+        "allocatedCapital": 100_000.0,
+    }
+
+
+def paper_global_risk_snapshot() -> dict:
+    return {
+        "authoritativeReadOnly": True,
+        "availableRiskDollars": 100_000.0,
+        "maxQuantity": 10_000,
+        "reject": False,
+    }
 
 def phase6_config(mode: str, *, fallback_behavior: str) -> MetaStrategyExecutionPipelineConfig:
     settings = build_meta_strategy_settings(

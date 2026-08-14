@@ -6,20 +6,7 @@ from backend.app.algorithms.meta_strategy.jobs import MetaStrategyJobRepository
 
 
 def readiness_report_ready() -> dict[str, object]:
-    prerequisites = {
-        "durableDatabaseAvailable": True,
-        "activeSettingsPromotedForPaper": True,
-        "paperBrokerVerified": True,
-        "authoritativeMarketDataHealthy": True,
-        "marketClockHealthy": True,
-        "requiredWorkersHealthy": True,
-        "queueLagBelowThreshold": True,
-        "deadLetterWithinThreshold": True,
-        "restartReconstructionSucceeded": True,
-        "inventoryReconciliationCurrent": True,
-        "globalRiskSourceCurrent": True,
-        "requiredAcceptanceTestsPassed": True,
-    }
+    prerequisites = healthy_paper_readiness_prerequisites()
     return {
         "algorithmId": "meta_strategy",
         "status": "OK",
@@ -40,6 +27,32 @@ def readiness_report_ready() -> dict[str, object]:
     }
 
 
+def healthy_paper_readiness_prerequisites() -> dict[str, bool]:
+    return {
+        "durableDatabaseAvailable": True,
+        "inventoryRepositoryAvailable": True,
+        "inventoryConsistencyPasses": True,
+        "allocatedCapitalPositive": True,
+        "accountSnapshotMetaStrategyDerived": True,
+        "riskSnapshotMetaStrategyDerived": True,
+        "activeSettingsPromotedForPaper": True,
+        "paperBrokerVerified": True,
+        "brokerPaperOnly": True,
+        "authoritativeMarketDataHealthy": True,
+        "marketClockHealthy": True,
+        "requiredWorkersHealthy": True,
+        "queueLagBelowThreshold": True,
+        "deadLetterWithinThreshold": True,
+        "restartReconstructionSucceeded": True,
+        "inventoryReconciliationCurrent": True,
+        "globalRiskSourceCurrent": True,
+        "requiredAcceptanceTestsPassed": True,
+        "paperToggleEnabled": True,
+        "runtimeModePaper": True,
+        "liveTradingDisabled": True,
+    }
+
+
 def arm_automatic_paper_trading(repository: MetaStrategyJobRepository, *, now: datetime) -> None:
     repository.write_gateway_snapshot(
         "meta_strategy.runtime.readiness",
@@ -51,20 +64,7 @@ def arm_automatic_paper_trading(repository: MetaStrategyJobRepository, *, now: d
             "mode": "PAPER",
             "paperOrdersBlocked": False,
             "marketWorkersHealthy": True,
-            "paperReadinessPrerequisites": {
-                "durableDatabaseAvailable": True,
-                "activeSettingsPromotedForPaper": True,
-                "paperBrokerVerified": True,
-                "authoritativeMarketDataHealthy": True,
-                "marketClockHealthy": True,
-                "requiredWorkersHealthy": True,
-                "queueLagBelowThreshold": True,
-                "deadLetterWithinThreshold": True,
-                "restartReconstructionSucceeded": True,
-                "inventoryReconciliationCurrent": True,
-                "globalRiskSourceCurrent": True,
-                "requiredAcceptanceTestsPassed": True,
-            },
+            "paperReadinessPrerequisites": healthy_paper_readiness_prerequisites(),
             "workers": {
                 "finalised_bar_decisions": "healthy",
                 "order_submission": "healthy",

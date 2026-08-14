@@ -43,8 +43,15 @@ class MetaStrategySizingContext:
     stop_distance: float
     market_liquidity: float
     remaining_algorithm_risk: float
-    global_available_risk: float
-    global_quantity_cap: int
+    global_available_risk: float | None
+    global_quantity_cap: int | None
+    existing_symbol_exposure: float = 0.0
+    realized_daily_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    reserved_risk: float = 0.0
+    maximum_daily_loss: float | None = None
+    maximum_open_risk: float | None = None
+    risk_reducing_exit: bool = False
 
     def __post_init__(self) -> None:
         if not 0.0 <= float(self.model_risk_multiplier) <= 1.0:
@@ -56,12 +63,19 @@ class MetaStrategySizingContext:
             "stop_distance",
             "market_liquidity",
             "remaining_algorithm_risk",
-            "global_available_risk",
+            "existing_symbol_exposure",
+            "realized_daily_pnl",
+            "unrealized_pnl",
+            "reserved_risk",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value):
                 raise ValueError(f"meta_strategy.sizing.{name}_must_be_finite")
-        if self.global_quantity_cap < 0:
+        for name in ("global_available_risk", "maximum_daily_loss", "maximum_open_risk"):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError(f"meta_strategy.sizing.{name}_must_be_finite")
+        if self.global_quantity_cap is not None and self.global_quantity_cap < 0:
             raise ValueError("meta_strategy.sizing.global_quantity_cap_must_be_non_negative")
 
 
@@ -106,21 +120,25 @@ def calculate_meta_strategy_position_size(
     if not context.local_gates_passed:
         return _zero_result(context, settings, "local_gates", ("meta_strategy.sizing.local_gate_failed",))
     invalid_reasons = _invalid_market_reasons(context)
-    if invalid_reasons:
+    if invalid_reasons and not context.risk_reducing_exit:
         return _zero_result(context, settings, "invalid_market", invalid_reasons)
 
+    effective_global_risk = context.remaining_algorithm_risk if context.global_available_risk is None else float(context.global_available_risk)
+    effective_global_quantity_cap = settings.maximum_share_quantity if context.global_quantity_cap is None else int(context.global_quantity_cap)
     base_risk = max(0.0, context.account_equity * context.baseline_settings.risk_percentage)
     dynamic_risk = min(base_risk, max(0.0, context.account_equity * context.effective_settings.risk_percentage))
     ml_risk = min(dynamic_risk, dynamic_risk * context.model_risk_multiplier)
     risk_based_quantity = _floor_quantity(ml_risk / context.stop_distance)
-    position_cap_quantity = _floor_quantity((context.account_equity * context.effective_settings.position_cap) / context.entry_price)
+    maximum_position_notional = max(0.0, context.account_equity * context.effective_settings.position_cap)
+    remaining_position_notional = max(0.0, maximum_position_notional - max(0.0, context.existing_symbol_exposure))
+    position_cap_quantity = _floor_quantity(remaining_position_notional / context.entry_price)
     buying_power_quantity = _floor_quantity(context.available_buying_power / context.entry_price)
     liquidity_quantity = _floor_quantity(context.market_liquidity * settings.liquidity_participation_rate)
     maximum_share_quantity = int(settings.maximum_share_quantity)
     remaining_algorithm_risk_quantity = _floor_quantity(context.remaining_algorithm_risk / context.stop_distance)
     global_risk_quantity_cap = min(
-        int(context.global_quantity_cap),
-        _floor_quantity(context.global_available_risk / context.stop_distance),
+        max(0, effective_global_quantity_cap),
+        _floor_quantity(effective_global_risk / context.stop_distance),
     )
     caps = (
         _cap("risk_based_quantity", risk_based_quantity, "Risk dollars divided by stop distance."),
@@ -209,12 +227,20 @@ def _invalid_market_reasons(context: MetaStrategySizingContext) -> tuple[str, ..
         reasons.extend(("meta_strategy.sizing.non_finite_input", "meta_strategy.sizing.invalid_remaining_algorithm_risk"))
     elif context.remaining_algorithm_risk == 0:
         reasons.append("meta_strategy.sizing.zero_algorithm_risk")
-    if context.global_available_risk < 0:
-        reasons.extend(("meta_strategy.sizing.non_finite_input", "meta_strategy.sizing.invalid_global_risk"))
-    elif context.global_available_risk == 0:
-        reasons.append("meta_strategy.sizing.zero_global_risk")
+    if context.global_available_risk is not None:
+        if context.global_available_risk < 0:
+            reasons.extend(("meta_strategy.sizing.non_finite_input", "meta_strategy.sizing.invalid_global_risk"))
+        elif context.global_available_risk == 0:
+            reasons.append("meta_strategy.sizing.zero_global_risk")
     if context.global_quantity_cap == 0:
         reasons.append("meta_strategy.sizing.zero_approved_quantity")
+    if context.maximum_daily_loss is not None and context.realized_daily_pnl <= -abs(float(context.maximum_daily_loss)):
+        reasons.append("meta_strategy.sizing.daily_loss_limit_exceeded")
+    if context.maximum_open_risk is not None and context.reserved_risk >= max(0.0, float(context.maximum_open_risk)):
+        reasons.append("meta_strategy.sizing.maximum_open_risk_exceeded")
+    maximum_position_notional = max(0.0, context.account_equity * context.effective_settings.position_cap)
+    if context.entry_price > 0 and context.existing_symbol_exposure >= maximum_position_notional:
+        reasons.append("meta_strategy.sizing.maximum_position_exceeded")
     return tuple(dict.fromkeys(reasons))
 
 

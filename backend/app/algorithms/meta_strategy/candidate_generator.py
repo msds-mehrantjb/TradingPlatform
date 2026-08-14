@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from backend.app.algorithms.meta_strategy.candidate_geometry import CandidateGeometryConfig, CandidateGeometryResult, calculate_candidate_geometry
 from backend.app.algorithms.meta_strategy.candidate_validation import CandidateGeometryValidationError
@@ -16,6 +16,8 @@ from backend.app.algorithms.meta_strategy.family_aggregation import (
     StrategyContribution,
     aggregate_family_scores,
 )
+from backend.app.algorithms.meta_strategy.identity import ALGORITHM_ID
+from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 from backend.app.algorithms.meta_strategy.settings import MetaStrategySettings, build_meta_strategy_settings
 from backend.app.algorithms.meta_strategy.strategy_registry import (
     ACTIVE_DIRECTIONAL_STRATEGIES,
@@ -544,10 +546,18 @@ def _conflicting_exposure(snapshot: MetaStrategyMarketSnapshot, direction: Direc
     state = snapshot.features.get("existingPositionState") or snapshot.features.get("algorithmExposureState") or {}
     if not isinstance(state, dict):
         return False
+    if not _trusted_meta_strategy_position_state(state):
+        return False
     if not bool(state.get("policyAllowsEntry", True)):
         return True
     side = str(state.get("side") or state.get("direction") or "").upper()
     return (direction == "BUY" and side in {"SHORT", "SELL"}) or (direction == "SELL" and side in {"LONG", "BUY"})
+
+
+def _trusted_meta_strategy_position_state(state: Mapping[str, Any]) -> bool:
+    algorithm_id = state.get("algorithmId") or state.get("algorithm_id")
+    partition_id = state.get("capitalPartitionId") or state.get("capital_partition_id")
+    return algorithm_id == ALGORITHM_ID and partition_id == META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 
 
 def _duplicate_or_cooldown(snapshot: MetaStrategyMarketSnapshot) -> bool:

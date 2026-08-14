@@ -22,6 +22,9 @@ from backend.app.algorithms.meta_strategy.interfaces import (
 )
 from backend.app.algorithms.meta_strategy.ownership import (
     META_STRATEGY_AUTHORITATIVE_DOMAIN_IDS,
+    META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+    META_STRATEGY_EXPECTED_MUTABLE_OWNER,
+    META_STRATEGY_REJECTED_FOREIGN_ALGORITHM_IDS,
     META_STRATEGY_REQUIRED_IDENTITY_FIELDS,
     meta_strategy_ownership_contract,
 )
@@ -93,6 +96,14 @@ class MetaStrategyPhase1ArchitectureContractsTest(unittest.TestCase):
         self.assertTrue(expected_identity_fields.issubset(set(META_STRATEGY_REQUIRED_IDENTITY_FIELDS)))
         self.assertFalse(contract["mayMutateForeignAlgorithmState"])
         self.assertFalse(contract["mayReadSiblingPrivateState"])
+        self.assertEqual(contract["expectedMutableOwner"], META_STRATEGY_EXPECTED_MUTABLE_OWNER)
+        self.assertEqual(contract["expectedMutableOwner"]["algorithmId"], ALGORITHM_ID)
+        self.assertEqual(contract["expectedMutableOwner"]["capitalPartitionId"], META_STRATEGY_DEFAULT_CAPITAL_PARTITION)
+        self.assertEqual(
+            set(META_STRATEGY_REJECTED_FOREIGN_ALGORITHM_IDS),
+            {"weighted_voting", "voting_ensemble", "wca", "regime", "session"},
+        )
+        self.assertEqual(contract["rejectedForeignAlgorithmIds"], META_STRATEGY_REJECTED_FOREIGN_ALGORITHM_IDS)
         for domain in contract["authoritativeDomains"]:
             with self.subTest(domain=domain["domain_id"]):
                 self.assertTrue(domain["mutable_by_meta_strategy_only"])
@@ -148,16 +159,20 @@ class MetaStrategyPhase1ArchitectureContractsTest(unittest.TestCase):
         path = temp_db_path()
         repository = MetaStrategySqliteRepository(f"sqlite:///{path}")
 
-        with self.assertRaises(MetaStrategyRepositoryAttributionError):
+        with self.assertRaises(MetaStrategyRepositoryAttributionError) as weighted_error:
             repository.persist("decisions", {**sample_payload("decisions"), "algorithmId": "weighted_voting"})
+        self.assertEqual(weighted_error.exception.reason_codes, ("meta_strategy.repository.foreign_algorithm_rejected",))
+        self.assertEqual(weighted_error.exception.observed_algorithm_id, "weighted_voting")
         with self.assertRaises(MetaStrategyRepositoryAttributionError):
             repository.persist("decisions", {**sample_payload("decisions"), "algorithmId": "regime"}, record_id="existing-record")
         with self.assertRaises(MetaStrategyRepositoryAttributionError):
             repository.persist("trades", {**sample_payload("trades"), "algorithmId": "wca"})
 
         insert_legacy_foreign_row(path)
-        with self.assertRaises(MetaStrategyRepositoryAttributionError):
+        with self.assertRaises(MetaStrategyRepositoryAttributionError) as loaded_foreign:
             repository.load("decisions", "foreign-record")
+        self.assertEqual(loaded_foreign.exception.reason_codes, ("meta_strategy.repository.foreign_algorithm_rejected",))
+        self.assertEqual(loaded_foreign.exception.observed_algorithm_id, "weighted_voting")
         with self.assertRaises(MetaStrategyRepositoryAttributionError):
             repository.latest_for_decision("decisions", "foreign-decision")
 

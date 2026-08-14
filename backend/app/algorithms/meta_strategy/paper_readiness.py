@@ -96,8 +96,10 @@ def build_meta_strategy_paper_entry_readiness_prerequisites(
     controls = dict(snapshot.get("controls") or {})
     algorithm_readiness = dict(snapshot.get("algorithmReadiness") or {})
     inventory = dict(snapshot.get("inventory") or {})
+    inventory_snapshot = dict(inventory.get("snapshot") or {})
     consistency = dict(inventory.get("consistency") or {})
     broker = dict(metrics.get("paperBrokerConnectivity") or {})
+    paper_control = _paper_control_state(controls)
     queue_lag_seconds = _queue_lag_seconds(runtime_data, queues)
     dead_letter_count = _dead_letter_count(runtime_data, queues, metrics)
     workers = dict(runtime_data.get("workers") or {})
@@ -122,9 +124,41 @@ def build_meta_strategy_paper_entry_readiness_prerequisites(
     required_acceptance_passed = _runtime_bool(runtime_prerequisites, runtime_data, "requiredAcceptanceTestsPassed")
     if required_acceptance_passed is None and paper_readiness is not None:
         required_acceptance_passed = paper_readiness.get("paperReady") is True and not tuple(paper_readiness.get("blockingCriteria") or ())
+    inventory_repository_available = _runtime_bool(runtime_prerequisites, runtime_data, "inventoryRepositoryAvailable")
+    if inventory_repository_available is None:
+        inventory_repository_available = _meta_strategy_owned_inventory_snapshot(inventory_snapshot)
+    inventory_consistency_passes = _runtime_bool(runtime_prerequisites, runtime_data, "inventoryConsistencyPasses")
+    if inventory_consistency_passes is None:
+        inventory_consistency_passes = bool(inventory_reconciled)
+    allocated_capital_positive = _runtime_bool(runtime_prerequisites, runtime_data, "allocatedCapitalPositive")
+    if allocated_capital_positive is None:
+        allocated_capital_positive = _float_value(inventory_snapshot.get("allocated_capital", inventory_snapshot.get("allocatedCapital"))) > 0
+    account_snapshot_meta_strategy_derived = _runtime_bool(runtime_prerequisites, runtime_data, "accountSnapshotMetaStrategyDerived")
+    if account_snapshot_meta_strategy_derived is None:
+        account_snapshot_meta_strategy_derived = _account_snapshot_meta_strategy_derived(runtime_data)
+    risk_snapshot_meta_strategy_derived = _runtime_bool(runtime_prerequisites, runtime_data, "riskSnapshotMetaStrategyDerived")
+    if risk_snapshot_meta_strategy_derived is None:
+        risk_snapshot_meta_strategy_derived = _risk_snapshot_meta_strategy_derived(runtime_data)
+    broker_paper_only = _runtime_bool(runtime_prerequisites, runtime_data, "brokerPaperOnly")
+    if broker_paper_only is None:
+        broker_paper_only = _paper_broker_is_paper_only(broker, runtime_data)
+    paper_toggle_enabled = _runtime_bool(runtime_prerequisites, runtime_data, "paperToggleEnabled")
+    if paper_toggle_enabled is None:
+        paper_toggle_enabled = paper_control.get("newPaperEntriesEnabled") is True and paper_control.get("paperOnly") is True
+    runtime_mode_paper = _runtime_bool(runtime_prerequisites, runtime_data, "runtimeModePaper", "paperMode")
+    if runtime_mode_paper is None:
+        runtime_mode_paper = str(runtime_data.get("mode") or "").upper() == "PAPER"
+    live_trading_disabled = _runtime_bool(runtime_prerequisites, runtime_data, "liveTradingDisabled")
+    if live_trading_disabled is None:
+        live_trading_disabled = paper_control.get("liveExecutionEnabled") is False and runtime_data.get("liveTradingEnabled") is not True
     prerequisites = {
         "version": META_STRATEGY_PAPER_ENTRY_READINESS_VERSION,
         "durableDatabaseAvailable": _runtime_bool(runtime_prerequisites, runtime_data, "durableDatabaseAvailable") is not False,
+        "inventoryRepositoryAvailable": bool(inventory_repository_available),
+        "inventoryConsistencyPasses": bool(inventory_consistency_passes),
+        "allocatedCapitalPositive": bool(allocated_capital_positive),
+        "accountSnapshotMetaStrategyDerived": bool(account_snapshot_meta_strategy_derived),
+        "riskSnapshotMetaStrategyDerived": bool(risk_snapshot_meta_strategy_derived),
         "activeSettingsPromotedForPaper": _runtime_bool(runtime_prerequisites, runtime_data, "activeSettingsPromotedForPaper")
         if _runtime_bool(runtime_prerequisites, runtime_data, "activeSettingsPromotedForPaper") is not None
         else (
@@ -134,6 +168,7 @@ def build_meta_strategy_paper_entry_readiness_prerequisites(
         "paperBrokerVerified": _runtime_bool(runtime_prerequisites, runtime_data, "paperBrokerVerified")
         if _runtime_bool(runtime_prerequisites, runtime_data, "paperBrokerVerified") is not None
         else broker.get("verified") is True or str(broker.get("status") or "").upper() in {"OK", "CONNECTED", "VERIFIED"},
+        "brokerPaperOnly": bool(broker_paper_only),
         "authoritativeMarketDataHealthy": _runtime_bool(runtime_prerequisites, runtime_data, "authoritativeMarketDataHealthy", "marketDataHealthy") is True,
         "marketClockHealthy": _runtime_bool(runtime_prerequisites, runtime_data, "marketClockHealthy") is True,
         "requiredWorkersHealthy": bool(required_workers_healthy),
@@ -143,6 +178,9 @@ def build_meta_strategy_paper_entry_readiness_prerequisites(
         "inventoryReconciliationCurrent": bool(inventory_reconciled),
         "globalRiskSourceCurrent": _runtime_bool(runtime_prerequisites, runtime_data, "globalRiskSourceCurrent") is True,
         "requiredAcceptanceTestsPassed": bool(required_acceptance_passed),
+        "paperToggleEnabled": bool(paper_toggle_enabled),
+        "runtimeModePaper": bool(runtime_mode_paper),
+        "liveTradingDisabled": bool(live_trading_disabled),
         "queueLagSeconds": queue_lag_seconds,
         "deadLetterCount": dead_letter_count,
         "workers": workers,
@@ -150,8 +188,10 @@ def build_meta_strategy_paper_entry_readiness_prerequisites(
         "evidence": {
             "runtimePrerequisites": runtime_prerequisites,
             "algorithmReadiness": algorithm_readiness,
+            "inventorySnapshot": inventory_snapshot,
             "inventoryConsistency": consistency,
             "paperBrokerConnectivity": broker,
+            "paperControl": paper_control,
             "queueHealth": queue_health,
         },
     }
@@ -161,8 +201,14 @@ def build_meta_strategy_paper_entry_readiness_prerequisites(
         if key
         in {
             "durableDatabaseAvailable",
+            "inventoryRepositoryAvailable",
+            "inventoryConsistencyPasses",
+            "allocatedCapitalPositive",
+            "accountSnapshotMetaStrategyDerived",
+            "riskSnapshotMetaStrategyDerived",
             "activeSettingsPromotedForPaper",
             "paperBrokerVerified",
+            "brokerPaperOnly",
             "authoritativeMarketDataHealthy",
             "marketClockHealthy",
             "requiredWorkersHealthy",
@@ -172,6 +218,9 @@ def build_meta_strategy_paper_entry_readiness_prerequisites(
             "inventoryReconciliationCurrent",
             "globalRiskSourceCurrent",
             "requiredAcceptanceTestsPassed",
+            "paperToggleEnabled",
+            "runtimeModePaper",
+            "liveTradingDisabled",
         }
         and value is not True
     ]
@@ -187,6 +236,58 @@ def _runtime_bool(prerequisites: Mapping[str, Any], runtime: Mapping[str, Any], 
         if runtime.get(key) is not None:
             return runtime.get(key) is True
     return None
+
+
+def _paper_control_state(controls: Mapping[str, Any]) -> dict[str, Any]:
+    for key in ("AUTOMATIC_PAPER_TRADING", "automaticPaperTrading", "paperControl"):
+        candidate = controls.get(key)
+        if isinstance(candidate, Mapping):
+            state = candidate.get("state")
+            return dict(state) if isinstance(state, Mapping) else dict(candidate)
+    return {}
+
+
+def _meta_strategy_owned_inventory_snapshot(snapshot: Mapping[str, Any]) -> bool:
+    return (
+        snapshot.get("algorithm_id", snapshot.get("algorithmId")) == "meta_strategy"
+        and snapshot.get("capital_partition_id", snapshot.get("capitalPartitionId")) == "meta_strategy.paper.default"
+    )
+
+
+def _account_snapshot_meta_strategy_derived(runtime: Mapping[str, Any]) -> bool:
+    account = runtime.get("accountSnapshot") or runtime.get("account")
+    if not isinstance(account, Mapping):
+        return False
+    return (
+        account.get("algorithmId") == "meta_strategy"
+        and account.get("capitalPartitionId") == "meta_strategy.paper.default"
+        and account.get("accountAuthority") == "meta_strategy_inventory.current_inventory_snapshot"
+    )
+
+
+def _risk_snapshot_meta_strategy_derived(runtime: Mapping[str, Any]) -> bool:
+    risk = runtime.get("riskSnapshot") or runtime.get("globalRiskSnapshot") or runtime.get("globalRisk")
+    if not isinstance(risk, Mapping):
+        return False
+    return (
+        risk.get("algorithmId") == "meta_strategy"
+        and risk.get("capitalPartitionId") == "meta_strategy.paper.default"
+        and risk.get("source") == "meta_strategy_local_settings_risk"
+    )
+
+
+def _paper_broker_is_paper_only(broker: Mapping[str, Any], runtime: Mapping[str, Any]) -> bool:
+    mode = str(runtime.get("paperGatewayExecutionMode") or runtime.get("executionMode") or broker.get("executionMode") or "").upper()
+    if mode in {"LOCAL_PAPER", "BROKER_PAPER", "LOCAL_LEDGER"}:
+        return True
+    return broker.get("paperOnly") is True or broker.get("liveExecutionEnabled") is False
+
+
+def _float_value(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _entry_queue_lag_limit_seconds() -> int:

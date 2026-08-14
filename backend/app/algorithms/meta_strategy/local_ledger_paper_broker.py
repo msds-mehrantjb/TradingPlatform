@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 from backend.app.domain.models import Signal
 from backend.app.execution import PaperGatewayBrokerAck, PaperGatewayFill, PaperOrderIntentRecord
 
@@ -121,9 +122,13 @@ class MetaStrategyLocalLedgerPaperBroker:
         if not fill:
             return None
         return PaperGatewayFill(
+            executionMode="LOCAL_PAPER",
             clientOrderId=str(fill["clientOrderId"]),
             algorithmId="meta_strategy",
             orderIntentId=str(fill["orderIntentId"]),
+            capitalPartitionId=str(fill.get("capitalPartitionId") or META_STRATEGY_DEFAULT_CAPITAL_PARTITION),
+            brokerOrderId=str(fill.get("brokerOrderId") or ""),
+            brokerFillId=str(fill.get("brokerFillId") or ""),
             symbol=str(fill["symbol"]).upper(),
             side=Signal.SELL if str(fill["side"]).upper() == "SELL" else Signal.BUY,
             filledQuantity=int(fill["filledQuantity"]),
@@ -146,7 +151,7 @@ class MetaStrategyLocalLedgerPaperBroker:
 
     def refresh_positions(self) -> list[dict[str, Any]]:
         positions = [
-            dict(value)
+            _reconciliation_only_position(value)
             for key, value in self.store.snapshots.items()
             if str(key).startswith(_POSITION_PREFIX) and isinstance(value, Mapping)
         ]
@@ -190,18 +195,20 @@ class MetaStrategyLocalLedgerPaperBroker:
         self.store.write_snapshot(_FILL_PREFIX + client_order_id, fill)
         self.store.write_snapshot(
             _POSITION_PREFIX + str(order["symbol"]).upper(),
-            {
-                "algorithmId": "meta_strategy",
-                "capitalPartitionId": order["capitalPartitionId"],
-                "clientOrderId": client_order_id,
-                "brokerOrderId": order["brokerOrderId"],
-                "symbol": str(order["symbol"]).upper(),
-                "quantity": int(order.get("quantity") or 0),
-                "side": str(order["side"]).upper(),
-                "averagePrice": price,
-                "paperOnly": True,
-                "updatedAt": timestamp.isoformat(),
-            },
+            _reconciliation_only_position(
+                {
+                    "algorithmId": "meta_strategy",
+                    "capitalPartitionId": order["capitalPartitionId"],
+                    "clientOrderId": client_order_id,
+                    "brokerOrderId": order["brokerOrderId"],
+                    "symbol": str(order["symbol"]).upper(),
+                    "quantity": int(order.get("quantity") or 0),
+                    "side": str(order["side"]).upper(),
+                    "averagePrice": price,
+                    "paperOnly": True,
+                    "updatedAt": timestamp.isoformat(),
+                }
+            ),
         )
         updated_order = {**dict(order), "status": "FILLED", "remainingQuantity": 0, "updatedAt": timestamp.isoformat()}
         self.store.write_snapshot(_ORDER_PREFIX + client_order_id, updated_order)
@@ -221,6 +228,28 @@ class MetaStrategyLocalLedgerPaperBroker:
         self.store.write_snapshot(_EVENT_PREFIX + event_id, event)
         return event
 
+
+def _reconciliation_only_position(position: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        **dict(position),
+        "recordType": "broker_simulated_position",
+        "brokerSimulationOnly": True,
+        "reconciliationOnly": True,
+        "portfolioAuthority": False,
+        "inventoryAuthority": False,
+        "accountAuthority": "meta_strategy_inventory.current_inventory_snapshot",
+        "cashAuthority": False,
+        "pnlAuthority": False,
+        "riskAuthority": False,
+        "reasonCodes": tuple(
+            dict.fromkeys(
+                (
+                    *tuple(position.get("reasonCodes") or ()),
+                    "meta_strategy.local_ledger.position_reconciliation_only",
+                )
+            )
+        ),
+    }
 
 def _read_optional(store: Any, key: str) -> dict[str, Any] | None:
     try:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -13,6 +14,8 @@ from backend.app.algorithms.meta_strategy.alpaca_paper_broker import (
 )
 from backend.app.algorithms.meta_strategy.decision_worker import MetaStrategyDecisionStateProvider
 from backend.app.algorithms.meta_strategy.jobs import META_STRATEGY_JOB_QUEUES, MetaStrategyJobRepository
+from backend.app.algorithms.meta_strategy.local_ledger_paper_broker import MetaStrategyLocalLedgerPaperBroker
+from backend.app.algorithms.meta_strategy.local_paper_broker import MetaStrategyLocalPaperBroker
 from backend.app.algorithms.meta_strategy.repository import MetaStrategySqliteRepository
 from backend.app.algorithms.meta_strategy.state_provider import MetaStrategyCandleStoreStateProvider
 from backend.app.algorithms.meta_strategy.settings import MetaStrategySettingsStore
@@ -216,11 +219,18 @@ class MetaStrategyWorkerGlobalRiskSource:
 
 
 def _paper_gateway(repository: MetaStrategyJobRepository) -> PaperOrderGateway:
+    broker_name = os.getenv("META_STRATEGY_PAPER_BROKER", "LOCAL_LEDGER").strip().upper()
+    if broker_name in {"LOCAL_LEDGER", "LEDGER", "PAPER_LEDGER"}:
+        broker = MetaStrategyLocalLedgerPaperBroker(repository.gateway_store())
+        return PaperOrderGateway(broker, repository.gateway_store(), execution_mode="LOCAL_PAPER")
+    if broker_name in {"LOCAL", "LOCAL_PAPER", "LOCAL_HTTP"}:
+        broker = MetaStrategyLocalPaperBroker()
+        return PaperOrderGateway(broker, repository.gateway_store(), execution_mode="LOCAL_PAPER")
     try:
         broker = MetaStrategyAlpacaPaperBroker()
     except MetaStrategyAlpacaPaperBrokerConfigurationError as exc:
         raise RuntimeError("meta_strategy.worker.paper_broker_required") from exc
-    return PaperOrderGateway(broker, repository.gateway_store())
+    return PaperOrderGateway(broker, repository.gateway_store(), execution_mode="BROKER_PAPER")
 
 
 def _require_inventory_repository(inventory_repository: MetaStrategySqliteRepository | None) -> MetaStrategySqliteRepository:

@@ -13,6 +13,7 @@ from backend.app.algorithms.meta_strategy import (
     META_STRATEGY_RECOVERY_TEST_IDS,
 )
 from backend.app.algorithms.meta_strategy.jobs import MetaStrategyJobRepository
+from backend.app.algorithms.meta_strategy.ownership import META_STRATEGY_DEFAULT_CAPITAL_PARTITION
 from backend.app.algorithms.meta_strategy.repository import MetaStrategySqliteRepository
 from backend.app.algorithms.meta_strategy.runtime_supervisor import MARKET_TIME_QUEUES
 from backend.app.algorithms.meta_strategy.service import MetaStrategyApplicationService
@@ -93,8 +94,86 @@ class MetaStrategyPaperReadinessAcceptanceTest(unittest.TestCase):
         self.assertIn("position_management_worker_running", paper["blockingCriteria"])
         self.assertEqual(response["payload"]["currentShadowPaperStatus"]["paper"], "blocked")
 
+    def test_inventory_health_prerequisite_blocks_new_entries(self) -> None:
+        reason_by_field = {
+            "inventoryRepositoryAvailable": "meta_strategy.readiness.inventory_repository_unavailable",
+            "inventoryConsistencyPasses": "meta_strategy.readiness.inventory_consistency_failed",
+            "allocatedCapitalPositive": "meta_strategy.readiness.allocated_capital_missing",
+            "accountSnapshotMetaStrategyDerived": "meta_strategy.readiness.account_snapshot_not_meta_strategy_inventory",
+            "riskSnapshotMetaStrategyDerived": "meta_strategy.readiness.risk_snapshot_not_meta_strategy_inventory",
+            "restartReconstructionSucceeded": "meta_strategy.readiness.restart_reconstruction_failed",
+            "brokerPaperOnly": "meta_strategy.readiness.broker_not_paper_only",
+            "paperToggleEnabled": "meta_strategy.readiness.paper_toggle_disabled",
+            "runtimeModePaper": "meta_strategy.readiness.runtime_mode_not_paper",
+            "liveTradingDisabled": "meta_strategy.readiness.live_trading_enabled",
+        }
+        for field, reason_code in reason_by_field.items():
+            with self.subTest(field=field):
+                runtime = healthy_runtime()
+                runtime["ready"] = False
+                runtime["paperOrdersBlocked"] = True
+                runtime["paperReadinessPrerequisites"] = {**runtime["paperReadinessPrerequisites"], field: False}
+                service = service_with_runtime(runtime)
+                record_acceptance_evidence(service)
 
-def service_with_runtime(runtime: dict) -> MetaStrategyApplicationService:
+                response = service.readiness_report()
+                prerequisites = response["payload"]["paperEntryReadinessPrerequisites"]
+
+                self.assertEqual(response["status"], "REJECTED")
+                self.assertFalse(response["payload"]["newEntryPermission"]["allowed"])
+                self.assertFalse(prerequisites[field])
+                self.assertIn(field, prerequisites["blockingPrerequisites"])
+                self.assertIn(reason_code, response["payload"]["newEntryPermission"]["reasonCodes"])
+
+    def test_readiness_blocks_without_local_allocated_capital_even_when_runtime_claims_ready(self) -> None:
+        service = service_with_runtime(healthy_runtime(), seed_capital=False)
+        record_acceptance_evidence(service)
+
+        response = service.readiness_report()
+        prerequisites = response["payload"]["paperEntryReadinessPrerequisites"]
+
+        self.assertEqual(response["status"], "REJECTED")
+        self.assertFalse(prerequisites["allocatedCapitalPositive"])
+        self.assertIn("meta_strategy.readiness.allocated_capital_missing", response["payload"]["newEntryPermission"]["reasonCodes"])
+
+    def test_readiness_blocks_when_durable_paper_toggle_is_disabled(self) -> None:
+        service = service_with_runtime(healthy_runtime(), paper_toggle=False)
+        record_acceptance_evidence(service)
+
+        response = service.readiness_report()
+        prerequisites = response["payload"]["paperEntryReadinessPrerequisites"]
+
+        self.assertEqual(response["status"], "REJECTED")
+        self.assertFalse(prerequisites["paperToggleEnabled"])
+        self.assertIn("meta_strategy.readiness.paper_toggle_disabled", response["payload"]["newEntryPermission"]["reasonCodes"])
+
+    def test_market_data_unhealthy_blocks_local_ledger_paper_ready_even_with_broker_verified(self) -> None:
+        runtime = healthy_runtime()
+        runtime["ready"] = False
+        runtime["paperOrdersBlocked"] = True
+        runtime["reasonCodes"] = ("meta_strategy.runtime.candle_producer_failed",)
+        runtime["workers"] = {**runtime["workers"], "finalized_candle_producer": "failed"}
+        runtime["paperReadinessPrerequisites"] = {
+            **runtime["paperReadinessPrerequisites"],
+            "paperBrokerVerified": True,
+            "authoritativeMarketDataHealthy": False,
+        }
+        service = service_with_runtime(runtime)
+        record_acceptance_evidence(service)
+
+        response = service.readiness_report()
+        prerequisites = response["payload"]["paperEntryReadinessPrerequisites"]
+
+        self.assertEqual(response["status"], "REJECTED")
+        self.assertFalse(response["payload"]["paperReady"])
+        self.assertFalse(prerequisites["authoritativeMarketDataHealthy"])
+        self.assertIn("authoritativeMarketDataHealthy", prerequisites["blockingPrerequisites"])
+        self.assertIn("meta_strategy.readiness.market_data_unhealthy", response["payload"]["newEntryPermission"]["reasonCodes"])
+        self.assertFalse(response["payload"]["newEntryPermission"]["allowed"])
+        self.assertTrue(response["payload"]["currentShadowPaperStatus"]["paperOrdersBlocked"])
+
+
+def service_with_runtime(runtime: dict, *, seed_capital: bool = True, paper_toggle: bool = True) -> MetaStrategyApplicationService:
     database_url = f"sqlite:///{temp_db_path()}"
     settings_store = MetaStrategySettingsStore(temp_db_path(prefix="meta-strategy-paper-readiness-settings"))
     settings = settings_store.create_baseline(
@@ -108,6 +187,30 @@ def service_with_runtime(runtime: dict) -> MetaStrategyApplicationService:
         repository=MetaStrategySqliteRepository(database_url),
         runtime_readiness_provider=lambda: runtime,
     )
+    if seed_capital:
+        service.repository.record_allocated_capital(
+            {
+                "algorithmId": "meta_strategy",
+                "capitalPartitionId": META_STRATEGY_DEFAULT_CAPITAL_PARTITION,
+                "eventId": f"capital-{uuid4().hex}",
+                "settingsVersion": settings.settings_version,
+                "correlationId": f"readiness-{uuid4().hex}",
+                "symbol": "PORTFOLIO",
+                "side": "BUY",
+                "quantity": 0,
+                "price": 0,
+                "allocatedCapital": 100000,
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+        )
+    if paper_toggle:
+        service.update_paper_control(
+            {
+                "newPaperEntriesEnabled": True,
+                "actor": "test",
+                "reason": "meta_strategy.test.enable_paper_readiness",
+            }
+        )
     for queue_name in MARKET_TIME_QUEUES:
         service.job_repository.record_worker_heartbeat(
             worker_id=f"meta_strategy.paper_readiness.{queue_name}",
@@ -120,8 +223,14 @@ def service_with_runtime(runtime: dict) -> MetaStrategyApplicationService:
 def healthy_runtime() -> dict:
     prerequisites = {
         "durableDatabaseAvailable": True,
+        "inventoryRepositoryAvailable": True,
+        "inventoryConsistencyPasses": True,
+        "allocatedCapitalPositive": True,
+        "accountSnapshotMetaStrategyDerived": True,
+        "riskSnapshotMetaStrategyDerived": True,
         "activeSettingsPromotedForPaper": True,
         "paperBrokerVerified": True,
+        "brokerPaperOnly": True,
         "authoritativeMarketDataHealthy": True,
         "marketClockHealthy": True,
         "requiredWorkersHealthy": True,
@@ -131,6 +240,9 @@ def healthy_runtime() -> dict:
         "inventoryReconciliationCurrent": True,
         "globalRiskSourceCurrent": True,
         "requiredAcceptanceTestsPassed": True,
+        "paperToggleEnabled": True,
+        "runtimeModePaper": True,
+        "liveTradingDisabled": True,
     }
     return {
         "algorithmId": "meta_strategy",

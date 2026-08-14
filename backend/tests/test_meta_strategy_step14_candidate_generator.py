@@ -114,7 +114,7 @@ class MetaStrategyStep14CandidateGeneratorTest(unittest.TestCase):
             ("stale", {"source_cutoff_timestamp": NOW.replace(hour=15, minute=40)}, {}, "meta_strategy.candidate.reject.data_stale"),
             ("wide_spread", {"spread_bps": 30.0, "spread": {"basisPoints": 30.0, "dollars": 0.20}}, {}, "meta_strategy.candidate.reject.spread_unacceptable"),
             ("thin_liquidity", {"liquidity": {"level": "thin", "score": 0.1, "shareVolume": 100.0}}, {}, "meta_strategy.candidate.reject.liquidity_unacceptable"),
-            ("conflicting_exposure", {"features": {"existingPositionState": {"policyAllowsEntry": False, "side": "SHORT"}}}, {}, "meta_strategy.candidate.reject.conflicting_exposure"),
+            ("conflicting_exposure", {"features": {"existingPositionState": {"algorithmId": "meta_strategy", "capitalPartitionId": "meta_strategy.paper.default", "policyAllowsEntry": False, "side": "SHORT"}}}, {}, "meta_strategy.candidate.reject.conflicting_exposure"),
             ("duplicate", {"features": {"duplicateOrderState": {"duplicate": True}}}, {}, "meta_strategy.candidate.reject.duplicate_or_cooldown"),
             ("cooldown", {"features": {"cooldownState": {"active": True}}}, {}, "meta_strategy.candidate.reject.duplicate_or_cooldown"),
             ("cost_margin", {}, {"minimum_expected_reward_cost_margin": 999.0}, "meta_strategy.candidate.reject.expected_reward_below_cost_margin"),
@@ -136,6 +136,26 @@ class MetaStrategyStep14CandidateGeneratorTest(unittest.TestCase):
                 self.assertFalse(candidate.deterministic_candidate.eligible)
                 self.assertTrue(normalized["rejected"])
                 self.assertIn(reason, normalized["rejectionReasonCodes"])
+
+    def test_deterministic_candidate_ignores_foreign_position_feature_state(self) -> None:
+        candidate = generate_deterministic_candidate(
+            snapshot_fixture(
+                case="buy",
+                features={
+                    "existingPositionState": {
+                        "algorithmId": "weighted_voting",
+                        "capitalPartitionId": "weighted_voting.paper.default",
+                        "policyAllowsEntry": False,
+                        "side": "SHORT",
+                    }
+                },
+            ),
+            config=GENERATION_CONFIG,
+        )
+        normalized = candidate.evidence["normalizedCandidate"]
+
+        self.assertNotIn("meta_strategy.candidate.reject.conflicting_exposure", normalized["reasonCodes"])
+        self.assertNotIn("meta_strategy.candidate.reject.conflicting_exposure", normalized["rejectionReasonCodes"])
 
     def test_sell_candidate_can_be_produced_without_ml(self) -> None:
         candidate = generate_deterministic_candidate(snapshot_fixture(case="sell"), config=GENERATION_CONFIG)
