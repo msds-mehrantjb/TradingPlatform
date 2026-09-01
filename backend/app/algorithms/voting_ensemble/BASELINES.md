@@ -150,6 +150,88 @@ votes, so such a dataset produces no trades however the gates are set — the al
 working, not the harness failing. The dataset above swings widely enough for a second family
 to have a view: 14 bars clear the family-support gate, 140 fall short.
 
+## Futures readiness phase: what changed and what it moved
+
+Audit and implementation for a bar-close intraday strategy on index futures (MES/MNQ). Six
+changes, each its own commit.
+
+| Commit | Change |
+|---|---|
+| `9541941` | The instrument capability refusal is enforced, as a gate |
+| `e73f5b2` | Index futures get their own Globex session shape |
+| `aa92f2a` | Entry window applied on both paths, for both session shapes |
+| `01e9a5f` | The contract-roll veto gets its dates |
+| `616db79` | Index futures are sized by their point value |
+| `ec17b5a` | A rotted event calendar no longer reads as a calm market |
+
+### Before and after, one fixed replay dataset
+
+390 one-minute SPY bars from 13:30Z on 2026-07-14, 351 evaluated, real pipeline throughout.
+The previous recorded numbers are the first row and are kept rather than replaced.
+
+| Arm | Trades | Wins | Win rate | Avg entry | Net PnL |
+|---|---|---|---|---|---|
+| Previously recorded (no entry window) | 7 | 1 | 14.3% | 565.81 | -85.04 |
+| After this phase, default configuration | 5 | 1 | 20.0% | 554.23 | -50.00 |
+| ...with the event veto on over two entries | 3 | 1 | 33.3% | 555.19 | -10.56 |
+| ...with the close segment at half size | 5 | 1 | 20.0% | 554.23 | -50.00 |
+
+**Only one change moved the default numbers, and it was a correctness fix.** Replay applied
+no entry window at all, so it kept taking entries after the live path had stopped for the
+session. The two removed entries are at 15:52 and 15:54 ET, past the 15:30 cutoff live
+enforces. Replay had been overstating late-session activity, which is the mirror of the bug
+the live entry window was added to fix. `applyEntryWindow: false` reproduces the old
+behaviour for anything recorded against it.
+
+The other five changes leave equity replay untouched by construction: the capability gate
+passes for SPY, the Globex profile engages only for an instrument declaring
+`extended_session`, SPY declares no roll schedule, the contract multiplier is 1.0 for shares
+(asserted by test, not assumed), and calendar staleness only applies to a dated event list.
+
+**The half-size close arm shows no effect, and the reason matters.** After the entry window,
+no entry survives in the `close` segment for the multiplier to act on -- both close-segment
+entries were the ones the window removed. The gate is not inert; it has nothing to do on this
+dataset. Reporting it as "no effect" without that explanation would be misleading.
+
+### A Phase 1 finding that was wrong
+
+The audit reported regime weighting as inert -- that `_family_regime_fit` always returned 1.0
+because nothing produced `trendFit`, `breakoutFit` and the rest. **That was wrong.** The
+classifier emits all five (`adx_atr_regime_classifier.py:186-190`) and they carry real,
+differentiated values: on a trending series TREND 0.94 and BREAKOUT 0.84 against REVERSAL
+0.18 and MEAN_REVERSION 0.16, which is the intended behaviour.
+
+The error came from a grep truncated by `head -12` while a fixture file held more than twelve
+matching lines, and was falsely confirmed by looking for the keys in the decision record,
+which does not carry regime features at all. Two weak checks agreeing looked like evidence.
+The finding is withdrawn and nothing was implemented against it.
+
+One real observation from checking properly: an unclassifiable regime drives every family fit
+to 0.0, which silences all voters rather than falling back to neutral weighting. That is
+fail-closed and defensible, but it is a behaviour worth knowing about.
+
+### Not done, deliberately
+
+**MES and MNQ still cannot be traded.** All three capabilities they declare are now built,
+but `SUPPORTED_CAPABILITIES` has not been widened, so `require_tradeable` still refuses them
+and the gate blocks every bar. Two reasons: there is no CME data source, so the pipeline
+would be permitted to trade an instrument it cannot quote; and none of this futures work has
+been exercised against a single real MES bar. It is correct by construction and by unit test,
+which is not the same as correct, and futures sizing errors are 5x errors. Widening that set
+is the act that lets real money size against this code and should be taken deliberately, with
+data, not as the tail end of an implementation phase.
+
+**Notional binds before margin on futures.** An MES contract at 5000 index points carries
+$25,000 of notional, so $100k of equity holds four regardless of stop size. Futures post
+margin (~$1-2k), not notional, so the exposure caps are materially conservative for them.
+Safe direction, but a modelling decision to revisit before going live.
+
+**Replay still builds its snapshot directly** rather than constructing a finalized-bar event
+through the producer. The structural divergence remains; the behavioural one does not.
+`test_voting_ensemble_live_replay_parity.py` pins segment, entry window and event veto to
+agree bar for bar, which is what the shared path would have bought. Each of those three
+agreed only after a specific defect was fixed, and all three looked fine from one side.
+
 ## When to re-record
 
 Re-record, keeping the prior version beside the new one, when any of these happen:
@@ -162,6 +244,10 @@ Re-record, keeping the prior version beside the new one, when any of these happe
 5. `sessionSegments` boundaries change. They decide which segment each bar falls in, so a
    replay under different boundaries applies a different policy to the same bars while
    reporting the same segment names.
+6. `applyEntryWindow` is turned off, or `sessionStart`/`newTradesUntil` change. They decide
+   which bars may open a position at all.
+7. An instrument's `point_value` or `roll_schedule` changes, or `SUPPORTED_CAPABILITIES` is
+   widened. The first two change every sized quantity; the third changes what may trade.
 
 A baseline recorded without its enabling configuration cannot be reproduced, so the
 configuration is part of the record, not context around it.
