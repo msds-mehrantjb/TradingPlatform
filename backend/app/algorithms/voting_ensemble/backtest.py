@@ -74,10 +74,17 @@ class VotingEnsembleBacktestRunner:
         simulator = VotingEnsembleExecutionSimulator(self.config.execution)
         sessions = _group_by_session(one_minute)
         for session_date, session_candles in sorted(sessions.items()):
+            # Both reset per session: the daily-loss cap and the intraday-drawdown cap
+            # are daily measures, so carrying either across a session boundary would
+            # gate one day's trading on another day's losses.
+            fills: list[dict[str, Any]] = []
+            intraday_high = float(self.config.startingCapital)
             for index, candle in enumerate(session_candles):
                 if index + 1 < self.config.warmupCandles:
                     continue
                 prefix = tuple(session_candles[: index + 1])
+                account = self._account_snapshot(timestamp=candle.timestamp, fills=fills, intraday_high=intraday_high)
+                intraday_high = max(intraday_high, account["equity"])
                 evaluation = self._evaluate_at(
                     symbol=symbol,
                     timestamp=candle.timestamp,
@@ -88,6 +95,7 @@ class VotingEnsembleBacktestRunner:
                     iwm=iwm,
                     breadth=breadth,
                     external_breadth_feed=external_breadth_feed,
+                    account=account,
                 )
                 position_active = bool(active_until and candle.timestamp <= active_until)
                 order_plan = None if position_active else self._order_plan(symbol, evaluation, candle, session_date)
@@ -127,6 +135,16 @@ class VotingEnsembleBacktestRunner:
                 if execution and order_plan and execution.fill.filledQuantity > 0:
                     trade = self._trade_record(record, order_plan, execution)
                     trades.append(trade)
+                    stop = order_plan.stopPrice
+                    fills.append(
+                        {
+                            "entryAt": execution.fill.filledAt,
+                            "exitAt": execution.exit.exitAt if execution.exit else None,
+                            "netPnl": float(execution.exit.pnl if execution.exit else 0.0),
+                            "notional": execution.fill.filledQuantity * execution.fill.averagePrice,
+                            "risk": abs(execution.fill.averagePrice - stop) * execution.fill.filledQuantity if stop else 0.0,
+                        }
+                    )
                     if execution.exit and execution.exit.exitAt:
                         active_until = execution.exit.exitAt
                     else:
@@ -172,6 +190,7 @@ class VotingEnsembleBacktestRunner:
         iwm: tuple[VotingCandle, ...],
         breadth: dict[str, tuple[VotingCandle, ...]],
         external_breadth_feed: dict[str, Any] | None,
+        account: dict[str, Any],
     ) -> dict[str, Any]:
         payload = {
             "symbol": symbol.upper(),
@@ -191,7 +210,16 @@ class VotingEnsembleBacktestRunner:
             # snapshot.economicEventState rather than from the evaluate payload. Without
             # this a replay of a gated live run would silently skip every blackout the
             # live run honoured, and the two would not be comparable.
-            "market_context": {"event": self._event_state_at(timestamp)},
+            "market_context": {
+                "event": self._event_state_at(timestamp),
+                # Without these two the local gates fail closed on every bar
+                # (`trading_disabled`, `account_risk_state_missing`) and no candidate can
+                # ever reach a fill, so replay could only ever be driven by a stub
+                # service. The account is the simulated one, not a fixed fiction, which
+                # is what lets the daily-loss, drawdown and exposure gates actually bind.
+                "accountRiskSnapshot": account,
+                "operationalHealthSnapshot": self._operational_snapshot(),
+            },
         }
         snapshot = build_backtest_snapshot(payload)
         evaluate_payload = snapshot.to_evaluate_payload()
@@ -206,6 +234,50 @@ class VotingEnsembleBacktestRunner:
             decision["pipeline_envelope"] = {key: value for key, value in envelope.items() if key != "decision"}
             return decision
         return self.service.evaluate(evaluate_payload)
+
+    def _operational_snapshot(self) -> dict[str, Any]:
+        """The operational posture this replay assumes, with the configured overrides."""
+        snapshot = {"status": "nominal", "tradingEnabled": True, "paperTradingMode": True}
+        override = getattr(self.config, "operationalHealth", None)
+        if isinstance(override, dict):
+            snapshot.update(override)
+        return snapshot
+
+    def _account_snapshot(self, *, timestamp: datetime, fills: list[dict[str, Any]], intraday_high: float) -> dict[str, Any]:
+        """The simulated account as it stood at this bar, for the local risk gates.
+
+        Only a fill whose exit has already happened counts towards realised PnL. The
+        simulator resolves a trade's whole life at the moment it is entered, so accruing
+        it any earlier would let the daily-loss and drawdown gates see money the account
+        had not yet made when the gate ran. That is exactly the look-ahead replay exists
+        to avoid, and it would make the risk gates read as passing on evidence from
+        their own future.
+        """
+        realized = 0.0
+        open_notional = 0.0
+        open_risk = 0.0
+        for fill in fills:
+            if fill["exitAt"] is not None and fill["exitAt"] <= timestamp:
+                realized += fill["netPnl"]
+            elif fill["entryAt"] is not None and fill["entryAt"] <= timestamp:
+                open_notional += fill["notional"]
+                open_risk += fill["risk"]
+        equity = max(self.config.startingCapital + realized, 0.01)
+        notional_percent = (open_notional / equity) * 100.0
+        return {
+            "accountId": "voting-ensemble-backtest-account",
+            "equity": round(equity, 2),
+            "buyingPower": round(equity, 2),
+            "openPositionNotional": round(open_notional, 2),
+            "realizedPnlToday": round(realized, 2),
+            "unrealizedPnlToday": 0.0,
+            "estimatedExitCosts": 0.0,
+            "intradayEquityHigh": round(max(intraday_high, equity), 2),
+            "totalOpenRiskPercent": round((open_risk / equity) * 100.0, 4),
+            "totalSpyNotionalPercent": round(notional_percent, 4),
+            # One position at a time, so whatever is open is all in one direction.
+            "sameDirectionExposurePercent": round(notional_percent, 4),
+        }
 
     def _event_state_at(self, timestamp: datetime) -> dict[str, Any]:
         """Resolve the configured calendar for this bar, exactly as the live path does.

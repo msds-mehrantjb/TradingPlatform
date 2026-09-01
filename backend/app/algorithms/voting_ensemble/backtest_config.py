@@ -51,6 +51,12 @@ class VotingEnsembleBacktestConfig(DomainModel):
     # The gate configurations a replay ran under. A baseline recorded without these
     # cannot be reproduced: the calendar and the segment map are what determine which
     # bars were vetoed, so they belong in the run's configuration, not around it.
+    # The operational posture the replay is simulating. Replay has no operations to
+    # measure, so this is an assumption and is written down as one: the default says
+    # trading was enabled and in paper mode. Market-open, entry-window and session
+    # validity are deliberately left out, so they keep deriving from the bars being
+    # replayed and those gates still bind.
+    operationalHealth: dict[str, Any] | None = None
     sessionPolicy: dict[str, Any] | None = None
     eventCalendar: dict[str, Any] | None = None
     execution: ExecutionSimulationConfig = Field(default_factory=voting_ensemble_execution_config)
