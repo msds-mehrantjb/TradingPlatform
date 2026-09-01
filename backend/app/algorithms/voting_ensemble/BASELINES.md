@@ -49,6 +49,46 @@ still hold zero recorded observations, so there is no accumulated evidence for a
 change to invalidate. Recording began after the last stored session and needs the runtime to
 evaluate during live hours.
 
+## A/B: gates off vs gates on
+
+One fixed replay dataset, 390 one-minute SPY bars from 13:30Z on 2026-07-14, with QQQ, IWM
+and a three-component breadth set supplied so the ensemble is data-ready. 40 warm-up bars,
+351 evaluated bars per arm. A high-importance CPI event at 16:00Z with the default 15-minute
+pre and 30-minute post windows, giving a 15:45-16:30Z blackout.
+
+Measured at the decision layer, at the point a candidate forms
+(`voting_ensemble.local_gate.minimum_family_support`):
+
+| Arm | Candidate bars | Effect |
+|---|---|---|
+| gates off | 11 | baseline |
+| event veto only | 10 | vetoed 16:07Z, the one candidate inside the blackout |
+| session policy only | 0 | every bar segments as `midday`; the configured midday allow-list excluded the strategies that were voting |
+| both gates | 0 | session policy dominates |
+
+The event veto behaved exactly as specified: one candidate suppressed, the ten outside the
+window untouched. It took a bug fix to get there — see `8b5ea70`, the veto had been lost in
+the snapshot round trip and the first run of this A/B showed the event arm identical to the
+ungated one.
+
+### Two limits on this measurement, stated rather than papered over
+
+**No trade-level numbers.** The A/B stops at candidate formation because
+`VotingEnsembleBacktestRunner` cannot drive the real pipeline to a fill. Every bar in both
+arms carries `local_gate.trading_disabled`, `local_gate.account_risk_state_missing` and
+`local_gate.global_upstream_not_provided`: the runner supplies market data but no
+operational, account-risk or upstream-gate context, and `run()` exposes no way to provide
+it. The repository's only trade-producing replay test
+(`test_voting_ensemble_backtest_runner.py:110-129`) substitutes a stub `AlwaysBuyService`,
+which measures the fill simulator rather than the algorithm. So trade count, win rate and
+average entry are not obtainable this way, and no such table is offered here.
+
+**The session arm is not a tuned result.** All 390 synthetic bars segment as `midday`, so
+the arm exercises one branch of the segment map with an allow-list that happened to exclude
+the voting strategies. It shows the gate is wired and enforcing; it says nothing about
+whether that segment map is the right one. The gate stays disabled by default until it has
+been run against real session labels across `open`, `midday` and `close`.
+
 ## When to re-record
 
 Re-record, keeping the prior version beside the new one, when any of these happen:
