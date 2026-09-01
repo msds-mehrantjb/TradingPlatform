@@ -59,6 +59,12 @@ class VotingEnsembleBacktestConfig(DomainModel):
     # Exchange-local segment boundaries, so a replay can reproduce a live run that
     # used non-default ones. Shared with the live producer, not a second copy.
     sessionSegments: dict[str, Any] | None = None
+    # Replay applied no entry window at all, so it kept taking entries after the live
+    # path had stopped for the session. These make replay run the live rule; set
+    # applyEntryWindow False to reproduce a baseline recorded before that was fixed.
+    applyEntryWindow: bool = True
+    sessionStart: str = "09:35"
+    newTradesUntil: str = "15:30"
     operationalHealth: dict[str, Any] | None = None
     sessionPolicy: dict[str, Any] | None = None
     eventCalendar: dict[str, Any] | None = None

@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.market_feed import active_instrument
 from backend.app.algorithms.voting_ensemble.session_segments import (
+    entry_window_open,
     resolve_session_segment,
     session_profile_for_instrument,
     session_segment_boundaries_from_payload,
@@ -1094,6 +1095,12 @@ def _entry_window_open(*, market_open: bool, settings: Any, bar_end: datetime) -
     replayed bar is judged by the session it belongs to rather than by when it is
     being processed.
     """
+    profile = session_profile_for_instrument(_active_instrument_or_none())
+    if profile.name != "equity_rth":
+        # A near-23-hour session has no "market open" in the equity sense, and no
+        # equity settings window means anything against it, so the profile's own close
+        # and its shut segments decide.
+        return entry_window_open(bar_end, profile=profile)
     if not market_open:
         return False
     windows = getattr(settings, "sessionWindows", None)

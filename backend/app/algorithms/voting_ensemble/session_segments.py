@@ -44,6 +44,13 @@ SEGMENT_OVERNIGHT = "overnight"
 SEGMENT_MAINTENANCE = "maintenance_break"
 SEGMENT_WEEKEND = "weekend"
 
+# Not thin markets to trade carefully -- no market at all. Nothing may enter in these,
+# whether or not the optional session policy is switched on.
+NON_TRADABLE_SEGMENTS: frozenset[str] = frozenset({SEGMENT_MAINTENANCE, SEGMENT_WEEKEND})
+
+# No new entries within this many minutes of the session close.
+DEFAULT_ENTRY_CUTOFF_MINUTES = 30
+
 
 @dataclass(frozen=True)
 class SessionSegmentBoundaries:
@@ -83,6 +90,10 @@ class SessionProfile:
     name: str
     segments: tuple[tuple[str | None, str], ...]
     weekend_rule: str = "equity"
+    # When the session stops accepting business, exchange-local. Entries stop
+    # `entry_cutoff_minutes` before this.
+    session_close: str = "16:00"
+    entry_cutoff_minutes: int = DEFAULT_ENTRY_CUTOFF_MINUTES
 
     def segment_at(self, minute: int) -> str:
         for bound, segment in self.segments:
@@ -109,6 +120,7 @@ def equity_profile(boundaries: SessionSegmentBoundaries | None = None) -> Sessio
             (None, SEGMENT_OVERNIGHT),
         ),
         weekend_rule="equity",
+        session_close=resolved.close_end,
     )
 
 
@@ -125,6 +137,8 @@ FUTURES_GLOBEX_PROFILE = SessionProfile(
         (None, SEGMENT_OVERNIGHT),
     ),
     weekend_rule="futures",
+    # Globex settles at 17:00 ET, an hour after the equity close.
+    session_close="17:00",
 )
 
 
@@ -145,6 +159,46 @@ def resolve_session_segment(
     if _is_weekend(local, resolved.weekend_rule):
         return SEGMENT_WEEKEND
     return resolved.segment_at(local.hour * 60 + local.minute)
+
+
+def entry_window_open(
+    bar_end: datetime,
+    *,
+    profile: SessionProfile,
+    cutoff_minutes: int | None = None,
+    session_start: str | None = None,
+    new_trades_until: str | None = None,
+) -> bool:
+    """Whether a new entry may open on the bar that just closed.
+
+    Two refusals, both meaning "outside tradable hours": a segment where the market is shut,
+    and the run-in to the close.
+
+    An explicit `new_trades_until` wins, which is how the equity path keeps its configured
+    window unchanged. Without one the cutoff is measured from the profile's own close, so a
+    future gets 16:30 against its 17:00 settle rather than an equity's 15:30, which would
+    stop it trading 90 minutes early.
+    """
+    if resolve_session_segment(bar_end, profile=profile) in NON_TRADABLE_SEGMENTS:
+        return False
+    minute = _new_york_minute_of_day(bar_end)
+    if new_trades_until is not None:
+        closes_at = _minute_of_day(new_trades_until)
+        opens_at = _minute_of_day(session_start) if session_start is not None else None
+        if closes_at is None:
+            # No window resolved. Keep trading rather than silently halting on a settings
+            # problem: the loss from trading a little late is bounded, an unexplained full
+            # stop is not.
+            return True
+        return (opens_at is None or minute >= opens_at) and minute <= closes_at
+    closes_at = _minute_of_day(profile.session_close)
+    if closes_at is None:
+        return True
+    cutoff = profile.entry_cutoff_minutes if cutoff_minutes is None else max(0, int(cutoff_minutes))
+    # A blackout window before the close, not a ceiling. Globex wraps past midnight -- the
+    # session runs 18:00 to 17:00 the next day -- so "minute <= close - cutoff" would refuse
+    # the entire evening reopen, which is one of the more liquid parts of a future's day.
+    return not (closes_at - cutoff < minute <= closes_at)
 
 
 def session_profile_for_instrument(selected: Any | None) -> SessionProfile:
@@ -231,7 +285,10 @@ __all__ = [
     "SEGMENT_OVERNIGHT",
     "SEGMENT_PREMARKET",
     "SEGMENT_WEEKEND",
+    "DEFAULT_ENTRY_CUTOFF_MINUTES",
+    "NON_TRADABLE_SEGMENTS",
     "SessionProfile",
+    "entry_window_open",
     "SessionSegmentBoundaries",
     "VOTING_ENSEMBLE_SESSION_SEGMENT_VERSION",
     "equity_profile",

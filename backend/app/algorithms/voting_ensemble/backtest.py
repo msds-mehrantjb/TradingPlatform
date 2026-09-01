@@ -17,6 +17,7 @@ from backend.app.algorithms.voting_ensemble.pipeline import VotingEnsemblePipeli
 from backend.app.algorithms.voting_ensemble.profit_target_policy import profit_target_reason_codes
 from backend.app.market_feed import instrument_for_symbol
 from backend.app.algorithms.voting_ensemble.session_segments import (
+    entry_window_open,
     resolve_session_segment,
     session_profile_for_instrument,
     session_segment_boundaries_from_payload,
@@ -224,7 +225,7 @@ class VotingEnsembleBacktestRunner:
                 # service. The account is the simulated one, not a fixed fiction, which
                 # is what lets the daily-loss, drawdown and exposure gates actually bind.
                 "accountRiskSnapshot": account,
-                "operationalHealthSnapshot": self._operational_snapshot(symbol),
+                "operationalHealthSnapshot": self._operational_snapshot(symbol, bar_end=timestamp),
                 # Only the segment: setting `phase` here would reach the regime
                 # classifier, which reads that key, and would move replay output for
                 # reasons that have nothing to do with sessions.
@@ -259,7 +260,7 @@ class VotingEnsembleBacktestRunner:
             profile=profile if profile.name != "equity_rth" else None,
         )
 
-    def _operational_snapshot(self, symbol: str | None = None) -> dict[str, Any]:
+    def _operational_snapshot(self, symbol: str | None = None, *, bar_end: datetime | None = None) -> dict[str, Any]:
         """The operational posture this replay assumes, with the configured overrides.
 
         Tradability is resolved from the symbol being replayed rather than from the
@@ -275,6 +276,15 @@ class VotingEnsembleBacktestRunner:
             "paperTradingMode": True,
             "instrumentTradeable": registered.trade_ready if registered else True,
         }
+        if bar_end is not None and bool(getattr(self.config, "applyEntryWindow", True)):
+            profile = session_profile_for_instrument(registered)
+            equity = profile.name == "equity_rth"
+            snapshot["entryWindowOpen"] = entry_window_open(
+                bar_end,
+                profile=profile,
+                session_start=getattr(self.config, "sessionStart", None) if equity else None,
+                new_trades_until=getattr(self.config, "newTradesUntil", None) if equity else None,
+            )
         override = getattr(self.config, "operationalHealth", None)
         if isinstance(override, dict):
             snapshot.update(override)

@@ -389,3 +389,99 @@ class FuturesSessionProfileTest(unittest.TestCase):
             with self.subTest(segment=name):
                 self.assertFalse(segments[name].tradable)
                 self.assertEqual(segments[name].max_position_multiplier, 0.0)
+
+
+class EntryWindowTest(unittest.TestCase):
+    """Entries stop before the close, and the close is not the same time for both shapes."""
+
+    def profiles(self):
+        from backend.app.algorithms.voting_ensemble.session_segments import (
+            EQUITY_RTH_PROFILE,
+            FUTURES_GLOBEX_PROFILE,
+        )
+
+        return EQUITY_RTH_PROFILE, FUTURES_GLOBEX_PROFILE
+
+    def open_at(self, hour: int, minute: int, *, day: int = 15, **kwargs) -> bool:
+        from backend.app.algorithms.voting_ensemble.session_segments import entry_window_open
+
+        bar_end = datetime(2026, 7, day, hour, minute, tzinfo=NEW_YORK).astimezone(timezone.utc)
+        return entry_window_open(bar_end, **kwargs)
+
+    def test_the_equity_window_is_the_configured_one(self) -> None:
+        equity, _ = self.profiles()
+        window = {"profile": equity, "session_start": "09:35", "new_trades_until": "15:30"}
+
+        self.assertFalse(self.open_at(9, 34, **window))
+        self.assertTrue(self.open_at(9, 36, **window))
+        self.assertTrue(self.open_at(15, 30, **window))
+        self.assertFalse(self.open_at(15, 31, **window))
+
+    def test_the_futures_cutoff_is_measured_from_its_own_close(self) -> None:
+        """17:00 settle, so 16:30. An equity 15:30 would stop it 90 minutes early."""
+        _, futures = self.profiles()
+
+        self.assertTrue(self.open_at(16, 30, profile=futures))
+        self.assertFalse(self.open_at(16, 31, profile=futures))
+        self.assertFalse(self.open_at(17, 0, profile=futures))
+
+    def test_the_evening_reopen_is_tradable(self) -> None:
+        """Globex wraps past midnight: the session runs 18:00 to 17:00 the next day.
+
+        Treating the cutoff as a ceiling rather than a blackout window refused everything
+        after 16:30, which silently deleted the entire evening reopen and the whole
+        overnight session -- some of the more liquid hours a future has.
+        """
+        _, futures = self.profiles()
+
+        for hour in (18, 20, 23, 0, 2, 6):
+            with self.subTest(hour=hour):
+                self.assertTrue(self.open_at(hour, 30, profile=futures))
+
+    def test_nothing_enters_while_the_market_is_shut(self) -> None:
+        _, futures = self.profiles()
+
+        self.assertFalse(self.open_at(17, 30, profile=futures))  # maintenance halt
+        self.assertFalse(self.open_at(18, 0, profile=futures))
+        self.assertTrue(self.open_at(18, 1, profile=futures))
+        self.assertFalse(self.open_at(12, 0, day=18, profile=futures))  # Saturday
+
+    def test_the_cutoff_is_configurable(self) -> None:
+        _, futures = self.profiles()
+
+        self.assertTrue(self.open_at(16, 15, profile=futures, cutoff_minutes=30))
+        self.assertFalse(self.open_at(16, 15, profile=futures, cutoff_minutes=60))
+
+    def test_a_malformed_window_keeps_trading_rather_than_halting(self) -> None:
+        """An unexplained full stop is worse than trading a little late."""
+        equity, _ = self.profiles()
+
+        self.assertTrue(self.open_at(15, 45, profile=equity, new_trades_until="not a time"))
+
+
+class ReplayEntryWindowTest(unittest.TestCase):
+    """Replay set no entry window at all, so it took entries the live path refuses."""
+
+    def snapshot(self, hour: int, minute: int, **config) -> dict:
+        runner = object.__new__(VotingEnsembleBacktestRunner)
+        runner.config = VotingEnsembleBacktestConfig(**config)
+        bar_end = datetime(2026, 7, 15, hour, minute, tzinfo=NEW_YORK).astimezone(timezone.utc)
+        return runner._operational_snapshot("SPY", bar_end=bar_end)
+
+    def test_replay_now_runs_the_live_rule(self) -> None:
+        self.assertTrue(self.snapshot(12, 0)["entryWindowOpen"])
+        self.assertFalse(self.snapshot(15, 52)["entryWindowOpen"])
+
+    def test_the_old_behaviour_is_still_reachable_for_a_recorded_baseline(self) -> None:
+        self.assertNotIn("entryWindowOpen", self.snapshot(15, 52, applyEntryWindow=False))
+
+    def test_a_future_gets_the_globex_window_in_replay(self) -> None:
+        runner = object.__new__(VotingEnsembleBacktestRunner)
+        runner.config = VotingEnsembleBacktestConfig()
+        late = datetime(2026, 7, 15, 16, 45, tzinfo=NEW_YORK).astimezone(timezone.utc)
+        evening = datetime(2026, 7, 15, 20, 0, tzinfo=NEW_YORK).astimezone(timezone.utc)
+
+        self.assertFalse(runner._operational_snapshot("MES", bar_end=late)["entryWindowOpen"])
+        self.assertTrue(runner._operational_snapshot("MES", bar_end=evening)["entryWindowOpen"])
+        # The same evening bar is outside the equity window entirely.
+        self.assertFalse(runner._operational_snapshot("SPY", bar_end=evening)["entryWindowOpen"])
