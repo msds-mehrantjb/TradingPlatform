@@ -116,7 +116,13 @@ class VotingEnsembleContextPipelineTest(unittest.TestCase):
         self.assertEqual(status["contextSignals"], ["relative_strength_qqq_iwm", "market_breadth_momentum"])
         self.assertEqual(
             status["shadowContextSignals"],
-            ["economic_event_context", "market_structure_context", "volume_confirmation_context", "vwap_position_context"],
+            [
+                "economic_event_context",
+                "market_structure_context",
+                "volume_confirmation_context",
+                "vwap_position_context",
+                "market_forecast_context",
+            ],
         )
         self.assertTrue(status["inventoryStatus"]["valid"])
 

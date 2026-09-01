@@ -3864,10 +3864,11 @@ def export_backtest_dataset_from_store(
 
     base_manifest = best_backtest_manifest_or_none(symbol)
     base_files = (base_manifest or {}).get("files", {})
-    base_1m = read_jsonl_if_exists(Path(str(base_files.get("continuous1mJsonl", ""))))
-    base_5m = read_jsonl_if_exists(Path(str(base_files.get("continuous5mJsonl", ""))))
-    base_15m = read_jsonl_if_exists(Path(str(base_files.get("continuous15mJsonl", ""))))
-    base_daily = read_jsonl_if_exists(Path(str(base_files.get("dailyJsonl", ""))))
+    base_manifest_path = (base_manifest or {}).get("manifest")
+    base_1m = read_jsonl_if_exists(resolve_manifest_file(base_files, "continuous1mJsonl", base_manifest_path))
+    base_5m = read_jsonl_if_exists(resolve_manifest_file(base_files, "continuous5mJsonl", base_manifest_path))
+    base_15m = read_jsonl_if_exists(resolve_manifest_file(base_files, "continuous15mJsonl", base_manifest_path))
+    base_daily = read_jsonl_if_exists(resolve_manifest_file(base_files, "dailyJsonl", base_manifest_path))
     fresh_1m = store.range(symbol=symbol, timeframe="1Min", feed=feed, start=intraday_start, end=end)
     fresh_5m = store.range(symbol=symbol, timeframe="5Min", feed=feed, start=intraday_start, end=end)
     fresh_15m = store.range(symbol=symbol, timeframe="15Min", feed=feed, start=intraday_start, end=end)
@@ -3876,7 +3877,9 @@ def export_backtest_dataset_from_store(
     continuous_5m = merge_candle_rows(base_5m, fresh_5m, start=intraday_start, end=end, symbol=symbol, timeframe="5Min", feed=feed)
     continuous_15m = merge_candle_rows(base_15m, fresh_15m, start=intraday_start, end=end, symbol=symbol, timeframe="15Min", feed=feed)
     daily = merge_candle_rows(base_daily, fresh_daily, start=daily_start, end=end, symbol=symbol, timeframe="1Day", feed=feed)
-    auxiliary_1m = merge_auxiliary_candle_rows(base_files=base_files, feed=feed, start=intraday_start, end=end)
+    auxiliary_1m = merge_auxiliary_candle_rows(
+        base_files=base_files, feed=feed, start=intraday_start, end=end, base_manifest_path=base_manifest_path
+    )
     if not continuous_5m and continuous_1m:
         continuous_5m = aggregate_candles(continuous_1m, timeframe="5Min", minutes=5)
         warnings.append("5Min bars were aggregated from 1Min bars because native 5Min data was unavailable.")
@@ -4740,9 +4743,45 @@ async def regenerate_backtest_ml_artifacts_background(*, manifest: dict, symbol:
 
 
 def read_jsonl_if_exists(path: Path) -> list[dict]:
-    if not path.exists():
+    # A missing manifest key yields Path(""), which normalises to Path("."). That is an
+    # existing *directory*, so an exists() check passes and the open() then raises
+    # PermissionError, aborting the export after its output directory was created.
+    if not str(path).strip() or not path.is_file():
         return []
     return read_jsonl(path)
+
+
+MANIFEST_FILE_DEFAULT_NAMES = {
+    "continuous1mJsonl": "continuous_1m.jsonl",
+    "continuous5mJsonl": "continuous_5m.jsonl",
+    "continuous15mJsonl": "continuous_15m.jsonl",
+    "dailyJsonl": "daily_context.jsonl",
+    "qqq1mJsonl": "qqq_1m.jsonl",
+    "iwm1mJsonl": "iwm_1m.jsonl",
+}
+
+
+def resolve_manifest_file(base_files: dict, key: str, manifest_path: str | None = None) -> Path:
+    """Locate a file recorded in a manifest, tolerating a relocated repository.
+
+    Manifests store absolute paths, so moving the project (for example out of a synced
+    OneDrive folder) leaves every historical manifest pointing at a path that no longer
+    exists. When that happens, fall back to the same filename beside the manifest, which
+    is where the export always writes it.
+    """
+    raw = str(base_files.get(key) or "").strip()
+    if raw:
+        recorded = Path(raw)
+        if recorded.is_file():
+            return recorded
+    if not manifest_path:
+        return Path("")
+    candidate_dir = Path(str(manifest_path)).parent
+    filename = Path(raw).name if raw else MANIFEST_FILE_DEFAULT_NAMES.get(key, "")
+    if not filename:
+        return Path("")
+    relocated = candidate_dir / filename
+    return relocated if relocated.is_file() else Path("")
 
 
 async def fetch_voting_ensemble_auxiliary_bars(
@@ -4795,10 +4834,11 @@ def merge_auxiliary_candle_rows(
     feed: str,
     start: str,
     end: str,
+    base_manifest_path: str | None = None,
 ) -> dict[str, list[dict]]:
     base_auxiliary = {
-        "QQQ": read_jsonl_if_exists(Path(str(base_files.get("qqq1mJsonl", "")))),
-        "IWM": read_jsonl_if_exists(Path(str(base_files.get("iwm1mJsonl", "")))),
+        "QQQ": read_jsonl_if_exists(resolve_manifest_file(base_files, "qqq1mJsonl", base_manifest_path)),
+        "IWM": read_jsonl_if_exists(resolve_manifest_file(base_files, "iwm1mJsonl", base_manifest_path)),
         **read_manifest_breadth_components(base_files),
     }
     fresh_auxiliary = voting_auxiliary_1m_from_store(feed=feed, start=start, end=end)

@@ -114,4 +114,5 @@ class VotingEnsembleEvaluateResponse(BaseModel):
     candidate: dict[str, Any] | None = None
     order_plan: dict[str, Any] | None = None
     removed_voters: tuple[str, ...] = ("Ensemble Strategy Voting",)
+    reliability_scope: dict[str, str] = Field(default_factory=dict)
     reason_codes: tuple[str, ...] = ()

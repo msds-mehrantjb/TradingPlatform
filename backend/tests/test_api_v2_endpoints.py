@@ -97,6 +97,7 @@ class ApiV2EndpointsTest(unittest.TestCase):
                 "market_structure_context": "shadow",
                 "volume_confirmation_context": "shadow",
                 "vwap_position_context": "shadow",
+                "market_forecast_context": "shadow",
             },
         )
         self.assertEqual([module["id"] for module in regime], ["adx_atr_regime_classifier"])
@@ -216,7 +217,7 @@ class ApiV2EndpointsTest(unittest.TestCase):
         expected_modules = {
             "voting-ensemble": {
                 "directional": ["multi_timeframe_trend_alignment", "first_pullback_after_open", "failed_breakout_reversal", "liquidity_sweep_reversal", "bollinger_band_reversion", "atr_overextension_reversion"],
-                "context": ["relative_strength_qqq_iwm", "market_breadth_momentum", "economic_event_context", "market_structure_context", "volume_confirmation_context", "vwap_position_context"],
+                "context": ["relative_strength_qqq_iwm", "market_breadth_momentum", "economic_event_context", "market_structure_context", "volume_confirmation_context", "vwap_position_context", "market_forecast_context"],
                 "regime": ["adx_atr_regime_classifier"],
                 "safety": ["cash_avoid_trading_filter"],
                 "aggregator": ["ensemble_strategy_voting"],

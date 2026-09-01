@@ -64,6 +64,7 @@ class VotingEnsembleModuleInventoryTest(unittest.TestCase):
                 ("market_structure_context", "shadow"),
                 ("volume_confirmation_context", "shadow"),
                 ("vwap_position_context", "shadow"),
+                ("market_forecast_context", "shadow"),
             ),
         )
         self.assertEqual(
@@ -162,6 +163,7 @@ class VotingEnsembleModuleInventoryTest(unittest.TestCase):
                 "market_structure_context",
                 "volume_confirmation_context",
                 "vwap_position_context",
+                "market_forecast_context",
             ),
         )
 

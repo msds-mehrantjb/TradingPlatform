@@ -434,6 +434,23 @@ VOTING_ENSEMBLE_MODULE_INVENTORY = VotingEnsembleInventory(
             test_path="backend/tests/test_voting_ensemble_context_pipeline.py",
             promotion_evidence=("shadow-only until VWAP position evidence is validated out of sample",),
         ),
+        _entry(
+            "market_forecast_context",
+            "Market Forecast Multi-Horizon Context",
+            "1.0.0",
+            StrategyFamily.MARKET_CONTEXT,
+            StrategyRole.CONTEXT,
+            StrategyCollection.CONTEXT,
+            ("spy_1m_candles", "market_forecast_multi_horizon"),
+            "backend.app.algorithms.voting_ensemble.strategies.context.pipeline",
+            "backend.app.algorithms.voting_ensemble.strategies.context.pipeline:MarketForecastSnapshotContext",
+            "backend.app.algorithms.voting_ensemble.strategies.context.pipeline:MarketForecastSnapshotContext",
+            lifecycle_status="shadow",
+            test_path="backend/tests/test_voting_ensemble_market_forecast_context.py",
+            promotion_evidence=(
+                "shadow-only: the forecast's own activation policy is advisory_only_until_live_paper_validation",
+            ),
+        ),
     ),
     regime=(
         _entry(

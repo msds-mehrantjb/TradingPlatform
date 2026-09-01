@@ -45,7 +45,10 @@ class VotingEnsembleTradingSettingsTest(unittest.TestCase):
         self.assertEqual(config["slippagePerShare"], 0.02)
         self.assertEqual(config["entryConfirmationBars"], 3)
         self.assertEqual(config["warmupBars"], 50)
-        self.assertEqual(config["allowedEntryHours"], ["10:00", "11:00"])
+        self.assertEqual(
+            config["allowedEntryHours"],
+            ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00"],
+        )
         serialized = json.dumps(config, sort_keys=True)
         for forbidden in ("1Hour", "1Day", "1Week", "hybridOneHour", "swing", "openCloseEvents", "directionalWinnerMinVotesByTimeframe"):
             self.assertNotIn(forbidden, serialized)

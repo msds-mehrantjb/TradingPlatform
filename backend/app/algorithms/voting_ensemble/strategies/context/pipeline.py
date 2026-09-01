@@ -34,6 +34,7 @@ class VotingEnsembleContextPipeline:
         self.modules = modules or (
             RelativeStrengthQqqIwmSnapshotContext(),
             MarketBreadthMomentumSnapshotContext(),
+            MarketForecastSnapshotContext(),
             EconomicEventSnapshotContext(),
             MarketStructureSnapshotContext(),
             VolumeConfirmationSnapshotContext(),
@@ -105,6 +106,80 @@ class RelativeStrengthQqqIwmSnapshotContext:
                 "iwmReturn": round(iwm_return, 6),
             },
             source_timestamps=_source_timestamps(snapshot, qqq=snapshot.qqq.latestTimestamp, iwm=snapshot.iwm.latestTimestamp),
+        )
+
+
+class MarketForecastSnapshotContext:
+    """Advisory multi-horizon forecast, consumed as bounded context.
+
+    The forecast's own activation policy is advisory-only until live paper validation, so
+    it is deliberately wired here rather than as a directional vote or a gate: a context
+    signal can strengthen or weaken a candidate the strategies already produced, but can
+    never create or authorise one. It falls back to neutral whenever the model is
+    unavailable or the horizons disagree.
+    """
+
+    strategyId = "market_forecast_context"
+    strategyName = "Market Forecast Multi-Horizon Context"
+    strategyVersion = "1.0.0"
+    maxAdjustment = 0.06
+    minimumHorizonAgreement = 2
+    minimumEdge = 0.10
+
+    def evaluate(self, snapshot: VotingEnsembleEvaluationSnapshot, *, active: bool) -> VotingStrategyVote:
+        forecast = snapshot.marketForecast if isinstance(snapshot.marketForecast, dict) else {}
+        if not forecast or not forecast.get("inferencePerformed"):
+            return _vote(
+                self, active, "neutral", 0.0, False,
+                "No approved market forecast inference was available; forecast context stays neutral.",
+                ("voting_ensemble.context.market_forecast.model_unavailable",),
+                snapshot,
+                {"maxConfidenceAdjustment": 0.0, "forecastStatus": str(forecast.get("status") or "unavailable")},
+            )
+        horizons = ((forecast.get("multiHorizonForecast") or {}).get("horizons")) or []
+        ups = downs = 0
+        edges: list[float] = []
+        for horizon in horizons:
+            if not isinstance(horizon, dict) or str(horizon.get("status") or "") != "ready":
+                continue
+            up = _number(horizon.get("probabilityUp"))
+            down = _number(horizon.get("probabilityDown"))
+            if up is None or down is None:
+                continue
+            edge = up - down
+            edges.append(edge)
+            if edge >= self.minimumEdge:
+                ups += 1
+            elif edge <= -self.minimumEdge:
+                downs += 1
+        ready = len(edges)
+        if ready == 0:
+            return _vote(
+                self, active, "neutral", 0.0, False,
+                "No forecast horizon was ready; forecast context stays neutral.",
+                ("voting_ensemble.context.market_forecast.no_ready_horizon",),
+                snapshot,
+                {"maxConfidenceAdjustment": 0.0, "readyHorizons": 0},
+            )
+        mean_edge = sum(edges) / ready
+        if ups >= self.minimumHorizonAgreement and downs == 0:
+            effect, code = "confirm_long", "voting_ensemble.context.market_forecast.confirm_long"
+            reason = f"{ups} of {ready} forecast horizons favour upside; forecast can confirm long candidates only."
+        elif downs >= self.minimumHorizonAgreement and ups == 0:
+            effect, code = "confirm_short", "voting_ensemble.context.market_forecast.confirm_short"
+            reason = f"{downs} of {ready} forecast horizons favour downside; forecast can confirm short candidates only."
+        else:
+            effect, code = "neutral", "voting_ensemble.context.market_forecast.mixed_or_insufficient_agreement"
+            reason = f"Forecast horizons disagree ({ups} up, {downs} down of {ready}); forecast context stays neutral."
+        return _vote(
+            self, active, effect, min(1.0, abs(mean_edge) * 2.0), True, reason, (code,), snapshot,
+            {
+                "readyHorizons": ready,
+                "horizonsFavouringUp": ups,
+                "horizonsFavouringDown": downs,
+                "meanDirectionalEdge": round(mean_edge, 6),
+                "forecastStatus": str(forecast.get("status") or ""),
+            },
         )
 
 

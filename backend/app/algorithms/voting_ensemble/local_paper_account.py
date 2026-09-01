@@ -15,6 +15,22 @@ from backend.app.gates import BrokerAccountSnapshot, BrokerOrderState, BrokerPos
 
 VOTING_ENSEMBLE_ALGORITHM_ID = "voting_ensemble"
 VOTING_ENSEMBLE_CAPITAL_PARTITION_ID = "voting_ensemble.paper.default"
+
+
+VOTING_ENSEMBLE_LONG_ONLY_BUYING_POWER_MODEL = "LOCAL_CASH_NO_MARGIN_LONG_ONLY"
+VOTING_ENSEMBLE_LONG_SHORT_BUYING_POWER_MODEL = "LOCAL_CASH_NO_MARGIN_LONG_AND_SHORT"
+
+
+def _buying_power_model(allow_shorts: bool) -> str:
+    """Label the buying-power model actually in force.
+
+    Short exposure consumes the same cash buying power as long exposure, one for one:
+    the account still carries no margin and no leverage, so a short is sized against
+    cash exactly as a long is.
+    """
+    return VOTING_ENSEMBLE_LONG_SHORT_BUYING_POWER_MODEL if allow_shorts else VOTING_ENSEMBLE_LONG_ONLY_BUYING_POWER_MODEL
+
+
 VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID = "voting_ensemble.paper.default.account"
 VOTING_ENSEMBLE_LOCAL_PAPER_ACCOUNT_VERSION = "voting_ensemble_local_paper_account_v2"
 VOTING_ENSEMBLE_LOCAL_INVENTORY_MANIFEST_VERSION = "voting_ensemble_local_inventory_manifest_v1"
@@ -59,7 +75,7 @@ class VotingEnsemblePaperAccount:
     usableEntryBuyingPower: Decimal = Decimal("0")
     allowLeverage: bool = False
     allowMargin: bool = False
-    allowShorts: bool = False
+    allowShorts: bool = True
     maxLeverage: Decimal = Decimal("1")
     version: str = VOTING_ENSEMBLE_LOCAL_PAPER_ACCOUNT_VERSION
     accountId: str = VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID
@@ -85,7 +101,7 @@ class VotingEnsemblePaperAccount:
                 "allowMargin": bool(self.allowMargin),
                 "allowShorts": bool(self.allowShorts),
                 "maxLeverage": _percent(self.maxLeverage),
-                "buyingPowerModel": "LOCAL_CASH_NO_MARGIN_LONG_ONLY",
+                "buyingPowerModel": _buying_power_model(self.allowShorts),
                 "equityModel": "cash_plus_local_owned_position_market_value",
                 "realizedPnl": _money(self.realizedPnl),
                 "realizedPnlToday": _money(self.realizedPnlToday),
@@ -578,8 +594,6 @@ class VotingEnsembleInventoryLedger:
             quantity = min(quantity, signed_position)
         elif normalized_side == Signal.BUY and signed_position < 0:
             quantity = min(quantity, abs(signed_position))
-        elif normalized_side == Signal.SELL:
-            return None
         if quantity <= 0:
             return None
 

@@ -30,6 +30,8 @@ class AggregationThresholdSettings(ImmutableSettingsModel):
     minWinningVotes: int = Field(ge=1)
     minVoteEdge: float = Field(ge=0.0, le=1.0)
     holdBand: float = Field(ge=0.0, le=1.0)
+    reliabilityWeightingMode: Literal["shadow", "active", "fallback"] = "shadow"
+    reliabilitySampleWindow: Literal["rolling_20_trades", "rolling_60_trades", "rolling_120_trades"] = "rolling_60_trades"
 
 
 class MinimumFamilySupportSettings(ImmutableSettingsModel):

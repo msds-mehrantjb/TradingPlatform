@@ -33,7 +33,10 @@ ONE_MINUTE_BASELINE_SETTINGS: dict[str, Any] = {
     "positionSizing": "shares = risk dollars / stop distance, capped by available capital",
     "entryConfirmationBars": 3,
     "warmupBars": 50,
-    "allowedEntryHours": ("10:00", "11:00"),
+    # Entries are bounded by sessionStart/newTradesUntil, not by an hour allow-list.
+    # Kept as the full session so this value cannot silently narrow entries if a future
+    # gate starts consulting it.
+    "allowedEntryHours": ("09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00"),
     "orderAllocationPercent": 10.0,
     "dailyAllocationPercent": 30.0,
     "riskBudgetPercentOfOrder": 50.0,
@@ -49,12 +52,15 @@ ONE_MINUTE_BASELINE_SETTINGS: dict[str, Any] = {
     "minWinningVotes": 1,
     "minVoteEdge": 0.20,
     "holdBand": 0.0,
+    "reliabilityWeightingMode": "active",
+    "reliabilitySampleWindow": "rolling_60_trades",
     "minimumFamiliesForTrade": 1,
     "familyWeights": {
         "trend": 1.0,
         "breakout": 1.0,
         "reversal": 1.0,
         "mean_reversion": 1.0,
+        "gap_session": 1.0,
     },
     "maxContextBoost": 0.20,
     "maxContextPenalty": 0.20,

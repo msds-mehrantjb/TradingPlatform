@@ -24,6 +24,7 @@ from backend.app.algorithms.voting_ensemble.local_paper_account import (
     VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
     VOTING_ENSEMBLE_LOCAL_PAPER_ACCOUNT_VERSION,
     VotingEnsembleInventoryLedger,
+    _is_voting_ensemble_owned_position,
 )
 from backend.app.config import get_settings
 from backend.app.algorithms.voting_ensemble.execution_adapter import (
@@ -43,6 +44,10 @@ VotingEnsembleExecutionMode = Literal["LOCAL_PAPER", "BROKER_PAPER"]
 VOTING_ENSEMBLE_DEFAULT_EXECUTION_MODE: VotingEnsembleExecutionMode = "LOCAL_PAPER"
 VOTING_ENSEMBLE_PAPER_EXECUTION_VERSION = "voting_ensemble_paper_execution_v1"
 VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE = "voting_ensemble.paper_execution"
+VOTING_ENSEMBLE_SUPPORTED_BUYING_POWER_MODELS = (
+    "LOCAL_CASH_NO_MARGIN_LONG_ONLY",
+    "LOCAL_CASH_NO_MARGIN_LONG_AND_SHORT",
+)
 VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE = "voting_ensemble.paper_gateway"
 VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_DAILY_LOSS_PERCENT = 2.0
 VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_DRAWDOWN_PERCENT = 5.0
@@ -2210,9 +2215,8 @@ class VotingEnsembleLocalPaperExecutionEngine:
             account.get("algorithmId") == VOTING_ENSEMBLE_ALGORITHM_ID
             and account.get("capitalPartitionId") == VOTING_ENSEMBLE_CAPITAL_PARTITION_ID
             and account.get("accountId") == VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID
-            and account.get("buyingPowerModel") == "LOCAL_CASH_NO_MARGIN_LONG_ONLY"
+            and account.get("buyingPowerModel") in VOTING_ENSEMBLE_SUPPORTED_BUYING_POWER_MODELS
             and account.get("allowMargin") is False
-            and account.get("allowShorts") is False
         )
 
     def submit_order(self, intent: Any) -> PaperGatewayBrokerAck:
@@ -2754,6 +2758,18 @@ class VotingEnsembleLocalPaperExecutionEngine:
             },
         )
 
+    def _foreign_position_occupies(self, symbol: str) -> bool:
+        """True when a position record for this symbol exists but is not ours."""
+        try:
+            record = self.repository.read_snapshot(f"local_position.{symbol}")
+        except KeyError:
+            return False
+        if not isinstance(record, Mapping):
+            return False
+        if not int(record.get("quantity") or 0):
+            return False
+        return not _is_voting_ensemble_owned_position(record)
+
     def _submission_rejection_reason(self, intent: Any) -> str | None:
         if getattr(intent, "algorithmId", None) != VOTING_ENSEMBLE_ALGORITHM_ID:
             return "voting_ensemble.local_paper.foreign_algorithm_rejected"
@@ -2763,18 +2779,28 @@ class VotingEnsembleLocalPaperExecutionEngine:
         if quantity <= 0:
             return "voting_ensemble.local_paper.zero_quantity"
         side = Signal(getattr(intent, "side"))
-        if side == Signal.SELL:
-            position = self.repository.inventory_ledger.position_for_symbol(str(getattr(intent, "symbol", "SPY")).upper())
-            owned = int(position.get("quantity") or 0)
+        position = self.repository.inventory_ledger.position_for_symbol(str(getattr(intent, "symbol", "SPY")).upper())
+        # Signed: positive is long, negative is short. Whether an order is an entry or an
+        # exit depends on the exposure it changes, not on its side -- with shorts enabled
+        # a SELL may open a short or close a long, and a BUY may open a long or cover a
+        # short. Only exposure-increasing orders face entry risk; treating every SELL as
+        # an entry would trap a position that needs to be closed.
+        owned = int(position.get("quantity") or 0)
+        # position_for_symbol hides records this algorithm does not own, but the fill path
+        # would still write over that key. Opening any position on a symbol occupied by a
+        # foreign record would therefore corrupt another algorithm's state, so refuse it.
+        if owned == 0 and self._foreign_position_occupies(str(getattr(intent, "symbol", "SPY")).upper()):
+            return "voting_ensemble.local_paper.sell_cannot_mutate_foreign_or_absent_position"
+        reduces_exposure = (side == Signal.SELL and owned > 0) or (side == Signal.BUY and owned < 0)
+        if reduces_exposure:
             if (
-                owned <= 0
-                or position.get("algorithmId") != VOTING_ENSEMBLE_ALGORITHM_ID
+                position.get("algorithmId") != VOTING_ENSEMBLE_ALGORITHM_ID
                 or position.get("capitalPartitionId") != VOTING_ENSEMBLE_CAPITAL_PARTITION_ID
                 or position.get("positionOwner") != VOTING_ENSEMBLE_ALGORITHM_ID
                 or position.get("exitOwner") != VOTING_ENSEMBLE_ALGORITHM_ID
             ):
                 return "voting_ensemble.local_paper.sell_cannot_mutate_foreign_or_absent_position"
-            if quantity > owned:
+            if quantity > abs(owned):
                 return "voting_ensemble.local_paper.sell_quantity_exceeds_owned_inventory"
         inventory = self.repository.inventory_snapshot()
         account = inventory.get("account")
@@ -2786,12 +2812,18 @@ class VotingEnsembleLocalPaperExecutionEngine:
             or account.get("accountId") != VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID
         ):
             return "voting_ensemble.local_paper.account_ownership_invalid"
-        if account.get("allowMargin") is not False or account.get("allowShorts") is not False:
-            return "voting_ensemble.local_paper.margin_or_shorts_not_enabled"
-        if side == Signal.BUY:
-            entry_blocker = self._new_entry_risk_rejection_reason(intent, inventory=inventory, account=account, quantity=quantity)
-            if entry_blocker is not None:
-                return entry_blocker
+        if account.get("allowMargin") is not False:
+            return "voting_ensemble.local_paper.margin_not_enabled"
+        if reduces_exposure:
+            # An exit must never be blocked by entry risk, or the position is trapped.
+            return None
+        if side == Signal.SELL and account.get("allowShorts") is not True:
+            return "voting_ensemble.local_paper.shorts_not_enabled"
+        # A short entry consumes the same cash buying power and carries the same
+        # per-trade and open-risk limits as a long entry.
+        entry_blocker = self._new_entry_risk_rejection_reason(intent, inventory=inventory, account=account, quantity=quantity)
+        if entry_blocker is not None:
+            return entry_blocker
         return None
 
     def _new_entry_risk_rejection_reason(
@@ -2814,9 +2846,12 @@ class VotingEnsembleLocalPaperExecutionEngine:
             return "voting_ensemble.local_paper.insufficient_buying_power"
 
         stop_price = _positive_float(getattr(intent, "stopPrice", None))
-        if stop_price is None or stop_price >= entry_price:
+        if stop_price is None:
             return "voting_ensemble.local_paper.invalid_stop_distance"
-        stop_distance = entry_price - stop_price
+        is_short = Signal(getattr(intent, "side", Signal.BUY)) == Signal.SELL
+        stop_distance = (stop_price - entry_price) if is_short else (entry_price - stop_price)
+        if stop_distance <= 0:
+            return "voting_ensemble.local_paper.invalid_stop_distance"
         min_stop_distance = _local_entry_risk_setting(settings_payload, "minimumStopDistanceDollars", "minStopDistanceDollars", default=0.01)
         if stop_distance < min_stop_distance:
             return "voting_ensemble.local_paper.stop_distance_below_configured_minimum"

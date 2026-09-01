@@ -117,6 +117,7 @@ class VotingEnsembleEvaluationSnapshot(ImmutableSnapshotModel):
     openingRangeLevels: LevelSnapshot
     economicEventState: EventStateSnapshot
     sessionState: dict[str, Any] = Field(default_factory=dict)
+    marketForecast: dict[str, Any] = Field(default_factory=dict)
     accountRiskSnapshot: dict[str, Any] = Field(default_factory=dict)
     operationalHealthSnapshot: dict[str, Any] = Field(default_factory=dict)
     settingsHash: str
@@ -136,6 +137,7 @@ class VotingEnsembleEvaluationSnapshot(ImmutableSnapshotModel):
             "openingRange": self.openingRangeLevels.model_dump(mode="json"),
             "event": self.economicEventState.model_dump(mode="json"),
             "sessionState": self.sessionState,
+            "marketForecast": self.marketForecast,
             "accountRiskSnapshot": self.accountRiskSnapshot,
             "operationalHealthSnapshot": self.operationalHealthSnapshot,
             "settingsHash": self.settingsHash,

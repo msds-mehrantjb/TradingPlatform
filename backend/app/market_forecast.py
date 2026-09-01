@@ -3686,6 +3686,43 @@ def market_forecast_fold_model_path(artifact_id: str, fold: int) -> Path:
     return FORECAST_CANDIDATE_ARTIFACT_DIR / f"{safe_artifact_id(artifact_id)}.fold{int(fold)}.xgboost.json"
 
 
+def forecast_model_file_reference(model_file: Path | str) -> str:
+    """Record a saved booster's location relative to the forecast data root when possible.
+
+    Artifacts used to store absolute paths, so relocating the project (as the move off
+    OneDrive did) silently invalidated every artifact: the loader's existence check
+    failed and the forecast fell back to MODEL_UNAVAILABLE. A relative reference
+    survives that. Absolute paths remain readable via ``resolve_forecast_model_file``.
+    """
+    path = Path(str(model_file))
+    try:
+        return path.resolve().relative_to(MODEL_ARTIFACT_DIR.resolve()).as_posix()
+    except (ValueError, OSError):
+        return str(path)
+
+
+def resolve_forecast_model_file(model_file: Path | str | None) -> Path:
+    """Locate a saved booster from an artifact reference.
+
+    Accepts a path relative to the forecast data root (how artifacts record it now) or
+    an absolute path (how older artifacts do). If a recorded absolute path no longer
+    resolves, fall back to the same filename in the candidates directory so a relocated
+    repository keeps working.
+    """
+    raw = str(model_file or "").strip()
+    if not raw:
+        return Path("")
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        relative = MODEL_ARTIFACT_DIR / candidate
+        if relative.is_file():
+            return relative
+    if candidate.is_file():
+        return candidate
+    relocated = FORECAST_CANDIDATE_ARTIFACT_DIR / candidate.name
+    return relocated if relocated.is_file() else Path("")
+
+
 def safe_artifact_id(value: str) -> str:
     normalized = "".join(character if character.isalnum() or character in {"-", "_", "."} else "_" for character in str(value))
     return normalized.strip("._") or "market_forecast_candidate"
@@ -3711,7 +3748,7 @@ def load_market_forecast_artifact_file(path: Path) -> dict[str, Any] | None:
         feature_names = artifact.get("featureNames")
         if not model_file or not isinstance(feature_names, list):
             return None
-        if not Path(str(model_file)).exists():
+        if not resolve_forecast_model_file(model_file).is_file():
             return None
         return artifact
     if not isinstance(artifact.get("weights"), dict) and not isinstance(artifact.get("weightsByClass"), dict):
@@ -4179,7 +4216,10 @@ def xgboost_model_probabilities(features: dict[str, Any], artifact: dict[str, An
     flattened = flatten_forecast_features(features)
     values = [[float(flattened.get(name, 0.0)) for name in feature_names]]
     booster = xgb.Booster()
-    booster.load_model(str(artifact["modelFile"]))
+    resolved_model_file = resolve_forecast_model_file(artifact.get("modelFile"))
+    if not resolved_model_file.is_file():
+        return fallback_probabilities(features)
+    booster.load_model(str(resolved_model_file))
     matrix = xgb.DMatrix(values, feature_names=feature_names)
     raw = booster.predict(matrix)[0]
     if hasattr(raw, "tolist"):

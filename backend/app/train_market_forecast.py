@@ -29,11 +29,13 @@ from .market_forecast import (
     attach_microstructure_features,
     extract_market_forecast_features,
     flatten_forecast_features,
+    forecast_model_file_reference,
     market_forecast_artifact_path,
     market_forecast_candidate_artifact_path,
     market_forecast_candidate_model_path,
     market_forecast_fold_model_path,
     market_forecast_promotion_validation_gates,
+    resolve_forecast_model_file,
     MODEL_STATE_TRAINED_CANDIDATE,
     normalize_candles,
 )
@@ -1157,7 +1159,7 @@ def train_xgboost_model(
     test_metrics = evaluate_outcome_probabilities(zip(map(outcome_probabilities_from_xgboost, booster.predict(test_matrix)), labels(test_rows), row_economics(test_rows)))
     return (
         {
-            "modelFile": str(model_file),
+            "modelFile": forecast_model_file_reference(model_file),
             "topFeatures": top_xgboost_features(booster, limit=20),
         },
         train_metrics,
@@ -1181,7 +1183,7 @@ def train_xgboost_fold_model(train_rows: list[dict[str, Any]], feature_names: li
     model_file.parent.mkdir(parents=True, exist_ok=True)
     booster.save_model(str(model_file))
     return {
-        "modelFile": str(model_file),
+        "modelFile": forecast_model_file_reference(model_file),
         "topFeatures": top_xgboost_features(booster, limit=20),
     }
 
@@ -1192,7 +1194,12 @@ def xgboost_saved_probabilities(rows: list[dict[str, Any]], feature_names: list[
     except ImportError as exc:
         raise RuntimeError("xgboost is not installed in the backend Python environment") from exc
     booster = xgb.Booster()
-    booster.load_model(model_file)
+    # model_file is the artifact-relative reference written above, so resolve it the
+    # same way inference does rather than assuming it is a usable filesystem path.
+    resolved = resolve_forecast_model_file(model_file)
+    if not resolved.is_file():
+        raise RuntimeError(f"Saved market forecast booster could not be located: {model_file}")
+    booster.load_model(str(resolved))
     matrix = xgb.DMatrix(feature_matrix(rows, feature_names), feature_names=feature_names)
     return [outcome_probabilities_from_xgboost(raw) for raw in booster.predict(matrix)]
 

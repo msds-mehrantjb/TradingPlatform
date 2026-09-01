@@ -99,6 +99,7 @@ def build_point_in_time_snapshot(payload: dict[str, Any]) -> VotingEnsembleEvalu
         "openingRangeLevels": opening_range,
         "economicEventState": event_state,
         "sessionState": dict(context.get("sessionState") or {}),
+        "marketForecast": dict(context.get("marketForecast") or {}),
         "accountRiskSnapshot": dict(context.get("accountRiskSnapshot") or context.get("accountRisk") or {}),
         "operationalHealthSnapshot": dict(context.get("operationalHealthSnapshot") or context.get("operationalHealth") or {}),
         "settingsHash": settings_hash,

@@ -7,7 +7,13 @@ from time import perf_counter
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Protocol
 
-from backend.app.algorithms.voting_ensemble.ensemble.family_aware import FamilyAwareDeterministicEnsemble, FamilyAwareEnsembleConfig
+from backend.app.algorithms.voting_ensemble.ensemble.family_aware import FAMILY_ORDER, FamilyAwareDeterministicEnsemble, FamilyAwareEnsembleConfig
+from backend.app.algorithms.voting_ensemble.reliability.estimator import VotingEnsembleReliabilityEstimator
+from backend.app.algorithms.voting_ensemble.reliability.models import (
+    StrategyReliabilityEstimate,
+    VotingEnsembleReliabilityConfig,
+    VotingEnsembleReliabilityObservation,
+)
 from backend.app.algorithms.voting_ensemble.execution_adapter import VotingEnsembleExecutionAdapter
 from backend.app.algorithms.voting_ensemble.execution_economics import build_execution_economics
 from backend.app.algorithms.voting_ensemble.gates import VotingEnsembleLocalGateEngine
@@ -52,6 +58,7 @@ from backend.app.gates import GlobalGateInput
 VOTING_ENSEMBLE_SERVICE_VERSION = "voting_ensemble_backend_v2"
 StrategyEvaluator = Callable[[VotingEnsembleEvaluateRequest], VotingStrategyVote]
 FAMILY_AWARE_ENGINE = FamilyAwareDeterministicEnsemble()
+RELIABILITY_ESTIMATOR = VotingEnsembleReliabilityEstimator()
 REGIME_CLASSIFIER = AdxAtrRegimeClassifier()
 LOCAL_GATE_ENGINE = VotingEnsembleLocalGateEngine()
 LOCAL_SAFETY_MODULES: tuple[VotingEnsembleLocalGateEngine, ...] = (LOCAL_GATE_ENGINE,)
@@ -250,7 +257,7 @@ class VotingEnsembleService:
         counts = _counts(directional_votes)
         eligible_counts = _counts(eligible_votes)
         aggregation_started = perf_counter()
-        decision = _aggregate_with_family_engine(directional_votes, context_signals, snapshot, regime_state, pre_gate, settings=settings)
+        decision = _aggregate_with_family_engine(directional_votes, context_signals, snapshot, regime_state, pre_gate, settings=settings, payload=payload)
         aggregation_duration_ms = _elapsed_ms(aggregation_started)
         candidate = _candidate_from_decision(snapshot, decision, settings)
         latency_measurements = {
@@ -336,6 +343,7 @@ class VotingEnsembleService:
             shadow_directional_votes=shadow_directional_votes,
             context_signals=context_signals,
             shadow_context_signals=shadow_context_signals,
+            reliability_scope=reliability_scope(snapshot, regime_state),
             context_confirmation=context_confirmation,
             counts=counts,
             eligible_counts=eligible_counts,
@@ -557,19 +565,28 @@ STRATEGY_EVALUATORS_BY_ID: dict[str, StrategyEvaluator] = {
     "market_breadth_momentum": evaluate_market_breadth,
 }
 
-SNAPSHOT_STRATEGIES_BY_ID: dict[str, SnapshotDirectionalStrategy] = {
+SNAPSHOT_STRATEGY_INSTANCES: dict[str, SnapshotDirectionalStrategy] = {
     "multi_timeframe_trend_alignment": SnapshotMultiTimeframeTrendAlignmentStrategy(),
     "first_pullback_after_open": SnapshotFirstPullbackAfterOpenStrategy(),
     "failed_breakout_reversal": SnapshotFailedBreakoutReversalStrategy(),
     "liquidity_sweep_reversal": SnapshotLiquiditySweepReversalStrategy(),
     "bollinger_band_reversion": BollingerBandReversionStrategy(),
     "atr_overextension_reversion": AtrOverextensionReversionStrategy(),
+    "opening_range_breakout": OpeningRangeBreakoutStrategy(),
+    "vwap_trend_continuation": VwapTrendContinuationStrategy(),
+    "gap_continuation_fade": GapContinuationFadeStrategy(),
+}
+
+# The registry is the single source of truth for which directional modules are live;
+# these views follow it so a lifecycle promotion needs no matching edit here.
+SNAPSHOT_STRATEGIES_BY_ID: dict[str, SnapshotDirectionalStrategy] = {
+    module_id: SNAPSHOT_STRATEGY_INSTANCES[module_id]
+    for module_id in active_module_ids(StrategyCollection.DIRECTIONAL)
 }
 
 SHADOW_SNAPSHOT_STRATEGIES_BY_ID: dict[str, SnapshotDirectionalStrategy] = {
-    "gap_continuation_fade": GapContinuationFadeStrategy(),
-    "opening_range_breakout": OpeningRangeBreakoutStrategy(),
-    "vwap_trend_continuation": VwapTrendContinuationStrategy(),
+    module_id: SNAPSHOT_STRATEGY_INSTANCES[module_id]
+    for module_id in shadow_module_ids(StrategyCollection.DIRECTIONAL)
 }
 
 DIRECTIONAL_STRATEGIES: tuple[SnapshotDirectionalStrategy | StrategyEvaluator, ...] = tuple(
@@ -728,15 +745,25 @@ def _aggregate_with_family_engine(
     regime_state: RegimeState,
     safety_decision: GlobalGateDecision | None = None,
     settings: Any | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> EnsembleDecision:
     decided_at = _utc_timestamp(snapshot.evaluationTimestamp)
     session_date = decided_at.date()
     engine = _family_engine_for_settings(settings)
+    reliability_estimates = _reliability_estimates(
+        payload=payload or {},
+        votes=directional_votes,
+        snapshot=snapshot,
+        regime_state=regime_state,
+        settings=settings,
+        decided_at=decided_at,
+    )
     return engine.aggregate(
         strategySignals=[_strategy_signal_from_vote(vote, decided_at, session_date, snapshot.settingsHash) for vote in directional_votes],
         contextSignals=[_context_signal_from_vote(vote, decided_at, session_date, snapshot.settingsHash) for vote in context_votes],
         regimeState=regime_state,
         safetyDecision=safety_decision,
+        reliabilityEstimates=reliability_estimates,
         decidedAt=decided_at,
         sessionDate=session_date,
     )
@@ -752,10 +779,142 @@ def _family_engine_for_settings(settings: Any | None) -> FamilyAwareDeterministi
             minimumFinalScore=float(profile.minimumFinalScore),
             minimumIndependentSupportingFamilies=int(profile.minimumIndependentFamilySupport),
             minimumEligibleDirectionalStrategies=int(thresholds.minEligibleDirectionalVotes),
+            reliabilityMode=_reliability_mode(thresholds),
+            familyWeights=_family_weights(getattr(settings, "minimumFamilySupport", None)),
         )
     except Exception:
         return FAMILY_AWARE_ENGINE
     return FamilyAwareDeterministicEnsemble(config)
+
+
+def _reliability_mode(thresholds: Any | None) -> OperatingMode:
+    raw = str(getattr(thresholds, "reliabilityWeightingMode", "") or "").strip().upper()
+    try:
+        return OperatingMode[raw]
+    except KeyError:
+        return OperatingMode.SHADOW
+
+
+def _reliability_sample_window(thresholds: Any | None) -> str:
+    raw = str(getattr(thresholds, "reliabilitySampleWindow", "") or "").strip()
+    return raw if raw in {"rolling_20_trades", "rolling_60_trades", "rolling_120_trades"} else "rolling_60_trades"
+
+
+def _family_weights(minimum_family_support: Any | None) -> dict[StrategyFamily, float]:
+    """Map settings family weights (snake_case keys) onto the engine's StrategyFamily keys.
+
+    Settings permit a weight of 0 to mute a family; the engine config requires strictly
+    positive weights, so 0 is floored to an epsilon that `_weighted_family_mean` treats
+    as effectively muted.
+    """
+    raw = getattr(minimum_family_support, "familyWeights", None)
+    weights: dict[StrategyFamily, float] = {family: 1.0 for family in FAMILY_ORDER}
+    if not isinstance(raw, dict):
+        return weights
+    for key, value in raw.items():
+        try:
+            family = StrategyFamily[str(key).strip().upper()]
+        except KeyError:
+            continue
+        if family not in weights:
+            continue
+        weight = float(value)
+        weights[family] = weight if weight > 0.0 else 1e-6
+    return weights
+
+
+def _reliability_observations(payload: dict[str, Any]) -> list[VotingEnsembleReliabilityObservation]:
+    """Point-in-time per-strategy outcome history supplied with the evaluate payload.
+
+    History is an optional input: a malformed row is skipped rather than failing the
+    evaluation, and an empty list leaves every strategy on the neutral fallback.
+    """
+    context = payload.get("market_context") if isinstance(payload.get("market_context"), dict) else {}
+    raw = (
+        payload.get("strategy_reliability_observations")
+        or payload.get("strategyReliabilityObservations")
+        or context.get("strategyReliabilityObservations")
+        or []
+    )
+    if not isinstance(raw, list):
+        return []
+    observations: list[VotingEnsembleReliabilityObservation] = []
+    for row in raw:
+        if isinstance(row, VotingEnsembleReliabilityObservation):
+            observations.append(row)
+            continue
+        if not isinstance(row, dict):
+            continue
+        try:
+            observations.append(VotingEnsembleReliabilityObservation.model_validate(row))
+        except Exception:
+            continue
+    return observations
+
+
+def _reliability_estimates(
+    *,
+    payload: dict[str, Any],
+    votes: tuple[VotingStrategyVote, ...],
+    snapshot: VotingEnsembleEvaluationSnapshot,
+    regime_state: RegimeState,
+    settings: Any | None,
+    decided_at: datetime,
+) -> dict[str, StrategyReliabilityEstimate]:
+    """Estimate each strategy's accuracy for the direction it is currently signalling."""
+    observations = _reliability_observations(payload)
+    if not observations:
+        return {}
+    thresholds = getattr(settings, "aggregationThresholds", None)
+    mode = _reliability_mode(thresholds)
+    sample_window = _reliability_sample_window(thresholds)
+    estimator = VotingEnsembleReliabilityEstimator(
+        VotingEnsembleReliabilityConfig(sampleWindow=sample_window, mode=mode)
+    )
+    scope = reliability_scope(snapshot, regime_state)
+    regime = scope["regime"]
+    session_segment = scope["sessionSegment"]
+    volatility_state = scope["volatilityState"]
+    estimates: dict[str, StrategyReliabilityEstimate] = {}
+    for vote in votes:
+        direction = _domain_signal(vote.signal)
+        if direction == Signal.HOLD:
+            continue
+        strategy_id = _vote_strategy_id(vote)
+        estimates[strategy_id] = estimator.estimate_one(
+            observations=observations,
+            strategy_id=strategy_id,
+            direction=direction,
+            regime=regime,
+            session_segment=session_segment,
+            volatility_state=volatility_state,
+            sample_window=sample_window,
+            evaluation_timestamp=decided_at,
+            mode=mode,
+        )
+    return estimates
+
+
+def reliability_scope(snapshot: VotingEnsembleEvaluationSnapshot, regime_state: RegimeState) -> dict[str, str]:
+    """The bucket a reliability observation is filed under, and looked up by.
+
+    Recording and lookup must agree exactly or every estimate silently falls back to
+    neutral, so both sides call this one function.
+    """
+    return {
+        "regime": str(regime_state.label),
+        "sessionSegment": _session_segment(snapshot),
+        "volatilityState": str(regime_state.volatility).lower(),
+    }
+
+
+def _session_segment(snapshot: VotingEnsembleEvaluationSnapshot) -> str:
+    session_state = snapshot.sessionState if isinstance(snapshot.sessionState, dict) else {}
+    for key in ("sessionSegment", "segment", "session_segment", "phase"):
+        value = session_state.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "regular_session"
 
 
 def _local_gate_input(

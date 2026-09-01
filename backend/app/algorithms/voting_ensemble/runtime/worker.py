@@ -14,6 +14,7 @@ from backend.app.algorithms.voting_ensemble.runtime.commands import VotingEnsemb
 from backend.app.algorithms.voting_ensemble.runtime.queue import VotingEnsemblePriorityQueue
 from backend.app.algorithms.voting_ensemble.runtime.status_store import VotingEnsembleStatusStore
 from backend.app.algorithms.voting_ensemble.pipeline import VotingEnsemblePipeline
+from backend.app.algorithms.voting_ensemble.reliability_feed import build_reliability_observations
 from backend.app.algorithms.voting_ensemble.paper_execution import VOTING_ENSEMBLE_PAPER_EXECUTION_RUNTIME, VotingEnsemblePaperExecutionRuntime
 from backend.app.tick_data import parse_timestamp
 
@@ -53,6 +54,25 @@ class VotingEnsembleWorker:
         self.paper_execution_runtime = paper_execution_runtime or VOTING_ENSEMBLE_PAPER_EXECUTION_RUNTIME
         self.automatic_payload_builder = automatic_payload_builder
         self.quote_client = AlpacaClient(get_settings())
+
+    def _payload_with_reliability_history(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Attach realised per-strategy outcomes so accuracy weighting has evidence.
+
+        A caller-supplied history wins, which keeps replay and backtest payloads
+        point-in-time. History is best-effort: if it cannot be built, the evaluation
+        proceeds and every strategy falls back to neutral reliability.
+        """
+        if payload.get("strategy_reliability_observations") or payload.get("strategyReliabilityObservations"):
+            return payload
+        try:
+            observations = build_reliability_observations(
+                repository=getattr(self.paper_execution_runtime, "repository", None)
+            )
+        except Exception:
+            return payload
+        if not observations:
+            return payload
+        return {**payload, "strategy_reliability_observations": observations}
 
     def process_once(self, *, timeout: float | None = 0.0) -> dict[str, Any] | None:
         command = self.queue.pop(timeout=timeout)
@@ -99,6 +119,7 @@ class VotingEnsembleWorker:
                     "brokerSubmissionAllowed": False,
                 }
                 payload = self._payload_with_fresh_nbbo(authoritative_payload)
+            payload = self._payload_with_reliability_history(payload)
             try:
                 result = self.service.evaluate(payload)
             except Exception as exc:

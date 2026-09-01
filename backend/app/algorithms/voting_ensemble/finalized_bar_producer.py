@@ -489,11 +489,22 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
 
         quote = _call_market_provider(self.quote_provider, symbol=event.symbol.upper(), feed=feed)
         trade = _call_market_provider(self.last_trade_provider, symbol=event.symbol.upper(), feed=feed)
+        # The quote and last trade are fetched here, at the end of a snapshot build that
+        # first loads SPY, QQQ, IWM and every breadth component. That takes seconds, so
+        # anchoring the point-in-time cutoff to the bar-arrival time marks legitimately
+        # fresh market data as future-dated and fail-closes every evaluation.
+        #
+        # The cutoff is instead the latest moment any input was observed. That keeps
+        # point-in-time integrity (nothing in the snapshot post-dates the decision) and
+        # stays deterministic for replay and tests, unlike a wall-clock reading. The
+        # feed-sanity guard survives too: a quote whose own timestamp runs ahead of the
+        # receipt it arrived on is still rejected below.
+        market_data_observed_at = _latest_observation(observation_time, quote, trade)
         nbbo = _nbbo_from_quote_and_trade(
             quote,
             trade,
             event=event,
-            observation_time=observation_time,
+            observation_time=market_data_observed_at,
             max_quote_age_seconds=self.max_quote_age_seconds,
             max_trade_age_seconds=self.max_trade_age_seconds,
             failures=failures,
@@ -514,6 +525,7 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
         if not isinstance(global_gate, dict):
             global_gate = _server_global_gate(event, control, market_status)
 
+        market_forecast = _market_forecast_context(candles)
         ignored_fields = _ignored_authoritative_fields(command.payload, self.forbidden_caller_authoritative_fields)
         synchronization = {
             "algorithmId": "voting_ensemble",
@@ -538,6 +550,7 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
             "marketEvent": event.snapshot(),
             "sourceAuthority": event.sourceAuthority,
             "sessionState": _session_state(market_status),
+            "marketForecast": market_forecast,
             "backendMarketStatus": market_status,
             "accountRiskSnapshot": account_risk,
             "operationalHealthSnapshot": operational,
@@ -553,7 +566,7 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
         }
         payload = {
             "symbol": event.symbol.upper(),
-            "data_timestamp": _iso(observation_time),
+            "data_timestamp": _iso(market_data_observed_at),
             "candles": candles,
             "spy_5m_candles": five_minute,
             "spy_15m_candles": fifteen_minute,
@@ -1241,6 +1254,47 @@ def _parse_timestamp(value: Any) -> datetime:
     if isinstance(value, str):
         return _utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
     raise ValueError("timestamp is required")
+
+
+def _market_forecast_context(candles: list[dict[str, Any]]) -> dict[str, Any]:
+    """Multi-horizon forecast for the snapshot, derived from the SPY candles already loaded.
+
+    Advisory input only: the ensemble consumes it as a context signal, which can nudge an
+    existing directional candidate but can never authorise an entry on its own. A forecast
+    failure must never fail-close trading, so any error degrades to an empty payload and
+    the context module falls back to neutral.
+    """
+    if not candles:
+        return {}
+    try:
+        from backend.app.market_forecast import MARKET_FORECAST_SERVICE
+
+        forecast = MARKET_FORECAST_SERVICE.predict(list(candles))
+    except Exception:
+        return {}
+    if not isinstance(forecast, dict):
+        return {}
+    multi = forecast.get("multiHorizonForecast")
+    return {
+        "status": forecast.get("status"),
+        "inferenceStatus": forecast.get("inferenceStatus"),
+        "inferencePerformed": bool(forecast.get("inferencePerformed")),
+        "horizonMinutes": forecast.get("horizonMinutes"),
+        "multiHorizonForecast": multi if isinstance(multi, dict) else {},
+        "modelStatus": (forecast.get("model") or {}).get("status") if isinstance(forecast.get("model"), dict) else None,
+    }
+
+
+def _latest_observation(observation_time: datetime, *sources: Any) -> datetime:
+    """Latest moment any snapshot input was observed, used as the point-in-time cutoff."""
+    latest = observation_time
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        receipt = _optional_timestamp(source.get("marketDataReceiptTimestamp") or source.get("receivedAt"))
+        if receipt is not None and receipt > latest:
+            latest = receipt
+    return _utc(latest)
 
 
 def _utc(value: datetime) -> datetime:

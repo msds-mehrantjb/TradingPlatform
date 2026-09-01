@@ -209,6 +209,8 @@ def _settings_model_payload(config: dict[str, Any], profile: dict[str, Any], *, 
             minWinningVotes=int(config["minWinningVotes"]),
             minVoteEdge=float(config["minVoteEdge"]),
             holdBand=float(config["holdBand"]),
+            reliabilityWeightingMode=str(config.get("reliabilityWeightingMode", "shadow")),
+            reliabilitySampleWindow=str(config.get("reliabilitySampleWindow", "rolling_60_trades")),
         ),
         "minimumFamilySupport": MinimumFamilySupportSettings(
             minimumFamiliesForTrade=int(config["minimumFamiliesForTrade"]),

@@ -462,9 +462,9 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             self.assertEqual(account["usableEntryBuyingPower"], 250000.0)
             self.assertFalse(account["allowLeverage"])
             self.assertFalse(account["allowMargin"])
-            self.assertFalse(account["allowShorts"])
+            self.assertTrue(account["allowShorts"])
             self.assertEqual(account["maxLeverage"], 1.0)
-            self.assertEqual(account["buyingPowerModel"], "LOCAL_CASH_NO_MARGIN_LONG_ONLY")
+            self.assertEqual(account["buyingPowerModel"], "LOCAL_CASH_NO_MARGIN_LONG_AND_SHORT")
             self.assertEqual(account["equityModel"], "cash_plus_local_owned_position_market_value")
             for field in (
                 "equity",
@@ -1022,7 +1022,7 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             self.assertEqual(inventory["account"]["marginBuyingPower"], 0.0)
             self.assertFalse(inventory["account"]["allowLeverage"])
             self.assertFalse(inventory["account"]["allowMargin"])
-            self.assertFalse(inventory["account"]["allowShorts"])
+            self.assertTrue(inventory["account"]["allowShorts"])
             self.assertEqual(inventory["account"]["maxLeverage"], 1.0)
             self.assertEqual(inventory["account"]["openPositionNotional"], 1040.0)
             self.assertEqual(inventory["account"]["grossExposure"], 1040.0)
@@ -1271,17 +1271,23 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
             self.assertEqual(inventory["fills"], [])
             self.assertEqual(len(inventory["localExecutions"]), 3)
 
-    def test_local_paper_execution_engine_rejects_invalid_local_risk_and_naked_exit(self) -> None:
+    def test_local_paper_execution_engine_rejects_invalid_local_risk_and_opens_shorts(self) -> None:
         repository = VotingEnsemblePaperExecutionRepository()
         engine = VotingEnsembleLocalPaperExecutionEngine(repository)
 
         risk_ack = engine.submit_order(local_engine_intent(client_order_id="engine-risk", quantity=1, planned_risk=200000.0))
+        # With shorts enabled a SELL against no position opens one rather than being
+        # rejected as a naked exit; it still has to clear the same entry risk as a long.
         sell_ack = engine.submit_order(local_engine_intent(client_order_id="engine-sell", quantity=1, side=Signal.SELL))
+        short_risk_ack = engine.submit_order(
+            local_engine_intent(client_order_id="engine-short-risk", quantity=1, side=Signal.SELL, planned_risk=200000.0)
+        )
 
         self.assertEqual(risk_ack.status, "REJECTED")
         self.assertEqual(risk_ack.rejectedReason, "voting_ensemble.local_paper.local_risk_limit_exceeded")
-        self.assertEqual(sell_ack.status, "REJECTED")
-        self.assertEqual(sell_ack.rejectedReason, "voting_ensemble.local_paper.sell_cannot_mutate_foreign_or_absent_position")
+        self.assertNotEqual(sell_ack.status, "REJECTED")
+        self.assertEqual(short_risk_ack.status, "REJECTED")
+        self.assertEqual(short_risk_ack.rejectedReason, "voting_ensemble.local_paper.local_risk_limit_exceeded")
 
     def test_local_paper_execution_engine_enforces_configured_local_entry_risk_caps(self) -> None:
         repository = VotingEnsemblePaperExecutionRepository()
