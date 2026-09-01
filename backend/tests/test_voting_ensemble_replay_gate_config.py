@@ -9,6 +9,10 @@ from backend.app.algorithms.voting_ensemble.event_calendar import (
     event_calendar_from_payload,
     resolve_event_veto,
 )
+from backend.app.algorithms.voting_ensemble.snapshot.builder import (
+    _unwrap_event_state,
+    build_point_in_time_snapshot,
+)
 from backend.app.algorithms.voting_ensemble.strategies.context.pipeline import _event_blackout_active
 
 
@@ -28,6 +32,11 @@ SESSION_POLICY = {
     "enabled": True,
     "segments": {"close": {"tradable": True, "permittedStrategies": ["bollinger_band_reversion"]}},
 }
+
+
+def _snapshot_payload_with_event(event: dict) -> dict:
+    """The smallest payload the builder accepts, carrying only the event under test."""
+    return {"symbol": "SPY", "data_timestamp": CPI.isoformat(), "market_context": {"event": event}}
 
 
 def runner_with(**config) -> VotingEnsembleBacktestRunner:
@@ -81,6 +90,33 @@ class ReplayGateConfigTest(unittest.TestCase):
 
         self.assertIsNotNone(state["providerTimestamp"])
         self.assertIsNotNone(state["receiptTimestamp"])
+
+    def test_the_veto_survives_the_evaluate_payload_round_trip(self) -> None:
+        """The gate reads the blackout after a rebuild, not just on the first build.
+
+        Replay builds a snapshot, flattens it with `to_evaluate_payload`, and the service
+        rebuilds from that payload. `to_evaluate_payload` re-emits the event as the
+        snapshot's own dump, so the second build sees {"state": {...}} where the first saw
+        {...}. Before this was handled the blackout was silently lost in the round trip:
+        replay evaluated blackout bars as if the calendar were empty, and a gated live run
+        could not be reproduced.
+        """
+        state = runner_with(eventCalendar=CALENDAR)._event_state_at(CPI)
+        first = build_point_in_time_snapshot(_snapshot_payload_with_event(state))
+
+        self.assertTrue(_event_blackout_active(first.economicEventState.state))
+
+        rebuilt = build_point_in_time_snapshot(
+            _snapshot_payload_with_event(first.to_evaluate_payload()["market_context"]["event"])
+        )
+
+        self.assertTrue(_event_blackout_active(rebuilt.economicEventState.state))
+
+    def test_a_raw_event_state_is_left_alone(self) -> None:
+        """Unwrapping must not disturb the shape the live producer already sends."""
+        raw = {"eventBlackoutActive": False, "state": "clear", "importance": "low"}
+
+        self.assertEqual(_unwrap_event_state(raw), raw)
 
     def test_a_malformed_calendar_in_replay_falls_back_to_no_veto(self) -> None:
         runner = runner_with(eventCalendar={"enabled": True, "events": [{"eventType": "CPI"}]})

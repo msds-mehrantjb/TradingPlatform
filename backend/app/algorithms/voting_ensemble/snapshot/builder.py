@@ -274,8 +274,32 @@ def _nbbo(payload: dict[str, Any], context: dict[str, Any], evaluation_timestamp
         return None
 
 
+def _unwrap_event_state(event: dict[str, Any]) -> dict[str, Any]:
+    """Accept either a raw event state or a serialised EventStateSnapshot.
+
+    `to_evaluate_payload` re-emits the snapshot's own dump under "event", so a rebuild from
+    that payload sees {"state": {...}} where the first build saw {...}. Anything evaluated
+    through the payload therefore lost the blackout the first build had recorded, silently:
+    the flag is nested one level below where the gate reads it. Unwrapping here keeps
+    build(to_evaluate_payload(build(x))) equal to build(x), which is the invariant replay
+    depends on to reproduce a gated live run.
+
+    A raw state carries `state` as a string, so a dict under that key is unambiguously the
+    wrapper rather than a legitimate value.
+    """
+    inner = event.get("state")
+    if not isinstance(inner, dict):
+        return event
+    unwrapped = dict(inner)
+    for key in ("providerTimestamp", "receiptTimestamp"):
+        if unwrapped.get(key) is None and event.get(key) is not None:
+            unwrapped[key] = event[key]
+    return unwrapped
+
+
 def _event_state(context: dict[str, Any], evaluation_timestamp: datetime, failures: list[str], stale: list[str], malformed: list[str]) -> EventStateSnapshot:
     event = context.get("event") if isinstance(context.get("event"), dict) else {}
+    event = _unwrap_event_state(event)
     provider_ts = _timestamp(_feed_value(event, "providerTimestamp", "sourceTimestamp", "timestamp")) if event else None
     receipt_ts = _timestamp(_feed_value(event, "receiptTimestamp", "receivedAt")) if event else None
     if event and provider_ts is None and receipt_ts is None:
