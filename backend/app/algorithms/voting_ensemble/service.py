@@ -382,7 +382,10 @@ class VotingEnsembleService:
             order_plan=order_plan.model_dump(mode="json") if order_plan else None,
             reason_codes=(
                 "voting_ensemble.evaluate.completed",
-                *tuple(session_policy_decision.reason_codes),
+                # Only when the policy is on. A disabled policy has nothing to say about the
+                # bar, and stamping "disabled" onto every decision record forever would be
+                # configuration state masquerading as a finding.
+                *tuple(session_policy_decision.reason_codes if session_policy_decision.enabled else ()),
                 *tuple(decision.reasonCodes),
                 *tuple(regime_state.features.get("reasonCodes") or ()),
                 *tuple(post_gate.reasonCodes),

@@ -27,6 +27,28 @@ def at(hour: int, minute: int, *, month: int = 7, day: int = 14) -> datetime:
     return datetime(2026, month, day, hour, minute, tzinfo=NEW_YORK).astimezone(timezone.utc)
 
 
+def _short_series(minutes: int = 60, *, base: float = 500.0, scale: float = 1.0) -> list[dict]:
+    """A brief session, enough bars to clear warm-up without the cost of a full day."""
+    rows, price = [], base
+    for index in range(minutes):
+        phase = index % 80
+        step = (1.4 if phase < 30 else (-1.1 if phase < 60 else 0.6)) * scale
+        price += step
+        wick = max(abs(step) * 0.8, 0.12) * scale
+        ts = at(9, 31) + timedelta(minutes=index)
+        rows.append(
+            {
+                "timestamp": ts.isoformat().replace("+00:00", "Z"),
+                "open": round(price - step, 4),
+                "high": round(max(price, price - step) + wick, 4),
+                "low": round(min(price, price - step) - wick, 4),
+                "close": round(price, 4),
+                "volume": 140000 + (index % 7) * 6000,
+            }
+        )
+    return rows
+
+
 class SessionSegmentTest(unittest.TestCase):
     """The label the session policy keys on has to be produced by something.
 
@@ -183,6 +205,47 @@ class SessionSizeCapTest(unittest.TestCase):
 
     def test_a_zero_cap_blocks_sizing_without_blocking_the_vote(self) -> None:
         self.assertEqual(self.budget(0.0).quantity, 0)
+
+
+class SessionPolicyReasonCodeTest(unittest.TestCase):
+    """A disabled policy must leave the decision record exactly as it found it."""
+
+    def codes(self, **config) -> list[str]:
+        runner = VotingEnsembleBacktestRunner(
+            config=VotingEnsembleBacktestConfig(warmupCandles=40, includeDecisionRecords=True, **config)
+        )
+        bars = _short_series()
+        result = runner.run(
+            symbol="SPY",
+            spy_1m_candles=bars,
+            qqq_candles=_short_series(base=440.0, scale=1.2),
+            iwm_candles=_short_series(base=210.0, scale=0.8),
+            breadth_components={
+                "XLK": _short_series(base=250.0, scale=1.1),
+                "XLF": _short_series(base=48.0, scale=0.9),
+                "XLV": _short_series(base=145.0, scale=0.7),
+            },
+            timeframe="1Min",
+        )
+        return list(result["decisionRecords"][0]["reasonCodes"])
+
+    def test_a_disabled_policy_stamps_nothing_on_the_record(self) -> None:
+        """Otherwise every decision ever made carries a code saying a feature is off.
+
+        That is configuration state masquerading as a finding, and it would bury the codes
+        that do describe the bar.
+        """
+        self.assertEqual([code for code in self.codes() if "session_policy" in code], [])
+
+    def test_an_enabled_policy_says_what_it_did(self) -> None:
+        codes = self.codes(
+            sessionPolicy={
+                "enabled": True,
+                "segments": {"open": {"tradable": True, "permittedStrategies": ["bollinger_band_reversion"]}},
+            }
+        )
+
+        self.assertIn("voting_ensemble.session_policy.voter_not_permitted_in_segment", codes)
 
 
 class SessionPolicyAgainstRealLabelsTest(unittest.TestCase):
