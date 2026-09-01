@@ -234,7 +234,11 @@ def trending_session() -> tuple[WeightedVotingCandle, ...]:
     candles = []
     for index in range(390):
         base = 100.0 + index * 0.03
-        volume = 200_000 if index != 5 else 5_000
+        # Candle 5 is deliberately thin so the participation limit binds and the entry
+        # fills partially. maximum_participation_rate is 0.01, so the cap is volume/100 and
+        # it has to sit below the order size for the partial-fill path to be exercised at
+        # all; 5_000 allowed 50 shares, which stopped binding once sizing came in smaller.
+        volume = 200_000 if index != 5 else 1_000
         candles.append(make_candle(index, base, base + 0.45, base - 0.18, base + 0.08, volume))
     return tuple(candles)
 

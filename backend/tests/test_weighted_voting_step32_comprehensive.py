@@ -159,7 +159,13 @@ class WeightedVotingStep32ComprehensiveTest(unittest.TestCase):
         self.assertEqual(replay.run.run_id, "golden-step32")
         self.assertEqual(len(replay.decisions), 10)
         self.assertEqual(len(replay.trades), 7)
-        self.assertEqual(replay.algorithm_results.net_pnl, 1544.146772192)
+        # Re-recorded at 04f0fe3, which fixed two sizing defects and shrank positions ~8.6x:
+        # _effective_risk_dollars read base_risk_per_trade_percent off the nested default
+        # settings, so condition-adjusted risk reduction was ignored, and the order-allocation
+        # cap was not the value actually reported as limiting. Everything else about this
+        # replay is unchanged -- same 10 decisions, same 7 trades, same 4.0 profit factor,
+        # same entry timing and exit reason -- so only the quantity-dependent figure moved.
+        self.assertEqual(replay.algorithm_results.net_pnl, 179.438551608)
         self.assertEqual(replay.algorithm_results.profit_factor, 4.0)
         self.assertEqual(replay.trades[0].entry_timestamp, SESSION_OPEN + timedelta(minutes=5))
         self.assertGreater(replay.trades[0].entry_timestamp, replay.decisions[0].data_timestamp)
