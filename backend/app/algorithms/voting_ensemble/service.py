@@ -55,7 +55,7 @@ from backend.app.algorithms.voting_ensemble.strategies.registry import (
 )
 from backend.app.algorithms.voting_ensemble.trading_settings.resolver import resolve_one_minute_trading_settings
 from backend.app.algorithms.voting_ensemble.risk_budget import resolve_voting_ensemble_risk_budget
-from backend.app.market_feed import active_instrument
+from backend.app.market_feed import active_instrument, instrument_for_symbol
 from backend.app.domain.models import AccountRiskState, BaselineTradingSettings, ContextSignal, Direction, DynamicPolicyBounds, EffectiveTradePolicy, EnsembleDecision, GateStatus, GlobalGateDecision, HardRiskLimits, OperatingMode, OrderPlan, Signal, StrategyFamily, StrategyRole, StrategySignal, TradeCandidate
 from backend.app.gates import GlobalGateInput
 
@@ -1069,6 +1069,20 @@ def _account_risk_state(snapshot: VotingEnsembleEvaluationSnapshot) -> AccountRi
     )
 
 
+def _contract_multiplier(symbol: str) -> float:
+    """Dollars of P&L per point of price for this symbol.
+
+    Defaults to 1.0 -- a share -- for anything the registry does not carry, which keeps the
+    equity arithmetic bit-for-bit unchanged.
+    """
+    try:
+        selected = instrument_for_symbol(symbol)
+    except Exception:
+        return 1.0
+    value = float(getattr(selected, "point_value", 1.0) or 1.0) if selected else 1.0
+    return value if value > 0 else 1.0
+
+
 def _active_instrument_tradeable() -> bool:
     """Whether the instrument the app is on can be sized by this platform.
 
@@ -1502,6 +1516,10 @@ def _risk_budget_config(
         # smaller into the close" intent was inert: the multiplier was resolved on
         # every bar, reported nowhere, and applied to nothing.
         "sessionCap": session_cap,
+        # Dollars per point for the instrument being sized. 1.0 for a share, 5.0 for MES,
+        # 2.0 for MNQ. Sourced from the registry that already carries the real contract
+        # specifications rather than restated here.
+        "contractMultiplier": _contract_multiplier(snapshot.symbol),
         "eventRiskCap": _number(operational, "eventRiskCap") if _number(operational, "eventRiskCap") is not None else 1.0,
         "drawdownCap": _drawdown_cap(account),
         "liquidityCap": _number(operational, "liquidityCap") if _number(operational, "liquidityCap") is not None else 1.0,

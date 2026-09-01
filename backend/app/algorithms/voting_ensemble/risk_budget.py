@@ -127,7 +127,7 @@ def resolve_voting_ensemble_risk_budget(
         reason_codes.extend(cap.reason_codes)
     return _budget(
         quantity=max(0, quantity),
-        planned_risk=round(max(0, quantity) * stop_distance, 6),
+        planned_risk=round(max(0, quantity) * stop_distance * max(_number(config, "contractMultiplier", 1.0), 1e-9), 6),
         sizing_mode="minimum_cap",
         risk_budget=round(max(0.0, risk_budget), 6),
         order_limit=round(max(0.0, order_limit), 6),
@@ -178,16 +178,23 @@ def _sizing_caps(
     current_volume = max(_number(config, "currentOneMinuteVolume", 0.0), _number(config, "volumeCurrent", 0.0), 0.0)
     participation_shares = current_volume * (_percent(config, "maximumVolumeParticipationPercent", 1.0) / 100.0)
     profile_max = _number(config, "profileMaximumShares", _number(config, "maximumShares", _number(config, "maxShareQuantity", 0.0)))
+    # Dollars per point of price. A share moves one dollar per dollar; an MES contract moves
+    # five and an MNQ two. Every cap below turns a dollar budget into a quantity, so the
+    # multiplier belongs exactly at those divisions and nowhere else -- sizing a future
+    # through the share arithmetic returns a plausible number wrong by this factor.
+    multiplier = max(_number(config, "contractMultiplier", 1.0), 1e-9)
+    notional_per_unit = entry_price * multiplier
+    risk_per_unit = stop_distance * multiplier
     return (
-        _cap("risk_based_shares", risk_budget / stop_distance, risk_budget, "voting_ensemble.risk_budget.cap.risk_based", "Risk budget divided by initial stop distance."),
-        _cap("position_notional_cap_shares", position_notional_cap / entry_price, position_notional_cap, "voting_ensemble.risk_budget.cap.position_notional", "Voting Ensemble position/notional cap."),
-        _cap("available_equity_buying_power_shares", available_equity_cap / entry_price, available_equity_cap, "voting_ensemble.risk_budget.cap.buying_power", "Available equity and buying power cap."),
+        _cap("risk_based_shares", risk_budget / risk_per_unit, risk_budget, "voting_ensemble.risk_budget.cap.risk_based", "Risk budget divided by initial stop distance."),
+        _cap("position_notional_cap_shares", position_notional_cap / notional_per_unit, position_notional_cap, "voting_ensemble.risk_budget.cap.position_notional", "Voting Ensemble position/notional cap."),
+        _cap("available_equity_buying_power_shares", available_equity_cap / notional_per_unit, available_equity_cap, "voting_ensemble.risk_budget.cap.buying_power", "Available equity and buying power cap."),
         _cap("liquidity_based_shares", fillable, fillable, "voting_ensemble.risk_budget.cap.liquidity", "Point-in-time displayed fillable quantity cap."),
         _cap("participation_rate_shares", participation_shares, participation_shares, "voting_ensemble.risk_budget.cap.participation", "Configured maximum participation rate cap."),
         _cap("profile_maximum_shares", profile_max, profile_max, "voting_ensemble.risk_budget.cap.profile_maximum_shares", "Resolved profile maximum shares cap."),
-        _cap("global_exposure_allowance_shares", global_exposure / entry_price, global_exposure, "voting_ensemble.risk_budget.cap.global_exposure", "Read-only global exposure allowance cap."),
-        _cap("local_exposure_allowance_shares", local_exposure / entry_price, local_exposure, "voting_ensemble.risk_budget.cap.local_exposure", "Voting Ensemble local exposure allowance cap."),
-        _cap("order_allocation_shares", order_limit / entry_price, order_limit, "voting_ensemble.risk_budget.cap.order_allocation", "Resolved order allocation cap."),
+        _cap("global_exposure_allowance_shares", global_exposure / notional_per_unit, global_exposure, "voting_ensemble.risk_budget.cap.global_exposure", "Read-only global exposure allowance cap."),
+        _cap("local_exposure_allowance_shares", local_exposure / notional_per_unit, local_exposure, "voting_ensemble.risk_budget.cap.local_exposure", "Voting Ensemble local exposure allowance cap."),
+        _cap("order_allocation_shares", order_limit / notional_per_unit, order_limit, "voting_ensemble.risk_budget.cap.order_allocation", "Resolved order allocation cap."),
     )
 
 
@@ -277,6 +284,7 @@ def _budget(
                 "drawdownCap",
                 "liquidityCap",
                 "sessionCap",
+                "contractMultiplier",
             }
         },
     }
