@@ -34,12 +34,14 @@ EVENT_STATE_CLEAR = "clear"
 EVENT_STATE_IMMINENT = "imminent"
 EVENT_STATE_ACTIVE = "active"
 EVENT_STATE_STABILIZING = "stabilizing"
+EVENT_STATE_STALE = "stale"
 
 EVENT_REASON_SCHEDULED = "voting_ensemble.event_calendar.scheduled_event_blackout"
 EVENT_REASON_AUCTION = "voting_ensemble.event_calendar.auction_window_blackout"
 EVENT_REASON_ROLL = "voting_ensemble.event_calendar.contract_roll_blackout"
 EVENT_REASON_DISABLED = "voting_ensemble.event_calendar.disabled"
 EVENT_REASON_CLEAR = "voting_ensemble.event_calendar.clear"
+EVENT_REASON_STALE = "voting_ensemble.event_calendar.stale"
 
 # Importances the gate treats as blocking. Anything below these is reported but does not
 # stop an entry, so a low-importance print does not halt the day.
@@ -96,6 +98,12 @@ class EventCalendarSettings:
     # instrument declares a roll date.
     contract_roll_blackout_days: int = 1
     contract_roll_dates: tuple[date, ...] = ()
+    # A hand-maintained calendar rots, and a rotted one is indistinguishable from a calm
+    # market: no event covers the bar, so the veto reports clear and fails open on exactly
+    # the days it exists to protect. These make the calendar assert its own coverage.
+    valid_until: date | None = None
+    stale_after_days: int = 90
+    stale_blocks_entries: bool = True
 
 
 @dataclass(frozen=True)
@@ -188,6 +196,9 @@ def event_calendar_from_payload(payload: Mapping[str, Any] | None) -> EventCalen
             session_close=str(payload.get("sessionClose", "16:00")),
             contract_roll_blackout_days=int(payload.get("contractRollBlackoutDays", 1)),
             contract_roll_dates=tuple(rolls),
+            valid_until=_parse_date(payload.get("validUntil", payload.get("valid_until"))),
+            stale_after_days=int(payload.get("staleAfterDays", 90)),
+            stale_blocks_entries=bool(payload.get("staleBlocksEntries", True)),
         )
     except Exception:
         return default_event_calendar()
@@ -262,6 +273,22 @@ def resolve_event_veto(
 
     instant = _utc(bar_end)
 
+    if calendar.stale_blocks_entries and _calendar_stale(instant, calendar):
+        return EventVetoDecision(
+            enabled=True,
+            blackout_active=True,
+            state=EVENT_STATE_STALE,
+            importance="critical",
+            reason_codes=(EVENT_REASON_STALE,),
+            active_event="calendar_stale",
+            explanation=(
+                "Event calendar no longer covers this bar. An uncovered calendar cannot distinguish "
+                "a calm day from an unmaintained one, so entries stop rather than proceeding on an "
+                "assumption of no events."
+            ),
+            resolved_at=instant,
+            )
+
     for event in calendar.events:
         state = event.state_at(instant)
         if state in (EVENT_STATE_IMMINENT, EVENT_STATE_ACTIVE, EVENT_STATE_STABILIZING) and event.blocks:
@@ -324,6 +351,40 @@ def _auction_window(instant: datetime, calendar: EventCalendarSettings) -> str |
     if calendar.block_closing_auction and closes_at - max(0, calendar.closing_auction_minutes) <= minute <= closes_at:
         return "closing_auction"
     return None
+
+
+def _calendar_stale(instant: datetime, calendar: EventCalendarSettings) -> bool:
+    """Whether the calendar still claims to cover this bar.
+
+    A calendar carrying only rules -- auction windows, a roll schedule -- cannot rot, because
+    those are derived rather than maintained. Only a dated event list can fall behind, so
+    only that is checked.
+
+    An explicit `valid_until` is the honest signal and wins. Without one the event list is
+    asked how old it is: if the newest event it carries is more than `stale_after_days`
+    before this bar, nobody has updated it in a quarter and its silence means nothing.
+    """
+    if not calendar.events:
+        return False
+    day = instant.astimezone(_EXCHANGE_TIMEZONE).date()
+    if calendar.valid_until is not None:
+        return day > calendar.valid_until
+    newest = max(_utc(event.scheduled_at).astimezone(_EXCHANGE_TIMEZONE).date() for event in calendar.events)
+    return (day - newest).days > max(0, calendar.stale_after_days)
+
+
+def _parse_date(value: Any) -> date | None:
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
 
 
 def _in_roll_blackout(instant: datetime, calendar: EventCalendarSettings) -> bool:

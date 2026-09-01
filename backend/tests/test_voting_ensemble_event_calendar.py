@@ -254,3 +254,90 @@ class ContractRollTest(unittest.TestCase):
 
         state = runner._event_state_at(datetime(2026, 9, 18, 17, 0, tzinfo=timezone.utc), "MES")
         self.assertFalse(state["eventBlackoutActive"])
+
+
+class CalendarStalenessTest(unittest.TestCase):
+    """A rotted calendar is indistinguishable from a calm market, and fails open.
+
+    The veto scans a dated event list. If nobody updates that list, no event covers the bar,
+    the veto reports clear, and entries proceed straight through FOMC day on the strength of
+    an empty file. That is the failure this closes: silence has to mean "checked and clear",
+    not "nobody looked".
+    """
+
+    CPI = {
+        "eventType": "CPI",
+        "eventFamily": "Inflation",
+        "importance": "high",
+        "scheduledAt": "2026-01-15T13:30:00Z",
+    }
+
+    def veto(self, when: str, **payload):
+        from datetime import datetime
+
+        from backend.app.algorithms.voting_ensemble.event_calendar import (
+            event_calendar_from_payload,
+            resolve_event_veto,
+        )
+
+        return resolve_event_veto(
+            bar_end=datetime.fromisoformat(when),
+            settings=event_calendar_from_payload({"enabled": True, **payload}),
+        )
+
+    def test_a_recent_calendar_is_trusted(self) -> None:
+        decision = self.veto("2026-02-14T14:00:00+00:00", events=[self.CPI])
+
+        self.assertFalse(decision.blackout_active)
+        self.assertEqual(decision.state, "clear")
+
+    def test_a_calendar_nobody_has_updated_stops_entries(self) -> None:
+        decision = self.veto("2026-08-03T14:00:00+00:00", events=[self.CPI])
+
+        self.assertTrue(decision.blackout_active)
+        self.assertEqual(decision.state, "stale")
+        self.assertIn("voting_ensemble.event_calendar.stale", decision.reason_codes)
+
+    def test_an_explicit_coverage_date_is_the_honest_signal(self) -> None:
+        """A calendar that says how far it reaches is believed over the age of its contents."""
+        inside = self.veto("2026-08-03T14:00:00+00:00", events=[self.CPI], validUntil="2026-12-31")
+        expired = self.veto("2026-08-03T14:00:00+00:00", events=[self.CPI], validUntil="2026-06-30")
+
+        self.assertFalse(inside.blackout_active)
+        self.assertTrue(expired.blackout_active)
+        self.assertEqual(expired.state, "stale")
+
+    def test_the_staleness_window_is_configurable(self) -> None:
+        recent = self.veto("2026-03-01T14:00:00+00:00", events=[self.CPI], staleAfterDays=90)
+        strict = self.veto("2026-03-01T14:00:00+00:00", events=[self.CPI], staleAfterDays=7)
+
+        self.assertFalse(recent.blackout_active)
+        self.assertTrue(strict.blackout_active)
+
+    def test_it_can_be_switched_off(self) -> None:
+        """Every gate here needs a way to disable it, including this one."""
+        decision = self.veto("2026-08-03T14:00:00+00:00", events=[self.CPI], staleBlocksEntries=False)
+
+        self.assertFalse(decision.blackout_active)
+
+    def test_a_rules_only_calendar_cannot_rot(self) -> None:
+        """Auction windows and a roll schedule are derived, not maintained, so they never age."""
+        decision = self.veto("2030-01-01T14:00:00+00:00")
+
+        self.assertFalse(decision.blackout_active)
+
+    def test_a_disabled_calendar_is_left_alone(self) -> None:
+        from datetime import datetime
+
+        from backend.app.algorithms.voting_ensemble.event_calendar import (
+            event_calendar_from_payload,
+            resolve_event_veto,
+        )
+
+        decision = resolve_event_veto(
+            bar_end=datetime.fromisoformat("2026-08-03T14:00:00+00:00"),
+            settings=event_calendar_from_payload({"enabled": False, "events": [self.CPI]}),
+        )
+
+        self.assertFalse(decision.blackout_active)
+        self.assertIn("voting_ensemble.event_calendar.disabled", decision.reason_codes)
