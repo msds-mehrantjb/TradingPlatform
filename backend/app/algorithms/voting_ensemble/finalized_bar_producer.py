@@ -9,6 +9,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
+
+from backend.app.algorithms.voting_ensemble.event_calendar import (
+    event_calendar_from_payload,
+    resolve_event_veto,
+)
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal, Protocol
@@ -565,6 +570,10 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
             "marketEvent": event.snapshot(),
             "sourceAuthority": event.sourceAuthority,
             "sessionState": _session_state(market_status),
+            # The economic-event key the snapshot builder reads. Without it _event_state
+            # produced an empty dict, so the blackout gate and the 32 event policies could
+            # never fire on the automatic path no matter what was on the calendar.
+            "event": _event_veto_state(command, settings, event),
             "marketForecast": market_forecast,
             "backendMarketStatus": market_status,
             "accountRiskSnapshot": account_risk,
@@ -1041,6 +1050,30 @@ def _account_snapshot_from_backend_account(account: dict[str, Any] | None, inven
         "localPaperAccount": True,
         "externalBrokerAccount": False,
     }
+
+
+def _event_veto_state(command: Any, settings: Any, event: Any) -> dict[str, Any]:
+    """Resolve the scheduled-event veto for this bar into the state the gates read.
+
+    A caller-supplied calendar wins over settings so a replay is judged against the
+    calendar as it stood for that bar, not as it stands when the replay runs.
+    """
+    payload = getattr(command, "payload", None)
+    context = payload.get("market_context") if isinstance(payload, dict) and isinstance(payload.get("market_context"), dict) else {}
+    configured = None
+    for candidate in (
+        context.get("eventCalendar") if isinstance(context, dict) else None,
+        payload.get("event_calendar") if isinstance(payload, dict) else None,
+        getattr(settings, "eventCalendar", None),
+    ):
+        if isinstance(candidate, dict):
+            configured = candidate
+            break
+    decision = resolve_event_veto(
+        bar_end=_utc(event.barEndTimestamp),
+        settings=event_calendar_from_payload(configured),
+    )
+    return decision.as_event_state()
 
 
 def _entry_window_open(*, market_open: bool, settings: Any, bar_end: datetime) -> bool:
