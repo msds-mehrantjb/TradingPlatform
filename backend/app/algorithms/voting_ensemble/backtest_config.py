@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import Field
 
 from backend.app.algorithms.voting_ensemble.exit_policy import VOTING_ENSEMBLE_DEFAULT_MAX_HOLDING_MINUTES, voting_ensemble_execution_config
@@ -46,6 +48,11 @@ class VotingEnsembleBacktestConfig(DomainModel):
     maximumHoldingMinutes: int = Field(default=VOTING_ENSEMBLE_DEFAULT_MAX_HOLDING_MINUTES, ge=1)
     includeDecisionRecords: bool = True
     maximumDecisionRecords: int | None = Field(default=None, ge=0)
+    # The gate configurations a replay ran under. A baseline recorded without these
+    # cannot be reproduced: the calendar and the segment map are what determine which
+    # bars were vetoed, so they belong in the run's configuration, not around it.
+    sessionPolicy: dict[str, Any] | None = None
+    eventCalendar: dict[str, Any] | None = None
     execution: ExecutionSimulationConfig = Field(default_factory=voting_ensemble_execution_config)
     executionStressScenarios: tuple[ExecutionSimulationConfig, ...] = Field(default_factory=voting_ensemble_execution_stress_scenarios)
     configVersion: str = VOTING_ENSEMBLE_BACKTEST_CONFIG_VERSION

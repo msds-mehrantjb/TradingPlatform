@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
+from backend.app.algorithms.voting_ensemble.event_calendar import (
+    event_calendar_from_payload,
+    resolve_event_veto,
+)
 from backend.app.algorithms.voting_ensemble.backtest_config import VotingEnsembleBacktestConfig, backtest_config_reason_codes
 from backend.app.algorithms.voting_ensemble.models import AlgoSignal, VotingCandle
 from backend.app.algorithms.voting_ensemble.exit_policy import VotingEnsembleExecutionSimulator, exit_policy_reason_codes
@@ -183,15 +187,35 @@ class VotingEnsembleBacktestRunner:
             },
             "external_breadth_feed": external_breadth_feed,
             "nbbo": _synthetic_backtest_nbbo(candles[-1], timestamp),
+            # The event veto has to ride the snapshot, because the gates read it from
+            # snapshot.economicEventState rather than from the evaluate payload. Without
+            # this a replay of a gated live run would silently skip every blackout the
+            # live run honoured, and the two would not be comparable.
+            "market_context": {"event": self._event_state_at(timestamp)},
         }
         snapshot = build_backtest_snapshot(payload)
         evaluate_payload = snapshot.to_evaluate_payload()
+        session_policy = getattr(self.config, "sessionPolicy", None)
+        if isinstance(session_policy, dict):
+            # Read by the service above the voting layer, so it attaches to the evaluate
+            # payload rather than the snapshot.
+            evaluate_payload["session_policy"] = session_policy
         if hasattr(self.service, "run"):
             envelope = self.service.run(evaluate_payload, mode="backtest")
             decision = dict(envelope["decision"])
             decision["pipeline_envelope"] = {key: value for key, value in envelope.items() if key != "decision"}
             return decision
         return self.service.evaluate(evaluate_payload)
+
+    def _event_state_at(self, timestamp: datetime) -> dict[str, Any]:
+        """Resolve the configured calendar for this bar, exactly as the live path does.
+
+        Same module and same bar-end input as the producer, so a replay and the live run
+        it reproduces reach the same verdict for the same bar instead of two
+        implementations that merely look alike.
+        """
+        calendar = event_calendar_from_payload(getattr(self.config, "eventCalendar", None))
+        return resolve_event_veto(bar_end=timestamp, settings=calendar).as_event_state()
 
     def _order_plan(self, symbol: str, evaluation: dict[str, Any], candle: VotingCandle, session_date: date) -> OrderPlan | None:
         order_payload = evaluation.get("order_plan")
