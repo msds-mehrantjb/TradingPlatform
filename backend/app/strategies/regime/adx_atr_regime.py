@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from statistics import mean
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.domain.feature_engine import FeatureQuality
 from backend.app.domain.models import Direction, RegimeState, StrategyRole
@@ -36,12 +36,34 @@ class AdxAtrRegimeConfig(BaseModel):
     rangeAdx: float = Field(default=16.0, ge=0, le=100)
     lowAtrPercentile: float = Field(default=0.25, ge=0, le=1)
     highAtrPercentile: float = Field(default=0.75, ge=0, le=1)
-    lowRealizedVolatilityPercentile: float = Field(default=0.25, ge=0, le=1)
+    # 0.60, not the 0.25 this once declared. The LOW test was applying a hardcoded
+    # 0.60 while this field went unread, so the declared value had never been in
+    # force. Recording what the classifier actually does rather than changing what
+    # it does: the two are only reconcilable one way round.
+    lowRealizedVolatilityPercentile: float = Field(default=0.60, ge=0, le=1)
     highRealizedVolatilityPercentile: float = Field(default=0.75, ge=0, le=1)
+    # The only place regime and event interact: these promote volatility to EXTREME
+    # and the label to event_shock while an economic event is live.
+    eventShockAtrPercentile: float = Field(default=0.65, ge=0, le=1)
+    eventShockRealizedVolatilityPercentile: float = Field(default=0.65, ge=0, le=1)
+    realizedVolatilityWindow: int = Field(default=20, ge=5, le=120)
     volatilityExpansionRatio: float = Field(default=1.25, gt=0)
     volatilityContractionRatio: float = Field(default=0.80, gt=0)
     atrBaselineWindow: int = Field(default=20, ge=5, le=120)
     maxFeatureAgeSeconds: int = Field(default=90, ge=0, le=900)
+
+    @model_validator(mode="after")
+    def _thresholds_leave_no_gap(self) -> "AdxAtrRegimeConfig":
+        """ADX bands must tile the range, or a reading lands in no band at all.
+
+        rangeAdx 16 against weakTrendAdx 18 used to leave a hole: a directional bar
+        at ADX 17 matched no branch and came back labelled unknown.
+        """
+        if not self.rangeAdx <= self.weakTrendAdx <= self.strongTrendAdx:
+            raise ValueError("ADX thresholds must satisfy rangeAdx <= weakTrendAdx <= strongTrendAdx")
+        if self.lowAtrPercentile > self.highAtrPercentile:
+            raise ValueError("lowAtrPercentile must not exceed highAtrPercentile")
+        return self
 
     @property
     def configurationHash(self) -> str:
@@ -136,7 +158,7 @@ class AdxAtrRegimeClassifier:
         lh_ll = bool(features["spy1mLowerHighLowerLow"].value)
         atr_series = _atr_series(candles, self.config.adxPeriod)
         atr_percentile = _percentile_rank(atr_series, atr)
-        computed_realized_volatility_percentile = _realized_volatility_percentile(candles, 20)
+        computed_realized_volatility_percentile = _realized_volatility_percentile(candles, self.config.realizedVolatilityWindow)
         realized_volatility_percentile = (
             computed_realized_volatility_percentile
             if computed_realized_volatility_percentile is not None
@@ -218,12 +240,16 @@ class AdxAtrRegimeClassifier:
         volatility_state: str,
         context: StrategyEvaluationContext,
     ) -> Literal["LOW", "NORMAL", "HIGH", "EXTREME"]:
-        if self._event_shock_active(context) and (realized_volatility_percentile >= 0.65 or atr_percentile >= 0.65):
+        if self._event_shock_active(context) and (
+            realized_volatility_percentile >= self.config.eventShockRealizedVolatilityPercentile
+            or atr_percentile >= self.config.eventShockAtrPercentile
+        ):
             return "EXTREME"
         if atr_percentile >= self.config.highAtrPercentile or realized_volatility_percentile >= self.config.highRealizedVolatilityPercentile:
             return "HIGH"
         if volatility_state == "contraction" or (
-            atr_percentile <= self.config.lowAtrPercentile and realized_volatility_percentile <= 0.60
+            atr_percentile <= self.config.lowAtrPercentile
+            and realized_volatility_percentile <= self.config.lowRealizedVolatilityPercentile
         ):
             return "LOW"
         return "NORMAL"
@@ -247,13 +273,14 @@ class AdxAtrRegimeClassifier:
             return "strong_trend"
         if direction != Direction.FLAT and adx >= self.config.weakTrendAdx:
             return "weak_trend"
-        if adx <= self.config.rangeAdx or direction == Direction.FLAT:
-            return "range"
-        if atr_percentile >= self.config.highAtrPercentile or realized_volatility_percentile >= self.config.highRealizedVolatilityPercentile:
-            return "high_volatility"
-        if volatility_state == "contraction":
-            return "low_volatility"
-        return "unknown"
+        # Anything left has no direction, or too little ADX to call a trend. Both are a
+        # range. This used to test adx <= rangeAdx, so a directional bar between
+        # rangeAdx and weakTrendAdx matched nothing and fell through to unknown -- with
+        # dataReady True and family fits within a whisker of weak_trend, so it read as
+        # unclassified to anything gating on the label and as a near-trend to anything
+        # routing on the fits. unknown now means only that the classifier could not
+        # measure, which is what _unknown() already reported it as.
+        return "range"
 
     def _range_trend_classification(self, label: RegimeLabel, adx: float, direction: Direction) -> str:
         if label in {"strong_trend", "weak_trend"} and direction != Direction.FLAT:
@@ -285,7 +312,7 @@ class AdxAtrRegimeClassifier:
         if label == "strong_trend":
             mean_reversion_fit = min(mean_reversion_fit, 0.30)
             reversal_fit = min(reversal_fit, 0.45)
-        if label in {"range", "low_volatility"} and direction == Direction.FLAT:
+        if label in {"range", "low_volatility", "unknown"} and direction == Direction.FLAT:
             trend_fit = min(trend_fit, 0.35)
             breakout_fit = min(breakout_fit, 0.35)
         if label == "event_shock":
