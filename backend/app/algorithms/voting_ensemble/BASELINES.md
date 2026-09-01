@@ -52,42 +52,63 @@ evaluate during live hours.
 ## A/B: gates off vs gates on
 
 One fixed replay dataset, 390 one-minute SPY bars from 13:30Z on 2026-07-14, with QQQ, IWM
-and a three-component breadth set supplied so the ensemble is data-ready. 40 warm-up bars,
-351 evaluated bars per arm. A high-importance CPI event at 16:00Z with the default 15-minute
-pre and 30-minute post windows, giving a 15:45-16:30Z blackout.
+and a three-component breadth set so the ensemble is data-ready. 40 warm-up bars, 351
+evaluated bars per arm. Run through the real pipeline end to end, no stub service.
 
-Measured at the decision layer, at the point a candidate forms
-(`voting_ensemble.local_gate.minimum_family_support`):
+### Trade level, with the event scheduled over two entries
 
-| Arm | Candidate bars | Effect |
-|---|---|---|
-| gates off | 11 | baseline |
-| event veto only | 10 | vetoed 16:07Z, the one candidate inside the blackout |
-| session policy only | 0 | every bar segments as `midday`; the configured midday allow-list excluded the strategies that were voting |
-| both gates | 0 | session policy dominates |
+A high-importance event at 17:13Z, giving a 16:58-17:43Z blackout that covers the entries at
+17:12Z and 17:14Z:
 
-The event veto behaved exactly as specified: one candidate suppressed, the ten outside the
-window untouched. It took a bug fix to get there — see `8b5ea70`, the veto had been lost in
-the snapshot round trip and the first run of this A/B showed the event arm identical to the
-ungated one.
+| Arm | Trades | Wins | Win rate | Avg entry | Net PnL |
+|---|---|---|---|---|---|
+| gates off | 7 | 1 | 14.3% | 565.81 | -85.04 |
+| event veto | 5 | 1 | 20.0% | 571.03 | -45.60 |
 
-### Two limits on this measurement, stated rather than papered over
+The veto removed exactly the two entries inside its window and left the other five untouched.
+Win rate and average entry move because two losers were removed, not because anything was
+re-weighted: the veto is a filter above the voting layer and does not touch a voter.
 
-**No trade-level numbers.** The A/B stops at candidate formation because
-`VotingEnsembleBacktestRunner` cannot drive the real pipeline to a fill. Every bar in both
-arms carries `local_gate.trading_disabled`, `local_gate.account_risk_state_missing` and
-`local_gate.global_upstream_not_provided`: the runner supplies market data but no
-operational, account-risk or upstream-gate context, and `run()` exposes no way to provide
-it. The repository's only trade-producing replay test
-(`test_voting_ensemble_backtest_runner.py:110-129`) substitutes a stub `AlwaysBuyService`,
-which measures the fill simulator rather than the algorithm. So trade count, win rate and
-average entry are not obtainable this way, and no such table is offered here.
+### The same dataset with the event at 12:00 ET
 
-**The session arm is not a tuned result.** All 390 synthetic bars segment as `midday`, so
-the arm exercises one branch of the segment map with an allow-list that happened to exclude
-the voting strategies. It shows the gate is wired and enforcing; it says nothing about
-whether that segment map is the right one. The gate stays disabled by default until it has
-been run against real session labels across `open`, `midday` and `close`.
+With the blackout at 15:45-16:30Z instead, the veto blocks 51 bars but removes no trade: none
+of the seven entries fall in that window. Worth recording, because "the gate fired" and "the
+gate changed the outcome" are different claims and only the second one is a result.
+
+### Session policy
+
+Zero trades in every configuration tried. Every bar of this synthetic dataset segments as
+`midday`, so the arm exercises one branch of the segment map with an allow-list that excluded
+the strategies that were voting. It shows the gate is wired and enforcing; it says nothing
+about whether that segment map is right. The gate stays disabled by default until it has run
+against real session labels across `open`, `midday` and `close`.
+
+### What had to be fixed to measure any of this
+
+Two defects, both found by running the A/B rather than by reading the code:
+
+1. The event veto was lost in the snapshot round trip (`8b5ea70`). The first A/B showed the
+   event arm identical to the ungated one, including an entry inside the blackout.
+2. Replay could not drive the real pipeline to a fill at all. Every bar failed
+   `local_gate.trading_disabled` and `local_gate.account_risk_state_missing`, because the
+   runner supplied market data but no operational or account context. The only
+   trade-producing replay test in the repository substituted a stub `AlwaysBuyService`, which
+   measures the fill simulator rather than the algorithm, and the local risk gates were never
+   exercised in replay at all.
+
+The account the runner now supplies is the simulated one and moves as the replay trades, so
+the daily-loss, drawdown and exposure gates bind on real numbers. Realised PnL accrues only
+once a fill's exit has actually happened: the simulator resolves a trade's whole life at
+entry, and accruing any earlier would let the risk gates decide on money the account had not
+yet made when the gate ran.
+
+### A note on family support
+
+The ensemble requires two independent families before it will trade
+(`minimumIndependentFamilySupport=2`). On a smooth synthetic drift only one family ever
+votes, so such a dataset produces no trades however the gates are set — the algorithm
+working, not the harness failing. The dataset above swings widely enough for a second family
+to have a view: 14 bars clear the family-support gate, 140 fall short.
 
 ## When to re-record
 
