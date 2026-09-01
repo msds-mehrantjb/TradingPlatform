@@ -12,6 +12,9 @@ SESSION_DATE = date(2026, 1, 5)
 START = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
 
 
+from backend.app.algorithms.weighted_voting.decision_gates import WEIGHTED_VOTING_LOCAL_GATE_IDS
+
+
 class ApiV2EndpointsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(app)
@@ -336,10 +339,14 @@ class ApiV2EndpointsTest(unittest.TestCase):
             },
             "weighted-voting": {
                 "directional": ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"],
+                # No context voters: market context reaches the decision through the regime
+                # classifier instead. Empty is the honest answer, not an unpublished group.
                 "context": [],
-                "regime": [],
-                "safety": [],
-                "aggregator": [],
+                "regime": ["market_condition_classifier"],
+                # Derived, not restated: a copy of 29 gate ids here would be one more list to
+                # drift from the pipeline.
+                "safety": list(WEIGHTED_VOTING_LOCAL_GATE_IDS),
+                "aggregator": ["weighted_signal_aggregator"],
             },
         }
         for path_id, expected in expected_modules.items():

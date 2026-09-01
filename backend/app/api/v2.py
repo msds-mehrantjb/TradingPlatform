@@ -84,7 +84,7 @@ from backend.app.algorithms.voting_ensemble.trading_settings.models import (
 )
 from backend.app.algorithms.wca.engine import WCA_ENGINE_VERSION
 from backend.app.algorithms.wca.strategy_registry import WCA_HARD_FILTER_REGISTRY, WCA_MODIFIER_REGISTRY, WCA_STRATEGY_REGISTRY
-from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_STRATEGY_CATALOG
+from backend.app.algorithms.weighted_voting.module_inventory import weighted_voting_full_inventory
 from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_SERVICE_VERSION
 from backend.app.algorithms.voting_ensemble.strategies.base import StrategyEvaluationContext
 from backend.app.algorithms.voting_ensemble.strategies.context import MarketBreadthMomentumContext, RelativeStrengthQqqIwmContext
@@ -439,17 +439,10 @@ def wca_inventory() -> dict[str, Any]:
 
 @router.get("/algorithms/weighted-voting/inventory")
 def weighted_voting_inventory() -> dict[str, Any]:
-    return {
-        "algorithmId": "weighted_voting",
-        "engineVersion": WEIGHTED_VOTING_SERVICE_VERSION,
-        "modules": {
-            "directional": [_weighted_voting_module_payload(entry) for entry in WEIGHTED_VOTING_STRATEGY_CATALOG],
-            "context": [],
-            "regime": [],
-            "safety": [],
-            "aggregator": [],
-        },
-    }
+    # The safety, regime and aggregator groups used to be hardcoded empty, so 29 local
+    # gates, the market-condition classifier and the aggregator were absent from the
+    # published inventory even though every one of them runs on every decision.
+    return weighted_voting_full_inventory()
 
 
 @router.post("/features/evaluate")
@@ -1219,23 +1212,6 @@ def _wca_module_payload(entry: Any, collection: str, module_id: str) -> dict[str
         "enabled": entry.lifecycle == "active",
         "requiredInputs": list(entry.required_market_inputs),
         "aliases": [_alias_metadata(entry.strategy_id, entry.slug)] if collection == "directional" else [],
-    }
-
-
-def _weighted_voting_module_payload(entry: Any) -> dict[str, Any]:
-    return {
-        "id": entry.strategy_id,
-        "name": entry.name,
-        "version": entry.version,
-        "family": _enum_value(entry.family),
-        "role": "DIRECTIONAL",
-        "collection": "directional",
-        "status": entry.lifecycle,
-        "enabled": entry.executes,
-        "votingInfluence": entry.baseline_weight if entry.contributes_to_vote else 0.0,
-        "requiredInputs": list(entry.required_data),
-        "minimumWarmup": entry.minimum_warmup,
-        "aliases": [],
     }
 
 

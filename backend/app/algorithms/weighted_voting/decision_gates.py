@@ -68,6 +68,58 @@ class WeightedVotingGatePipelineResult:
     explanation: str
 
 
+@dataclass(frozen=True)
+class WeightedVotingGateModule:
+    """One local safety gate, as the inventory reports it."""
+
+    gate_id: str
+    gate_name: str
+    blocks_order: bool = True
+
+
+# Every gate the local pipeline runs, in pipeline order. These are real modules of the
+# algorithm and belong in its published inventory, which previously reported only the
+# directional strategies and left safety, regime and aggregation empty.
+#
+# Declared rather than derived because building a neutral gate input means building a
+# whole decision. A test runs the pipeline and asserts the emitted gate ids match this
+# list exactly, so it cannot drift from what actually executes.
+WEIGHTED_VOTING_LOCAL_GATE_INVENTORY: tuple[WeightedVotingGateModule, ...] = (
+    WeightedVotingGateModule("data_freshness", "Data Freshness"),
+    WeightedVotingGateModule("minimum_candle_history", "Minimum Candle History"),
+    WeightedVotingGateModule("weighted_winner", "Valid Weighted Winner"),
+    WeightedVotingGateModule("minimum_active_strategy_count", "Minimum Active Strategy Count"),
+    WeightedVotingGateModule("minimum_directional_strategy_count", "Minimum Directional Strategy Count"),
+    WeightedVotingGateModule("minimum_active_weight_coverage", "Minimum Active Weight Coverage"),
+    WeightedVotingGateModule("minimum_winner_score", "Minimum Winner Score"),
+    WeightedVotingGateModule("minimum_winner_edge", "Minimum Winner Edge"),
+    WeightedVotingGateModule("maximum_family_concentration", "Maximum Family Concentration"),
+    WeightedVotingGateModule("maximum_conflicting_weight_percentage", "Maximum Conflicting-Weight Percentage"),
+    WeightedVotingGateModule("acceptable_disagreement", "Acceptable Disagreement"),
+    WeightedVotingGateModule("acceptable_strategy_data_quality", "Acceptable Strategy Data Quality"),
+    WeightedVotingGateModule("five_minute_confirmation", "Five-Minute Confirmation"),
+    WeightedVotingGateModule("market_condition_eligibility", "Market-Condition Eligibility"),
+    WeightedVotingGateModule("positive_expected_value_after_costs", "Positive Expected Value After Costs"),
+    WeightedVotingGateModule("local_spread_threshold", "Local Spread Threshold"),
+    WeightedVotingGateModule("local_slippage_threshold", "Local Slippage Threshold"),
+    WeightedVotingGateModule("local_liquidity_threshold", "Local Liquidity Threshold"),
+    WeightedVotingGateModule("valid_atr_range", "Valid ATR Range"),
+    WeightedVotingGateModule("entry_quality", "Entry Quality"),
+    WeightedVotingGateModule("allowed_weighted_voting_session_window", "Allowed Weighted Voting Session Window"),
+    WeightedVotingGateModule("weighted_voting_daily_loss", "Weighted Voting Daily Loss"),
+    WeightedVotingGateModule("weighted_voting_trade_count_limit", "Weighted Voting Trade-Count Limit"),
+    WeightedVotingGateModule("weighted_voting_cooldown", "Weighted Voting Cooldown"),
+    WeightedVotingGateModule("existing_position", "Existing Position"),
+    WeightedVotingGateModule("weighted_voting_capital_availability", "Weighted Voting Capital Availability"),
+    WeightedVotingGateModule("weighted_voting_capital_partition_availability", "Weighted Voting Capital-Partition Availability"),
+    WeightedVotingGateModule("weighted_voting_pyramiding_rule", "Weighted Voting Pyramiding Rule"),
+    WeightedVotingGateModule("final_local_acceptance", "Final Local Acceptance"),
+)
+WEIGHTED_VOTING_LOCAL_GATE_IDS: tuple[str, ...] = tuple(
+    module.gate_id for module in WEIGHTED_VOTING_LOCAL_GATE_INVENTORY
+)
+
+
 def evaluate_local_decision_gates(
     inputs: WeightedVotingLocalGateInputs,
     *,
