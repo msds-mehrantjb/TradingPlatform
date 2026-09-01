@@ -18,6 +18,7 @@ from backend.app.algorithms.voting_ensemble.profit_target_policy import profit_t
 from backend.app.market_feed import instrument_for_symbol
 from backend.app.algorithms.voting_ensemble.session_segments import (
     resolve_session_segment,
+    session_profile_for_instrument,
     session_segment_boundaries_from_payload,
 )
 from backend.app.algorithms.voting_ensemble.snapshot.builder import build_backtest_snapshot
@@ -227,7 +228,7 @@ class VotingEnsembleBacktestRunner:
                 # Only the segment: setting `phase` here would reach the regime
                 # classifier, which reads that key, and would move replay output for
                 # reasons that have nothing to do with sessions.
-                "sessionState": {"sessionSegment": self._session_segment_at(timestamp)},
+                "sessionState": {"sessionSegment": self._session_segment_at(timestamp, symbol)},
             },
         }
         snapshot = build_backtest_snapshot(payload)
@@ -244,11 +245,18 @@ class VotingEnsembleBacktestRunner:
             return decision
         return self.service.evaluate(evaluate_payload)
 
-    def _session_segment_at(self, timestamp: datetime) -> str:
-        """Resolve the segment for this bar with the same module the live path uses."""
+    def _session_segment_at(self, timestamp: datetime, symbol: str | None = None) -> str:
+        """Resolve the segment for this bar with the same module the live path uses.
+
+        The profile follows the symbol being replayed rather than the application's
+        active instrument, for the same reason tradability does: a replay is about the
+        data in front of it.
+        """
+        profile = session_profile_for_instrument(instrument_for_symbol(symbol) if symbol else None)
         return resolve_session_segment(
             timestamp,
             boundaries=session_segment_boundaries_from_payload(getattr(self.config, "sessionSegments", None)),
+            profile=profile if profile.name != "equity_rth" else None,
         )
 
     def _operational_snapshot(self, symbol: str | None = None) -> dict[str, Any]:

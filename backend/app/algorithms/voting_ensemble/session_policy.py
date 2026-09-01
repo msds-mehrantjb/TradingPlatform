@@ -30,7 +30,18 @@ SESSION_POLICY_SEGMENT_CLOSED_REASON = "voting_ensemble.session_policy.segment_n
 
 # Segment names this policy understands. The snapshot's session state supplies the label;
 # anything it does not recognise is treated as unknown and left alone rather than guessed at.
-SESSION_SEGMENTS: tuple[str, ...] = ("premarket", "open", "midday", "close", "overnight")
+# `maintenance_break` and `weekend` exist for the futures session shape: Globex halts
+# 17:00-18:00 every day and closes Friday 17:00 to Sunday 18:00. Neither is a thin
+# market to trade carefully -- both are no market at all.
+SESSION_SEGMENTS: tuple[str, ...] = (
+    "premarket",
+    "open",
+    "midday",
+    "close",
+    "overnight",
+    "maintenance_break",
+    "weekend",
+)
 
 
 @dataclass(frozen=True)
@@ -112,6 +123,8 @@ def default_session_policy() -> SessionPolicySettings:
             "midday": SessionSegmentPolicy("midday", tradable=True, max_position_multiplier=1.0),
             "close": SessionSegmentPolicy("close", tradable=True, max_position_multiplier=0.5),
             "overnight": SessionSegmentPolicy("overnight", tradable=False, max_position_multiplier=0.0),
+            "maintenance_break": SessionSegmentPolicy("maintenance_break", tradable=False, max_position_multiplier=0.0),
+            "weekend": SessionSegmentPolicy("weekend", tradable=False, max_position_multiplier=0.0),
         },
     )
 
@@ -245,6 +258,9 @@ def _normalize_segment(value: Any) -> str:
         "closing": "close",
         "pre_market": "premarket",
         "after_hours": "overnight",
+        "maintenance": "maintenance_break",
+        "globex_break": "maintenance_break",
+        "closed": "weekend",
         "postmarket": "overnight",
     }
     return aliases.get(text, text)

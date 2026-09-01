@@ -303,3 +303,89 @@ class SessionPolicyAgainstRealLabelsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FuturesSessionProfileTest(unittest.TestCase):
+    """An index future does not keep equity hours.
+
+    Globex runs Sunday 18:00 to Friday 17:00 ET with a 17:00-18:00 halt every day. Labelling
+    a future's 02:00 bar with the equity profile would call a liquid overnight session
+    `premarket`, and would call the maintenance halt tradable overnight.
+    """
+
+    def profile(self):
+        from backend.app.algorithms.voting_ensemble.session_segments import FUTURES_GLOBEX_PROFILE
+
+        return FUTURES_GLOBEX_PROFILE
+
+    def test_the_globex_day(self) -> None:
+        cases = {
+            (2, 0): "overnight",
+            (9, 29): "overnight",
+            (9, 31): "open",
+            (10, 30): "open",
+            (12, 0): "midday",
+            (15, 1): "close",
+            (17, 0): "close",
+            (17, 30): "maintenance_break",
+            (18, 0): "maintenance_break",
+            (18, 1): "overnight",
+            (22, 0): "overnight",
+        }
+        for (hour, minute), expected in cases.items():
+            with self.subTest(time=f"{hour:02d}:{minute:02d}"):
+                bar_end = datetime(2026, 7, 15, hour, minute, tzinfo=NEW_YORK).astimezone(timezone.utc)
+                self.assertEqual(resolve_session_segment(bar_end, profile=self.profile()), expected)
+
+    def test_the_overnight_session_is_not_premarket(self) -> None:
+        """The distinction the equity profile cannot make, and the reason this profile exists."""
+        bar_end = datetime(2026, 7, 15, 2, 0, tzinfo=NEW_YORK).astimezone(timezone.utc)
+
+        self.assertEqual(resolve_session_segment(bar_end, profile=self.profile()), "overnight")
+        self.assertEqual(resolve_session_segment(bar_end), "premarket")
+
+    def test_the_week_closes_friday_evening_and_reopens_sunday_evening(self) -> None:
+        cases = {
+            (17, 16, 59): "close",
+            (17, 17, 30): "weekend",
+            (18, 12, 0): "weekend",
+            (19, 17, 0): "weekend",
+            (19, 18, 30): "overnight",
+        }
+        for (day, hour, minute), expected in cases.items():
+            with self.subTest(day=day, time=f"{hour:02d}:{minute:02d}"):
+                bar_end = datetime(2026, 7, day, hour, minute, tzinfo=NEW_YORK).astimezone(timezone.utc)
+                self.assertEqual(resolve_session_segment(bar_end, profile=self.profile()), expected)
+
+    def test_an_equity_weekend_is_the_whole_of_saturday_and_sunday(self) -> None:
+        for day in (18, 19):
+            with self.subTest(day=day):
+                bar_end = datetime(2026, 7, day, 12, 0, tzinfo=NEW_YORK).astimezone(timezone.utc)
+                self.assertEqual(resolve_session_segment(bar_end), "weekend")
+
+    def test_the_profile_is_chosen_by_declared_capability(self) -> None:
+        """Not by a symbol list, so a new instrument opts in by declaring what it needs."""
+        from backend.app.algorithms.voting_ensemble.session_segments import session_profile_for_instrument
+        from backend.app.market_feed import instrument_for_symbol
+
+        self.assertEqual(session_profile_for_instrument(instrument_for_symbol("SPY")).name, "equity_rth")
+        self.assertEqual(session_profile_for_instrument(instrument_for_symbol("MES")).name, "futures_globex")
+        self.assertEqual(session_profile_for_instrument(instrument_for_symbol("MNQ")).name, "futures_globex")
+        self.assertEqual(session_profile_for_instrument(None).name, "equity_rth")
+
+    def test_replay_follows_the_symbol_being_replayed(self) -> None:
+        runner = object.__new__(VotingEnsembleBacktestRunner)
+        runner.config = VotingEnsembleBacktestConfig()
+        bar_end = datetime(2026, 7, 15, 2, 0, tzinfo=NEW_YORK).astimezone(timezone.utc)
+
+        self.assertEqual(runner._session_segment_at(bar_end, "SPY"), "premarket")
+        self.assertEqual(runner._session_segment_at(bar_end, "MES"), "overnight")
+
+    def test_the_halt_and_the_weekend_are_not_tradable_by_default(self) -> None:
+        from backend.app.algorithms.voting_ensemble.session_policy import default_session_policy
+
+        segments = default_session_policy().segments
+        for name in ("maintenance_break", "weekend"):
+            with self.subTest(segment=name):
+                self.assertFalse(segments[name].tradable)
+                self.assertEqual(segments[name].max_position_multiplier, 0.0)

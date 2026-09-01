@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from backend.app.market_feed import active_instrument
 from backend.app.algorithms.voting_ensemble.session_segments import (
     resolve_session_segment,
+    session_profile_for_instrument,
     session_segment_boundaries_from_payload,
 )
 from backend.app.algorithms.voting_ensemble.snapshot.builder import build_point_in_time_snapshot
@@ -1178,11 +1179,25 @@ def _session_state(market_status: dict[str, Any], *, settings: Any = None, bar_e
         # The label the session policy keys on. `phase` is left exactly as it was:
         # the regime classifier reads that key, and repurposing it would change
         # regime output as a side effect of adding a session label.
+        # The profile comes from the instrument the app is on: an index future keeps
+        # Globex hours, so labelling its 02:00 bar with an equity profile would call a
+        # liquid overnight session `premarket` and its maintenance halt tradable.
+        profile = session_profile_for_instrument(_active_instrument_or_none())
         state["sessionSegment"] = resolve_session_segment(
             bar_end,
             boundaries=session_segment_boundaries_from_payload(_session_segment_config(settings)),
+            profile=profile if profile.name != "equity_rth" else None,
         )
+        state["sessionProfile"] = profile.name
     return state
+
+
+def _active_instrument_or_none() -> Any | None:
+    """The active instrument, or None if the registry cannot be consulted."""
+    try:
+        return active_instrument()
+    except Exception:
+        return None
 
 
 def _session_segment_config(settings: Any) -> dict[str, Any] | None:
