@@ -63,6 +63,11 @@ from .execution.cost_model import (
     train_execution_cost_candidate,
 )
 from .risk.api import router as risk_router
+from .market_feed import (
+    active_instrument,
+    market_feed_status,
+    set_active_instrument,
+)
 from .market_forecast import (
     FUTURE_MARKET_PREDICTION_LEDGER_NAME,
     FUTURE_MARKET_PREDICTION_LEDGER_TITLE,
@@ -193,6 +198,11 @@ def _read_ui_response_cache(key: tuple[Any, ...]) -> dict[str, Any] | None:
         _UI_RESPONSE_CACHE.pop(key, None)
         return None
     return deepcopy(payload)
+
+
+def _clear_ui_response_cache() -> None:
+    """Drop cached UI responses so a feed switch is not served the previous feed's bars."""
+    _UI_RESPONSE_CACHE.clear()
 
 
 def _write_ui_response_cache(key: tuple[Any, ...], payload: dict[str, Any]) -> dict[str, Any]:
@@ -1764,10 +1774,32 @@ def save_trade_history_archive(payload: dict = Body(...)) -> dict:
     }
 
 
+@app.get("/api/market-feed")
+def market_feed() -> dict:
+    """What instrument and data source the whole app is on, and what else it could be."""
+    return market_feed_status()
+
+
+@app.put("/api/market-feed/active")
+def switch_market_feed(instrumentId: str = Query(..., min_length=1, max_length=32)) -> dict:
+    """Switch the app-wide instrument. Charting and collection follow immediately.
+
+    An instrument the platform cannot trade yet may still be selected -- collecting
+    its history is how trading support gets validated -- but it stays trade_ready
+    False and the trading paths refuse it rather than sizing it as shares.
+    """
+    try:
+        selected = set_active_instrument(instrumentId)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _clear_ui_response_cache()
+    return {"activeInstrument": selected.as_dict(), "scope": "application_wide"}
+
+
 @app.get("/api/candles")
 async def candles(
-    symbol: str = Query("SPY", min_length=1, max_length=12),
-    feed: Literal["iex", "sip", "otc"] = "iex",
+    symbol: str | None = Query(None, min_length=1, max_length=12),
+    feed: str | None = Query(None, min_length=1, max_length=16),
     timeframe: Literal["1Min", "3Min", "5Min", "15Min", "1Hour", "1Day"] = "1Min",
     limit: int = Query(240, ge=10, le=1000),
     start: str | None = None,
@@ -1775,8 +1807,22 @@ async def candles(
     sort: Literal["asc", "desc"] = "asc",
     refresh: bool = True,
 ) -> dict:
-    normalized_symbol = symbol.upper()
-    cache_key = ("candles", normalized_symbol, feed, timeframe, limit, start or "", end or "", sort)
+    # The chart follows the app-wide feed unless the caller names a symbol or feed
+    # explicitly. Reading the active instrument here, rather than defaulting to SPY,
+    # is what makes switching move the chart with everything else.
+    active = active_instrument()
+    normalized_symbol = (symbol or active.symbol).upper()
+    resolved_feed = feed or active.feed
+    cache_key = (
+        "candles",
+        normalized_symbol,
+        resolved_feed,
+        timeframe,
+        limit,
+        start or "",
+        end or "",
+        sort,
+    )
     if not refresh:
         cached_response = _read_ui_response_cache(cache_key)
         if cached_response is not None:
@@ -1784,7 +1830,7 @@ async def candles(
     cached = dedupe_candles_by_time(await _store_latest_candles(
         symbol=normalized_symbol,
         timeframe=timeframe,
-        feed=feed,
+        feed=resolved_feed,
         limit=limit,
     ))
     closed_intraday_request = (
@@ -1804,7 +1850,7 @@ async def candles(
         prepared_session_date, prepared_bars = prepared_last_available_bars(
             symbol=normalized_symbol,
             timeframe=timeframe,
-            feed=feed,
+            feed=resolved_feed,
             limit=limit,
         )
         if prepared_bars:
@@ -1820,7 +1866,7 @@ async def candles(
             session_date, session_bars = await completed_session_bars(
                 symbol=normalized_symbol,
                 timeframe=timeframe,
-                feed=feed,
+                feed=resolved_feed,
                 limit=limit,
             )
             if session_bars:
@@ -1859,7 +1905,7 @@ async def candles(
             alpaca.get_bars(
                 symbol=normalized_symbol,
                 timeframe=timeframe,
-                feed=feed,
+                feed=resolved_feed,
                 limit=limit,
                 start=request_start,
                 end=request_end,
@@ -1874,7 +1920,7 @@ async def candles(
         fallback = demo_bars(
             symbol=normalized_symbol,
             timeframe=timeframe,
-            feed=feed,
+            feed=resolved_feed,
             limit=limit,
         )
         fallback = dedupe_candles_by_time(fallback)
@@ -1891,7 +1937,7 @@ async def candles(
         fallback = demo_bars(
             symbol=normalized_symbol,
             timeframe=timeframe,
-            feed=feed,
+            feed=resolved_feed,
             limit=limit,
         )
         fallback = dedupe_candles_by_time(fallback)

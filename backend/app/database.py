@@ -4,6 +4,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from typing import Iterator
 
 from .config import Settings
@@ -152,19 +153,29 @@ class CandleStore:
         timeframe: str,
         feed: str,
         limit: int,
+        provider: str | None = None,
     ) -> list[dict]:
+        # provider is part of the primary key, so two sources can hold the same symbol,
+        # feed and timeframe as separate rows. Reads did not filter on it, which was
+        # harmless while Alpaca was the only writer and becomes a silent interleave of two
+        # sources the moment a second one exists. Optional, so existing callers keep their
+        # behaviour and anything reading one specific source asks for it.
+        clauses = ["symbol = ?", "timeframe = ?", "feed = ?"]
+        params: list[Any] = [symbol, timeframe, feed]
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider)
+        params.append(limit)
+        query = f"""
+            SELECT provider, feed, symbol, timeframe, timestamp,
+                   open, high, low, close, volume, trade_count, vwap
+            FROM candles
+            WHERE {" AND ".join(clauses)}
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """
         with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT provider, feed, symbol, timeframe, timestamp,
-                       open, high, low, close, volume, trade_count, vwap
-                FROM candles
-                WHERE symbol = ? AND timeframe = ? AND feed = ?
-                ORDER BY timestamp DESC
-                LIMIT ?
-                """,
-                (symbol, timeframe, feed, limit),
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in reversed(rows)]
 
     def latest_until(
@@ -175,19 +186,29 @@ class CandleStore:
         feed: str,
         limit: int,
         end: str,
+        provider: str | None = None,
     ) -> list[dict]:
+        # provider is part of the primary key, so two sources can hold the same symbol,
+        # feed and timeframe as separate rows. Reads did not filter on it, which was
+        # harmless while Alpaca was the only writer and becomes a silent interleave of two
+        # sources the moment a second one exists. Optional, so existing callers keep their
+        # behaviour and anything reading one specific source asks for it.
+        clauses = ["symbol = ?", "timeframe = ?", "feed = ?", "timestamp <= ?"]
+        params: list[Any] = [symbol, timeframe, feed, end]
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider)
+        params.append(limit)
+        query = f"""
+            SELECT provider, feed, symbol, timeframe, timestamp,
+                   open, high, low, close, volume, trade_count, vwap
+            FROM candles
+            WHERE {" AND ".join(clauses)}
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """
         with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT provider, feed, symbol, timeframe, timestamp,
-                       open, high, low, close, volume, trade_count, vwap
-                FROM candles
-                WHERE symbol = ? AND timeframe = ? AND feed = ? AND timestamp <= ?
-                ORDER BY timestamp DESC
-                LIMIT ?
-                """,
-                (symbol, timeframe, feed, end, limit),
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in reversed(rows)]
 
     def range(
@@ -198,9 +219,18 @@ class CandleStore:
         feed: str,
         start: str | None = None,
         end: str | None = None,
+        provider: str | None = None,
     ) -> list[dict]:
+        # provider is part of the primary key, so two sources can hold the same symbol,
+        # feed and timeframe as separate rows. Reads did not filter on it, which was
+        # harmless while Alpaca was the only writer and becomes a silent interleave of two
+        # sources the moment a second one exists. Optional, so existing callers keep their
+        # behaviour and anything reading one specific source asks for it.
         clauses = ["symbol = ?", "timeframe = ?", "feed = ?"]
         params: list[str] = [symbol, timeframe, feed]
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider)
         if start:
             clauses.append("timestamp >= ?")
             params.append(start)
