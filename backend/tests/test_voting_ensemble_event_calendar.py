@@ -165,3 +165,92 @@ class EventVetoTimezoneTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContractRollTest(unittest.TestCase):
+    """The roll veto was written and left inert: nothing ever supplied a roll date.
+
+    Liquidity splits across two contracts as a future approaches expiry, so the quotes the
+    algorithm sizes against stop describing one market. The machinery to refuse that window
+    already existed; only the dates were missing.
+    """
+
+    def runner(self, **calendar):
+        from backend.app.algorithms.voting_ensemble.backtest import VotingEnsembleBacktestRunner
+        from backend.app.algorithms.voting_ensemble.backtest_config import VotingEnsembleBacktestConfig
+
+        runner = object.__new__(VotingEnsembleBacktestRunner)
+        runner.config = VotingEnsembleBacktestConfig(eventCalendar={"enabled": True, **calendar})
+        return runner
+
+    def blackout(self, runner, day: int, symbol: str, month: int = 9) -> bool:
+        from datetime import datetime, timezone
+
+        state = runner._event_state_at(datetime(2026, month, day, 17, 0, tzinfo=timezone.utc), symbol)
+        return bool(state["eventBlackoutActive"])
+
+    def test_the_imm_dates_are_the_third_friday_of_the_quarter_months(self) -> None:
+        from backend.app.algorithms.voting_ensemble.event_calendar import quarterly_imm_roll_dates
+
+        dates = quarterly_imm_roll_dates(2026)
+
+        self.assertEqual([d.isoformat() for d in dates], ["2026-03-20", "2026-06-19", "2026-09-18", "2026-12-18"])
+        for value in dates:
+            with self.subTest(date=value):
+                self.assertEqual(value.weekday(), 4)  # Friday
+                self.assertTrue(15 <= value.day <= 21)  # the third one
+
+    def test_a_future_stops_entering_into_its_expiry(self) -> None:
+        runner = self.runner()
+
+        self.assertFalse(self.blackout(runner, 16, "MES"))
+        self.assertTrue(self.blackout(runner, 17, "MES"))
+        self.assertTrue(self.blackout(runner, 18, "MES"))
+        self.assertFalse(self.blackout(runner, 19, "MES"))
+
+    def test_an_equity_never_rolls(self) -> None:
+        runner = self.runner()
+
+        for day in (17, 18):
+            with self.subTest(day=day):
+                self.assertFalse(self.blackout(runner, day, "SPY"))
+
+    def test_the_roll_window_is_configurable(self) -> None:
+        """A desk that stands aside for the whole roll week says so."""
+        runner = self.runner(contractRollBlackoutDays=7)
+
+        self.assertFalse(self.blackout(runner, 10, "MES"))
+        self.assertTrue(self.blackout(runner, 11, "MES"))
+        self.assertTrue(self.blackout(runner, 18, "MES"))
+
+    def test_a_configured_calendar_keeps_its_own_dates(self) -> None:
+        """An explicit list wins; a desk's known roll calendar is not silently replaced."""
+        from datetime import date
+
+        from backend.app.algorithms.voting_ensemble.event_calendar import (
+            calendar_with_instrument_rolls,
+            event_calendar_from_payload,
+        )
+        from backend.app.market_feed import instrument_for_symbol
+
+        configured = event_calendar_from_payload(
+            {"enabled": True, "contractRollDates": ["2026-08-14"]}
+        )
+        merged = calendar_with_instrument_rolls(
+            configured, instrument_for_symbol("MES"), around=date(2026, 9, 14)
+        )
+
+        self.assertEqual(merged.contract_roll_dates, configured.contract_roll_dates)
+
+    def test_the_roll_respects_the_calendar_switch(self) -> None:
+        """Like every other veto here, it ships off and is turned on deliberately."""
+        from datetime import datetime, timezone
+
+        from backend.app.algorithms.voting_ensemble.backtest import VotingEnsembleBacktestRunner
+        from backend.app.algorithms.voting_ensemble.backtest_config import VotingEnsembleBacktestConfig
+
+        runner = object.__new__(VotingEnsembleBacktestRunner)
+        runner.config = VotingEnsembleBacktestConfig()
+
+        state = runner._event_state_at(datetime(2026, 9, 18, 17, 0, tzinfo=timezone.utc), "MES")
+        self.assertFalse(state["eventBlackoutActive"])

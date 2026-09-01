@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
 from backend.app.algorithms.voting_ensemble.event_calendar import (
+    calendar_with_instrument_rolls,
     event_calendar_from_payload,
     resolve_event_veto,
 )
@@ -218,7 +219,7 @@ class VotingEnsembleBacktestRunner:
             # this a replay of a gated live run would silently skip every blackout the
             # live run honoured, and the two would not be comparable.
             "market_context": {
-                "event": self._event_state_at(timestamp),
+                "event": self._event_state_at(timestamp, symbol),
                 # Without these two the local gates fail closed on every bar
                 # (`trading_disabled`, `account_risk_state_missing`) and no candidate can
                 # ever reach a fill, so replay could only ever be driven by a stub
@@ -326,14 +327,18 @@ class VotingEnsembleBacktestRunner:
             "sameDirectionExposurePercent": round(notional_percent, 4),
         }
 
-    def _event_state_at(self, timestamp: datetime) -> dict[str, Any]:
+    def _event_state_at(self, timestamp: datetime, symbol: str | None = None) -> dict[str, Any]:
         """Resolve the configured calendar for this bar, exactly as the live path does.
 
         Same module and same bar-end input as the producer, so a replay and the live run
         it reproduces reach the same verdict for the same bar instead of two
         implementations that merely look alike.
         """
-        calendar = event_calendar_from_payload(getattr(self.config, "eventCalendar", None))
+        calendar = calendar_with_instrument_rolls(
+            event_calendar_from_payload(getattr(self.config, "eventCalendar", None)),
+            instrument_for_symbol(symbol) if symbol else None,
+            around=timestamp.date(),
+        )
         return resolve_event_veto(bar_end=timestamp, settings=calendar).as_event_state()
 
     def _order_plan(self, symbol: str, evaluation: dict[str, Any], candle: VotingCandle, session_date: date) -> OrderPlan | None:

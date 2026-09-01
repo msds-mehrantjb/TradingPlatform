@@ -20,7 +20,7 @@ resolving against whatever is current when the replay executes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -191,6 +191,50 @@ def event_calendar_from_payload(payload: Mapping[str, Any] | None) -> EventCalen
         )
     except Exception:
         return default_event_calendar()
+
+
+def quarterly_imm_roll_dates(year: int) -> tuple[date, ...]:
+    """CME equity index expiries: the third Friday of March, June, September and December."""
+    return tuple(_third_friday(year, month) for month in (3, 6, 9, 12))
+
+
+def roll_dates_for_instrument(selected: Any | None, *, around: date) -> tuple[date, ...]:
+    """The instrument's roll dates near a given day, or nothing if it does not roll.
+
+    Spans the neighbouring years so a bar in late December still sees the January-adjacent
+    schedule rather than falling off the end of its own year.
+    """
+    if selected is None or getattr(selected, "roll_schedule", None) != "quarterly_imm":
+        return ()
+    dates: list[date] = []
+    for year in (around.year - 1, around.year, around.year + 1):
+        dates.extend(quarterly_imm_roll_dates(year))
+    return tuple(sorted(dates))
+
+
+def calendar_with_instrument_rolls(
+    calendar: EventCalendarSettings,
+    selected: Any | None,
+    *,
+    around: date,
+) -> EventCalendarSettings:
+    """Attach derived roll dates, unless the configuration already named its own.
+
+    An explicitly configured list wins: a desk that knows its own roll calendar should not
+    have it silently replaced by a derived one.
+    """
+    if calendar.contract_roll_dates:
+        return calendar
+    derived = roll_dates_for_instrument(selected, around=around)
+    if not derived:
+        return calendar
+    return replace(calendar, contract_roll_dates=derived)
+
+
+def _third_friday(year: int, month: int) -> date:
+    first = date(year, month, 1)
+    first_friday = first + timedelta(days=(4 - first.weekday()) % 7)
+    return first_friday + timedelta(days=14)
 
 
 def resolve_event_veto(

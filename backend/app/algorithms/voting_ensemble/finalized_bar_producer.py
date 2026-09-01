@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from backend.app.algorithms.voting_ensemble.event_calendar import (
+    calendar_with_instrument_rolls,
     event_calendar_from_payload,
     resolve_event_veto,
 )
@@ -1078,7 +1079,11 @@ def _event_veto_state(command: Any, settings: Any, event: Any) -> dict[str, Any]
             break
     decision = resolve_event_veto(
         bar_end=_utc(event.barEndTimestamp),
-        settings=event_calendar_from_payload(configured),
+        settings=calendar_with_instrument_rolls(
+            event_calendar_from_payload(configured),
+            _active_instrument_or_none(),
+            around=_utc(event.barEndTimestamp).date(),
+        ),
     )
     return decision.as_event_state()
 

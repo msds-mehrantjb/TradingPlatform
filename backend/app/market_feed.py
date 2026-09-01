@@ -67,6 +67,10 @@ class Instrument:
     session_calendar: str
     required_capabilities: tuple[str, ...]
     contract_root: str | None = None
+    # How the contract rolls, for the event calendar to derive dates from. CME equity
+    # index futures expire on the IMM date: the third Friday of March, June, September
+    # and December.
+    roll_schedule: str | None = None
     roll_rule: str | None = None
 
     @property
@@ -125,6 +129,7 @@ INSTRUMENTS: tuple[Instrument, ...] = (
         session_calendar="cme_equity_index",
         required_capabilities=("contract_sizing", "extended_session", "contract_rollover"),
         contract_root="ES",
+        roll_schedule="quarterly_imm",
         roll_rule="quarterly_hmuz_volume_crossover",
     ),
     Instrument(
@@ -139,6 +144,7 @@ INSTRUMENTS: tuple[Instrument, ...] = (
         session_calendar="cme_equity_index",
         required_capabilities=("contract_sizing", "extended_session", "contract_rollover"),
         contract_root="MES",
+        roll_schedule="quarterly_imm",
         roll_rule="quarterly_hmuz_volume_crossover",
     ),
     Instrument(
@@ -153,6 +159,7 @@ INSTRUMENTS: tuple[Instrument, ...] = (
         session_calendar="cme_equity_index",
         required_capabilities=("contract_sizing", "extended_session", "contract_rollover"),
         contract_root="NQ",
+        roll_schedule="quarterly_imm",
         roll_rule="quarterly_hmuz_volume_crossover",
     ),
     Instrument(
@@ -167,6 +174,7 @@ INSTRUMENTS: tuple[Instrument, ...] = (
         session_calendar="cme_equity_index",
         required_capabilities=("contract_sizing", "extended_session", "contract_rollover"),
         contract_root="MNQ",
+        roll_schedule="quarterly_imm",
         roll_rule="quarterly_hmuz_volume_crossover",
     ),
 )
