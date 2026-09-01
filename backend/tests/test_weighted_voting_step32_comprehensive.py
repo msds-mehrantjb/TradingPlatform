@@ -159,12 +159,27 @@ class WeightedVotingStep32ComprehensiveTest(unittest.TestCase):
         self.assertEqual(replay.run.run_id, "golden-step32")
         self.assertEqual(len(replay.decisions), 10)
         self.assertEqual(len(replay.trades), 7)
-        # Re-recorded at 04f0fe3, which fixed two sizing defects and shrank positions ~8.6x:
-        # _effective_risk_dollars read base_risk_per_trade_percent off the nested default
-        # settings, so condition-adjusted risk reduction was ignored, and the order-allocation
-        # cap was not the value actually reported as limiting. Everything else about this
-        # replay is unchanged -- same 10 decisions, same 7 trades, same 4.0 profit factor,
-        # same entry timing and exit reason -- so only the quantity-dependent figure moved.
+        # Re-recorded at 04f0fe3, which corrected two ways this algorithm was over-sizing.
+        # Positions fell ~8.6x, which is the over-sizing going away rather than a change of
+        # risk appetite:
+        #
+        # 1. The sizing context took account_equity from read_only_account_equity, the whole
+        #    brokerage account (100_000), instead of inventory.equity, this algorithm's own
+        #    capital partition (30_000). Sizing against capital the algorithm does not own
+        #    crosses the partition boundary the whole design rests on.
+        # 2. requested_quantity is the minimum over requested_caps, and the order-allocation
+        #    and maximum-position caps were not in that dict. Both were computed, reported in
+        #    the caps tuple and published through the API, and neither ever limited an order.
+        #    Here order allocation binds at floor(30_000 * 10% / 100.2) = 29, against the 299
+        #    the capital partition alone had allowed.
+        #
+        # The commit also changed _effective_risk_dollars to read base_risk_per_trade_percent
+        # off the resolved settings rather than the nested defaults. That is the correct read,
+        # but both values are 0.5 here so it moved nothing; it is not part of the 8.6x.
+        #
+        # Everything else about this replay is unchanged -- same 10 decisions, 7 trades, 4.0
+        # profit factor, entry timing and exit reason -- so only the quantity-dependent figure
+        # moved, which is what a sizing correction looks like and not what a logic change does.
         self.assertEqual(replay.algorithm_results.net_pnl, 179.438551608)
         self.assertEqual(replay.algorithm_results.profit_factor, 4.0)
         self.assertEqual(replay.trades[0].entry_timestamp, SESSION_OPEN + timedelta(minutes=5))
