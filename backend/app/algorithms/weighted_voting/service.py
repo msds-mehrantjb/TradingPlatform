@@ -13,7 +13,11 @@ from backend.app.algorithms.weighted_voting.architecture import weighted_voting_
 from backend.app.algorithms.weighted_voting.backtest.engine import WeightedBacktestEngineConfig, WeightedBacktestResult, backtest_engine_status, run_weighted_voting_backtest
 from backend.app.algorithms.weighted_voting.backtest.execution_simulator import simulator_status
 from backend.app.algorithms.weighted_voting.backtest.walk_forward import walk_forward_status
-from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS, weighted_voting_dedicated_strategy_inventory
+from backend.app.algorithms.weighted_voting.catalog import (
+    WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS,
+    WEIGHTED_VOTING_STRATEGY_CATALOG,
+    weighted_voting_dedicated_strategy_inventory,
+)
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.decision_gates import WeightedFiveMinuteAlignment, WeightedVotingLocalGateInputs, evaluate_local_decision_gates
 from backend.app.algorithms.weighted_voting.decision_kernel import WeightedVotingDecisionKernel, decision_kernel_status
@@ -175,7 +179,7 @@ class WeightedVotingService:
         if snapshot:
             state = WeightedWeightState.model_validate(snapshot)
             if _active_weight_state_matches_catalog(state):
-                return state
+                return _weight_state_completed_for_catalog(state)
         state = create_unseeded_equal_weight_state(timestamp=_now())
         self.store.write_snapshot(ACTIVE_WEIGHT_STATE_KEY, state.model_dump(mode="json"))
         return state
@@ -185,7 +189,7 @@ class WeightedVotingService:
         if snapshot:
             state = WeightedWeightState.model_validate(snapshot)
             if _active_weight_state_matches_catalog(state):
-                return state
+                return _weight_state_completed_for_catalog(state)
         return create_unseeded_equal_weight_state(timestamp=timestamp)
 
     def _effective_settings_read_only(self, timestamp: datetime) -> Any:
@@ -931,5 +935,26 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _catalog_strategy_ids() -> set[str]:
+    return {entry.strategy_id for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
+
+
 def _active_weight_state_matches_catalog(state: WeightedWeightState) -> bool:
-    return set(state.strategy_weights) == set(WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS)
+    """True when persisted weights still cover every voter and name nothing foreign.
+
+    Registering a shadow module must not throw away adapted weights: a shadow strategy
+    carries no weight, so a state written before it existed is still correct and is
+    filled out by `_weight_state_completed_for_catalog`. Only a state that is missing an
+    active voter, or that names a strategy the catalogue no longer has, is rejected and
+    re-seeded to equal weights.
+    """
+    persisted = set(state.strategy_weights)
+    return set(WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS) <= persisted <= _catalog_strategy_ids()
+
+
+def _weight_state_completed_for_catalog(state: WeightedWeightState) -> WeightedWeightState:
+    """Give every catalogue strategy a slot, at zero weight for the ones not yet voting."""
+    missing = {strategy_id: 0.0 for strategy_id in _catalog_strategy_ids() if strategy_id not in state.strategy_weights}
+    if not missing:
+        return state
+    return state.model_copy(update={"strategy_weights": {**state.strategy_weights, **missing}})

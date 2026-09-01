@@ -1,4 +1,4 @@
-﻿"""Backend-owned Regime contracts.
+"""Backend-owned Regime contracts.
 
 These contracts intentionally live in Python so the backend runtime is the
 source of truth for Regime classification, decisions, orders, and backtests.

@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from backend.app.algorithms.weighted_voting.aggregation import aggregate_weighted_signals
-from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS
+from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS, WEIGHTED_VOTING_SHADOW_STRATEGY_IDS
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.models import (
     WeightedDataQualityStatus,
@@ -99,12 +99,15 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
         signals = strategy_signals({strategy_id: 0.25 for strategy_id in FAMILY_BY_STRATEGY})
         decision = aggregate_weighted_signals(signals, decision_timestamp=TS, historical_outcomes=correlated_reversal_outcomes())
 
-        self.assertEqual(len(decision.weight_adjustments), 4)
+        self.assertEqual(len(decision.weight_adjustments), 8)
         self.assertAlmostEqual(sum(adjustment.final_effective_weight for adjustment in decision.weight_adjustments), 1.0, delta=0.0000001)
         self.assertTrue(all(adjustment.original_frozen_weight >= 0 for adjustment in decision.weight_adjustments))
         self.assertTrue(any(adjustment.correlation_penalty < 1 for adjustment in decision.weight_adjustments))
         final_weights = {adjustment.strategy_id: adjustment.final_effective_weight for adjustment in decision.weight_adjustments}
         self.assertTrue(all(final_weights[strategy_id] > 0.0 for strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS))
+        # The whole distribution stays with the voters, so a shadow strategy taking part in
+        # the evaluation cannot dilute them.
+        self.assertTrue(all(final_weights[strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
 
     def test_initial_weight_state_is_unseeded_equal_weights(self) -> None:
         state = create_unseeded_equal_weight_state(timestamp=TS)
@@ -141,12 +144,16 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
         )
 
         self.assertEqual(seeded.state_status, WeightedWeightStateStatus.BACKTEST_SEEDED.value)
-        self.assertEqual(set(seeded.strategy_weights), set(WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS))
+        self.assertEqual(set(seeded.strategy_weights), set(FAMILY_BY_STRATEGY))
         self.assertAlmostEqual(sum(seeded.strategy_weights.values()), 1.0, delta=0.0000001)
         self.assertGreater(seeded.strategy_weights["S2"], 0.25)
         self.assertLess(seeded.strategy_weights["S6"], 0.25)
         self.assertTrue(all(weight <= 0.35 + 0.0000001 for weight in seeded.strategy_weights.values()))
-        self.assertTrue(all(abs(weight - 0.25) <= 0.10 + 0.0000001 for weight in seeded.strategy_weights.values()))
+        # Only the voters are seeded near equal weight; shadow strategies sit at zero.
+        self.assertTrue(all(seeded.strategy_weights[strategy_id] == 0.0 for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS))
+        self.assertTrue(
+            all(abs(seeded.strategy_weights[strategy_id] - 0.25) <= 0.10 + 0.0000001 for strategy_id in WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS)
+        )
         self.assertIn("weighted_voting.weights.backtest_seeded_initial", seeded.reason_codes)
 
     def test_same_session_update_preserves_frozen_active_weights(self) -> None:
@@ -297,7 +304,7 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
 
         updated = update_performance_weight_state(
             state,
-            performance_outcomes({"S1": [0.08] * 80, "S2": [0.005] * 45, "S5": [0.004] * 45}),
+            performance_outcomes({"S99": [0.08] * 80, "S2": [0.005] * 45, "S5": [0.004] * 45}),
             update_timestamp=TS,
             session_date="2026-01-14",
         )
@@ -308,10 +315,14 @@ class WeightedVotingWeightEngineTest(unittest.TestCase):
 
 
 FAMILY_BY_STRATEGY = {
+    "S1": WeightedStrategyFamily.BREAKOUT,
     "S2": WeightedStrategyFamily.TREND,
+    "S3": WeightedStrategyFamily.TREND,
+    "S4": WeightedStrategyFamily.MEAN_REVERSION,
     "S7": WeightedStrategyFamily.MEAN_REVERSION,
     "S5": WeightedStrategyFamily.REVERSAL,
     "S6": WeightedStrategyFamily.REVERSAL,
+    "S8": WeightedStrategyFamily.BREAKOUT,
 }
 
 

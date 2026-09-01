@@ -10,16 +10,27 @@ from backend.app.algorithms.weighted_voting.strategies.bollinger_atr_reversion i
 from backend.app.algorithms.weighted_voting.strategies.failed_breakout_reversal import FailedBreakoutReversalStrategy
 from backend.app.algorithms.weighted_voting.strategies.first_pullback_after_open import FirstPullbackAfterOpenStrategy
 from backend.app.algorithms.weighted_voting.strategies.liquidity_sweep_reversal import LiquiditySweepReversalStrategy
+from backend.app.algorithms.weighted_voting.strategies.opening_range_breakout import OpeningRangeBreakoutStrategy
+from backend.app.algorithms.weighted_voting.strategies.volatility_breakout import VolatilityBreakoutStrategy
+from backend.app.algorithms.weighted_voting.strategies.vwap_mean_reversion import VwapMeanReversionStrategy
+from backend.app.algorithms.weighted_voting.strategies.vwap_trend_continuation import VwapTrendContinuationStrategy
 
 
 WEIGHTED_VOTING_SIGNAL_ENGINE_VERSION = "weighted_voting_signal_engine_v1"
 
 
+# Every catalogue entry is registered here, shadow included: a shadow strategy has to
+# actually run to produce the evidence its promotion gate demands. Lifecycle, not this
+# tuple, decides whether a strategy's vote carries weight.
 WEIGHTED_VOTING_STRATEGY_CLASSES = (
+    OpeningRangeBreakoutStrategy,
     FirstPullbackAfterOpenStrategy,
+    VwapTrendContinuationStrategy,
+    VwapMeanReversionStrategy,
     FailedBreakoutReversalStrategy,
     LiquiditySweepReversalStrategy,
     BollingerAtrReversionStrategy,
+    VolatilityBreakoutStrategy,
 )
 
 WEIGHTED_VOTING_STRATEGY_CLASS_BY_ID = {strategy_class.strategy_id: strategy_class for strategy_class in WEIGHTED_VOTING_STRATEGY_CLASSES}

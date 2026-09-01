@@ -17,7 +17,7 @@ class BollingerAtrReversionStrategy(WeightedVotingStrategyBase):
     family = WeightedVotingStrategyFamily.MEAN_REVERSION
 
     def evaluate(self, snapshot: WeightedVotingMarketSnapshot) -> WeightedVotingSignal:
-        context = reject_bad_context(self.strategy_id, self.name, self.family, snapshot, self.config, 50, ("10:00", "15:15"))
+        context = reject_bad_context(self.strategy_id, self.name, self.family, snapshot, self.config, self.minimum_warmup, self.session_window)
         if not hasattr(context, "candles"):
             return context
         closes = [candle.close for candle in context.candles]

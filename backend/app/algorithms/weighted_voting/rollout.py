@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import json
 import os
 from typing import Any, Literal, Mapping, Protocol
+
+from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS
 
 
 WEIGHTED_VOTING_ROLLOUT_VERSION = "weighted_voting_rollout_v2"
@@ -249,7 +251,9 @@ class WeightedVotingSmallAllocationGuardrails:
     cap_quantity: int = 10
     cap_daily_risk_dollars: float = 250.0
     cap_daily_trades: int = 2
-    approved_active_strategy_ids: tuple[str, ...] = ("S2", "S5", "S6", "S7")
+    # Follows the catalogue rather than restating it, so a promoted strategy is not
+    # silently missing from the small-allocation approval list.
+    approved_active_strategy_ids: tuple[str, ...] = field(default_factory=lambda: WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS)
     pyramiding_enabled: bool = False
     maximum_spread_percent: float = 0.0005
     maximum_data_freshness_seconds: int = 65

@@ -7,7 +7,11 @@ from typing import Callable
 from backend.app.algorithms.weighted_voting.market_condition import classify_market_condition
 from backend.app.algorithms.weighted_voting.market_snapshot import WeightedMarketSnapshot
 from backend.app.algorithms.weighted_voting.models import WeightedCandle, WeightedDataQualityStatus, WeightedSide, WeightedWeightState
-from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS, WEIGHTED_VOTING_STRATEGY_CATALOG
+from backend.app.algorithms.weighted_voting.catalog import (
+    WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS,
+    WEIGHTED_VOTING_SHADOW_STRATEGY_IDS,
+    WEIGHTED_VOTING_STRATEGY_CATALOG,
+)
 from backend.app.algorithms.weighted_voting.strategies.bollinger_atr_reversion import BollingerAtrReversionStrategy
 from backend.app.algorithms.weighted_voting.strategies.failed_breakout_reversal import FailedBreakoutReversalStrategy
 from backend.app.algorithms.weighted_voting.strategies.first_pullback_after_open import FirstPullbackAfterOpenStrategy
@@ -75,11 +79,11 @@ class WeightedVotingStrategyModulesTest(unittest.TestCase):
             with self.subTest(strategy=strategy.strategy_id):
                 self.assertEqual(strategy.evaluate(with_future).deterministic_json(), strategy.evaluate(base).deterministic_json())
 
-    def test_signal_engine_evaluates_exactly_four_authoritative_strategies_in_catalog_order(self) -> None:
+    def test_signal_engine_evaluates_every_catalogued_strategy_in_catalog_order(self) -> None:
         signals = evaluate_signals(s3_buy_snapshot())
 
-        self.assertEqual([signal.strategy_id for signal in signals], ["S2", "S5", "S6", "S7"])
-        self.assertEqual(len(signals), 4)
+        self.assertEqual([signal.strategy_id for signal in signals], ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"])
+        self.assertEqual(len(signals), 8)
         self.assertEqual(set(WEIGHTED_VOTING_STRATEGY_CLASS_BY_ID), {entry.strategy_id for entry in WEIGHTED_VOTING_STRATEGY_CATALOG})
 
     def test_signal_engine_standardizes_strategy_results_and_attaches_active_weight(self) -> None:
@@ -122,7 +126,7 @@ class WeightedVotingStrategyModulesTest(unittest.TestCase):
                 self.assertIn("completed_one_minute_candles", signal.feature_snapshot)
                 self.assertNotIn("voting_ensemble", str(signal.model_dump(mode="json")))
 
-    def test_catalog_strategies_are_the_only_signal_engine_registrations(self) -> None:
+    def test_shadow_strategies_run_but_carry_no_voting_weight(self) -> None:
         signals = evaluate_signals(s3_buy_snapshot())
         by_id = {signal.strategy_id: signal for signal in signals}
 
@@ -131,10 +135,20 @@ class WeightedVotingStrategyModulesTest(unittest.TestCase):
                 self.assertEqual(by_id[strategy_id].feature_snapshot["strategy_lifecycle"], "active")
                 self.assertTrue(by_id[strategy_id].feature_snapshot["strategy_contributes_to_vote"])
 
-        self.assertNotIn("S1", by_id)
-        self.assertNotIn("S3", by_id)
-        self.assertNotIn("S4", by_id)
-        self.assertNotIn("S8", by_id)
+        # A shadow strategy has to evaluate to produce the evidence its promotion gate wants,
+        # so it appears in the signal list -- but with zero weight and marked ineligible, it
+        # cannot move the vote.
+        for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS:
+            with self.subTest(strategy_id=strategy_id):
+                signal = by_id[strategy_id]
+                self.assertEqual(signal.feature_snapshot["strategy_lifecycle"], "shadow")
+                self.assertFalse(signal.feature_snapshot["strategy_contributes_to_vote"])
+                self.assertEqual(signal.base_weight, 0.0)
+                self.assertEqual(signal.active_weight, 0.0)
+                self.assertEqual(signal.final_weight, 0.0)
+                self.assertFalse(signal.eligible)
+                self.assertFalse(signal.active)
+                self.assertIn("weighted_voting.signal_engine.strategy_shadow_observed_zero_weight", signal.reason_codes)
 
     def test_strategy_pairs_have_distinct_triggers(self) -> None:
         s1_snapshot = s1_buy_snapshot()

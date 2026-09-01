@@ -48,7 +48,7 @@ class WeightedVotingSettingsTest(unittest.TestCase):
         self.assertEqual(baseline["configurationNamespace"], WEIGHTED_VOTING_CONFIGURATION_NAMESPACE)
         self.assertEqual(baseline["configurationKey"], WEIGHTED_VOTING_BASELINE_CONFIGURATION_KEY)
         self.assertEqual(baseline["configVersion"], config.config_version)
-        self.assertEqual(len(baseline["strategyEnablement"]), 4)
+        self.assertEqual(len(baseline["strategyEnablement"]), 8)
         self.assertEqual(set(baseline["strategyEnablement"]), set(baseline["strategyBaselineWeights"]))
         self.assertAlmostEqual(sum(baseline["strategyBaselineWeights"].values()), 1.0)
         self.assertEqual(baseline["decisionThresholds"]["minimumWinningScore"], config.minimum_score)
@@ -147,7 +147,8 @@ class WeightedVotingSettingsTest(unittest.TestCase):
         defaults = default_weighted_settings(timestamp=TS, baseline_config=config)
 
         self.assertEqual(defaults.strategy_states["S2"], "active")
-        self.assertEqual(set(defaults.strategy_states), {"S2", "S5", "S6", "S7"})
+        self.assertEqual(set(defaults.strategy_states), {"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"})
+        self.assertEqual(defaults.strategy_states["S1"], "shadow")
         self.assertEqual(defaults.strategy_eligibility, config.strategy_enablement)
         self.assertEqual(defaults.baseline_strategy_weights, config.strategy_baseline_weights)
         self.assertEqual(defaults.minimum_strategy_weights, config.strategy_minimum_weights)

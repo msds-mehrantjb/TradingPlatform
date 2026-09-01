@@ -1,4 +1,4 @@
-﻿"""Explicit production composition root for the Regime paper runtime."""
+"""Explicit production composition root for the Regime paper runtime."""
 
 from __future__ import annotations
 

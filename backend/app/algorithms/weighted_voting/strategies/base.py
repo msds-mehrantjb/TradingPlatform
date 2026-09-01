@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from backend.app.algorithms.weighted_voting.catalog import weighted_voting_catalog_entry
 from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.market_snapshot import WeightedVotingMarketSnapshot
 from backend.app.algorithms.weighted_voting.models import WeightedVotingSignal, WeightedVotingStrategyFamily
@@ -16,6 +17,20 @@ class WeightedVotingStrategyBase(ABC):
 
     def __init__(self, config: WeightedVotingConfig | None = None) -> None:
         self.config = config or WeightedVotingConfig()
+
+    @property
+    def minimum_warmup(self) -> int:
+        """Completed candles this strategy needs, as the catalogue declares it.
+
+        Reading it here rather than hardcoding it in each module keeps the published
+        inventory honest: what the API advertises is what the strategy enforces.
+        """
+        return weighted_voting_catalog_entry(self.strategy_id).minimum_warmup
+
+    @property
+    def session_window(self) -> tuple[str, str]:
+        """Session window this strategy runs in, as the catalogue declares it."""
+        return weighted_voting_catalog_entry(self.strategy_id).session_window_bounds
 
     @abstractmethod
     def evaluate(self, snapshot: WeightedVotingMarketSnapshot) -> WeightedVotingSignal:

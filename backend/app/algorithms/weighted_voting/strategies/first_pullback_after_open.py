@@ -17,7 +17,7 @@ class FirstPullbackAfterOpenStrategy(WeightedVotingStrategyBase):
     family = WeightedVotingStrategyFamily.TREND
 
     def evaluate(self, snapshot: WeightedVotingMarketSnapshot) -> WeightedVotingSignal:
-        context = reject_bad_context(self.strategy_id, self.name, self.family, snapshot, self.config, 25, ("09:45", "11:30"))
+        context = reject_bad_context(self.strategy_id, self.name, self.family, snapshot, self.config, self.minimum_warmup, self.session_window)
         if not hasattr(context, "candles"):
             return context
         session = regular_session_candles(context.candles)

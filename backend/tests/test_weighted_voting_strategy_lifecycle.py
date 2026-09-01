@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
+from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_SHADOW_STRATEGY_IDS
 from backend.app.algorithms.weighted_voting.service import WeightedVotingService
 from backend.app.algorithms.weighted_voting.strategy_lifecycle import (
     WEIGHTED_VOTING_LIFECYCLE_AFTER_MARKET_WORKFLOW,
@@ -28,11 +29,25 @@ class WeightedVotingStrategyLifecycleTest(unittest.TestCase):
         self.assertEqual(decision.action, "reject")
         self.assertIn("weighted_voting.strategy_lifecycle.evidence_required", decision.reason_codes)
 
-    def test_initial_snapshot_contains_only_active_catalog_strategies(self) -> None:
+    def test_initial_snapshot_mirrors_the_whole_catalog(self) -> None:
         store = MemoryStore()
         initial = load_latest_strategy_lifecycle_snapshot(store, timestamp=TS)
 
-        self.assertEqual(initial.strategy_states, {"S2": "active", "S5": "active", "S6": "active", "S7": "active"})
+        # The snapshot governs every module, shadow included; a module it does not name
+        # cannot be promoted or demoted through the lifecycle gate at all.
+        self.assertEqual(
+            initial.strategy_states,
+            {
+                "S1": "shadow",
+                "S2": "active",
+                "S3": "shadow",
+                "S4": "shadow",
+                "S5": "active",
+                "S6": "active",
+                "S7": "active",
+                "S8": "shadow",
+            },
+        )
         self.assertTrue(all(key.startswith("weighted_voting.") for key in store.snapshots))
 
     def test_intraday_or_non_admin_workflow_rejects_even_strong_evidence(self) -> None:
@@ -44,11 +59,28 @@ class WeightedVotingStrategyLifecycleTest(unittest.TestCase):
         self.assertEqual(decision.action, "reject")
         self.assertIn("weighted_voting.strategy_lifecycle.after_market_required", decision.reason_codes)
 
-    def test_retired_strategy_ids_are_not_lifecycle_targets(self) -> None:
-        for strategy_id in ("S1", "S3", "S4", "S8"):
+    def test_shadow_strategies_are_lifecycle_targets_that_still_have_to_earn_promotion(self) -> None:
+        """Shadow modules are governed, not merely listed.
+
+        Being a lifecycle target is what makes a shadow strategy promotable at all; the
+        promotion gates, not registration, are what keep it from voting before it has
+        earned the right to.
+        """
+        for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS:
             with self.subTest(strategy_id=strategy_id):
-                with self.assertRaisesRegex(ValueError, "unknown Weighted Voting strategy lifecycle evidence target"):
-                    passing_evidence(strategy_id)
+                promote = evaluate_strategy_lifecycle_change(passing_evidence(strategy_id))
+                self.assertEqual(promote.previous_lifecycle, "shadow")
+                self.assertEqual(promote.action, "promote")
+                self.assertEqual(promote.target_lifecycle, "active")
+                self.assertTrue(promote.approved)
+
+                blocked = evaluate_strategy_lifecycle_change(passing_evidence(strategy_id, completed_trades=3))
+                self.assertFalse(blocked.approved)
+                self.assertEqual(blocked.target_lifecycle, "shadow")
+
+    def test_strategies_outside_the_catalog_are_not_lifecycle_targets(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown Weighted Voting strategy lifecycle evidence target"):
+            passing_evidence("S99")
 
     def test_active_strategy_demotes_or_disables_when_demotion_gates_fail(self) -> None:
         demote = evaluate_strategy_lifecycle_change(passing_evidence("S2", recent_net_expectancy_after_costs=-0.03))

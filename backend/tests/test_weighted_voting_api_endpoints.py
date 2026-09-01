@@ -182,13 +182,23 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertEqual(status.json()["serviceBoundary"]["reason_code_namespace"], "weighted_voting.")
         self.assertIn("WeightedVotingEvaluateRequest", status.json()["serviceBoundary"]["input_models"])
         self.assertIn("WeightedVotingDecision", status.json()["serviceBoundary"]["output_models"])
-        self.assertEqual([item["strategy_id"] for item in status.json()["strategyInventory"]], ["S2", "S5", "S6", "S7"])
+        self.assertEqual(
+            [item["strategy_id"] for item in status.json()["strategyInventory"]],
+            ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"],
+        )
+        self.assertEqual(
+            [item["strategy_id"] for item in status.json()["strategyInventory"] if item["lifecycle"] == "active"],
+            ["S2", "S5", "S6", "S7"],
+        )
         self.assertTrue(all(item["implementation_path"].startswith("backend/app/algorithms/weighted_voting/strategies/") for item in status.json()["strategyInventory"]))
         self.assertTrue(all(item["required_indicators"] for item in status.json()["strategyInventory"]))
         self.assertTrue(all(item["state_namespace"].startswith("weighted_voting.strategies.") for item in status.json()["strategyInventory"]))
         self.assertTrue(all(item["performance_history"] for item in status.json()["strategyInventory"]))
         self.assertTrue(all(item["enabled"] for item in status.json()["strategyInventory"]))
-        self.assertEqual(sum(item["baseline_weight"] for item in status.json()["strategyInventory"]), 1.0)
+        # baseline_weight is what a strategy would carry if promoted; voting_influence is what
+        # it actually carries today, and that is the one that has to be a distribution.
+        self.assertEqual(sum(item["voting_influence"] for item in status.json()["strategyInventory"]), 1.0)
+        self.assertTrue(all(item["baseline_weight"] == 0.25 for item in status.json()["strategyInventory"]))
         self.assertTrue(all(item["minimum_weight"] == 0.02 for item in status.json()["strategyInventory"]))
         self.assertTrue(all(item["maximum_weight"] == 0.35 for item in status.json()["strategyInventory"]))
         self.assertTrue(all(item["long_allowed"] and item["short_allowed"] for item in status.json()["strategyInventory"]))
@@ -282,7 +292,7 @@ class WeightedVotingApiEndpointsTest(unittest.TestCase):
         self.assertEqual(response.json()["weightState"]["state_status"], "BACKTEST_SEEDED")
         self.assertGreater(weights["S2"], 0.25)
         self.assertLess(weights["S6"], 0.25)
-        self.assertTrue(all(abs(weight - 0.25) <= 0.10 + 0.0000001 for weight in weights.values()))
+        self.assertTrue(all(abs(weights[strategy_id] - 0.25) <= 0.10 + 0.0000001 for strategy_id in ("S2", "S5", "S6", "S7")))
 
     def test_backtest_endpoints_store_and_return_run_collections(self) -> None:
         inventory_keys_before = {key for key in self.store.snapshots if key.startswith("weighted_voting.inventory.")}

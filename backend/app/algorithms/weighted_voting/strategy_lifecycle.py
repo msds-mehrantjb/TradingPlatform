@@ -453,7 +453,14 @@ def _gate(
 
 def _read_latest_snapshot(store: WeightedVotingStateStore, timestamp: datetime) -> WeightedVotingStrategyLifecycleSnapshot:
     try:
-        return _snapshot_from_dict(store.read_snapshot(WEIGHTED_VOTING_STRATEGY_LIFECYCLE_LATEST_KEY))
+        stored = _snapshot_from_dict(store.read_snapshot(WEIGHTED_VOTING_STRATEGY_LIFECYCLE_LATEST_KEY))
+        # A snapshot written before the catalogue gained or lost a strategy no longer covers
+        # every module, and every later gate reads it by strategy id. Re-seed from the
+        # catalogue instead of failing, which keeps a newly registered shadow module
+        # governed from its first evaluation rather than unreachable until a manual reset.
+        if set(stored.strategy_states) != _catalog_ids():
+            raise KeyError(WEIGHTED_VOTING_STRATEGY_LIFECYCLE_LATEST_KEY)
+        return stored
     except KeyError:
         snapshot = initial_strategy_lifecycle_snapshot(created_at=timestamp)
         store.write_snapshot(WEIGHTED_VOTING_STRATEGY_LIFECYCLE_LATEST_KEY, snapshot.as_dict())

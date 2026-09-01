@@ -10,7 +10,7 @@ class VolatilityBreakoutStrategy(WeightedVotingStrategyBase):
     family = WeightedVotingStrategyFamily.BREAKOUT
 
     def evaluate(self, snapshot: WeightedVotingMarketSnapshot) -> WeightedVotingSignal:
-        context = reject_bad_context(self.strategy_id, self.name, self.family, snapshot, self.config, 50, ("11:00", "15:30"))
+        context = reject_bad_context(self.strategy_id, self.name, self.family, snapshot, self.config, self.minimum_warmup, self.session_window)
         if not hasattr(context, "candles"):
             return context
         latest = context.latest

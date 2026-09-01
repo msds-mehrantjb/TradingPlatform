@@ -335,7 +335,7 @@ class ApiV2EndpointsTest(unittest.TestCase):
                 "aggregator": [],
             },
             "weighted-voting": {
-                "directional": ["S2", "S5", "S6", "S7"],
+                "directional": ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"],
                 "context": [],
                 "regime": [],
                 "safety": [],

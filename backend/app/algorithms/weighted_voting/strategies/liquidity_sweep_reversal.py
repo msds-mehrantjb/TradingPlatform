@@ -17,7 +17,7 @@ class LiquiditySweepReversalStrategy(WeightedVotingStrategyBase):
     family = WeightedVotingStrategyFamily.REVERSAL
 
     def evaluate(self, snapshot: WeightedVotingMarketSnapshot) -> WeightedVotingSignal:
-        context = reject_bad_context(self.strategy_id, self.name, self.family, snapshot, self.config, 25, ("09:45", "15:30"))
+        context = reject_bad_context(self.strategy_id, self.name, self.family, snapshot, self.config, self.minimum_warmup, self.session_window)
         if not hasattr(context, "candles"):
             return context
         latest = context.latest

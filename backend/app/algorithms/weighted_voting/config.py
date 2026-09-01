@@ -7,7 +7,10 @@ import hashlib
 import json
 from typing import Any, Literal
 
-from backend.app.algorithms.weighted_voting.catalog import WEIGHTED_VOTING_STRATEGY_CATALOG
+from backend.app.algorithms.weighted_voting.catalog import (
+    WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT,
+    WEIGHTED_VOTING_STRATEGY_CATALOG,
+)
 from backend.app.algorithms.weighted_voting.identity import WEIGHTED_VOTING_CONFIGURATION_VERSION
 
 WEIGHTED_VOTING_CONFIG_VERSION = WEIGHTED_VOTING_CONFIGURATION_VERSION
@@ -20,7 +23,16 @@ def _strategy_enablement() -> dict[str, bool]:
 
 
 def _strategy_baseline_weights() -> dict[str, float]:
-    return {entry.strategy_id: entry.baseline_weight for entry in WEIGHTED_VOTING_STRATEGY_CATALOG}
+    """Published baseline voting weights, which stay a distribution over the voters.
+
+    A shadow strategy executes but casts no weighted vote, so it is published at 0.0
+    rather than at its catalogue baseline; otherwise registering one would inflate the
+    advertised weights past 1.0 without any strategy actually gaining influence.
+    """
+    return {
+        entry.strategy_id: (entry.baseline_weight if entry.contributes_to_vote else 0.0)
+        for entry in WEIGHTED_VOTING_STRATEGY_CATALOG
+    }
 
 
 def _strategy_minimum_weights() -> dict[str, float]:
@@ -95,7 +107,8 @@ class WeightedVotingConfig:
     maximum_strategy_weight: float = 0.35
     maximum_family_weight: float = 0.50
     minimum_enabled_strategy_weight: float = 0.02
-    equal_seed_weight: float = 0.25
+    # The equal share among the strategies that vote, not a fixed quarter.
+    equal_seed_weight: float = field(default_factory=lambda: WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT)
     minimum_qualified_outcomes_for_adaptation: int = 40
     weight_smoothing_previous: float = 0.70
     weight_smoothing_candidate: float = 0.30
