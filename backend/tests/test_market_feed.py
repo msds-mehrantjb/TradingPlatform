@@ -214,6 +214,31 @@ class ChartFollowsActiveFeedTest(unittest.TestCase):
         self.assertEqual(response.json()["activeInstrument"]["symbol"], "MNQ")
         self.assertEqual(self.client.get("/api/market-feed").json()["activeInstrument"]["symbol"], "MNQ")
 
+    def test_the_chart_refuses_an_instrument_with_no_provider_behind_it(self) -> None:
+        """Following the instrument's symbol and feed is not enough on its own.
+
+        The fetch goes to Alpaca, so selecting a futures instrument produced Alpaca's own
+        'invalid feed: cme' rejection -- true, but nothing a reader could act on. The
+        refusal now names the instrument, the provider and why there is nothing behind it.
+        """
+        self.client.put("/api/market-feed/active", params={"instrumentId": "mes_future"})
+
+        response = self.client.get("/api/candles", params={"limit": 10})
+
+        self.assertEqual(response.status_code, 503)
+        detail = response.json()["detail"]
+        self.assertEqual(detail["instrumentId"], "mes_future")
+        self.assertEqual(detail["provider"], "futures")
+        self.assertIn("CME data vendor", detail["reason"])
+
+    def test_an_explicit_symbol_still_charts_while_the_app_is_on_another_instrument(self) -> None:
+        """Naming a symbol bypasses the active instrument, so equities stay viewable."""
+        self.client.put("/api/market-feed/active", params={"instrumentId": "mes_future"})
+
+        response = self.client.get("/api/candles", params={"symbol": "SPY", "feed": "iex", "limit": 10})
+
+        self.assertEqual(response.status_code, 200)
+
     def test_switching_to_an_unknown_instrument_is_a_404(self) -> None:
         self.assertEqual(
             self.client.put("/api/market-feed/active", params={"instrumentId": "nope"}).status_code, 404

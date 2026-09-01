@@ -65,6 +65,7 @@ from .execution.cost_model import (
 from .risk.api import router as risk_router
 from .market_feed import (
     active_instrument,
+    build_providers,
     market_feed_status,
     set_active_instrument,
 )
@@ -93,6 +94,9 @@ from .tick_data import append_quote_trade_ticks
 settings = get_settings()
 store = CandleStore(settings)
 alpaca = AlpacaClient(settings)
+# One registry of data sources, so the chart and anything else can ask whether the
+# instrument the app is on actually has a source behind it.
+MARKET_DATA_PROVIDERS = build_providers(alpaca)
 session_decision_store = SessionDecisionJsonlStore(root=SESSION_PERSISTENCE_ROOT)
 voting_ensemble_runtime_supervisor = get_voting_ensemble_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
 regime_runtime_supervisor = get_regime_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
@@ -1813,6 +1817,22 @@ async def candles(
     active = active_instrument()
     normalized_symbol = (symbol or active.symbol).upper()
     resolved_feed = feed or active.feed
+    # Following the instrument's symbol and feed is not enough on its own: the fetch below
+    # goes to Alpaca, so an instrument served by another source produced Alpaca's own
+    # 'invalid feed' rejection rather than anything a reader could act on. Refuse here,
+    # with the provider's reason, whenever the active instrument is not one Alpaca serves.
+    if not symbol and not feed:
+        provider = MARKET_DATA_PROVIDERS.get(active.provider)
+        if provider is None or not provider.available:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": f"no market data provider is configured for {active.symbol}",
+                    "instrumentId": active.instrument_id,
+                    "provider": active.provider,
+                    "reason": getattr(provider, "reason", "provider is not registered"),
+                },
+            )
     cache_key = (
         "candles",
         normalized_symbol,
