@@ -23,6 +23,7 @@ _EXCHANGE_TIMEZONE = ZoneInfo("America/New_York")
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.app.market_feed import active_instrument
 from backend.app.algorithms.voting_ensemble.session_segments import (
     resolve_session_segment,
     session_segment_boundaries_from_payload,
@@ -1135,8 +1136,15 @@ def _operational_snapshot(
     market_open = bool(market_status.get("isOpen"))
     synchronized = bool(synchronization.get("snapshotSynchronized"))
     trading_enabled = bool(control.get("newEntriesEnabled")) and market_open and synchronized and bool(global_gate.get("eligible", global_gate.get("status") == "PASS"))
+    # The instrument the application is actually on, not the symbol in the payload.
+    # Switching the app to MES must stop entries everywhere, not only where a symbol
+    # happens to be checked.
+    active = active_instrument()
     return {
         "status": "ready" if trading_enabled else "blocked",
+        "instrumentTradeable": active.trade_ready,
+        "instrumentId": active.instrument_id,
+        "instrumentMissingCapabilities": list(active.missing_capabilities),
         "tradingEnabled": trading_enabled,
         "automaticPaperTradingEnabled": bool(control.get("effectivePaperTradingEnabled")) and synchronized,
         "requestedPaperTradingEnabled": bool(control.get("requestedPaperTradingEnabled")),

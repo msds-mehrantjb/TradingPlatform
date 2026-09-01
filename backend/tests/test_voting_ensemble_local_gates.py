@@ -250,6 +250,9 @@ def base_gate_input(**overrides):
             "decisionDeadlineValid": True,
         },
         "operationalState": {
+            # Mandatory like the rest of this group: an instrument the platform cannot size
+            # is refused before sizing. Production supplies it from the active instrument.
+            "instrumentTradeable": True,
             "tradingEnabled": True,
             "paperTradingMode": True,
             "marketOpen": True,

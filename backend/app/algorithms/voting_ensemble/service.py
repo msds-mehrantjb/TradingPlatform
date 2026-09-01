@@ -55,6 +55,7 @@ from backend.app.algorithms.voting_ensemble.strategies.registry import (
 )
 from backend.app.algorithms.voting_ensemble.trading_settings.resolver import resolve_one_minute_trading_settings
 from backend.app.algorithms.voting_ensemble.risk_budget import resolve_voting_ensemble_risk_budget
+from backend.app.market_feed import active_instrument
 from backend.app.domain.models import AccountRiskState, BaselineTradingSettings, ContextSignal, Direction, DynamicPolicyBounds, EffectiveTradePolicy, EnsembleDecision, GateStatus, GlobalGateDecision, HardRiskLimits, OperatingMode, OrderPlan, Signal, StrategyFamily, StrategyRole, StrategySignal, TradeCandidate
 from backend.app.gates import GlobalGateInput
 
@@ -1068,6 +1069,18 @@ def _account_risk_state(snapshot: VotingEnsembleEvaluationSnapshot) -> AccountRi
     )
 
 
+def _active_instrument_tradeable() -> bool:
+    """Whether the instrument the app is on can be sized by this platform.
+
+    Defaults to True if the registry cannot be consulted: this gate exists to catch a
+    known-untradeable instrument, not to halt trading because a lookup failed.
+    """
+    try:
+        return bool(active_instrument().trade_ready)
+    except Exception:
+        return True
+
+
 def _operational_state(
     snapshot: VotingEnsembleEvaluationSnapshot,
     upstream_global_gate: GlobalGateDecision | None,
@@ -1078,6 +1091,9 @@ def _operational_state(
     status = str(state.get("status") or "").lower()
     nominal = status in {"nominal", "ready", "ok", "healthy"}
     return {
+        # Falls back to the application's active instrument when the snapshot does not carry
+        # the flag, so the refusal cannot be bypassed by a payload that simply omits it.
+        "instrumentTradeable": bool(state.get("instrumentTradeable", _active_instrument_tradeable())),
         "tradingEnabled": bool(state.get("tradingEnabled", nominal)),
         "paperTradingMode": bool(state.get("paperTradingMode", True)) and not bool(state.get("liveTradingEnabled", False)),
         "marketOpen": bool(state.get("marketOpen", not bool(session.get("marketClosed", False)))),

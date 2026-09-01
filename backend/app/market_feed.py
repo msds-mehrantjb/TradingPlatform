@@ -304,6 +304,20 @@ def set_active_instrument(instrument_id: str, *, allow_untradeable: bool = True)
     return selected
 
 
+def instrument_for_symbol(symbol: str) -> Instrument | None:
+    """The registered instrument trading under this symbol, if the registry knows it.
+
+    Returns None for a symbol the registry does not carry -- a breadth component, say --
+    which callers should read as "no instrument-level restriction" rather than as a
+    refusal. Only registered instruments can carry capability requirements.
+    """
+    wanted = str(symbol or "").strip().upper()
+    for item in INSTRUMENTS:
+        if item.symbol.upper() == wanted:
+            return item
+    return None
+
+
 def require_tradeable(selected: Instrument | None = None) -> Instrument:
     """The active instrument, or a refusal explaining what the platform still lacks.
 
@@ -349,6 +363,7 @@ __all__ = [
     "active_instrument_id",
     "build_providers",
     "instrument",
+    "instrument_for_symbol",
     "market_feed_status",
     "require_tradeable",
     "set_active_instrument",

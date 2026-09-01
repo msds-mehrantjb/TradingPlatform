@@ -170,6 +170,11 @@ class VotingEnsembleLocalGateEngine:
     def _operational_safety(self, context: GlobalGateInput) -> list[GateCheckResult]:
         state = context.operationalState
         bool_checks = (
+            # The platform sizes in shares. An index future is quoted in points worth $5
+            # (MES) or $2 (MNQ) each, so the share path would not fail loudly on one -- it
+            # would return a plausible quantity that is wrong by the point value. The
+            # capability check refuses before sizing rather than after.
+            ("operational.instrument_tradeable", "instrumentTradeable", "voting_ensemble.local_gate.instrument_not_tradeable"),
             ("operational.trading_enabled", "tradingEnabled", "voting_ensemble.local_gate.trading_disabled"),
             ("operational.paper_mode", "paperTradingMode", "voting_ensemble.local_gate.live_trading_not_authorized"),
             ("operational.market_open", "marketOpen", "voting_ensemble.local_gate.market_closed"),
