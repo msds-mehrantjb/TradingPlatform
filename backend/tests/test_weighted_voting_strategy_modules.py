@@ -4,6 +4,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
+from dataclasses import replace
+
+from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
 from backend.app.algorithms.weighted_voting.market_condition import classify_market_condition
 from backend.app.algorithms.weighted_voting.market_snapshot import WeightedMarketSnapshot
 from backend.app.algorithms.weighted_voting.models import WeightedCandle, WeightedDataQualityStatus, WeightedSide, WeightedWeightState
@@ -125,6 +128,62 @@ class WeightedVotingStrategyModulesTest(unittest.TestCase):
                 self.assertAlmostEqual(signal.buy_probability + signal.sell_probability + signal.hold_probability, 1.0, delta=0.000001)
                 self.assertIn("completed_one_minute_candles", signal.feature_snapshot)
                 self.assertNotIn("voting_ensemble", str(signal.model_dump(mode="json")))
+
+    def test_a_strategy_disabled_in_settings_stops_voting(self) -> None:
+        """Settings could switch a strategy off and it would keep voting anyway.
+
+        The resolved state reached the decision's settings snapshot and was reported
+        there, but the signal engine never read it, so every surface showed the strategy
+        as disabled while its weight still counted.
+        """
+        snapshot = s2_buy_snapshot()
+        config = WeightedVotingConfig()
+        disabled = replace(config, strategy_states={**config.strategy_states, "S2": "disabled"})
+
+        voting = next(signal for signal in evaluate_signals(snapshot, config) if signal.strategy_id == "S2")
+        stopped = next(signal for signal in evaluate_signals(snapshot, disabled) if signal.strategy_id == "S2")
+
+        self.assertTrue(voting.eligible)
+        self.assertGreater(voting.final_weight, 0.0)
+        # The strategy still evaluates and still reports its call; it just cannot vote.
+        self.assertEqual(stopped.signal, voting.signal)
+        self.assertFalse(stopped.eligible)
+        self.assertEqual(stopped.base_weight, 0.0)
+        self.assertEqual(stopped.active_weight, 0.0)
+        self.assertEqual(stopped.final_weight, 0.0)
+        self.assertIn("weighted_voting.signal_engine.strategy_disabled_by_settings", stopped.reason_codes)
+        self.assertTrue(stopped.feature_snapshot["strategy_runtime_disabled"])
+
+    def test_strategy_eligibility_false_also_stops_a_strategy_voting(self) -> None:
+        snapshot = s2_buy_snapshot()
+        config = WeightedVotingConfig()
+        ineligible = replace(config, strategy_enablement={**config.strategy_enablement, "S2": False})
+
+        signal = next(item for item in evaluate_signals(snapshot, ineligible) if item.strategy_id == "S2")
+
+        self.assertFalse(signal.eligible)
+        self.assertEqual(signal.final_weight, 0.0)
+
+    def test_settings_cannot_turn_a_shadow_strategy_into_a_voter(self) -> None:
+        """Settings may only ever take a vote away.
+
+        If a runtime flag could grant one, flipping it would put a strategy on capital
+        without any of the evidence the promotion gate exists to require.
+        """
+        snapshot = s2_buy_snapshot()
+        config = WeightedVotingConfig()
+        forced = replace(
+            config,
+            strategy_states={strategy_id: "active" for strategy_id in config.strategy_states},
+            strategy_enablement={strategy_id: True for strategy_id in config.strategy_enablement},
+        )
+
+        signals = {signal.strategy_id: signal for signal in evaluate_signals(snapshot, forced)}
+
+        for strategy_id in WEIGHTED_VOTING_SHADOW_STRATEGY_IDS:
+            with self.subTest(strategy_id=strategy_id):
+                self.assertFalse(signals[strategy_id].eligible)
+                self.assertEqual(signals[strategy_id].final_weight, 0.0)
 
     def test_shadow_strategies_run_but_carry_no_voting_weight(self) -> None:
         signals = evaluate_signals(s3_buy_snapshot())

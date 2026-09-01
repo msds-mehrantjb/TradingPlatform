@@ -54,8 +54,36 @@ def evaluate_signals(
         else:
             strategy_class = WEIGHTED_VOTING_STRATEGY_CLASS_BY_ID[entry.strategy_id]
             raw_signal = strategy_class(active_config).evaluate(snapshot)
-        signals.append(_standardize_strategy_signal(raw_signal, entry, snapshot, active_weight_state, market_condition))
+        signals.append(
+            _standardize_strategy_signal(
+                raw_signal,
+                entry,
+                snapshot,
+                active_weight_state,
+                market_condition,
+                runtime_disabled=_runtime_disabled(entry, active_config),
+            )
+        )
     return signals
+
+
+def _runtime_disabled(entry: WeightedVotingStrategyCatalogEntry, config: WeightedVotingConfig) -> bool:
+    """Whether settings have switched this strategy off for now.
+
+    Operators can disable a strategy through dynamic settings, and that state was
+    resolved and reported all the way into the decision's settings snapshot but never
+    read here, so a strategy switched off in settings kept voting while every surface
+    showed it as disabled.
+
+    This can only ever take a vote away. The catalogue lifecycle decides whether a
+    strategy may vote at all, and settings must not be able to widen that -- otherwise
+    flipping a runtime flag would put a shadow strategy on capital without any of the
+    evidence the promotion gate demands.
+    """
+    state = str(config.strategy_states.get(entry.strategy_id, "active")).strip().lower()
+    if state and state != "active":
+        return True
+    return not bool(config.strategy_enablement.get(entry.strategy_id, True))
 
 
 def waiting_signals(snapshot: WeightedVotingMarketSnapshot) -> list[WeightedVotingSignal]:
@@ -95,14 +123,16 @@ def _standardize_strategy_signal(
     snapshot: WeightedVotingMarketSnapshot,
     active_weight_state: WeightedWeightState | None,
     market_condition: WeightedMarketCondition | None,
+    runtime_disabled: bool = False,
 ) -> WeightedVotingSignal:
     if signal.strategy_id != entry.strategy_id:
         raise ValueError(f"strategy {entry.strategy_id} returned signal for {signal.strategy_id}")
+    votes = entry.contributes_to_vote and not runtime_disabled
     base_weight = entry.baseline_weight
-    active_weight = _active_weight(entry, active_weight_state) if entry.contributes_to_vote else 0.0
+    active_weight = _active_weight(entry, active_weight_state) if votes else 0.0
     market_condition_fit = _market_condition_fit(entry, market_condition)
     data_ready = _data_ready(signal, entry, snapshot)
-    eligible = bool(entry.contributes_to_vote and signal.eligible and data_ready and _direction_allowed(signal, entry))
+    eligible = bool(votes and signal.eligible and data_ready and _direction_allowed(signal, entry))
     active = bool(eligible and active_weight > 0 and market_condition_fit > 0)
     final_weight = min(entry.maximum_weight, active_weight * market_condition_fit) if active else 0.0
     reasons = list(signal.reason_codes)
@@ -110,6 +140,8 @@ def _standardize_strategy_signal(
         reasons.append("weighted_voting.signal_engine.strategy_shadow_observed_zero_weight")
     if entry.lifecycle in ("disabled", "retired"):
         reasons.append("weighted_voting.signal_engine.strategy_disabled")
+    if runtime_disabled:
+        reasons.append("weighted_voting.signal_engine.strategy_disabled_by_settings")
     if entry.lifecycle == "not_data_ready":
         reasons.append("weighted_voting.signal_engine.strategy_lifecycle_not_data_ready")
     if not data_ready:
@@ -131,7 +163,7 @@ def _standardize_strategy_signal(
             "hold_probability": signal.p_hold,
             "confidence": signal.directional_confidence,
             "expected_return_before_costs": signal.expected_return,
-            "base_weight": base_weight if entry.contributes_to_vote else 0.0,
+            "base_weight": base_weight if votes else 0.0,
             "active_weight": active_weight,
             "final_weight": round(final_weight, 10),
             "eligible": eligible,
@@ -139,7 +171,7 @@ def _standardize_strategy_signal(
             "data_ready": data_ready,
             "market_condition_fit": market_condition_fit,
             "reason_codes": tuple(dict.fromkeys(reasons)),
-            "feature_snapshot": _feature_snapshot(signal, entry, snapshot, market_condition),
+            "feature_snapshot": _feature_snapshot(signal, entry, snapshot, market_condition, runtime_disabled),
         }
     )
 
@@ -174,6 +206,7 @@ def _feature_snapshot(
     entry: WeightedVotingStrategyCatalogEntry,
     snapshot: WeightedVotingMarketSnapshot,
     market_condition: WeightedMarketCondition | None,
+    runtime_disabled: bool = False,
 ) -> dict[str, float | str | bool | None]:
     latest = snapshot.one_minute_candles[-1] if snapshot.one_minute_candles else None
     features: dict[str, float | str | bool | None] = {
@@ -184,6 +217,7 @@ def _feature_snapshot(
         "strategy_family": _enum_value(entry.family),
         "strategy_executes": entry.executes,
         "strategy_contributes_to_vote": entry.contributes_to_vote,
+        "strategy_runtime_disabled": runtime_disabled,
         "shadow_performance_state": f"weighted_voting.strategies.{entry.strategy_id}.shadow_performance" if entry.shadow_records_only else None,
         "pairwise_signal_correlation_state": f"weighted_voting.performance_tracker.pairwise_signal_correlation.{entry.strategy_id}",
         "pairwise_return_correlation_state": f"weighted_voting.performance_tracker.pairwise_return_correlation.{entry.strategy_id}",
