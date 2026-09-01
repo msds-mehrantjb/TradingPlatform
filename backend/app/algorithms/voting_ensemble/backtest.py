@@ -15,6 +15,10 @@ from backend.app.algorithms.voting_ensemble.models import AlgoSignal, VotingCand
 from backend.app.algorithms.voting_ensemble.exit_policy import VotingEnsembleExecutionSimulator, exit_policy_reason_codes
 from backend.app.algorithms.voting_ensemble.pipeline import VotingEnsemblePipeline
 from backend.app.algorithms.voting_ensemble.profit_target_policy import profit_target_reason_codes
+from backend.app.algorithms.voting_ensemble.session_segments import (
+    resolve_session_segment,
+    session_segment_boundaries_from_payload,
+)
 from backend.app.algorithms.voting_ensemble.snapshot.builder import build_backtest_snapshot
 from backend.app.algorithms.voting_ensemble.stop_loss_policy import stop_loss_reason_codes
 from backend.app.algorithms.voting_ensemble.strategies.registry import (
@@ -219,6 +223,10 @@ class VotingEnsembleBacktestRunner:
                 # is what lets the daily-loss, drawdown and exposure gates actually bind.
                 "accountRiskSnapshot": account,
                 "operationalHealthSnapshot": self._operational_snapshot(),
+                # Only the segment: setting `phase` here would reach the regime
+                # classifier, which reads that key, and would move replay output for
+                # reasons that have nothing to do with sessions.
+                "sessionState": {"sessionSegment": self._session_segment_at(timestamp)},
             },
         }
         snapshot = build_backtest_snapshot(payload)
@@ -234,6 +242,13 @@ class VotingEnsembleBacktestRunner:
             decision["pipeline_envelope"] = {key: value for key, value in envelope.items() if key != "decision"}
             return decision
         return self.service.evaluate(evaluate_payload)
+
+    def _session_segment_at(self, timestamp: datetime) -> str:
+        """Resolve the segment for this bar with the same module the live path uses."""
+        return resolve_session_segment(
+            timestamp,
+            boundaries=session_segment_boundaries_from_payload(getattr(self.config, "sessionSegments", None)),
+        )
 
     def _operational_snapshot(self) -> dict[str, Any]:
         """The operational posture this replay assumes, with the configured overrides."""

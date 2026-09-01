@@ -23,6 +23,10 @@ _EXCHANGE_TIMEZONE = ZoneInfo("America/New_York")
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.app.algorithms.voting_ensemble.session_segments import (
+    resolve_session_segment,
+    session_segment_boundaries_from_payload,
+)
 from backend.app.algorithms.voting_ensemble.snapshot.builder import build_point_in_time_snapshot
 from backend.app.algorithms.voting_ensemble.runtime.commands import (
     VOTING_ENSEMBLE_EVALUATION_RESULT_CONTRACT_VERSION,
@@ -569,7 +573,7 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
             "settings": settings.model_dump(mode="json"),
             "marketEvent": event.snapshot(),
             "sourceAuthority": event.sourceAuthority,
-            "sessionState": _session_state(market_status),
+            "sessionState": _session_state(market_status, settings=settings, bar_end=_utc(event.barEndTimestamp)),
             # The economic-event key the snapshot builder reads. Without it _event_state
             # produced an empty dict, so the blackout gate and the 32 event policies could
             # never fire on the automatic path no matter what was on the calendar.
@@ -1154,14 +1158,34 @@ def _operational_snapshot(
     }
 
 
-def _session_state(market_status: dict[str, Any]) -> dict[str, Any]:
+def _session_state(market_status: dict[str, Any], *, settings: Any = None, bar_end: datetime | None = None) -> dict[str, Any]:
     market_open = bool(market_status.get("isOpen"))
-    return {
+    state = {
         "phase": "regular" if market_open else "closed",
         "marketClosed": not market_open,
         "marketStatus": "open" if market_open else str(market_status.get("status") or "closed"),
         "backendClock": market_status,
     }
+    if bar_end is not None:
+        # The label the session policy keys on. `phase` is left exactly as it was:
+        # the regime classifier reads that key, and repurposing it would change
+        # regime output as a side effect of adding a session label.
+        state["sessionSegment"] = resolve_session_segment(
+            bar_end,
+            boundaries=session_segment_boundaries_from_payload(_session_segment_config(settings)),
+        )
+    return state
+
+
+def _session_segment_config(settings: Any) -> dict[str, Any] | None:
+    """The configured segment boundaries, if the settings carry any."""
+    windows = getattr(settings, "sessionWindows", None)
+    payload = getattr(windows, "sessionSegments", None) if windows is not None else None
+    if payload is None:
+        payload = getattr(settings, "sessionSegments", None)
+    if hasattr(payload, "model_dump"):
+        return payload.model_dump(mode="json")
+    return payload if isinstance(payload, dict) else None
 
 
 def _prior_day_levels(candles: list[dict[str, Any]], event: VotingEnsembleFinalizedBarMarketEvent) -> dict[str, Any]:

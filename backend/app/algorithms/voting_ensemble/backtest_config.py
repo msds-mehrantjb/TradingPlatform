@@ -56,6 +56,9 @@ class VotingEnsembleBacktestConfig(DomainModel):
     # trading was enabled and in paper mode. Market-open, entry-window and session
     # validity are deliberately left out, so they keep deriving from the bars being
     # replayed and those gates still bind.
+    # Exchange-local segment boundaries, so a replay can reproduce a live run that
+    # used non-default ones. Shared with the live producer, not a second copy.
+    sessionSegments: dict[str, Any] | None = None
     operationalHealth: dict[str, Any] | None = None
     sessionPolicy: dict[str, Any] | None = None
     eventCalendar: dict[str, Any] | None = None
