@@ -16,11 +16,6 @@ WEIGHTED_VOTING_CATALOG_VERSION = WEIGHTED_VOTING_STRATEGY_VERSION
 _UNASSIGNED_BASELINE_WEIGHT = 0.0
 WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT = 0.02
 WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT = 0.35
-WEIGHTED_VOTING_DEFAULT_ELIGIBLE_MARKET_CONDITIONS = (
-    "clean",
-    "mixed",
-    "strategy_specific_permissions",
-)
 WeightedVotingStrategyLifecycleStatus = Literal["active", "shadow", "disabled", "not_data_ready", "retired"]
 WEIGHTED_VOTING_PAIRWISE_SIGNAL_CORRELATION_NAMESPACE = "weighted_voting.performance_tracker.pairwise_signal_correlation"
 WEIGHTED_VOTING_PAIRWISE_RETURN_CORRELATION_NAMESPACE = "weighted_voting.performance_tracker.pairwise_return_correlation"
@@ -51,7 +46,6 @@ class WeightedVotingStrategyCatalogEntry:
     baseline_weight: float = _UNASSIGNED_BASELINE_WEIGHT
     minimum_weight: float = WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT
     maximum_weight: float = WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT
-    eligible_market_conditions: tuple[str, ...] = WEIGHTED_VOTING_DEFAULT_ELIGIBLE_MARKET_CONDITIONS
     long_allowed: bool = True
     short_allowed: bool = True
 
@@ -101,8 +95,10 @@ class WeightedVotingDedicatedStrategyInventoryItem:
     minimum_weight: float
     maximum_weight: float
     required_data: tuple[str, ...]
+    optional_data: tuple[str, ...]
     eligible_sessions: tuple[str, ...]
-    eligible_market_conditions: tuple[str, ...]
+    invalid_market_conditions: tuple[str, ...]
+    data_quality_classification: str
     long_allowed: bool
     short_allowed: bool
     module_name: str
@@ -495,8 +491,10 @@ def weighted_voting_dedicated_strategy_inventory() -> tuple[WeightedVotingDedica
             minimum_weight=entry.minimum_weight,
             maximum_weight=entry.maximum_weight,
             required_data=entry.required_data,
+            optional_data=entry.optional_data,
             eligible_sessions=entry.eligible_sessions,
-            eligible_market_conditions=entry.eligible_market_conditions,
+            invalid_market_conditions=entry.invalid_market_conditions,
+            data_quality_classification=entry.data_quality_classification,
             long_allowed=entry.long_allowed,
             short_allowed=entry.short_allowed,
             module_name=entry.module_name,
@@ -573,7 +571,6 @@ WEIGHTED_VOTING_MODULE_INVENTORY = weighted_voting_module_inventory()
 __all__ = [
     "WEIGHTED_VOTING_BASELINE_STRATEGY_WEIGHT",
     "WEIGHTED_VOTING_CATALOG_VERSION",
-    "WEIGHTED_VOTING_DEFAULT_ELIGIBLE_MARKET_CONDITIONS",
     "WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT",
     "WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT",
     "WEIGHTED_VOTING_MODULE_INVENTORY",

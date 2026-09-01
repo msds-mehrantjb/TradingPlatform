@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import inspect
 import pkgutil
@@ -15,6 +16,8 @@ from backend.app.algorithms.weighted_voting.catalog import (
     WEIGHTED_VOTING_ACTIVE_STRATEGY_IDS,
     WEIGHTED_VOTING_SHADOW_STRATEGY_IDS,
     WEIGHTED_VOTING_STRATEGY_CATALOG,
+    WeightedVotingDedicatedStrategyInventoryItem,
+    WeightedVotingStrategyCatalogEntry,
     weighted_voting_active_strategy_catalog,
     weighted_voting_dedicated_strategy_inventory,
     weighted_voting_enabled_strategy_catalog,
@@ -208,11 +211,43 @@ class WeightedVotingStrategyCatalogTest(unittest.TestCase):
                 self.assertEqual(entry.minimum_weight, WEIGHTED_VOTING_MINIMUM_STRATEGY_WEIGHT)
                 self.assertEqual(entry.maximum_weight, WEIGHTED_VOTING_MAXIMUM_STRATEGY_WEIGHT)
                 self.assertEqual(entry.eligible_sessions, (entry.valid_session_window,))
-                self.assertTrue(entry.eligible_market_conditions)
                 self.assertTrue(entry.long_allowed)
                 self.assertTrue(entry.short_allowed)
                 self.assertEqual(entry.strategy_implementation_version, entry.version)
                 self.assertEqual(entry.dedicated_file, f"backend/app/algorithms/weighted_voting/strategies/{entry.module_name}.py")
+
+    def test_every_catalogue_field_is_either_enforced_or_published(self) -> None:
+        """A field that neither changes behaviour nor reaches anyone is not documentation.
+
+        Four fields used to sit in the catalogue with no consumer at all, and one of them --
+        a uniform "eligible market conditions" list identical across every strategy -- read
+        like a permission the engine checked. Each field now has to be one thing or the
+        other, and adding a new one forces that choice.
+        """
+        enforced = {
+            # read by the signal engine or the strategy modules themselves
+            "strategy_id", "name", "family", "module_name", "minimum_warmup",
+            "valid_session_window", "lifecycle", "enabled", "baseline_weight",
+            "minimum_weight", "maximum_weight", "long_allowed", "short_allowed",
+            "version", "lifecycle_reason",
+        }
+        published_as = {
+            "purpose": "explanation",
+            "buy_rule": "buy_conditions",
+            "sell_rule": "sell_conditions",
+            "hold_rule": "hold_conditions",
+            "confidence_components": "confidence_calculation",
+            "invalidation_condition": "invalidation_level",
+        }
+        item_fields = {field.name for field in dataclasses.fields(WeightedVotingDedicatedStrategyInventoryItem)}
+
+        for field in dataclasses.fields(WeightedVotingStrategyCatalogEntry):
+            with self.subTest(field=field.name):
+                surfaced = field.name in item_fields or published_as.get(field.name) in item_fields
+                self.assertTrue(
+                    field.name in enforced or surfaced,
+                    f"{field.name} is neither enforced by the engine nor published in the inventory",
+                )
 
     def test_catalog_is_authoritative_for_enabled_and_active_strategies(self) -> None:
         enabled = weighted_voting_enabled_strategy_catalog()
@@ -277,7 +312,9 @@ class WeightedVotingStrategyCatalogTest(unittest.TestCase):
             "data_readiness_checks",
             "market_condition_permissions",
             "eligible_sessions",
-            "eligible_market_conditions",
+            "optional_data",
+            "invalid_market_conditions",
+            "data_quality_classification",
             "entry_conditions",
             "buy_conditions",
             "sell_conditions",
