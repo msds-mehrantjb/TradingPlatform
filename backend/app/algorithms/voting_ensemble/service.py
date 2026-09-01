@@ -15,6 +15,10 @@ from backend.app.algorithms.voting_ensemble.reliability.models import (
     VotingEnsembleReliabilityObservation,
 )
 from backend.app.algorithms.voting_ensemble.execution_adapter import VotingEnsembleExecutionAdapter
+from backend.app.algorithms.voting_ensemble.session_policy import (
+    apply_session_policy,
+    session_policy_from_payload,
+)
 from backend.app.algorithms.voting_ensemble.execution_economics import build_execution_economics
 from backend.app.algorithms.voting_ensemble.gates import VotingEnsembleLocalGateEngine
 from backend.app.algorithms.voting_ensemble.intelligence_capture import VotingEnsembleCaptureWriter, capture_operational_event, capture_voting_ensemble_evaluation
@@ -253,6 +257,15 @@ class VotingEnsembleService:
         context_signals = context_result.active
         shadow_context_signals = context_result.shadow
         strategy_duration_ms = _elapsed_ms(strategy_started)
+        # Session policy sits above the voters: every strategy has already evaluated and
+        # kept its reasoning, and this only decides whose vote counts in this segment.
+        # Blocked votes are marked ineligible rather than dropped, so the decision record
+        # still shows what they said and why they did not count.
+        directional_votes, session_policy_decision = apply_session_policy(
+            directional_votes,
+            session_segment=_session_segment(snapshot),
+            settings=session_policy_from_payload(_session_policy_payload(payload, settings)),
+        )
         eligible_votes = tuple(vote for vote in directional_votes if vote.eligible and vote.dataReady)
         counts = _counts(directional_votes)
         eligible_counts = _counts(eligible_votes)
@@ -906,6 +919,25 @@ def reliability_scope(snapshot: VotingEnsembleEvaluationSnapshot, regime_state: 
         "sessionSegment": _session_segment(snapshot),
         "volatilityState": str(regime_state.volatility).lower(),
     }
+
+
+def _session_policy_payload(payload: dict[str, Any], settings: Any) -> dict[str, Any] | None:
+    """Where the session policy is configured.
+
+    A caller-supplied policy wins so replay and backtest can pin the exact policy a
+    recorded run used, rather than picking up whatever the live settings happen to say
+    at the moment the replay is executed.
+    """
+    context = payload.get("market_context") if isinstance(payload.get("market_context"), dict) else {}
+    for candidate in (
+        payload.get("session_policy"),
+        payload.get("sessionPolicy"),
+        context.get("sessionPolicy"),
+        getattr(settings, "sessionPolicy", None),
+    ):
+        if isinstance(candidate, dict):
+            return candidate
+    return None
 
 
 def _session_segment(snapshot: VotingEnsembleEvaluationSnapshot) -> str:
