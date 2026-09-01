@@ -15,6 +15,7 @@ from backend.app.algorithms.voting_ensemble.runtime.queue import VotingEnsembleP
 from backend.app.algorithms.voting_ensemble.runtime.status_store import VotingEnsembleStatusStore
 from backend.app.algorithms.voting_ensemble.pipeline import VotingEnsemblePipeline
 from backend.app.algorithms.voting_ensemble.reliability_feed import build_reliability_observations
+from backend.app.market_feed import active_instrument
 from backend.app.algorithms.voting_ensemble.paper_execution import VOTING_ENSEMBLE_PAPER_EXECUTION_RUNTIME, VotingEnsemblePaperExecutionRuntime
 from backend.app.tick_data import parse_timestamp
 
@@ -46,6 +47,7 @@ class VotingEnsembleWorker:
         backtesting_adapter: "VotingEnsembleBacktestingAdapter | None" = None,
         paper_execution_runtime: VotingEnsemblePaperExecutionRuntime | None = None,
         automatic_payload_builder: VotingEnsembleAutomaticPayloadBuilder | None = None,
+        quote_client: Any | None = None,
     ) -> None:
         self.queue = queue
         self.status_store = status_store
@@ -53,7 +55,10 @@ class VotingEnsembleWorker:
         self.backtesting_adapter = backtesting_adapter or _default_backtesting_adapter()
         self.paper_execution_runtime = paper_execution_runtime or VOTING_ENSEMBLE_PAPER_EXECUTION_RUNTIME
         self.automatic_payload_builder = automatic_payload_builder
-        self.quote_client = AlpacaClient(get_settings())
+        # Injected so the worker uses whatever source the app is on. Building its own
+        # client here meant an app-wide feed switch never reached this path; the
+        # default keeps existing callers working.
+        self.quote_client = quote_client or AlpacaClient(get_settings())
 
     def _payload_with_reliability_history(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Attach realised per-strategy outcomes so accuracy weighting has evidence.
@@ -218,8 +223,11 @@ class VotingEnsembleWorker:
         raise ValueError(f"Unsupported Voting Ensemble command kind: {command.commandKind}")
 
     def _payload_with_fresh_nbbo(self, payload: dict[str, Any]) -> dict[str, Any]:
-        symbol = str(payload.get("symbol") or "SPY").upper()
-        feed = str(payload.get("feed") or payload.get("marketDataFeed") or "iex").lower()
+        # Fall back to the active instrument rather than a hardcoded SPY/iex, so a
+        # payload that does not name them still quotes what the app is actually on.
+        active = active_instrument()
+        symbol = str(payload.get("symbol") or active.symbol).upper()
+        feed = str(payload.get("feed") or payload.get("marketDataFeed") or active.feed).lower()
         try:
             quote = self.quote_client.get_latest_quote_sync(symbol=symbol, feed=feed)
         except Exception:

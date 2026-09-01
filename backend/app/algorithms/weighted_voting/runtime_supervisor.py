@@ -1051,7 +1051,14 @@ class WeightedVotingRuntimeSupervisor:
         rollout_validation: WeightedVotingRolloutValidation | None = None,
         position_manager: WeightedVotingPositionManagerService | None = None,
         finalized_bar_producer: WeightedVotingFinalizedBarProducer | None = None,
+        market_data_client: Any | None = None,
+        candle_store: Any | None = None,
     ) -> None:
+        # Injected so the bar producer reads the source the app is on. It used to build
+        # its own AlpacaClient, which no feed switch could reach. Both default to the
+        # previous behaviour when a caller does not supply them.
+        self.market_data_client = market_data_client
+        self.candle_store = candle_store
         self.store = store or WeightedVotingFilesystemStateStore()
         self.weighted_config = weighted_config or WeightedVotingConfig()
         self.config = config or WeightedVotingRuntimeConfig(paper_execution_mode=self.weighted_config.paper_execution_mode)
@@ -1304,7 +1311,7 @@ class WeightedVotingRuntimeSupervisor:
             from backend.app.database import CandleStore
 
             settings = get_settings()
-            candle_store = CandleStore(settings)
+            candle_store = self.candle_store or CandleStore(settings)
             config = WeightedVotingFinalizedBarProducerConfig(
                 symbols=tuple(symbol.upper() for symbol in self.config.symbols),
                 fetch_limit=self.config.market_data_fetch_limit,
@@ -1313,7 +1320,7 @@ class WeightedVotingRuntimeSupervisor:
                 max_staleness_seconds=self.config.max_queue_lag_seconds,
             )
             return WeightedVotingFinalizedBarProducer(
-                market_data_client=AlpacaClient(settings),
+                market_data_client=self.market_data_client or AlpacaClient(settings),
                 candle_store=candle_store,
                 publish_event=self.publish_finalised_bar,
                 config=config,

@@ -50,6 +50,7 @@ class VotingEnsembleRuntimeOrchestrator:
         status_store_path: str | None = None,
         paper_execution_runtime: VotingEnsemblePaperExecutionRuntime | None = None,
         automatic_payload_builder: VotingEnsembleAutomaticPayloadBuilder | None = None,
+        quote_client: Any | None = None,
     ) -> None:
         persistence_path = status_store_path if status_store_path is not None else (default_status_store_path() if auto_start else None)
         self.status_store = status_store or VotingEnsembleStatusStore(persistence_path=persistence_path)
@@ -60,6 +61,7 @@ class VotingEnsembleRuntimeOrchestrator:
             service=service,
             paper_execution_runtime=paper_execution_runtime,
             automatic_payload_builder=automatic_payload_builder,
+            quote_client=quote_client,
         )
         self.paper_execution_runtime = self.worker.paper_execution_runtime
         self.in_process_adapter = InProcessVotingEnsembleWorkerAdapter(self.worker)
