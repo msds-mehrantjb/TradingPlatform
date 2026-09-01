@@ -45,7 +45,7 @@ class WcaStep6InventoryPersistenceTests(unittest.TestCase):
 
             self.assertEqual(migration_count, 1)
             self.assertTrue(set(WCA_PERSISTENCE_TABLES).issubset(tables))
-            self.assertEqual(len(WCA_PERSISTENCE_RECORD_INVENTORY), 44)
+            self.assertEqual(len(WCA_PERSISTENCE_RECORD_INVENTORY), 49)
             self.assertIn("wca_runtime_control", WCA_PERSISTENCE_TABLES)
             self.assert_primary_key(conn, "wca_finalized_bar_event_receipts", "event_id")
             self.assert_primary_key(conn, "wca_decisions", "decision_id")
@@ -99,8 +99,14 @@ class WcaStep6InventoryPersistenceTests(unittest.TestCase):
         self.assertGreater(counts["wca_modifier_evaluations"], 0)
         self.assertGreater(counts["wca_global_risk_responses"], 0)
         self.assertGreater(counts["wca_order_intents"], 0)
-        self.assertTrue(repository.create_execution_outbox_record(decision, account_id="paper", idempotency_key="outbox-key", final_validation_context=validation_context(decision)))
-        self.assertFalse(repository.create_execution_outbox_record(decision, account_id="paper", idempotency_key="outbox-key", final_validation_context=validation_context(decision)))
+        # The outbox record carries the order's own idempotency key. Production keeps the
+        # two identical -- service.py derives the outbox key as
+        # "proposed.idempotency_key or <generated>" and writes it back onto the order -- and
+        # applying a fill rejects any outbox row whose key disagrees with the order it claims
+        # to belong to. A different literal here builds a state the system does not produce.
+        outbox_key = decision.proposed_order.idempotency_key
+        self.assertTrue(repository.create_execution_outbox_record(decision, account_id="paper", idempotency_key=outbox_key, final_validation_context=validation_context(decision)))
+        self.assertFalse(repository.create_execution_outbox_record(decision, account_id="paper", idempotency_key=outbox_key, final_validation_context=validation_context(decision)))
         self.assertTrue(repository.record_broker_order(decision, broker_order_id="broker-order-1", account_id="paper", idempotency_key="broker-key", status="accepted"))
         self.assertFalse(repository.record_broker_order(decision, broker_order_id="broker-order-1", account_id="paper", idempotency_key="broker-key", status="accepted"))
         self.assertTrue(repository.apply_fill_and_update_position(decision, fill_id="fill-1", account_id="paper", quantity=5, broker_order_id="broker-order-1"))

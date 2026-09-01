@@ -74,6 +74,13 @@ class WcaStep17PersistenceTests(unittest.TestCase):
             "inventory_projection",
             "daily_state_projection",
             "broker_account_snapshots",
+            # The local paper broker owns its own account, positions, lots, orders and
+            # fills. All five are wca_-prefixed tables written through this repository.
+            "local_paper_account",
+            "local_positions",
+            "local_lots",
+            "local_orders",
+            "local_fills",
             "exit_state",
             "reconciliation_results",
             "runtime_health",

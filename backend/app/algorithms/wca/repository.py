@@ -2702,7 +2702,12 @@ class WcaSqliteRepository:
             else:
                 order_outbox_id = str(order_row["outbox_id"])
                 order_idempotency_key = str(order_row["idempotency_key"] or "")
-                order_client_order_id = str(order_row["client_order_id"] or "")
+                # Same fallback the no-outbox-row branch above applies. An outbox row can
+                # legitimately carry no client order id -- create_execution_outbox_record
+                # only copies one if the order intent already had it -- while every table the
+                # fill writes CHECKs client_order_id non-empty. Without this the fill failed
+                # on a constraint that had nothing to do with the fill.
+                order_client_order_id = str(order_row["client_order_id"] or "") or proposed.idempotency_key or order_outbox_id
             if order_idempotency_key != proposed.idempotency_key:
                 raise ValueError("WCA fill idempotency key does not match the WCA order")
             if not client_order_id:
