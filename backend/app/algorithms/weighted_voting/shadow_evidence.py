@@ -189,6 +189,7 @@ class WeightedVotingShadowEvidenceResult:
     evidence: WeightedVotingStrategyLifecycleEvidence
     trades: tuple[WeightedVotingShadowTrade, ...]
     observation_count: int
+    comparison: Any | None
     unavailable_metrics: tuple[str, ...]
     reason_codes: tuple[str, ...]
     explanation: str
@@ -521,7 +522,12 @@ def build_shadow_evidence(
     trades = simulate_shadow_trades(own, candles, strategy_id=strategy_id, cost_model=cost_model)
     returns = [trade.r_multiple for trade in trades]
 
-    unavailable: list[str] = list(WEIGHTED_VOTING_SHADOW_LIVE_ONLY_METRICS)
+    comparison = compare_paper_against_backtest(
+        strategy_id, observations=own, candles=candles, cost_model=cost_model
+    )
+    unavailable: list[str] = [] if comparison else list(WEIGHTED_VOTING_SHADOW_LIVE_ONLY_METRICS)
+    paper_shadow_stability = comparison.paper_shadow_stability if comparison else WEIGHTED_VOTING_SHADOW_UNAVAILABLE_STABILITY
+    paper_backtest_divergence = comparison.paper_backtest_divergence if comparison else WEIGHTED_VOTING_SHADOW_UNAVAILABLE_DIVERGENCE
     correlation = _peer_correlation(strategy_id, own, peer_observations or {})
     if correlation is None:
         unavailable.append("correlation_with_active_strategies")
@@ -544,8 +550,7 @@ def build_shadow_evidence(
         mfe_quality=round(_mfe_quality(trades), 10),
         walk_forward_stability=round(_walk_forward_stability(returns), 10),
         holdout_stability=round(_holdout_stability(returns), 10),
-        # Only a real live-versus-backtest comparison can establish this one.
-        paper_shadow_stability=WEIGHTED_VOTING_SHADOW_UNAVAILABLE_STABILITY,
+        paper_shadow_stability=paper_shadow_stability,
         session_consistency=round(_label_consistency(trades, "session_label"), 10),
         regime_consistency=round(_label_consistency(trades, "regime_label"), 10),
         severe_tail_loss_pattern=any(value <= WEIGHTED_VOTING_SHADOW_SEVERE_TAIL_LOSS_R for value in returns),
@@ -555,7 +560,7 @@ def build_shadow_evidence(
         recent_net_expectancy_after_costs=round(_recent_expectancy(returns), 10),
         data_readiness_rate=round(_ratio(own, lambda item: item.data_ready), 10),
         execution_cost_edge_ratio=round(_cost_edge_ratio(trades), 10),
-        paper_backtest_divergence=WEIGHTED_VOTING_SHADOW_UNAVAILABLE_DIVERGENCE,
+        paper_backtest_divergence=paper_backtest_divergence,
         strategy_error_rate=round(_ratio(own, lambda item: item.errored), 10),
     )
     missing = tuple(dict.fromkeys(unavailable))
@@ -564,6 +569,7 @@ def build_shadow_evidence(
         evidence=evidence,
         trades=trades,
         observation_count=len(own),
+        comparison=comparison,
         unavailable_metrics=missing,
         reason_codes=tuple(f"weighted_voting.shadow_evidence.unavailable.{name}" for name in missing),
         explanation=(
@@ -821,4 +827,206 @@ def shadow_evidence_report(store: Any, *, candles: Sequence[Any], evaluated_at: 
         "evidenceVersion": WEIGHTED_VOTING_SHADOW_EVIDENCE_VERSION,
         "liveOnlyMetrics": list(WEIGHTED_VOTING_SHADOW_LIVE_ONLY_METRICS),
         "strategies": [review.as_dict() for review in reviews],
+    }
+
+
+# ------------------------------------------------- paper versus backtest comparison
+
+# How far apart a live shadow record and a backtest of the same bars may drift before the
+# live behaviour stops being evidence for anything. Divergence is reported as a fraction, so
+# 1.0 means the two arms share no ground at all.
+WEIGHTED_VOTING_SHADOW_MINIMUM_COMPARABLE_BARS = 30
+WEIGHTED_VOTING_SHADOW_MINIMUM_COMPARABLE_TRADES = 5
+
+
+@dataclass(frozen=True)
+class WeightedVotingPaperBacktestComparison:
+    """Live shadow behaviour measured against a backtest of the same bars."""
+
+    strategy_id: str
+    compared_bars: int
+    live_trades: int
+    backtest_trades: int
+    direction_agreement: float
+    live_expectancy: float
+    backtest_expectancy: float
+    paper_shadow_stability: float
+    paper_backtest_divergence: float
+    explanation: str
+
+
+def replay_shadow_observations(
+    strategy_id: str,
+    candles: Sequence[Any],
+    *,
+    config: Any | None = None,
+    symbol: str = "SPY",
+    warmup: int | None = None,
+) -> list[WeightedVotingShadowObservation]:
+    """What the strategy would have signalled bar by bar, from historical candles alone.
+
+    This is the backtest arm. It drives the real strategy module through the production
+    snapshot builder rather than a replica, so the only thing that differs from the live
+    arm is where the market data came from -- which is exactly the gap the comparison is
+    supposed to measure.
+    """
+    from backend.app.algorithms.weighted_voting.config import WeightedVotingConfig
+    from backend.app.algorithms.weighted_voting.market_snapshot import build_weighted_voting_market_snapshot
+    from backend.app.algorithms.weighted_voting.signal_engine import WEIGHTED_VOTING_STRATEGY_CLASS_BY_ID
+
+    from backend.app.algorithms.weighted_voting.strategies.common import eastern_datetime
+
+    entry = weighted_voting_catalog_entry(strategy_id)
+    strategy = WEIGHTED_VOTING_STRATEGY_CLASS_BY_ID[strategy_id](config or WeightedVotingConfig())
+    start = max(1, warmup if warmup is not None else entry.minimum_warmup)
+    ordered = sorted(candles, key=lambda candle: _utc(candle.timestamp))
+    observations: list[WeightedVotingShadowObservation] = []
+
+    # Replay one session at a time. The live runtime hands a strategy the current session's
+    # bars, and session-scoped values -- VWAP, the opening range -- mean a window spanning
+    # several days would compute different numbers than the live arm ever saw, so the two
+    # arms would not be comparable. It also keeps this linear in the number of sessions
+    # instead of quadratic in the whole candle history.
+    sessions: dict[Any, list[Any]] = {}
+    for candle in ordered:
+        sessions.setdefault(eastern_datetime(_utc(candle.timestamp)).date(), []).append(candle)
+
+    for session_candles in sessions.values():
+        for index in range(start, len(session_candles)):
+            observations.extend(
+                _replay_one_bar(strategy, session_candles[: index + 1], symbol=symbol)
+            )
+    return observations
+
+
+def _replay_one_bar(strategy: Any, window: Sequence[Any], *, symbol: str) -> list[WeightedVotingShadowObservation]:
+    """Evaluate one strategy on one bar, given that bar and the session so far."""
+    from backend.app.algorithms.weighted_voting.market_snapshot import build_weighted_voting_market_snapshot
+
+    latest = window[-1]
+    spread = max(0.02, float(latest.close) * 0.0002)
+    try:
+        snapshot = build_weighted_voting_market_snapshot(
+            {
+                "symbol": symbol,
+                "candles": [_candle_row(candle) for candle in window],
+                "data_timestamp": _utc(latest.timestamp).isoformat(),
+                "bid": round(float(latest.close) - spread / 2.0, 10),
+                "ask": round(float(latest.close) + spread / 2.0, 10),
+            }
+        )
+        signal = strategy.evaluate(snapshot)
+    except Exception:
+        # A bar the replay cannot build is dropped rather than recorded as a Hold: a
+        # fabricated Hold would count as agreement with whatever the live arm did.
+        return []
+    return [
+        observation_from_signal(
+            signal,
+            session_label=str(getattr(snapshot, "session_phase", "unknown") or "unknown"),
+            regime_label="replay",
+            reference_close=float(latest.close),
+        )
+    ]
+
+
+def compare_paper_against_backtest(
+    strategy_id: str,
+    *,
+    observations: Sequence[WeightedVotingShadowObservation],
+    candles: Sequence[Any],
+    config: Any | None = None,
+    symbol: str = "SPY",
+    cost_model: WeightedBacktestExecutionCostModel | None = None,
+) -> WeightedVotingPaperBacktestComparison | None:
+    """Compare the recorded live shadow record against a backtest of the same bars.
+
+    Returns None when there is not enough overlap to say anything, which leaves both
+    metrics at their failing values. An unestablished comparison must never read as a
+    passing one, so a thin sample is reported as absent rather than as agreement.
+    """
+    live = [item for item in observations if item.strategy_id == strategy_id]
+    if not live:
+        return None
+
+    # Only bars the live record actually covers can be compared; a backtest over a wider
+    # window would be measuring a different period, not a divergence.
+    live_by_timestamp = {item.data_timestamp: item for item in live}
+    window = [candle for candle in candles if _utc(candle.timestamp) in live_by_timestamp]
+    if len(window) < WEIGHTED_VOTING_SHADOW_MINIMUM_COMPARABLE_BARS:
+        return None
+
+    # Check the live arm before replaying. The replay evaluates the strategy on every bar,
+    # which is by far the most expensive step here, and a live record that cannot produce
+    # enough trades to compare rules the comparison out on its own.
+    if len(simulate_shadow_trades(live, candles, strategy_id=strategy_id, cost_model=cost_model)) < WEIGHTED_VOTING_SHADOW_MINIMUM_COMPARABLE_TRADES:
+        return None
+
+    replay = replay_shadow_observations(strategy_id, candles, config=config, symbol=symbol)
+    replay_by_timestamp = {item.data_timestamp: item for item in replay}
+    shared = sorted(set(live_by_timestamp) & set(replay_by_timestamp))
+    if len(shared) < WEIGHTED_VOTING_SHADOW_MINIMUM_COMPARABLE_BARS:
+        return None
+
+    agreement = sum(
+        1 for stamp in shared if live_by_timestamp[stamp].signal == replay_by_timestamp[stamp].signal
+    ) / len(shared)
+
+    live_trades = simulate_shadow_trades(
+        [live_by_timestamp[stamp] for stamp in shared], candles, strategy_id=strategy_id, cost_model=cost_model
+    )
+    backtest_trades = simulate_shadow_trades(
+        [replay_by_timestamp[stamp] for stamp in shared], candles, strategy_id=strategy_id, cost_model=cost_model
+    )
+    if len(live_trades) < WEIGHTED_VOTING_SHADOW_MINIMUM_COMPARABLE_TRADES or len(backtest_trades) < WEIGHTED_VOTING_SHADOW_MINIMUM_COMPARABLE_TRADES:
+        return None
+
+    live_expectancy = fmean(trade.r_multiple for trade in live_trades)
+    backtest_expectancy = fmean(trade.r_multiple for trade in backtest_trades)
+    divergence = _expectancy_divergence(live_expectancy, backtest_expectancy)
+
+    # Stability is the agreement the two arms actually share: how often they called the same
+    # direction, discounted by how far their realised edge drifted apart. A strategy that
+    # signals identically but earns a different result is not stable evidence either.
+    stability = max(0.0, min(1.0, agreement * (1.0 - divergence)))
+    return WeightedVotingPaperBacktestComparison(
+        strategy_id=strategy_id,
+        compared_bars=len(shared),
+        live_trades=len(live_trades),
+        backtest_trades=len(backtest_trades),
+        direction_agreement=round(agreement, 10),
+        live_expectancy=round(live_expectancy, 10),
+        backtest_expectancy=round(backtest_expectancy, 10),
+        paper_shadow_stability=round(stability, 10),
+        paper_backtest_divergence=round(divergence, 10),
+        explanation=(
+            f"{strategy_id} agreed with its backtest on {agreement:.1%} of {len(shared)} shared bars; "
+            f"live expectancy {live_expectancy:.4f}R against backtest {backtest_expectancy:.4f}R."
+        ),
+    )
+
+
+def _expectancy_divergence(live: float, backtest: float) -> float:
+    """How far the live edge drifted from the backtest edge, as a bounded fraction.
+
+    Scaled by the larger of the two magnitudes so a small absolute gap between two small
+    edges is not read as agreement, and opposite signs always land at full divergence.
+    """
+    if live == 0.0 and backtest == 0.0:
+        return 0.0
+    if (live > 0.0) != (backtest > 0.0):
+        return 1.0
+    scale = max(abs(live), abs(backtest))
+    return max(0.0, min(1.0, abs(live - backtest) / scale)) if scale > 0 else 1.0
+
+
+def _candle_row(candle: Any) -> dict[str, Any]:
+    return {
+        "timestamp": _utc(candle.timestamp).isoformat(),
+        "open": float(candle.open),
+        "high": float(candle.high),
+        "low": float(candle.low),
+        "close": float(candle.close),
+        "volume": float(candle.volume),
+        "finalized": True,
     }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from backend.app.algorithms.weighted_voting.catalog import (
@@ -10,6 +11,9 @@ from backend.app.algorithms.weighted_voting.catalog import (
 from backend.app.algorithms.weighted_voting.models import WeightedCandle
 from backend.app.algorithms.weighted_voting.shadow_evidence import (
     WEIGHTED_VOTING_SHADOW_LIVE_ONLY_METRICS,
+    _expectancy_divergence,
+    compare_paper_against_backtest,
+    replay_shadow_observations,
     WeightedVotingShadowObservation,
     build_shadow_evidence,
     load_shadow_observations,
@@ -329,6 +333,89 @@ class ShadowPromotionReviewTest(unittest.TestCase):
             with self.subTest(strategy_id=row["strategyId"]):
                 self.assertFalse(row["approved"])
                 self.assertFalse(row["evidenceComplete"])
+
+
+class PaperBacktestComparisonTest(unittest.TestCase):
+    """The two metrics that only a live-versus-backtest comparison can establish."""
+
+    def test_replay_reconstructs_the_strategy_from_candles_alone(self) -> None:
+        bars = candles(1200)
+
+        replay = replay_shadow_observations("S3", bars)
+
+        self.assertTrue(replay)
+        self.assertTrue(all(item.strategy_id == "S3" for item in replay))
+        self.assertTrue(any(item.directional for item in replay))
+
+    def test_a_live_record_matching_its_backtest_scores_full_stability(self) -> None:
+        bars = candles(1200)
+        replay = replay_shadow_observations("S3", bars)
+
+        comparison = compare_paper_against_backtest("S3", observations=replay, candles=bars)
+
+        self.assertIsNotNone(comparison)
+        self.assertEqual(comparison.direction_agreement, 1.0)
+        self.assertEqual(comparison.paper_backtest_divergence, 0.0)
+        self.assertEqual(comparison.paper_shadow_stability, 1.0)
+
+    def test_disagreeing_with_the_backtest_lowers_stability(self) -> None:
+        bars = candles(1200)
+        replay = replay_shadow_observations("S3", bars)
+        sat_out = [
+            replace(item, signal="Hold") if (item.signal == "Buy" and index % 3 == 0) else item
+            for index, item in enumerate(replay)
+        ]
+
+        matched = compare_paper_against_backtest("S3", observations=replay, candles=bars)
+        drifted = compare_paper_against_backtest("S3", observations=sat_out, candles=bars)
+
+        self.assertIsNotNone(drifted)
+        self.assertLess(drifted.direction_agreement, matched.direction_agreement)
+        self.assertLess(drifted.paper_shadow_stability, matched.paper_shadow_stability)
+
+    def test_a_record_too_thin_to_compare_is_reported_absent_not_agreeing(self) -> None:
+        """No comparison must read as a failing one, never as a passing one."""
+        bars = candles(1200)
+
+        # S1 never signals on this series, so neither arm can produce trades.
+        self.assertIsNone(compare_paper_against_backtest("S1", observations=observations(bars), candles=bars))
+        self.assertIsNone(compare_paper_against_backtest("S3", observations=[], candles=bars))
+
+    def test_divergence_is_bounded_and_punishes_opposite_signs(self) -> None:
+        self.assertEqual(_expectancy_divergence(0.5, 0.5), 0.0)
+        self.assertEqual(_expectancy_divergence(0.0, 0.0), 0.0)
+        # An edge that flipped sign has nothing in common with its backtest.
+        self.assertEqual(_expectancy_divergence(0.5, -0.2), 1.0)
+        self.assertEqual(_expectancy_divergence(-0.5, 0.2), 1.0)
+        self.assertEqual(_expectancy_divergence(0.5, 1.0), 0.5)
+        for live, backtest in ((3.0, 0.1), (0.1, 3.0), (-2.0, -0.01)):
+            with self.subTest(live=live, backtest=backtest):
+                self.assertGreaterEqual(_expectancy_divergence(live, backtest), 0.0)
+                self.assertLessEqual(_expectancy_divergence(live, backtest), 1.0)
+
+    def test_evidence_takes_both_metrics_from_the_comparison_once_it_exists(self) -> None:
+        bars = candles(1200)
+        replay = replay_shadow_observations("S3", bars)
+
+        result = build_shadow_evidence("S3", observations=replay, candles=bars)
+
+        self.assertNotIn("paper_shadow_stability", result.unavailable_metrics)
+        self.assertNotIn("paper_backtest_divergence", result.unavailable_metrics)
+        self.assertIsNotNone(result.comparison)
+        self.assertEqual(result.evidence.paper_shadow_stability, result.comparison.paper_shadow_stability)
+        self.assertEqual(result.evidence.paper_backtest_divergence, result.comparison.paper_backtest_divergence)
+
+    def test_evidence_keeps_the_failing_values_when_no_comparison_is_possible(self) -> None:
+        bars = candles(1200)
+
+        result = build_shadow_evidence("S1", observations=observations(bars), candles=bars)
+
+        self.assertIsNone(result.comparison)
+        self.assertEqual(result.evidence.paper_shadow_stability, 0.0)
+        self.assertEqual(result.evidence.paper_backtest_divergence, 1.0)
+        for metric in WEIGHTED_VOTING_SHADOW_LIVE_ONLY_METRICS:
+            with self.subTest(metric=metric):
+                self.assertIn(metric, result.unavailable_metrics)
 
 
 if __name__ == "__main__":
