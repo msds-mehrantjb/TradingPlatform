@@ -91,6 +91,7 @@ def resolve_voting_ensemble_risk_budget(
         _fraction(config, "eventRiskCap", 1.0),
         _fraction(config, "drawdownCap", 1.0),
         _fraction(config, "liquidityCap", 1.0),
+        _fraction(config, "sessionCap", 1.0),
         _fraction(config, "regimeFit", 1.0),
         _family_support_multiplier(config),
     )
@@ -275,6 +276,7 @@ def _budget(
                 "eventRiskCap",
                 "drawdownCap",
                 "liquidityCap",
+                "sessionCap",
             }
         },
     }

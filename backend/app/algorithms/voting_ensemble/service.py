@@ -308,6 +308,7 @@ class VotingEnsembleService:
             settings=settings,
             decision=decision,
             candidate=candidate,
+            session_cap=session_policy_decision.max_position_multiplier,
             local_gate=post_gate,
             execution_economics=execution_economics.model_dump(mode="json") if execution_economics else None,
         )
@@ -381,6 +382,7 @@ class VotingEnsembleService:
             order_plan=order_plan.model_dump(mode="json") if order_plan else None,
             reason_codes=(
                 "voting_ensemble.evaluate.completed",
+                *tuple(session_policy_decision.reason_codes),
                 *tuple(decision.reasonCodes),
                 *tuple(regime_state.features.get("reasonCodes") or ()),
                 *tuple(post_gate.reasonCodes),
@@ -1283,6 +1285,7 @@ def _risk_budget_for_candidate(
     candidate: TradeCandidate | None,
     local_gate: GlobalGateDecision,
     execution_economics: dict[str, Any] | None,
+    session_cap: float = 1.0,
 ) -> Any | None:
     if candidate is None:
         return None
@@ -1298,6 +1301,7 @@ def _risk_budget_for_candidate(
             account=account,
             local_gate=local_gate,
             execution_economics=execution_economics,
+            session_cap=session_cap,
         ),
         equity=equity,
         entry_price=candidate.entryPrice,
@@ -1426,6 +1430,7 @@ def _risk_budget_config(
     account: AccountRiskState | None,
     local_gate: GlobalGateDecision,
     execution_economics: dict[str, Any] | None,
+    session_cap: float = 1.0,
 ) -> dict[str, Any]:
     profile = settings.resolvedTradingProfile
     operational = snapshot.operationalHealthSnapshot
@@ -1473,6 +1478,11 @@ def _risk_budget_config(
         "minimumIndependentFamilySupport": int(profile.minimumIndependentFamilySupport),
         "regimeFit": _candidate_regime_fit(decision),
         "dynamicRiskCap": float(profile.riskMultiplier),
+        # The session policy's size multiplier, joining the other caps rather than
+        # arriving as a separate mechanism. Until this was wired the policy's "run
+        # smaller into the close" intent was inert: the multiplier was resolved on
+        # every bar, reported nowhere, and applied to nothing.
+        "sessionCap": session_cap,
         "eventRiskCap": _number(operational, "eventRiskCap") if _number(operational, "eventRiskCap") is not None else 1.0,
         "drawdownCap": _drawdown_cap(account),
         "liquidityCap": _number(operational, "liquidityCap") if _number(operational, "liquidityCap") is not None else 1.0,
