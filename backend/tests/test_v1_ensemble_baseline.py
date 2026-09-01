@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import mock_open, patch
 
 from backend.app import main
-from backend.app.config import ApplicationConfig
+from backend.app.config import ApplicationConfig, get_settings
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "v1_ensemble_fixtures.json"
@@ -67,7 +67,11 @@ class V1EnsembleBaselineTest(unittest.TestCase):
         endpoint_config = main.application_config()
 
         self.assertEqual(config["version"], "application-config-v1")
-        self.assertEqual(endpoint_config, config)
+        # The endpoint mirrors the resolved settings, not the shipped defaults. Comparing it
+        # against a bare ApplicationConfig() asserted that this machine's environment matches
+        # the defaults, so any .env that legitimately enables something -- the meta-strategy
+        # runtime in paper mode, say -- failed a test that is meant to be about the contract.
+        self.assertEqual(endpoint_config, get_settings().application_config.as_dict())
         self.assertEqual(len(config["configurationHash"]), 12)
         self.assertEqual(
             config["featureFlags"],
