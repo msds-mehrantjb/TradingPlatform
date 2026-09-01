@@ -8,9 +8,13 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal, Protocol
+
+_EXCHANGE_TIMEZONE = ZoneInfo("America/New_York")
+
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -542,7 +546,18 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
                 else "voting_ensemble.automatic_snapshot.fail_closed",
             ],
         }
-        operational = _operational_snapshot(control, market_status, inventory, global_gate, synchronization)
+        operational = _operational_snapshot(
+            control,
+            market_status,
+            inventory,
+            global_gate,
+            synchronization,
+            entry_window_open=_entry_window_open(
+                market_open=bool(market_status.get("isOpen")),
+                settings=settings,
+                bar_end=_utc(event.barEndTimestamp),
+            ),
+        )
         context = {
             "settingsHash": command.settingsHash,
             "settingsVersion": settings.settingsVersion,
@@ -1028,12 +1043,57 @@ def _account_snapshot_from_backend_account(account: dict[str, Any] | None, inven
     }
 
 
+def _entry_window_open(*, market_open: bool, settings: Any, bar_end: datetime) -> bool:
+    """Whether a new entry may still be opened on the bar that just closed.
+
+    This used to be market_open, which said nothing the market-open gate did not
+    already say, and left the live path taking new entries until the closing bell
+    while run_voting_ensemble_backtest stopped at newTradesUntil. The two ran
+    different entry rules, so replay understated late-session activity.
+
+    The window is evaluated on the bar's own end timestamp, not the wall clock, so a
+    replayed bar is judged by the session it belongs to rather than by when it is
+    being processed.
+    """
+    if not market_open:
+        return False
+    windows = getattr(settings, "sessionWindows", None)
+    opens_at = _minute_of_day(getattr(windows, "sessionStart", None))
+    closes_at = _minute_of_day(getattr(windows, "newTradesUntil", None))
+    if opens_at is None or closes_at is None:
+        # No window resolved. Keep the previous behaviour rather than silently
+        # halting every entry on a settings problem: the loss from trading a little
+        # late is bounded, an unexplained full stop is not.
+        return True
+    minute = _new_york_minute_of_day(bar_end)
+    return opens_at <= minute <= closes_at
+
+
+def _minute_of_day(value: Any) -> int | None:
+    """Parse an "HH:MM" session boundary into minutes past midnight."""
+    text = str(value or "").strip()
+    if not text or ":" not in text:
+        return None
+    hours, _, minutes = text.partition(":")
+    try:
+        return int(hours) * 60 + int(minutes)
+    except ValueError:
+        return None
+
+
+def _new_york_minute_of_day(value: datetime) -> int:
+    """Exchange-local minute past midnight, DST included."""
+    local = _utc(value).astimezone(_EXCHANGE_TIMEZONE)
+    return local.hour * 60 + local.minute
+
+
 def _operational_snapshot(
     control: dict[str, Any],
     market_status: dict[str, Any],
     inventory: dict[str, Any],
     global_gate: dict[str, Any],
     synchronization: dict[str, Any],
+    entry_window_open: bool | None = None,
 ) -> dict[str, Any]:
     market_open = bool(market_status.get("isOpen"))
     synchronized = bool(synchronization.get("snapshotSynchronized"))
@@ -1047,7 +1107,7 @@ def _operational_snapshot(
         "paperTradingMode": True,
         "liveTradingEnabled": False,
         "marketOpen": market_open,
-        "entryWindowOpen": market_open,
+        "entryWindowOpen": market_open if entry_window_open is None else entry_window_open,
         "validSession": market_open,
         "feedDegraded": not synchronized,
         "clockDisagreement": False,
