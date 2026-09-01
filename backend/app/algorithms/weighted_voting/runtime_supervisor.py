@@ -71,6 +71,7 @@ from backend.app.algorithms.weighted_voting.scheduler import (
     run_after_market_daily_weight_update,
 )
 from backend.app.algorithms.weighted_voting.service import WeightedVotingService
+from backend.app.algorithms.weighted_voting.shadow_evidence import record_shadow_observations
 from backend.app.algorithms.weighted_voting.strategy_lifecycle import WEIGHTED_VOTING_STRATEGY_LIFECYCLE_LATEST_KEY
 from backend.app.domain.exchange_calendar import ExchangeCalendarService, NEW_YORK
 from backend.app.execution import PaperOrderGateway
@@ -3289,6 +3290,27 @@ class WeightedVotingRuntimeSupervisor:
             if lifecycle not in self.metrics.strategy_signal_counts:
                 self.metrics.strategy_signal_counts[lifecycle] = {}
             self.metrics.strategy_signal_counts[lifecycle][strategy_id] = self.metrics.strategy_signal_counts[lifecycle].get(strategy_id, 0) + 1
+        self._record_shadow_evidence(result)
+
+    def _record_shadow_evidence(self, result: dict[str, Any]) -> None:
+        """Persist this decision's per-strategy signals so shadow evidence can accrue.
+
+        The counters above live on an in-memory metrics object and die with the process.
+        Promotion evidence has to survive a restart, so the signals themselves are
+        written to each strategy's own key. Never allowed to disturb the decision loop.
+        """
+        store = getattr(self, "store", None)
+        if store is None:
+            return
+        try:
+            record_shadow_observations(
+                store,
+                _signals_from_result(result),
+                session_label=_shadow_session_label(result),
+                regime_label=_shadow_regime_label(result),
+            )
+        except Exception:
+            return
 
     def _worker_state(self) -> dict[str, dict[str, Any]]:
         state: dict[str, dict[str, Any]] = {}
@@ -5227,6 +5249,29 @@ def _position_management_end_of_day(timestamp: datetime, config: WeightedVotingC
     cutoff_minutes = int(getattr(config, "session_cutoff_minutes", 10) or 10)
     session_close = local.replace(hour=16, minute=0, second=0, microsecond=0)
     return local >= session_close - timedelta(minutes=max(0, cutoff_minutes))
+
+
+def _shadow_session_label(result: dict[str, Any]) -> str:
+    """Session bucket a recorded observation is filed under.
+
+    Session and regime are what the promotion gate reads consistency across, so an
+    unknown label is recorded as unknown rather than folded into a real bucket -- that
+    would make a strategy look consistent across conditions it was never tested in.
+    """
+    for path in (("marketCondition", "sessionPhase"), ("marketCondition", "session_phase"), ("sessionPhase",)):
+        value = _deep_get(result, path)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "unknown"
+
+
+def _shadow_regime_label(result: dict[str, Any]) -> str:
+    """Regime bucket a recorded observation is filed under."""
+    for path in (("marketCondition", "regimeLabel"), ("marketCondition", "regime_label"), ("regimeLabel",)):
+        value = _deep_get(result, path)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "unknown"
 
 
 def _signals_from_result(result: dict[str, Any]) -> tuple[dict[str, Any], ...]:
