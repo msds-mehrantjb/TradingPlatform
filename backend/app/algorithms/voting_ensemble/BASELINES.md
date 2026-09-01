@@ -75,13 +75,53 @@ With the blackout at 15:45-16:30Z instead, the veto blocks 51 bars but removes n
 of the seven entries fall in that window. Worth recording, because "the gate fired" and "the
 gate changed the outcome" are different claims and only the second one is a result.
 
-### Session policy
+### Session policy, against real segment labels
 
-Zero trades in every configuration tried. Every bar of this synthetic dataset segments as
-`midday`, so the arm exercises one branch of the segment map with an allow-list that excluded
-the strategies that were voting. It shows the gate is wired and enforcing; it says nothing
-about whether that segment map is right. The gate stays disabled by default until it has run
-against real session labels across `open`, `midday` and `close`.
+The policy keys on a session segment, and until now nothing produced one. The live path
+reported `phase: "regular"`, which the policy's alias table normalises to `midday`, and
+replay supplied no session state at all, which falls back to the same place. So a policy
+written to stand aside at the open or run smaller into the close could only ever see
+`midday`, in every environment. The gate was enforcing correctly against a label with one
+possible value.
+
+`session_segments.py` now resolves the segment from the bar's end timestamp in exchange-local
+time, and both the live producer and replay call it -- one implementation, for the same
+reason the event veto is shared. Boundaries are configurable and default to 09:30/10:30/
+15:00/16:00 New York. They are read as half-open intervals on the bar end, so a bar ending
+at 09:30 is still premarket and one ending at 16:00 is the last bar of the close.
+
+Over the same 390-bar session the segments now come out as 60 `open`, 270 `midday`, 59
+`close` and 1 `premarket`, and the policy discriminates between them:
+
+| Arm | Trades | Shares | Wins | Win rate | Net PnL | Entries by segment |
+|---|---|---|---|---|---|---|
+| policy off | 7 | 121 | 1 | 14.3% | -85.04 | midday 5, close 2 |
+| open closed | 7 | 121 | 1 | 14.3% | -85.04 | midday 5, close 2 |
+| midday closed | 2 | 32 | 0 | 0.0% | -35.04 | close 2 |
+| close closed | 5 | 89 | 1 | 20.0% | -50.00 | midday 5 |
+| close at half size | 7 | 105 | 1 | 14.3% | -67.52 | midday 5, close 2 |
+| close: reversion only | 5 | 89 | 1 | 20.0% | -50.00 | midday 5 |
+
+Each arm removes exactly the entries in the segment it closes and leaves the others
+untouched. Closing the open segment removes nothing, because this session produced no entry
+there -- a negative result worth keeping, since an arm that changes nothing is evidence the
+gate is keyed on the segment rather than firing indiscriminately.
+
+The half-size arm keeps all seven trades and takes 121 shares down to 105. The two close
+entries account for 32 shares, and 16 of them are what the multiplier removed: exactly half,
+applied only in the segment configured for it.
+
+### The size multiplier was inert until this run
+
+`apply_session_policy` resolved a `max_position_multiplier` on every bar and returned it on a
+decision object that `service.py` assigned and never read. Vote blocking worked, because that
+is carried on the votes themselves, but the sizing half of the policy was applied to nothing
+and reported nowhere. "Run smaller into the close" was a comment, not a behaviour.
+
+The multiplier now travels as `sessionCap` alongside `dynamicRiskCap`, `eventRiskCap`,
+`drawdownCap` and `liquidityCap`, and combines with them the same way, so it is one more cap
+in an existing family rather than a parallel mechanism. The policy's reason codes now reach
+the decision record too, so a bar that was sized down says so.
 
 ### What had to be fixed to measure any of this
 
@@ -119,6 +159,9 @@ Re-record, keeping the prior version beside the new one, when any of these happe
    since the calendar is the input that determines which bars were vetoed.
 3. Any directional trigger changes from close to something else, or vice versa.
 4. ATR, VWAP or swing-detection inputs change. They were deliberately untouched here.
+5. `sessionSegments` boundaries change. They decide which segment each bar falls in, so a
+   replay under different boundaries applies a different policy to the same bars while
+   reporting the same segment names.
 
 A baseline recorded without its enabling configuration cannot be reproduced, so the
 configuration is part of the record, not context around it.
