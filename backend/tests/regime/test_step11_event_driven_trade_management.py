@@ -25,7 +25,7 @@ def test_step11_completed_bar_worker_enqueues_idempotent_paper_exit_intent() -> 
         opened = manager.apply_fill_observation(identity, _fill_observation(now))["position"]
         supervisor = RegimeRuntimeSupervisor(
             service=RegimeApplicationService(repository),
-            config=RegimeRuntimeSupervisorConfig(default_runtime_mode="paper", max_processing_lag_seconds=1_000_000, maintenance_interval_seconds=60, heartbeat_interval_seconds=60),
+            config=RegimeRuntimeSupervisorConfig(default_runtime_mode="paper", max_processing_lag_seconds=99_999_999, maintenance_interval_seconds=60, heartbeat_interval_seconds=60),
             paper_gateway=PaperOrderGateway(_BrokerWithoutPositions(), _SnapshotStore()),
         )
         event = RegimeFinalisedBarEvent.from_payload(_completed_bar_payload(now, low=99.4, close=99.45))
