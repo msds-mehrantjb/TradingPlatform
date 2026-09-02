@@ -180,7 +180,7 @@ async def latest_market_data_quote(symbol: str = Query("SPY"), feed: str = Query
     if settings.has_alpaca_credentials:
         try:
             quote = await asyncio.wait_for(alpaca.get_latest_quote(symbol=normalized_symbol, feed=normalized_feed), timeout=5.0)
-            if quote is not None:
+            if quote is not None and _is_two_sided(quote):
                 return {
                     "status": "ready",
                     "symbol": normalized_symbol,
@@ -371,6 +371,22 @@ async def _context_bars(
         except (TimeoutError, httpx.HTTPError):
             pass
     return cached or _dedupe_candles(demo_bars(symbol=symbol, timeframe=timeframe, feed=feed, limit=limit))
+
+
+def _is_two_sided(quote: dict[str, Any]) -> bool:
+    """Whether a quote has both sides and is not crossed.
+
+    Outside regular hours a venue will return one side of the book -- a bid with no ask, or
+    the reverse. Passing that straight through as `ready` hands callers an NBBO whose spread
+    is the entire price, which is worse than admitting the feed had nothing: the fallback
+    below at least derives a coherent two-sided quote from the last candle.
+    """
+    try:
+        bid = float(quote.get("bid") or 0.0)
+        ask = float(quote.get("ask") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return bid > 0.0 and ask >= bid
 
 
 def _latest_quote_from_cached_or_demo_candle(*, symbol: str, feed: str) -> dict[str, Any]:
