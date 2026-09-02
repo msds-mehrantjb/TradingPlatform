@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any, Protocol
@@ -44,6 +45,50 @@ class VotingBacktestService(Protocol):
         ...
 
 
+VOTING_ENSEMBLE_BACKTEST_ENGINE_FIELDS: dict[str, Any] = {
+    "engine": "voting_ensemble_pipeline",
+    "engineLabel": "Voting Ensemble pipeline (same code path as the live runtime)",
+    "matchesLiveAlgorithm": True,
+}
+
+
+@dataclass(frozen=True)
+class _StreamWindow:
+    """The slice of a stream a single bar is allowed to see, in both forms the runner needs."""
+
+    candles: tuple[VotingCandle, ...]
+    dumps: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class _Stream:
+    """A candle stream prepared once, then sliced per bar.
+
+    The previous runner rebuilt every auxiliary prefix on every bar: a scan of the whole
+    stream followed by a `model_dump` of every candle in it. On one session that was
+    invisible; on six years of one-minute data it was quadratic and the replay simply
+    never finished. Timestamps and JSON forms are computed once here, and a bar takes a
+    bounded trailing window by bisection.
+    """
+
+    candles: tuple[VotingCandle, ...]
+    timestamps: tuple[datetime, ...]
+    dumps: tuple[dict[str, Any], ...]
+
+    @classmethod
+    def build(cls, candles: tuple[VotingCandle, ...]) -> "_Stream":
+        return cls(
+            candles=candles,
+            timestamps=tuple(candle.timestamp for candle in candles),
+            dumps=tuple(candle.model_dump(mode="json") for candle in candles),
+        )
+
+    def window(self, timestamp: datetime, limit: int) -> _StreamWindow:
+        end = bisect_right(self.timestamps, timestamp)
+        start = max(0, end - max(0, int(limit)))
+        return _StreamWindow(candles=self.candles[start:end], dumps=self.dumps[start:end])
+
+
 @dataclass
 class VotingEnsembleBacktestRunner:
     service: VotingBacktestService = field(default_factory=VotingEnsemblePipeline)
@@ -63,16 +108,24 @@ class VotingEnsembleBacktestRunner:
         timeframe: str = "1Min",
     ) -> dict[str, Any]:
         one_minute = _sort_voting_candles(spy_1m_candles)
-        five_minute = _sort_voting_candles(spy_5m_candles or [])
-        fifteen_minute = _sort_voting_candles(spy_15m_candles or []) or _aggregate_voting_candles(one_minute, 15)
-        qqq = _sort_voting_candles(qqq_candles or [])
-        iwm = _sort_voting_candles(iwm_candles or [])
+        five_minute = _Stream.build(_sort_voting_candles(spy_5m_candles or []))
+        fifteen_minute = _Stream.build(_sort_voting_candles(spy_15m_candles or []) or _aggregate_voting_candles(one_minute, 15))
+        qqq = _Stream.build(_sort_voting_candles(qqq_candles or []))
+        iwm = _Stream.build(_sort_voting_candles(iwm_candles or []))
         breadth = {
-            symbol.upper(): _sort_voting_candles(component_candles)
+            symbol.upper(): _Stream.build(_sort_voting_candles(component_candles))
             for symbol, component_candles in (breadth_components or {}).items()
         }
+        data_quality = self._data_quality(
+            five_minute.candles,
+            fifteen_minute.candles,
+            qqq.candles,
+            iwm.candles,
+            {name: stream.candles for name, stream in breadth.items()},
+            bool(spy_15m_candles),
+        )
         if not one_minute:
-            return self._empty_result(symbol=symbol, timeframe=timeframe, data_quality=self._data_quality(five_minute, fifteen_minute, qqq, iwm, breadth, False))
+            return self._empty_result(symbol=symbol, timeframe=timeframe, data_quality=data_quality)
 
         trades: list[dict[str, Any]] = []
         stage_results: list[dict[str, Any]] = []
@@ -81,33 +134,46 @@ class VotingEnsembleBacktestRunner:
         active_until: datetime | None = None
         simulator = VotingEnsembleExecutionSimulator(self.config.execution)
         sessions = _group_by_session(one_minute)
+        auxiliary_limit = self.config.auxiliaryHistoryLimit
         for session_date, session_candles in sorted(sessions.items()):
             # Both reset per session: the daily-loss cap and the intraday-drawdown cap
             # are daily measures, so carrying either across a session boundary would
             # gate one day's trading on another day's losses.
             fills: list[dict[str, Any]] = []
             intraday_high = float(self.config.startingCapital)
+            session_dumps = [candle.model_dump(mode="json") for candle in session_candles]
+            session_market = [_market_candle_from_voting(candle, symbol=symbol, timeframe="1Min") for candle in session_candles]
             for index, candle in enumerate(session_candles):
                 if index + 1 < self.config.warmupCandles:
                     continue
-                prefix = tuple(session_candles[: index + 1])
+                # The SPY history stays within the session, as it always has, and is now
+                # also capped at the live producer's window so a long extended-hours
+                # session cannot show replay more bars than live would see.
+                prefix_start = max(0, index + 1 - self.config.oneMinuteHistoryLimit)
+                prefix = tuple(session_candles[prefix_start : index + 1])
+                prefix_dumps = tuple(session_dumps[prefix_start : index + 1])
+                windows = {
+                    "spy_5m_candles": five_minute.window(candle.timestamp, self.config.fiveMinuteHistoryLimit),
+                    "spy_15m_candles": fifteen_minute.window(candle.timestamp, self.config.fifteenMinuteHistoryLimit),
+                    "qqq_candles": qqq.window(candle.timestamp, auxiliary_limit),
+                    "iwm_candles": iwm.window(candle.timestamp, auxiliary_limit),
+                }
+                breadth_windows = {name: stream.window(candle.timestamp, auxiliary_limit) for name, stream in breadth.items()}
                 account = self._account_snapshot(timestamp=candle.timestamp, fills=fills, intraday_high=intraday_high)
                 intraday_high = max(intraday_high, account["equity"])
                 evaluation = self._evaluate_at(
                     symbol=symbol,
                     timestamp=candle.timestamp,
                     candles=prefix,
-                    five_minute=five_minute,
-                    fifteen_minute=fifteen_minute,
-                    qqq=qqq,
-                    iwm=iwm,
-                    breadth=breadth,
+                    candle_dumps=prefix_dumps,
+                    windows=windows,
+                    breadth=breadth_windows,
                     external_breadth_feed=external_breadth_feed,
                     account=account,
                 )
                 position_active = bool(active_until and candle.timestamp <= active_until)
                 order_plan = None if position_active else self._order_plan(symbol, evaluation, candle, session_date)
-                future_candles = [_market_candle_from_voting(item, symbol=symbol, timeframe="1Min") for item in session_candles[index + 1 :]]
+                future_candles = session_market[index + 1 :]
                 execution = simulator.simulate(order_plan, future_candles, candle.timestamp) if order_plan else None
                 stress_results.extend(
                     self._stress_results(
@@ -128,11 +194,8 @@ class VotingEnsembleBacktestRunner:
                     input_stage=self._input_stage(
                         timestamp=candle.timestamp,
                         candles=prefix,
-                        five_minute=five_minute,
-                        fifteen_minute=fifteen_minute,
-                        qqq=qqq,
-                        iwm=iwm,
-                        breadth=breadth,
+                        windows=windows,
+                        breadth=breadth_windows,
                     ),
                 )
                 decision_count += 1
@@ -166,18 +229,20 @@ class VotingEnsembleBacktestRunner:
                 timeframe=timeframe,
                 date_label=f"{one_minute[0].timestamp.date()} to {one_minute[-1].timestamp.date()}",
             ),
+            **VOTING_ENSEMBLE_BACKTEST_ENGINE_FIELDS,
             "engineVersion": "voting_ensemble_v2",
             "backtestVersion": VOTING_ENSEMBLE_BACKTEST_VERSION,
             "backtestConfigVersion": self.config.configVersion,
             "backtestConfigReasonCodes": list(backtest_config_reason_codes()),
             "algorithmVersion": "voting_ensemble_backend_v2",
+            "historyWindows": self._history_windows(),
             "strategyCatalog": {
                 "directional": list(VOTING_ENSEMBLE_DIRECTIONAL_CATALOG),
                 "context": list(VOTING_ENSEMBLE_CONTEXT_CATALOG),
                 "moduleInventory": VOTING_ENSEMBLE_MODULE_INVENTORY.model_dump(mode="json"),
                 "removedVoters": ["Ensemble Strategy Voting"],
             },
-            "dataQuality": self._data_quality(five_minute, fifteen_minute, qqq, iwm, breadth, bool(spy_15m_candles)),
+            "dataQuality": data_quality,
             "costStress": _stress_summary(stress_results),
             "decisionCount": decision_count,
             "stageResultCount": decision_count,
@@ -186,32 +251,35 @@ class VotingEnsembleBacktestRunner:
             "explanation": "Dedicated Voting Ensemble backtest used the unified Voting Ensemble pipeline for pre-execution decisions and limited backtest work to point-in-time event delivery, deterministic synthetic quotes, simulated fills, and reporting.",
         }
 
+    def _history_windows(self) -> dict[str, int]:
+        return {
+            "spy1m": self.config.oneMinuteHistoryLimit,
+            "spy5m": self.config.fiveMinuteHistoryLimit,
+            "spy15m": self.config.fifteenMinuteHistoryLimit,
+            "auxiliary1m": self.config.auxiliaryHistoryLimit,
+        }
+
     def _evaluate_at(
         self,
         *,
         symbol: str,
         timestamp: datetime,
         candles: tuple[VotingCandle, ...],
-        five_minute: tuple[VotingCandle, ...],
-        fifteen_minute: tuple[VotingCandle, ...],
-        qqq: tuple[VotingCandle, ...],
-        iwm: tuple[VotingCandle, ...],
-        breadth: dict[str, tuple[VotingCandle, ...]],
+        candle_dumps: tuple[dict[str, Any], ...],
+        windows: dict[str, _StreamWindow],
+        breadth: dict[str, _StreamWindow],
         external_breadth_feed: dict[str, Any] | None,
         account: dict[str, Any],
     ) -> dict[str, Any]:
         payload = {
             "symbol": symbol.upper(),
             "data_timestamp": timestamp.isoformat(),
-            "candles": [candle.model_dump(mode="json") for candle in candles],
-            "spy_5m_candles": [candle.model_dump(mode="json") for candle in _prefix(five_minute, timestamp)],
-            "spy_15m_candles": [candle.model_dump(mode="json") for candle in _prefix(fifteen_minute, timestamp)],
-            "qqq_candles": [candle.model_dump(mode="json") for candle in _prefix(qqq, timestamp)],
-            "iwm_candles": [candle.model_dump(mode="json") for candle in _prefix(iwm, timestamp)],
-            "breadth_components": {
-                name: [candle.model_dump(mode="json") for candle in _prefix(component, timestamp)]
-                for name, component in breadth.items()
-            },
+            "candles": list(candle_dumps),
+            "spy_5m_candles": list(windows["spy_5m_candles"].dumps),
+            "spy_15m_candles": list(windows["spy_15m_candles"].dumps),
+            "qqq_candles": list(windows["qqq_candles"].dumps),
+            "iwm_candles": list(windows["iwm_candles"].dumps),
+            "breadth_components": {name: list(window.dumps) for name, window in breadth.items()},
             "external_breadth_feed": external_breadth_feed,
             "nbbo": _synthetic_backtest_nbbo(candles[-1], timestamp),
             # The event veto has to ride the snapshot, because the gates read it from
@@ -355,26 +423,18 @@ class VotingEnsembleBacktestRunner:
         *,
         timestamp: datetime,
         candles: tuple[VotingCandle, ...],
-        five_minute: tuple[VotingCandle, ...],
-        fifteen_minute: tuple[VotingCandle, ...],
-        qqq: tuple[VotingCandle, ...],
-        iwm: tuple[VotingCandle, ...],
-        breadth: dict[str, tuple[VotingCandle, ...]],
+        windows: dict[str, _StreamWindow],
+        breadth: dict[str, _StreamWindow],
     ) -> dict[str, Any]:
-        five_prefix = _prefix(five_minute, timestamp)
-        fifteen_prefix = _prefix(fifteen_minute, timestamp)
-        qqq_prefix = _prefix(qqq, timestamp)
-        iwm_prefix = _prefix(iwm, timestamp)
-        breadth_prefix = {name: _prefix(component, timestamp) for name, component in breadth.items()}
         return {
             "timestampUtc": timestamp.isoformat().replace("+00:00", "Z"),
             "pointInTime": True,
             "spy1m": _stream_summary(candles),
-            "spy5m": _stream_summary(five_prefix),
-            "spy15m": _stream_summary(fifteen_prefix),
-            "qqq1m": _stream_summary(qqq_prefix),
-            "iwm1m": _stream_summary(iwm_prefix),
-            "breadthComponents": {name: _stream_summary(component) for name, component in breadth_prefix.items()},
+            "spy5m": _stream_summary(windows["spy_5m_candles"].candles),
+            "spy15m": _stream_summary(windows["spy_15m_candles"].candles),
+            "qqq1m": _stream_summary(windows["qqq_candles"].candles),
+            "iwm1m": _stream_summary(windows["iwm_candles"].candles),
+            "breadthComponents": {name: _stream_summary(window.candles) for name, window in breadth.items()},
         }
 
     def _stage_result(
@@ -551,11 +611,13 @@ class VotingEnsembleBacktestRunner:
     def _empty_result(self, *, symbol: str, timeframe: str, data_quality: dict[str, Any]) -> dict[str, Any]:
         return {
             **self._metrics(trades=[], bars=0, sessions=0, timeframe=timeframe, date_label="No candles"),
+            **VOTING_ENSEMBLE_BACKTEST_ENGINE_FIELDS,
             "engineVersion": "voting_ensemble_v2",
             "backtestVersion": VOTING_ENSEMBLE_BACKTEST_VERSION,
             "backtestConfigVersion": self.config.configVersion,
             "backtestConfigReasonCodes": list(backtest_config_reason_codes()),
             "algorithmVersion": "voting_ensemble_backend_v2",
+            "historyWindows": self._history_windows(),
             "symbol": symbol.upper(),
             "strategyCatalog": {
                 "directional": list(VOTING_ENSEMBLE_DIRECTIONAL_CATALOG),
@@ -634,10 +696,6 @@ def _group_by_session(candles: tuple[VotingCandle, ...]) -> dict[date, list[Voti
     for candle in candles:
         sessions.setdefault(candle.timestamp.date(), []).append(candle)
     return sessions
-
-
-def _prefix(candles: tuple[VotingCandle, ...], timestamp: datetime) -> tuple[VotingCandle, ...]:
-    return tuple(candle for candle in candles if candle.timestamp <= timestamp)
 
 
 def _stream_summary(candles: tuple[VotingCandle, ...]) -> dict[str, Any]:

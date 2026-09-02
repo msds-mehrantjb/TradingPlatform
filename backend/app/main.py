@@ -2734,6 +2734,7 @@ def voting_ensemble_ml_comparison(
     )
     return {
         **result,
+        **MIXED_VOTING_ENSEMBLE_ENGINE_FIELDS,
         "symbol": symbol.upper(),
         "sourceManifest": manifest.get("manifest") or str(Path(str(manifest.get("manifest") or "")).resolve()),
         "startDate": start_date,
@@ -2777,7 +2778,7 @@ def latest_voting_ensemble_dynamic_artifact(
     if artifact_path.exists():
         artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
         return {
-            **artifact,
+            **tag_legacy_engine(artifact),
             "artifactPath": str(artifact_path),
             "sourceManifest": manifest.get("manifest") or artifact.get("sourceManifest"),
         }
@@ -2793,7 +2794,7 @@ def latest_voting_ensemble_dynamic_artifact(
     if latest_artifact_path and latest_artifact_path.exists():
         artifact = json.loads(latest_artifact_path.read_text(encoding="utf-8"))
         return {
-            **artifact,
+            **tag_legacy_engine(artifact),
             "artifactPath": str(latest_artifact_path),
             "sourceManifest": artifact.get("sourceManifest") or manifest.get("manifest"),
         }
@@ -2824,6 +2825,7 @@ def build_dynamic_trading_artifact(payload: dict) -> dict:
     artifact = {
         "status": "Ready",
         "version": "dynamic_trading_artifact_v1",
+        **LEGACY_VOTING_ENSEMBLE_ENGINE_FIELDS,
         "artifactId": f"{symbol}_{start_date}_{end_date}_{config_hash}",
         "configHash": config_hash,
         "createdAt": datetime.now(UTC).isoformat(),
@@ -5157,6 +5159,55 @@ def risk_config_hash(config: dict) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:12]
 
 
+LEGACY_VOTING_ENSEMBLE_ENGINE_FIELDS: dict = {
+    "engine": "legacy_main_py",
+    "engineLabel": "Legacy engine (main.py historical votes)",
+    "matchesLiveAlgorithm": False,
+    "engineNote": (
+        "Produced by the legacy backtest engine in main.py: nine hard-coded strategies under a "
+        "majority vote, with none of the gates, session policy, event veto, risk budget or "
+        "reliability weighting the live Voting Ensemble pipeline applies. Historical reference "
+        "only; it is not evidence about the current algorithm."
+    ),
+}
+
+MIXED_VOTING_ENSEMBLE_ENGINE_FIELDS: dict = {
+    "engine": "mixed_pipeline_and_legacy",
+    "engineLabel": "Mixed: 1Min/5Min from the Voting Ensemble pipeline, other timeframes from the legacy engine",
+    "matchesLiveAlgorithm": False,
+    "engineNote": (
+        "The 1Min and 5Min base rows come from the dedicated Voting Ensemble runner, which shares "
+        "the live pipeline. The 1Hour, 1Day, 1Week and Event rows come from the legacy main.py "
+        "engine and do not describe the current algorithm."
+    ),
+}
+
+
+def tag_legacy_engine(result: dict) -> dict:
+    """Mark a legacy-engine result so nothing downstream can mistake it for the live algorithm."""
+    if not isinstance(result, dict):
+        return result
+    return {**result, **LEGACY_VOTING_ENSEMBLE_ENGINE_FIELDS}
+
+
+def voting_ensemble_context_ready_from(
+    qqq_candles: list[dict],
+    iwm_candles: list[dict],
+    breadth_components: dict[str, list[dict]],
+) -> datetime | None:
+    """The first UTC session start at which every context stream the ensemble needs exists.
+
+    None when any stream is absent altogether: the runner then reports the missing input
+    in its data quality rather than the replay silently choosing a start for it.
+    """
+    streams = [qqq_candles, iwm_candles, *breadth_components.values()]
+    if not streams or any(not stream for stream in streams):
+        return None
+    first_timestamps = [min(parse_utc_datetime(str(candle["timestamp"])) for candle in stream) for stream in streams]
+    latest_first = max(first_timestamps)
+    return latest_first.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 def compact_backtest_result(result: dict, max_trades: int = 40) -> dict:
     trades = list(result.get("trades", []))
     return {
@@ -5176,7 +5227,10 @@ def dynamic_backtest_results(replay_data: dict[str, list[dict]], risk_config: di
     five_minute = replay_data.get("5Min", [])
     daily = replay_data.get("1Day", [])
     weekly = replay_data.get("1Week", [])
-    return {
+    # Every timeframe here, 1Min and 5Min included, is the legacy main.py engine. The
+    # Trading Settings artifact is a settings-sensitivity tool over that engine, not a
+    # measurement of the live Voting Ensemble pipeline, and its results say so.
+    results = {
         "1Min": run_voting_ensemble_backtest(one_minute, timeframe="1Min", risk_config_override=risk_config),
         "5Min": run_voting_ensemble_backtest(five_minute, timeframe="5Min", risk_config_override=risk_config),
         "1Hour": run_one_hour_filter_backtest(
@@ -5192,6 +5246,7 @@ def dynamic_backtest_results(replay_data: dict[str, list[dict]], risk_config: di
             risk_config_override=risk_config,
         ),
     }
+    return {timeframe: tag_legacy_engine(result) for timeframe, result in results.items()}
 
 
 def dynamic_ml_comparison(
@@ -5342,11 +5397,18 @@ WEEKLY_DRAWDOWN_STOPS = [0.0, 4.0, 6.0]
 
 
 def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timeframe: str, start_date: str, end_date: str) -> dict:
-    cache_version = "voting_ensemble_dedicated_v1" if timeframe in {"1Min", "5Min"} else "voting_ensemble_risk_v16"
+    # v2: the dedicated runner now evaluates each bar against the live producer's history
+    # windows, derives its configuration from the resolved live settings, and starts where
+    # the context streams start. A v1 cache was recorded under none of those, so it is not
+    # comparable and must not be served as if it were.
+    dedicated = timeframe in {"1Min", "5Min"}
+    cache_version = "voting_ensemble_dedicated_v2" if dedicated else "voting_ensemble_risk_v16"
     cache_path = data_path.parent / f"{cache_version}_{timeframe}_{start_date}_{end_date}.json"
     if cache_path.exists():
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        if timeframe in {"1Min", "5Min"} and cached.get("stageResultsJsonl") and not cached.get("mlReplaySnapshots"):
+        if not dedicated and "engine" not in cached:
+            cached = tag_legacy_engine(cached)
+        if dedicated and cached.get("stageResultsJsonl") and not cached.get("mlReplaySnapshots"):
             cached["mlReplaySnapshots"] = materialize_voting_ensemble_replay_ml_snapshots(
                 stage_results_jsonl=Path(str(cached["stageResultsJsonl"])),
                 output_root=data_path.parent / f"voting_ensemble_ml_snapshots_{timeframe}_{start_date}_{end_date}",
@@ -5368,14 +5430,15 @@ def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timefram
     if timeframe == "1Hour":
         execution_candles = aggregate_candles(candles, timeframe="5Min", minutes=5)
         direction_candles = aggregate_candles(candles, timeframe="1Hour", minutes=60)
-        result = run_one_hour_filter_backtest(execution_candles, direction_candles)
+        result = tag_legacy_engine(run_one_hour_filter_backtest(execution_candles, direction_candles))
     elif timeframe == "1Week":
         candles = aggregate_weekly_candles(candles)
-        result = run_swing_voting_ensemble_backtest(candles, timeframe=timeframe)
+        result = tag_legacy_engine(run_swing_voting_ensemble_backtest(candles, timeframe=timeframe))
     elif timeframe == "1Day":
-        result = run_swing_voting_ensemble_backtest(candles, timeframe=timeframe)
-    elif timeframe in {"1Min", "5Min"}:
-        from backend.app.algorithms.voting_ensemble import VotingEnsembleBacktestConfig, VotingEnsembleBacktestRunner
+        result = tag_legacy_engine(run_swing_voting_ensemble_backtest(candles, timeframe=timeframe))
+    elif dedicated:
+        from backend.app.algorithms.voting_ensemble import VotingEnsembleBacktestRunner
+        from backend.app.algorithms.voting_ensemble.backtest_config import backtest_config_from_live_settings
 
         files = manifest.get("files") or {}
         one_minute_path = Path(str(files.get("continuous1mJsonl", "")))
@@ -5416,13 +5479,23 @@ def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timefram
             ]
             for symbol, path in ((files.get("breadthComponentsJsonl") or {}).items() if isinstance(files.get("breadthComponentsJsonl"), dict) else [])
         }
-        result = VotingEnsembleBacktestRunner(
-            config=VotingEnsembleBacktestConfig(
-                startingCapital=float(VOTING_ENSEMBLE_RISK_CONFIG["startingCapital"]),
-                includeDecisionRecords=True,
-                maximumDecisionRecords=None,
-            )
-        ).run(
+        # The ensemble will not trade without QQQ, IWM and breadth context, and those
+        # streams start years after the SPY history does. Evaluating the context-less
+        # years would take a day of compute to establish that every bar was
+        # data-not-ready, so the replay starts where the context does and says so.
+        context_start = voting_ensemble_context_ready_from(qqq_candles, iwm_candles, breadth_components)
+        requested_bar_count = len(one_minute)
+        if context_start is not None:
+            one_minute = [candle for candle in one_minute if parse_utc_datetime(str(candle["timestamp"])) >= context_start]
+            five_minute = [candle for candle in five_minute if parse_utc_datetime(str(candle["timestamp"])) >= context_start]
+            fifteen_minute = [candle for candle in fifteen_minute if parse_utc_datetime(str(candle["timestamp"])) >= context_start]
+        effective_start_date = (
+            parse_utc_datetime(str(one_minute[0]["timestamp"])).date().isoformat() if one_minute else start_date
+        )
+        # Derived from the same resolved settings the live service runs under, so the
+        # replay's gates, entry window and capital are live's rather than a restatement.
+        config = backtest_config_from_live_settings(includeDecisionRecords=True, maximumDecisionRecords=None)
+        result = VotingEnsembleBacktestRunner(config=config).run(
             symbol=str(manifest.get("symbol") or "SPY"),
             spy_1m_candles=one_minute,
             spy_5m_candles=five_minute,
@@ -5432,6 +5505,15 @@ def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timefram
             breadth_components=breadth_components,
             timeframe=timeframe,
         )
+        result["requestedStartDate"] = start_date
+        result["effectiveStartDate"] = effective_start_date
+        result["effectiveStartReason"] = (
+            "Replay starts where QQQ, IWM and breadth context data begins; the ensemble is data-not-ready before that."
+            if context_start is not None and len(one_minute) != requested_bar_count
+            else "Replay covers the requested range."
+        )
+        result["barsExcludedBeforeContext"] = requested_bar_count - len(one_minute)
+        result["liveSettingsConfigurationHash"] = config.liveSettingsConfigurationHash
         stage_results = result.pop("stageResults", [])
         result.pop("decisionRecords", None)
         stage_path = data_path.parent / f"voting_ensemble_stage_results_{timeframe}_{start_date}_{end_date}.jsonl"
@@ -5447,7 +5529,7 @@ def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timefram
             data_quality=result.get("dataQuality") if isinstance(result.get("dataQuality"), dict) else {},
         )
     else:
-        result = run_voting_ensemble_backtest(candles, timeframe=timeframe)
+        result = tag_legacy_engine(run_voting_ensemble_backtest(candles, timeframe=timeframe))
     result["sourceManifest"] = manifest.get("manifest") or str(data_path.parent / "manifest.json")
     result["startDate"] = start_date
     result["endDate"] = end_date

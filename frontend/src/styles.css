@@ -6900,3 +6900,23 @@ canvas.dragging {
     gap: 8px;
   }
 }
+
+.algo-engine-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.78em;
+  border: 1px solid rgba(94, 234, 212, 0.45);
+  background: rgba(94, 234, 212, 0.12);
+}
+
+.algo-engine-badge[data-legacy="true"] {
+  border-color: rgba(251, 191, 36, 0.6);
+  background: rgba(251, 191, 36, 0.16);
+}
+
+.ml-comparison .algo-engine-badge {
+  margin: 0.25rem 0;
+}

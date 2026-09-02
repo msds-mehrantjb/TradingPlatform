@@ -1246,10 +1246,20 @@ type BacktestTrade = {
   returnPercent: number;
 };
 
-type BacktestResult = {
+type BacktestEngineFields = {
+  engine?: string;
+  engineLabel?: string;
+  engineNote?: string;
+  matchesLiveAlgorithm?: boolean;
+};
+
+type BacktestResult = BacktestEngineFields & {
   timeframe: BacktestResultTimeframe;
   dateLabel: string;
   trades: BacktestTrade[];
+  requestedStartDate?: string;
+  effectiveStartDate?: string;
+  effectiveStartReason?: string;
   totalTrades?: number;
   displayedTrades?: number;
   totalPnl: number;
@@ -1373,7 +1383,7 @@ type MlComparisonRow = {
   verdict?: "Improved" | "Worse" | "Mixed" | "Inconclusive";
 };
 
-type MlComparisonResult = {
+type MlComparisonResult = BacktestEngineFields & {
   model: {
     name: string;
     role: string;
@@ -2324,7 +2334,7 @@ type PositionSummary = {
   returnPct: number;
 };
 
-type DynamicTradingArtifact = {
+type DynamicTradingArtifact = BacktestEngineFields & {
   status: "Ready";
   artifactId: string;
   configHash: string;
@@ -11502,6 +11512,15 @@ function activeVotingEnsembleVotes(fallback: AlgoVote[]): AlgoVote[] {
   return fallback;
 }
 
+function renderEngineBadge(fields: BacktestEngineFields | null | undefined, fallback = "Engine unknown (result predates engine labels)") {
+  const legacy = fields?.matchesLiveAlgorithm === false;
+  const label = fields?.engineLabel ?? (fields?.matchesLiveAlgorithm ? "Voting Ensemble pipeline" : fallback);
+  const title = fields?.engineNote ?? (legacy ? "" : "Same code path as the live Voting Ensemble runtime.");
+  return `<span class="algo-engine-badge" data-legacy="${legacy ? "true" : "false"}" title="${escapeHtml(title)}">Engine: <strong>${escapeHtml(label)}</strong>${
+    legacy ? " - not the live algorithm" : ""
+  }</span>`;
+}
+
 function renderAlgoIntradayTrades(backtest: BacktestResult) {
   if (state.algoBacktestTimeframe !== "1Min" && state.algoBacktestTimeframe !== "5Min") {
     algoIntradayTradesSummary.innerHTML = "";
@@ -11511,9 +11530,15 @@ function renderAlgoIntradayTrades(backtest: BacktestResult) {
   const totalTrades = backtest.totalTrades ?? backtest.trades.length;
   const winRate = totalTrades ? formatProbability(backtest.winners / totalTrades) : "0%";
   const rangeLabel = backtest.rangeLabel ?? backtest.dateLabel;
+  const effectiveRange =
+    backtest.effectiveStartDate && backtest.requestedStartDate && backtest.effectiveStartDate !== backtest.requestedStartDate
+      ? `<span title="${escapeHtml(backtest.effectiveStartReason ?? "")}">Evaluated from: ${escapeHtml(backtest.effectiveStartDate)} (context data starts here)</span>`
+      : "";
   algoIntradayTradesSummary.innerHTML = `
     <span>Backtest: <strong>${escapeHtml(algoBacktestTimeframeLabel(backtest.timeframe))}</strong></span>
+    ${renderEngineBadge(backtest)}
     <span>Range: ${escapeHtml(rangeLabel)}</span>
+    ${effectiveRange}
     <span>Trades: ${totalTrades} - Win rate: ${winRate}</span>
     <span>P/L: <strong class="${backtest.totalPnl >= 0 ? "positive" : "negative"}">${signedCurrency(backtest.totalPnl)}</strong> (${signed(backtest.totalReturnPercent)}%)</span>
   `;
@@ -18723,7 +18748,13 @@ function dynamicArtifactSummaryText(matches: boolean, best?: MlComparisonResult[
   }
   const artifact = state.dynamicArtifact;
   const bestText = best ? ` Best ML: ${best.timeframe} ${best.verdict}, ${signedCurrency(best.bestPnl)}.` : "";
-  return `Ready ${artifact?.rangeLabel ?? ""}.${bestText}`;
+  const engineText =
+    artifact?.matchesLiveAlgorithm === false
+      ? ` Legacy engine (${artifact.engineLabel ?? "main.py"}): not the live Voting Ensemble logic.`
+      : artifact && artifact.engine === undefined
+        ? " Engine unlabeled: produced before engine labels, treat as legacy."
+        : "";
+  return `Ready ${artifact?.rangeLabel ?? ""}.${bestText}${engineText}`;
 }
 
 function marketPermissionGate(context: MarketContext | null, intendedSide: AlgoSignal): TradeLayerGate {
@@ -19199,7 +19230,9 @@ function dynamicArtifactStatusLabel() {
   const settingsKey = tradingSettingsKey(state.tradingSettings);
   const artifactMatches = state.dynamicArtifactStatus === "ready" && state.dynamicArtifactSettingsKey === settingsKey;
   return artifactMatches
-    ? "Ready"
+    ? state.dynamicArtifact?.matchesLiveAlgorithm === true
+      ? "Ready"
+      : "Ready (legacy engine)"
     : state.dynamicArtifactStatus === "loading"
       ? "Loading"
       : state.dynamicArtifactStatus === "error"
@@ -20162,6 +20195,7 @@ function renderMlComparison(timeframe: BacktestResultTimeframe) {
   return `
     <div class="ml-comparison">
       <strong>ML Comparison</strong>
+      ${renderEngineBadge(comparison, "Legacy engine (result predates engine labels)")}
       <span class="ml-comparison-note">${escapeHtml(comparison.model.name)} - ${comparison.model.rows} shared trades - ${comparison.model.trainingPolicy}</span>
       <div class="ml-table-wrap">
         <table>
