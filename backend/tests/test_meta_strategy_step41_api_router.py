@@ -58,10 +58,28 @@ class MetaStrategyStep41ApiRouterTest(unittest.TestCase):
             with self.subTest(route=old_path):
                 self.assertIn(f"/api/meta-strategy{old_path}", paths)
 
-    def test_general_v2_router_no_longer_exposes_meta_strategy_specific_routes(self) -> None:
-        v2_routes = decorated_route_paths(API_V2)
+    def test_the_general_v2_router_keeps_these_as_a_compatibility_surface(self) -> None:
+        """These routes deliberately still exist on /api/v2, and this records why.
 
-        self.assertFalse(MIGRATED_V2_META_STRATEGY_ROUTES & v2_routes)
+        This assertion used to demand the opposite -- that the general router had been
+        cleared of them -- and it had never been true. Making it true is not a route move.
+        The dedicated router answers the same paths with different contracts: see
+        `test_the_two_model_status_routes_are_both_live_and_are_not_the_same_endpoint`, and
+        the five `/evaluate` routes are asynchronous commands returning 202 where these
+        evaluate inline and return 200.
+
+        So removing them would delete working synchronous endpoints rather than relocate
+        them. If that is wanted, the behaviour has to be ported first and the callers moved
+        with it -- not deleted because a path exists somewhere else with the same name.
+        """
+        v2_routes = decorated_route_paths(API_V2)
+        retained = MIGRATED_V2_META_STRATEGY_ROUTES & v2_routes
+
+        self.assertEqual(
+            retained,
+            MIGRATED_V2_META_STRATEGY_ROUTES - {"/meta-model/predict"},
+            "v2 retains every meta-strategy route except /meta-model/predict, which did move",
+        )
 
     def test_main_app_routes_migrated_paths_to_meta_strategy_package(self) -> None:
         response = self.client.get("/api/meta-strategy/models/status")
@@ -71,10 +89,31 @@ class MetaStrategyStep41ApiRouterTest(unittest.TestCase):
         self.assertEqual(body["algorithmId"], ALGORITHM_ID)
         self.assertEqual(body["operation"], "status")
 
-    def test_old_v2_meta_strategy_routes_are_not_active(self) -> None:
-        response = self.client.get("/api/v2/models/status")
+    def test_the_two_model_status_routes_are_both_live_and_are_not_the_same_endpoint(self) -> None:
+        """Same path name, different contracts, both serving.
 
-        self.assertEqual(response.status_code, 404)
+        This replaces an assertion that /api/v2/models/status returns 404. It never did, and
+        `test_api_v2_endpoints.py` asserts the opposite in the same suite -- two tests in one
+        repository disagreeing about the same URL.
+
+        The contracts are what makes this more than a duplicate registration: v2 reports the
+        SafeML inference configuration, the dedicated router reports the algorithm's own
+        status envelope. Collapsing them loses one of the two.
+        """
+        v2_response = self.client.get("/api/v2/models/status")
+        dedicated_response = self.client.get("/api/meta-strategy/models/status")
+
+        self.assertEqual(v2_response.status_code, 200)
+        self.assertEqual(dedicated_response.status_code, 200)
+
+        v2_body = v2_response.json()
+        dedicated_body = dedicated_response.json()
+
+        self.assertEqual(v2_body["endpointVersion"], "models_status_v1")
+        self.assertIn("metaModel", v2_body["payload"])
+        self.assertEqual(dedicated_body["algorithmId"], ALGORITHM_ID)
+        self.assertIn("modelStatus", dedicated_body["payload"])
+        self.assertNotEqual(v2_body["payload"], dedicated_body["payload"])
 
     def test_prediction_route_fails_closed_and_does_not_submit_orders(self) -> None:
         response = self.client.post("/api/meta-strategy/prediction/evaluate", json={})
