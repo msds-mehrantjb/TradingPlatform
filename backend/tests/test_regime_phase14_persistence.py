@@ -79,6 +79,7 @@ EXPECTED_REGIME_OWNED_TABLES = (
     "regime_ml_artifacts",
     "regime_runtime_state",
     "regime_bar_processing",
+    "regime_local_paper_accounts",
     "regime_inventory_events",
     "regime_inventory_snapshots",
     "regime_daily_risk_state",
