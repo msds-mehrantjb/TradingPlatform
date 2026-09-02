@@ -232,6 +232,78 @@ through the producer. The structural divergence remains; the behavioural one doe
 agree bar for bar, which is what the shared path would have bought. Each of those three
 agreed only after a specific defect was fixed, and all three looked fine from one side.
 
+## Full-dataset replay under the live pipeline (recorded 2026-09-02)
+
+Every number recorded above came from one synthetic 390-bar session. Every number stored
+on disk before this section came from something else entirely: the legacy engine in
+`main.py`, nine hard-coded strategies under a majority vote with none of the gates,
+session policy, event veto, risk budget or reliability weighting this pipeline applies.
+That engine wrote the June "best baseline" file, every `voting_ensemble_risk_v16_*` cache,
+the daily Trading Settings artifact and the ML comparison. The dedicated runner that does
+share the live pipeline had never produced a result over real data, and could not: it
+re-scanned and re-serialised the whole five-minute, QQQ, IWM and breadth histories on every
+one-minute bar, which is quadratic over six years and is what the daily artifact job had
+been stuck on for a day when this was found.
+
+### What changed (`98974f8`, `890f3f1`)
+
+| Change | Effect on replay |
+|---|---|
+| Every legacy-engine result carries `engine`, `engineLabel`, `matchesLiveAlgorithm=false` and a note; the frontend shows the badge | None on numbers. A legacy result can no longer be read as evidence about this algorithm |
+| Each bar sees the live producer's windows: 390 SPY one-minute candles (within the session), 240 of each auxiliary stream, 78 five-minute and 26 fifteen-minute bars derived from the one-minute limit. Pinned to the producer's own defaults by test | **None on the 390-bar session** (5 trades, 1 win, -50.00, 351 decisions, re-verified). On multi-session data the auxiliary window is now live's instead of the whole prefix, which is the parity fix |
+| The replay configuration is derived from the resolved live settings (`backtest_config_from_live_settings`), and the settings hash travels with the result | None while the gates ship disabled. Turning one on live now moves replay with it instead of leaving replay on stale defaults |
+| The cached endpoint starts where QQQ, IWM and breadth context begins and records `effectiveStartDate` | The ensemble is data-not-ready without context, so the excluded years held no trades. They held a day of compute |
+| The in-memory intelligence-capture store is bounded (2048 records) | None on numbers. Unbounded, it retained about a megabyte per bar and reached 10 GB in twenty minutes; the live process leaks the same way, one session at a time |
+
+### The recorded run
+
+Dataset `SPY/20260901T202755Z` (prepared 2026-09-01T20:27Z, `feed=iex`), timeframe 1Min,
+requested range 2020-07-28 to 2026-09-01. Real pipeline end to end, default configuration,
+cache `voting_ensemble_dedicated_v2_1Min_2020-07-28_2026-09-01.json`.
+
+| | |
+|---|---|
+| Effective start | 2026-06-29, where the context streams begin; 583,869 earlier SPY bars excluded |
+| Sessions evaluated | 33 (14,568 one-minute bars, 13,281 decisions after a 40-bar warm-up) |
+| Live settings hash | `aed8572a2685bb5c` (`voting_ensemble_one_minute_settings_v1`), capital 25,000, entries 09:35-15:30, session policy off, event calendar off |
+| History windows | 390 / 78 / 26 / 240 |
+| Trades | 84 (30 long, 54 short), 3 shares each |
+| Wins / losses | 39 / 45 |
+| Net PnL | **+9.76** (gross +24.88, costs 15.12) |
+| Profit factor | 1.11 |
+| Expectancy | 0.12 per trade |
+| Exits | 52 time stop, 17 protective stop, 15 profit target |
+| By family | trend 78 trades, +21.01 net; reversal 6 trades, -11.25 net |
+| Wall clock | 5,072 s on one core |
+
+Flat, in other words: the pipeline trades in 32 of 33 sessions, sizes every entry to three
+shares under the allocation rule, and gives most of the gross back in costs. That is the
+first honest number for this algorithm over real data, and it is nothing like the legacy
+figures beside it on disk.
+
+### Three things the run exposed, none fixed here
+
+1. **The dataset is missing 13 sessions.** Aug 11 through Aug 27 have no bars at all
+   (Jul 3 is a holiday). The daily refresh runs in `full_history_plus_latest_session` mode,
+   so a day the refresh does not run is a day the history never gets. The replay is
+   correct for the data it was given; the data is not the period it claims to be.
+2. **Every trade is labelled `unknown_regime`.** The classifier runs (family fits are
+   real, see the withdrawn finding above); the trade record's regime label reads a key the
+   decision does not carry. A by-regime breakdown of this run is therefore empty.
+3. **`maxDrawdownPercent` is 0.0 and does not mean no drawdown.** The metric is the
+   absolute of a negative total, not a running peak-to-trough. It reports zero for any run
+   that ends above water.
+
+### Wall-clock note
+
+Roughly 0.35 s per bar on real data with eleven breadth streams, so a session costs
+about two and a half minutes and this dataset about 85 minutes. The daily artifact job
+now runs this for 1Min and again for 5Min, so the job takes about three hours where it
+previously never finished. The `/api/voting-ensemble/backtest` endpoint still computes
+synchronously on a cache miss; the frontend gives up after 20 s, so the cache has to be
+produced by the daily job (or `scripts/run_voting_ensemble_dedicated_replay.py`) before the
+panel can show it.
+
 ## When to re-record
 
 Re-record, keeping the prior version beside the new one, when any of these happen:
@@ -248,6 +320,15 @@ Re-record, keeping the prior version beside the new one, when any of these happe
    which bars may open a position at all.
 7. An instrument's `point_value` or `roll_schedule` changes, or `SUPPORTED_CAPABILITIES` is
    widened. The first two change every sized quantity; the third changes what may trade.
+8. `oneMinuteHistoryLimit` or `auxiliaryHistoryLimit` change, or the live producer's
+   `history_limit` moves away from them. They decide how much history every bar is judged
+   against; the test pins them together, so the failure will say which side moved.
+9. The dataset's context coverage changes. The effective start follows the first bar at
+   which QQQ, IWM and every breadth component exist, so a re-prepared dataset with earlier
+   context evaluates more sessions and is not the same run.
+10. The resolved live settings hash changes. The replay configuration is derived from it,
+    so a different hash is a different configuration whether or not any field looks
+    different.
 
 A baseline recorded without its enabling configuration cannot be reproduced, so the
 configuration is part of the record, not context around it.
