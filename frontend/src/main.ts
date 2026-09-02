@@ -11513,11 +11513,13 @@ function activeVotingEnsembleVotes(fallback: AlgoVote[]): AlgoVote[] {
 }
 
 function renderEngineBadge(fields: BacktestEngineFields | null | undefined, fallback = "Engine unknown (result predates engine labels)") {
+  const live = fields?.matchesLiveAlgorithm === true;
   const legacy = fields?.matchesLiveAlgorithm === false;
-  const label = fields?.engineLabel ?? (fields?.matchesLiveAlgorithm ? "Voting Ensemble pipeline" : fallback);
-  const title = fields?.engineNote ?? (legacy ? "" : "Same code path as the live Voting Ensemble runtime.");
-  return `<span class="algo-engine-badge" data-legacy="${legacy ? "true" : "false"}" title="${escapeHtml(title)}">Engine: <strong>${escapeHtml(label)}</strong>${
-    legacy ? " - not the live algorithm" : ""
+  const unknown = !live && !legacy;
+  const label = fields?.engineLabel ?? (live ? "Voting Ensemble pipeline" : fallback);
+  const title = fields?.engineNote ?? (live ? "Same code path as the live Voting Ensemble runtime." : unknown ? "No engine label on this result; treat it as legacy until regenerated." : "");
+  return `<span class="algo-engine-badge" data-legacy="${live ? "false" : "true"}" title="${escapeHtml(title)}">Engine: <strong>${escapeHtml(label)}</strong>${
+    live ? "" : " - not the live algorithm"
   }</span>`;
 }
 
