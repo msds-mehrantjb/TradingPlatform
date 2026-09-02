@@ -188,5 +188,39 @@ class VotingEnsembleIntelligenceCaptureTest(unittest.TestCase):
             store.write(bad_record)
 
 
+class VotingEnsembleCaptureMemoryBoundTest(unittest.TestCase):
+    """The in-memory capture store is bounded.
+
+    Every evaluation publishes about twenty-five records, one of them a dump of the whole
+    input snapshot with every candle in it. Unbounded, that grew by about a megabyte per
+    bar and exhausted a 32 GB machine inside a multi-session replay. The newest records
+    stay, the oldest go, and the store counts what it evicted so the loss is visible.
+    """
+
+    def test_store_keeps_the_newest_records_and_counts_evictions(self) -> None:
+        store = VotingEnsembleCaptureStore(max_records=3)
+        for index in range(5):
+            store.write(
+                build_capture_record(
+                    event_type="input_snapshot",
+                    payload={"index": index},
+                    correlation_id=f"corr-{index}",
+                    settings_hash="settings",
+                    snapshot_timestamp=NOW,
+                )
+            )
+
+        self.assertEqual(len(store.records), 3)
+        self.assertEqual([record.payload["index"] for record in store.records], [2, 3, 4])
+        self.assertEqual(store.evictedRecordCount, 2)
+        self.assertEqual(len(store.list_records(correlationId="corr-4")), 1)
+        self.assertEqual(len(store.list_records(correlationId="corr-0")), 0)
+
+    def test_default_bound_is_finite(self) -> None:
+        self.assertGreater(VotingEnsembleCaptureStore().maxRecords, 0)
+        with self.assertRaises(ValueError):
+            VotingEnsembleCaptureStore(max_records=0)
+
+
 if __name__ == "__main__":
     unittest.main()

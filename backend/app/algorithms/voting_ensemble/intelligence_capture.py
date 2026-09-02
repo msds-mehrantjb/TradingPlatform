@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from queue import Full, Queue
@@ -79,14 +80,34 @@ class VotingEnsembleCaptureRecord(DomainModel):
         return _require_utc(value) if value else None
 
 
+VOTING_ENSEMBLE_CAPTURE_MEMORY_LIMIT = 2048
+
+
 class VotingEnsembleCaptureStore:
-    def __init__(self, *, storage_path: str | Path | None = None) -> None:
+    """Capture records, appended to disk when a path is configured and held in memory for
+    diagnostics.
+
+    The in-memory copy is bounded. Every evaluation publishes roughly twenty-five records,
+    one of which is a dump of the whole input snapshot with every candle in it, so an
+    unbounded list grew by about a megabyte per bar: enough to exhaust a 32 GB machine
+    inside a multi-session replay, and a slow leak in the live process. The newest
+    records are kept and the oldest evicted; the on-disk log, when configured, is never
+    truncated.
+    """
+
+    def __init__(self, *, storage_path: str | Path | None = None, max_records: int = VOTING_ENSEMBLE_CAPTURE_MEMORY_LIMIT) -> None:
+        if max_records <= 0:
+            raise ValueError("max_records must be positive")
         self.storagePath = Path(storage_path).resolve() if storage_path is not None else None
-        self.records: list[VotingEnsembleCaptureRecord] = []
+        self.maxRecords = int(max_records)
+        self.records: deque[VotingEnsembleCaptureRecord] = deque(maxlen=self.maxRecords)
+        self.evictedRecordCount = 0
 
     def write(self, record: VotingEnsembleCaptureRecord) -> VotingEnsembleCaptureRecord:
         if not record.tableName.startswith("voting_ensemble_capture_"):
             raise ValueError("Voting Ensemble capture cannot write outside voting_ensemble_capture_* namespaces")
+        if len(self.records) == self.maxRecords:
+            self.evictedRecordCount += 1
         self.records.append(record)
         if self.storagePath is not None:
             self.storagePath.parent.mkdir(parents=True, exist_ok=True)
