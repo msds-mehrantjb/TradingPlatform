@@ -152,12 +152,18 @@ class RegimeRuntimeSupervisor:
         paper_gateway: PaperOrderGateway | None = None,
         account_snapshot_provider: Callable[[dict[str, str]], dict[str, Any]] | None = None,
         market_event_publisher: Any | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.service = service or RegimeApplicationService()
         self.config = config or RegimeRuntimeSupervisorConfig()
         self.paper_gateway = paper_gateway
         self.account_snapshot_provider = account_snapshot_provider
         self.market_event_publisher = market_event_publisher
+        # The wall clock by default. A deterministic session harness replays a fixed trading
+        # day, and the execution gate refuses outside regular hours, so a runtime that cannot
+        # be handed a clock can only be acceptance-tested between 09:30 and 16:00 ET -- which
+        # is to say, intermittently.
+        self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(timezone.utc))
         self.event_queue: asyncio.Queue[RegimeFinalisedBarEvent] = asyncio.Queue(maxsize=self.config.queue_maxsize)
         self.command_queue: asyncio.Queue[RegimeRuntimeCommand] = asyncio.Queue(maxsize=self.config.command_queue_maxsize)
         self.stop_event = asyncio.Event()
@@ -772,7 +778,7 @@ class RegimeRuntimeSupervisor:
                 rollout_stage=rollout_stage,
                 rollout_snapshot=rollout_snapshot,
                 promotion_evidence=promotion_evidence,
-                evaluated_at=datetime.now(timezone.utc),
+                evaluated_at=self._clock(),
             )
             if preflight_blockers:
                 for reason in preflight_blockers:
@@ -875,7 +881,7 @@ class RegimeRuntimeSupervisor:
                 identity=identity,
                 paper_gateway=paper_gateway,
                 outbox_record=outbox_record,
-                evaluated_at=datetime.now(timezone.utc),
+                evaluated_at=self._clock(),
             )
             self._mark_component("paper_broker", "healthy", reason_codes=("regime.health.paper_broker.submit_attempted",))
             self._mark_component("global_risk_connection", "healthy", reason_codes=("regime.health.global_risk.checked",))
@@ -1552,7 +1558,7 @@ class RegimeRuntimeSupervisor:
                 confirmed_regime=str(confirmed.get("confirmed_regime") or "unknown"),
                 entry_paused=bool(self.metrics.entry_creation_paused_for_reconciliation or self.metrics.paused),
                 global_emergency_flatten=bool(self.metrics.emergency_flatten_requested),
-                evaluated_at=datetime.now(timezone.utc),
+                evaluated_at=self._clock(),
             )
             self.metrics.open_positions = max(0, int(result.get("openPositionsEvaluated") or 0) - int(result.get("exitIntentsCreated") or 0))
             if result.get("exitIntentsCreated"):
