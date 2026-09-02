@@ -884,7 +884,7 @@ def _stage_final_validation(state: _PipelineState) -> None:
             max_quote_age_seconds=state.request.max_quote_age_seconds,
             max_spread_bps=state.dynamic_profile.effective_settings.spread_limit_bps if state.dynamic_profile else 15.0,
             minimum_liquidity=state.dynamic_profile.effective_settings.liquidity_requirement if state.dynamic_profile else 0.0,
-            duplicate_intent_ids=_duplicate_order_intent_ids_from_inventory(state.request.inventory_snapshot or {}),
+            duplicate_intent_ids=_duplicate_intent_ids(state.request),
             existing_position_symbols=risk_state.existing_position_symbols if state.config.settings.position_management.one_position_per_symbol else (),
         )
     )
@@ -1361,6 +1361,19 @@ def _symbol_exposure_from_inventory(inventory: Mapping[str, Any], symbol: str) -
         price = _snapshot_float(position, "marketPrice", "market_price", "averagePrice", "average_price", "price") or 0.0
         total += abs(float(quantity) * float(price))
     return round(total, 10)
+
+
+def _duplicate_intent_ids(request: Any) -> tuple[str, ...]:
+    """Known-duplicate intent ids, from the inventory and from the caller.
+
+    The request carried `duplicate_order_intent_ids` and nothing ever read it, so a caller
+    that explicitly declared an id it had already submitted was ignored and the order went
+    through. Duplicate protection that quietly does nothing is worse than none, because it is
+    relied on precisely when it matters.
+    """
+    inventory = _duplicate_order_intent_ids_from_inventory(getattr(request, "inventory_snapshot", None) or {})
+    declared = tuple(str(item) for item in (getattr(request, "duplicate_order_intent_ids", ()) or ()))
+    return tuple(dict.fromkeys((*inventory, *declared)))
 
 
 def _duplicate_order_intent_ids_from_inventory(inventory: Mapping[str, Any]) -> tuple[str, ...]:
