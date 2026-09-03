@@ -32,7 +32,7 @@ class VotingEnsembleTradingSettingsTest(unittest.TestCase):
     def test_current_one_minute_baseline_values_are_migrated_without_hourly_daily_weekly_keys(self) -> None:
         config = dynamic_risk_config({})
 
-        self.assertEqual(config["startingCapital"], 25000.0)
+        self.assertEqual(config["startingCapital"], 100000.0)
         self.assertEqual(config["riskPerTradePercent"], 0.5)
         self.assertEqual(config["maxDailyLossPercent"], 2.0)
         # No fixed trade count; the daily-loss limit governs the day's activity.

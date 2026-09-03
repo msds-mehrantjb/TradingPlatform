@@ -87,7 +87,12 @@ def _buying_power_model(allow_shorts: bool) -> str:
 VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID = "voting_ensemble.paper.default.account"
 VOTING_ENSEMBLE_LOCAL_PAPER_ACCOUNT_VERSION = "voting_ensemble_local_paper_account_v2"
 VOTING_ENSEMBLE_LOCAL_INVENTORY_MANIFEST_VERSION = "voting_ensemble_local_inventory_manifest_v1"
-VOTING_ENSEMBLE_DEFAULT_LOCAL_CASH = Decimal("100000")
+from backend.app.algorithms.voting_ensemble.trading_settings.baseline import one_minute_baseline_settings
+
+# Opening cash comes from the settings baseline's startingCapital, so the account and
+# the settings cannot carry different equities again. VOTING_ENSEMBLE_LOCAL_PAPER_INITIAL_CASH
+# remains an explicit operator override (see _configured_initial_cash), not a second default.
+VOTING_ENSEMBLE_DEFAULT_LOCAL_CASH = Decimal(str(one_minute_baseline_settings()["startingCapital"]))
 VOTING_ENSEMBLE_LOCAL_SOURCE_AUTHORITY = "voting_ensemble_local_paper_account"
 VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE = "voting_ensemble.paper_execution"
 VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE = "voting_ensemble.paper_gateway"

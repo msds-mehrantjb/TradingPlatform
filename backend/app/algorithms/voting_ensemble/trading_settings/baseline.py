@@ -10,7 +10,10 @@ VOTING_ENSEMBLE_ONE_MINUTE_BASELINE_VERSION = "voting_ensemble_baseline_settings
 
 
 ONE_MINUTE_BASELINE_SETTINGS: dict[str, Any] = {
-    "startingCapital": 25000.0,
+    # The one source of starting equity. The local paper account derives its opening
+    # cash from this value; the two used to carry separate defaults (25,000 here,
+    # 100,000 in the account) and every recorded size depended on which one was read.
+    "startingCapital": 100000.0,
     "riskPerTradePercent": 0.5,
     "maxDailyLossPercent": 2.0,
     # No fixed trade count. The day's activity is bounded by the daily-loss limit above
