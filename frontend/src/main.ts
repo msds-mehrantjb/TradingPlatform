@@ -6630,6 +6630,9 @@ async function fetchVotingEnsembleBacktest(timeframe: AlgoBacktestTimeframe) {
       if (response.ok) {
         return (await response.json()) as BacktestResult;
       }
+      if (response.status === 409) {
+        throw new Error(await artifactNotReadyMessage(response, "Full-range Voting Ensemble backtest"));
+      }
       if (response.status !== 404) {
         throw new Error(`Full-range Voting Ensemble backtest unavailable (${response.status})`);
       }

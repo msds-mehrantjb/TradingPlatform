@@ -299,10 +299,12 @@ figures beside it on disk.
 Roughly 0.35 s per bar on real data with eleven breadth streams, so a session costs
 about two and a half minutes and this dataset about 85 minutes. The daily artifact job
 now runs this for 1Min and again for 5Min, so the job takes about three hours where it
-previously never finished. The `/api/voting-ensemble/backtest` endpoint still computes
-synchronously on a cache miss; the frontend gives up after 20 s, so the cache has to be
-produced by the daily job (or `scripts/run_voting_ensemble_dedicated_replay.py`) before the
-panel can show it.
+previously never finished. The `/api/voting-ensemble/backtest` endpoint no longer computes
+on a cache miss: it answers 409 with the expected cache path and the latest artifact job.
+It used to compute inside the request thread, and because the frontend gave up after 20 s
+while the thread kept going, a few page loads against a fresh dataset were enough to pin
+the backend for hours. The cache is produced by the daily job or
+`scripts/run_voting_ensemble_dedicated_replay.py`, and the panel shows it once it exists.
 
 ## When to re-record
 

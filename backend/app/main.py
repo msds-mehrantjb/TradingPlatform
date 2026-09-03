@@ -2662,6 +2662,24 @@ def voting_ensemble_backtest(
     if not data_path.exists():
         raise HTTPException(status_code=404, detail=f"{timeframe} backtest dataset missing")
 
+    # The dedicated replay takes about 85 minutes on real data. Computing it inside a
+    # request thread meant every page load against a fresh dataset started another one:
+    # the frontend gave up after 20 s, the thread kept going, and a few reloads were
+    # enough to pin the backend for hours. A miss is now reported, not computed; the
+    # daily artifact job and scripts/run_voting_ensemble_dedicated_replay.py produce it.
+    if timeframe in {"1Min", "5Min"}:
+        cache_path = dedicated_voting_ensemble_cache_path(data_path=data_path, timeframe=timeframe, start_date=start_date, end_date=end_date)
+        if not cache_path.exists():
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": f"{timeframe} Voting Ensemble replay for {start_date} to {end_date} has not been produced for this dataset yet.",
+                    "expectedPath": str(cache_path),
+                    "producedBy": "daily ML artifact job or scripts/run_voting_ensemble_dedicated_replay.py",
+                    "latestJob": latest_ml_artifact_job_status(symbol=symbol.upper(), start_date=start_date, end_date=end_date),
+                },
+            )
+
     result = cached_voting_ensemble_backtest(
         data_path=data_path,
         manifest=manifest,
@@ -5396,14 +5414,21 @@ WEEKLY_HOLDING_BARS = [6, 8, 10]
 WEEKLY_DRAWDOWN_STOPS = [0.0, 4.0, 6.0]
 
 
-def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timeframe: str, start_date: str, end_date: str) -> dict:
-    # v2: the dedicated runner now evaluates each bar against the live producer's history
+def dedicated_voting_ensemble_cache_path(*, data_path: Path, timeframe: str, start_date: str, end_date: str) -> Path:
+    # v2: the dedicated runner evaluates each bar against the live producer's history
     # windows, derives its configuration from the resolved live settings, and starts where
     # the context streams start. A v1 cache was recorded under none of those, so it is not
     # comparable and must not be served as if it were.
+    return data_path.parent / f"voting_ensemble_dedicated_v2_{timeframe}_{start_date}_{end_date}.json"
+
+
+def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timeframe: str, start_date: str, end_date: str) -> dict:
     dedicated = timeframe in {"1Min", "5Min"}
-    cache_version = "voting_ensemble_dedicated_v2" if dedicated else "voting_ensemble_risk_v16"
-    cache_path = data_path.parent / f"{cache_version}_{timeframe}_{start_date}_{end_date}.json"
+    cache_path = (
+        dedicated_voting_ensemble_cache_path(data_path=data_path, timeframe=timeframe, start_date=start_date, end_date=end_date)
+        if dedicated
+        else data_path.parent / f"voting_ensemble_risk_v16_{timeframe}_{start_date}_{end_date}.json"
+    )
     if cache_path.exists():
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
         if not dedicated and "engine" not in cached:
