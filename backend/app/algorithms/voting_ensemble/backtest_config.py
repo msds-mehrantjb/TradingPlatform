@@ -105,6 +105,20 @@ class VotingEnsembleBacktestConfig(DomainModel):
         return max(1, -(-self.oneMinuteHistoryLimit // 15))
 
 
+def _live_short_entries_enabled() -> bool:
+    """Whether the live runtime is taking short entries.
+
+    Imported lazily: paper_execution builds the runtime singleton at import, and the
+    replay configuration must not drag that in at module load.
+    """
+    try:
+        from backend.app.algorithms.voting_ensemble.paper_execution import _short_trading_enabled_from_env
+
+        return bool(_short_trading_enabled_from_env())
+    except Exception:
+        return False
+
+
 def backtest_config_from_live_settings(settings_payload: dict[str, Any] | None = None, **overrides: Any) -> VotingEnsembleBacktestConfig:
     """Build the replay configuration from the settings the live path resolves.
 
@@ -135,6 +149,10 @@ def backtest_config_from_live_settings(settings_payload: dict[str, Any] | None =
         "eventCalendar": _dict_or_none(getattr(settings, "eventCalendar", None)),
         "liveSettingsConfigurationHash": str(settings.configurationHash),
         "liveSettingsVersion": str(settings.settingsVersion),
+        # Follows the live runtime rather than restating its default, so enabling shorts
+        # live moves the replay with it instead of leaving the two describing different
+        # strategies. Off by default; refused shorts still populate shadowTrades.
+        "allowShortEntries": _live_short_entries_enabled(),
     }
     derived.update(overrides)
     return VotingEnsembleBacktestConfig(**derived)

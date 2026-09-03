@@ -374,11 +374,12 @@ the rule, and the percent was echoed into metadata and validated against 100 and
 else.
 
 Both are removed from the Voting Ensemble baseline, resolver, settings model, validation
-and metadata echo, and from the Voting Ensemble panel's "Risk budget %" input and its
-preview maths (the preview's risk budget is now the account base risk in both sizing modes).
-A payload that still carries either key is ignored, not rejected. The shared domain model,
-the legacy engine, the meta strategy and their fixtures keep their own copies of the fields;
-they are separate readers and were left alone. No recorded number moves: the removal is of
+and metadata echo. A payload that still carries either key is ignored, not rejected. The
+shared domain model, the legacy engine, the meta strategy, their fixtures and the panel's
+"Risk budget %" input keep their own copies; they are separate readers and were left alone
+by decision. One consequence to know: the panel's manual-order preview still computes a
+risk budget from that input, and the backend no longer reads it, so the preview's share
+count and the sized order can disagree. No recorded number moves for this change: it is of
 text that never sized a trade. The `positionSizing` string documents the rule.
 
 ## Inert controls: wired, removed, or kept documented (2026-09-03)

@@ -85,6 +85,30 @@ class RegimeTransitionStatePersistenceTest(unittest.TestCase):
         self.assertEqual(record["state"]["pendingCount"], 0)
         self.assertEqual(record["state"]["transitionState"], "stable")
 
+    def test_an_unchanged_state_does_not_rewrite_the_store(self) -> None:
+        # A write rewrites the whole snapshot file, and the classifier saves every bar.
+        repository = VotingEnsemblePaperExecutionRepository(self.store_path)
+        classifier = AdxAtrRegimeClassifier(state_store=LocalStoreAdxAtrRegimeStateStore(repository))
+        classifier.evaluate_snapshot_output(strong_trend_snapshot())
+        first_write = self.store_path.stat().st_mtime_ns
+
+        for _ in range(3):
+            classifier.evaluate_snapshot_output(strong_trend_snapshot())
+
+        self.assertEqual(self.store_path.stat().st_mtime_ns, first_write)
+
+        # A real transition still persists.
+        classifier.evaluate_snapshot_output(range_snapshot())
+        record = repository.read_snapshot("regime_transition_state.SPY.1Min")
+        self.assertEqual(record["state"]["transitionState"], "pending_transition")
+
+    def test_both_entry_points_share_one_hysteresis_key(self) -> None:
+        # The classifier has two entry points; two spellings of the key would give one
+        # classifier two independent states and two records on disk.
+        source = Path(classifier_module.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('state_key="SPY"', source)
+        self.assertEqual(source.count("state_key=regime_state_key("), 2)
+
     def test_unreadable_state_starts_from_unknown(self) -> None:
         repository = VotingEnsemblePaperExecutionRepository(self.store_path)
         repository.write_snapshot("regime_transition_state.SPY.1Min", {"state": {"activeLabel": "not-a-label"}})

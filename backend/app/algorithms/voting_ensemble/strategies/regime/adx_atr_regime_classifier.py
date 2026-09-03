@@ -183,7 +183,17 @@ class LocalStoreAdxAtrRegimeStateStore:
             logger.warning("voting_ensemble.regime.transition_state_unreadable key=%s; starting from unknown", key)
             return AdxAtrRegimeRuntimeState()
 
+    @staticmethod
+    def _decision_fields(state: AdxAtrRegimeRuntimeState) -> tuple[Any, ...]:
+        # lastEvaluatedAt is informational; only these decide the next bar's label.
+        return (state.activeLabel, state.pendingLabel, state.pendingCount, state.transitionState)
+
     def save(self, key: str, state: AdxAtrRegimeRuntimeState) -> None:
+        # The classifier saves on every bar, including the common case where nothing moved,
+        # and a write rewrites the whole snapshot file. Only a real change is worth that,
+        # so the stored lastEvaluatedAt is the last change rather than the last evaluation.
+        if self._decision_fields(self.load(key)) == self._decision_fields(state):
+            return
         symbol, _, timeframe = key.partition(":")
         self.repository.write_snapshot(
             self.snapshot_key(key),
@@ -211,7 +221,9 @@ class AdxAtrRegimeClassifier:
         output = self._output_from_evidence(
             evidence,
             evaluated_at=context.evaluatedAt,
-            state_key="SPY",
+            # The same key the snapshot path uses. Two spellings would give one classifier
+            # two independent hysteresis states, and two records in the persistent store.
+            state_key=regime_state_key("SPY"),
             session_state=_session_state_from_raw(context.featureSnapshot.rawInputs.get("sessionState")),
             event_risk_state="event_risk_active" if self._event_shock_active(context) else "event_risk_clear",
             liquidity_state=_liquidity_state(None, None),

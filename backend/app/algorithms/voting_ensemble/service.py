@@ -1557,7 +1557,9 @@ def _effective_policy_for_order_planner(
         minimumRiskMultiplier=float(settings.profileOverlayLimits.minimumRiskMultiplier),
         maximumRiskMultiplier=1.0,
         minimumTargetR=1.0,
-        maximumTargetR=max(1.0, float(settings.targetPolicy.takeProfitR) * float(profile.targetMultiplier)),
+        # takeProfitR already carries the profile's target multiplier from settings
+        # resolution; multiplying again here is the double application 306d8c1 removed.
+        maximumTargetR=max(1.0, float(settings.targetPolicy.takeProfitR)),
         minimumHoldingMinutes=1,
         maximumHoldingMinutes=int(profile.maximumHoldingMinutes),
         minimumAtrStopMultiplier=0.5,

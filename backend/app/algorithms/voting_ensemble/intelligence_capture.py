@@ -28,7 +28,9 @@ VOTING_ENSEMBLE_OPERATIONAL_EVENT_TYPES = {
     "final_trade_outcome",
     "worker_job_status",
     "error_recovery_event",
-    "shadow_decision",
+    # No shadow_decision type here on purpose: a refused short is recorded by
+    # paper_execution.record_shadow_decision into the algorithm's own snapshot store, and
+    # a capture type with no producer is a table that never receives a row.
 }
 
 
@@ -53,7 +55,6 @@ CAPTURE_TABLES: dict[str, str] = {
     "final_trade_outcome": "voting_ensemble_capture_trade_outcomes",
     "worker_job_status": "voting_ensemble_capture_worker_job_status",
     "error_recovery_event": "voting_ensemble_capture_error_recovery_events",
-    "shadow_decision": "voting_ensemble_capture_shadow_decisions",
 }
 
 
