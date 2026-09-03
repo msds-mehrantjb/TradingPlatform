@@ -49,13 +49,11 @@ class VotingEnsembleReplayPolicyEngine:
             startingCapital=accountRiskState.equity or 1.0,
             orderAllocationPercent=10.0,
             dailyAllocationPercent=30.0,
-            riskBudgetPercentOfOrder=50.0,
             maxTradesPerDay=3,
             stopLossPercent=0.35,
             fixedStopDistanceDollars=VOTING_ENSEMBLE_DEFAULT_STOP_DISTANCE,
             takeProfitR=VOTING_ENSEMBLE_DEFAULT_TARGET_R,
             slippagePerShare=0.02,
-            positionSizingMode="allocation",
             settingsVersion="voting_ensemble_entry_baseline_v1",
             configurationHash="voting_ensemble_entry_baseline_v1",
         )

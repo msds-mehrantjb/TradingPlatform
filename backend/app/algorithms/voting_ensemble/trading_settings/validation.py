@@ -23,8 +23,6 @@ def validate_one_minute_settings(settings: VotingEnsembleOneMinuteSettings) -> V
     _validate_time_order(settings.sessionWindows.sessionStart, settings.sessionWindows.newTradesUntil, settings.sessionWindows.forceClose)
     if settings.riskPerTrade.riskPerTradePercent > 100.0:
         raise ValueError("risk per trade percent cannot exceed 100")
-    if settings.riskPerTrade.riskBudgetPercentOfOrder > 100.0:
-        raise ValueError("risk budget percent of order cannot exceed 100")
     if settings.dailyLossCap.maxDailyLossPercent > 100.0:
         raise ValueError("daily loss percent cannot exceed 100")
     if settings.positionNotionalCap.orderAllocationPercent > 100.0:

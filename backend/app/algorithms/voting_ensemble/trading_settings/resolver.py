@@ -53,11 +53,9 @@ def resolve_one_minute_trading_settings(settings_payload: dict[str, Any] | None 
     config = _apply_payload_overrides(baseline, settings_dict)
     profile = resolve_dynamic_trading_profile(settings_dict)
     effective = apply_profile_to_config(config, profile)
-    effective["positionSizing"] = (
-        "shares = per-order allocation dollars / entry price, with planned risk checked against order risk budget"
-        if effective["positionSizingMode"] == "allocation"
-        else baseline["positionSizing"]
-    )
+    # One sizing rule, stated by the baseline: the minimum over every cap. The old
+    # mode switch chose between two descriptions of a rule that sizing never read.
+    effective["positionSizing"] = baseline["positionSizing"]
     settings_without_hash = _settings_model_payload(effective, profile, configuration_hash="pending")
     configuration_hash = trading_settings_hash(settings_without_hash)
     resolved = VotingEnsembleOneMinuteSettings.model_validate(
@@ -111,7 +109,6 @@ def one_minute_settings_to_legacy_risk_config(settings: VotingEnsembleOneMinuteS
         "reasonCodes": settings.reasonCodes,
         "startingCapital": settings.riskPerTrade.startingCapital,
         "riskPerTradePercent": settings.riskPerTrade.riskPerTradePercent,
-        "riskBudgetPercentOfOrder": settings.riskPerTrade.riskBudgetPercentOfOrder,
         "maxDailyLossPercent": settings.dailyLossCap.maxDailyLossPercent,
         "maxTradesPerDay": settings.maximumTrades.maxTradesPerDay,
         "sessionStart": settings.sessionWindows.sessionStart,
@@ -131,7 +128,6 @@ def one_minute_settings_to_legacy_risk_config(settings: VotingEnsembleOneMinuteS
         "dailyAllocationPercent": settings.positionNotionalCap.dailyAllocationPercent,
         "maximumPositionPercent": settings.positionNotionalCap.maximumPositionPercent,
         "maxShareQuantity": settings.positionNotionalCap.maxShareQuantity,
-        "positionSizingMode": settings.positionSizingMode,
         "entriesBlocked": settings.entriesBlocked,
         "paperExecutionMode": settings.paperExecutionMode.model_dump(mode="json"),
         "tradingProfile": {
@@ -172,7 +168,6 @@ def _apply_payload_overrides(baseline: dict[str, Any], settings_payload: dict[st
     config["startingCapital"] = _number(settings_payload, "startingCapital", config["startingCapital"], minimum=1000.0, maximum=10_000_000.0)
     config["orderAllocationPercent"] = _number(settings_payload, "orderAllocationPercent", 10.0, minimum=0.1, maximum=100.0)
     config["dailyAllocationPercent"] = _number(settings_payload, "dailyAllocationPercent", 30.0, minimum=0.1, maximum=100.0)
-    config["riskBudgetPercentOfOrder"] = _number(settings_payload, "riskBudgetPercentOfOrder", 50.0, minimum=0.1, maximum=100.0)
     config["riskPerTradePercent"] = _number(settings_payload, "riskPerTradePercent", config["riskPerTradePercent"], minimum=0.01, maximum=100.0)
     config["maxDailyLossPercent"] = _number(settings_payload, "maxDailyLossPercent", config["maxDailyLossPercent"], minimum=0.1, maximum=100.0)
     # Zero is "no fixed cap": trading for the day is then bounded by the daily-loss,
@@ -185,7 +180,8 @@ def _apply_payload_overrides(baseline: dict[str, Any], settings_payload: dict[st
     config["fixedStopDistanceDollars"] = _number(settings_payload, "fixedStopDistanceDollars", config["fixedStopDistanceDollars"], minimum=0.0, maximum=100.0)
     config["takeProfitR"] = _number(settings_payload, "takeProfitR", config["takeProfitR"], minimum=0.1, maximum=20.0)
     config["slippagePerShare"] = _number(settings_payload, "slippagePerShare", config["slippagePerShare"], minimum=0.0, maximum=10.0)
-    config["positionSizingMode"] = str(settings_payload.get("positionSizingMode") or config["positionSizingMode"])
+    # A payload may still carry positionSizingMode / riskBudgetPercentOfOrder from an
+    # older client; both are ignored, never rejected, because sizing never read them.
     return config
 
 
@@ -254,7 +250,6 @@ def _settings_model_payload(config: dict[str, Any], profile: dict[str, Any], *, 
         "riskPerTrade": RiskPerTradeSettings(
             startingCapital=float(config["startingCapital"]),
             riskPerTradePercent=float(config["riskPerTradePercent"]),
-            riskBudgetPercentOfOrder=float(config["riskBudgetPercentOfOrder"]),
         ),
         "dailyLossCap": DailyLossCapSettings(maxDailyLossPercent=float(config["maxDailyLossPercent"])),
         "positionNotionalCap": PositionNotionalCapSettings(
@@ -296,7 +291,6 @@ def _settings_model_payload(config: dict[str, Any], profile: dict[str, Any], *, 
         "expenseModel": ExpenseModelSettings.model_validate(config["expenseModel"]),
         "resolvedTradingProfile": _resolved_profile_settings(config, profile),
         "entriesBlocked": bool(config.get("entriesBlocked")),
-        "positionSizingMode": str(config["positionSizingMode"]),
         "positionSizing": str(config["positionSizing"]),
     }
 

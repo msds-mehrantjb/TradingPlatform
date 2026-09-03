@@ -363,6 +363,24 @@ ATR-scaled stop is wide; the two shorts stopped out for about 4 points each wher
 geometry had lost $1 a share. That is the mechanism working on a tape built to swing, not a
 verdict on it; the verdict is the real-data pair below. The test pins the new row.
 
+## Sizing is the minimum over caps (2026-09-03)
+
+The baseline used to carry `positionSizingMode: "allocation"` and
+`riskBudgetPercentOfOrder: 50`. Neither was ever read by the risk budget. The share count
+has one rule: the minimum over every cap, being risk dollars / stop distance, the per-order
+allocation, the daily allocation, the maximum position, the maximum share quantity, buying
+power and the remaining daily-loss budget. The mode only chose between two descriptions of
+the rule, and the percent was echoed into metadata and validated against 100 and nothing
+else.
+
+Both are removed from the Voting Ensemble baseline, resolver, settings model, validation
+and metadata echo, and from the Voting Ensemble panel's "Risk budget %" input and its
+preview maths (the preview's risk budget is now the account base risk in both sizing modes).
+A payload that still carries either key is ignored, not rejected. The shared domain model,
+the legacy engine, the meta strategy and their fixtures keep their own copies of the fields;
+they are separate readers and were left alone. No recorded number moves: the removal is of
+text that never sized a trade. The `positionSizing` string documents the rule.
+
 ## When to re-record
 
 Re-record, keeping the prior version beside the new one, when any of these happen:

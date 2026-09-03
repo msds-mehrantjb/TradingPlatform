@@ -54,6 +54,28 @@ class VotingEnsembleTradingSettingsTest(unittest.TestCase):
         for forbidden in ("1Hour", "1Day", "1Week", "hybridOneHour", "swing", "openCloseEvents", "directionalWinnerMinVotesByTimeframe"):
             self.assertNotIn(forbidden, serialized)
 
+    def test_sizing_mode_and_order_risk_budget_are_gone_and_ignored(self) -> None:
+        # Neither key ever governed sizing: the risk budget is the minimum over caps.
+        # They were echoed into metadata only, so they are removed rather than wired.
+        resolved = resolve_one_minute_trading_settings({})
+        config = dynamic_risk_config(resolved)
+
+        self.assertNotIn("positionSizingMode", config)
+        self.assertNotIn("riskBudgetPercentOfOrder", config)
+        self.assertFalse(hasattr(resolved, "positionSizingMode"))
+        self.assertFalse(hasattr(resolved.riskPerTrade, "riskBudgetPercentOfOrder"))
+        self.assertNotIn("positionSizingMode", resolved.model_dump(mode="json"))
+        self.assertNotIn("riskBudgetPercentOfOrder", json.dumps(resolved.model_dump(mode="json")))
+        self.assertIn("minimum over caps", resolved.positionSizing)
+        for cap in ("risk dollars / stop distance", "order allocation", "daily allocation", "maximum position", "max share quantity", "buying power", "remaining daily-loss budget"):
+            self.assertIn(cap, resolved.positionSizing)
+
+        # An older client may still send them; they are ignored, never rejected, and
+        # they do not change the resolved configuration.
+        with_stale_keys = resolve_one_minute_trading_settings({"positionSizingMode": "risk", "riskBudgetPercentOfOrder": 12.5})
+        self.assertEqual(with_stale_keys.configurationHash, resolved.configurationHash)
+        self.assertEqual(with_stale_keys.positionSizing, resolved.positionSizing)
+
     def test_legacy_multitimeframe_data_is_available_only_as_labelled_compatibility(self) -> None:
         legacy = legacy_multi_timeframe_compatibility_config()
 

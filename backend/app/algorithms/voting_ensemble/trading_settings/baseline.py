@@ -45,7 +45,12 @@ ONE_MINUTE_BASELINE_SETTINGS: dict[str, Any] = {
         "finraTafPerSellShare": 0.000166,
         "finraTafMaxPerTrade": 8.30,
     },
-    "positionSizing": "shares = risk dollars / stop distance, capped by available capital",
+    # Sizing has one rule: the share count is the minimum over every cap (risk dollars /
+    # stop distance, per-order allocation, daily allocation, maximum position, maximum
+    # share quantity, buying power, remaining daily-loss budget). The former
+    # positionSizingMode / riskBudgetPercentOfOrder pair never governed sizing; they
+    # were echoed into metadata only and have been removed.
+    "positionSizing": "shares = minimum over caps: risk dollars / stop distance, order allocation, daily allocation, maximum position, max share quantity, buying power, remaining daily-loss budget",
     "entryConfirmationBars": 3,
     "warmupBars": 50,
     # Entries are bounded by sessionStart/newTradesUntil, not by an hour allow-list.
@@ -54,8 +59,6 @@ ONE_MINUTE_BASELINE_SETTINGS: dict[str, Any] = {
     "allowedEntryHours": ("09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00"),
     "orderAllocationPercent": 10.0,
     "dailyAllocationPercent": 30.0,
-    "riskBudgetPercentOfOrder": 50.0,
-    "positionSizingMode": "allocation",
     "maximumPositionPercent": 50.0,
     "maxShareQuantity": 1000,
     "maximumSpreadBps": 25.0,

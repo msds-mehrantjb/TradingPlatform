@@ -101,7 +101,6 @@ class NetEdgeRequirementSettings(ImmutableSettingsModel):
 class RiskPerTradeSettings(ImmutableSettingsModel):
     startingCapital: float = Field(gt=0.0)
     riskPerTradePercent: float = Field(ge=0.0)
-    riskBudgetPercentOfOrder: float = Field(ge=0.0)
 
 
 class DailyLossCapSettings(ImmutableSettingsModel):
@@ -255,5 +254,5 @@ class VotingEnsembleOneMinuteSettings(ImmutableSettingsModel):
     expenseModel: ExpenseModelSettings
     resolvedTradingProfile: ResolvedTradingProfileSettings
     entriesBlocked: bool = False
-    positionSizingMode: Literal["allocation", "risk"] = "allocation"
+    # Sizing has one rule (the minimum over every cap); the string documents it.
     positionSizing: str

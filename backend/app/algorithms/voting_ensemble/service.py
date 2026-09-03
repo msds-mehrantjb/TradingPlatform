@@ -1525,13 +1525,13 @@ def _effective_policy_for_order_planner(
         startingCapital=float(settings.riskPerTrade.startingCapital),
         orderAllocationPercent=float(profile.orderAllocationPercent),
         dailyAllocationPercent=float(profile.dailyAllocationPercent),
-        riskBudgetPercentOfOrder=float(settings.riskPerTrade.riskBudgetPercentOfOrder),
         maxTradesPerDay=int(profile.maxTradesPerDay),
         stopLossPercent=float(settings.stopPolicy.stopLossPercent),
         fixedStopDistanceDollars=float(settings.stopPolicy.fixedStopDistanceDollars),
         takeProfitR=float(settings.targetPolicy.takeProfitR),
         slippagePerShare=float(settings.slippageLimits.slippagePerShare),
-        positionSizingMode=settings.positionSizingMode,
+        # The shared domain model keeps its sizing-mode fields at their defaults; the
+        # Voting Ensemble sizes as the minimum over caps and no longer carries them.
     )
     hard_limits = HardRiskLimits(
         maximumRiskPerTradePercent=float(profile.riskPerTradePercent),
