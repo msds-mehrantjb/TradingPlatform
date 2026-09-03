@@ -715,6 +715,9 @@ def _session_state_from_raw(raw: Any) -> str:
 
 
 def _event_risk_state(raw: dict[str, Any]) -> str:
+    # Documented inert: the snapshot's economicEventState never carries `name` or
+    # `active`, so this always reports clear. An event feed populating those keys on
+    # the snapshot is what would make it fire.
     name = str(raw.get("name") or "").lower()
     active = bool(raw.get("active") or raw.get("isActive"))
     if active or name not in {"", "none", "no_event"}:

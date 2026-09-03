@@ -386,44 +386,45 @@ text that never sized a trade. The `positionSizing` string documents the rule.
 The audit listed the controls that could not fire live. Each was decided, and the
 decision is recorded here so nobody re-audits them as surprises.
 
-Wired (each has a test and a reason code of its own):
+Wired (each has a test and a reason code of its own). This is the priority now that the
+trade-count cap is gone: the day is bounded by losses, and these two are how an operator
+and the loss streak stop it.
 
 - **Kill switch.** `POST /api/voting-ensemble/runtime/kill-switch` throws or clears it
-  with a reason; the control file records who, why and when. Every enqueue path already
-  read `killSwitchActive`; it just had no setter.
+  with a reason; the control file records who, why and when, and the supervisor's
+  permission recompute reads it. Every enqueue path already read `killSwitchActive`; it
+  just had no setter.
 - **Consecutive-loss gate.** The account snapshot now carries today's trailing losing
-  streak from the local paper closed trades (a winner resets it). The gate's input used
-  to be a constant zero.
-- **Max concurrent positions.** The gate engine reads the settings' cap and counts open
-  local positions. A candidate that nets against the open position (a reversal exit)
-  passes, since it opens nothing.
-- **Feed-age and latency limits.** The gate context measures the primary bar's age since
-  completion and the oldest auxiliary feed (QQQ, IWM, breadth) against
-  `maxPrimaryFeedAgeSeconds` and `maxAuxiliaryFeedAgeSeconds`; the worker stamps the real
-  queue delay (it was a constant 0.0) and expires a finalized-bar command that waited past
-  `maxQueueLatencyMs`; the in-process latency is checked against `maxDecisionLatencyMs` at
-  the post-gate. The producer keeps its own, stricter, pre-checks (5 s quote, 10 s trade,
-  90 s auxiliary) in front of these.
+  streak from the local paper closed trades (a winner resets it), gated at 3 as
+  configured. The gate's input used to be a constant zero.
 
 Removed:
 
 - **Signal-fade exit.** Declared on the holding-time policy, consumed by nothing, with no
   path to a consumer. The legacy engine in `main.py` keeps its own.
+- **Context conflict limit 0.20.** With both live contexts capped at 0.08 per signal the
+  largest reachable conflict is 0.072, so it could never trigger. Conflicts still reduce
+  the score, bounded; the limit and its reason code are gone.
 
-Kept, documented inert (no code path can make them fire; changing them changes nothing):
+Kept, documented inert. Each carries a one-line comment at its read site saying why it is
+inert and what would feed it:
 
-- **Event-risk state gate.** Reads keys the snapshot never carries, so it always reports
-  clear. It needs an event feed in the snapshot before it can mean anything.
-- **Context conflict limit 0.20.** With both live contexts at confidence 0.45 the largest
-  reachable move is ±0.072, so the limit cannot trigger. A tuning question, not a wiring
-  fix.
-- **eventRiskCap, liquidityCap, minimum tradable size, participation limit.** Read from
-  the operational snapshot; the producer never sets them, so they default to 1.0.
-- **Existing-position conflict.** Never set. Wiring it would block the reversal exit the
-  paper account nets, which the concurrent-position cap above already handles correctly.
-- **Pyramiding, warm-up bars, entry confirmation bars, allowed entry hours.** Resolved
-  into the settings and consumed by nothing live; the snapshot readiness and the
-  session windows do the real work. The baseline comments them.
+- **Session policy multipliers** (`session_policy.py`): read as the session cap, but the
+  policy ships off, so every segment resolves to 1.0.
+- **eventRiskCap, liquidityCap, minimum tradable size, participation limit**
+  (`service.py` risk-budget config, `risk_budget.py`): read from the operational snapshot,
+  which the producer never populates.
+- **Existing-position conflict** (`gates.py` `_risk_limits`): never set; an opposite
+  candidate is the reversal exit the paper account nets.
+- **Max concurrent positions** (`resolver.py`): no gate reads it; the exposure caps bound
+  a second position in practice.
+- **Warm-up bars, entry confirmation bars, feed-age limits, decision and queue latency
+  limits** (`resolver.py`, `baseline.py`): resolved into the settings, consumed by
+  nothing; the producer's freshness checks use their own constants and only
+  `commandDeadlineSeconds` reaches a gate.
+- **Event-risk state gate** (`adx_atr_regime_classifier.py`): reads keys the snapshot
+  never carries, so it always reports clear.
+- **Pyramiding, allowed entry hours**: the baseline comments them.
 
 ## When to re-record
 

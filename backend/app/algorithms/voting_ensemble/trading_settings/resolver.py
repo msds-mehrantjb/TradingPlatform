@@ -226,12 +226,22 @@ def _settings_model_payload(config: dict[str, Any], profile: dict[str, Any], *, 
             allowedEntryHours=tuple(str(value) for value in config["allowedEntryHours"]),
         ),
         "eventBlackouts": EventBlackoutSettings(blackoutMinutesBefore=0, blackoutMinutesAfter=0),
+        # Documented inert: warmupBars and entryConfirmationBars are consumed by nothing
+        # (snapshot readiness has its own history requirement; strategies confirm their
+        # own entries), and the two feed-age limits have no consumer either. The producer
+        # freshness checks use their own constants (5 s quote, 10 s trade, 90 s auxiliary).
+        # A gate reading the bar's age since completion and the auxiliary feeds' age from
+        # the snapshot against these values is what would make them bind.
         "dataFreshness": DataFreshnessSettings(
             warmupBars=int(config["warmupBars"]),
             entryConfirmationBars=int(config["entryConfirmationBars"]),
             maxPrimaryFeedAgeSeconds=int(config["maxPrimaryFeedAgeSeconds"]),
             maxAuxiliaryFeedAgeSeconds=int(config["maxAuxiliaryFeedAgeSeconds"]),
         ),
+        # Documented inert: only commandDeadlineSeconds is consumed (the decision-deadline
+        # gate reads it against decisionAgeSeconds). maxDecisionLatencyMs and
+        # maxQueueLatencyMs have no consumer; the worker measuring its queue delay and the
+        # service its in-process durations against them is what would feed them.
         "latencyLimits": LatencyLimitSettings(
             maxDecisionLatencyMs=int(config["maxDecisionLatencyMs"]),
             maxQueueLatencyMs=int(config["maxQueueLatencyMs"]),
@@ -260,6 +270,10 @@ def _settings_model_payload(config: dict[str, Any], profile: dict[str, Any], *, 
         ),
         "maximumTrades": MaximumTradesSettings(
             maxTradesPerDay=int(config["maxTradesPerDay"]),
+            # Documented inert: no gate reads maxConcurrentPositions. The exposure caps
+            # bound a second position in practice, and an opposite candidate is the
+            # reversal exit the paper account nets. A gate counting open local positions
+            # (letting a netting candidate through) is what would feed it.
             maxConcurrentPositions=int(config["maxConcurrentPositions"]),
         ),
         "stopPolicy": StopPolicySettings(

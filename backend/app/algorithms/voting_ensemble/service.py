@@ -81,16 +81,11 @@ def _local_gate_engine(settings: Any) -> VotingEnsembleLocalGateEngine:
     profile = getattr(settings, "resolvedTradingProfile", None)
     family_support = int(getattr(profile, "minimumIndependentFamilySupport", 2) or 2)
     trades_per_day = int(getattr(profile, "maxTradesPerDay", 0) or 0)
-    concurrent_positions = int(getattr(getattr(settings, "maximumTrades", None), "maxConcurrentPositions", 1) or 0)
-    key = (family_support, trades_per_day, concurrent_positions)
+    key = (family_support, trades_per_day)
     engine = _LOCAL_GATE_ENGINES.get(key)
     if engine is None:
         engine = VotingEnsembleLocalGateEngine(
-            voting_ensemble_local_gate_config(
-                minimum_independent_family_support=family_support,
-                maximum_trades_per_day=trades_per_day,
-                maximum_concurrent_positions=concurrent_positions,
-            )
+            voting_ensemble_local_gate_config(minimum_independent_family_support=family_support, maximum_trades_per_day=trades_per_day)
         )
         _LOCAL_GATE_ENGINES[key] = engine
     return engine
@@ -1044,7 +1039,7 @@ def _local_gate_input(
     if execution_economics:
         market.update(_market_state_from_economics(execution_economics))
         execution.update(_execution_state_from_economics(execution_economics))
-    risk = _risk_state(snapshot, candidate)
+    risk = _risk_state(snapshot)
     return GlobalGateInput(
         orderIntent=order_intent,
         evaluatedAt=evaluated_at,
@@ -1242,20 +1237,14 @@ def _execution_state_from_economics(economics: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def _risk_state(snapshot: VotingEnsembleEvaluationSnapshot, candidate: TradeCandidate | None = None) -> dict[str, Any]:
+def _risk_state(snapshot: VotingEnsembleEvaluationSnapshot) -> dict[str, Any]:
     account = snapshot.accountRiskSnapshot
-    net_signed_quantity = float(_number(account, "netSignedQuantity") or 0.0)
-    # An opposite-direction candidate nets against the open position in the paper
-    # account (that is how a reversal exit happens), so it does not open a second one
-    # and the concurrent-position cap must let it through.
-    candidate_direction = str(getattr(candidate, "direction", "") or "").upper() if candidate is not None else ""
-    reduces_open_position = (net_signed_quantity > 0 and candidate_direction == "SHORT") or (net_signed_quantity < 0 and candidate_direction == "LONG")
     return {
+        # Fed by the producer from today's local paper closed trades; it used to be
+        # a constant zero, so the consecutive-loss gate could never fire.
         "consecutiveLosses": int(_number(account, "consecutiveLosses") or 0),
+        # Documented inert: the producer never sets this (see gates.py _risk_limits).
         "existingPositionConflict": bool(account.get("existingPositionConflict", False)),
-        "openPositionCount": int(_number(account, "openPositionCount") or 0),
-        "netSignedQuantity": net_signed_quantity,
-        "candidateReducesOpenPosition": bool(reduces_open_position),
     }
 
 
@@ -1683,6 +1672,10 @@ def _risk_budget_config(
         # 2.0 for MNQ. Sourced from the registry that already carries the real contract
         # specifications rather than restated here.
         "contractMultiplier": _contract_multiplier(snapshot.symbol),
+        # Documented inert: eventRiskCap, liquidityCap and minimumTradableSize are read from
+        # the operational snapshot and the live producer never sets them, so they resolve
+        # to 1.0, 1.0 and 1 share. A producer writing them from an event or liquidity
+        # feed is what would make them bind.
         "eventRiskCap": _number(operational, "eventRiskCap") if _number(operational, "eventRiskCap") is not None else 1.0,
         "drawdownCap": _drawdown_cap(account),
         # What the day can still lose before the daily-loss gate closes it, net of the

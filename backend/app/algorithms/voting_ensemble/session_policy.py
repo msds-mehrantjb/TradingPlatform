@@ -55,6 +55,9 @@ class SessionSegmentPolicy:
     permitted_strategies: tuple[str, ...] | None = None
     # Multiplier on the position size the candidate may take in this segment. 1.0 is full
     # size; 0.0 blocks sizing without blocking the vote.
+    # Documented inert in the shipped configuration: the risk budget reads it as the
+    # session cap, but the session policy ships off, so every segment resolves to 1.0.
+    # Turning the session policy on is what would make a segment's multiplier bind.
     max_position_multiplier: float = 1.0
 
     def permits(self, strategy_id: str) -> bool:

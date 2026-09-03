@@ -1037,24 +1037,6 @@ def _consecutive_losses_from_inventory(inventory: dict[str, Any], session: str) 
     return streak
 
 
-def _open_positions_from_inventory(inventory: dict[str, Any]) -> tuple[int, float]:
-    """Count of open local positions and their net signed quantity."""
-    positions = inventory.get("localPositions")
-    if not isinstance(positions, list):
-        positions = inventory.get("positions") if isinstance(inventory.get("positions"), list) else []
-    count = 0
-    net_signed = 0.0
-    for position in positions:
-        if not isinstance(position, dict):
-            continue
-        quantity = float(position.get("signedQuantity") or 0.0)
-        if quantity == 0.0:
-            continue
-        count += 1
-        net_signed += quantity
-    return count, net_signed
-
-
 def _record_session(record: Any, session: str) -> bool:
     if not isinstance(record, dict):
         return False
@@ -1335,7 +1317,6 @@ def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEns
     if isinstance(inventory, dict):
         account = inventory.get("localPaperAccount") or inventory.get("account")
     session = _iso(event.barEndTimestamp)[:10]
-    open_position_count, net_signed_quantity = _open_positions_from_inventory(inventory if isinstance(inventory, dict) else {})
     consecutive_losses = _consecutive_losses_from_inventory(inventory if isinstance(inventory, dict) else {}, session)
     if isinstance(account, dict):
         equity = _positive_or_zero(account.get("equity"))
@@ -1344,8 +1325,6 @@ def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEns
         drawdown = _positive_or_zero(account.get("drawdownPercent") or account.get("drawdownFromIntradayHighPercent"))
         return {
             "consecutiveLosses": consecutive_losses,
-            "openPositionCount": open_position_count,
-            "netSignedQuantity": net_signed_quantity,
             "algorithmId": "voting_ensemble",
             "algorithm_id": "voting_ensemble",
             "capitalPartitionId": str(account.get("capitalPartitionId") or "voting_ensemble.paper.default"),
@@ -1402,8 +1381,6 @@ def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEns
             else 0
         ),
         "consecutiveLosses": consecutive_losses,
-        "openPositionCount": open_position_count,
-        "netSignedQuantity": net_signed_quantity,
         "observedAt": _iso(event.receivedAt),
         "sessionDate": _iso(event.barEndTimestamp)[:10],
         "sourceAuthority": "voting_ensemble.local_paper_account.missing",
