@@ -13,7 +13,10 @@ ONE_MINUTE_BASELINE_SETTINGS: dict[str, Any] = {
     "startingCapital": 25000.0,
     "riskPerTradePercent": 0.5,
     "maxDailyLossPercent": 2.0,
-    "maxTradesPerDay": 3,
+    # No fixed trade count. The day's activity is bounded by the daily-loss limit above
+    # and by the drawdown and exposure caps, which is what a count was standing in for.
+    # A positive value restores a hard cap.
+    "maxTradesPerDay": 0,
     "sessionStart": "09:35",
     "newTradesUntil": "15:30",
     "forceClose": "15:55",

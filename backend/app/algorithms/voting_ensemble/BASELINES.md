@@ -316,11 +316,22 @@ execute what the replay measured. Both are closed.
 | Time stop | The simulator exits at `filledAt + maximumHoldingMinutes`; the local engine's maintenance loop only evaluated protective legs and end of day, so a live position ran to stop, target or the close. 52 of the 84 baseline exits were time stops | `submit_maximum_holding_exits` runs in the maintenance loop every 15 s, reads the limit the entry order recorded (the algorithm default of 30 when it recorded none), and flattens with a limit at the mark. A flat position clears its `openedAt`, so a re-entry starts its own clock |
 | Short protection | The OCO was created only for BUY fills; a short had no stop and no target, end-of-day flattening skipped it, and the stored-order ownership check rejected the short entry's fill outright | Every exit helper keys on signed exposure. A short fill gets a BUY stop-limit above and a BUY limit below, covers resize or cancel them, and end of day covers shorts |
 
-What did **not** change: short entries are still refused at the intent layer unless
-`short_trading_enabled` is set, which production does not set. The recorded baseline took
-54 short trades, so it still describes a wider strategy than the live engine will run
-until that flag is turned on deliberately. The gap-through stop (a stop-limit whose limit
-equals its trigger) is also unchanged.
+Short entries are now enabled in the runtime (`c296392`): it constructs its worker with
+`short_trading_enabled` unless `VOTING_ENSEMBLE_SHORT_TRADING_ENABLED=false` is set. The
+gap-through stop (a stop-limit whose limit equals its trigger) is unchanged.
+
+## No fixed trade count (2026-09-02)
+
+The three-trades-per-day cap is gone from the baseline settings, the local gate engine's
+default and the local paper engine's default. `maxTradesPerDay=0` now means no cap, and
+the day's activity is bounded by what the cap was standing in for: the 2 % daily-loss
+limit (which also zeroes the risk multiplier), the 5 % intraday drawdown cap, and the
+open-risk and exposure caps. A positive value restores a hard cap, and an overlay still
+scales a positive cap but cannot reduce "no cap".
+
+On the recorded 390-bar session this moves nothing: the default run stays at 5 trades,
+1 win, -50.00, 351 decisions (re-verified by test). The cap had never bound there. The
+full-dataset baseline below is re-run under the new rule, since on real data it did.
 
 ## When to re-record
 

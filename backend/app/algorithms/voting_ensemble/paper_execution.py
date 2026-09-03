@@ -55,7 +55,7 @@ VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_DRAWDOWN_PERCENT = 5.0
 VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_OPEN_RISK_PERCENT = 3.0
 VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_SPY_NOTIONAL_PERCENT = 50.0
 VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_ALGORITHM_EXPOSURE_PERCENT = 50.0
-VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_TRADES_PER_DAY = 3
+VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_TRADES_PER_DAY = 0
 VOTING_ENSEMBLE_EXECUTION_OUTBOX_SCHEMA_VERSION = "voting_ensemble_execution_outbox_v1"
 VOTING_ENSEMBLE_DECISION_RECORD_SCHEMA_VERSION = "voting_ensemble_decision_record_v1"
 VOTING_ENSEMBLE_EXECUTION_OUTBOX_STATES = {
@@ -3007,7 +3007,9 @@ class VotingEnsembleLocalPaperExecutionEngine:
         max_trades_per_day = int(
             _local_entry_risk_setting(settings_payload, "maximumTradesPerDay", "maxTradesPerDay", default=float(VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_TRADES_PER_DAY))
         )
-        if max_trades_per_day <= 0 or int(account.get("tradesToday") or 0) >= max_trades_per_day:
+        # Zero means no fixed cap: the day's trading is bounded by the daily-loss,
+        # drawdown and exposure checks above, not by a count.
+        if max_trades_per_day > 0 and int(account.get("tradesToday") or 0) >= max_trades_per_day:
             return "voting_ensemble.local_paper.maximum_trades_per_day_exceeded"
         return None
 

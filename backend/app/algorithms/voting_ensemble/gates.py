@@ -57,7 +57,7 @@ def voting_ensemble_local_gate_config() -> GlobalGateConfig:
         maximumOpenRiskPercent=3.0,
         maximumSpyNotionalPercent=50.0,
         maximumSameDirectionExposurePercent=50.0,
-        maximumTradesPerDay=3,
+        maximumTradesPerDay=0,
         maximumConsecutiveLosses=3,
         defaultRiskMultiplierCap=1.0,
         defaultMaximumRiskPercent=0.5,
@@ -314,7 +314,9 @@ class VotingEnsembleLocalGateEngine:
             results.append(_fail("risk.notional_exposure", "Voting Ensemble local risk limits", ["voting_ensemble.local_gate.notional_exposure"], "SPY notional exposure exceeds the local cap."))
         if account.sameDirectionExposurePercent >= self.config.maximumSameDirectionExposurePercent:
             results.append(_fail("risk.same_direction_exposure", "Voting Ensemble local risk limits", ["voting_ensemble.local_gate.same_direction_exposure"], "Same-direction exposure exceeds the local cap."))
-        if account.tradesToday >= self.config.maximumTradesPerDay:
+        # A trade-count cap is optional. At zero the day's activity is governed by the
+        # daily-loss, drawdown and exposure limits above rather than by a fixed number.
+        if self.config.maximumTradesPerDay > 0 and account.tradesToday >= self.config.maximumTradesPerDay:
             results.append(_fail("risk.trade_count_limit", "Voting Ensemble local risk limits", ["voting_ensemble.local_gate.trade_count_limit"], "Voting Ensemble trade-count limit has been reached."))
         consecutive_losses = _number(context.riskState, "consecutiveLosses")
         if consecutive_losses is None:

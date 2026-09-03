@@ -35,7 +35,8 @@ class VotingEnsembleTradingSettingsTest(unittest.TestCase):
         self.assertEqual(config["startingCapital"], 25000.0)
         self.assertEqual(config["riskPerTradePercent"], 0.5)
         self.assertEqual(config["maxDailyLossPercent"], 2.0)
-        self.assertEqual(config["maxTradesPerDay"], 3)
+        # No fixed trade count; the daily-loss limit governs the day's activity.
+        self.assertEqual(config["maxTradesPerDay"], 0)
         self.assertEqual(config["sessionStart"], "09:35")
         self.assertEqual(config["newTradesUntil"], "15:30")
         self.assertEqual(config["forceClose"], "15:55")
@@ -134,7 +135,11 @@ class VotingEnsembleTradingSettingsTest(unittest.TestCase):
         self.assertEqual(profile.riskMultiplier, 0.35)
         self.assertEqual(resolved.riskPerTrade.riskPerTradePercent, 0.175)
         self.assertEqual(resolved.positionNotionalCap.orderAllocationPercent, 5.0)
-        self.assertEqual(resolved.maximumTrades.maxTradesPerDay, 1)
+        # The baseline has no fixed trade cap, and an overlay cannot reduce "no cap".
+        self.assertEqual(resolved.maximumTrades.maxTradesPerDay, 0)
+        # An explicit cap is still scaled by the overlay.
+        capped = resolve_one_minute_trading_settings({**payload, "maxTradesPerDay": 3})
+        self.assertEqual(capped.maximumTrades.maxTradesPerDay, 1)
         self.assertEqual(profile.minimumFinalScore, 0.30)
         self.assertEqual(profile.minimumIndependentFamilySupport, 2)
         self.assertEqual(profile.minimumEdgeToCostRatio, 2.5)

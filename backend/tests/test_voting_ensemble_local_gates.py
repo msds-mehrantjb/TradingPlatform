@@ -45,7 +45,6 @@ class VotingEnsembleLocalGatesTest(unittest.TestCase):
             ("open_risk", {"accountRiskState": account_state(open_risk=4.0)}, "voting_ensemble.local_gate.open_risk"),
             ("notional", {"accountRiskState": account_state(notional=60.0)}, "voting_ensemble.local_gate.notional_exposure"),
             ("same_direction", {"accountRiskState": account_state(same_direction=60.0)}, "voting_ensemble.local_gate.same_direction_exposure"),
-            ("trades", {"accountRiskState": account_state(trades=3)}, "voting_ensemble.local_gate.trade_count_limit"),
             ("losses", {"riskState": {"consecutiveLosses": 3}}, "voting_ensemble.local_gate.consecutive_loss_limit"),
             ("cooldown", {"executionState": {"cooldownActive": True}}, "voting_ensemble.local_gate.cooldown_after_execution_failure"),
             ("position_conflict", {"riskState": {"existingPositionConflict": True}}, "voting_ensemble.local_gate.existing_position_conflict"),
@@ -56,6 +55,23 @@ class VotingEnsembleLocalGatesTest(unittest.TestCase):
                 decision = engine.evaluate(base_gate_input(**overrides)).to_global_gate_decision()
                 self.assertFalse(decision.eligible)
                 self.assertIn(reason_code, decision.reasonCodes)
+
+    def test_trade_count_is_not_capped_unless_a_cap_is_configured(self) -> None:
+        """The day's activity is bounded by the daily-loss and exposure limits, not a count."""
+        from backend.app.algorithms.voting_ensemble.gates import voting_ensemble_local_gate_config
+
+        uncapped = VotingEnsembleLocalGateEngine().evaluate(base_gate_input(accountRiskState=account_state(trades=12))).to_global_gate_decision()
+        self.assertNotIn("voting_ensemble.local_gate.trade_count_limit", uncapped.reasonCodes)
+
+        capped_engine = VotingEnsembleLocalGateEngine(voting_ensemble_local_gate_config().model_copy(update={"maximumTradesPerDay": 3}))
+        capped = capped_engine.evaluate(base_gate_input(accountRiskState=account_state(trades=3))).to_global_gate_decision()
+        self.assertFalse(capped.eligible)
+        self.assertIn("voting_ensemble.local_gate.trade_count_limit", capped.reasonCodes)
+
+        # The daily-loss limit is what stops the day.
+        lost = VotingEnsembleLocalGateEngine().evaluate(base_gate_input(accountRiskState=account_state(trades=12, realized=-600.0))).to_global_gate_decision()
+        self.assertFalse(lost.eligible)
+        self.assertIn("voting_ensemble.local_gate.daily_loss", lost.reasonCodes)
 
     def test_upstream_global_gate_failure_is_advisory_for_local_paper(self) -> None:
         gate_input = base_gate_input(

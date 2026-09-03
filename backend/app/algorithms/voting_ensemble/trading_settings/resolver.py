@@ -175,9 +175,12 @@ def _apply_payload_overrides(baseline: dict[str, Any], settings_payload: dict[st
     config["riskBudgetPercentOfOrder"] = _number(settings_payload, "riskBudgetPercentOfOrder", 50.0, minimum=0.1, maximum=100.0)
     config["riskPerTradePercent"] = _number(settings_payload, "riskPerTradePercent", config["riskPerTradePercent"], minimum=0.01, maximum=100.0)
     config["maxDailyLossPercent"] = _number(settings_payload, "maxDailyLossPercent", config["maxDailyLossPercent"], minimum=0.1, maximum=100.0)
-    requested_max_trades = int(_number(settings_payload, "maxTradesPerDay", config["maxTradesPerDay"], minimum=1, maximum=50))
+    # Zero is "no fixed cap": trading for the day is then bounded by the daily-loss,
+    # drawdown and exposure limits. A positive cap is still clamped to what the daily
+    # allocation can fund at the per-order allocation.
+    requested_max_trades = int(_number(settings_payload, "maxTradesPerDay", config["maxTradesPerDay"], minimum=0, maximum=50))
     allocation_trade_cap = max(1, int(config["dailyAllocationPercent"] // max(config["orderAllocationPercent"], 0.1)))
-    config["maxTradesPerDay"] = min(requested_max_trades, allocation_trade_cap)
+    config["maxTradesPerDay"] = 0 if requested_max_trades <= 0 else min(requested_max_trades, allocation_trade_cap)
     config["stopLossPercent"] = _number(settings_payload, "stopLossPercent", config["stopLossPercent"], minimum=0.01, maximum=20.0)
     config["fixedStopDistanceDollars"] = _number(settings_payload, "fixedStopDistanceDollars", config["fixedStopDistanceDollars"], minimum=0.0, maximum=100.0)
     config["takeProfitR"] = _number(settings_payload, "takeProfitR", config["takeProfitR"], minimum=0.1, maximum=20.0)
