@@ -4607,6 +4607,25 @@ def _local_paper_env_float(name: str, default: float) -> float:
     return max(0.0, value)
 
 
+def _local_paper_env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+# Short entries are part of the algorithm: the decision core is symmetric and the recorded
+# baseline took 54 of its 84 trades short. The engine protects a short with a buy-side stop
+# and target and covers it at end of day, so the runtime enables them unless the operator
+# turns them off with VOTING_ENSEMBLE_SHORT_TRADING_ENABLED=false.
+VOTING_ENSEMBLE_SHORT_TRADING_ENV = "VOTING_ENSEMBLE_SHORT_TRADING_ENABLED"
+
+
 def _extract_nbbo_payload(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
     direct = payload.get("nbbo")
     if isinstance(direct, Mapping):
@@ -4695,7 +4714,15 @@ def _hash(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
 
 
+def _short_trading_enabled_from_env() -> bool:
+    # The runtime is built at import, before the app has necessarily loaded backend/.env,
+    # so read the operator's file first (never overriding a value already in the process).
+    load_dotenv(os.getenv("VOTING_ENSEMBLE_DOTENV_PATH") or str(Path(__file__).resolve().parents[3] / ".env"), override=False)
+    return _local_paper_env_bool(VOTING_ENSEMBLE_SHORT_TRADING_ENV, True)
+
+
 VOTING_ENSEMBLE_PAPER_EXECUTION_RUNTIME = VotingEnsemblePaperExecutionRuntime(
     repository=VotingEnsemblePaperExecutionRepository(default_paper_execution_store_path()),
+    short_trading_enabled=_short_trading_enabled_from_env(),
     auto_start=False,
 )

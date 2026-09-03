@@ -224,5 +224,29 @@ class MaximumHoldingTimeExitTest(unittest.TestCase):
         self.assertIn("voting_ensemble.local_paper.maximum_holding_exit_already_open", second[0]["reasonCodes"])
 
 
+class ShortTradingRuntimeFlagTest(unittest.TestCase):
+    """The production runtime enables short entries unless the operator turns them off."""
+
+    def test_flag_defaults_on_and_parses_common_spellings(self) -> None:
+        from backend.app.algorithms.voting_ensemble.paper_execution import VOTING_ENSEMBLE_SHORT_TRADING_ENV, _local_paper_env_bool
+
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+
+            os.environ.pop(VOTING_ENSEMBLE_SHORT_TRADING_ENV, None)
+            self.assertTrue(_local_paper_env_bool(VOTING_ENSEMBLE_SHORT_TRADING_ENV, True))
+        for raw, expected in (("false", False), ("0", False), ("off", False), ("true", True), ("1", True), ("nonsense", True), ("  ", True)):
+            with patch.dict("os.environ", {VOTING_ENSEMBLE_SHORT_TRADING_ENV: raw}):
+                self.assertEqual(_local_paper_env_bool(VOTING_ENSEMBLE_SHORT_TRADING_ENV, True), expected, raw)
+
+    def test_runtime_passes_the_flag_to_its_worker(self) -> None:
+        from backend.app.algorithms.voting_ensemble.paper_execution import VotingEnsemblePaperExecutionRuntime
+
+        runtime = VotingEnsemblePaperExecutionRuntime(repository=VotingEnsemblePaperExecutionRepository(), short_trading_enabled=True)
+
+        self.assertTrue(runtime.short_trading_enabled)
+        self.assertTrue(runtime.worker.short_trading_enabled)
+
+
 if __name__ == "__main__":
     unittest.main()
