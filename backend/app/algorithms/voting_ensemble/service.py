@@ -312,12 +312,16 @@ class VotingEnsembleService:
         decision = _aggregate_with_family_engine(directional_votes, context_signals, snapshot, regime_state, pre_gate, settings=settings, payload=payload)
         aggregation_duration_ms = _elapsed_ms(aggregation_started)
         candidate = _candidate_from_decision(snapshot, decision, settings)
+        in_process_ms = float(snapshot_duration_ms) + float(strategy_duration_ms) + float(aggregation_duration_ms) + float(gate_duration_ms)
+        deadline_reasons = _decision_deadline_reasons(snapshot, settings, in_process_ms)
         latency_measurements = {
             "snapshotBuildDurationMs": snapshot_duration_ms,
             "strategyEvaluationDurationMs": strategy_duration_ms,
             "aggregationDurationMs": aggregation_duration_ms,
             "gateDurationMs": gate_duration_ms,
-            "decisionDeadlineExpired": _decision_deadline_expired(snapshot, settings),
+            "inProcessDurationMs": round(in_process_ms, 4),
+            "decisionDeadlineExpired": bool(deadline_reasons),
+            "decisionDeadlineReasonCodes": deadline_reasons,
         }
         # Size first, then cost. Economics and the cost gates used to run on a
         # zero-quantity candidate, so participation, impact, the per-share TAF and the
@@ -1045,6 +1049,9 @@ def _local_gate_input(
         market.update(_market_state_from_economics(execution_economics))
         execution.update(_execution_state_from_economics(execution_economics))
     risk = _risk_state(snapshot, candidate)
+    freshness = getattr(settings, "dataFreshness", None)
+    primary_candle_age = _primary_candle_age_seconds(snapshot)
+    auxiliary_feed_age = _auxiliary_feed_age_seconds(snapshot)
     return GlobalGateInput(
         orderIntent=order_intent,
         evaluatedAt=evaluated_at,
@@ -1060,16 +1067,33 @@ def _local_gate_input(
         orderPlan=None,
         featureSnapshot=snapshot.model_dump(mode="json"),
         dataState={
-            "freshCandle": snapshot.dataReadiness.ready and "stale_spy_candle" not in snapshot.dataReadiness.staleInputs,
+            # The settings' feed-age limits bound the primary bar and the auxiliary
+            # feeds here; the snapshot's own staleness flags never carried a candle age.
+            "freshCandle": (
+                snapshot.dataReadiness.ready
+                and "stale_spy_candle" not in snapshot.dataReadiness.staleInputs
+                and _within_feed_age_limit(primary_candle_age, getattr(freshness, "maxPrimaryFeedAgeSeconds", 0))
+            ),
             "freshQuote": snapshot.nbbo is not None and "stale_spy_quote" not in snapshot.dataReadiness.staleInputs,
             "validBidAsk": bool(snapshot.nbbo and snapshot.nbbo.bid > 0 and snapshot.nbbo.ask >= snapshot.nbbo.bid),
             "monotonicTimestamps": "future_spy_candle" not in snapshot.dataReadiness.staleInputs,
             "requiredTimeframeSynchronized": snapshot.feedHealthStatus == "ready",
-            "requiredAuxiliaryDataReady": not snapshot.dataReadiness.mandatoryFailures,
+            "requiredAuxiliaryDataReady": (
+                not snapshot.dataReadiness.mandatoryFailures
+                and _within_feed_age_limit(auxiliary_feed_age, getattr(freshness, "maxAuxiliaryFeedAgeSeconds", 0))
+            ),
+            "primaryCandleAgeSeconds": primary_candle_age,
+            "auxiliaryFeedAgeSeconds": auxiliary_feed_age,
             "featureSchemaValid": bool(snapshot.snapshotVersion),
             "feedHealthy": snapshot.feedHealthStatus == "ready" and not bool(snapshot.operationalHealthSnapshot.get("feedDegraded", False)),
             "clockSynchronized": not bool(snapshot.operationalHealthSnapshot.get("clockDisagreement", False)),
-            "decisionDeadlineValid": not bool((execution_economics or {}).get("latency", {}).get("decisionDeadlineExpired", False)),
+            # A bar that waited past the queue-latency limit or the command deadline is
+            # refused at the pre-gate, candidate or not; the post-gate adds the measured
+            # in-process latency through the economics.
+            "decisionDeadlineValid": (
+                not bool((execution_economics or {}).get("latency", {}).get("decisionDeadlineExpired", False))
+                and not _decision_deadline_reasons(snapshot, settings)
+            ),
         },
         operationalState={**operational, "settingsHash": settings_hash, "contextEntryBlackout": context_entry_blackout},
         brokerState={},
@@ -1407,12 +1431,59 @@ def _elapsed_ms(start: float) -> float:
     return round((perf_counter() - start) * 1000.0, 4)
 
 
-def _decision_deadline_expired(snapshot: VotingEnsembleEvaluationSnapshot, settings: Any | None) -> bool:
+def _decision_deadline_reasons(snapshot: VotingEnsembleEvaluationSnapshot, settings: Any | None, in_process_ms: float | None = None) -> list[str]:
+    """Why this decision is too late to act on, against the settings' latency limits.
+
+    Three clocks: how long the bar has waited since it was enqueued (the command
+    deadline and the queue-latency limit both bound it) and how long this process
+    took to reach a candidate (the decision-latency limit). Only the first existed
+    before; the two millisecond limits in the settings had no consumer.
+    """
+    limits = getattr(settings, "latencyLimits", None)
+    reasons: list[str] = []
     decision_age_seconds = _number(snapshot.operationalHealthSnapshot, "decisionAgeSeconds")
-    if decision_age_seconds is None:
-        return False
-    deadline = getattr(getattr(settings, "latencyLimits", None), "commandDeadlineSeconds", 30)
-    return float(decision_age_seconds) > float(deadline)
+    if decision_age_seconds is not None and float(decision_age_seconds) > float(getattr(limits, "commandDeadlineSeconds", 30) or 30):
+        reasons.append("voting_ensemble.latency.command_deadline_exceeded")
+    queue_delay_ms = _number(snapshot.operationalHealthSnapshot, "queueDelayMs")
+    max_queue_ms = float(getattr(limits, "maxQueueLatencyMs", 0) or 0)
+    if queue_delay_ms is not None and max_queue_ms > 0 and float(queue_delay_ms) > max_queue_ms:
+        reasons.append("voting_ensemble.latency.queue_latency_exceeded")
+    max_decision_ms = float(getattr(limits, "maxDecisionLatencyMs", 0) or 0)
+    if in_process_ms is not None and max_decision_ms > 0 and float(in_process_ms) > max_decision_ms:
+        reasons.append("voting_ensemble.latency.decision_latency_exceeded")
+    return reasons
+
+
+def _decision_deadline_expired(snapshot: VotingEnsembleEvaluationSnapshot, settings: Any | None, in_process_ms: float | None = None) -> bool:
+    return bool(_decision_deadline_reasons(snapshot, settings, in_process_ms))
+
+
+def _primary_candle_age_seconds(snapshot: VotingEnsembleEvaluationSnapshot) -> float | None:
+    """Seconds between the last finalized one-minute bar's completion and the evaluation."""
+    if not snapshot.spyOneMinuteCandles:
+        return None
+    latest = snapshot.spyOneMinuteCandles[-1].completionTimestamp
+    return (_utc_timestamp(snapshot.evaluationTimestamp) - _utc_timestamp(latest)).total_seconds()
+
+
+def _auxiliary_feed_age_seconds(snapshot: VotingEnsembleEvaluationSnapshot) -> float | None:
+    """Age of the oldest auxiliary feed (QQQ, IWM, breadth) at the evaluation."""
+    evaluated_at = _utc_timestamp(snapshot.evaluationTimestamp)
+    observed: list[datetime] = []
+    for data in (snapshot.qqq, snapshot.iwm):
+        stamp = data.latestTimestamp or (data.candles[-1].completionTimestamp if data.candles else None)
+        if stamp is not None:
+            observed.append(stamp)
+    if snapshot.breadth.timestamp is not None:
+        observed.append(snapshot.breadth.timestamp)
+    if not observed:
+        return None
+    return max((evaluated_at - _utc_timestamp(stamp)).total_seconds() for stamp in observed)
+
+
+def _within_feed_age_limit(age_seconds: float | None, limit_seconds: Any) -> bool:
+    limit = float(limit_seconds or 0)
+    return age_seconds is None or limit <= 0 or age_seconds <= limit
 
 
 def _execution_economics_with_gate_duration(economics: Any | None, gate_duration_ms: float) -> dict[str, Any] | None:

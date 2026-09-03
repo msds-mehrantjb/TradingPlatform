@@ -223,8 +223,10 @@ class VotingEnsembleLocalGatesTest(unittest.TestCase):
         self.assertEqual(result["final_signal"], "Hold")
         self.assertTrue(result["safety_gate_failed"])
         self.assertIn("data.decision_deadline", result["blocked_gate_ids"])
-        self.assertTrue(result["execution_economics"]["latency"]["decisionDeadlineExpired"])
-        self.assertEqual(result["execution_economics"]["latency"]["decisionAgeSeconds"], 999.0)
+        # An expired command deadline is now refused at the pre-gate, before a candidate
+        # or its economics exist, so nothing downstream is costed for a stale bar.
+        self.assertIn("voting_ensemble.evaluate.blocked_by_local_safety", result["reason_codes"])
+        self.assertIsNone(result["execution_economics"])
 
     def test_service_blocks_insufficient_fillable_quantity(self) -> None:
         result = evaluate_service_candidate(

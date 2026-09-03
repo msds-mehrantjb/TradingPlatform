@@ -85,6 +85,17 @@ class VotingEnsembleWorker:
             return None
         if _is_stale(command):
             return self.status_store.expire(command)
+        if command.commandKind == "finalized_bar_evaluation":
+            queue_delay_ms = _queue_delay_seconds(command) * 1000.0
+            limit_ms = _maximum_queue_latency_ms()
+            if limit_ms > 0 and queue_delay_ms > limit_ms:
+                # The settings' queue-latency limit. A bar that waited this long is
+                # evaluated against a tape that has moved on; expire it rather than
+                # trade on it late.
+                return self.status_store.expire(
+                    command,
+                    error=f"Voting Ensemble finalized-bar command waited {queue_delay_ms:.0f} ms in the queue, over the {limit_ms:.0f} ms maxQueueLatencyMs limit",
+                )
         self.status_store.mark_running(command)
         try:
             result = self._execute(command)
@@ -115,7 +126,7 @@ class VotingEnsembleWorker:
                         f"Voting Ensemble automatic snapshot construction failed: {exc}",
                         ["voting_ensemble.runtime.automatic_snapshot_construction_failed"],
                     )
-                payload = authoritative_payload
+                payload = _payload_with_queue_measurements(authoritative_payload, command)
                 local_mark_result = _mark_local_paper_from_payload(self.paper_execution_runtime, payload)
             else:
                 authoritative_payload = {
@@ -308,6 +319,36 @@ class VotingEnsembleWorkerThread:
                 self.lastError = str(exc) or type(exc).__name__
                 self.lastErrorAt = datetime.now(UTC).isoformat()
                 sleep(0.25)
+
+
+def _queue_delay_seconds(command: VotingEnsembleRuntimeCommand, now: datetime | None = None) -> float:
+    """How long the command has waited since it was enqueued."""
+    created = command.createdAt
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    current = now or datetime.now(UTC)
+    return max(0.0, (current - created.astimezone(UTC)).total_seconds())
+
+
+def _maximum_queue_latency_ms() -> float:
+    from backend.app.algorithms.voting_ensemble.trading_settings.baseline import one_minute_baseline_settings
+
+    return float(one_minute_baseline_settings().get("maxQueueLatencyMs") or 0.0)
+
+
+def _payload_with_queue_measurements(payload: dict[str, Any], command: VotingEnsembleRuntimeCommand) -> dict[str, Any]:
+    """Stamp the measured queue delay on the operational snapshot.
+
+    The producer wrote decisionAgeSeconds as a constant 0.0, so the command-deadline
+    check and the queue-latency limit had nothing real to read. Both now see how long
+    this bar waited between enqueue and evaluation.
+    """
+    queue_delay_seconds = _queue_delay_seconds(command)
+    context = dict(payload.get("market_context") or {}) if isinstance(payload.get("market_context"), dict) else {}
+    operational = dict(context.get("operationalHealthSnapshot") or {}) if isinstance(context.get("operationalHealthSnapshot"), dict) else {}
+    operational["queueDelayMs"] = round(queue_delay_seconds * 1000.0, 3)
+    operational["decisionAgeSeconds"] = round(queue_delay_seconds, 6)
+    return {**payload, "market_context": {**context, "operationalHealthSnapshot": operational}}
 
 
 def _is_stale(command: VotingEnsembleRuntimeCommand) -> bool:
