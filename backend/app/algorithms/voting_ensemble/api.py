@@ -95,6 +95,30 @@ def update_runtime_control(payload: VotingEnsembleRuntimeControlUpdate) -> dict[
     )
 
 
+class VotingEnsembleKillSwitchUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    active: bool
+    reason: str | None = None
+
+
+@router.get("/runtime/kill-switch", summary="Voting Ensemble kill switch state")
+def runtime_kill_switch() -> dict[str, Any]:
+    return get_voting_ensemble_runtime_supervisor().kill_switch_status(refresh_readiness=False)
+
+
+@router.post("/runtime/kill-switch", summary="Throw or clear the Voting Ensemble kill switch")
+def update_runtime_kill_switch(payload: VotingEnsembleKillSwitchUpdate) -> dict[str, Any]:
+    # Active, it blocks every new-entry path (enqueue, producer, server gate, submission)
+    # through the control file they already read. Protective exits keep running.
+    return get_voting_ensemble_runtime_supervisor().set_kill_switch(
+        payload.active,
+        reason=payload.reason,
+        updated_by="api",
+        refresh_readiness=True,
+    )
+
+
 @router.get("/runtime/paper-inventory", summary="Voting Ensemble paper orders, fills, and positions")
 def runtime_paper_inventory() -> dict[str, Any]:
     return get_voting_ensemble_runtime_supervisor().paper_inventory()

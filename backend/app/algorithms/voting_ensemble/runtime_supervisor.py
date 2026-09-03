@@ -57,6 +57,11 @@ class VotingEnsembleRuntimeControl:
     liveTradingEnabled: bool = False
     newEntriesEnabled: bool = False
     killSwitchActive: bool = False
+    # Who threw the switch, why and when. Until the API below existed the only way
+    # to set it was editing control.json by hand, so nothing recorded these.
+    killSwitchReason: str | None = None
+    killSwitchUpdatedAt: str | None = None
+    killSwitchUpdatedBy: str | None = None
     controlVersion: str = VOTING_ENSEMBLE_CONTROL_VERSION
     updatedAt: str | None = None
     updatedBy: str = "system"
@@ -73,6 +78,9 @@ class VotingEnsembleRuntimeControl:
             "liveTradingEnabled": False,
             "newEntriesEnabled": self.newEntriesEnabled,
             "killSwitchActive": self.killSwitchActive,
+            "killSwitchReason": self.killSwitchReason,
+            "killSwitchUpdatedAt": self.killSwitchUpdatedAt,
+            "killSwitchUpdatedBy": self.killSwitchUpdatedBy,
             "controlVersion": self.controlVersion,
             "updatedAt": self.updatedAt,
             "updatedBy": self.updatedBy,
@@ -91,6 +99,9 @@ class VotingEnsembleRuntimeControl:
             liveTradingEnabled=False,
             newEntriesEnabled=bool(payload.get("newEntriesEnabled", False)),
             killSwitchActive=bool(payload.get("killSwitchActive", False)),
+            killSwitchReason=str(payload["killSwitchReason"]) if payload.get("killSwitchReason") else None,
+            killSwitchUpdatedAt=str(payload["killSwitchUpdatedAt"]) if payload.get("killSwitchUpdatedAt") else None,
+            killSwitchUpdatedBy=str(payload["killSwitchUpdatedBy"]) if payload.get("killSwitchUpdatedBy") else None,
             controlVersion=str(payload.get("controlVersion") or VOTING_ENSEMBLE_CONTROL_VERSION),
             updatedAt=str(payload["updatedAt"]) if payload.get("updatedAt") else None,
             updatedBy=str(payload.get("updatedBy") or "system"),
@@ -220,6 +231,31 @@ class VotingEnsembleRuntimeControlStore:
         self.control.effectivePaperTradingEnabled = False
         self.control.updatedAt = _now()
         self.repository.save(self.control)
+
+    def set_kill_switch(self, active: bool, *, updated_by: str, reason: str | None = None) -> VotingEnsembleRuntimeControl:
+        """Throw or clear the kill switch.
+
+        Active, it takes effective paper trading and new entries down in the same
+        write, so a reader of the file sees a consistent state before readiness is
+        recomputed. Clearing it does not turn paper trading back on by itself; the
+        next readiness refresh does, if everything else is healthy.
+        """
+        self.reload_if_changed()
+        now = _now()
+        self.control.killSwitchActive = bool(active)
+        self.control.killSwitchReason = str(reason).strip() or None if reason is not None else None
+        self.control.killSwitchUpdatedAt = now
+        self.control.killSwitchUpdatedBy = updated_by
+        if active:
+            self.control.effectivePaperTradingEnabled = False
+            self.control.newEntriesEnabled = False
+        self.control.liveTradingEnabled = False
+        self.control.updatedAt = now
+        self.control.updatedBy = updated_by
+        self.control.reasonCodes = [
+            "voting_ensemble.control.kill_switch_activated" if active else "voting_ensemble.control.kill_switch_cleared",
+        ]
+        return self.repository.save(self.control)
 
     def clear_entry_block(self, reason_code: str) -> None:
         self.reload_if_changed()
@@ -480,6 +516,35 @@ class VotingEnsembleRuntimeSupervisor:
         if refresh_readiness:
             self._refresh_readiness()
         return self.control_store.snapshot()
+
+    def set_kill_switch(
+        self,
+        active: bool,
+        *,
+        reason: str | None = None,
+        updated_by: str = "api",
+        refresh_readiness: bool = True,
+    ) -> dict[str, Any]:
+        self.control_store.set_kill_switch(active, updated_by=updated_by, reason=reason)
+        if refresh_readiness:
+            self._refresh_readiness()
+        return self.kill_switch_status(refresh_readiness=False)
+
+    def kill_switch_status(self, *, refresh_readiness: bool = False) -> dict[str, Any]:
+        if refresh_readiness:
+            self._refresh_readiness()
+        control = self.control_store.snapshot()
+        return {
+            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "active": bool(control.get("killSwitchActive")),
+            "reason": control.get("killSwitchReason"),
+            "updatedAt": control.get("killSwitchUpdatedAt"),
+            "updatedBy": control.get("killSwitchUpdatedBy"),
+            "blocksNewEntries": bool(control.get("killSwitchActive")),
+            "effectivePaperTradingEnabled": bool(control.get("effectivePaperTradingEnabled")),
+            "newEntriesEnabled": bool(control.get("newEntriesEnabled")),
+            "control": control,
+        }
 
     def entry_permission_snapshot(self) -> dict[str, Any]:
         self._refresh_readiness()

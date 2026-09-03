@@ -414,6 +414,42 @@ class VotingEnsembleRuntimeSupervisorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("voting_ensemble.control.effective_paper_on", enabled["reasonCodes"])
         control_path.unlink(missing_ok=True)
 
+    async def test_kill_switch_can_be_thrown_and_cleared_through_the_supervisor(self) -> None:
+        control_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"control-{uuid4().hex}.json"
+        self.supervisor = supervisor_with_runtime(
+            control_store=VotingEnsembleRuntimeControlStore(VotingEnsembleRuntimeControlRepository(control_path)),
+            settings=paper_settings(),
+            market_clock_provider=lambda: {"isOpen": True, "status": "open"},
+        )
+        await self.supervisor.start()
+        enabled = self.supervisor.update_control(requested_paper_trading_enabled=True, updated_by="test")
+        self.assertTrue(enabled["effectivePaperTradingEnabled"])
+
+        thrown = self.supervisor.set_kill_switch(True, reason="operator drill", updated_by="test")
+        permission_while_thrown = self.supervisor.entry_permission_snapshot()
+        # The file is the contract every enqueue path reads; a fresh reader sees it too.
+        persisted = VotingEnsembleRuntimeControlRepository(control_path).load()
+
+        self.assertTrue(thrown["active"])
+        self.assertEqual(thrown["reason"], "operator drill")
+        self.assertEqual(thrown["updatedBy"], "test")
+        self.assertFalse(thrown["effectivePaperTradingEnabled"])
+        self.assertFalse(thrown["newEntriesEnabled"])
+        self.assertFalse(permission_while_thrown["newEntriesAllowed"])
+        self.assertIn("voting_ensemble.control.killSwitchOff", permission_while_thrown["reasonCodes"])
+        self.assertTrue(persisted.killSwitchActive)
+        self.assertEqual(persisted.killSwitchReason, "operator drill")
+
+        cleared = self.supervisor.set_kill_switch(False, updated_by="test")
+        permission_after = self.supervisor.entry_permission_snapshot()
+
+        self.assertFalse(cleared["active"])
+        self.assertIsNone(cleared["reason"])
+        self.assertTrue(cleared["effectivePaperTradingEnabled"])
+        self.assertTrue(permission_after["newEntriesAllowed"])
+        self.assertNotIn("voting_ensemble.control.killSwitchOff", permission_after["reasonCodes"])
+        control_path.unlink(missing_ok=True)
+
     async def test_control_store_reloads_external_lightweight_control_write(self) -> None:
         control_path = Path("backend/tests/.tmp_voting_ensemble_runtime") / f"control-{uuid4().hex}.json"
         self.supervisor = supervisor_with_runtime(
