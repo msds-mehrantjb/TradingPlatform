@@ -489,6 +489,11 @@ class VotingEnsembleInventoryLedger:
             value = _intent_setting(intent, key)
             if value is not None:
                 payload[key] = value
+        # How far past its stop a gapped protective stop may fill, from the resolved
+        # settings when the intent carries them.
+        max_slippage = _intent_setting(intent, "maxSlippagePerShare")
+        if max_slippage is not None and max_slippage > 0:
+            payload["maxStopSlippageDollars"] = max_slippage
         self.store.write_snapshot(f"local_order.{order.clientOrderId}", payload)
         self.persist_inventory_manifest(observed_at=observed_at)
         return payload

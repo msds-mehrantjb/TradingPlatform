@@ -2726,6 +2726,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
             "limitPrice": float(limit_price),
             "stopPrice": trigger_price if protective_kind == "STOP_LOSS" else None,
             "targetPrice": limit_price if protective_kind == "PROFIT_TARGET" else None,
+            "maxStopSlippageDollars": parent_order.get("maxStopSlippageDollars"),
             "submittedAt": submitted_at.isoformat().replace("+00:00", "Z"),
             "status": "OPEN",
             "protectiveKind": protective_kind,
@@ -2884,13 +2885,24 @@ class VotingEnsembleLocalPaperExecutionEngine:
         if limit is None:
             return {"status": "NOT_FILLABLE", "orderStatus": "REJECTED", "reasonCode": "voting_ensemble.local_paper_execution_engine.limit_price_missing"}
         executable_price = _float(quote.get("ask" if side == Signal.BUY else "bid"))
-        if side == Signal.BUY and executable_price > limit:
-            return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.buy_limit_not_executable"}
-        if side == Signal.SELL and executable_price < limit:
+        gapped_through = (side == Signal.BUY and executable_price > limit) or (side == Signal.SELL and executable_price < limit)
+        fill_policy = "limit_quote_size_participation_slippage_capped_at_limit"
+        if gapped_through and order.get("protectiveKind") == "STOP_LOSS" and "STOP" in order_type:
+            # A protective stop whose limit equals its trigger used to sit open after a
+            # gap through it, waiting for the quote to come back. It now fills at the
+            # quote, bounded to the stop plus the configured maximum slippage: the same
+            # rule the backtest simulator applies to a candle that gaps through a stop.
+            max_slip = _stop_gap_slippage_bound(order)
+            fill_price = max(executable_price, limit - max_slip) if side == Signal.SELL else min(executable_price, limit + max_slip)
+            fill_policy = "protective_stop_gap_through_filled_at_quote_bounded_by_max_slippage"
+        elif gapped_through:
+            if side == Signal.BUY:
+                return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.buy_limit_not_executable"}
             return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.sell_limit_not_executable"}
-        slippage_bps = _local_paper_env_float("VOTING_ENSEMBLE_LOCAL_PAPER_SLIPPAGE_BPS", 0.0)
-        fill_price = executable_price * (1.0 + slippage_bps / 10000.0) if side == Signal.BUY else executable_price * (1.0 - slippage_bps / 10000.0)
-        fill_price = min(fill_price, limit) if side == Signal.BUY else max(fill_price, limit)
+        else:
+            slippage_bps = _local_paper_env_float("VOTING_ENSEMBLE_LOCAL_PAPER_SLIPPAGE_BPS", 0.0)
+            fill_price = executable_price * (1.0 + slippage_bps / 10000.0) if side == Signal.BUY else executable_price * (1.0 - slippage_bps / 10000.0)
+            fill_price = min(fill_price, limit) if side == Signal.BUY else max(fill_price, limit)
         remaining = max(0, int(order.get("quantity") or 0) - int(order.get("filledQuantity") or 0))
         quote_size = _float(quote.get("askSize" if side == Signal.BUY else "bidSize"))
         participation = max(0.0, min(100.0, _local_paper_env_float("VOTING_ENSEMBLE_LOCAL_PAPER_MAX_PARTICIPATION_PCT", 100.0))) / 100.0
@@ -2901,7 +2913,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
             "status": "FILLABLE",
             "quantity": fill_quantity,
             "fillPrice": round(fill_price, 6),
-            "fillPolicy": "limit_quote_size_participation_slippage_capped_at_limit",
+            "fillPolicy": fill_policy,
         }
 
     def _record_open_order_status(self, order: Mapping[str, Any], *, status: str, reason_code: str) -> None:
@@ -4186,6 +4198,21 @@ def _clock_requires_eod_flatten(clock: Mapping[str, Any], *, now: datetime | Non
         return False
     observed = _require_utc(now or datetime.now(UTC))
     return next_close - observed <= timedelta(minutes=5)
+
+
+VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_STOP_SLIPPAGE_DOLLARS = 1.0
+
+
+def _stop_gap_slippage_bound(order: Mapping[str, Any]) -> float:
+    """How far past its stop a gapped protective stop may fill, in dollars per share.
+
+    The order carries the value the settings resolved (maxSlippagePerShare) when the
+    intent supplied one; otherwise the environment or the algorithm default applies.
+    """
+    on_order = _positive_float(order.get("maxStopSlippageDollars"))
+    if on_order is not None:
+        return on_order
+    return _local_paper_env_float("VOTING_ENSEMBLE_LOCAL_PAPER_MAX_STOP_SLIPPAGE_DOLLARS", VOTING_ENSEMBLE_LOCAL_DEFAULT_MAX_STOP_SLIPPAGE_DOLLARS)
 
 
 def _positive_or_zero_float(value: Any) -> float | None:

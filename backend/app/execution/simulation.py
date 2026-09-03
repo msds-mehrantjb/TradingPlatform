@@ -40,6 +40,9 @@ class ExecutionSimulationConfig(DomainModel):
     maxCancelReplaceAttempts: int = Field(default=0, ge=0)
     replacementPriceOffsetBps: float = Field(default=0.0, ge=0.0)
     stopGapSlippageMultiplier: float = Field(default=1.0, ge=0.0)
+    # Furthest a stop may fill past its price on a gap, in dollars per share. None means
+    # the gap fills at the open however far that is.
+    maximumStopSlippageDollars: float | None = Field(default=None, gt=0.0)
     targetGapSlippageMultiplier: float = Field(default=1.0, ge=0.0)
     conservativeSameBarRule: Literal["STOP_FIRST"] = "STOP_FIRST"
     endOfDayExit: bool = True
@@ -296,10 +299,13 @@ def effective_slippage(config: ExecutionSimulationConfig, candle: MarketCandle |
 def stop_gap_price(side: Signal, order_plan: OrderPlan, candle: MarketCandle, config: ExecutionSimulationConfig) -> float | None:
     if order_plan.stopPrice is None:
         return None
+    bound = config.maximumStopSlippageDollars
     if side == Signal.BUY and candle.open < order_plan.stopPrice:
-        return candle.open - ((order_plan.stopPrice - candle.open) * max(0.0, config.stopGapSlippageMultiplier - 1.0))
+        price = candle.open - ((order_plan.stopPrice - candle.open) * max(0.0, config.stopGapSlippageMultiplier - 1.0))
+        return max(price, order_plan.stopPrice - bound) if bound else price
     if side == Signal.SELL and candle.open > order_plan.stopPrice:
-        return candle.open + ((candle.open - order_plan.stopPrice) * max(0.0, config.stopGapSlippageMultiplier - 1.0))
+        price = candle.open + ((candle.open - order_plan.stopPrice) * max(0.0, config.stopGapSlippageMultiplier - 1.0))
+        return min(price, order_plan.stopPrice + bound) if bound else price
     return order_plan.stopPrice
 
 

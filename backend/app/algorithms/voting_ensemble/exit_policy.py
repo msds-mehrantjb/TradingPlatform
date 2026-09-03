@@ -20,6 +20,9 @@ def voting_ensemble_execution_config() -> ExecutionSimulationConfig:
         orderExpirationSeconds=300,
         conservativeSameBarRule="STOP_FIRST",
         endOfDayExit=True,
+        # A gapped stop fills at the open, no further than this past the stop; the same
+        # bound the local paper engine applies (baseline maxSlippagePerShare).
+        maximumStopSlippageDollars=1.0,
     )
 
 
