@@ -59,9 +59,13 @@ class FamilyAwareEnsembleConfig(BaseModel):
     minimumFinalScore: float = Field(default=0.20, ge=0, le=1)
     minimumIndependentSupportingFamilies: int = Field(default=2, ge=1)
     minimumFamilyAgreement: float = Field(default=0.10, ge=0, le=1)
-    # A context-conflict limit used to sit here at 0.20. With both live contexts capped
-    # at 0.08 per signal, the largest reachable conflict is 0.072, so it could never
-    # trigger; it is gone rather than kept as a control that does nothing.
+    # Documented inert for the Voting Ensemble, live for other callers. This engine is
+    # shared (re-exported as backend.app.ensemble.family_aware, used by the meta
+    # strategy's characterization), and with enough conflicting context signals the limit
+    # does fire there. In the Voting Ensemble's own wiring it cannot: two context modules
+    # capped at maxContextAdjustmentPerSignal 0.08 reach 0.072 against this 0.20. What
+    # would feed it here is a third context module, or a higher per-signal cap.
+    maximumContextConflict: float = Field(default=0.20, ge=0, le=1)
     minimumEligibleDirectionalStrategies: int = Field(default=2, ge=1)
     maxContextAdjustmentPerSignal: float = Field(default=0.08, ge=0, le=0.25)
     reliabilityMode: OperatingMode = OperatingMode.SHADOW
@@ -269,6 +273,7 @@ class FamilyAwareDeterministicEnsemble:
         candidate_side = _side_for_score(raw_score, self.config.minimumFinalScore)
         context_adjustments = self._context_adjustments(contextSignals, candidate_side)
         context_delta = sum(float(row["adjustment"]) for row in context_adjustments)
+        context_conflict = sum(abs(float(row["adjustment"])) for row in context_adjustments if float(row["adjustment"]) < 0)
         final_score = _clamp_signed(raw_score + context_delta)
         supporting_families, opposing_families = self._family_support(family_aggregates, final_score)
         diagnostic_signals = self._signals_with_family_diagnostics(scored_signals, family_aggregates)
@@ -278,6 +283,7 @@ class FamilyAwareDeterministicEnsemble:
             eligible_strategy_count=controlled_eligible_count,
             supporting_families=supporting_families,
             opposing_families=opposing_families,
+            context_conflict=context_conflict,
             safety_decision=safetyDecision,
         )
         confidence = abs(final_score) if signal != Signal.HOLD else max(0.0, 1.0 - abs(final_score))
@@ -609,6 +615,7 @@ class FamilyAwareDeterministicEnsemble:
         eligible_strategy_count: int,
         supporting_families: list[StrategyFamily],
         opposing_families: list[StrategyFamily],
+        context_conflict: float,
         safety_decision: GlobalGateDecision | None,
     ) -> tuple[Signal, list[str]]:
         reason_codes: list[str] = []
@@ -622,6 +629,8 @@ class FamilyAwareDeterministicEnsemble:
             reason_codes.append("ensemble.insufficient_independent_family_support")
         if opposing_families:
             reason_codes.append("ensemble.conflicting_families")
+        if context_conflict > self.config.maximumContextConflict:
+            reason_codes.append("ensemble.context_conflict_exceeds_limit")
         if self._safety_blocks(safety_decision):
             reason_codes.append("ensemble.safety_blocked_new_entry")
         if reason_codes:

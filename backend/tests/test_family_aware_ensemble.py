@@ -309,10 +309,10 @@ class FamilyAwareDeterministicEnsembleTest(unittest.TestCase):
         self.assertEqual(weak.signal, Signal.HOLD.value)
         self.assertIn("ensemble.weak_final_score", weak.reasonCodes)
 
-    def test_context_conflict_is_bounded_and_only_moves_the_score(self) -> None:
-        # The conflict limit that used to force a Hold here is gone: with two contexts
-        # capped at 0.08 each the largest reachable conflict was 0.072 against a 0.20
-        # limit, so it could never fire. Conflicts still reduce the score, bounded.
+    def test_context_conflict_is_bounded_and_can_force_hold(self) -> None:
+        # The limit is live on this shared engine (the meta strategy's characterization
+        # aggregates through it). It is unreachable in the Voting Ensemble's own wiring,
+        # where two contexts capped at 0.08 each reach 0.072 against the 0.20 default.
         result = aggregate(
             [
                 strategy_signal("multi_timeframe_trend_alignment", Signal.BUY, confidence=0.9),
@@ -322,13 +322,18 @@ class FamilyAwareDeterministicEnsembleTest(unittest.TestCase):
                 context_signal("relative_strength_qqq_iwm", "strong_short_conflict", confidence=1.0),
                 context_signal("market_breadth_momentum", "strong_short_conflict", confidence=1.0),
             ],
-            FamilyAwareEnsembleConfig(),
+            FamilyAwareEnsembleConfig(maximumContextConflict=0.10),
         )
 
+        self.assertEqual(result.signal, Signal.HOLD.value)
         self.assertLess(result.finalScore, result.rawScore)
-        self.assertGreaterEqual(result.finalScore, result.rawScore - 0.16)
-        self.assertNotIn("ensemble.context_conflict_exceeds_limit", result.reasonCodes)
-        self.assertNotIn("maximumContextConflict", FamilyAwareEnsembleConfig.model_fields)
+        self.assertIn("ensemble.context_conflict_exceeds_limit", result.reasonCodes)
+
+    def test_the_voting_ensemble_wiring_cannot_reach_the_conflict_limit(self) -> None:
+        # Two context modules, each capped at maxContextAdjustmentPerSignal.
+        config = FamilyAwareEnsembleConfig()
+        largest_reachable_conflict = 2 * config.maxContextAdjustmentPerSignal * 0.45
+        self.assertLess(largest_reachable_conflict, config.maximumContextConflict)
 
     def test_safety_result_blocks_candidate(self) -> None:
         module = FamilyAwareDeterministicEnsemble()

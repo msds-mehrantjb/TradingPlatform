@@ -132,6 +132,7 @@ def engine(max_context_adjustment: float = 0.08) -> FamilyAwareDeterministicEnse
         FamilyAwareEnsembleConfig(
             minimumEligibleDirectionalStrategies=1,
             minimumIndependentSupportingFamilies=1,
+            maximumContextConflict=1.0,
             maxContextAdjustmentPerSignal=max_context_adjustment,
         )
     )

@@ -403,9 +403,18 @@ Removed:
 
 - **Signal-fade exit.** Declared on the holding-time policy, consumed by nothing, with no
   path to a consumer. The legacy engine in `main.py` keeps its own.
-- **Context conflict limit 0.20.** With both live contexts capped at 0.08 per signal the
-  largest reachable conflict is 0.072, so it could never trigger. Conflicts still reduce
-  the score, bounded; the limit and its reason code are gone.
+
+Approved for removal, then kept after it broke another algorithm:
+
+- **Context conflict limit 0.20.** Removing it was approved on the ground that it can
+  never fire, which is true of the Voting Ensemble and only of the Voting Ensemble: two
+  context modules capped at `maxContextAdjustmentPerSignal` 0.08 reach 0.072. The family
+  aware engine is shared, re-exported as `backend.app.ensemble.family_aware`, and the meta
+  strategy's characterization aggregates through it with the default configuration and
+  enough conflicting context to cross 0.20. Removing the check flipped a recorded Hold to
+  a Buy and failed that algorithm's characterization fixtures. The control is restored and
+  documented inert for this algorithm at its definition, with what would make it reachable
+  here: a third context module, or a higher per-signal cap.
 
 Kept, documented inert. Each carries a one-line comment at its read site saying why it is
 inert and what would feed it:
