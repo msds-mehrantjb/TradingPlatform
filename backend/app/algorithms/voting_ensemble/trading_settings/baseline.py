@@ -51,6 +51,9 @@ ONE_MINUTE_BASELINE_SETTINGS: dict[str, Any] = {
     # positionSizingMode / riskBudgetPercentOfOrder pair never governed sizing; they
     # were echoed into metadata only and have been removed.
     "positionSizing": "shares = minimum over caps: risk dollars / stop distance, order allocation, daily allocation, maximum position, max share quantity, buying power, remaining daily-loss budget",
+    # Documented inert: resolved into the settings, consumed by nothing live. The snapshot
+    # readiness has its own history requirement and the strategies confirm their own
+    # entries. Kept so the contract does not change; see BASELINES.md "Inert controls".
     "entryConfirmationBars": 3,
     "warmupBars": 50,
     # Entries are bounded by sessionStart/newTradesUntil, not by an hour allow-list.

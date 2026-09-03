@@ -143,8 +143,9 @@ class TargetPolicySettings(ImmutableSettingsModel):
 
 
 class HoldingTimePolicySettings(ImmutableSettingsModel):
+    # The holding-time stop is the live engine's. A signal-fade exit used to be declared
+    # here too; nothing consumed it and no path to a consumer existed, so it is gone.
     maximumHoldingMinutes: int = Field(ge=1)
-    signalFadeExit: Literal["disabled", "shadow", "active"] = "disabled"
 
 
 class OrderTypeLimitPolicySettings(ImmutableSettingsModel):

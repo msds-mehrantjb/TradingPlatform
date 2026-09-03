@@ -381,6 +381,50 @@ the legacy engine, the meta strategy and their fixtures keep their own copies of
 they are separate readers and were left alone. No recorded number moves: the removal is of
 text that never sized a trade. The `positionSizing` string documents the rule.
 
+## Inert controls: wired, removed, or kept documented (2026-09-03)
+
+The audit listed the controls that could not fire live. Each was decided, and the
+decision is recorded here so nobody re-audits them as surprises.
+
+Wired (each has a test and a reason code of its own):
+
+- **Kill switch.** `POST /api/voting-ensemble/runtime/kill-switch` throws or clears it
+  with a reason; the control file records who, why and when. Every enqueue path already
+  read `killSwitchActive`; it just had no setter.
+- **Consecutive-loss gate.** The account snapshot now carries today's trailing losing
+  streak from the local paper closed trades (a winner resets it). The gate's input used
+  to be a constant zero.
+- **Max concurrent positions.** The gate engine reads the settings' cap and counts open
+  local positions. A candidate that nets against the open position (a reversal exit)
+  passes, since it opens nothing.
+- **Feed-age and latency limits.** The gate context measures the primary bar's age since
+  completion and the oldest auxiliary feed (QQQ, IWM, breadth) against
+  `maxPrimaryFeedAgeSeconds` and `maxAuxiliaryFeedAgeSeconds`; the worker stamps the real
+  queue delay (it was a constant 0.0) and expires a finalized-bar command that waited past
+  `maxQueueLatencyMs`; the in-process latency is checked against `maxDecisionLatencyMs` at
+  the post-gate. The producer keeps its own, stricter, pre-checks (5 s quote, 10 s trade,
+  90 s auxiliary) in front of these.
+
+Removed:
+
+- **Signal-fade exit.** Declared on the holding-time policy, consumed by nothing, with no
+  path to a consumer. The legacy engine in `main.py` keeps its own.
+
+Kept, documented inert (no code path can make them fire; changing them changes nothing):
+
+- **Event-risk state gate.** Reads keys the snapshot never carries, so it always reports
+  clear. It needs an event feed in the snapshot before it can mean anything.
+- **Context conflict limit 0.20.** With both live contexts at confidence 0.45 the largest
+  reachable move is ±0.072, so the limit cannot trigger. A tuning question, not a wiring
+  fix.
+- **eventRiskCap, liquidityCap, minimum tradable size, participation limit.** Read from
+  the operational snapshot; the producer never sets them, so they default to 1.0.
+- **Existing-position conflict.** Never set. Wiring it would block the reversal exit the
+  paper account nets, which the concurrent-position cap above already handles correctly.
+- **Pyramiding, warm-up bars, entry confirmation bars, allowed entry hours.** Resolved
+  into the settings and consumed by nothing live; the snapshot readiness and the
+  session windows do the real work. The baseline comments them.
+
 ## When to re-record
 
 Re-record, keeping the prior version beside the new one, when any of these happen:
