@@ -1235,12 +1235,14 @@ type BacktestTrade = {
   entryPrice: number;
   exitPrice: number;
   shares?: number;
+  quantity?: number;
   stopPrice?: number;
   targetPrice?: number;
   exitReason?: string;
   rMultiple?: number;
   accountReturnPercent?: number;
   grossPnl?: number;
+  netPnl?: number;
   expenses?: number;
   pnl: number;
   returnPercent: number;
@@ -21696,16 +21698,24 @@ function renderBacktestTrades(trades: BacktestTrade[]) {
     `;
   }
   return trades
-    .map(
-      (trade) => `
+    .map((trade) => {
+      // The dedicated replay's trade records carry `quantity` and `netPnl` and, before
+      // they were added server-side, no `returnPercent`; the legacy engine's carry
+      // `shares` and `returnPercent`. Derive what is missing rather than crash the panel.
+      const shares = trade.shares ?? trade.quantity;
+      const pnl = typeof trade.pnl === "number" ? trade.pnl : (trade.netPnl ?? 0);
+      const notional = shares && trade.entryPrice ? shares * trade.entryPrice : 0;
+      const returnPercent = typeof trade.returnPercent === "number" ? trade.returnPercent : notional ? (pnl / notional) * 100 : 0;
+      const rMultiple = typeof trade.rMultiple === "number" ? trade.rMultiple.toFixed(2) : "NA";
+      return `
         <tr>
-          <td>${trade.side}${trade.shares ? ` - ${trade.shares} sh` : ""}</td>
+          <td>${trade.side}${shares ? ` - ${shares} sh` : ""}</td>
           <td>${formatTime(trade.entryAt)} @ ${price(trade.entryPrice)}</td>
           <td>${formatTime(trade.exitAt)} @ ${price(trade.exitPrice)}${trade.exitReason ? ` - ${escapeHtml(trade.exitReason)}` : ""}</td>
-          <td class="${trade.pnl >= 0 ? "positive" : "negative"}">${signedCurrency(trade.pnl)} (${signed(trade.returnPercent)}%, ${trade.rMultiple ?? "NA"}R)</td>
+          <td class="${pnl >= 0 ? "positive" : "negative"}">${signedCurrency(pnl)} (${signed(returnPercent)}%, ${rMultiple}R)</td>
         </tr>
-      `,
-    )
+      `;
+    })
     .join("");
 }
 

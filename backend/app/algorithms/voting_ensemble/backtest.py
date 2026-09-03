@@ -506,6 +506,12 @@ class VotingEnsembleBacktestRunner:
         exit_result = execution.exit
         gross_pnl = float(exit_result.grossPnl if exit_result else 0.0)
         net_pnl = float(exit_result.pnl if exit_result else 0.0)
+        quantity = int(execution.fill.filledQuantity)
+        entry_price = float(execution.fill.averagePrice)
+        notional = quantity * entry_price
+        # Risk per share is the planned stop distance, so the R multiple describes the
+        # trade against the risk that was actually budgeted, not against the outcome.
+        risk = abs(entry_price - float(order_plan.stopPrice)) * quantity if order_plan.stopPrice else 0.0
         return {
             "side": side,
             "decisionTimestampUtc": record["decisionTimestampUtc"],
@@ -513,7 +519,10 @@ class VotingEnsembleBacktestRunner:
             "exitAt": exit_result.exitAt.isoformat().replace("+00:00", "Z") if exit_result and exit_result.exitAt else None,
             "entryPrice": execution.fill.averagePrice,
             "exitPrice": exit_result.exitPrice if exit_result else None,
-            "quantity": execution.fill.filledQuantity,
+            "quantity": quantity,
+            "shares": quantity,
+            "returnPercent": round((net_pnl / notional) * 100, 4) if notional else 0.0,
+            "rMultiple": round(net_pnl / risk, 4) if risk else None,
             "grossPnl": round(gross_pnl, 2),
             "netPnl": round(net_pnl, 2),
             "pnl": round(net_pnl, 2),
