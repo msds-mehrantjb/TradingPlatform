@@ -25,6 +25,7 @@ _EXCHANGE_TIMEZONE = ZoneInfo("America/New_York")
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.market_feed import active_instrument
+from backend.app.algorithms.voting_ensemble.local_paper_account import fill_is_exit
 from backend.app.algorithms.voting_ensemble.session_segments import (
     entry_window_open,
     resolve_session_segment,
@@ -999,10 +1000,13 @@ def _daily_counters_from_inventory(inventory: dict[str, Any], event: VotingEnsem
     unrealized = sum(float(position.get("unrealizedPnl") or 0.0) for position in positions if isinstance(position, dict))
     realized = sum(float(fill.get("realizedPnl") or 0.0) for fill in fills if isinstance(fill, dict))
     loss_count = sum(1 for fill in fills if isinstance(fill, dict) and float(fill.get("realizedPnl") or 0.0) < 0.0)
+    orders_by_id = {str(item.get("clientOrderId") or ""): item for item in inventory.get("orders") or [] if isinstance(item, dict)}
+    entry_fills = [fill for fill in fills if isinstance(fill, dict) and not fill_is_exit(fill, orders_by_id.get(str(fill.get("clientOrderId") or "")))]
     return {
         "algorithmId": "voting_ensemble",
         "sessionDate": session,
-        "tradesToday": len(fills),
+        # Entries only; exits never consume a trade-count budget.
+        "tradesToday": len(entry_fills),
         "ordersToday": len(orders),
         "realizedPnlToday": round(realized, 6),
         "unrealizedPnlToday": round(unrealized, 6),
@@ -1347,7 +1351,11 @@ def _account_snapshot_from_inventory(inventory: dict[str, Any], event: VotingEns
         "totalSpyNotionalPercent": 0.0,
         "sameDirectionExposurePercent": 0.0,
         "estimatedExitCosts": 0.0,
-        "tradesToday": len(inventory.get("orders") or []) if isinstance(inventory, dict) else 0,
+        "tradesToday": (
+            len([item for item in inventory.get("orders") or [] if isinstance(item, dict) and not fill_is_exit(item, item)])
+            if isinstance(inventory, dict)
+            else 0
+        ),
         "observedAt": _iso(event.receivedAt),
         "sessionDate": _iso(event.barEndTimestamp)[:10],
         "sourceAuthority": "voting_ensemble.local_paper_account.missing",

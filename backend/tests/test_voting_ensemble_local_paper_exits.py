@@ -224,6 +224,58 @@ class MaximumHoldingTimeExitTest(unittest.TestCase):
         self.assertIn("voting_ensemble.local_paper.maximum_holding_exit_already_open", second[0]["reasonCodes"])
 
 
+class TradeCountCountsEntriesOnlyTest(unittest.TestCase):
+    """A round trip consumes one of a trade-count budget, not two.
+
+    The counter used to count every fill, exits included, so a cap of three allowed about
+    one and a half trades. Now a stop, target, time-stop or end-of-day fill never counts.
+    """
+
+    def trades_today(self, repository) -> int:
+        return int(repository.inventory_snapshot()["localPaperAccount"]["tradesToday"])
+
+    def test_one_round_trip_consumes_exactly_one_of_three(self) -> None:
+        with patch.dict("os.environ", NO_FEES):
+            engine, repository = engine_with_repository()
+            cap = {"maximumTradesPerDay": 3}
+
+            open_long(engine, repository, client_order_id="rt-1", settings_snapshot=cap)
+            self.assertEqual(self.trades_today(repository), 1)
+            # Stop out: an exit fill, not a trade.
+            seed_local_quote(repository, bid=99.0, ask=99.05, bid_size=3)
+            self.assertIsNotNone(engine.refresh_order("rt-1-stop"))
+            self.assertEqual(repository.inventory_snapshot()["localPositions"], [])
+            self.assertEqual(self.trades_today(repository), 1)
+
+            open_long(engine, repository, client_order_id="rt-2", settings_snapshot=cap)
+            seed_local_quote(repository, bid=101.5, ask=101.55, bid_size=3)
+            self.assertIsNotNone(engine.refresh_order("rt-2-target"))
+            self.assertEqual(self.trades_today(repository), 2)
+
+            open_long(engine, repository, client_order_id="rt-3", settings_snapshot=cap)
+            seed_local_quote(repository, bid=100.0, ask=100.0, bid_size=3)
+            self.assertEqual(len(engine.submit_maximum_holding_exits(evaluated_at=NOW + timedelta(minutes=30))), 1)
+            self.assertEqual(self.trades_today(repository), 3)
+
+            # Three entries used; six fills happened. The fourth entry is what the cap refuses.
+            seed_local_quote(repository, bid=100.0, ask=100.0, ask_size=3)
+            fourth = engine.submit_order(local_engine_intent(client_order_id="rt-4", quantity=3, limit_price=100.0, settings_snapshot=cap))
+
+        self.assertEqual(fourth.status, "REJECTED")
+        self.assertEqual(fourth.rejectedReason, "voting_ensemble.local_paper.maximum_trades_per_day_exceeded")
+
+    def test_exit_classification_uses_the_order_record_then_the_id_convention(self) -> None:
+        from backend.app.algorithms.voting_ensemble.local_paper_account import fill_is_exit
+
+        self.assertTrue(fill_is_exit({"clientOrderId": "x"}, {"protectiveKind": "STOP_LOSS"}))
+        self.assertTrue(fill_is_exit({"clientOrderId": "x"}, {"exitReason": "END_OF_DAY_LIQUIDATION"}))
+        self.assertFalse(fill_is_exit({"clientOrderId": "x"}, {"side": "SELL"}))
+        self.assertTrue(fill_is_exit({"clientOrderId": "entry-1-stop"}, None))
+        self.assertTrue(fill_is_exit({"clientOrderId": "ve-eod-abc"}, None))
+        self.assertFalse(fill_is_exit({"clientOrderId": "ve-intent-abc"}, None))
+        self.assertTrue(fill_is_exit({"clientOrderId": "anything", "exposureEffect": "exit"}, {}))
+
+
 class ShortTradingRuntimeFlagTest(unittest.TestCase):
     """The production runtime enables short entries unless the operator turns them off."""
 

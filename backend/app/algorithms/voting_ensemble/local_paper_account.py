@@ -21,6 +21,31 @@ VOTING_ENSEMBLE_LONG_ONLY_BUYING_POWER_MODEL = "LOCAL_CASH_NO_MARGIN_LONG_ONLY"
 VOTING_ENSEMBLE_LONG_SHORT_BUYING_POWER_MODEL = "LOCAL_CASH_NO_MARGIN_LONG_AND_SHORT"
 
 
+VOTING_ENSEMBLE_EXIT_ORDER_ID_PREFIXES = ("ve-exit-", "ve-eod-", "ve-hold-")
+VOTING_ENSEMBLE_EXIT_ORDER_ID_SUFFIXES = ("-stop", "-target", "-protective")
+
+
+def fill_is_exit(fill: Mapping[str, Any], order: Mapping[str, Any] | None = None) -> bool:
+    """Whether a fill reduced exposure rather than opening or adding to it.
+
+    The order record decides when it is available: a protective leg or an order with an
+    exit reason is an exit. Without the record, the client-order-id conventions the
+    engine uses for its own exits decide. A fill that carries an explicit
+    ``exposureEffect`` (some replay paths do) is honoured first.
+    """
+    effect = str(fill.get("exposureEffect") or "").lower()
+    if effect in {"entry", "add", "open"}:
+        return False
+    if effect in {"exit", "reduce", "close", "cover"}:
+        return True
+    if order:
+        if order.get("protectiveKind") or order.get("exitReason"):
+            return True
+        return False
+    client_order_id = str(fill.get("clientOrderId") or "")
+    return client_order_id.startswith(VOTING_ENSEMBLE_EXIT_ORDER_ID_PREFIXES) or client_order_id.endswith(VOTING_ENSEMBLE_EXIT_ORDER_ID_SUFFIXES)
+
+
 def _intent_setting(intent: Any, key: str) -> float | None:
     """A numeric setting from an intent, directly or from its settings snapshot."""
     direct = getattr(intent, key, None)
@@ -1275,12 +1300,31 @@ class VotingEnsembleInventoryLedger:
         return latest_price, latest_at
 
     def _trades_today(self, session_date: date) -> int:
+        """Entry fills today: positions opened or added to.
+
+        Exits never count. Every fill used to count, so a round trip consumed two of a
+        three-trade cap and the effective limit was one and a half trades. A fill is an
+        exit when its order is a protective leg or a reasoned exit; the order record is
+        the authority, with the client-order-id conventions as the fallback for fills
+        whose order the local store never held.
+        """
         count = 0
         for fill in self.fills():
             filled_at = _parse_time(fill.get("filledAt"))
-            if filled_at is not None and filled_at.date() == session_date:
-                count += 1
+            if filled_at is None or filled_at.date() != session_date:
+                continue
+            if self._fill_is_exit(fill):
+                continue
+            count += 1
         return count
+
+    def _fill_is_exit(self, fill: Mapping[str, Any]) -> bool:
+        client_order_id = str(fill.get("clientOrderId") or "")
+        try:
+            order = self.store.read_snapshot(f"local_order.{client_order_id}") if client_order_id else {}
+        except KeyError:
+            order = {}
+        return fill_is_exit(fill, order)
 
     def _records(self, prefix: str, *, namespace: str = VOTING_ENSEMBLE_PAPER_EXECUTION_NAMESPACE) -> list[dict[str, Any]]:
         return [
