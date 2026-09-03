@@ -139,7 +139,10 @@ def apply_profile_to_config(config: dict[str, Any], profile: dict[str, Any]) -> 
         effective["maximumSpreadDollars"] = min(float(effective["maximumSpreadDollars"]), float(profile["maximumSpreadDollars"]))
     if profile.get("maximumSlippagePerShare") is not None:
         effective["maxSlippagePerShare"] = min(float(effective["maxSlippagePerShare"]), float(profile["maximumSlippagePerShare"]))
+    # Settings resolution is the one place a profile multiplier is applied. The resolved
+    # values below already carry it; nothing downstream multiplies by the profile again.
     effective["fixedStopDistanceDollars"] = round(float(effective["fixedStopDistanceDollars"]) * float(profile["stopMultiplier"]), 4)
+    effective["stopAtrMultiplier"] = round(float(effective.get("stopAtrMultiplier", 1.5)) * float(profile["stopMultiplier"]), 4)
     effective["takeProfitR"] = round(float(effective["takeProfitR"]) * float(profile["targetMultiplier"]), 4)
     effective["maximumHoldingMinutes"] = max(1, floor(int(effective["maximumHoldingMinutes"]) * float(profile["maximumHoldingMultiplier"])))
     if profile.get("cancelReplaceTimeoutSeconds") is not None:

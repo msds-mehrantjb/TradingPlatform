@@ -1221,7 +1221,6 @@ def _candidate_from_decision(
     if signal == Signal.HOLD or not decision.eligible or snapshot.nbbo is None:
         return None
     entry = snapshot.nbbo.ask if signal == Signal.BUY else snapshot.nbbo.bid
-    profile = settings.resolvedTradingProfile
     geometry = _exit_geometry(snapshot, signal, entry, settings)
     stop = geometry["stopPrice"]
     target = geometry["targetPrice"]
@@ -1271,20 +1270,20 @@ def _exit_geometry(
     Post-fill management (breakeven trigger and trail) is expressed in the same initial
     stop distance so every part of the trade shares one unit of risk.
     """
-    profile = settings.resolvedTradingProfile
+    # The resolved settings already carry the profile's stop and target multipliers
+    # (applied once, at settings resolution); they are not applied again here.
     stop_policy = settings.stopPolicy
     target_policy = settings.targetPolicy
-    stop_multiplier = float(profile.stopMultiplier)
     atr = float(snapshot.features.atr) if snapshot.features.atr and snapshot.features.atr > 0 else None
     atr_multiplier = float(getattr(stop_policy, "atrMultiplier", 0.0) or 0.0)
     if atr is not None and atr_multiplier > 0:
-        stop_distance = atr * atr_multiplier * stop_multiplier
+        stop_distance = atr * atr_multiplier
         stop_source = "atr"
     else:
-        stop_distance = float(stop_policy.fixedStopDistanceDollars) * stop_multiplier
+        stop_distance = float(stop_policy.fixedStopDistanceDollars)
         stop_source = "fixed_dollars"
     stop_distance = max(stop_distance, float(stop_policy.minimumStopDistanceDollars), 0.01)
-    take_profit_r = float(target_policy.takeProfitR) * float(profile.targetMultiplier)
+    take_profit_r = float(target_policy.takeProfitR)
     minimum_r = min(float(getattr(target_policy, "minimumTakeProfitR", 1.0) or 1.0), take_profit_r)
     r_target_distance = stop_distance * take_profit_r
     target_distance = r_target_distance
@@ -1624,7 +1623,10 @@ def _risk_budget_config(
         "independentFamilySupport": len(decision.supportingFamilies),
         "minimumIndependentFamilySupport": int(profile.minimumIndependentFamilySupport),
         "regimeFit": _candidate_regime_fit(decision),
-        "dynamicRiskCap": float(profile.riskMultiplier),
+        # The profile's risk and allocation multipliers are already in the resolved
+        # riskPerTradePercent and allocation percents above. Passing riskMultiplier here
+        # as well applied it twice, so a 0.55 overlay cut risk to 0.30.
+        "dynamicRiskCap": 1.0,
         # The session policy's size multiplier, joining the other caps rather than
         # arriving as a separate mechanism. Until this was wired the policy's "run
         # smaller into the close" intent was inert: the multiplier was resolved on
