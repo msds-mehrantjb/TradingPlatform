@@ -281,6 +281,23 @@ class VotingEnsembleService:
             "gateDurationMs": gate_duration_ms,
             "decisionDeadlineExpired": _decision_deadline_expired(snapshot, settings),
         }
+        # Size first, then cost. Economics and the cost gates used to run on a
+        # zero-quantity candidate, so participation, impact, the per-share TAF and the
+        # fillable-quantity check were all evaluated for an order of no shares. The
+        # provisional size assumes the gates pass; the final size below re-runs with the
+        # real gate and net-edge results and can only come out lower.
+        provisional_budget = _risk_budget_for_candidate(
+            snapshot=snapshot,
+            settings=settings,
+            decision=decision,
+            candidate=candidate,
+            session_cap=session_policy_decision.max_position_multiplier,
+            local_gate=pre_gate,
+            execution_economics=None,
+            provisional=True,
+        )
+        if candidate is not None and provisional_budget is not None:
+            candidate = candidate.model_copy(update={"quantity": int(provisional_budget.quantity)})
         execution_economics = build_execution_economics(
             snapshot=snapshot,
             decision=decision,
@@ -288,6 +305,12 @@ class VotingEnsembleService:
             settings=settings,
             latency_measurements=latency_measurements,
         )
+        if candidate is not None and execution_economics is not None:
+            # Expected value in dollars: the per-share net edge after costs times the
+            # sized quantity, so the gate's dollar threshold compares like with like.
+            candidate = candidate.model_copy(
+                update={"expectedValue": round(float(execution_economics.predictedNetEdgeDollars) * int(candidate.quantity), 6)}
+            )
         post_gate_started = perf_counter()
         post_gate_engine_decision = LOCAL_GATE_ENGINE.evaluate(
             _local_gate_input(
@@ -1213,7 +1236,10 @@ def _candidate_from_decision(
         targetPrice=round(target, 4),
         quantity=0,
         confidence=decision.confidence,
-        expectedValue=max(0.0, abs(decision.finalScore) - ((snapshot.nbbo.spreadDollars if snapshot.nbbo else 0.0) / max(entry, 0.01))),
+        # Expected value is dollars after costs and is only known once the order is
+        # sized and costed; it is filled in by the evaluate sequence. It used to be a
+        # unitless score compared against a dollar threshold.
+        expectedValue=None,
         features={
             "supportingFamilies": len(decision.supportingFamilies),
             "finalScore": decision.finalScore,
@@ -1398,6 +1424,7 @@ def _risk_budget_for_candidate(
     local_gate: GlobalGateDecision,
     execution_economics: dict[str, Any] | None,
     session_cap: float = 1.0,
+    provisional: bool = False,
 ) -> Any | None:
     if candidate is None:
         return None
@@ -1414,6 +1441,7 @@ def _risk_budget_for_candidate(
             local_gate=local_gate,
             execution_economics=execution_economics,
             session_cap=session_cap,
+            provisional=provisional,
         ),
         equity=equity,
         entry_price=candidate.entryPrice,
@@ -1543,6 +1571,7 @@ def _risk_budget_config(
     local_gate: GlobalGateDecision,
     execution_economics: dict[str, Any] | None,
     session_cap: float = 1.0,
+    provisional: bool = False,
 ) -> dict[str, Any]:
     profile = settings.resolvedTradingProfile
     operational = snapshot.operationalHealthSnapshot
@@ -1556,6 +1585,10 @@ def _risk_budget_config(
     global_allowance = _number(operational, "globalExposureAllowanceDollars")
     local_allowance = _number(operational, "localExposureAllowanceDollars")
     available_fillable = _number(execution_economics or {}, "availableFillableQuantity")
+    if available_fillable is None and snapshot.nbbo is not None:
+        # Before economics exist (the provisional sizing pass) the quoted size on the
+        # entry side is the fillable quantity; economics report the same number later.
+        available_fillable = float(snapshot.nbbo.askSize if candidate.signal == Signal.BUY else snapshot.nbbo.bidSize)
     net_edge = _number(execution_economics or {}, "predictedNetEdgeDollars")
     minimum_net_edge = _number(execution_economics or {}, "minimumNetEdgeDollars")
     edge_ratio = _number(execution_economics or {}, "edgeToCostRatio")
@@ -1569,8 +1602,10 @@ def _risk_budget_config(
     )
     return {
         "candidateSignal": _algo_signal_from_domain(candidate.signal).upper(),
-        "gatesPassed": bool(local_gate.eligible),
-        "netEdgePassed": net_edge_passed,
+        # A provisional pass sizes as if the gates and the net-edge check will pass, so
+        # the economics can be costed on the real order; the final pass uses the results.
+        "gatesPassed": True if provisional else bool(local_gate.eligible),
+        "netEdgePassed": True if provisional else net_edge_passed,
         "profileAllowsEntries": profile.entryPermission == "allow_new_entries",
         "entriesBlocked": bool(profile.entriesBlocked),
         "riskPerTradePercent": float(profile.riskPerTradePercent),

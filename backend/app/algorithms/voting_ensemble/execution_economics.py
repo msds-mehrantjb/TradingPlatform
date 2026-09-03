@@ -48,6 +48,9 @@ class VotingEnsembleExecutionEconomics(BaseModel):
     predictedNetEdgeDollars: float
     edgeToCostRatio: float
     availableFillableQuantity: int = Field(ge=0)
+    # The order size these economics were costed for. Zero means the candidate was
+    # never sized (a Hold), not that costs were evaluated for an empty order.
+    sizedQuantity: int = Field(default=0, ge=0)
     participationRate: float = Field(ge=0.0)
     adverseSelectionRisk: float = Field(ge=0.0, le=1.0)
     minimumNetEdgeDollars: float = Field(ge=0.0)
@@ -136,6 +139,7 @@ def build_execution_economics(
         predictedNetEdgeDollars=round(net_edge, 6),
         edgeToCostRatio=round(edge_to_cost, 6),
         availableFillableQuantity=fillable_quantity,
+        sizedQuantity=quantity,
         participationRate=round(participation_rate, 8),
         adverseSelectionRisk=round(_adverse_selection_risk(nbbo.spreadBasisPoints, nbbo.quoteAgeSeconds, participation_rate), 6),
         minimumNetEdgeDollars=round(float(minimum_net_edge), 6),
