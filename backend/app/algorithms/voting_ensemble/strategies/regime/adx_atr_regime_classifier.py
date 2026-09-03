@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from statistics import mean
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -115,6 +116,26 @@ class AdxAtrRegimeRuntimeState(BaseModel):
     transitionState: str = "initial"
 
 
+logger = logging.getLogger(__name__)
+
+# The evaluation snapshot is the finalized one-minute tape; the auxiliary timeframes
+# ride along as context and never drive the hysteresis.
+VOTING_ENSEMBLE_REGIME_STATE_TIMEFRAME = "1Min"
+VOTING_ENSEMBLE_REGIME_STATE_SNAPSHOT_PREFIX = "regime_transition_state"
+
+
+def regime_state_key(symbol: str, timeframe: str = VOTING_ENSEMBLE_REGIME_STATE_TIMEFRAME) -> str:
+    return f"{symbol}:{timeframe}"
+
+
+class AdxAtrRegimeStateStore(Protocol):
+    namespace: str
+
+    def load(self, key: str) -> AdxAtrRegimeRuntimeState: ...
+
+    def save(self, key: str, state: AdxAtrRegimeRuntimeState) -> None: ...
+
+
 class InMemoryAdxAtrRegimeStateStore:
     namespace = "voting_ensemble.regime.adx_atr.state.memory"
 
@@ -128,10 +149,58 @@ class InMemoryAdxAtrRegimeStateStore:
         self._state[key] = state
 
 
+class LocalStoreAdxAtrRegimeStateStore:
+    """Two-bar hysteresis state kept in the algorithm's local snapshot store.
+
+    The active label and pending count used to live only in process memory, so every
+    restart began from ``unknown`` and the first bars after a restart could classify
+    differently from a long-running worker. Each state is one snapshot keyed by
+    symbol and timeframe, so a restarted worker resumes the bar count it left at.
+    The replay runner and ad-hoc callers keep the in-memory store; only the live
+    worker hands this one in.
+    """
+
+    namespace = "voting_ensemble.regime.adx_atr.state.local_store"
+
+    def __init__(self, repository: Any) -> None:
+        self.repository = repository
+
+    @staticmethod
+    def snapshot_key(key: str) -> str:
+        return f"{VOTING_ENSEMBLE_REGIME_STATE_SNAPSHOT_PREFIX}.{key.replace(':', '.')}"
+
+    def load(self, key: str) -> AdxAtrRegimeRuntimeState:
+        try:
+            payload = self.repository.read_snapshot(self.snapshot_key(key))
+        except KeyError:
+            return AdxAtrRegimeRuntimeState()
+        state = payload.get("state") if isinstance(payload, dict) else None
+        if not isinstance(state, dict):
+            return AdxAtrRegimeRuntimeState()
+        try:
+            return AdxAtrRegimeRuntimeState.model_validate(state)
+        except ValueError:
+            logger.warning("voting_ensemble.regime.transition_state_unreadable key=%s; starting from unknown", key)
+            return AdxAtrRegimeRuntimeState()
+
+    def save(self, key: str, state: AdxAtrRegimeRuntimeState) -> None:
+        symbol, _, timeframe = key.partition(":")
+        self.repository.write_snapshot(
+            self.snapshot_key(key),
+            {
+                "namespace": self.namespace,
+                "stateKey": key,
+                "symbol": symbol,
+                "timeframe": timeframe or VOTING_ENSEMBLE_REGIME_STATE_TIMEFRAME,
+                "state": state.model_dump(mode="json"),
+            },
+        )
+
+
 class AdxAtrRegimeClassifier:
     registryEntry = resolve_strategy("adx_atr_regime_classifier")
 
-    def __init__(self, config: AdxAtrRegimeConfig | None = None, state_store: InMemoryAdxAtrRegimeStateStore | None = None) -> None:
+    def __init__(self, config: AdxAtrRegimeConfig | None = None, state_store: AdxAtrRegimeStateStore | None = None) -> None:
         self.config = config or AdxAtrRegimeConfig()
         self.state_store = state_store or InMemoryAdxAtrRegimeStateStore()
 
@@ -158,7 +227,7 @@ class AdxAtrRegimeClassifier:
         return self._output_from_evidence(
             evidence,
             evaluated_at=snapshot.evaluationTimestamp,
-            state_key=snapshot.symbol,
+            state_key=regime_state_key(snapshot.symbol),
             session_state=_session_state_from_raw(snapshot.sessionState),
             event_risk_state=_event_risk_state(snapshot.economicEventState.model_dump(mode="json")),
             liquidity_state=_liquidity_state(
@@ -320,7 +389,19 @@ class AdxAtrRegimeClassifier:
         direction = _snapshot_direction(snapshot)
         atr_series = _atr_series(candles, min(self.config.adxPeriod, max(2, len(candles) - 1)))
         atr_percentile = _percentile_rank(atr_series, atr) or _atr_percentile_from_snapshot(snapshot)
-        realized_volatility_percentile = _realized_volatility_percentile(candles, min(20, max(2, len(candles) - 2))) or 0.5
+        computed_realized_volatility_percentile = _realized_volatility_percentile(candles, min(20, max(2, len(candles) - 2)))
+        # A short tape cannot rank realized volatility, and 0.5 is an assumption, not a
+        # measurement. It is logged so a restart or thin snapshot is visible in the
+        # worker log rather than silently classifying as mid-volatility. A genuine 0.0
+        # percentile is kept (the old ``or 0.5`` swallowed it).
+        realized_volatility_assumed = computed_realized_volatility_percentile is None
+        realized_volatility_percentile = 0.5 if realized_volatility_assumed else computed_realized_volatility_percentile
+        if realized_volatility_assumed:
+            logger.warning(
+                "voting_ensemble.regime.realized_volatility_percentile_assumed symbol=%s candles=%d assumed=0.5",
+                snapshot.symbol,
+                len(candles),
+            )
         volatility_state = self._volatility_state(atr_series, atr)
         volatility = self._volatility_label(atr_percentile, realized_volatility_percentile, volatility_state, None)
         label = self._label(adx, atr_percentile, realized_volatility_percentile, volatility_state, volatility, direction)
@@ -345,7 +426,12 @@ class AdxAtrRegimeClassifier:
             reversalFit=fits["reversalFit"],
             meanReversionFit=fits["meanReversionFit"],
             gapSessionFit=fits["gapSessionFit"],
-            reasonCodes=[f"regime.{label}", f"regime.volatility_{volatility_state}", "regime.snapshot_point_in_time"],
+            reasonCodes=[
+                f"regime.{label}",
+                f"regime.volatility_{volatility_state}",
+                "regime.snapshot_point_in_time",
+                *(["regime.realized_volatility_percentile_assumed_0_5"] if realized_volatility_assumed else []),
+            ],
         )
 
     def _readiness_errors(self, context: StrategyEvaluationContext, required: tuple[str, ...]) -> list[str]:

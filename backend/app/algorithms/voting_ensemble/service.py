@@ -220,6 +220,17 @@ def _looks_like_snapshot_hash(value: str) -> bool:
 class VotingEnsembleService:
     version = VOTING_ENSEMBLE_SERVICE_VERSION
 
+    def __init__(self, *, regime_classifier: AdxAtrRegimeClassifier | None = None) -> None:
+        # The live worker hands in a classifier whose two-bar hysteresis persists in
+        # the algorithm's local store. Replay, tests and ad-hoc callers keep the
+        # module-level in-memory classifier, resolved at call time so tests that
+        # swap it still take effect.
+        self._regime_classifier = regime_classifier
+
+    @property
+    def regime_classifier(self) -> AdxAtrRegimeClassifier:
+        return self._regime_classifier if self._regime_classifier is not None else REGIME_CLASSIFIER
+
     def evaluate(self, payload: dict) -> dict:
         snapshot_started = perf_counter()
         snapshot = build_live_paper_snapshot(payload)
@@ -239,7 +250,7 @@ class VotingEnsembleService:
 
         settings = resolve_one_minute_trading_settings(_settings_payload(payload))
         request = VotingEnsembleEvaluateRequest.model_validate(snapshot.to_evaluate_payload())
-        regime_state = REGIME_CLASSIFIER.evaluate_snapshot(snapshot)
+        regime_state = self.regime_classifier.evaluate_snapshot(snapshot)
         upstream_global_gate = _upstream_global_gate_decision(snapshot)
         pre_gate_started = perf_counter()
         pre_gate_engine_decision = _local_gate_engine(settings).evaluate(

@@ -51,9 +51,9 @@ class VotingEnsembleWorker:
     ) -> None:
         self.queue = queue
         self.status_store = status_store
-        self.service = service or VotingEnsemblePipeline()
-        self.backtesting_adapter = backtesting_adapter or _default_backtesting_adapter()
         self.paper_execution_runtime = paper_execution_runtime or VOTING_ENSEMBLE_PAPER_EXECUTION_RUNTIME
+        self.service = service or _default_pipeline(self.paper_execution_runtime)
+        self.backtesting_adapter = backtesting_adapter or _default_backtesting_adapter()
         self.automatic_payload_builder = automatic_payload_builder
         # Injected so the worker uses whatever source the app is on. Building its own
         # client here meant an app-wide feed switch never reached this path; the
@@ -395,6 +395,26 @@ def _snapshot_hash(payload: dict[str, Any]) -> str | None:
     context = payload.get("market_context") if isinstance(payload.get("market_context"), dict) else {}
     snapshot = context.get("automaticRuntimeSnapshot") or context.get("pointInTimeSnapshot")
     return snapshot.get("snapshotHash") if isinstance(snapshot, dict) else None
+
+
+def _default_pipeline(paper_execution_runtime: Any) -> VotingEnsemblePipeline:
+    """The live pipeline keeps the regime hysteresis in the algorithm's local store.
+
+    Replay and tests build their own service and stay in memory; only the worker's
+    default path persists, keyed by symbol and timeframe, so a restart resumes the
+    two-bar transition count instead of starting from ``unknown``.
+    """
+    from backend.app.algorithms.voting_ensemble.service import VotingEnsembleService
+    from backend.app.algorithms.voting_ensemble.strategies.regime.adx_atr_regime_classifier import (
+        AdxAtrRegimeClassifier,
+        LocalStoreAdxAtrRegimeStateStore,
+    )
+
+    repository = getattr(paper_execution_runtime, "repository", None)
+    if repository is None:
+        return VotingEnsemblePipeline()
+    classifier = AdxAtrRegimeClassifier(state_store=LocalStoreAdxAtrRegimeStateStore(repository))
+    return VotingEnsemblePipeline(service=VotingEnsembleService(regime_classifier=classifier))
 
 
 def _default_backtesting_adapter() -> "VotingEnsembleBacktestingAdapter":
