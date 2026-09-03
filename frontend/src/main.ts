@@ -18324,6 +18324,7 @@ function renderTradingSettingsPanel(order?: ManualOrderRecommendation) {
           ${renderTradingSettingInput("startingCapital", "Total balance", settings.startingCapital, 1000, 10000000, 100)}
           ${renderTradingSettingInput("orderAllocationPercent", "Order limit %", settings.orderAllocationPercent, 0.1, VOTING_MAX_ORDER_ALLOCATION_PERCENT, 0.1)}
           ${renderTradingSettingInput("dailyAllocationPercent", "Daily max %", settings.dailyAllocationPercent, 0.1, 100, 0.1)}
+          ${renderTradingSettingInput("riskBudgetPercentOfOrder", "Risk budget %", settings.riskBudgetPercentOfOrder, 0.1, 100, 0.1)}
           ${renderTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 1, 50, 1)}
           ${renderTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
           ${renderTradingSettingInput("stopLossPercent", "Stop %", settings.stopLossPercent, 0.01, 20, 0.01)}
@@ -19011,9 +19012,9 @@ function manualOrderRecommendation(
   const orderLimitDollars = accountBalance * (settings.orderAllocationPercent / 100);
   const dailyLimitDollars = accountBalance * (settings.dailyAllocationPercent / 100);
   const availableOrderDollars = Math.min(orderLimitDollars, dailyLimitDollars);
-  // The Voting Ensemble sizes as the minimum over caps; the per-order "risk budget %"
-  // never governed it and is gone. The preview's risk budget is the account base risk.
-  const baseRiskDollars = accountBalance * (settings.baseRiskPercent / 100);
+  const baseRiskDollars = settings.useDefaultSizingSettings
+    ? accountBalance * (settings.baseRiskPercent / 100)
+    : orderLimitDollars * (settings.riskBudgetPercentOfOrder / 100);
   const slippagePerSharePerSide = settings.slippagePerShare;
 
   if (structuralSide === "Sell" && heldShares <= 0) {
@@ -19087,7 +19088,11 @@ function manualOrderRecommendation(
     failedGates.push(structuralSide === "Buy" ? "vote-size quantity below 1 share" : "order allocation below 1 share");
   }
   if (plannedStopRiskDollars > riskDollars) {
-    failedGates.push(`planned stop risk exceeds ${settings.baseRiskPercent}% account risk budget`);
+    failedGates.push(
+      settings.useDefaultSizingSettings
+        ? `planned stop risk exceeds ${settings.baseRiskPercent}% account risk budget`
+        : `planned stop risk exceeds ${settings.riskBudgetPercentOfOrder}% order risk budget`,
+    );
   }
 
   const eligible = failedGates.length === 0;
@@ -19422,8 +19427,9 @@ function votingEnsembleBuyQuantitySizing(
   const accountEquity = useDefaults ? settings.startingCapital : finitePositiveOrDefault(manualAccountEquity, settings.startingCapital);
   const minimumBuyScore = useDefaults ? clampNumber(settings.minimumBuyScore, 0, 1) : 0.6;
   const minimumSignalEdge = useDefaults ? clampNumber(settings.minimumSignalEdge, 0, 1) : 0.2;
-  // Account base risk in both modes: the per-order risk budget percent is gone.
-  const baseRiskPct = Math.max(0, settings.baseRiskPercent / 100);
+  const baseRiskPct = useDefaults
+    ? Math.max(0, settings.baseRiskPercent / 100)
+    : Math.max(0, settings.orderAllocationPercent / 100) * Math.max(0, settings.riskBudgetPercentOfOrder / 100);
   const maxPositionPct = useDefaults
     ? Math.max(0, settings.maxPositionPercent / 100)
     : Math.max(0, finitePositiveOrDefault(manualOrderLimitDollars, accountEquity * (settings.orderAllocationPercent / 100)) / Math.max(accountEquity, 0.01));

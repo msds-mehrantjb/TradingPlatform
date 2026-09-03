@@ -47,6 +47,15 @@ def resolve_voting_ensemble_risk_budget(
     entry_price: float,
     stop_distance: float,
 ) -> VotingEnsembleRiskBudget:
+    """Size the candidate as the minimum over every cap.
+
+    There is no sizing mode. The share count is the smallest of: risk dollars over the
+    stop distance (risk per trade, bounded by the remaining daily-loss budget), the
+    per-order and daily allocation notionals, the maximum position, the maximum share
+    quantity, buying power, fillable quantity and participation, each scaled by the
+    dynamic and session caps. The old positionSizingMode / riskBudgetPercentOfOrder
+    pair was echoed into metadata and never governed a share count; it is gone.
+    """
     candidate_signal = str(config.get("candidateSignal") or config.get("signal") or "").upper()
     gates_passed = bool(config.get("gatesPassed", True))
     net_edge_passed = bool(config.get("netEdgePassed", True))
@@ -189,6 +198,10 @@ def _sizing_caps(
     local_exposure = _number(config, "localExposureAllowanceDollars", position_notional_cap)
     fillable = _number(config, "availableFillableQuantity", _number(config, "liquidityShares", 0.0))
     current_volume = max(_number(config, "currentOneMinuteVolume", 0.0), _number(config, "volumeCurrent", 0.0), 0.0)
+    # Documented inert: maximumVolumeParticipationPercent, eventRiskCap, liquidityCap and
+    # minimumTradableSize are read from the operational snapshot, and the live producer
+    # never sets them, so they sit at their defaults (1 %, 1.0, 1.0, 1 share). A producer
+    # that writes them from a liquidity or event feed is what would make them bind.
     participation_shares = current_volume * (_percent(config, "maximumVolumeParticipationPercent", 1.0) / 100.0)
     profile_max = _number(config, "profileMaximumShares", _number(config, "maximumShares", _number(config, "maxShareQuantity", 0.0)))
     # Dollars per point of price. A share moves one dollar per dollar; an MES contract moves
