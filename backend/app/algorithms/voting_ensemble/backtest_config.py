@@ -88,6 +88,10 @@ class VotingEnsembleBacktestConfig(DomainModel):
     # the defaults were" cannot.
     liveSettingsConfigurationHash: str | None = None
     liveSettingsVersion: str | None = None
+    # Live keeps short entries off (VOTING_ENSEMBLE_SHORT_TRADING_DEFAULT), so a replay
+    # that describes the live strategy must too. Refused shorts are still simulated into
+    # the result's shadowTrades, apart from the account, so the short side can be judged.
+    allowShortEntries: bool = False
     execution: ExecutionSimulationConfig = Field(default_factory=voting_ensemble_execution_config)
     executionStressScenarios: tuple[ExecutionSimulationConfig, ...] = Field(default_factory=voting_ensemble_execution_stress_scenarios)
     configVersion: str = VOTING_ENSEMBLE_BACKTEST_CONFIG_VERSION

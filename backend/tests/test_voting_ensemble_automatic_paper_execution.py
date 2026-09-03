@@ -2030,6 +2030,17 @@ class VotingEnsembleAutomaticPaperExecutionTest(unittest.TestCase):
 
         self.assertFalse(result["enqueued"])
         self.assertIn("voting_ensemble.paper_execution.short_entries_disabled", result["reasonCodes"])
+        # The refused short is kept as a shadow decision so the short side can be judged
+        # from what it would have done, before it is ever enabled.
+        self.assertIn("voting_ensemble.paper_execution.short_recorded_as_shadow_decision", result["reasonCodes"])
+        shadows = repository.shadow_decisions()
+        self.assertEqual(len(shadows), 1)
+        self.assertEqual(shadows[0]["shadowDecisionId"], result["shadowDecisionId"])
+        self.assertTrue(shadows[0]["hypothetical"])
+        self.assertEqual(shadows[0]["side"], "SELL")
+        self.assertEqual(shadows[0]["stage"], "enqueue")
+        self.assertEqual(shadows[0]["orderPlan"]["side"], "SELL")
+        self.assertIsNotNone(shadows[0]["stopPrice"])
         store_path.unlink(missing_ok=True)
 
     def test_startup_reconciliation_reads_broker_state_and_blocks_unattributed_position(self) -> None:

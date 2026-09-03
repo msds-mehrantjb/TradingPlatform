@@ -128,10 +128,15 @@ class VotingEnsembleBacktestRunner:
             return self._empty_result(symbol=symbol, timeframe=timeframe, data_quality=data_quality)
 
         trades: list[dict[str, Any]] = []
+        shadow_trades: list[dict[str, Any]] = []
         stage_results: list[dict[str, Any]] = []
         stress_results: list[dict[str, Any]] = []
         decision_count = 0
         active_until: datetime | None = None
+        # The shadow short book holds one position at a time, like the real one, so the
+        # short side's hypothetical record is a sequence of trades and not every bar's
+        # candidate stacked on top of the last.
+        shadow_active_until: datetime | None = None
         simulator = VotingEnsembleExecutionSimulator(self.config.execution)
         sessions = _group_by_session(one_minute)
         auxiliary_limit = self.config.auxiliaryHistoryLimit
@@ -173,6 +178,11 @@ class VotingEnsembleBacktestRunner:
                 )
                 position_active = bool(active_until and candle.timestamp <= active_until)
                 order_plan = None if position_active else self._order_plan(symbol, evaluation, candle, session_date)
+                # A short the live runtime would refuse is not traded here either; it is
+                # simulated apart from the account so the short side can still be judged.
+                shadow_plan = None
+                if order_plan is not None and Signal(order_plan.side) == Signal.SELL and not self.config.allowShortEntries:
+                    shadow_plan, order_plan = order_plan, None
                 future_candles = session_market[index + 1 :]
                 execution = simulator.simulate(order_plan, future_candles, candle.timestamp) if order_plan else None
                 stress_results.extend(
@@ -198,6 +208,18 @@ class VotingEnsembleBacktestRunner:
                         breadth=breadth_windows,
                     ),
                 )
+                if shadow_plan is not None and not (shadow_active_until and candle.timestamp <= shadow_active_until):
+                    shadow_execution = simulator.simulate(shadow_plan, future_candles, candle.timestamp)
+                    if shadow_execution.fill.filledQuantity > 0:
+                        shadow_trades.append(
+                            {
+                                **self._trade_record(record, shadow_plan, shadow_execution),
+                                "hypothetical": True,
+                                "shadowReason": "short_entries_disabled",
+                            }
+                        )
+                        shadow_exit = shadow_execution.exit
+                        shadow_active_until = shadow_exit.exitAt if shadow_exit and shadow_exit.exitAt else shadow_execution.fill.filledAt
                 decision_count += 1
                 if self.config.includeDecisionRecords and (
                     self.config.maximumDecisionRecords is None or len(stage_results) < self.config.maximumDecisionRecords
@@ -244,6 +266,10 @@ class VotingEnsembleBacktestRunner:
             },
             "dataQuality": data_quality,
             "costStress": _stress_summary(stress_results),
+            "shortEntriesAllowed": bool(self.config.allowShortEntries),
+            "shadowTrades": shadow_trades,
+            "shadowTradeCount": len(shadow_trades),
+            "shadowNetPnl": round(sum(float(trade.get("netPnl") or 0.0) for trade in shadow_trades), 2),
             "decisionCount": decision_count,
             "stageResultCount": decision_count,
             "stageResults": stage_results,

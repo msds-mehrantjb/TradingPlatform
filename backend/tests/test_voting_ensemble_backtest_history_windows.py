@@ -132,16 +132,42 @@ class BacktestHistoryWindowTest(unittest.TestCase):
             timeframe="1Min",
         )
 
-        # The default-configuration row recorded in BASELINES.md under the dynamic exit
-        # geometry (ATR-scaled stop, level-aware target, breakeven-then-trail). The
-        # previous geometry gave 5 trades, 1 win, -50.00 on this same session; both are
-        # kept in the record.
-        self.assertEqual(result["totalTrades"], 3)
+        # The default-configuration row recorded in BASELINES.md: dynamic exit geometry
+        # (ATR-scaled stop, level-aware target, breakeven-then-trail) and long-only, as
+        # the live runtime is. The two shorts this session used to take are simulated as
+        # shadow trades apart from the account. Earlier rows (5 trades / -50.00 under the
+        # fixed geometry; 3 trades / -81.90 with shorts taken) are kept in the record.
+        self.assertEqual(result["totalTrades"], 1)
         self.assertEqual(result["winners"], 1)
-        self.assertEqual(result["netTotalPnl"], -81.9)
+        self.assertEqual(result["netTotalPnl"], 61.85)
         self.assertEqual(result["decisionCount"], 351)
+        self.assertTrue(all(trade["side"] == "Long" for trade in result["trades"]))
+        self.assertFalse(result["shortEntriesAllowed"])
+        self.assertEqual(result["shadowTradeCount"], 2)
+        self.assertTrue(all(trade["side"] == "Short" and trade["hypothetical"] for trade in result["shadowTrades"]))
+        self.assertEqual(result["shadowNetPnl"], -143.75)
         self.assertEqual(result["engine"], "voting_ensemble_pipeline")
         self.assertTrue(result["matchesLiveAlgorithm"])
+
+    def test_allowing_short_entries_trades_the_shorts_instead_of_shadowing_them(self) -> None:
+        runner = VotingEnsembleBacktestRunner(config=VotingEnsembleBacktestConfig(warmupCandles=40, includeDecisionRecords=False, allowShortEntries=True))
+
+        result = runner.run(
+            symbol="SPY",
+            spy_1m_candles=series(),
+            qqq_candles=series(base=440.0, scale=1.2),
+            iwm_candles=series(base=210.0, scale=0.8),
+            breadth_components={
+                "XLK": series(base=250.0, scale=1.1),
+                "XLF": series(base=48.0, scale=0.9),
+                "XLV": series(base=145.0, scale=0.7),
+            },
+            timeframe="1Min",
+        )
+
+        self.assertEqual(result["totalTrades"], 3)
+        self.assertEqual(result["shadowTradeCount"], 0)
+        self.assertEqual(result["netTotalPnl"], -81.9)
 
 
 class BacktestConfigFromLiveSettingsTest(unittest.TestCase):

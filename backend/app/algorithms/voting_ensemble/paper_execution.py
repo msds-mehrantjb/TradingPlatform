@@ -681,6 +681,60 @@ class VotingEnsemblePaperExecutionRepository:
     def local_mark_fresh_for_entries(self, symbol: str, *, evaluated_at: datetime) -> bool:
         return self.inventory_ledger.local_mark_is_fresh_for_entries(symbol, evaluated_at=evaluated_at)
 
+    def record_shadow_decision(
+        self,
+        order_plan: OrderPlan,
+        *,
+        reason_codes: list[str] | tuple[str, ...],
+        decision_id: str = "",
+        stage: str = "enqueue",
+        evaluated_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Keep a decision the runtime refused to act on, with everything needed to judge it later.
+
+        Used for short entries while shorts are off live: the order plan is stored whole
+        (side, size, entry, stop, target, holding and trailing parameters) and marked
+        hypothetical, so the short side's performance can be evaluated from what it would
+        have done before it is ever enabled. Keyed by order plan, so a refusal repeated at
+        submission time overwrites rather than duplicates.
+        """
+        observed = _require_utc(evaluated_at or datetime.now(UTC))
+        shadow_id = f"shadow-{_hash({'orderPlanId': order_plan.orderPlanId, 'decisionId': decision_id})[:20]}"
+        payload = {
+            "schemaVersion": "voting_ensemble_shadow_decision_v1",
+            "shadowDecisionId": shadow_id,
+            "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
+            "capitalPartitionId": VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
+            "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
+            "executionMode": self.execution_mode,
+            "hypothetical": True,
+            "stage": stage,
+            "decisionId": decision_id,
+            "orderPlanId": order_plan.orderPlanId,
+            "symbol": order_plan.symbol,
+            "side": Signal(order_plan.side).value,
+            "quantity": int(order_plan.quantity),
+            "entryPrice": order_plan.entryPrice,
+            "limitPrice": order_plan.limitPrice,
+            "stopPrice": order_plan.stopPrice,
+            "targetPrice": order_plan.targetPrice,
+            "maximumHoldingMinutes": order_plan.maximumHoldingMinutes,
+            "breakevenTriggerR": order_plan.breakevenTriggerR,
+            "trailingStopDistance": order_plan.trailingStopDistance,
+            "orderPlan": order_plan.model_dump(mode="json"),
+            "recordedAt": observed.isoformat().replace("+00:00", "Z"),
+            "reasonCodes": [*list(reason_codes), "voting_ensemble.paper_execution.shadow_decision_recorded"],
+        }
+        self.write_snapshot(f"shadow_decision.{shadow_id}", payload)
+        return payload
+
+    def shadow_decisions(self) -> list[dict[str, Any]]:
+        """Every refused decision recorded for hypothetical evaluation, oldest first."""
+        records = [dict(item) for item in self.inventory_ledger._records("shadow_decision.")]
+        records.sort(key=lambda item: str(item.get("recordedAt") or ""))
+        return records
+
     def apply_local_fill(
         self,
         *,
@@ -1155,6 +1209,7 @@ class VotingEnsemblePaperExecutionWorker:
             short_trading_enabled=self.short_trading_enabled,
         )
         if short_blockers:
+            shadow = self.repository.record_shadow_decision(intent.orderPlan, reason_codes=short_blockers, decision_id=str(intent.decisionId), stage="submission")
             result = {
                 "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
                 "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
@@ -1162,7 +1217,8 @@ class VotingEnsemblePaperExecutionWorker:
                 "orderIntentId": intent.orderIntentId,
                 "submitted": False,
                 "status": "BLOCKED",
-                "reasonCodes": short_blockers,
+                "shadowDecisionId": shadow.get("shadowDecisionId"),
+                "reasonCodes": [*short_blockers, "voting_ensemble.paper_execution.short_recorded_as_shadow_decision"],
             }
             self.repository.mark_outbox_status(intent, "BLOCKED", result=result, reason_codes=tuple(result["reasonCodes"]))
             return result
@@ -1747,11 +1803,16 @@ class VotingEnsemblePaperExecutionRuntime:
             short_trading_enabled=self.short_trading_enabled,
         )
         if short_blockers:
+            # A refused short is still a decision the algorithm made. Recording it as a
+            # shadow decision is what lets the short side be evaluated before it is
+            # ever enabled.
+            shadow = self.repository.record_shadow_decision(order_plan, reason_codes=short_blockers, decision_id=str(decision.get("decisionId") or ""), evaluated_at=evaluated_at, stage="enqueue")
             return {
                 "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
                 "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
                 "enqueued": False,
-                "reasonCodes": short_blockers,
+                "shadowDecisionId": shadow.get("shadowDecisionId"),
+                "reasonCodes": [*short_blockers, "voting_ensemble.paper_execution.short_recorded_as_shadow_decision"],
             }
         permission = self._entry_permission()
         if not exit_intent and not bool(permission.get("newEntriesAllowed", permission.get("effectivePaperTradingEnabled", False))):
@@ -1843,6 +1904,7 @@ class VotingEnsemblePaperExecutionRuntime:
             short_trading_enabled=self.short_trading_enabled,
         )
         if short_blockers:
+            shadow = self.repository.record_shadow_decision(intent.orderPlan, reason_codes=short_blockers, decision_id=str(intent.decisionId), stage="submission")
             result = {
                 "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
                 "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
@@ -1850,7 +1912,8 @@ class VotingEnsemblePaperExecutionRuntime:
                 "orderIntentId": intent.orderIntentId,
                 "submitted": False,
                 "status": "BLOCKED",
-                "reasonCodes": short_blockers,
+                "shadowDecisionId": shadow.get("shadowDecisionId"),
+                "reasonCodes": [*short_blockers, "voting_ensemble.paper_execution.short_recorded_as_shadow_decision"],
             }
             self.repository.mark_outbox_status(intent, "BLOCKED", result=result, reason_codes=tuple(result["reasonCodes"]))
             return result
@@ -4741,11 +4804,13 @@ def _local_paper_env_bool(name: str, default: bool) -> bool:
     return default
 
 
-# Short entries are part of the algorithm: the decision core is symmetric and the recorded
-# baseline took 54 of its 84 trades short. The engine protects a short with a buy-side stop
-# and target and covers it at end of day, so the runtime enables them unless the operator
-# turns them off with VOTING_ENSEMBLE_SHORT_TRADING_ENABLED=false.
+# Short entries stay off live. The decision core is symmetric and the engine can hold a
+# short safely (buy-side stop and target, end-of-day cover), but the recorded evidence is
+# long-only until the short side has been evaluated in shadow: every refused short is
+# logged as a shadow decision for exactly that purpose. Set
+# VOTING_ENSEMBLE_SHORT_TRADING_ENABLED=true to turn them on deliberately.
 VOTING_ENSEMBLE_SHORT_TRADING_ENV = "VOTING_ENSEMBLE_SHORT_TRADING_ENABLED"
+VOTING_ENSEMBLE_SHORT_TRADING_DEFAULT = False
 
 
 def _extract_nbbo_payload(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -4840,7 +4905,7 @@ def _short_trading_enabled_from_env() -> bool:
     # The runtime is built at import, before the app has necessarily loaded backend/.env,
     # so read the operator's file first (never overriding a value already in the process).
     load_dotenv(os.getenv("VOTING_ENSEMBLE_DOTENV_PATH") or str(Path(__file__).resolve().parents[3] / ".env"), override=False)
-    return _local_paper_env_bool(VOTING_ENSEMBLE_SHORT_TRADING_ENV, True)
+    return _local_paper_env_bool(VOTING_ENSEMBLE_SHORT_TRADING_ENV, VOTING_ENSEMBLE_SHORT_TRADING_DEFAULT)
 
 
 VOTING_ENSEMBLE_PAPER_EXECUTION_RUNTIME = VotingEnsemblePaperExecutionRuntime(

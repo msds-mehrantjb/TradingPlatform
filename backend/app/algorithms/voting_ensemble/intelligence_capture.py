@@ -28,6 +28,7 @@ VOTING_ENSEMBLE_OPERATIONAL_EVENT_TYPES = {
     "final_trade_outcome",
     "worker_job_status",
     "error_recovery_event",
+    "shadow_decision",
 }
 
 
@@ -52,6 +53,7 @@ CAPTURE_TABLES: dict[str, str] = {
     "final_trade_outcome": "voting_ensemble_capture_trade_outcomes",
     "worker_job_status": "voting_ensemble_capture_worker_job_status",
     "error_recovery_event": "voting_ensemble_capture_error_recovery_events",
+    "shadow_decision": "voting_ensemble_capture_shadow_decisions",
 }
 
 

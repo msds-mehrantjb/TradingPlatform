@@ -277,19 +277,27 @@ class TradeCountCountsEntriesOnlyTest(unittest.TestCase):
 
 
 class ShortTradingRuntimeFlagTest(unittest.TestCase):
-    """The production runtime enables short entries unless the operator turns them off."""
+    """The production runtime keeps short entries off unless the operator turns them on."""
 
-    def test_flag_defaults_on_and_parses_common_spellings(self) -> None:
-        from backend.app.algorithms.voting_ensemble.paper_execution import VOTING_ENSEMBLE_SHORT_TRADING_ENV, _local_paper_env_bool
+    def test_flag_defaults_off_and_parses_common_spellings(self) -> None:
+        from backend.app.algorithms.voting_ensemble.paper_execution import (
+            VOTING_ENSEMBLE_SHORT_TRADING_DEFAULT,
+            VOTING_ENSEMBLE_SHORT_TRADING_ENV,
+            _local_paper_env_bool,
+            _short_trading_enabled_from_env,
+        )
 
+        self.assertFalse(VOTING_ENSEMBLE_SHORT_TRADING_DEFAULT)
         with patch.dict("os.environ", {}, clear=False):
             import os
 
             os.environ.pop(VOTING_ENSEMBLE_SHORT_TRADING_ENV, None)
-            self.assertTrue(_local_paper_env_bool(VOTING_ENSEMBLE_SHORT_TRADING_ENV, True))
-        for raw, expected in (("false", False), ("0", False), ("off", False), ("true", True), ("1", True), ("nonsense", True), ("  ", True)):
+            self.assertFalse(_local_paper_env_bool(VOTING_ENSEMBLE_SHORT_TRADING_ENV, VOTING_ENSEMBLE_SHORT_TRADING_DEFAULT))
+        for raw, expected in (("false", False), ("0", False), ("off", False), ("true", True), ("1", True), ("nonsense", False), ("  ", False)):
             with patch.dict("os.environ", {VOTING_ENSEMBLE_SHORT_TRADING_ENV: raw}):
-                self.assertEqual(_local_paper_env_bool(VOTING_ENSEMBLE_SHORT_TRADING_ENV, True), expected, raw)
+                self.assertEqual(_local_paper_env_bool(VOTING_ENSEMBLE_SHORT_TRADING_ENV, VOTING_ENSEMBLE_SHORT_TRADING_DEFAULT), expected, raw)
+        with patch.dict("os.environ", {VOTING_ENSEMBLE_SHORT_TRADING_ENV: "true"}):
+            self.assertTrue(_short_trading_enabled_from_env())
 
     def test_runtime_passes_the_flag_to_its_worker(self) -> None:
         from backend.app.algorithms.voting_ensemble.paper_execution import VotingEnsemblePaperExecutionRuntime
