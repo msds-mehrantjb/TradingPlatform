@@ -70,7 +70,12 @@ class VotingEnsembleRegimeClassifierTest(unittest.TestCase):
         service_module.DIRECTIONAL_STRATEGIES = (trend_buy, reversal_buy)
         service_module.CONTEXT_STRATEGIES = ()
         try:
-            result = VotingEnsembleService().evaluate(snapshot_payload(candles(30)))
+            payload = snapshot_payload(candles(30))
+            # Economics are costed on the sized order; on these 1,000-share bars the
+            # default gross edge nets negative after impact. This test is about the
+            # classifier, so give the candidate a real edge and keep the gate out of it.
+            payload["market_context"]["operationalHealthSnapshot"].update({"predictedGrossEdgeDollars": 2.0})
+            result = VotingEnsembleService().evaluate(payload)
         finally:
             service_module.REGIME_CLASSIFIER = original_classifier
             service_module.DIRECTIONAL_STRATEGIES = original_directional

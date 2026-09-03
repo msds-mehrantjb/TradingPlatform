@@ -20,7 +20,7 @@ from backend.app.algorithms.voting_ensemble.session_policy import (
     session_policy_from_payload,
 )
 from backend.app.algorithms.voting_ensemble.execution_economics import build_execution_economics
-from backend.app.algorithms.voting_ensemble.gates import VotingEnsembleLocalGateEngine
+from backend.app.algorithms.voting_ensemble.gates import VotingEnsembleLocalGateEngine, voting_ensemble_local_gate_config
 from backend.app.algorithms.voting_ensemble.intelligence_capture import VotingEnsembleCaptureWriter, capture_operational_event, capture_voting_ensemble_evaluation
 from backend.app.algorithms.voting_ensemble.models import (
     AlgoSignal,
@@ -67,6 +67,28 @@ RELIABILITY_ESTIMATOR = VotingEnsembleReliabilityEstimator()
 REGIME_CLASSIFIER = AdxAtrRegimeClassifier()
 LOCAL_GATE_ENGINE = VotingEnsembleLocalGateEngine()
 LOCAL_SAFETY_MODULES: tuple[VotingEnsembleLocalGateEngine, ...] = (LOCAL_GATE_ENGINE,)
+_LOCAL_GATE_ENGINES: dict[tuple[int, int], VotingEnsembleLocalGateEngine] = {}
+
+
+def _local_gate_engine(settings: Any) -> VotingEnsembleLocalGateEngine:
+    """The gate engine configured from the resolved settings.
+
+    The engine used to be one module-level instance with a hard-coded family minimum of
+    2 while the settings said 1, so the setting could not take effect. The limits the
+    settings decide (family support, trade cap) are read from them here; everything else
+    in the gate configuration stays the engine's own. Cached by the values read.
+    """
+    profile = getattr(settings, "resolvedTradingProfile", None)
+    family_support = int(getattr(profile, "minimumIndependentFamilySupport", 2) or 2)
+    trades_per_day = int(getattr(profile, "maxTradesPerDay", 0) or 0)
+    key = (family_support, trades_per_day)
+    engine = _LOCAL_GATE_ENGINES.get(key)
+    if engine is None:
+        engine = VotingEnsembleLocalGateEngine(
+            voting_ensemble_local_gate_config(minimum_independent_family_support=family_support, maximum_trades_per_day=trades_per_day)
+        )
+        _LOCAL_GATE_ENGINES[key] = engine
+    return engine
 CONTEXT_PIPELINE = VotingEnsembleContextPipeline()
 CAPTURE_WRITER = VotingEnsembleCaptureWriter(auto_start=True)
 EXECUTION_ADAPTER = VotingEnsembleExecutionAdapter()
@@ -220,7 +242,7 @@ class VotingEnsembleService:
         regime_state = REGIME_CLASSIFIER.evaluate_snapshot(snapshot)
         upstream_global_gate = _upstream_global_gate_decision(snapshot)
         pre_gate_started = perf_counter()
-        pre_gate_engine_decision = LOCAL_GATE_ENGINE.evaluate(
+        pre_gate_engine_decision = _local_gate_engine(settings).evaluate(
             _local_gate_input(
                 snapshot=snapshot,
                 settings_hash=settings.configurationHash,
@@ -312,7 +334,7 @@ class VotingEnsembleService:
                 update={"expectedValue": round(float(execution_economics.predictedNetEdgeDollars) * int(candidate.quantity), 6)}
             )
         post_gate_started = perf_counter()
-        post_gate_engine_decision = LOCAL_GATE_ENGINE.evaluate(
+        post_gate_engine_decision = _local_gate_engine(settings).evaluate(
             _local_gate_input(
                 snapshot=snapshot,
                 settings_hash=settings.configurationHash,

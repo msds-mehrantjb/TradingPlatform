@@ -33,7 +33,14 @@ STRATEGY_EVALUATION_BLOCKING_REASON_CODES = {
 }
 
 
-def voting_ensemble_local_gate_config() -> GlobalGateConfig:
+def voting_ensemble_local_gate_config(*, minimum_independent_family_support: int = 2, maximum_trades_per_day: int = 0) -> GlobalGateConfig:
+    """The local gate configuration, with the two limits the settings decide passed in.
+
+    minimum_independent_family_support is the settings' minimumFamiliesForTrade. At 2, a
+    single family alone can never trade: both REVERSAL strategies agreeing is one family,
+    and the candidate needs a second independent one behind it. The gate used to hard-code
+    2 while the setting said 1, so the setting could not take effect either way.
+    """
     conditional = StrategyConditionalGateConfig(
         configVersion="voting_ensemble_strategy_conditional_gates_v1",
         configurationHash="voting_ensemble_strategy_conditional_gates_v1",
@@ -46,7 +53,7 @@ def voting_ensemble_local_gate_config() -> GlobalGateConfig:
         requireMlWhenEnabled=False,
         requireModelHealthWhenEnabled=False,
         minimumDeterministicScore=0.20,
-        minimumIndependentFamilySupport=2,
+        minimumIndependentFamilySupport=max(1, int(minimum_independent_family_support)),
         minimumExpectedValueAfterCosts=0.01,
         maximumSpreadBps=25.0,
         maximumExpectedSlippageDollars=0.05,
@@ -57,7 +64,7 @@ def voting_ensemble_local_gate_config() -> GlobalGateConfig:
         maximumOpenRiskPercent=3.0,
         maximumSpyNotionalPercent=50.0,
         maximumSameDirectionExposurePercent=50.0,
-        maximumTradesPerDay=0,
+        maximumTradesPerDay=max(0, int(maximum_trades_per_day)),
         maximumConsecutiveLosses=3,
         defaultRiskMultiplierCap=1.0,
         defaultMaximumRiskPercent=0.5,

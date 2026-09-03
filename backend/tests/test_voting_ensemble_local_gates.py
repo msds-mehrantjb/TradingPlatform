@@ -56,6 +56,26 @@ class VotingEnsembleLocalGatesTest(unittest.TestCase):
                 self.assertFalse(decision.eligible)
                 self.assertIn(reason_code, decision.reasonCodes)
 
+    def test_family_support_minimum_comes_from_the_settings(self) -> None:
+        """The gate reads minimumFamiliesForTrade; it used to hard-code 2 while the setting said 1."""
+        from backend.app.algorithms.voting_ensemble.gates import voting_ensemble_local_gate_config
+        from backend.app.algorithms.voting_ensemble.service import _local_gate_engine
+        from backend.app.algorithms.voting_ensemble.trading_settings.resolver import resolve_one_minute_trading_settings
+
+        settings = resolve_one_minute_trading_settings(None)
+        engine = _local_gate_engine(settings)
+
+        self.assertEqual(settings.resolvedTradingProfile.minimumIndependentFamilySupport, 2)
+        self.assertEqual(engine.config.minimumIndependentFamilySupport, 2)
+        self.assertIs(_local_gate_engine(settings), engine)
+        # With two families required, one family alone is blocked; a config asking for
+        # one lets it through. Both REVERSAL strategies agreeing is still one family.
+        single_family = base_gate_input(ensembleDecision=ensemble_decision().model_copy(update={"supportingFamilies": ["REVERSAL"]}))
+        blocked = engine.evaluate(single_family).to_global_gate_decision()
+        allowed = VotingEnsembleLocalGateEngine(voting_ensemble_local_gate_config(minimum_independent_family_support=1)).evaluate(single_family).to_global_gate_decision()
+        self.assertIn("voting_ensemble.local_gate.minimum_family_support", blocked.reasonCodes)
+        self.assertNotIn("voting_ensemble.local_gate.minimum_family_support", allowed.reasonCodes)
+
     def test_trade_count_is_not_capped_unless_a_cap_is_configured(self) -> None:
         """The day's activity is bounded by the daily-loss and exposure limits, not a count."""
         from backend.app.algorithms.voting_ensemble.gates import voting_ensemble_local_gate_config

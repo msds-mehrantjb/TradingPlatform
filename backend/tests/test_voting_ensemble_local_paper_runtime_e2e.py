@@ -124,7 +124,7 @@ class VotingEnsembleLocalPaperRuntimeE2ETest(unittest.TestCase):
             self.assertEqual(entry_gateway_account["accountId"], VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID)
             self.assertEqual(entry_gateway_account["availableBuyingPower"], 100000.0)
 
-            exit_payload = market_payload(candle_count=31, bid=101.5, ask=101.55)
+            exit_payload = market_payload(candle_count=31, bid=101.5, ask=101.55, gross_edge_dollars=2.0)
             exit_job = orchestrator.enqueue_finalized_bar_event(finalized_event(exit_payload, correlation_id="corr-e2e-exit"))
             with patched_strategy_votes("Sell"):
                 orchestrator.drain_in_process()
@@ -266,8 +266,13 @@ class FixedRegimeClassifier:
         )
 
 
-def market_payload(*, candle_count: int, bid: float, ask: float) -> dict[str, Any]:
+def market_payload(*, candle_count: int, bid: float, ask: float, gross_edge_dollars: float | None = None) -> dict[str, Any]:
     payload = snapshot_payload(candles(candle_count))
+    if gross_edge_dollars is not None:
+        # Economics are costed on the sized order. The opposite-signal Sell below is a
+        # reversal entry the paper account nets against the long, and on a quoted
+        # spread its default gross edge no longer clears impact, so state the edge.
+        payload["market_context"]["operationalHealthSnapshot"].update({"predictedGrossEdgeDollars": gross_edge_dollars})
     observed = payload["data_timestamp"]
     nbbo = {
         "bid": bid,

@@ -69,7 +69,10 @@ ONE_MINUTE_BASELINE_SETTINGS: dict[str, Any] = {
     "holdBand": 0.0,
     "reliabilityWeightingMode": "active",
     "reliabilitySampleWindow": "rolling_60_trades",
-    "minimumFamiliesForTrade": 1,
+    # Independent families that must support a candidate. At 2, one family alone can
+    # never trade: both REVERSAL strategies agreeing is still one family. The gate reads
+    # this value; it used to hard-code 2 while this said 1.
+    "minimumFamiliesForTrade": 2,
     "familyWeights": {
         "trend": 1.0,
         "breakout": 1.0,

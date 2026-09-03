@@ -105,7 +105,12 @@ class VotingEnsembleFamilyAwareAuthoritativeTest(unittest.TestCase):
         service_module.CONTEXT_STRATEGIES = ()
         service_module.REGIME_CLASSIFIER = FixedRegimeClassifier(regime_state)
         try:
-            result = VotingEnsembleService().evaluate(snapshot_payload(candles(30)))
+            payload = snapshot_payload(candles(30))
+            # This test compares the aggregation, not the cost gate. Economics are now
+            # costed on the sized order, and on this tape's 1,000-share bars the default
+            # gross edge nets negative after impact, so give the candidate a real edge.
+            payload["market_context"]["operationalHealthSnapshot"].update({"predictedGrossEdgeDollars": 2.0})
+            result = VotingEnsembleService().evaluate(payload)
         finally:
             service_module.DIRECTIONAL_STRATEGIES = original_directional
             service_module.CONTEXT_STRATEGIES = original_context
