@@ -306,6 +306,22 @@ while the thread kept going, a few page loads against a fresh dataset were enoug
 the backend for hours. The cache is produced by the daily job or
 `scripts/run_voting_ensemble_dedicated_replay.py`, and the panel shows it once it exists.
 
+## Live engine exits brought up to the simulator (2026-09-02)
+
+The audit of the live decision path found two ways the local paper engine could not
+execute what the replay measured. Both are closed.
+
+| Gap | Was | Now |
+|---|---|---|
+| Time stop | The simulator exits at `filledAt + maximumHoldingMinutes`; the local engine's maintenance loop only evaluated protective legs and end of day, so a live position ran to stop, target or the close. 52 of the 84 baseline exits were time stops | `submit_maximum_holding_exits` runs in the maintenance loop every 15 s, reads the limit the entry order recorded (the algorithm default of 30 when it recorded none), and flattens with a limit at the mark. A flat position clears its `openedAt`, so a re-entry starts its own clock |
+| Short protection | The OCO was created only for BUY fills; a short had no stop and no target, end-of-day flattening skipped it, and the stored-order ownership check rejected the short entry's fill outright | Every exit helper keys on signed exposure. A short fill gets a BUY stop-limit above and a BUY limit below, covers resize or cancel them, and end of day covers shorts |
+
+What did **not** change: short entries are still refused at the intent layer unless
+`short_trading_enabled` is set, which production does not set. The recorded baseline took
+54 short trades, so it still describes a wider strategy than the live engine will run
+until that flag is turned on deliberately. The gap-through stop (a stop-limit whose limit
+equals its trigger) is also unchanged.
+
 ## When to re-record
 
 Re-record, keeping the prior version beside the new one, when any of these happen:

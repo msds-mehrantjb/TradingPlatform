@@ -21,6 +21,23 @@ VOTING_ENSEMBLE_LONG_ONLY_BUYING_POWER_MODEL = "LOCAL_CASH_NO_MARGIN_LONG_ONLY"
 VOTING_ENSEMBLE_LONG_SHORT_BUYING_POWER_MODEL = "LOCAL_CASH_NO_MARGIN_LONG_AND_SHORT"
 
 
+def _holding_minutes_from_intent(intent: Any) -> int | None:
+    """The maximum holding minutes an intent carries, if it carries one.
+
+    Gateway intents keep it on their settings snapshot; engine-internal exit intents and
+    tests may set it directly. None when neither says, so the caller can fall back to the
+    algorithm default rather than to a made-up number.
+    """
+    direct = getattr(intent, "maximumHoldingMinutes", None)
+    snapshot = getattr(intent, "settingsSnapshot", None)
+    candidate = direct if direct is not None else (snapshot.get("maximumHoldingMinutes") if isinstance(snapshot, Mapping) else None)
+    try:
+        minutes = int(candidate) if candidate is not None else None
+    except (TypeError, ValueError):
+        return None
+    return minutes if minutes is not None and minutes > 0 else None
+
+
 def _buying_power_model(allow_shorts: bool) -> str:
     """Label the buying-power model actually in force.
 
@@ -424,6 +441,12 @@ class VotingEnsembleInventoryLedger:
         if exit_reason:
             payload["exitReason"] = str(exit_reason)
             payload["reasonCodes"] = [*list(payload.get("reasonCodes") or ()), "voting_ensemble.local_paper.risk_reducing_exit_order_accepted_locally"]
+        # The holding limit travels on the gateway record's settings snapshot. Keeping it
+        # on the local order is what lets the maintenance loop enforce a time stop for
+        # the position this order opens, instead of a default it has to guess at.
+        holding_minutes = _holding_minutes_from_intent(intent)
+        if holding_minutes is not None:
+            payload["maximumHoldingMinutes"] = holding_minutes
         self.store.write_snapshot(f"local_order.{order.clientOrderId}", payload)
         self.persist_inventory_manifest(observed_at=observed_at)
         return payload
@@ -990,12 +1013,16 @@ class VotingEnsembleInventoryLedger:
             notional=float(market_value),
             unrealizedPnl=float(unrealized),
             realizedPnl=float(prior_realized + _decimal(realized_pnl)),
-            openedAt=_parse_time(current_position.get("openedAt")) or (filled_at if signed_position == 0 and next_quantity != 0 else None),
+            # A flat record keeps no opening metadata. It used to carry the previous
+            # trade's openedAt and entry ids forward, so the next position on the symbol
+            # inherited a clock that had already been running for hours and a time stop
+            # would have fired on it at once.
+            openedAt=((_parse_time(current_position.get("openedAt")) if signed_position != 0 else None) or filled_at) if next_quantity else None,
             updatedAt=filled_at,
             stopPrice=stop_price if next_quantity else None,
             profitTargetPrice=profit_target_price if next_quantity else None,
-            entryOrderId=str(current_position.get("entryOrderId") or client_order_id) if next_quantity else str(current_position.get("entryOrderId") or client_order_id),
-            entryFillIds=tuple(dict.fromkeys(entry_fill_ids)),
+            entryOrderId=str(current_position.get("entryOrderId") or client_order_id) if next_quantity else None,
+            entryFillIds=tuple(dict.fromkeys(entry_fill_ids)) if next_quantity else (),
             lastFillId=client_order_id,
             lastMarkedAt=filled_at if next_quantity else None,
             markPricePolicy="fill_price_until_fresh_nbbo_mark" if next_quantity else None,

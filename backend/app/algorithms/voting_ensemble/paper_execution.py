@@ -27,6 +27,7 @@ from backend.app.algorithms.voting_ensemble.local_paper_account import (
     _is_voting_ensemble_owned_position,
 )
 from backend.app.config import get_settings
+from backend.app.algorithms.voting_ensemble.exit_policy import VOTING_ENSEMBLE_DEFAULT_MAX_HOLDING_MINUTES
 from backend.app.algorithms.voting_ensemble.execution_adapter import (
     VOTING_ENSEMBLE_EXECUTION_STATE_NAMESPACE,
     VotingEnsembleExecutionAdapter,
@@ -1917,6 +1918,10 @@ class VotingEnsemblePaperExecutionRuntime:
             }
         evaluator = getattr(self.paper_gateway.broker, "evaluate_open_protective_orders", None)
         protective_fills = evaluator() if callable(evaluator) else []
+        # Protective legs first, so a position that just stopped out is not also sent a
+        # time-stop exit; then the holding limit; then end of day.
+        holding_exit = getattr(self.paper_gateway.broker, "submit_maximum_holding_exits", None)
+        holding_updates = holding_exit(evaluated_at=now) if callable(holding_exit) else []
         eod_updates = self._local_end_of_day_updates(evaluated_at=now)
         return {
             "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
@@ -1926,6 +1931,8 @@ class VotingEnsemblePaperExecutionRuntime:
             "executionMode": "LOCAL_PAPER",
             "status": "MAINTAINED",
             "protectiveFillsObserved": len(protective_fills),
+            "holdingExitUpdates": holding_updates,
+            "holdingExitsSubmitted": len([item for item in holding_updates if item.get("submitted")]),
             "eodUpdates": eod_updates,
             "eodExitsSubmitted": len([item for item in eod_updates if item.get("submitted")]),
             "brokerAccountsObserved": 0,
@@ -2194,6 +2201,9 @@ class VotingEnsembleLocalPaperBroker:
     def submit_end_of_day_liquidation(self, *, evaluated_at: datetime) -> list[dict[str, Any]]:
         return self.engine.submit_end_of_day_liquidation(evaluated_at=evaluated_at)
 
+    def submit_maximum_holding_exits(self, *, evaluated_at: datetime) -> list[dict[str, Any]]:
+        return self.engine.submit_maximum_holding_exits(evaluated_at=evaluated_at)
+
 
 class VotingEnsembleLocalPaperExecutionEngine:
     """Authoritative LOCAL_PAPER execution engine for Voting Ensemble.
@@ -2322,25 +2332,81 @@ class VotingEnsembleLocalPaperExecutionEngine:
         return fills
 
     def submit_end_of_day_liquidation(self, *, evaluated_at: datetime) -> list[dict[str, Any]]:
+        return self._submit_flattening_exits(
+            evaluated_at=evaluated_at,
+            exit_reason="END_OF_DAY_LIQUIDATION",
+            client_order_prefix="ve-eod",
+            already_open_code="voting_ensemble.local_paper.end_of_day_exit_already_open",
+            submitted_code="voting_ensemble.local_paper.end_of_day_flattening_exit_submitted",
+            due=lambda position, observed: True,
+        )
+
+    def submit_maximum_holding_exits(self, *, evaluated_at: datetime) -> list[dict[str, Any]]:
+        """Flatten any position that has been open longer than its holding limit.
+
+        The limit is the one the entry order carried; a position whose entry order did not
+        record one gets the algorithm default. This is the time stop the backtest simulator
+        has always applied and the local engine never did, so live positions ran to stop,
+        target or the close while replay closed them at thirty minutes.
+        """
+        return self._submit_flattening_exits(
+            evaluated_at=evaluated_at,
+            exit_reason="MAXIMUM_HOLDING_TIME",
+            client_order_prefix="ve-hold",
+            already_open_code="voting_ensemble.local_paper.maximum_holding_exit_already_open",
+            submitted_code="voting_ensemble.local_paper.maximum_holding_time_exit_submitted",
+            due=self._holding_limit_reached,
+        )
+
+    def _holding_limit_reached(self, position: Mapping[str, Any], observed: datetime) -> bool:
+        opened_at = _parse_time(position.get("openedAt"))
+        if opened_at is None:
+            return False
+        return observed - _require_utc(opened_at) >= timedelta(minutes=self._holding_limit_minutes(position))
+
+    def _holding_limit_minutes(self, position: Mapping[str, Any]) -> int:
+        entry_order_id = str(position.get("entryOrderId") or "")
+        if entry_order_id:
+            try:
+                entry_order = self.repository.read_snapshot(f"local_order.{entry_order_id}")
+            except KeyError:
+                entry_order = {}
+            try:
+                minutes = int(entry_order.get("maximumHoldingMinutes") or 0)
+            except (TypeError, ValueError):
+                minutes = 0
+            if minutes > 0:
+                return minutes
+        return VOTING_ENSEMBLE_DEFAULT_MAX_HOLDING_MINUTES
+
+    def _submit_flattening_exits(
+        self,
+        *,
+        evaluated_at: datetime,
+        exit_reason: str,
+        client_order_prefix: str,
+        already_open_code: str,
+        submitted_code: str,
+        due: Callable[[Mapping[str, Any], datetime], bool],
+    ) -> list[dict[str, Any]]:
         observed = _require_utc(evaluated_at)
         updates: list[dict[str, Any]] = []
         for position in self.repository.inventory_ledger.positions():
             symbol = str(position.get("symbol") or "").upper()
-            quantity = max(0, int(position.get("quantity") or position.get("signedQuantity") or 0))
-            if not symbol or quantity <= 0:
+            signed = int(position.get("quantity") or position.get("signedQuantity") or 0)
+            if not symbol or signed == 0:
                 continue
-            if self._has_open_local_exit(symbol, reason="END_OF_DAY_LIQUIDATION"):
-                updates.append(
-                    {
-                        "symbol": symbol,
-                        "submitted": False,
-                        "status": "OPEN",
-                        "reasonCodes": ["voting_ensemble.local_paper.end_of_day_exit_already_open"],
-                    }
-                )
+            if not due(position, observed):
+                continue
+            # A long is flattened with a SELL, a short with a BUY. The mark is already the
+            # conservative liquidation side for the position's direction.
+            exit_side = Signal.SELL if signed > 0 else Signal.BUY
+            quantity = abs(signed)
+            if self._has_open_local_exit(symbol, reason=exit_reason):
+                updates.append({"symbol": symbol, "submitted": False, "status": "OPEN", "reasonCodes": [already_open_code]})
                 continue
             limit_price = max(0.01, _float(position.get("markPrice") or position.get("averageEntryPrice") or position.get("averagePrice")))
-            client_order_id = f"ve-eod-{_hash({'symbol': symbol, 'quantity': quantity, 'at': observed.isoformat()})[:20]}"
+            client_order_id = f"{client_order_prefix}-{_hash({'symbol': symbol, 'quantity': quantity, 'side': exit_side.value, 'at': observed.isoformat()})[:20]}"
             intent = _LocalPaperEngineIntent(
                 algorithmId=VOTING_ENSEMBLE_ALGORITHM_ID,
                 capitalPartitionId=VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
@@ -2349,7 +2415,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
                 decisionId=client_order_id,
                 clientOrderId=client_order_id,
                 symbol=symbol,
-                side=Signal.SELL,
+                side=exit_side,
                 orderType="LIMIT",
                 submittedQuantity=quantity,
                 limitPrice=limit_price,
@@ -2359,7 +2425,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
                 plannedRiskDollars=0.0,
                 createdAt=observed,
                 timeInForce="DAY",
-                exitReason="END_OF_DAY_LIQUIDATION",
+                exitReason=exit_reason,
             )
             ack = self.submit_order(intent)
             fill = self.refresh_order(client_order_id) if ack.status != "REJECTED" else None
@@ -2367,13 +2433,15 @@ class VotingEnsembleLocalPaperExecutionEngine:
                 {
                     "symbol": symbol,
                     "clientOrderId": client_order_id,
+                    "side": exit_side.value,
                     "submitted": ack.status != "REJECTED",
                     "status": fill.status if fill else ack.status,
                     "quantity": quantity,
                     "filledQuantity": fill.filledQuantity if fill else 0,
                     "averageFillPrice": fill.averageFillPrice if fill else None,
+                    "exitReason": exit_reason,
                     "reasonCodes": [
-                        "voting_ensemble.local_paper.end_of_day_flattening_exit_submitted",
+                        submitted_code,
                         "voting_ensemble.paper_execution.risk_reducing_exit_allowed_when_entries_blocked",
                     ],
                 }
@@ -2465,39 +2533,48 @@ class VotingEnsembleLocalPaperExecutionEngine:
         return fill
 
     def _after_local_fill(self, *, order: Mapping[str, Any], fill: PaperGatewayFill) -> None:
-        if not order.get("protectiveKind") and fill.side == Signal.BUY and fill.filledQuantity > 0:
-            self._ensure_local_protective_oco(order, fill)
-            return
+        # Positions are signed: positive long, negative short. Whether a fill opened
+        # exposure or reduced it depends on the position it left behind, not on the
+        # fill's side, so every branch below reads the signed quantity first.
+        symbol = str(order.get("symbol") or fill.symbol).upper()
+        signed = self.repository.inventory_ledger.quantity_for_symbol(symbol)
         if order.get("protectiveKind"):
-            remaining = self.repository.inventory_ledger.quantity_for_symbol(str(order.get("symbol") or fill.symbol).upper())
-            if remaining <= 0 or str(order.get("status") or "").upper() == "FILLED":
+            if signed == 0 or str(order.get("status") or "").upper() == "FILLED":
                 self._cancel_competing_oco_exit(order, reason_code="voting_ensemble.local_paper_execution_engine.oco_sibling_canceled_after_exit_fill")
             else:
-                self._resize_open_oco_siblings(order, remaining_quantity=remaining)
+                self._resize_open_oco_siblings(order, remaining_quantity=abs(signed))
             return
-        if fill.side == Signal.SELL:
-            symbol = str(order.get("symbol") or fill.symbol).upper()
-            remaining = self.repository.inventory_ledger.quantity_for_symbol(symbol)
-            if remaining <= 0:
-                self._cancel_open_local_exits_for_symbol(
-                    symbol,
-                    exclude_client_order_id=str(order.get("clientOrderId") or fill.clientOrderId),
-                    reason_code="voting_ensemble.local_paper_execution_engine.local_exit_siblings_canceled_after_flatten",
-                )
-            else:
-                self._resize_open_exit_orders_for_symbol(
-                    symbol,
-                    remaining_quantity=remaining,
-                    exclude_client_order_id=str(order.get("clientOrderId") or fill.clientOrderId),
-                )
+        if fill.filledQuantity <= 0:
+            return
+        opened_exposure = (fill.side == Signal.BUY and signed > 0) or (fill.side == Signal.SELL and signed < 0)
+        if opened_exposure:
+            self._ensure_local_protective_oco(order, fill)
+            return
+        exclude = str(order.get("clientOrderId") or fill.clientOrderId)
+        if signed == 0:
+            self._cancel_open_local_exits_for_symbol(
+                symbol,
+                exclude_client_order_id=exclude,
+                reason_code="voting_ensemble.local_paper_execution_engine.local_exit_siblings_canceled_after_flatten",
+            )
+        else:
+            self._resize_open_exit_orders_for_symbol(symbol, remaining_quantity=abs(signed), exclude_client_order_id=exclude)
 
     def _ensure_local_protective_oco(self, entry_order: Mapping[str, Any], fill: PaperGatewayFill) -> None:
-        if fill.side != Signal.BUY:
-            return
+        """Protect whatever exposure the entry fill left, long or short.
+
+        A long is protected by a SELL stop-limit below and a SELL limit above; a short by
+        a BUY stop-limit above and a BUY limit below. Shorts used to get nothing here, so
+        a short position ran unprotected until end of day.
+        """
         symbol = str(entry_order.get("symbol") or fill.symbol).upper()
-        remaining = self.repository.inventory_ledger.quantity_for_symbol(symbol)
-        if remaining <= 0:
+        signed = self.repository.inventory_ledger.quantity_for_symbol(symbol)
+        if signed == 0:
             return
+        if (fill.side == Signal.BUY) != (signed > 0):
+            return
+        exit_side = Signal.SELL if signed > 0 else Signal.BUY
+        remaining = abs(signed)
         stop_price = _positive_float(entry_order.get("stopPrice"))
         target_price = _positive_float(entry_order.get("targetPrice"))
         if stop_price is None and target_price is None:
@@ -2509,6 +2586,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
                 parent_order=entry_order,
                 client_order_id=f"{parent_id}-stop",
                 protective_kind="STOP_LOSS",
+                side=exit_side,
                 quantity=remaining,
                 order_type="STOP_LIMIT",
                 trigger_price=stop_price,
@@ -2520,6 +2598,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
                 parent_order=entry_order,
                 client_order_id=f"{parent_id}-target",
                 protective_kind="PROFIT_TARGET",
+                side=exit_side,
                 quantity=remaining,
                 order_type="LIMIT",
                 trigger_price=None,
@@ -2533,6 +2612,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
         parent_order: Mapping[str, Any],
         client_order_id: str,
         protective_kind: str,
+        side: Signal = Signal.SELL,
         quantity: int,
         order_type: str,
         trigger_price: float | None,
@@ -2554,7 +2634,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
             "orderIntentId": parent_order.get("orderIntentId"),
             "decisionId": parent_order.get("decisionId"),
             "symbol": str(parent_order.get("symbol") or "SPY").upper(),
-            "side": Signal.SELL.value,
+            "side": Signal(side).value,
             "orderType": order_type,
             "quantity": int(quantity),
             "filledQuantity": min(int(existing.get("filledQuantity") or 0), int(quantity)),
@@ -2580,12 +2660,17 @@ class VotingEnsembleLocalPaperExecutionEngine:
         self.repository.write_snapshot(f"local_order.{client_order_id}", payload)
 
     def _order_sized_to_owned_position(self, order: Mapping[str, Any]) -> Mapping[str, Any]:
-        if not order.get("protectiveKind") and Signal(order.get("side") or Signal.BUY) != Signal.SELL:
-            return order
-        if Signal(order.get("side") or Signal.BUY) != Signal.SELL:
-            return order
+        side = Signal(order.get("side") or Signal.BUY)
         position = self.repository.inventory_ledger.position_for_symbol(str(order.get("symbol") or "SPY").upper())
-        owned = max(0, int(position.get("quantity") or 0))
+        signed = int(position.get("quantity") or 0)
+        # Only an order that reduces the current exposure is sized to it: a SELL against
+        # a long, a BUY against a short. Anything else is an entry and keeps its size.
+        # A protective order whose position is already gone is sized to zero here and
+        # cancelled by the caller.
+        reduces_exposure = (side == Signal.SELL and signed > 0) or (side == Signal.BUY and signed < 0)
+        if not reduces_exposure and not order.get("protectiveKind"):
+            return order
+        owned = abs(signed) if reduces_exposure else 0
         quantity = min(int(order.get("quantity") or 0), owned + int(order.get("filledQuantity") or 0))
         if quantity == int(order.get("quantity") or 0):
             return order
@@ -2634,7 +2719,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
         for order in self.repository.inventory_ledger.orders():
             if str(order.get("symbol") or "").upper() != symbol.upper():
                 continue
-            if Signal(order.get("side") or Signal.BUY) != Signal.SELL:
+            if not _is_local_exit_order(order):
                 continue
             if str(order.get("status") or "").upper() not in {"OPEN", "PARTIALLY_FILLED", "NEW", "ACCEPTED"}:
                 continue
@@ -2648,7 +2733,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
                 continue
             if str(sibling.get("symbol") or "").upper() != symbol.upper():
                 continue
-            if Signal(sibling.get("side") or Signal.BUY) != Signal.SELL:
+            if not _is_local_exit_order(sibling):
                 continue
             if str(sibling.get("status") or "").upper() in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}:
                 continue
@@ -2668,7 +2753,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
                 continue
             if str(sibling.get("symbol") or "").upper() != symbol.upper():
                 continue
-            if Signal(sibling.get("side") or Signal.BUY) != Signal.SELL:
+            if not _is_local_exit_order(sibling):
                 continue
             if str(sibling.get("status") or "").upper() not in {"OPEN", "PARTIALLY_FILLED", "NEW", "ACCEPTED"}:
                 continue
@@ -2933,10 +3018,21 @@ class VotingEnsembleLocalPaperExecutionEngine:
             return "voting_ensemble.local_paper.stored_order_foreign_capital_partition_rejected"
         if order.get("accountId", VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID) != VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID:
             return "voting_ensemble.local_paper.stored_order_foreign_account_rejected"
-        if Signal(order.get("side") or Signal.BUY) == Signal.SELL:
-            position = self.repository.inventory_ledger.position_for_symbol(str(order.get("symbol") or "SPY").upper())
-            if not position or int(position.get("quantity") or 0) <= 0:
+        # Same exposure logic as submission: an order that reduces the position must
+        # find one we own; an order that opens or adds exposure must not land on a
+        # symbol a foreign record occupies. Side alone decided this before, which meant
+        # a short entry accepted at submission could never fill.
+        side = Signal(order.get("side") or Signal.BUY)
+        symbol = str(order.get("symbol") or "SPY").upper()
+        position = self.repository.inventory_ledger.position_for_symbol(symbol)
+        signed = int(position.get("quantity") or 0)
+        if _is_local_exit_order(order) or (side == Signal.SELL and signed > 0) or (side == Signal.BUY and signed < 0):
+            reduces = (side == Signal.SELL and signed > 0) or (side == Signal.BUY and signed < 0)
+            if not position or not reduces:
                 return "voting_ensemble.local_paper.sell_cannot_mutate_foreign_or_absent_position"
+            return None
+        if signed == 0 and self._foreign_position_occupies(symbol):
+            return "voting_ensemble.local_paper.sell_cannot_mutate_foreign_or_absent_position"
         return None
 
     def _record_rejected_order(self, intent: Any, reason: str) -> None:
@@ -4003,6 +4099,15 @@ def _clock_requires_eod_flatten(clock: Mapping[str, Any], *, now: datetime | Non
         return False
     observed = _require_utc(now or datetime.now(UTC))
     return next_close - observed <= timedelta(minutes=5)
+
+
+def _is_local_exit_order(order: Mapping[str, Any]) -> bool:
+    """An order that exists to reduce a position: a protective leg or a reasoned exit.
+
+    Side is not the test. With shorts, a SELL can be an entry and a BUY can be a cover,
+    so the exit helpers key on what the order is for rather than which way it trades.
+    """
+    return bool(order.get("protectiveKind")) or bool(order.get("exitReason"))
 
 
 def _has_open_exit_for_position(open_orders: list[BrokerOrderState], position: BrokerPositionState) -> bool:
