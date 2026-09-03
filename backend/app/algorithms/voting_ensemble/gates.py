@@ -33,7 +33,12 @@ STRATEGY_EVALUATION_BLOCKING_REASON_CODES = {
 }
 
 
-def voting_ensemble_local_gate_config(*, minimum_independent_family_support: int = 2, maximum_trades_per_day: int = 0) -> GlobalGateConfig:
+def voting_ensemble_local_gate_config(
+    *,
+    minimum_independent_family_support: int = 2,
+    maximum_trades_per_day: int = 0,
+    maximum_concurrent_positions: int = 1,
+) -> GlobalGateConfig:
     """The local gate configuration, with the two limits the settings decide passed in.
 
     minimum_independent_family_support is the settings' minimumFamiliesForTrade. At 2, a
@@ -66,6 +71,7 @@ def voting_ensemble_local_gate_config(*, minimum_independent_family_support: int
         maximumSameDirectionExposurePercent=50.0,
         maximumTradesPerDay=max(0, int(maximum_trades_per_day)),
         maximumConsecutiveLosses=3,
+        maximumConcurrentPositions=max(0, int(maximum_concurrent_positions)),
         defaultRiskMultiplierCap=1.0,
         defaultMaximumRiskPercent=0.5,
         defaultMaximumNotionalPercent=10.0,
@@ -332,6 +338,13 @@ class VotingEnsembleLocalGateEngine:
             results.append(_fail("risk.consecutive_loss_limit", "Voting Ensemble local risk limits", ["voting_ensemble.local_gate.consecutive_loss_limit"], "Consecutive-loss limit has been reached."))
         if bool(context.riskState.get("existingPositionConflict", False)):
             results.append(_fail("risk.existing_position_conflict", "Voting Ensemble local risk limits", ["voting_ensemble.local_gate.existing_position_conflict"], "Existing position conflicts with the candidate."))
+        # The concurrent-position cap counts open local positions. A candidate that nets
+        # against the open position (a reversal exit) opens nothing and passes.
+        if self.config.maximumConcurrentPositions > 0:
+            open_positions = int(_number(context.riskState, "openPositionCount") or 0)
+            reduces_open_position = bool(context.riskState.get("candidateReducesOpenPosition", False))
+            if open_positions >= self.config.maximumConcurrentPositions and not reduces_open_position:
+                results.append(_fail("risk.concurrent_position_limit", "Voting Ensemble local risk limits", ["voting_ensemble.local_gate.concurrent_position_limit"], "Open positions have reached the concurrent-position cap."))
         if not results:
             results.append(_pass("risk.local_limits_passed", "Voting Ensemble local risk limits", ["voting_ensemble.local_gate.risk_limits_passed"], "Voting Ensemble local risk limits passed."))
         return results

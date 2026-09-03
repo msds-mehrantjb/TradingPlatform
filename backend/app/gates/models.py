@@ -118,6 +118,8 @@ class GlobalGateConfig(DomainModel):
     maximumSameDirectionExposurePercent: float = Field(default=50.0, ge=0.0, le=100.0)
     maximumTradesPerDay: int = Field(default=10, ge=0)
     maximumConsecutiveLosses: int = Field(default=3, ge=0)
+    # Open positions allowed at once; 0 leaves the count ungated.
+    maximumConcurrentPositions: int = Field(default=0, ge=0)
     defaultRiskMultiplierCap: float = Field(default=1.0, ge=0.0, le=1.0)
     defaultMaximumRiskPercent: float = Field(default=1.0, ge=0.0, le=100.0)
     defaultMaximumNotionalPercent: float = Field(default=10.0, ge=0.0, le=100.0)
