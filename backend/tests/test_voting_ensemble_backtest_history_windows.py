@@ -132,10 +132,13 @@ class BacktestHistoryWindowTest(unittest.TestCase):
             timeframe="1Min",
         )
 
-        # The default-configuration row recorded in BASELINES.md.
-        self.assertEqual(result["totalTrades"], 5)
+        # The default-configuration row recorded in BASELINES.md under the dynamic exit
+        # geometry (ATR-scaled stop, level-aware target, breakeven-then-trail). The
+        # previous geometry gave 5 trades, 1 win, -50.00 on this same session; both are
+        # kept in the record.
+        self.assertEqual(result["totalTrades"], 3)
         self.assertEqual(result["winners"], 1)
-        self.assertEqual(result["netTotalPnl"], -50.0)
+        self.assertEqual(result["netTotalPnl"], -81.9)
         self.assertEqual(result["decisionCount"], 351)
         self.assertEqual(result["engine"], "voting_ensemble_pipeline")
         self.assertTrue(result["matchesLiveAlgorithm"])

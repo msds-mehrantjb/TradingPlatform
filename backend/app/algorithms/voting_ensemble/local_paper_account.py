@@ -21,6 +21,17 @@ VOTING_ENSEMBLE_LONG_ONLY_BUYING_POWER_MODEL = "LOCAL_CASH_NO_MARGIN_LONG_ONLY"
 VOTING_ENSEMBLE_LONG_SHORT_BUYING_POWER_MODEL = "LOCAL_CASH_NO_MARGIN_LONG_AND_SHORT"
 
 
+def _intent_setting(intent: Any, key: str) -> float | None:
+    """A numeric setting from an intent, directly or from its settings snapshot."""
+    direct = getattr(intent, key, None)
+    snapshot = getattr(intent, "settingsSnapshot", None)
+    candidate = direct if direct is not None else (snapshot.get(key) if isinstance(snapshot, Mapping) else None)
+    try:
+        return float(candidate) if candidate is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _holding_minutes_from_intent(intent: Any) -> int | None:
     """The maximum holding minutes an intent carries, if it carries one.
 
@@ -447,6 +458,12 @@ class VotingEnsembleInventoryLedger:
         holding_minutes = _holding_minutes_from_intent(intent)
         if holding_minutes is not None:
             payload["maximumHoldingMinutes"] = holding_minutes
+        # Post-fill management parameters ride the same snapshot, so the maintenance loop
+        # trails the stop by the rule the decision chose rather than a default.
+        for key in ("breakevenTriggerR", "trailingStopDistance"):
+            value = _intent_setting(intent, key)
+            if value is not None:
+                payload[key] = value
         self.store.write_snapshot(f"local_order.{order.clientOrderId}", payload)
         self.persist_inventory_manifest(observed_at=observed_at)
         return payload

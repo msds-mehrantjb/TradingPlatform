@@ -333,6 +333,36 @@ On the recorded 390-bar session this moves nothing: the default run stays at 5 t
 1 win, -50.00, 351 decisions (re-verified by test). The cap had never bound there. The
 full-dataset baseline below is re-run under the new rule, since on real data it did.
 
+## Dynamic exits and loss-budget sizing (2026-09-02)
+
+Three mechanisms replace the fixed geometry (a $1 stop, a 1.5 R target, a static stop
+until the time stop). All three live in the decision and are carried on the order plan,
+so the backtest simulator and the local paper engine manage a position by the same rule.
+
+| Mechanism | Rule | Where |
+|---|---|---|
+| Volatility-scaled stop | stop distance = `stopAtrMultiplier` (1.5) x session ATR, floored at `minimumStopDistanceDollars`; the fixed $1 is the fallback when no ATR exists | `service._exit_geometry` |
+| Level-aware target | the R-multiple target (1.5 R) unless a structural level (VWAP, opening range, prior day, premarket) sits between `minimumTakeProfitR` (1 R) and it, in which case the level less the spread is the target | `service._exit_geometry`, `_structural_levels` |
+| Loss-budget sizing | risk per trade = min(0.5 % of equity x caps, remaining daily loss budget), where the budget is 2 % of equity plus today's net loss less open risk. Zero budget is quantity zero | `service._remaining_daily_loss_budget`, `risk_budget.py` |
+| Breakeven and trail | once the mark has moved `breakevenTriggerR` (1 R) in the trade's favour the stop moves to the entry, then trails by `trailingStopR` (1 R) initial-stop distances, ratcheting only in the favourable direction; the simulator applies it on completed closes, the engine every 15 s against the mark | `execution/simulation.trailed_stop`, `paper_execution.trail_protective_stops` |
+
+The settings hash moves to `6d558ae3820428c0` (baseline: no trade cap, ATR 1.5, trigger
+1 R, trail 1 R, minimum target 1 R, structural targets on).
+
+**This changes the recorded single-session numbers**, since every trade's stop and target
+now depend on that session's ATR and levels. Same 390-bar synthetic session, default
+configuration, 351 decisions in both rows:
+
+| Geometry | Trades | Wins | Net PnL | Exits |
+|---|---|---|---|---|
+| Fixed ($1 stop, 1.5 R, static) | 5 | 1 | -50.00 | time stops and stops |
+| Dynamic (ATR stop, level target, trail) | 3 | 1 | -81.90 | 1 profit target, 2 protective stops |
+
+The synthetic tape is a sawtooth with 1.4-point steps, so its ATR is large and the
+ATR-scaled stop is wide; the two shorts stopped out for about 4 points each where the fixed
+geometry had lost $1 a share. That is the mechanism working on a tape built to swing, not a
+verdict on it; the verdict is the real-data pair below. The test pins the new row.
+
 ## When to re-record
 
 Re-record, keeping the prior version beside the new one, when any of these happen:
@@ -358,6 +388,9 @@ Re-record, keeping the prior version beside the new one, when any of these happe
 10. The resolved live settings hash changes. The replay configuration is derived from it,
     so a different hash is a different configuration whether or not any field looks
     different.
+11. `stopAtrMultiplier`, `minimumTakeProfitR`, `structuralTargets`, `breakevenTriggerR`,
+    `trailingStopR` or `trailingStopEnabled` change, or the ATR or level inputs they read
+    change. They decide every trade's stop, target and post-fill management.
 
 A baseline recorded without its enabling configuration cannot be reproduced, so the
 configuration is part of the record, not context around it.

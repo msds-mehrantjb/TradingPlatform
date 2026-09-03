@@ -124,10 +124,23 @@ class StopPolicySettings(ImmutableSettingsModel):
     stopLossPercent: float = Field(gt=0.0)
     fixedStopDistanceDollars: float = Field(ge=0.0)
     minimumStopDistanceDollars: float = Field(ge=0.0)
+    # Stop distance is atrMultiplier x the session ATR when an ATR exists; the fixed
+    # dollar distance is the fallback when it does not. Zero disables ATR scaling.
+    atrMultiplier: float = Field(default=1.5, ge=0.0)
+    # Once the position has moved breakevenTriggerR initial-stop distances in its
+    # favour, the stop moves to the entry and then trails by trailingStopR distances.
+    breakevenTriggerR: float = Field(default=1.0, ge=0.0)
+    trailingStopR: float = Field(default=1.0, ge=0.0)
+    trailingEnabled: bool = True
 
 
 class TargetPolicySettings(ImmutableSettingsModel):
     takeProfitR: float = Field(gt=0.0)
+    # A structural level (VWAP, opening range, prior day, premarket) that lies between
+    # minimumTakeProfitR and takeProfitR replaces the R-multiple target, since price
+    # tends to stall there. The trade still has to offer at least minimumTakeProfitR.
+    minimumTakeProfitR: float = Field(default=1.0, gt=0.0)
+    structuralTargets: bool = True
 
 
 class HoldingTimePolicySettings(ImmutableSettingsModel):

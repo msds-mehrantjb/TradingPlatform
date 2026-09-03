@@ -179,23 +179,35 @@ class RealisticExecutionSimulator:
 
     def _simulate_bracket_exit(self, order_plan: OrderPlan, fill: SimulatedFill, candles: list[MarketCandle]) -> SimulatedExit:
         side = Signal(order_plan.side)
+        # The working plan carries the stop as it stands now. It is only ever moved in
+        # the favourable direction, and only on a completed candle's close, so a candle
+        # is judged against the stop that was in force before it printed.
+        working = order_plan
+        trail_codes: list[str] = []
         for candle in candles:
             if fill.filledAt and candle.timestamp < fill.filledAt:
                 continue
-            if strategy_invalidation_touched(side, order_plan, candle):
-                return self._exit(order_plan, fill, candle.close, candle.timestamp, "strategy_invalidation", ["execution.strategy_invalidation_exit"])
-            if time_stop_touched(order_plan, fill, candle):
-                return self._exit(order_plan, fill, candle.close, candle.timestamp, "time_stop", ["execution.time_stop_exit"])
-            stop_hit = stop_touched(side, order_plan, candle)
-            target_hit = target_touched(side, order_plan, candle)
+            if strategy_invalidation_touched(side, working, candle):
+                return self._exit(working, fill, candle.close, candle.timestamp, "strategy_invalidation", ["execution.strategy_invalidation_exit", *trail_codes])
+            if time_stop_touched(working, fill, candle):
+                return self._exit(working, fill, candle.close, candle.timestamp, "time_stop", ["execution.time_stop_exit", *trail_codes])
+            stop_hit = stop_touched(side, working, candle)
+            target_hit = target_touched(side, working, candle)
             ambiguous = stop_hit and target_hit
             if ambiguous:
-                reason_codes = ["execution.same_bar_target_stop_ambiguous", "execution.conservative_stop_first"]
-                return self._exit(order_plan, fill, order_plan.stopPrice, candle.timestamp, "protective_stop", reason_codes, candle=candle)
+                reason_codes = ["execution.same_bar_target_stop_ambiguous", "execution.conservative_stop_first", *trail_codes]
+                return self._exit(working, fill, working.stopPrice, candle.timestamp, "protective_stop", reason_codes, candle=candle)
             if stop_hit:
-                return self._exit(order_plan, fill, stop_gap_price(side, order_plan, candle, self.config), candle.timestamp, "protective_stop", ["execution.protective_stop_hit", gap_reason(side, order_plan, candle, is_stop=True)], candle=candle)
+                return self._exit(working, fill, stop_gap_price(side, working, candle, self.config), candle.timestamp, "protective_stop", ["execution.protective_stop_hit", gap_reason(side, working, candle, is_stop=True), *trail_codes], candle=candle)
             if target_hit:
-                return self._exit(order_plan, fill, target_gap_price(side, order_plan, candle, self.config), candle.timestamp, "profit_target", ["execution.profit_target_hit", gap_reason(side, order_plan, candle, is_stop=False)], candle=candle)
+                return self._exit(working, fill, target_gap_price(side, working, candle, self.config), candle.timestamp, "profit_target", ["execution.profit_target_hit", gap_reason(side, working, candle, is_stop=False), *trail_codes], candle=candle)
+            moved = trailed_stop(side, order_plan, working, fill, candle.close)
+            if moved is not None and moved != working.stopPrice:
+                at_entry = fill.averagePrice is not None and abs(moved - float(fill.averagePrice)) < 1e-9
+                code = "execution.stop_moved_to_breakeven" if at_entry else "execution.stop_trailed"
+                if code not in trail_codes:
+                    trail_codes.append(code)
+                working = working.model_copy(update={"stopPrice": round(moved, 6)})
         if self.config.endOfDayExit and order_plan.endOfDayExit and candles:
             last = candles[-1]
             return self._exit(order_plan, fill, last.close, last.timestamp, "end_of_day", ["execution.end_of_day_exit"], candle=last)
@@ -310,6 +322,33 @@ def gap_reason(side: Signal, order_plan: OrderPlan, candle: MarketCandle, *, is_
     if not is_stop and ((side == Signal.BUY and candle.open > price) or (side == Signal.SELL and candle.open < price)):
         return "execution.target_gap"
     return ""
+
+
+def trailed_stop(side: Signal, original: OrderPlan, working: OrderPlan, fill: SimulatedFill, price: float) -> float | None:
+    """Where the stop belongs after the position has traded at `price`, or None.
+
+    Two steps, both in units of the initial stop distance (one R). Once price has moved
+    breakevenTriggerR in the trade's favour the stop moves to the entry; from then on it
+    trails price by trailingStopDistance. The stop only ever moves in the favourable
+    direction, and it never crosses the entry from the wrong side, so a trade that has
+    earned its breakeven cannot give it back to a trail set wider than the trigger.
+    """
+    if original.stopPrice is None or original.breakevenTriggerR is None or fill.averagePrice is None:
+        return None
+    entry = float(fill.averagePrice)
+    initial_risk = abs(entry - float(original.stopPrice))
+    if initial_risk <= 0:
+        return None
+    favourable = (price - entry) if side == Signal.BUY else (entry - price)
+    if favourable < original.breakevenTriggerR * initial_risk:
+        return None
+    current = float(working.stopPrice) if working.stopPrice is not None else float(original.stopPrice)
+    trail = float(original.trailingStopDistance) if original.trailingStopDistance else None
+    if side == Signal.BUY:
+        proposed = max(entry, price - trail) if trail else entry
+        return max(current, proposed)
+    proposed = min(entry, price + trail) if trail else entry
+    return min(current, proposed)
 
 
 def stop_touched(side: Signal, order_plan: OrderPlan, candle: MarketCandle) -> bool:

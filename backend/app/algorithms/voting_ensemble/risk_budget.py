@@ -96,6 +96,13 @@ def resolve_voting_ensemble_risk_budget(
         _family_support_multiplier(config),
     )
     risk_budget = equity * (_percent(config, "riskPerTradePercent", 0.5) / 100.0) * dynamic_cap * vote_edge_multiplier
+    # The day's remaining loss budget bounds the risk of one more trade. This is what
+    # lets the daily-loss limit, rather than a trade count, govern the day: as losses
+    # and open risk accumulate, each new position is sized to what is left.
+    daily_budget = _number(config, "remainingDailyLossBudgetDollars", None)
+    daily_budget_bound = daily_budget is not None and risk_budget > float(daily_budget)
+    if daily_budget_bound:
+        risk_budget = max(0.0, float(daily_budget))
     order_limit = min(
         equity * (_percent(config, "orderAllocationPercent", 10.0) / 100.0),
         equity * (_percent(config, "dailyAllocationPercent", 30.0) / 100.0),
@@ -117,6 +124,12 @@ def resolve_voting_ensemble_risk_budget(
         f"voting_ensemble.risk_budget.dynamic_cap:{dynamic_cap:.4f}",
         *vote_edge_reason_codes,
     ]
+    if daily_budget_bound:
+        reason_codes.append(
+            "voting_ensemble.risk_budget.daily_loss_budget_exhausted"
+            if risk_budget <= 0
+            else f"voting_ensemble.risk_budget.daily_loss_budget_bound:{risk_budget:.2f}"
+        )
     if risk_budget <= 0:
         reason_codes.append("voting_ensemble.risk_budget.zero_risk_budget")
         quantity = 0

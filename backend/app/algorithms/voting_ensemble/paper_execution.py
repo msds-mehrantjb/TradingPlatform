@@ -1916,10 +1916,14 @@ class VotingEnsemblePaperExecutionRuntime:
                 "evaluatedAt": now.isoformat().replace("+00:00", "Z"),
                 "reasonCodes": ["voting_ensemble.local_paper_maintenance.skipped_for_broker_paper_mode"],
             }
+        # Trail first, against the latest mark, so the protective legs are evaluated at
+        # the stop the position has earned; then protective legs, so a position that
+        # just stopped out is not also sent a time-stop exit; then the holding limit;
+        # then end of day.
+        trailer = getattr(self.paper_gateway.broker, "trail_protective_stops", None)
+        trail_updates = trailer(evaluated_at=now) if callable(trailer) else []
         evaluator = getattr(self.paper_gateway.broker, "evaluate_open_protective_orders", None)
         protective_fills = evaluator() if callable(evaluator) else []
-        # Protective legs first, so a position that just stopped out is not also sent a
-        # time-stop exit; then the holding limit; then end of day.
         holding_exit = getattr(self.paper_gateway.broker, "submit_maximum_holding_exits", None)
         holding_updates = holding_exit(evaluated_at=now) if callable(holding_exit) else []
         eod_updates = self._local_end_of_day_updates(evaluated_at=now)
@@ -1931,6 +1935,8 @@ class VotingEnsemblePaperExecutionRuntime:
             "executionMode": "LOCAL_PAPER",
             "status": "MAINTAINED",
             "protectiveFillsObserved": len(protective_fills),
+            "stopTrailUpdates": trail_updates,
+            "stopsTrailed": len(trail_updates),
             "holdingExitUpdates": holding_updates,
             "holdingExitsSubmitted": len([item for item in holding_updates if item.get("submitted")]),
             "eodUpdates": eod_updates,
@@ -2204,6 +2210,9 @@ class VotingEnsembleLocalPaperBroker:
     def submit_maximum_holding_exits(self, *, evaluated_at: datetime) -> list[dict[str, Any]]:
         return self.engine.submit_maximum_holding_exits(evaluated_at=evaluated_at)
 
+    def trail_protective_stops(self, *, evaluated_at: datetime) -> list[dict[str, Any]]:
+        return self.engine.trail_protective_stops(evaluated_at=evaluated_at)
+
 
 class VotingEnsembleLocalPaperExecutionEngine:
     """Authoritative LOCAL_PAPER execution engine for Voting Ensemble.
@@ -2357,6 +2366,80 @@ class VotingEnsembleLocalPaperExecutionEngine:
             submitted_code="voting_ensemble.local_paper.maximum_holding_time_exit_submitted",
             due=self._holding_limit_reached,
         )
+
+    def trail_protective_stops(self, *, evaluated_at: datetime) -> list[dict[str, Any]]:
+        """Move each open protective stop by the position's breakeven-and-trail rule.
+
+        Same rule the backtest simulator applies on candle closes: once the mark has
+        moved breakevenTriggerR initial-stop distances in the position's favour the stop
+        goes to the entry, then trails the mark by trailingStopDistance. The stop only
+        ever moves in the favourable direction, and a stop that has already triggered is
+        left alone so a limit waiting to fill is not yanked away from the price.
+        """
+        observed = _require_utc(evaluated_at)
+        updates: list[dict[str, Any]] = []
+        for position in self.repository.inventory_ledger.positions():
+            symbol = str(position.get("symbol") or "").upper()
+            signed = int(position.get("quantity") or position.get("signedQuantity") or 0)
+            if not symbol or signed == 0:
+                continue
+            entry_order = self._entry_order_for_position(position)
+            trigger_r = _positive_or_zero_float(entry_order.get("breakevenTriggerR"))
+            initial_stop = _positive_float(entry_order.get("stopPrice"))
+            entry_price = _positive_float(position.get("averageEntryPrice") or position.get("averagePrice"))
+            mark = _positive_float(position.get("markPrice"))
+            if trigger_r is None or initial_stop is None or entry_price is None or mark is None:
+                continue
+            initial_risk = abs(entry_price - initial_stop)
+            if initial_risk <= 0:
+                continue
+            favourable = (mark - entry_price) if signed > 0 else (entry_price - mark)
+            if favourable < trigger_r * initial_risk:
+                continue
+            trail = _positive_float(entry_order.get("trailingStopDistance"))
+            for order in self.repository.inventory_ledger.orders():
+                if str(order.get("symbol") or "").upper() != symbol or order.get("protectiveKind") != "STOP_LOSS":
+                    continue
+                if str(order.get("status") or "").upper() not in {"OPEN", "PARTIALLY_FILLED", "NEW", "ACCEPTED"} or bool(order.get("stopTriggered")):
+                    continue
+                current = _positive_float(order.get("triggerPrice")) or _positive_float(order.get("stopPrice"))
+                if current is None:
+                    continue
+                if signed > 0:
+                    proposed = max(entry_price, mark - trail) if trail else entry_price
+                    moved = max(current, proposed)
+                    improved = moved > current
+                else:
+                    proposed = min(entry_price, mark + trail) if trail else entry_price
+                    moved = min(current, proposed)
+                    improved = moved < current
+                if not improved:
+                    continue
+                moved = round(moved, 4)
+                code = "voting_ensemble.local_paper.stop_moved_to_breakeven" if abs(moved - entry_price) < 1e-9 else "voting_ensemble.local_paper.stop_trailed"
+                self.repository.write_snapshot(
+                    f"local_order.{order['clientOrderId']}",
+                    {
+                        **order,
+                        "triggerPrice": moved,
+                        "limitPrice": moved,
+                        "entryPrice": moved,
+                        "stopPrice": moved,
+                        "trailedAt": observed.isoformat().replace("+00:00", "Z"),
+                        "reasonCodes": [*list(order.get("reasonCodes") or ()), code],
+                    },
+                )
+                updates.append({"symbol": symbol, "clientOrderId": order["clientOrderId"], "from": current, "to": moved, "mark": mark, "reasonCodes": [code]})
+        return updates
+
+    def _entry_order_for_position(self, position: Mapping[str, Any]) -> Mapping[str, Any]:
+        entry_order_id = str(position.get("entryOrderId") or "")
+        if not entry_order_id:
+            return {}
+        try:
+            return self.repository.read_snapshot(f"local_order.{entry_order_id}")
+        except KeyError:
+            return {}
 
     def _holding_limit_reached(self, position: Mapping[str, Any], observed: datetime) -> bool:
         opened_at = _parse_time(position.get("openedAt"))
@@ -3545,6 +3628,8 @@ def proposal_from_order_plan(intent: VotingEnsemblePaperOrderIntent, *, quantity
         "clientOrderId": voting_ensemble_gateway_client_order_id(intent),
         "timeInForce": order.timeInForce,
         "maximumHoldingMinutes": order.maximumHoldingMinutes,
+        "breakevenTriggerR": order.breakevenTriggerR,
+        "trailingStopDistance": order.trailingStopDistance,
         "paperOnly": True,
         "liveTradingEnabled": False,
         "maximumOrderAgeSeconds": 60,
@@ -4101,6 +4186,14 @@ def _clock_requires_eod_flatten(clock: Mapping[str, Any], *, now: datetime | Non
         return False
     observed = _require_utc(now or datetime.now(UTC))
     return next_close - observed <= timedelta(minutes=5)
+
+
+def _positive_or_zero_float(value: Any) -> float | None:
+    try:
+        number = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    return number if number is not None and number >= 0 else None
 
 
 def _is_local_exit_order(order: Mapping[str, Any]) -> bool:

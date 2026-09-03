@@ -1199,13 +1199,9 @@ def _candidate_from_decision(
         return None
     entry = snapshot.nbbo.ask if signal == Signal.BUY else snapshot.nbbo.bid
     profile = settings.resolvedTradingProfile
-    stop_distance = max(
-        float(settings.stopPolicy.fixedStopDistanceDollars) * float(profile.stopMultiplier),
-        float(settings.stopPolicy.minimumStopDistanceDollars),
-    )
-    target_distance = stop_distance * float(settings.targetPolicy.takeProfitR) * float(profile.targetMultiplier)
-    stop = entry - stop_distance if signal == Signal.BUY else entry + stop_distance
-    target = entry + target_distance if signal == Signal.BUY else entry - target_distance
+    geometry = _exit_geometry(snapshot, signal, entry, settings)
+    stop = geometry["stopPrice"]
+    target = geometry["targetPrice"]
     evaluated_at = _utc_timestamp(snapshot.evaluationTimestamp)
     return TradeCandidate(
         candidateId=f"voting-ensemble-{snapshot.snapshotHash}",
@@ -1222,6 +1218,7 @@ def _candidate_from_decision(
             "supportingFamilies": len(decision.supportingFamilies),
             "finalScore": decision.finalScore,
             "strategyFamily": decision.supportingFamilies[0] if decision.supportingFamilies else "",
+            **geometry["features"],
         },
         reasonCodes=[*list(decision.reasonCodes), "voting_ensemble.pipeline.quantity_pending_risk_budget"],
         explanation="Voting Ensemble deterministic candidate generated after family aggregation for local gate evaluation.",
@@ -1229,6 +1226,88 @@ def _candidate_from_decision(
         sessionDate=evaluated_at.date(),
         configurationHash=f"{settings.configurationHash}:{decision.decisionId}",
     )
+
+
+def _exit_geometry(
+    snapshot: VotingEnsembleEvaluationSnapshot,
+    signal: Signal,
+    entry: float,
+    settings: Any,
+) -> dict[str, Any]:
+    """Stop and target for a candidate, sized to the session's volatility and its levels.
+
+    The stop is a multiple of the session ATR, so a quiet tape gets a tight stop and a
+    volatile one a wide stop, with the fixed dollar distance as the fallback when no ATR
+    exists yet. The target is the R-multiple target unless a structural level (VWAP, the
+    opening range, the prior day, the premarket range) lies between the minimum
+    acceptable R and that target, in which case the level is used, because price tends
+    to stall there and a target just short of it fills where a target beyond it does not.
+    Post-fill management (breakeven trigger and trail) is expressed in the same initial
+    stop distance so every part of the trade shares one unit of risk.
+    """
+    profile = settings.resolvedTradingProfile
+    stop_policy = settings.stopPolicy
+    target_policy = settings.targetPolicy
+    stop_multiplier = float(profile.stopMultiplier)
+    atr = float(snapshot.features.atr) if snapshot.features.atr and snapshot.features.atr > 0 else None
+    atr_multiplier = float(getattr(stop_policy, "atrMultiplier", 0.0) or 0.0)
+    if atr is not None and atr_multiplier > 0:
+        stop_distance = atr * atr_multiplier * stop_multiplier
+        stop_source = "atr"
+    else:
+        stop_distance = float(stop_policy.fixedStopDistanceDollars) * stop_multiplier
+        stop_source = "fixed_dollars"
+    stop_distance = max(stop_distance, float(stop_policy.minimumStopDistanceDollars), 0.01)
+    take_profit_r = float(target_policy.takeProfitR) * float(profile.targetMultiplier)
+    minimum_r = min(float(getattr(target_policy, "minimumTakeProfitR", 1.0) or 1.0), take_profit_r)
+    r_target_distance = stop_distance * take_profit_r
+    target_distance = r_target_distance
+    target_source = "r_multiple"
+    if bool(getattr(target_policy, "structuralTargets", True)):
+        buffer = max(0.01, snapshot.nbbo.spreadDollars if snapshot.nbbo else 0.01)
+        candidates: list[tuple[str, float]] = []
+        for label, level in _structural_levels(snapshot, signal):
+            distance = (level - entry) if signal == Signal.BUY else (entry - level)
+            distance -= buffer
+            if stop_distance * minimum_r <= distance < r_target_distance:
+                candidates.append((label, distance))
+        if candidates:
+            target_source, target_distance = min(candidates, key=lambda item: item[1])
+    stop = entry - stop_distance if signal == Signal.BUY else entry + stop_distance
+    target = entry + target_distance if signal == Signal.BUY else entry - target_distance
+    trailing_enabled = bool(getattr(stop_policy, "trailingEnabled", True))
+    trailing_r = float(getattr(stop_policy, "trailingStopR", 1.0) or 0.0)
+    breakeven_r = float(getattr(stop_policy, "breakevenTriggerR", 1.0) or 0.0)
+    return {
+        "stopPrice": stop,
+        "targetPrice": target,
+        "features": {
+            "stopDistance": round(stop_distance, 6),
+            "stopSource": stop_source,
+            "sessionAtr": atr,
+            "targetDistance": round(target_distance, 6),
+            "targetSource": target_source,
+            "targetRMultiple": round(target_distance / stop_distance, 4) if stop_distance else None,
+            "breakevenTriggerR": breakeven_r if trailing_enabled else None,
+            "trailingStopDistance": round(stop_distance * trailing_r, 6) if trailing_enabled and trailing_r > 0 else None,
+        },
+    }
+
+
+def _structural_levels(snapshot: VotingEnsembleEvaluationSnapshot, signal: Signal) -> tuple[tuple[str, float], ...]:
+    """Levels on the profit side of the entry, from the snapshot's own reference data."""
+    levels: list[tuple[str, float]] = []
+    features = snapshot.features
+    if features.vwap and features.vwap > 0:
+        levels.append(("vwap", float(features.vwap)))
+    for label, source in (("prior_day", snapshot.priorDayLevels), ("premarket", snapshot.premarketLevels), ("opening_range", snapshot.openingRangeLevels)):
+        high = getattr(source, "high", None)
+        low = getattr(source, "low", None)
+        if signal == Signal.BUY and high and high > 0:
+            levels.append((f"{label}_high", float(high)))
+        if signal == Signal.SELL and low and low > 0:
+            levels.append((f"{label}_low", float(low)))
+    return tuple(levels)
 
 
 def _candidate_family_from_decision(decision: EnsembleDecision | None) -> StrategyFamily | None:
@@ -1522,6 +1601,10 @@ def _risk_budget_config(
         "contractMultiplier": _contract_multiplier(snapshot.symbol),
         "eventRiskCap": _number(operational, "eventRiskCap") if _number(operational, "eventRiskCap") is not None else 1.0,
         "drawdownCap": _drawdown_cap(account),
+        # What the day can still lose before the daily-loss gate closes it, net of the
+        # risk already open. A new trade's planned risk may not exceed this, so one more
+        # entry cannot carry the day past the limit the operator chose to govern it.
+        "remainingDailyLossBudgetDollars": _remaining_daily_loss_budget(account, settings),
         "liquidityCap": _number(operational, "liquidityCap") if _number(operational, "liquidityCap") is not None else 1.0,
         "minimumTradableSize": int(_number(operational, "minimumTradableSize") or 1),
     }
@@ -1534,6 +1617,25 @@ def _candidate_regime_fit(decision: EnsembleDecision) -> float:
         if signal.signal == decision.signal and signal.eligible and signal.dataReady
     ]
     return max(0.0, min(1.0, sum(fits) / len(fits))) if fits else 1.0
+
+
+def _remaining_daily_loss_budget(account: AccountRiskState | None, settings: Any) -> float | None:
+    """Dollars the day can still lose before the daily-loss limit, net of open risk.
+
+    None when there is no account to read, so sizing falls back to its other caps rather
+    than treating a missing account as an empty budget.
+    """
+    if account is None:
+        return None
+    try:
+        limit_percent = float(settings.dailyLossCap.maxDailyLossPercent)
+    except AttributeError:
+        return None
+    equity = float(account.equity)
+    budget = equity * limit_percent / 100.0
+    realized = account.dailyNetPnlAfterExitCosts if account.dailyNetPnlAfterExitCosts is not None else account.realizedPnlToday
+    open_risk = equity * float(account.totalOpenRiskPercent) / 100.0
+    return round(max(0.0, budget + min(0.0, float(realized)) - open_risk), 6)
 
 
 def _drawdown_cap(account: AccountRiskState | None) -> float:

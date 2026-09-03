@@ -432,6 +432,12 @@ class OrderPlan(DomainModel):
     limitPrice: float | None = Field(default=None, gt=0)
     maximumHoldingMinutes: int | None = Field(default=None, ge=1)
     strategyInvalidationPrice: float | None = Field(default=None, gt=0)
+    # Post-fill management, both optional. When the position has moved breakevenTriggerR
+    # multiples of the initial stop distance in its favour, the stop moves to the entry
+    # and then trails the price by trailingStopDistance dollars, ratcheting only in the
+    # favourable direction.
+    breakevenTriggerR: float | None = Field(default=None, ge=0)
+    trailingStopDistance: float | None = Field(default=None, gt=0)
     endOfDayExit: bool = True
     timeInForce: Literal["DAY", "GTC"]
     eligible: bool

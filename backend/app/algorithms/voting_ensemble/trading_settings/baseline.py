@@ -23,7 +23,16 @@ ONE_MINUTE_BASELINE_SETTINGS: dict[str, Any] = {
     "execution": "next candle open",
     "stopLossPercent": 0.35,
     "fixedStopDistanceDollars": 1.0,
+    # Stop = 1.5 x session ATR (the fixed dollars are the fallback when no ATR exists).
+    # Target = 1.5 R, or the first structural level beyond 1 R if one lies inside that.
+    # After +1 R the stop moves to breakeven and trails by one initial-stop distance.
+    "stopAtrMultiplier": 1.5,
+    "breakevenTriggerR": 1.0,
+    "trailingStopR": 1.0,
+    "trailingStopEnabled": True,
     "takeProfitR": 1.5,
+    "minimumTakeProfitR": 1.0,
+    "structuralTargets": True,
     "slippagePerShare": 0.02,
     "expenseModel": {
         "description": "Estimated SPY share expenses: adverse slippage is priced into entry/exit, plus extra liquidity reserve and sell-side regulatory fee estimates.",

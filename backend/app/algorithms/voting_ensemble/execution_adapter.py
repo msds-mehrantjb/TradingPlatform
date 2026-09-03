@@ -156,6 +156,7 @@ class VotingEnsembleExecutionAdapter:
         if quantity <= 0:
             return _no_order(candidate, policy, ["voting_ensemble.order_planner.zero_quantity"], decidedAt, sessionDate, timeInForce=timeInForce, maximumHoldingMinutes=maximumHoldingMinutes)
         limit_price = _limit_price(candidate.signal, candidate.entryPrice, limitOffsetBps)
+        features = candidate.features if isinstance(candidate.features, dict) else {}
         return OrderPlan(
             orderPlanId=_order_plan_id(candidate, policy, orderType, limit_price),
             candidateId=candidate.candidateId,
@@ -168,6 +169,10 @@ class VotingEnsembleExecutionAdapter:
             targetPrice=candidate.targetPrice,
             limitPrice=limit_price,
             maximumHoldingMinutes=maximumHoldingMinutes,
+            # Post-fill management decided with the candidate's geometry, so the engine
+            # and the simulator manage the position by the same rule.
+            breakevenTriggerR=_optional_positive(features.get("breakevenTriggerR"), allow_zero=True),
+            trailingStopDistance=_optional_positive(features.get("trailingStopDistance")),
             timeInForce=timeInForce,
             eligible=True,
             validationErrors=[],
@@ -612,6 +617,16 @@ def _no_order(
         sessionDate=session_date,
         configurationHash=f"{policy.configurationHash}:{VOTING_ENSEMBLE_EXECUTION_ADAPTER_VERSION}",
     )
+
+
+def _optional_positive(value: Any, *, allow_zero: bool = False) -> float | None:
+    try:
+        number = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    if number is None or number < 0 or (number == 0 and not allow_zero):
+        return None
+    return number
 
 
 def _order_plan_id(candidate: TradeCandidate, policy: EffectiveTradePolicy, order_type: str, limit_price: float) -> str:
