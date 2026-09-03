@@ -31,9 +31,7 @@ class VotingEnsembleLatencyMeasurements(BaseModel):
     brokerAcknowledgementDurationMs: float = Field(ge=0.0)
     fillDurationMs: float = Field(ge=0.0)
     clockSkewMs: float = Field(ge=0.0)
-    inProcessDurationMs: float = Field(default=0.0, ge=0.0)
     decisionDeadlineExpired: bool
-    decisionDeadlineReasonCodes: tuple[str, ...] = ()
 
 
 class VotingEnsembleExecutionEconomics(BaseModel):
@@ -118,9 +116,7 @@ def build_execution_economics(
         brokerAcknowledgementDurationMs=float(_number(snapshot.operationalHealthSnapshot, "brokerAcknowledgementDurationMs") or 0.0),
         fillDurationMs=float(_number(snapshot.operationalHealthSnapshot, "fillDurationMs") or 0.0),
         clockSkewMs=float(_number(snapshot.operationalHealthSnapshot, "clockSkewMs") or 0.0),
-        inProcessDurationMs=max(0.0, float(latency_measurements.get("inProcessDurationMs") or 0.0)),
         decisionDeadlineExpired=bool(latency_measurements.get("decisionDeadlineExpired", False)),
-        decisionDeadlineReasonCodes=tuple(str(code) for code in (latency_measurements.get("decisionDeadlineReasonCodes") or ())),
     )
     payload = {
         "settingsHash": settings.configurationHash,
