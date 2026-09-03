@@ -3,11 +3,15 @@
 Record of what the bar-close audit and its follow-up work changed, and what that did to the
 recorded baselines.
 
-## Status: baselines unchanged, nothing re-recorded
+## Status: superseded by the 2026-09-03 golden re-record
 
-No previous version has been superseded, so there is no prior copy to keep alongside. The
-reason is worth stating rather than assuming, because "no change" is a claim that has to be
-earned.
+The reference baseline is now the run recorded at the end of this file, after the audit
+fixes. Every section between here and there is kept for what it measured, and each states
+the configuration it ran under; read them as history, not as the current numbers.
+
+The sections immediately below were written while the baselines genuinely had not moved,
+and their reasoning about why individual changes were inert stays correct. What changed is
+that the audit fixes, taken together, do move the numbers.
 
 ### What the audit expected to change, and did not
 
@@ -435,6 +439,78 @@ inert and what would feed it:
 - **Event-risk state gate** (`adx_atr_regime_classifier.py`): reads keys the snapshot
   never carries, so it always reports clear.
 - **Pyramiding, allowed entry hours**: the baseline comments them.
+
+## Golden re-record after the audit fixes (recorded 2026-09-03)
+
+This is now the reference baseline. It is the single run taken after every approved audit
+change was committed: entries counted as entries, the candidate sized before it is costed,
+profile multipliers applied once, gapped protective stops filled at the quote, one starting
+equity of 100,000, shorts off with refused shorts shadowed, the family minimum read from
+the settings, the sizing mode gone, the kill switch settable and the consecutive-loss input
+fed. Prior rows above are kept and stay valid for what they measured.
+
+Dataset `SPY/20260902T200952Z`, timeframe 1Min, requested range 2020-07-28 to 2026-09-02,
+cache `voting_ensemble_dedicated_v2_1Min_2020-07-28_2026-09-02.json`. The run it replaced
+is beside it as `.before_final_rerecord_2026-09-03.json`.
+
+| | |
+|---|---|
+| Live settings hash | `54fae2592a09797b` (was `aed8572a2685bb5c` at the first recorded run) |
+| Starting capital | 100,000 (final equity 99,966.76) |
+| Effective start | 2026-06-29, where the context streams begin |
+| Sessions evaluated | 34 (14,962 bars, 13,636 decisions); 16 sessions traded |
+| Trades | 32, all long, 8 to 13 shares each |
+| Wins / losses | 11 / 21, win rate 34.4% |
+| Average R | **-0.233** |
+| Net PnL | **-33.24** (gross -9.42, costs 23.82) |
+| Profit factor / expectancy | 0.70 / -1.04 per trade |
+| Max drawdown | 33.24 dollars, 0.033% of capital, peak to trough |
+| Exits | 21 protective stop, 11 profit target, no time stops |
+| By family | trend 27 trades -10.95; reversal 5 trades -22.29 |
+| Refused shorts (shadow) | 74 trades, **-52.77** |
+| Wall clock | 5,655 s on one core |
+
+**This baseline loses money, and that is the honest reading of the algorithm under the
+corrected code.** It is not a regression to fix before merging: every driver below is a
+change that was asked for and is working as specified.
+
+### Why it is not comparable with the run above it
+
+Four deliberate changes separate the two, and the arithmetic of each is known:
+
+1. **Shorts are off.** The previous run's +9.50 was 58 short trades making +14.43 against
+   30 long trades losing -4.93. Removing the short side removes the half that was carrying
+   the total. The long side was already negative.
+2. **Position sizes are roughly four times larger**, from the 100,000 equity replacing
+   25,000. Every entry was 3 shares before; entries here are 8 to 13. Per-share losses
+   that cost cents now cost dollars.
+3. **The exits actually manage the position.** This is the first recorded run whose trades
+   show `execution.stop_trailed` (9), `execution.stop_moved_to_breakeven` (1) and the
+   bounded gap fills `execution.stop_gap` and `execution.target_gap`. The previous run
+   shows none of these and instead 56 time stops: stops that could not fill drifted to the
+   30-minute limit, where they exited near breakeven (14 long time stops, +0.03 between
+   them). Those escapes were doing real work in the old total and are gone.
+4. **Average holding time fell from 19.1 to 6.3 minutes**, and the longest trade from 30
+   minutes to 19. The stop distance realised on exit fell from about 0.98 to 0.36, which
+   is the trail and the breakeven move pulling the stop in behind price.
+
+Trade counts, win rate, average R and drawdown may therefore not be compared line to line
+with any row above. Only this row describes the shipped configuration.
+
+### What the run says on its own terms
+
+- **The shadow evidence supports keeping shorts off.** The 74 refused shorts, simulated
+  apart from the account, lost 52.77. Under the corrected exit geometry the short side is
+  not the winner the previous run made it look like.
+- **Costs eat the edge.** Gross is -9.42 and costs are 23.82, so even the gross is
+  negative before expenses; this is not a spread-and-fees story alone.
+- **Both families lose.** Reversal loses 22.29 on 5 trades, trend 10.95 on 27.
+- **Two-thirds of trades stop out.** 21 of 32, with the trail contributing 9. A trail that
+  fires this often on a 6-minute average hold is a tuning question worth its own
+  experiment, not something to change silently under a baseline.
+
+Nothing here is promoted by recording it. Promotion still needs real shadow evidence from
+the live path, and this run argues against seeking it yet.
 
 ## When to re-record
 
