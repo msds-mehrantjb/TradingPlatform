@@ -6401,7 +6401,13 @@ async function loadLatestDynamicTradingArtifact() {
     state.dynamicArtifactSettingsKey = tradingSettingsKey(state.tradingSettings);
     if (state.algoBacktestTimeframe !== "Trading") {
       const dynamicBacktest = dynamicBacktestForTimeframe(state.algoBacktestTimeframe);
-      if (dynamicBacktest) {
+      // The 1m/5m panel prefers the dedicated replay, which runs the live pipeline. The
+      // artifact rows for those timeframes come from the legacy engine, and this load
+      // used to overwrite a pipeline result whenever it happened to finish second.
+      const keepPipelineResult =
+        (state.algoBacktestTimeframe === "1Min" || state.algoBacktestTimeframe === "5Min") &&
+        state.algoBacktestResult?.matchesLiveAlgorithm === true;
+      if (dynamicBacktest && !keepPipelineResult) {
         state.algoBacktestResult = dynamicBacktest;
         state.algoBacktestCandles = [];
         state.algoBacktestStatus = "ready";
