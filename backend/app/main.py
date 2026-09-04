@@ -2667,7 +2667,7 @@ def voting_ensemble_backtest(
     # the frontend gave up after 20 s, the thread kept going, and a few reloads were
     # enough to pin the backend for hours. A miss is now reported, not computed; the
     # daily artifact job and scripts/run_voting_ensemble_dedicated_replay.py produce it.
-    if timeframe in {"1Min", "5Min"}:
+    if timeframe == "1Min":
         cache_path = dedicated_voting_ensemble_cache_path(data_path=data_path, timeframe=timeframe, start_date=start_date, end_date=end_date)
         if not cache_path.exists():
             raise HTTPException(
@@ -5419,11 +5419,23 @@ def dedicated_voting_ensemble_cache_path(*, data_path: Path, timeframe: str, sta
     # windows, derives its configuration from the resolved live settings, and starts where
     # the context streams start. A v1 cache was recorded under none of those, so it is not
     # comparable and must not be served as if it were.
+    #
+    # The algorithm is a one-minute algorithm, so this is the only timeframe it can name.
+    if timeframe != "1Min":
+        raise ValueError(
+            f"The dedicated Voting Ensemble replay evaluates one-minute bars; {timeframe} has no dedicated artifact."
+        )
     return data_path.parent / f"voting_ensemble_dedicated_v2_{timeframe}_{start_date}_{end_date}.json"
 
 
 def cached_voting_ensemble_backtest(*, data_path: Path, manifest: dict, timeframe: str, start_date: str, end_date: str) -> dict:
-    dedicated = timeframe in {"1Min", "5Min"}
+    # One minute only. The dedicated runner evaluates the one-minute tape and derives the
+    # five- and fifteen-minute bars itself as context, so asking it for "5Min" ran exactly
+    # the same computation and stamped a different label on it: the two cached results
+    # were byte-identical apart from the label, and the five-minute tab showed the
+    # one-minute run. Other timeframes fall through to the legacy engine below, which does
+    # read the bars it is named for and is tagged so nothing mistakes it for live.
+    dedicated = timeframe == "1Min"
     cache_path = (
         dedicated_voting_ensemble_cache_path(data_path=data_path, timeframe=timeframe, start_date=start_date, end_date=end_date)
         if dedicated

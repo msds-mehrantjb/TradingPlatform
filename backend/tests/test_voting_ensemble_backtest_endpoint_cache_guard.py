@@ -82,5 +82,50 @@ class VotingEnsembleBacktestEndpointCacheGuardTest(unittest.TestCase):
         self.assertEqual(body["timeframe"], "1Min")
 
 
+class DedicatedReplayIsOneMinuteOnlyTest(unittest.TestCase):
+    """A five-minute request must not be served the one-minute run under another name.
+
+    The runner evaluates the one-minute tape and derives the five- and fifteen-minute bars
+    itself, so asking it for "5Min" ran the same computation and stamped a different label.
+    The two cached files were byte-identical apart from that label, and the panel showed
+    the one-minute run on its five-minute tab.
+    """
+
+    def test_only_one_minute_names_a_dedicated_artifact(self) -> None:
+        data_path = Path("continuous_1m.jsonl")
+        one_minute = main.dedicated_voting_ensemble_cache_path(
+            data_path=data_path, timeframe="1Min", start_date="2020-07-28", end_date="2026-09-01"
+        )
+        self.assertTrue(one_minute.name.startswith("voting_ensemble_dedicated_v2_1Min_"))
+
+        for timeframe in ("5Min", "15Min", "1Hour"):
+            with self.subTest(timeframe=timeframe), self.assertRaises(ValueError):
+                main.dedicated_voting_ensemble_cache_path(
+                    data_path=data_path, timeframe=timeframe, start_date="2020-07-28", end_date="2026-09-01"
+                )
+
+    def test_five_minutes_falls_through_to_the_legacy_engine_and_says_so(self) -> None:
+        # The legacy engine reads the bars it is named for, so a five-minute result is a
+        # real five-minute backtest, tagged so the panel's badge cannot claim it is live.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        five_minute = root / "continuous_5m.jsonl"
+        five_minute.write_text('{"timestamp": "2026-09-01T13:30:00Z", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}\n', encoding="utf-8")
+        manifest = {"symbol": "SPY", "manifest": str(root / "manifest.json"), "files": {"continuous5mJsonl": str(five_minute)}}
+
+        with mock.patch.object(main, "run_voting_ensemble_backtest", return_value={"trades": []}) as legacy:
+            result = main.cached_voting_ensemble_backtest(
+                data_path=five_minute, manifest=manifest, timeframe="5Min", start_date="2020-07-28", end_date="2026-09-01"
+            )
+
+        legacy.assert_called_once()
+        self.assertEqual(result["engine"], "legacy_main_py")
+        self.assertFalse(result["matchesLiveAlgorithm"])
+        self.assertEqual(result["timeframe"], "5Min")
+        # And it is not written where the served dedicated artifact lives.
+        self.assertFalse((root / "voting_ensemble_dedicated_v2_5Min_2020-07-28_2026-09-01.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

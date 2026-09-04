@@ -1,6 +1,10 @@
 """Run the dedicated Voting Ensemble replay against a prepared dataset, into the served cache.
 
-    python scripts/run_voting_ensemble_dedicated_replay.py <manifest.json> [1Min|5Min] [summary.json]
+    python scripts/run_voting_ensemble_dedicated_replay.py <manifest.json> [1Min] [summary.json]
+
+One minute is the only timeframe. The runner evaluates the one-minute tape and derives the
+five- and fifteen-minute bars itself, so a "5Min" run produced the same result under a
+different name.
 
 Uses main.py's own cache function, so the result lands next to the manifest under the name
 `/api/voting-ensemble/backtest` looks for, keyed by the manifest's requested range. The
@@ -57,7 +61,7 @@ def run(manifest_path: Path, timeframe: str, summary_path: Path | None) -> dict:
     start_date = str(manifest["requestedStartDate"])
     end_date = str(manifest["requestedEndDate"])
     files = manifest["files"]
-    data_path = Path(files["continuous5mJsonl"] if timeframe == "5Min" else files["continuous1mJsonl"])
+    data_path = Path(files["continuous1mJsonl"])
 
     started = time.perf_counter()
     result = main.cached_voting_ensemble_backtest(
@@ -84,7 +88,7 @@ if __name__ == "__main__":
     manifest_arg = Path(sys.argv[1])
     timeframe_arg = sys.argv[2] if len(sys.argv) > 2 else "1Min"
     summary_arg = Path(sys.argv[3]) if len(sys.argv) > 3 else None
-    if timeframe_arg not in {"1Min", "5Min"}:
-        raise SystemExit("timeframe must be 1Min or 5Min")
+    if timeframe_arg != "1Min":
+        raise SystemExit("timeframe must be 1Min: the dedicated replay evaluates one-minute bars")
     outcome = run(manifest_arg, timeframe_arg, summary_arg)
     print(json.dumps({k: outcome[k] for k in ("timeframe", "effectiveStartDate", "sessions", "decisionCount", "totalTrades", "netTotalPnl", "elapsedSeconds")}))
