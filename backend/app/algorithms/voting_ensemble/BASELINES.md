@@ -3,11 +3,12 @@
 Record of what the bar-close audit and its follow-up work changed, and what that did to the
 recorded baselines.
 
-## Status: superseded by the 2026-09-03 golden re-record
+## Status: superseded by the 2026-09-05 same-dataset re-record
 
-The reference baseline is now the run recorded at the end of this file, after the audit
-fixes. Every section between here and there is kept for what it measured, and each states
-the configuration it ran under; read them as history, not as the current numbers.
+The reference baseline is now the run recorded at the end of this file, on the dataset the
+application actually serves, with a like-for-like before beside it. Every section between
+here and there is kept for what it measured, and each states the configuration it ran
+under; read them as history, not as the current numbers.
 
 The sections immediately below were written while the baselines genuinely had not moved,
 and their reasoning about why individual changes were inert stays correct. What changed is
@@ -442,7 +443,12 @@ inert and what would feed it:
 
 ## Golden re-record after the audit fixes (recorded 2026-09-03)
 
-This is now the reference baseline. It is the single run taken after every approved audit
+**Superseded by the 2026-09-05 same-dataset re-record at the end of this file.** This run
+was compared against a different dataset with a different capital, so its verdict that the
+corrected algorithm is simply worse does not survive a like-for-like comparison. Kept for
+the configuration it recorded and for the driver arithmetic below, which still holds.
+
+This was the reference baseline. It is the single run taken after every approved audit
 change was committed: entries counted as entries, the candidate sized before it is costed,
 profile multipliers applied once, gapped protective stops filled at the quote, one starting
 equity of 100,000, shorts off with refused shorts shadowed, the family minimum read from
@@ -508,6 +514,70 @@ with any row above. Only this row describes the shipped configuration.
 - **Two-thirds of trades stop out.** 21 of 32, with the trail contributing 9. A trail that
   fires this often on a 6-minute average hold is a tuning question worth its own
   experiment, not something to change silently under a baseline.
+
+Nothing here is promoted by recording it. Promotion still needs real shadow evidence from
+the live path, and this run argues against seeking it yet.
+
+## Reference baseline: same dataset, before and after (recorded 2026-09-05)
+
+This supersedes the 2026-09-03 run above. That one compared two different datasets, which
+made every number non-comparable and hid what the fixes actually did. This is the same
+dataset, the same 15,355 bars and the same 13,990 decisions, run twice: once by the daily
+job on the pre-fix code, once by the corrected code after the branch merged. It is also the
+dataset `/api/voting-ensemble/backtest` serves, so these are the numbers the panel shows.
+
+Dataset `SPY/20260903T201027Z`, timeframe 1Min, requested range 2020-07-28 to 2026-09-03,
+effective start 2026-06-29 where the context streams begin. The pre-fix run is kept beside
+the live cache as `...pre_audit_fixes_20260904.json`.
+
+| | Before (pre-fix) | After (reference) |
+|---|---|---|
+| Settings hash | `6d558ae3820428c0` | `54fae2592a09797b` |
+| Starting capital | 25,000 | 100,000 |
+| Sessions evaluated / traded | 35 / 34 | 35 / 16 |
+| Trades | 123 (36 long, 87 short) | 32, all long |
+| Shares per entry | 3 | 8 to 13 |
+| Win rate | 40.7% | 34.4% |
+| Average R | -0.242 | **-0.233** |
+| Net PnL | -20.63 | -33.24 |
+| **Net as % of capital** | **-0.083%** | **-0.033%** |
+| Gross / costs | +1.51 / 22.14 | -9.42 / 23.82 |
+| Max drawdown (peak to trough) | 20.63, 0.083% of capital | 33.24, **0.033%** of capital |
+| Exits | 74 stop, 49 target | 21 stop, 11 target |
+| Refused shorts (shadow) | not recorded | 80 trades, -66.19 |
+
+**Read the percentage rows, not the dollar rows.** The dollar loss grows from 20.63 to
+33.24 only because the capital grew four times. Against the equity actually at risk the
+corrected algorithm loses less than half as much, 0.033% against 0.083%, and its worst
+peak-to-trough drawdown falls by the same measure. Average R is also marginally better,
+-0.233 against -0.242. An earlier note in this file called the corrected run simply worse;
+that was an artifact of comparing across datasets and capital, and it was wrong.
+
+What still holds, and is not flattered by the normalisation:
+
+- **The algorithm loses money on this sample**, in both configurations. Profit factor 0.70,
+  expectancy -1.04 a trade, final equity 99,966.76.
+- **Costs exceed the edge.** Gross is -9.42 before 23.82 of costs. The pre-fix run had a
+  gross of +1.51 and still finished under water once costs were paid.
+- **Both families lose**: reversal -22.29 on 5 trades, trend -10.95 on 27.
+- **Two-thirds of trades stop out**, 21 of 32.
+- **The shadow evidence argues for keeping shorts off.** The 80 refused shorts, simulated
+  apart from the account, lost 66.19. The pre-fix run took 87 shorts for real.
+
+### Why the trade count fell from 123 to 32
+
+Three approved changes, in order of size:
+
+1. **Shorts are off.** 87 of the 123 were short. They are recorded as shadow trades now and
+   would have lost 66.19.
+2. **The family minimum is read from the settings and is 2.** Fewer candidates survive
+   aggregation, which is why the long side also fell, from 36 to 32.
+3. **Sizing is the minimum over caps against 100,000.** Entries are 8 to 13 shares rather
+   than a flat 3, so each trade carries roughly four times the risk and the daily-loss
+   budget binds sooner.
+
+Sessions traded fell from 34 to 16: the algorithm now stands aside on more than half the
+days it used to trade.
 
 Nothing here is promoted by recording it. Promotion still needs real shadow evidence from
 the live path, and this run argues against seeking it yet.
