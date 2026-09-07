@@ -613,3 +613,43 @@ Re-record, keeping the prior version beside the new one, when any of these happe
 
 A baseline recorded without its enabling configuration cannot be reproduced, so the
 configuration is part of the record, not context around it.
+
+## Operator-editable trading settings (2026-09-07)
+
+Until now nothing an operator typed reached this algorithm. The automatic path resolved
+`resolve_one_minute_trading_settings({})` — the bare baseline — so the dashboard's
+Trading Settings, Target Order and Default Settings panels described a configuration the
+running algorithm never read. The resolver accepted ten override keys; the dashboard
+offered a different set, two of which (`riskBudgetPercentOfOrder`, `positionSizingMode`)
+the backend had already removed because sizing never read them, and its starting capital
+was 25,000 against this baseline's 100,000.
+
+Three pieces close that:
+
+- **`trading_settings/editable.py`** is the registry of what an operator may change. Each
+  field names the read site that makes it take effect, and the list is the single source
+  for the resolver, the API and the dashboard, so those three cannot drift again. Every
+  parameter in the "Inert controls" section above is excluded and reported read-only with
+  its reason instead, because an editable control that changes no trade is worse than an
+  absent one.
+- **`trading_settings/store.py`** holds the overrides in
+  `data/algorithms/voting_ensemble/runtime/trading_settings.json`. Only the overrides are
+  stored, never the resolved settings, so a stored edit stays meaningful when the baseline
+  moves. The resolver itself stays pure — it takes a payload and returns settings, with no
+  hidden state — and the callers that trade are what put the two together. A corrupt file
+  leaves the algorithm on the baseline rather than stopping it.
+- **`GET`/`PUT /api/voting-ensemble/trading-settings`** read and write it. A save is
+  refused, not clamped, when a value is out of range or the combination cannot validate,
+  so a mistyped risk percentage is visible rather than silently different. The resolver
+  still clamps on the read side, because it runs on every bar and must not fail one.
+
+The paths that now resolve the stored overrides: the finalised-bar producer (the automatic
+path that trades), the evaluation service, the runtime command hash, the snapshot builder,
+and `backtest_config_from_live_settings`. Replay following live is that function's stated
+contract; a caller that pins its own payload still wins, so a re-record stays exact.
+
+**The recorded baseline hash `54fae2592a09797b` is unchanged with no overrides stored**, and
+a test asserts it. Nothing about the numbers above moves until an operator saves an edit.
+Once one is saved the hash moves with it, which is condition 10 in the re-record list: a
+baseline recorded under an override is a different configuration, and the override set is
+part of the record.

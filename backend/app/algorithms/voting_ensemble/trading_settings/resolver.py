@@ -12,6 +12,10 @@ from backend.app.algorithms.voting_ensemble.trading_settings.baseline import (
     VOTING_ENSEMBLE_ONE_MINUTE_BASELINE_VERSION,
     one_minute_baseline_settings,
 )
+from backend.app.algorithms.voting_ensemble.trading_settings.editable import (
+    EDITABLE_ONE_MINUTE_FIELDS,
+    EditableTradingSettingField,
+)
 from backend.app.algorithms.voting_ensemble.trading_settings.hashing import trading_settings_hash
 from backend.app.algorithms.voting_ensemble.trading_settings.models import (
     AggregationThresholdSettings,
@@ -43,7 +47,11 @@ from backend.app.algorithms.voting_ensemble.trading_settings.models import (
     VotingEnsembleOneMinuteSettings,
 )
 from backend.app.algorithms.voting_ensemble.trading_settings.profiles import apply_profile_to_config, resolve_dynamic_trading_profile
-from backend.app.algorithms.voting_ensemble.trading_settings.validation import reject_forbidden_runtime_keys, validate_one_minute_settings
+from backend.app.algorithms.voting_ensemble.trading_settings.validation import (
+    TIME_PATTERN,
+    reject_forbidden_runtime_keys,
+    validate_one_minute_settings,
+)
 
 
 def resolve_one_minute_trading_settings(settings_payload: dict[str, Any] | None = None) -> VotingEnsembleOneMinuteSettings:
@@ -162,27 +170,118 @@ def risk_config_hash(config: dict[str, Any]) -> str:
     return trading_settings_hash(config)
 
 
+def effective_override_config(settings_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The baseline with the overrides folded in, before any dynamic profile overlay.
+
+    This is what the settings editor reads back to show the operator the value that will
+    actually trade, rather than echoing what they typed: the registry bounds clamp it and
+    the trade cap is limited by what the daily allocation can fund.
+    """
+    return _apply_payload_overrides(one_minute_baseline_settings(), settings_payload if isinstance(settings_payload, dict) else {})
+
+
 def _apply_payload_overrides(baseline: dict[str, Any], settings_payload: dict[str, Any]) -> dict[str, Any]:
+    """Fold the operator's overrides onto the baseline, one registry field at a time.
+
+    This used to name ten keys by hand, so the other parameters the pipeline reads --
+    the ATR stop multiplier, the trailing geometry, the vote thresholds, the family
+    weights, the session window -- were unreachable from any caller. The registry in
+    `editable.py` is now the list, and every field on it names the read site that makes
+    it take effect, so nothing here can drift from what actually trades.
+
+    Unknown keys are ignored rather than rejected. A payload arriving from an older
+    client still carries `riskBudgetPercentOfOrder` and `positionSizingMode`, neither of
+    which sizing ever read; failing the save would strand that client.
+    """
     config = deepcopy(baseline)
 
-    config["startingCapital"] = _number(settings_payload, "startingCapital", config["startingCapital"], minimum=1000.0, maximum=10_000_000.0)
-    config["orderAllocationPercent"] = _number(settings_payload, "orderAllocationPercent", 10.0, minimum=0.1, maximum=100.0)
-    config["dailyAllocationPercent"] = _number(settings_payload, "dailyAllocationPercent", 30.0, minimum=0.1, maximum=100.0)
-    config["riskPerTradePercent"] = _number(settings_payload, "riskPerTradePercent", config["riskPerTradePercent"], minimum=0.01, maximum=100.0)
-    config["maxDailyLossPercent"] = _number(settings_payload, "maxDailyLossPercent", config["maxDailyLossPercent"], minimum=0.1, maximum=100.0)
+    for spec in EDITABLE_ONE_MINUTE_FIELDS:
+        raw = _payload_value(settings_payload, spec.path)
+        if raw is None:
+            continue
+        value = _coerce_field(spec, raw)
+        if value is None:
+            continue
+        _set_config_value(config, spec.path, value)
+
     # Zero is "no fixed cap": trading for the day is then bounded by the daily-loss,
     # drawdown and exposure limits. A positive cap is still clamped to what the daily
     # allocation can fund at the per-order allocation.
-    requested_max_trades = int(_number(settings_payload, "maxTradesPerDay", config["maxTradesPerDay"], minimum=0, maximum=50))
+    requested_max_trades = int(config["maxTradesPerDay"])
     allocation_trade_cap = max(1, int(config["dailyAllocationPercent"] // max(config["orderAllocationPercent"], 0.1)))
     config["maxTradesPerDay"] = 0 if requested_max_trades <= 0 else min(requested_max_trades, allocation_trade_cap)
-    config["stopLossPercent"] = _number(settings_payload, "stopLossPercent", config["stopLossPercent"], minimum=0.01, maximum=20.0)
-    config["fixedStopDistanceDollars"] = _number(settings_payload, "fixedStopDistanceDollars", config["fixedStopDistanceDollars"], minimum=0.0, maximum=100.0)
-    config["takeProfitR"] = _number(settings_payload, "takeProfitR", config["takeProfitR"], minimum=0.1, maximum=20.0)
-    config["slippagePerShare"] = _number(settings_payload, "slippagePerShare", config["slippagePerShare"], minimum=0.0, maximum=10.0)
-    # A payload may still carry positionSizingMode / riskBudgetPercentOfOrder from an
-    # older client; both are ignored, never rejected, because sizing never read them.
     return config
+
+
+def _payload_value(payload: dict[str, Any], path: tuple[str, ...]) -> Any:
+    """Read one field from the payload, accepting the dotted key or the nested object.
+
+    A client may send `{"familyWeights": {"trend": 1.2}}` or `{"familyWeights.trend": 1.2}`;
+    the dashboard sends the flat form and the stored override file keeps the nested one.
+    """
+    dotted = ".".join(path)
+    if dotted in payload:
+        return payload[dotted]
+    cursor: Any = payload
+    for segment in path:
+        if not isinstance(cursor, dict) or segment not in cursor:
+            return None
+        cursor = cursor[segment]
+    return cursor
+
+
+def _config_value(config: dict[str, Any], path: tuple[str, ...]) -> Any:
+    cursor: Any = config
+    for segment in path:
+        if not isinstance(cursor, dict):
+            return None
+        cursor = cursor.get(segment)
+    return cursor
+
+
+def _set_config_value(config: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
+    cursor = config
+    for segment in path[:-1]:
+        nested = cursor.get(segment)
+        if not isinstance(nested, dict):
+            nested = {}
+            cursor[segment] = nested
+        cursor = nested
+    cursor[path[-1]] = value
+
+
+def _coerce_field(spec: EditableTradingSettingField, raw: Any) -> Any:
+    """Coerce and clamp one override, or return None to keep the baseline value.
+
+    A value that cannot be read as the declared kind is discarded rather than raised on:
+    the alternative is one malformed field failing a whole save, and the resolver runs on
+    every evaluation, not only on an operator edit.
+    """
+    if spec.kind == "boolean":
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str) and raw.strip().lower() in {"true", "false"}:
+            return raw.strip().lower() == "true"
+        return None
+    if spec.kind == "choice":
+        candidate = str(raw).strip()
+        return candidate if candidate in spec.choices else None
+    if spec.kind == "time":
+        candidate = str(raw).strip()
+        return candidate if TIME_PATTERN.match(candidate) else None
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    if spec.minimum is not None:
+        number = max(float(spec.minimum), number)
+    if spec.maximum is not None:
+        number = min(float(spec.maximum), number)
+    if spec.kind == "integer":
+        return int(round(number))
+    return number
 
 
 def _settings_model_payload(config: dict[str, Any], profile: dict[str, Any], *, configuration_hash: str) -> dict[str, Any]:
@@ -348,11 +447,3 @@ def _resolved_profile_settings(config: dict[str, Any], profile: dict[str, Any]) 
 def _one_minute_only_config(config: dict[str, Any]) -> dict[str, Any]:
     baseline = one_minute_baseline_settings()
     return {key: deepcopy(config.get(key, value)) for key, value in baseline.items()}
-
-
-def _number(payload: dict[str, Any], name: str, default: float, *, minimum: float, maximum: float) -> float:
-    try:
-        value = float(payload.get(name, default))
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, min(maximum, value))

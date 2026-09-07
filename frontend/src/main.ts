@@ -19,6 +19,18 @@ import {
   withWcaRuntimeControlReady,
 } from "./features/wca/state";
 import { renderWcaPanel } from "./features/wca/WcaPanel";
+import {
+  changedOverrides as votingEnsembleChangedOverrides,
+  fetchVotingEnsembleTradingSettings,
+  hasPendingEdits as votingEnsembleHasPendingEdits,
+  readFieldInput as readVotingEnsembleFieldInput,
+  resetVotingEnsembleTradingSettings,
+  saveVotingEnsembleTradingSettings,
+  type VotingEnsembleSettingField,
+  type VotingEnsembleSettingValue,
+  type VotingEnsembleTradingSettingsView,
+} from "./trading-settings/voting-ensemble";
+import { renderVotingEnsembleTradingSettings } from "./trading-settings/voting-ensemble-panel";
 import type { WcaBacktestResult, WcaDecision, WcaRuntimeControl } from "./features/wca/types";
 
 type Timeframe = "1Min" | "3Min" | "5Min" | "15Min" | "1Hour" | "1Day";
@@ -2132,7 +2144,6 @@ type PersistedUiState = {
   metaStrategiesExpanded?: boolean;
   metaChecksExpanded?: boolean;
   tradingSettingsExpanded?: boolean;
-  votingDefaultSizingExpanded?: boolean;
   weightedTradingSettingsExpanded?: boolean;
   weightedDefaultSettingsExpanded?: boolean;
   weightedVotingExpandableDefaultsVersion?: number;
@@ -2215,7 +2226,6 @@ function saveUiState() {
     metaStrategiesExpanded: state.metaStrategiesExpanded,
     metaChecksExpanded: state.metaChecksExpanded,
     tradingSettingsExpanded: state.tradingSettingsExpanded,
-    votingDefaultSizingExpanded: state.votingDefaultSizingExpanded,
     weightedTradingSettingsExpanded: state.weightedTradingSettingsExpanded,
     weightedDefaultSettingsExpanded: state.weightedDefaultSettingsExpanded,
     weightedVotingExpandableDefaultsVersion,
@@ -3239,6 +3249,14 @@ const state = {
   metaStrategyLatestDecision: null as Record<string, unknown> | null,
   metaStrategyLatestDecisionStatus: "idle" as "idle" | "loading" | "ready" | "error",
   metaStrategyLatestDecisionWarning: "",
+  // The backend-owned trading settings. `draft` holds edits the operator has typed
+  // but not saved; the algorithm keeps trading the saved values until they do.
+  votingEnsembleSettingsView: null as VotingEnsembleTradingSettingsView | null,
+  votingEnsembleSettingsStatus: "idle" as "idle" | "loading" | "ready" | "saving" | "error",
+  votingEnsembleSettingsWarning: "",
+  votingEnsembleSettingsDraft: {} as Record<string, VotingEnsembleSettingValue>,
+  votingEnsembleSettingsGroupsExpanded: {} as Record<string, boolean>,
+  votingEnsembleSettingsShowInert: false,
   votingEnsemblePaperInventory: emptyVotingEnsemblePaperInventory(),
   votingEnsemblePaperInventoryStatus: "idle" as "idle" | "loading" | "ready" | "error",
   votingEnsemblePaperInventoryWarning: "",
@@ -3307,7 +3325,6 @@ const state = {
   tradingRagWarning: "",
   tradingSettings: loadTradingSettings(),
   tradingSettingsExpanded: true,
-  votingDefaultSizingExpanded: persistedUiState.votingDefaultSizingExpanded ?? false,
   weightedTradingSettings: loadWeightedTradingSettings(),
   weightedTradingSettingsExpanded: persistedUiState.weightedTradingSettingsExpanded ?? true,
   weightedDefaultSettingsExpanded: persistedUiState.weightedDefaultSettingsExpanded ?? false,
@@ -5056,6 +5073,75 @@ algoBacktestTradingButton.addEventListener("click", () => {
   void setAlgoBacktestTimeframe("Trading");
 });
 
+function handleVotingEnsembleSettingChange(event: Event) {
+  const element = (event.target as HTMLElement).closest<HTMLInputElement | HTMLSelectElement>("[data-ve-setting]");
+  if (!element) {
+    return;
+  }
+  const key = element.dataset.veSetting;
+  if (!key) {
+    return;
+  }
+  const field = votingEnsembleSettingsField(key);
+  if (!field) {
+    return;
+  }
+  const value = readVotingEnsembleFieldInput(field, element);
+  if (value === undefined) {
+    // A field cleared mid-edit: drop the pending value rather than storing a blank, so
+    // the saved configuration keeps whatever the backend already has for it.
+    delete state.votingEnsembleSettingsDraft[key];
+  } else {
+    state.votingEnsembleSettingsDraft = { ...state.votingEnsembleSettingsDraft, [key]: value };
+  }
+  // A checkbox or select is a completed edit and can re-render; typing in a number field
+  // must not, or the input loses focus on every keystroke. The action buttons still need
+  // to enable, so a "change" (blur or Enter) repaints.
+  if (event.type !== "input" || element instanceof HTMLSelectElement || (element as HTMLInputElement).type === "checkbox") {
+    updateTradingSettingsMount(state.currentTargetOrder ?? undefined);
+  }
+}
+
+document.addEventListener("input", handleVotingEnsembleSettingChange);
+document.addEventListener("change", handleVotingEnsembleSettingChange);
+
+document.addEventListener("click", (event) => {
+  const groupToggle = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-ve-group-toggle]");
+  if (groupToggle) {
+    const group = groupToggle.dataset.veGroupToggle ?? "";
+    const expanded = state.votingEnsembleSettingsGroupsExpanded[group] ?? true;
+    state.votingEnsembleSettingsGroupsExpanded = { ...state.votingEnsembleSettingsGroupsExpanded, [group]: !expanded };
+    updateTradingSettingsMount(state.currentTargetOrder ?? undefined);
+    return;
+  }
+  const action = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-ve-settings-action]");
+  if (!action) {
+    return;
+  }
+  switch (action.dataset.veSettingsAction) {
+    case "save":
+      void saveVotingEnsembleTradingSettingsToBackend();
+      break;
+    case "revert":
+      state.votingEnsembleSettingsDraft = {};
+      state.votingEnsembleSettingsWarning = "";
+      updateTradingSettingsMount(state.currentTargetOrder ?? undefined);
+      break;
+    case "reset":
+      void resetVotingEnsembleTradingSettingsToBaseline();
+      break;
+    case "refresh":
+      void loadVotingEnsembleTradingSettings({ force: true });
+      break;
+    case "toggle-inert":
+      state.votingEnsembleSettingsShowInert = !state.votingEnsembleSettingsShowInert;
+      updateTradingSettingsMount(state.currentTargetOrder ?? undefined);
+      break;
+    default:
+      break;
+  }
+});
+
 function handleTradingSettingChange(event: Event) {
   const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-trading-setting]");
   if (!input) {
@@ -5690,16 +5776,6 @@ document.addEventListener("click", (event) => {
     return;
   }
   state.tradingSettingsExpanded = !state.tradingSettingsExpanded;
-  saveUiState();
-  updateAlgorithmPanel(visibleCandles());
-});
-
-document.addEventListener("click", (event) => {
-  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("#tradingDefaultSizingToggle");
-  if (!button) {
-    return;
-  }
-  state.votingDefaultSizingExpanded = !state.votingDefaultSizingExpanded;
   saveUiState();
   updateAlgorithmPanel(visibleCandles());
 });
@@ -18279,11 +18355,13 @@ function updateTradingSettingsMount(order?: ManualOrderRecommendation, options: 
   }
   const key = JSON.stringify({
     expanded: state.tradingSettingsExpanded,
-    defaultSizingExpanded: state.votingDefaultSizingExpanded,
-    settings: state.tradingSettings,
-    artifactStatus: state.dynamicArtifactStatus,
-    artifactSettingsKey: state.dynamicArtifactSettingsKey,
-    artifactId: state.dynamicArtifact?.artifactId ?? "",
+    status: state.votingEnsembleSettingsStatus,
+    warning: state.votingEnsembleSettingsWarning,
+    hash: state.votingEnsembleSettingsView?.configurationHash ?? "",
+    updatedAt: state.votingEnsembleSettingsView?.updatedAt ?? "",
+    draft: state.votingEnsembleSettingsDraft,
+    groups: state.votingEnsembleSettingsGroupsExpanded,
+    showInert: state.votingEnsembleSettingsShowInert,
     order: order ?? null,
   });
   if (key === tradingSettingsMountKey) {
@@ -18302,40 +18380,172 @@ function isEditingWithin(container: HTMLElement) {
   );
 }
 
+/**
+ * Copy the backend-resolved values onto the local settings object.
+ *
+ * The target-order preview, the artifact key and the sizing readouts all read
+ * `state.tradingSettings`, which used to be seeded from a hard-coded
+ * `defaultTradingSettings()` that had drifted from the backend baseline -- 25,000 of
+ * starting capital against 100,000, an ATR multiplier of 2 against 1.5, a ten-trade cap
+ * against no cap at all. Mirroring here means those readouts describe the configuration
+ * the algorithm actually trades, without touching the other four algorithms, which keep
+ * their own scope and their own storage key.
+ */
+function applyBackendSettingsToLocalTradingSettings(view: VotingEnsembleTradingSettingsView) {
+  const resolved = new Map<string, VotingEnsembleSettingValue>();
+  for (const group of view.groups) {
+    for (const field of group.fields) {
+      if (field.value !== null) {
+        resolved.set(field.key, field.value as VotingEnsembleSettingValue);
+      }
+    }
+  }
+  const numberOf = (key: string, fallback: number) => {
+    const value = resolved.get(key);
+    return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  };
+  const current = state.tradingSettings;
+  const riskPercent = numberOf("riskPerTradePercent", current.baseRiskPercent);
+  const orderAllocation = numberOf("orderAllocationPercent", current.orderAllocationPercent);
+  const dailyAllocation = numberOf("dailyAllocationPercent", current.dailyAllocationPercent);
+  const positionPercent = numberOf("maximumPositionPercent", current.maxPositionPercent);
+  const targetR = numberOf("takeProfitR", current.takeProfitR);
+  const holdingMinutes = numberOf("maximumHoldingMinutes", current.baseMaximumHoldingMinutes);
+  const slippage = numberOf("slippagePerShare", current.slippagePerShare);
+  const atrMultiplier = numberOf("stopAtrMultiplier", current.atrStopMultiplier);
+  const voteEdge = numberOf("minVoteEdge", current.minimumSignalEdge);
+
+  state.tradingSettings = sanitizeTradingSettings(
+    {
+      ...current,
+      startingCapital: numberOf("startingCapital", current.startingCapital),
+      orderAllocationPercent: orderAllocation,
+      dailyAllocationPercent: dailyAllocation,
+      maxTradesPerDay: numberOf("maxTradesPerDay", current.maxTradesPerDay),
+      stopLossPercent: numberOf("stopLossPercent", current.stopLossPercent),
+      fixedStopDistanceDollars: numberOf("fixedStopDistanceDollars", current.fixedStopDistanceDollars),
+      takeProfitR: targetR,
+      slippagePerShare: slippage,
+      baseSlippagePerShare: slippage,
+      baseRiskPercent: riskPercent,
+      maximumRiskPerTradePercent: riskPercent,
+      basePositionPercent: positionPercent,
+      maxPositionPercent: positionPercent,
+      baseOrderAllocationPercent: orderAllocation,
+      maximumOrderNotionalPercent: orderAllocation,
+      baseDailyAllocationPercent: dailyAllocation,
+      maximumDailyNotionalPercent: dailyAllocation,
+      baseAtrStopMultiplier: atrMultiplier,
+      atrStopMultiplier: atrMultiplier,
+      baseTargetR: targetR,
+      baseMaximumHoldingMinutes: holdingMinutes,
+      maxDailyLossPercent: numberOf("maxDailyLossPercent", current.maxDailyLossPercent),
+      maxAllowedShares: numberOf("maxShareQuantity", current.maxAllowedShares),
+      maximumSpreadBps: numberOf("maximumSpreadBps", current.maximumSpreadBps),
+      minimumSignalEdge: voteEdge,
+      minimumBuyScore: voteEdge,
+      newEntryCutoff: String(resolved.get("newTradesUntil") ?? current.newEntryCutoff),
+    },
+    VOTING_MAX_ORDER_ALLOCATION_PERCENT,
+  );
+  saveTradingSettings(state.tradingSettings);
+}
+
+function votingEnsembleSettingsPanelState() {
+  const view = state.votingEnsembleSettingsView;
+  return {
+    view,
+    status: state.votingEnsembleSettingsStatus,
+    warning: state.votingEnsembleSettingsWarning,
+    draft: state.votingEnsembleSettingsDraft,
+    expanded: state.tradingSettingsExpanded,
+    expandedGroups: state.votingEnsembleSettingsGroupsExpanded,
+    showInert: state.votingEnsembleSettingsShowInert,
+    dirty: view ? votingEnsembleHasPendingEdits(view, state.votingEnsembleSettingsDraft) : false,
+  };
+}
+
+function votingEnsembleSettingsField(key: string): VotingEnsembleSettingField | null {
+  const view = state.votingEnsembleSettingsView;
+  if (!view) {
+    return null;
+  }
+  for (const group of view.groups) {
+    for (const field of group.fields) {
+      if (field.key === key) {
+        return field;
+      }
+    }
+  }
+  return null;
+}
+
+async function loadVotingEnsembleTradingSettings(options: { force?: boolean } = {}) {
+  if (!options.force && state.votingEnsembleSettingsStatus === "loading") {
+    return;
+  }
+  state.votingEnsembleSettingsStatus = "loading";
+  state.votingEnsembleSettingsWarning = "";
+  updateTradingSettingsMount(state.currentTargetOrder ?? undefined);
+  try {
+    state.votingEnsembleSettingsView = await fetchVotingEnsembleTradingSettings();
+    applyBackendSettingsToLocalTradingSettings(state.votingEnsembleSettingsView);
+    // A reload is the operator's own request for the backend's truth, so pending edits
+    // are dropped rather than left sitting on top of values that may have moved.
+    state.votingEnsembleSettingsDraft = {};
+    state.votingEnsembleSettingsStatus = "ready";
+  } catch (error) {
+    state.votingEnsembleSettingsStatus = "error";
+    state.votingEnsembleSettingsWarning = error instanceof Error ? error.message : "Voting Ensemble trading settings unavailable.";
+  }
+  updateTradingSettingsMount(state.currentTargetOrder ?? undefined);
+}
+
+async function saveVotingEnsembleTradingSettingsToBackend() {
+  const view = state.votingEnsembleSettingsView;
+  if (!view) {
+    return;
+  }
+  state.votingEnsembleSettingsStatus = "saving";
+  state.votingEnsembleSettingsWarning = "";
+  updateTradingSettingsMount(state.currentTargetOrder ?? undefined);
+  try {
+    const saved = await saveVotingEnsembleTradingSettings(votingEnsembleChangedOverrides(view, state.votingEnsembleSettingsDraft));
+    state.votingEnsembleSettingsView = saved;
+    applyBackendSettingsToLocalTradingSettings(saved);
+    state.votingEnsembleSettingsDraft = {};
+    state.votingEnsembleSettingsStatus = "ready";
+  } catch (error) {
+    // The edits stay in the draft on failure: a rejected save is usually one bad value,
+    // and discarding the rest would make the operator retype the whole change.
+    state.votingEnsembleSettingsStatus = "error";
+    state.votingEnsembleSettingsWarning = error instanceof Error ? error.message : "Voting Ensemble settings save failed.";
+  }
+  updateTradingSettingsMount(state.currentTargetOrder ?? undefined);
+}
+
+async function resetVotingEnsembleTradingSettingsToBaseline() {
+  state.votingEnsembleSettingsStatus = "saving";
+  state.votingEnsembleSettingsWarning = "";
+  updateTradingSettingsMount(state.currentTargetOrder ?? undefined);
+  try {
+    state.votingEnsembleSettingsView = await resetVotingEnsembleTradingSettings();
+    applyBackendSettingsToLocalTradingSettings(state.votingEnsembleSettingsView);
+    state.votingEnsembleSettingsDraft = {};
+    state.votingEnsembleSettingsStatus = "ready";
+  } catch (error) {
+    state.votingEnsembleSettingsStatus = "error";
+    state.votingEnsembleSettingsWarning = error instanceof Error ? error.message : "Voting Ensemble settings reset failed.";
+  }
+  updateTradingSettingsMount(state.currentTargetOrder ?? undefined);
+}
+
 function renderTradingSettingsPanel(order?: ManualOrderRecommendation) {
-  const settings = state.tradingSettings;
-  const artifact = state.dynamicArtifact;
-  const settingsKey = tradingSettingsKey(settings);
-  const artifactMatches = state.dynamicArtifactStatus === "ready" && state.dynamicArtifactSettingsKey === settingsKey;
-  const status = dynamicArtifactStatusLabel();
-  const best = artifact?.mlComparison?.bestByTimeframe?.find((row) => row.verdict === "Improved") ?? artifact?.mlComparison?.bestByTimeframe?.[0];
-  const expanded = state.tradingSettingsExpanded;
-  return `
-    <div class="trading-settings-panel" data-status="${escapeHtml(status.toLowerCase().replaceAll(" ", "-"))}" data-expanded="${String(expanded)}">
-      <button id="tradingSettingsToggle" class="trading-settings-head" type="button" aria-expanded="${String(expanded)}" aria-controls="tradingSettingsBody">
-        <span class="trading-settings-title">
-          <b>${expanded ? "-" : "+"}</b>
-          <strong>Trading Settings</strong>
-        </span>
-        <span class="trading-settings-summary">${escapeHtml(dynamicArtifactSummaryText(artifactMatches, best))}</span>
-      </button>
-      <div id="tradingSettingsBody" class="trading-settings-body" ${expanded ? "" : "hidden"}>
-        <div class="trading-settings-grid">
-          ${renderTradingSettingInput("startingCapital", "Total balance", settings.startingCapital, 1000, 10000000, 100)}
-          ${renderTradingSettingInput("orderAllocationPercent", "Order limit %", settings.orderAllocationPercent, 0.1, VOTING_MAX_ORDER_ALLOCATION_PERCENT, 0.1)}
-          ${renderTradingSettingInput("dailyAllocationPercent", "Daily max %", settings.dailyAllocationPercent, 0.1, 100, 0.1)}
-          ${renderTradingSettingInput("riskBudgetPercentOfOrder", "Risk budget %", settings.riskBudgetPercentOfOrder, 0.1, 100, 0.1)}
-          ${renderTradingSettingInput("maxTradesPerDay", "Max trades/day", settings.maxTradesPerDay, 1, 50, 1)}
-          ${renderTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
-          ${renderTradingSettingInput("stopLossPercent", "Stop %", settings.stopLossPercent, 0.01, 20, 0.01)}
-          ${renderTradingSettingInput("takeProfitR", "Target R", settings.takeProfitR, 0.1, 20, 0.1)}
-          ${renderTradingSettingInput("slippagePerShare", "Slippage/share", settings.slippagePerShare, 0, 10, 0.01)}
-        </div>
-        ${order ? renderTargetOrderSettings(order) : ""}
-        ${renderTradingDefaultSizingSection(settings)}
-      </div>
-    </div>
-  `;
+  // The three sections an operator manages trades through -- Trading Settings, Target
+  // Order and Default Settings -- are now the backend's own field groups, so what is
+  // shown here is exactly what the pipeline resolves. The target-order preview below
+  // them is the order those parameters currently produce.
+  return renderVotingEnsembleTradingSettings(votingEnsembleSettingsPanelState(), order ? renderTargetOrderSettings(order) : "");
 }
 
 function updateWeightedTradingSettingsMount() {
@@ -18600,7 +18810,11 @@ function nullableBackendNumber(value: unknown) {
 function renderTargetOrderSettings(order: ManualOrderRecommendation) {
   return `
     <div class="target-settings-panel" data-side="${escapeHtml(order.side.toLowerCase())}">
-      <strong>Target Order</strong>
+      <div class="target-settings-head">
+        <strong>Target Order</strong>
+        ${renderTradingSettingToggle("useDefaultSizingSettings", "Use resolved sizing", state.tradingSettings.useDefaultSizingSettings)}
+      </div>
+      <p class="target-settings-note">Sized from the saved Voting Ensemble settings above. Turn the toggle off to override a field by hand for a manual submit.</p>
       ${renderTargetOrderBlockers(order)}
       <div class="target-settings-grid">
         ${renderTargetSettingInput("accountBalance", "Total balance", order.accountBalance, "number", 0.01)}
@@ -18690,22 +18904,6 @@ function renderTargetSettingSelect(
   `;
 }
 
-function renderTradingSettingInput(
-  name: keyof TradingSettings,
-  label: string,
-  value: number,
-  min: number,
-  max: number,
-  step: number,
-) {
-  return `
-    <label>
-      <span>${escapeHtml(label)}</span>
-      <input data-trading-setting="${escapeHtml(name)}" type="number" min="${min}" max="${max}" step="${step}" value="${value}" />
-    </label>
-  `;
-}
-
 function renderTradingSettingToggle(
   name: keyof TradingSettings,
   label: string,
@@ -18716,36 +18914,6 @@ function renderTradingSettingToggle(
       <span>${escapeHtml(label)}</span>
       <input data-trading-setting="${escapeHtml(name)}" type="checkbox" ${checked ? "checked" : ""} />
     </label>
-  `;
-}
-
-function renderTradingDefaultSizingSection(settings: TradingSettings) {
-  const expanded = state.votingDefaultSizingExpanded;
-  return `
-    <div class="trading-default-section" data-expanded="${String(expanded)}">
-      <div class="trading-default-head">
-        <button id="tradingDefaultSizingToggle" class="trading-default-expand" type="button" aria-expanded="${String(expanded)}" aria-controls="tradingDefaultSizingBody">
-          <b>${expanded ? "-" : "+"}</b>
-          <strong>Default Settings</strong>
-        </button>
-        ${renderTradingSettingToggle("useDefaultSizingSettings", "On / Off", settings.useDefaultSizingSettings)}
-      </div>
-      <div id="tradingDefaultSizingBody" class="trading-default-body" ${expanded ? "" : "hidden"}>
-        <div class="trading-settings-grid trading-default-grid">
-          ${renderTradingSettingInput("minimumBuyScore", "Minimum buy score", settings.minimumBuyScore, 0, 1, 0.01)}
-          ${renderTradingSettingInput("minimumSignalEdge", "Minimum signal edge", settings.minimumSignalEdge, 0, 1, 0.01)}
-          ${renderTradingSettingInput("baseRiskPercent", "Base risk %", settings.baseRiskPercent, 0.01, 10, 0.01)}
-          ${renderTradingSettingInput("maxPositionPercent", "Max position %", settings.maxPositionPercent, 0.1, 100, 0.1)}
-          ${renderTradingSettingInput("fixedStopDistanceDollars", "Stop $/share", settings.fixedStopDistanceDollars, 0, 100, 0.01)}
-          ${renderTradingSettingInput("atrStopMultiplier", "ATR stop multiplier", settings.atrStopMultiplier, 0.1, 10, 0.1)}
-          ${renderTradingSettingInput("minimumStopDistancePercent", "Min stop distance %", settings.minimumStopDistancePercent, 0.001, 5, 0.001)}
-          ${renderTradingSettingInput("maxParticipationPercent", "Max participation %", settings.maxParticipationPercent, 0.001, 10, 0.001)}
-          ${renderTradingSettingInput("maxAllowedShares", "Max shares (0 auto)", settings.maxAllowedShares, 0, 1000000, 1)}
-          ${renderTradingSettingInput("maxDailyLossPercent", "Max daily loss %", settings.maxDailyLossPercent, 0.1, 10, 0.1)}
-          ${renderTradingSettingToggle("pyramidingEnabled", "Pyramiding", settings.pyramidingEnabled)}
-        </div>
-      </div>
-    </div>
   `;
 }
 
@@ -24449,6 +24617,7 @@ void loadSpyNews();
 void loadEsSnapshot();
 void loadVotingEnsembleInventory();
 void loadVotingEnsembleRuntimeControl();
+void loadVotingEnsembleTradingSettings();
 void loadWeightedVotingRuntimeControl();
 void loadMetaStrategyPaperControl();
 void loadMetaStrategyReadinessStatus();

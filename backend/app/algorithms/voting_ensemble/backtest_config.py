@@ -132,8 +132,13 @@ def backtest_config_from_live_settings(settings_payload: dict[str, Any] | None =
     Explicit overrides win, so a caller can still pin a recorded run's exact policy.
     """
     from backend.app.algorithms.voting_ensemble.trading_settings.resolver import resolve_one_minute_trading_settings
+    from backend.app.algorithms.voting_ensemble.trading_settings.store import merged_settings_payload
 
-    settings = resolve_one_minute_trading_settings(settings_payload)
+    # Stored operator overrides sit underneath the caller's payload for the same reason
+    # the rest of this function derives from the live resolution: a replay run with no
+    # settings of its own has to describe the configuration that is actually trading. A
+    # caller that pins a recorded run's payload still wins, so re-records stay exact.
+    settings = resolve_one_minute_trading_settings(merged_settings_payload(settings_payload))
     windows = getattr(settings, "sessionWindows", None)
     segments = getattr(windows, "sessionSegments", None) if windows is not None else None
     if segments is None:

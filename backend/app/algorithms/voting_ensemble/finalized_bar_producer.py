@@ -39,6 +39,7 @@ from backend.app.algorithms.voting_ensemble.runtime.commands import (
     VotingEnsembleRuntimeCommand,
 )
 from backend.app.algorithms.voting_ensemble.trading_settings.resolver import resolve_one_minute_trading_settings
+from backend.app.algorithms.voting_ensemble.trading_settings.store import stored_trading_settings_overrides
 
 
 VOTING_ENSEMBLE_FINALIZED_BAR_PRODUCER_VERSION = "voting_ensemble_finalized_bar_producer_v1"
@@ -582,7 +583,10 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
         )
         breadth_feed = _breadth_feed_from_components(breadth_components, event, observation_time)
         daily_counters = _daily_counters_from_inventory(inventory, event)
-        settings = resolve_one_minute_trading_settings({})
+        # The operator's saved overrides, not a bare baseline. This is the automatic
+        # path that trades the paper account: resolving `{}` here meant every edit an
+        # operator made in the dashboard was invisible to the algorithm that trades.
+        settings = resolve_one_minute_trading_settings(stored_trading_settings_overrides())
         try:
             global_gate = (
                 self.global_risk_provider(event=event.snapshot(), control=control, accountRiskSnapshot=account_risk, inventory=inventory)

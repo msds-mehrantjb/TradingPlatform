@@ -54,6 +54,7 @@ from backend.app.algorithms.voting_ensemble.strategies.registry import (
     voting_ensemble_inventory_status,
 )
 from backend.app.algorithms.voting_ensemble.trading_settings.resolver import resolve_one_minute_trading_settings
+from backend.app.algorithms.voting_ensemble.trading_settings.store import merged_settings_payload
 from backend.app.algorithms.voting_ensemble.risk_budget import resolve_voting_ensemble_risk_budget
 from backend.app.market_feed import active_instrument, instrument_for_symbol
 from backend.app.domain.models import AccountRiskState, BaselineTradingSettings, ContextSignal, Direction, DynamicPolicyBounds, EffectiveTradePolicy, EnsembleDecision, GateStatus, GlobalGateDecision, HardRiskLimits, OperatingMode, OrderPlan, Signal, StrategyFamily, StrategyRole, StrategySignal, TradeCandidate
@@ -248,7 +249,9 @@ class VotingEnsembleService:
             )
             return response_payload
 
-        settings = resolve_one_minute_trading_settings(_settings_payload(payload))
+        # Stored overrides underneath whatever the caller sent, so a manual evaluation
+        # and the automatic bar resolve the same configuration.
+        settings = resolve_one_minute_trading_settings(merged_settings_payload(_settings_payload(payload)))
         request = VotingEnsembleEvaluateRequest.model_validate(snapshot.to_evaluate_payload())
         regime_state = self.regime_classifier.evaluate_snapshot(snapshot)
         upstream_global_gate = _upstream_global_gate_decision(snapshot)

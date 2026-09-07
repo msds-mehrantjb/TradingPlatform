@@ -6,6 +6,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, status
+# This module defines its own `status` endpoint further down, which shadows the FastAPI
+# module inside any function body. Decorators are evaluated before that happens; request
+# handlers are not, so a status code used at request time is imported by name.
+from starlette.status import HTTP_422_UNPROCESSABLE_ENTITY
 from pydantic import BaseModel, ConfigDict
 
 from backend.app.algorithms.voting_ensemble.models import VotingEnsembleEvaluateRequest
@@ -14,6 +18,13 @@ from backend.app.algorithms.voting_ensemble.runtime.orchestrator import VOTING_E
 from backend.app.algorithms.voting_ensemble.runtime.status_store import VotingEnsembleJobNotFound, VotingEnsembleJobNotReady
 from backend.app.algorithms.voting_ensemble.runtime_supervisor import get_voting_ensemble_runtime_supervisor
 from backend.app.algorithms.voting_ensemble.service import VotingEnsembleService, voting_ensemble_service_runtime_bindings
+from backend.app.algorithms.voting_ensemble.trading_settings.store import (
+    override_validation_errors,
+    split_known_override_keys,
+    trading_settings_repository,
+)
+from backend.app.algorithms.voting_ensemble.trading_settings.resolver import resolve_one_minute_trading_settings
+from backend.app.algorithms.voting_ensemble.trading_settings.view import trading_settings_view
 
 
 router = APIRouter(prefix="/api/voting-ensemble", tags=["voting-ensemble"])
@@ -73,6 +84,81 @@ def replay(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 @router.post("/settings-refresh", status_code=status.HTTP_202_ACCEPTED, summary="Enqueue Voting Ensemble settings refresh")
 def settings_refresh(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     return _job_response(_runtime_boundary().enqueue_settings_refresh(payload))
+
+
+class VotingEnsembleTradingSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    overrides: dict[str, Any] = {}
+    updatedBy: str = "operator"
+    reason: str = ""
+    # A reset stores an empty override set, which is not the same as sending `{}` by
+    # accident: the flag says the operator meant to go back to the baseline.
+    reset: bool = False
+
+
+@router.get("/trading-settings", summary="Voting Ensemble editable one-minute trading settings")
+def trading_settings() -> dict[str, Any]:
+    return trading_settings_view(trading_settings_repository().load_record())
+
+
+@router.put("/trading-settings", summary="Update Voting Ensemble one-minute trading settings")
+def update_trading_settings(payload: VotingEnsembleTradingSettingsUpdate) -> dict[str, Any]:
+    """Persist the operator's overrides and put them in front of the trading paths.
+
+    The save is refused rather than clamped when a value is out of range, so an operator
+    who mistypes a risk percentage sees the mistake instead of a silently different
+    number. The resolver still clamps on the read side, because it runs on every bar and
+    must never fail one.
+    """
+    requested = {} if payload.reset else dict(payload.overrides or {})
+    accepted, ignored = split_known_override_keys(requested)
+    errors = override_validation_errors(accepted)
+    if errors:
+        raise HTTPException(
+            status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reasonCodes": ["voting_ensemble.trading_settings.invalid_override"],
+                "errors": errors,
+            },
+        )
+    try:
+        # Resolving before the write is what stops a cross-field contradiction -- an
+        # order allocation above the daily allocation, a session window out of order --
+        # from being persisted and then failing on every subsequent evaluation.
+        resolve_one_minute_trading_settings(accepted)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reasonCodes": ["voting_ensemble.trading_settings.invalid_combination"],
+                "errors": [str(exc)],
+            },
+        ) from exc
+
+    record = trading_settings_repository().save(
+        accepted,
+        updated_by=payload.updatedBy,
+        reason=payload.reason or ("reset to baseline" if payload.reset else "operator update"),
+    )
+    view = trading_settings_view(record)
+    # Tell the runtime its configuration moved. The trading paths read the store on the
+    # next bar regardless, so this is the audit record rather than the delivery.
+    try:
+        refresh = _runtime_boundary().enqueue_settings_refresh(
+            {
+                "settingsHash": view["configurationHash"],
+                "reason": "voting_ensemble.trading_settings.operator_update",
+                "overriddenKeys": view["overriddenKeys"],
+            }
+        )
+        view["settingsRefreshJobId"] = refresh.get("jobId") or refresh.get("job_id")
+    except Exception:
+        view["settingsRefreshJobId"] = None
+        view["reasonCodes"] = [*view["reasonCodes"], "voting_ensemble.trading_settings.refresh_enqueue_unavailable"]
+    view["ignoredKeys"] = sorted({*view.get("ignoredKeys", []), *ignored})
+    view["reasonCodes"] = [*view["reasonCodes"], "voting_ensemble.trading_settings.updated"]
+    return view
 
 
 @router.post("/recovery-reconciliation", status_code=status.HTTP_202_ACCEPTED, summary="Enqueue Voting Ensemble recovery reconciliation")

@@ -211,8 +211,13 @@ def _payload_settings_hash(payload: dict[str, Any]) -> str:
         return str(explicit)
     settings_payload = payload.get("settings") or payload.get("tradingSettings") or {}
     from backend.app.algorithms.voting_ensemble.trading_settings.resolver import resolve_one_minute_trading_settings
+    from backend.app.algorithms.voting_ensemble.trading_settings.store import merged_settings_payload
 
-    return resolve_one_minute_trading_settings(settings_payload).configurationHash
+    # The hash has to describe the settings the command will be evaluated under, which
+    # are the stored overrides unless the caller named its own. A hash taken from the
+    # bare baseline would make two commands under different settings share an
+    # idempotency key and collapse into one.
+    return resolve_one_minute_trading_settings(merged_settings_payload(settings_payload)).configurationHash
 
 
 def _idempotency_key(

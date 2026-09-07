@@ -19,6 +19,7 @@ from backend.app.algorithms.voting_ensemble.snapshot.models import (
     VotingEnsembleReadinessDecision,
 )
 from backend.app.algorithms.voting_ensemble.trading_settings.resolver import resolve_one_minute_trading_settings
+from backend.app.algorithms.voting_ensemble.trading_settings.store import merged_settings_payload
 from backend.app.algorithms.voting_ensemble.trading_settings.hashing import trading_settings_hash
 
 
@@ -133,7 +134,7 @@ def _payload_settings_hash(payload: dict[str, Any]) -> str:
     explicit = context.get("settingsHash") or context.get("settings_hash") or payload.get("settingsHash")
     if explicit:
         return str(explicit)
-    return resolve_one_minute_trading_settings(payload.get("settings") or payload.get("tradingSettings") or {}).configurationHash
+    return resolve_one_minute_trading_settings(merged_settings_payload(payload.get("settings") or payload.get("tradingSettings") or {})).configurationHash
 
 
 def _finalized_prefix(raw_candles: Iterable[Any], evaluation_timestamp: datetime, failures: list[str], label: str) -> tuple[FinalizedCandleEvidence, ...]:
