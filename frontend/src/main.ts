@@ -29,6 +29,9 @@ import {
   type VotingEnsembleSettingField,
   type VotingEnsembleSettingValue,
   type VotingEnsembleTradingSettingsView,
+  exitGeometryForEntry as votingEnsembleExitGeometry,
+  tradingGeometryFromView as votingEnsembleGeometryFromView,
+  type VotingEnsembleTradingGeometry,
 } from "./trading-settings/voting-ensemble";
 import { renderVotingEnsembleTradingSettings } from "./trading-settings/voting-ensemble-panel";
 import type { WcaBacktestResult, WcaDecision, WcaRuntimeControl } from "./features/wca/types";
@@ -2331,6 +2334,8 @@ type LotOrderTemplate = {
   estimatedSlippage: number;
   forecastSafetyNote?: string;
   forecastExitReason?: string;
+  /** How the stop was derived and how it will be managed, from the resolved settings. */
+  managementNote?: string;
 };
 
 type LotOrderOverride = Partial<Omit<LotOrderTemplate, "action">>;
@@ -3700,6 +3705,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
                   </tfoot>
                 </table>
               </div>
+              <div id="tradeHistoryBudget" class="trade-history-budget"></div>
             </div>
           </div>
         </div>
@@ -4487,6 +4493,7 @@ const openOrderControls = document.querySelector<HTMLDivElement>("#openOrderCont
 const tradeHistoryTitle = document.querySelector<HTMLSpanElement>("#tradeHistoryTitle")!;
 const tradeHistoryBody = document.querySelector<HTMLTableSectionElement>("#tradeHistoryBody")!;
 const tradeHistoryBalance = document.querySelector<HTMLTableCellElement>("#tradeHistoryBalance")!;
+const tradeHistoryBudget = document.querySelector<HTMLDivElement>("#tradeHistoryBudget")!;
 
 refreshSelect.value = String(state.refreshSeconds);
 feedSelect.value = state.feed;
@@ -5100,6 +5107,9 @@ function handleVotingEnsembleSettingChange(event: Event) {
   if (event.type !== "input" || element instanceof HTMLSelectElement || (element as HTMLInputElement).type === "checkbox") {
     updateTradingSettingsMount(state.currentTargetOrder ?? undefined);
   }
+  // The toggle warns that unsaved edits are on screen, so it has to follow the draft even
+  // while the panel itself is being typed into and deliberately not re-rendered.
+  updateTradeToggleButton();
 }
 
 document.addEventListener("input", handleVotingEnsembleSettingChange);
@@ -9114,6 +9124,14 @@ function updateTradeToggleButton() {
     ? runtime.activeEntryBlocks.join(", ")
     : "";
   const reason = selectedReason || ensembleActiveBlocks || ensemblePaperReadyBlocks;
+  // Which configuration the toggle is about to trade. Turning paper on is the moment an
+  // operator most needs to know that the settings on screen are not the saved ones, and
+  // that a profile overlay may be refusing entries regardless of this button.
+  const ensembleGeometry = selected.mode === "ensemble" ? votingEnsembleGeometry() : null;
+  const settingsDraftPending =
+    selected.mode === "ensemble" &&
+    Boolean(state.votingEnsembleSettingsView) &&
+    votingEnsembleHasPendingEdits(state.votingEnsembleSettingsView!, state.votingEnsembleSettingsDraft);
   const controlLabel = [
     `${selected.label} paper control.`,
     "Scope: selected algorithm only.",
@@ -9124,9 +9142,15 @@ function updateTradeToggleButton() {
     error ? "Status: error." : "",
     blocked ? "Status: on but blocked by local/backend gates." : "",
     reason ? `Reason: ${reason}.` : "",
+    ensembleGeometry ? `Settings: ${ensembleGeometry.configurationHash}.` : "",
+    ensembleGeometry?.entriesBlocked ? "Settings: the dynamic profile is refusing new entries." : "",
+    settingsDraftPending ? "Settings: unsaved edits on screen; the algorithm trades the saved values until you save." : "",
   ].filter(Boolean).join(" ");
   tradeToggleButton.title = controlLabel;
   tradeToggleButton.setAttribute("aria-label", controlLabel);
+  tradeToggleButton.dataset.settingsHash = ensembleGeometry?.configurationHash ?? "";
+  tradeToggleButton.dataset.settingsDirty = String(settingsDraftPending);
+  tradeToggleButton.dataset.settingsBlocksEntries = String(Boolean(ensembleGeometry?.entriesBlocked));
 }
 
 function describeVotingEnsembleRuntimeRecord(record: Record<string, unknown> | null | undefined, preferredFields: string[]) {
@@ -9577,6 +9601,65 @@ function setOrderControlOverridesForMode(mode: TradingWindowMode, overrides: Rec
   }
   state.orderControlOverrides = overrides;
   saveOrderControlOverrides();
+}
+
+/**
+ * One line describing how the open position will be managed, in the settings' own terms.
+ *
+ * The stop source is named because it changes which control an operator should reach for:
+ * a stop reading "fixed" means the session has no ATR yet, so editing the ATR multiplier
+ * will not move this price.
+ */
+function votingEnsembleManagementNote(
+  exit: ReturnType<typeof votingEnsembleExitGeometry>,
+  geometry: VotingEnsembleTradingGeometry,
+) {
+  const parts = [
+    exit.stopSource === "atr"
+      ? `Stop ${geometry.atrMultiplier}x ATR (${price(exit.stopDistance)}/share)`
+      : `Stop ${price(exit.stopDistance)}/share fixed, no session ATR yet`,
+    `target ${geometry.takeProfitR}R`,
+  ];
+  if (exit.structuralTargetPossible) {
+    parts.push(`a structural level beyond ${geometry.minimumTakeProfitR}R may tighten it`);
+  }
+  if (exit.breakevenPrice !== null) {
+    parts.push(`breakeven at ${price(exit.breakevenPrice)} (+${geometry.breakevenTriggerR}R)`);
+  }
+  if (exit.trailingDistance !== null) {
+    parts.push(`then trails ${price(exit.trailingDistance)}`);
+  } else {
+    parts.push("no trail");
+  }
+  parts.push(`flat after ${geometry.maximumHoldingMinutes} min`);
+  return `${parts.join(", ")}.`;
+}
+
+/**
+ * Repaint the parts of the trading window that read the resolved settings.
+ *
+ * Order Controls prices its exits from them, the ledger states the daily-loss budget from
+ * them, and the paper toggle names the configuration hash. Without this a saved edit
+ * showed in the settings panel while the window beside it still described the old one.
+ */
+function refreshVotingEnsembleTradingWindow() {
+  updateQuoteCard(currentCandle());
+}
+
+/**
+ * The resolved Voting Ensemble geometry, or null before the backend has answered.
+ *
+ * Null is meaningful and is not papered over with defaults: if the backend has not
+ * answered, the sections fall back to their previous local behaviour rather than showing
+ * invented numbers that claim to be the algorithm's.
+ */
+function votingEnsembleGeometry(): VotingEnsembleTradingGeometry | null {
+  return votingEnsembleGeometryFromView(state.votingEnsembleSettingsView);
+}
+
+/** The session ATR the exit geometry is measured in, matching the backend's 14-period. */
+function votingEnsembleSessionAtr() {
+  return averageTrueRange(latestRegularSessionCandles(), 14) ?? 0;
 }
 
 function tradingSettingsForMode(mode: TradingWindowMode) {
@@ -10196,15 +10279,28 @@ function lotOrderTemplate(lot: OpenOrderLot, latestPrice: number, mode: TradingW
   const settings = tradingSettingsForMode(mode);
   const shouldSell = Boolean(targetOrder?.eligible && targetOrder.side === "Sell" && isActiveTargetOrder(targetOrder));
   const atr = mode === "weighted" ? averageTrueRange(latestRegularSessionCandles(), 14) ?? 0 : 0;
-  const riskPerShare = tradingSettingsStopDistance(settings, lot.entryPrice, atr);
-  const fallbackStop = roundNumber(lot.entryPrice - riskPerShare, 2);
-  const fallbackTarget = roundNumber(lot.entryPrice + riskPerShare * settings.takeProfitR, 2);
+  // The Voting Ensemble sizes its exits from the settings the backend resolves, using the
+  // backend's own rule order: the ATR stop first, the fixed dollar distance only as the
+  // fallback when the session has no ATR. This client used to return the fixed distance
+  // whenever it was above zero, so the ATR multiplier could never reach the price shown,
+  // and it passed atr=0 for this mode anyway. Other modes keep their own local settings.
+  const ensembleGeometry = mode === "ensemble" ? votingEnsembleGeometry() : null;
+  const ensembleExit = ensembleGeometry
+    ? votingEnsembleExitGeometry(lot.entryPrice, ensembleGeometry, votingEnsembleSessionAtr(), "Buy")
+    : null;
+  const riskPerShare = ensembleExit ? ensembleExit.stopDistance : tradingSettingsStopDistance(settings, lot.entryPrice, atr);
+  const exitSlippagePerShare = ensembleGeometry ? ensembleGeometry.slippagePerShare : settings.slippagePerShare;
+  const fallbackStop = roundNumber(ensembleExit ? ensembleExit.stopPrice : lot.entryPrice - riskPerShare, 2);
+  const fallbackTarget = roundNumber(
+    ensembleExit ? ensembleExit.targetPrice : lot.entryPrice + riskPerShare * settings.takeProfitR,
+    2,
+  );
   const triggerPrice = shouldSell && targetOrder?.triggerPrice !== null && targetOrder?.triggerPrice !== undefined
     ? targetOrder.triggerPrice
     : latestPrice;
   const limitPrice = shouldSell && targetOrder?.limitPrice !== null && targetOrder?.limitPrice !== undefined
     ? targetOrder.limitPrice
-    : roundNumber(triggerPrice - settings.slippagePerShare, 2);
+    : roundNumber(triggerPrice - exitSlippagePerShare, 2);
   const stopPrice = shouldSell && targetOrder?.stopPrice !== null && targetOrder?.stopPrice !== undefined
     ? targetOrder.stopPrice
     : fallbackStop;
@@ -10224,7 +10320,8 @@ function lotOrderTemplate(lot: OpenOrderLot, latestPrice: number, mode: TradingW
     targetPrice: roundNumber(targetPrice, 2),
     riskDollars,
     plannedStopRiskDollars,
-    estimatedSlippage: roundNumber(defaultQuantity * settings.slippagePerShare * 2, 2),
+    estimatedSlippage: roundNumber(defaultQuantity * exitSlippagePerShare * 2, 2),
+    managementNote: ensembleExit && ensembleGeometry ? votingEnsembleManagementNote(ensembleExit, ensembleGeometry) : undefined,
   };
   return withLotExitAction(lot, applyLotOrderOverrides(lot, baseTemplate, mode), latestPrice, shouldSell, mode);
 }
@@ -10456,6 +10553,7 @@ function renderOpenOrderControl(
         <button type="button" data-sell-lot-id="${escapeHtml(lot.id)}" ${canSell ? "" : "disabled"}>Sell Order</button>
       </div>
       <span class="open-order-status">${escapeHtml(statusText)}</span>
+      ${template.managementNote ? `<span class="open-order-management">${escapeHtml(template.managementNote)}</span>` : ""}
     </article>
   `;
 }
@@ -11348,6 +11446,38 @@ function renderTradeHistoryBalance(history = normalizedTradeHistoryForMode(state
   tradeHistoryBalance.textContent = moneyWithCents(balance);
   tradeHistoryBalance.classList.toggle("up", balance > 0);
   tradeHistoryBalance.classList.toggle("down", balance < 0);
+  renderTradeHistoryBudget(balance);
+}
+
+/**
+ * The day measured against the limit that actually stops it.
+ *
+ * The Balance cell above is a cash-flow figure and says nothing about how much room the
+ * day has left. With no fixed trade count in the baseline, the daily-loss cap is the main
+ * bound on a session, so the ledger states it in the settings' own numbers -- and moves
+ * the moment either the capital or the cap is edited.
+ *
+ * Only the Voting Ensemble tab has backend-resolved settings to read; the other
+ * algorithms keep their own configuration and are left alone.
+ */
+function renderTradeHistoryBudget(realized: number) {
+  const geometry = state.tradingWindowMode === "ensemble" ? votingEnsembleGeometry() : null;
+  if (!geometry) {
+    tradeHistoryBudget.hidden = true;
+    tradeHistoryBudget.textContent = "";
+    return;
+  }
+  const budget = Math.max(0, geometry.startingCapital) * (Math.max(0, geometry.maxDailyLossPercent) / 100);
+  const lossSoFar = Math.max(0, -realized);
+  const remaining = Math.max(0, budget - lossSoFar);
+  const usedPercent = budget > 0 ? Math.min(100, (lossSoFar / budget) * 100) : 0;
+  tradeHistoryBudget.hidden = false;
+  tradeHistoryBudget.dataset.state = usedPercent >= 100 ? "exhausted" : usedPercent >= 60 ? "warning" : "ok";
+  tradeHistoryBudget.innerHTML = `
+    <span>Daily loss budget</span>
+    <b>${moneyWithCents(remaining)} left</b>
+    <i>of ${moneyWithCents(budget)} (${geometry.maxDailyLossPercent}% of ${moneyWithCents(geometry.startingCapital)})</i>
+  `;
 }
 
 function scheduleDrawChart() {
@@ -18490,6 +18620,7 @@ async function loadVotingEnsembleTradingSettings(options: { force?: boolean } = 
   try {
     state.votingEnsembleSettingsView = await fetchVotingEnsembleTradingSettings();
     applyBackendSettingsToLocalTradingSettings(state.votingEnsembleSettingsView);
+    refreshVotingEnsembleTradingWindow();
     // A reload is the operator's own request for the backend's truth, so pending edits
     // are dropped rather than left sitting on top of values that may have moved.
     state.votingEnsembleSettingsDraft = {};
@@ -18513,6 +18644,7 @@ async function saveVotingEnsembleTradingSettingsToBackend() {
     const saved = await saveVotingEnsembleTradingSettings(votingEnsembleChangedOverrides(view, state.votingEnsembleSettingsDraft));
     state.votingEnsembleSettingsView = saved;
     applyBackendSettingsToLocalTradingSettings(saved);
+    refreshVotingEnsembleTradingWindow();
     state.votingEnsembleSettingsDraft = {};
     state.votingEnsembleSettingsStatus = "ready";
   } catch (error) {
@@ -18531,6 +18663,7 @@ async function resetVotingEnsembleTradingSettingsToBaseline() {
   try {
     state.votingEnsembleSettingsView = await resetVotingEnsembleTradingSettings();
     applyBackendSettingsToLocalTradingSettings(state.votingEnsembleSettingsView);
+    refreshVotingEnsembleTradingWindow();
     state.votingEnsembleSettingsDraft = {};
     state.votingEnsembleSettingsStatus = "ready";
   } catch (error) {

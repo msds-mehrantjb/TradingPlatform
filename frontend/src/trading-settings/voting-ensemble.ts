@@ -17,6 +17,15 @@
 
 import { BACKTEST_API_CANDIDATES } from "../api/client";
 
+// The exit arithmetic lives in its own import-free module so it can be tested directly
+// and so this file stays the HTTP boundary. Re-exported for callers that want both.
+export {
+  exitGeometryForEntry,
+  tradingGeometryFromView,
+  type VotingEnsembleExitGeometry,
+  type VotingEnsembleTradingGeometry,
+} from "./voting-ensemble-geometry";
+
 export type VotingEnsembleSettingKind = "number" | "integer" | "boolean" | "time" | "choice";
 export type VotingEnsembleSettingBinding = "live" | "backtest" | "both";
 
@@ -71,6 +80,8 @@ export type VotingEnsembleTradingSettingsView = {
   paperOnly: boolean;
   liveTradingEnabled: boolean;
   positionSizing: string;
+  /** From the resolved dynamic profile: the overlay is refusing new entries. */
+  entriesBlocked: boolean;
   inertParameters: VotingEnsembleInertParameter[];
   reasonCodes: string[];
 };
@@ -174,6 +185,7 @@ function normalizeView(payload: Record<string, unknown>): VotingEnsembleTradingS
     paperOnly: payload.paperOnly !== false,
     liveTradingEnabled: Boolean(payload.liveTradingEnabled),
     positionSizing: String(payload.positionSizing ?? ""),
+    entriesBlocked: Boolean((payload.resolved as Record<string, unknown> | undefined)?.entriesBlocked),
     inertParameters: Array.isArray(payload.inertParameters) ? (payload.inertParameters as VotingEnsembleInertParameter[]) : [],
     reasonCodes: Array.isArray(payload.reasonCodes) ? (payload.reasonCodes as string[]) : [],
   };

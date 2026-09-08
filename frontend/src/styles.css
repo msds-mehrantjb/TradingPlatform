@@ -7183,3 +7183,68 @@ canvas.dragging {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* ------------------------------------------------------------------------- */
+/* Voting Ensemble trading window: values sourced from the resolved settings  */
+/* ------------------------------------------------------------------------- */
+
+/* How an open lot will be managed, in the settings' own terms. */
+.open-order-management {
+  display: block;
+  border-top: 1px dashed #e2e8f0;
+  margin-top: 5px;
+  padding-top: 5px;
+  color: #475569;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+/* The limit that actually bounds the day, beside the ledger it bounds. */
+.trade-history-budget {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  border-top: 1px solid #e2e8f0;
+  margin-top: 6px;
+  padding-top: 6px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.trade-history-budget > span {
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.trade-history-budget > b {
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.trade-history-budget > i {
+  color: #94a3b8;
+  font-style: normal;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.trade-history-budget[data-state="ok"] > b {
+  color: #047857;
+}
+
+.trade-history-budget[data-state="warning"] > b {
+  color: #b45309;
+}
+
+.trade-history-budget[data-state="exhausted"] > b {
+  color: #b91c1c;
+}
+
+/* Unsaved settings mean the button is about to trade something else. */
+.trade-toggle-button[data-settings-dirty="true"] {
+  outline: 2px dashed #d97706;
+  outline-offset: 2px;
+}
