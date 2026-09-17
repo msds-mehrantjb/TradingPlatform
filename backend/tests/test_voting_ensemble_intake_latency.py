@@ -36,6 +36,27 @@ def candles(count: int, *, symbol: str) -> list[dict]:
     return rows
 
 
+def next_minute(symbol: str) -> list[dict]:
+    row = dict(candles(1, symbol=symbol)[0])
+    row["timestamp"] = BAR_END.isoformat().replace("+00:00", "Z")
+    return [row]
+
+
+def bar_closed(row: dict, cutoff: datetime) -> bool:
+    start = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
+    return start + timedelta(minutes=1) <= cutoff
+
+
+def track_latest(fetch, latest: dict[str, str]):
+    async def wrapper(symbol, *, now):
+        rows = await fetch(symbol, now=now)
+        if rows:
+            latest[symbol] = rows[-1]["timestamp"]
+        return rows
+
+    return wrapper
+
+
 class RecordingClient:
     """Counts requests and records the order and concurrency they arrive in."""
 
@@ -153,6 +174,40 @@ class IntakeLatencyTest(unittest.TestCase):
 
         self.assertEqual(result[0]["status"], "enqueued")
         self.assertEqual(len(published), 1)
+
+    def test_auxiliary_streams_are_refetched_when_a_new_primary_bar_closes(self) -> None:
+        # The snapshot needs every auxiliary stream to hold the primary bar's exact minute.
+        # On the thirty-second cadence alone, the auxiliaries were a minute behind every
+        # new bar, so every automatic evaluation failed closed.
+        class Live(RecordingClient):
+            async def get_bars(self, *, symbol, timeframe, feed, limit, start, end, sort):
+                self.calls.append(symbol)
+                cutoff = datetime.fromisoformat(end)
+                return [row for row in candles(60, symbol=symbol) + next_minute(symbol) if bar_closed(row, cutoff)]
+
+        client = Live()
+        stores: dict[str, str] = {}
+        instance = producer(client, store_path=self.store_path)
+        instance._refresh_symbol_history = track_latest(instance._refresh_symbol_history, stores)
+        # Late in the minute before BAR_END's minute closes; the auxiliaries refresh here.
+        started = BAR_END + timedelta(seconds=45)
+        closed = BAR_END + timedelta(minutes=1, seconds=3)
+        self.assertLess((closed - started).total_seconds(), instance.config.auxiliary_refresh_seconds)
+
+        asyncio.run(instance.poll_once(now=started))
+        before = len(client.calls)
+        # Within the cadence, but the next minute has closed.
+        asyncio.run(instance.poll_once(now=closed))
+
+        self.assertEqual(len(client.calls) - before, 1 + len(instance.config.auxiliary_symbols))
+        next_start = BAR_END.isoformat().replace("+00:00", "Z")
+        for symbol in instance.config.auxiliary_symbols:
+            self.assertEqual(stores[symbol], next_start)
+
+        # The following poll, on the same bar, costs a single request again.
+        before = len(client.calls)
+        asyncio.run(instance.poll_once(now=closed + timedelta(seconds=2)))
+        self.assertEqual(client.calls[before:], ["SPY"])
 
     def test_the_deadline_and_finalization_delay_are_unchanged(self) -> None:
         # The fix is the intake, not the deadline. If these move, the argument changes.

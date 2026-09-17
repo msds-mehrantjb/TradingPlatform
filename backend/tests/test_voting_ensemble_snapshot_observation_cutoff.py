@@ -47,12 +47,21 @@ def iso(moment: datetime) -> str:
 
 
 class SnapshotObservationCutoffTest(unittest.TestCase):
-    def build_payload(self, *, quote_offset: int, trade_offset: int, receipt_offset: int | None = None) -> dict[str, Any]:
+    def build_payload(
+        self,
+        *,
+        quote_offset: float,
+        trade_offset: float,
+        receipt_offset: float | None = None,
+        minutes_missing: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
         receipt = receipt_offset if receipt_offset is not None else max(quote_offset, trade_offset)
         store = MemoryCandleStore()
         for symbol in ["SPY", *BREADTH]:
+            # Trailing minutes with no bar, as IEX leaves them when a symbol does not trade.
+            missing = (minutes_missing or {}).get(symbol, 0)
             store.upsert_many(
-                [stored_candle(NOW - timedelta(minutes=15 - i), symbol=symbol, close=100.0 + i * 0.01) for i in range(15)]
+                [stored_candle(NOW - timedelta(minutes=15 - i), symbol=symbol, close=100.0 + i * 0.01) for i in range(15 - missing)]
             )
         event = finalized_market_event_from_candle(
             stored_candle(NOW - timedelta(minutes=1)),
@@ -154,6 +163,72 @@ class SnapshotObservationCutoffTest(unittest.TestCase):
 
         codes = " ".join(caught.exception.reason_codes)
         self.assertIn("future_spy_quote", codes)
+
+    def test_exchange_clock_slightly_ahead_of_the_local_clock_is_accepted(self) -> None:
+        """A local clock 0.9 s slow made every fresh quote look future-dated."""
+        payload = self.build_payload(quote_offset=5.5, trade_offset=5.5, receipt_offset=4)
+
+        self.assertIsNotNone(payload.get("nbbo"), "nbbo was dropped as future-dated")
+        self.assertEqual(payload["market_context"]["automaticRuntimeSnapshot"]["dataReadiness"]["ready"], True)
+
+    def test_exchange_clock_far_ahead_of_the_local_clock_is_still_rejected(self) -> None:
+        with self.assertRaises(VotingEnsembleAutomaticSnapshotError) as caught:
+            self.build_payload(quote_offset=7, trade_offset=7, receipt_offset=4)
+
+        self.assertIn("future_spy_quote", " ".join(caught.exception.reason_codes))
+
+    def test_auxiliary_stream_without_a_bar_this_minute_is_accepted(self) -> None:
+        """IEX leaves minutes empty for thinly traded sector ETFs."""
+        payload = self.build_payload(quote_offset=3, trade_offset=3, minutes_missing={"XLRE": 1, "QQQ": 1})
+
+        self.assertIsNotNone(payload.get("nbbo"))
+
+    def test_index_stream_older_than_the_age_limit_still_fails_closed(self) -> None:
+        with self.assertRaises(VotingEnsembleAutomaticSnapshotError) as caught:
+            self.build_payload(quote_offset=3, trade_offset=3, minutes_missing={"QQQ": 2})
+
+        self.assertIn("voting_ensemble.automatic_snapshot.qqq_stale_or_unsynchronized", caught.exception.reason_codes)
+
+    def test_stale_sector_etfs_are_left_out_of_breadth(self) -> None:
+        """Eight of eleven fresh sector ETFs meets the breadth strategy's own coverage floor."""
+        stale = {"XLRE": 2, "XLC": 3, "XLB": 4}
+        payload = self.build_payload(quote_offset=3, trade_offset=3, minutes_missing=stale)
+
+        components = payload["breadth_components"]
+        self.assertEqual(len(components), 8)
+        self.assertFalse(set(stale) & set(components))
+        self.assertEqual(payload["external_breadth_feed"]["componentCount"], 8)
+
+    def test_too_few_fresh_sector_etfs_fails_closed(self) -> None:
+        stale = {"XLRE": 2, "XLC": 3, "XLB": 4, "XLV": 2}
+        with self.assertRaises(VotingEnsembleAutomaticSnapshotError) as caught:
+            self.build_payload(quote_offset=3, trade_offset=3, minutes_missing=stale)
+
+        codes = caught.exception.reason_codes
+        self.assertIn("voting_ensemble.automatic_snapshot.breadth_coverage_insufficient", codes)
+        for symbol in stale:
+            self.assertIn(f"voting_ensemble.automatic_snapshot.{symbol.lower()}_stale_or_unsynchronized", codes)
+
+    def test_spy_last_trade_twenty_seconds_old_is_accepted(self) -> None:
+        """IEX can go more than ten seconds without a SPY print while the quote is fresh."""
+        payload = self.build_payload(quote_offset=3, trade_offset=-17, receipt_offset=3)
+
+        self.assertIsNotNone(payload.get("nbbo"))
+
+    def test_spy_last_trade_older_than_thirty_seconds_still_fails_closed(self) -> None:
+        with self.assertRaises(VotingEnsembleAutomaticSnapshotError) as caught:
+            self.build_payload(quote_offset=3, trade_offset=-30, receipt_offset=3)
+
+        self.assertIn("voting_ensemble.automatic_snapshot.stale_spy_last_trade", caught.exception.reason_codes)
+
+    def test_the_primary_symbol_still_needs_this_exact_minute(self) -> None:
+        with self.assertRaises(VotingEnsembleAutomaticSnapshotError) as caught:
+            self.build_payload(quote_offset=3, trade_offset=3, minutes_missing={"SPY": 1})
+
+        self.assertIn(
+            "voting_ensemble.automatic_snapshot.spy_finalized_one_minute_candle_missing_or_unsynchronized",
+            caught.exception.reason_codes,
+        )
 
 
 if __name__ == "__main__":

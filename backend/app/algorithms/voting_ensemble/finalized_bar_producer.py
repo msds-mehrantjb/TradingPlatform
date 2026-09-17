@@ -27,13 +27,17 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.market_feed import active_instrument
 from backend.app.algorithms.voting_ensemble.local_paper_account import fill_is_exit
+from backend.app.algorithms.voting_ensemble.strategies.context.market_breadth_momentum import MarketBreadthMomentumConfig
 from backend.app.algorithms.voting_ensemble.session_segments import (
     entry_window_open,
     resolve_session_segment,
     session_profile_for_instrument,
     session_segment_boundaries_from_payload,
 )
-from backend.app.algorithms.voting_ensemble.snapshot.builder import build_point_in_time_snapshot
+from backend.app.algorithms.voting_ensemble.snapshot.builder import (
+    EXCHANGE_CLOCK_SKEW_TOLERANCE_SECONDS,
+    build_point_in_time_snapshot,
+)
 from backend.app.algorithms.voting_ensemble.runtime.commands import (
     VOTING_ENSEMBLE_EVALUATION_RESULT_CONTRACT_VERSION,
     VotingEnsembleRuntimeCommand,
@@ -336,26 +340,52 @@ class VotingEnsembleFinalizedBarProducer:
         see context older than it did before.
         """
         current = _utc(now or datetime.now(UTC))
-        symbols = [symbol.upper() for symbol in self.config.symbols]
+        primaries = [symbol.upper() for symbol in self.config.symbols]
+        auxiliaries = [symbol.upper() for symbol in self.config.auxiliary_symbols if symbol.upper() not in primaries]
+        symbols = list(primaries)
         if self._auxiliary_refresh_due(current):
-            symbols.extend(
-                symbol.upper() for symbol in self.config.auxiliary_symbols if symbol.upper() not in symbols
-            )
+            symbols.extend(auxiliaries)
             self._auxiliary_refreshed_at = current
-        histories = await asyncio.gather(
-            *(self._refresh_symbol_history(symbol, now=current) for symbol in symbols),
-            return_exceptions=True,
-        )
-        fetched: dict[str, list[dict[str, Any]]] = {}
-        for symbol, history in zip(symbols, histories):
-            # A failed fetch falls back to the cache inside process_symbol, exactly as it
-            # did when each symbol was fetched on its own.
-            if not isinstance(history, BaseException):
-                fetched[symbol] = history
+        fetched = await self._fetch_histories(symbols, now=current)
+        # A refresh on the thirty-second cadence almost never lands after the primary bar's
+        # minute closed, so every new bar was evaluated against context a minute behind.
+        # When a primary bar has closed since the last auxiliary refresh, fetch the
+        # auxiliaries now, before the bar is published.
+        if len(symbols) == len(primaries) and auxiliaries and self._new_bar_since_auxiliary_refresh(fetched, now=current):
+            self._auxiliary_refreshed_at = current
+            fetched.update(await self._fetch_histories(auxiliaries, now=current))
         results = []
         for symbol in self.config.symbols:
             results.append((await self.process_symbol(symbol, now=current, rows=fetched.get(symbol.upper()))).to_dict())
         return tuple(results)
+
+    async def _fetch_histories(self, symbols: list[str], *, now: datetime) -> dict[str, list[dict[str, Any]]]:
+        histories = await asyncio.gather(
+            *(self._refresh_symbol_history(symbol, now=now) for symbol in symbols),
+            return_exceptions=True,
+        )
+        # A failed fetch falls back to the cache inside process_symbol, exactly as it did
+        # when each symbol was fetched on its own.
+        return {
+            symbol: history
+            for symbol, history in zip(symbols, histories)
+            if not isinstance(history, BaseException)
+        }
+
+    def _new_bar_since_auxiliary_refresh(self, fetched: dict[str, list[dict[str, Any]]], *, now: datetime) -> bool:
+        last = self._auxiliary_refreshed_at
+        if last is None:
+            return True
+        delay = timedelta(seconds=self.config.finalization_delay_seconds)
+        for symbol in self.config.symbols:
+            finalized = [
+                row
+                for row in fetched.get(symbol.upper(), ())
+                if _is_complete_one_minute_bar(row, now=now, finalization_delay_seconds=self.config.finalization_delay_seconds)
+            ]
+            if finalized and _bar_end(finalized[-1]) + delay > last:
+                return True
+        return False
 
     def _auxiliary_refresh_due(self, now: datetime) -> bool:
         last = self._auxiliary_refreshed_at
@@ -493,8 +523,11 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
         history_limit: int = 390,
         feed: str = "iex",
         max_quote_age_seconds: float = 5.0,
-        max_trade_age_seconds: float = 10.0,
+        # IEX can go more than ten seconds without a SPY print while the quote stays fresh;
+        # the quote's own five-second limit is what bounds the price.
+        max_trade_age_seconds: float = 30.0,
         max_auxiliary_age_seconds: float = 90.0,
+        min_fresh_breadth_components: int | None = None,
     ) -> None:
         self.candle_store = candle_store
         self.control_snapshot_provider = control_snapshot_provider
@@ -505,6 +538,13 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
         self.last_trade_provider = last_trade_provider
         self.global_risk_provider = global_risk_provider
         self.breadth_symbols = tuple(symbol.upper() for symbol in breadth_symbols)
+        # The breadth strategy scores whatever share of its basket is fresh, down to its own
+        # coverage floor, so the gate in front of it asks for the same coverage, not all of it.
+        self.min_fresh_breadth_components = (
+            min_fresh_breadth_components
+            if min_fresh_breadth_components is not None
+            else math.ceil(MarketBreadthMomentumConfig().minComponentCoverage * len(self.breadth_symbols))
+        )
         self.history_limit = history_limit
         self.feed = feed
         self.max_quote_age_seconds = max_quote_age_seconds
@@ -528,16 +568,29 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
         if not fifteen_minute:
             failures.append("voting_ensemble.automatic_snapshot.missing_completed_spy_fifteen_minute_candles")
 
-        qqq = self._load_candles("QQQ", feed, 240, event, failures, mandatory=True)
-        iwm = self._load_candles("IWM", feed, 240, event, failures, mandatory=True)
-        breadth_components = {
-            symbol: self._load_candles(symbol, feed, 240, event, failures, mandatory=True)
+        qqq = self._load_candles("QQQ", feed, 240, event, failures, mandatory=True, exact_minute=False)
+        iwm = self._load_candles("IWM", feed, 240, event, failures, mandatory=True, exact_minute=False)
+        loaded_breadth = {
+            symbol: self._load_candles(symbol, feed, 240, event, failures, mandatory=False)
             for symbol in self.breadth_symbols
         }
         _require_synchronized_latest("QQQ", qqq, event, failures, stale, self.max_auxiliary_age_seconds)
         _require_synchronized_latest("IWM", iwm, event, failures, stale, self.max_auxiliary_age_seconds)
-        for symbol, component in breadth_components.items():
-            _require_synchronized_latest(symbol, component, event, failures, stale, self.max_auxiliary_age_seconds)
+        # On IEX several sector ETFs regularly go minutes without a print. Breadth is scored
+        # from the fresh ones only; a stale price would read as "unchanged" and drag it
+        # toward neutral.
+        breadth_components = {
+            symbol: component
+            for symbol, component in loaded_breadth.items()
+            if _latest_is_fresh(component, event, self.max_auxiliary_age_seconds)
+        }
+        if len(breadth_components) < self.min_fresh_breadth_components:
+            for symbol, component in loaded_breadth.items():
+                if symbol not in breadth_components:
+                    _require_synchronized_latest(symbol, component, event, failures, stale, self.max_auxiliary_age_seconds)
+                    if not component:
+                        failures.append(f"voting_ensemble.automatic_snapshot.{symbol.lower()}_finalized_one_minute_candle_missing_or_unsynchronized")
+            failures.append("voting_ensemble.automatic_snapshot.breadth_coverage_insufficient")
 
         control = self.control_snapshot_provider()
         inventory = self.paper_inventory_provider()
@@ -750,6 +803,7 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
         failures: list[str],
         *,
         mandatory: bool,
+        exact_minute: bool = True,
     ) -> list[dict[str, Any]]:
         rows = self.candle_store.latest_until(
             symbol=symbol.upper(),
@@ -760,7 +814,11 @@ class VotingEnsembleAutomaticEvaluationPayloadBuilder:
         )
         candles = [_candle_payload(row, finalized_at=event.finalizedAt) for row in rows]
         latest_timestamp = _utc(_parse_timestamp(candles[-1]["timestamp"])) if candles else None
-        if mandatory and latest_timestamp != _utc(event.barStartTimestamp):
+        # Context streams need a bar, not this exact minute's bar: on IEX a sector ETF
+        # often has no trade in a given minute, which failed about three quarters of
+        # automatic evaluations. Their age is bounded by _require_synchronized_latest.
+        required = latest_timestamp == _utc(event.barStartTimestamp) if exact_minute else latest_timestamp is not None
+        if mandatory and not required:
             failures.append(f"voting_ensemble.automatic_snapshot.{symbol.lower()}_finalized_one_minute_candle_missing_or_unsynchronized")
         return candles
 
@@ -938,6 +996,14 @@ def _require_synchronized_latest(
         stale.append(f"voting_ensemble.automatic_snapshot.{symbol.lower()}_stale_or_unsynchronized")
 
 
+def _latest_is_fresh(candles: list[dict[str, Any]], event: VotingEnsembleFinalizedBarMarketEvent, max_age_seconds: float) -> bool:
+    if not candles:
+        return False
+    latest = _utc(_parse_timestamp(candles[-1]["timestamp"]))
+    bar_start = _utc(event.barStartTimestamp)
+    return latest <= bar_start and (bar_start - latest).total_seconds() <= max_age_seconds
+
+
 def _call_market_provider(provider: Callable[..., dict[str, Any] | None] | None, **kwargs: Any) -> dict[str, Any] | None:
     if provider is None:
         return None
@@ -996,7 +1062,7 @@ def _nbbo_from_quote_and_trade(
     if ask < bid:
         malformed.append("voting_ensemble.automatic_snapshot.spy_quote_crossed")
         return None
-    tolerance = timedelta(seconds=1)
+    tolerance = timedelta(seconds=EXCHANGE_CLOCK_SKEW_TOLERANCE_SECONDS)
     if quote_timestamp > observation_time + tolerance or quote_receipt > observation_time + tolerance:
         stale.append("voting_ensemble.automatic_snapshot.future_spy_quote")
     if trade_timestamp > observation_time + tolerance or trade_receipt > observation_time + tolerance:

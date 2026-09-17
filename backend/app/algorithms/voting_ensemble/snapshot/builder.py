@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable
 
 from backend.app.algorithms.voting_ensemble.models import VotingCandle
@@ -26,6 +26,7 @@ from backend.app.algorithms.voting_ensemble.trading_settings.hashing import trad
 VOTING_ENSEMBLE_SNAPSHOT_BUILDER_VERSION = "voting_ensemble_snapshot_builder_v1"
 MAX_QUOTE_AGE_SECONDS = 5.0
 MAX_RECEIPT_AGE_SECONDS = 10.0
+EXCHANGE_CLOCK_SKEW_TOLERANCE_SECONDS = 2.0
 
 
 def build_live_paper_snapshot(payload: dict[str, Any]) -> VotingEnsembleEvaluationSnapshot:
@@ -245,10 +246,14 @@ def _nbbo(payload: dict[str, Any], context: dict[str, Any], evaluation_timestamp
         malformed.append("malformed_spy_nbbo")
         return None
     assert bid is not None and ask is not None and bid_size is not None and ask_size is not None and quote_ts is not None and trade_ts is not None and receipt_ts is not None
-    if quote_ts > evaluation_timestamp or trade_ts > evaluation_timestamp or receipt_ts > evaluation_timestamp:
+    # Quote and trade times are stamped by the exchange; the cutoff comes from this
+    # machine's clock. A local clock under a second slow rejected every fresh quote.
+    exchange_cutoff = evaluation_timestamp + timedelta(seconds=EXCHANGE_CLOCK_SKEW_TOLERANCE_SECONDS)
+    if quote_ts > exchange_cutoff or trade_ts > exchange_cutoff or receipt_ts > evaluation_timestamp:
         stale.append("future_spy_nbbo_timestamp")
         return None
-    quote_age = (evaluation_timestamp - quote_ts).total_seconds()
+    # Inside the skew tolerance a quote can read as slightly younger than zero.
+    quote_age = max(0.0, (evaluation_timestamp - quote_ts).total_seconds())
     receipt_age = (evaluation_timestamp - receipt_ts).total_seconds()
     if quote_age > float(source.get("maxQuoteAgeSeconds") or MAX_QUOTE_AGE_SECONDS):
         stale.append("stale_spy_quote")
