@@ -315,14 +315,25 @@ class PaperOrderGateway:
                 self.global_risk_manager.release_reservation(global_risk_decision.reservationId)
         return result
 
-    def cancel_stale_orders(self, *, evaluated_at: datetime) -> tuple[PaperOrderGatewayResult, ...]:
+    def cancel_stale_orders(
+        self,
+        *,
+        evaluated_at: datetime,
+        working_statuses: frozenset[str] = frozenset({"PENDING_SUBMISSION", "ACCEPTED", "PARTIALLY_FILLED"}),
+    ) -> tuple[PaperOrderGatewayResult, ...]:
+        # A broker that acknowledges with NEW or OPEN (the Voting Ensemble local paper
+        # broker does) passes those here; the default keeps every other caller unchanged.
         evaluated_at = _require_utc(evaluated_at)
         results = []
         for key, payload in _store_items(self.store):
             if not key.startswith("paper_order_gateway.intent."):
                 continue
-            intent = PaperOrderIntentRecord.model_validate(payload)
-            if intent.status not in {"PENDING_SUBMISSION", "ACCEPTED", "PARTIALLY_FILLED"}:
+            # Stores may stamp their own ownership fields onto a record; the intent is only
+            # what the gateway wrote.
+            intent = PaperOrderIntentRecord.model_validate(
+                {field: value for field, value in payload.items() if field in PaperOrderIntentRecord.model_fields}
+            )
+            if intent.status not in working_statuses:
                 continue
             if (evaluated_at - intent.createdAt) <= timedelta(seconds=intent.staleAfterSeconds):
                 continue
@@ -865,10 +876,18 @@ def _read_optional(store: PaperOrderGatewayStore, key: str) -> dict | None:
 
 
 def _store_items(store: PaperOrderGatewayStore):
+    # Keys come back relative to the gateway. A store may file gateway records under its
+    # own namespace (the Voting Ensemble repository does), which made every
+    # startswith("paper_order_gateway.") scan over its records match nothing.
     snapshots = getattr(store, "snapshots", None)
     if isinstance(snapshots, dict):
-        return list(snapshots.items())
+        return [(_gateway_relative_key(key), value) for key, value in snapshots.items()]
     return []
+
+
+def _gateway_relative_key(key: str) -> str:
+    index = key.find("paper_order_gateway.")
+    return key[index:] if index > 0 and key[index - 1] == "." else key
 
 
 def _hash_payload(payload: dict[str, Any]) -> str:

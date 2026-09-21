@@ -396,8 +396,9 @@ def inferred_market_status() -> dict:
     return local_market_status()
 
 
-def local_market_status(*, warning: str | None = None) -> dict:
-    now_utc = datetime.now(UTC)
+def local_market_status(*, warning: str | None = None, now: datetime | None = None) -> dict:
+    # `now` lets a caller read the calendar at another moment, such as a delayed data clock.
+    now_utc = (now or datetime.now(UTC)).astimezone(UTC)
     eastern = eastern_timezone(now_utc)
     now = now_utc.astimezone(eastern)
     today = now.date()

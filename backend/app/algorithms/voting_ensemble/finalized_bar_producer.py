@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.market_feed import active_instrument
 from backend.app.algorithms.voting_ensemble.local_paper_account import fill_is_exit
+from backend.app.algorithms.voting_ensemble.data_clock import data_now, market_data_feed
 from backend.app.algorithms.voting_ensemble.strategies.context.market_breadth_momentum import MarketBreadthMomentumConfig
 from backend.app.algorithms.voting_ensemble.session_segments import (
     entry_window_open,
@@ -122,11 +123,15 @@ class VotingEnsembleFinalizedBarMarketEvent(BaseModel):
         return payload
 
 
+MULTI_SYMBOL_WARM_UP_LOOKBACK = timedelta(days=5)
+MULTI_SYMBOL_POLL_LOOKBACK = timedelta(minutes=10)
+
+
 @dataclass(frozen=True)
 class VotingEnsembleFinalizedBarProducerConfig:
     symbols: tuple[str, ...] = (VOTING_ENSEMBLE_DEFAULT_SYMBOL,)
     auxiliary_symbols: tuple[str, ...] = ("QQQ", "IWM", "XLK", "XLF", "XLY", "XLP", "XLV", "XLI", "XLE", "XLB", "XLU", "XLRE", "XLC")
-    feed: str = "iex"
+    feed: str = field(default_factory=market_data_feed)
     timeframe: str = "1Min"
     fetch_limit: int = 450
     history_limit: int = 390
@@ -323,6 +328,7 @@ class VotingEnsembleFinalizedBarProducer:
         self.config = config or VotingEnsembleFinalizedBarProducerConfig()
         self.settings_hash_provider = settings_hash_provider or (lambda: "voting_ensemble_default_settings")
         self._auxiliary_refreshed_at: datetime | None = None
+        self._multi_symbol_history_warm = False
 
     async def poll_once(self, *, now: datetime | None = None) -> tuple[dict[str, Any], ...]:
         """Fetch every symbol this poll needs at once, then decide on the primary bar.
@@ -339,9 +345,18 @@ class VotingEnsembleFinalizedBarProducer:
         in the same poll that publishes the event, never after it, so the snapshot cannot
         see context older than it did before.
         """
-        current = _utc(now or datetime.now(UTC))
+        current = _utc(now or data_now())
         primaries = [symbol.upper() for symbol in self.config.symbols]
         auxiliaries = [symbol.upper() for symbol in self.config.auxiliary_symbols if symbol.upper() not in primaries]
+        if callable(getattr(self.market_data_client, "get_bars_multi", None)):
+            # One request carries every stream, so there is no cadence to manage: the
+            # auxiliaries are always as fresh as the primary bar they accompany.
+            fetched = await self._fetch_histories_in_one_request([*primaries, *auxiliaries], now=current)
+            self._auxiliary_refreshed_at = current
+            results = []
+            for symbol in self.config.symbols:
+                results.append((await self.process_symbol(symbol, now=current, rows=fetched.get(symbol.upper()))).to_dict())
+            return tuple(results)
         symbols = list(primaries)
         if self._auxiliary_refresh_due(current):
             symbols.extend(auxiliaries)
@@ -372,6 +387,34 @@ class VotingEnsembleFinalizedBarProducer:
             if not isinstance(history, BaseException)
         }
 
+    async def _fetch_histories_in_one_request(self, symbols: list[str], *, now: datetime) -> dict[str, list[dict[str, Any]]]:
+        # The first request fills the candle store with enough history for the snapshot
+        # (a weekend or holiday back); after that only the last few minutes are needed.
+        lookback = MULTI_SYMBOL_WARM_UP_LOOKBACK if not self._multi_symbol_history_warm else MULTI_SYMBOL_POLL_LOOKBACK
+        try:
+            rows_by_symbol = await self.market_data_client.get_bars_multi(
+                symbols=symbols,
+                timeframe=self.config.timeframe,
+                feed=self.config.feed,
+                start=now - lookback,
+                end=now,
+            )
+        except Exception:
+            # process_symbol falls back to the candle store, as for a failed single fetch.
+            return {}
+        fetched: dict[str, list[dict[str, Any]]] = {}
+        for symbol in symbols:
+            valid = [
+                _normalize_candle(row, symbol=symbol, timeframe=self.config.timeframe, feed=self.config.feed)
+                for row in rows_by_symbol.get(symbol, ())
+            ]
+            valid = [row for row in valid if row is not None]
+            if valid:
+                self.candle_store.upsert_many(valid)
+            fetched[symbol] = valid
+        self._multi_symbol_history_warm = True
+        return fetched
+
     def _new_bar_since_auxiliary_refresh(self, fetched: dict[str, list[dict[str, Any]]], *, now: datetime) -> bool:
         last = self._auxiliary_refreshed_at
         if last is None:
@@ -400,7 +443,7 @@ class VotingEnsembleFinalizedBarProducer:
         now: datetime | None = None,
         rows: list[dict[str, Any]] | None = None,
     ) -> VotingEnsembleFinalizedBarProductionResult:
-        current = _utc(now or datetime.now(UTC))
+        current = _utc(now or data_now())
         normalized_symbol = symbol.upper()
         valid = rows if rows is not None else await self._refresh_symbol_history(normalized_symbol, now=current)
         finalized = [row for row in valid if _is_complete_one_minute_bar(row, now=current, finalization_delay_seconds=self.config.finalization_delay_seconds)]

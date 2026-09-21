@@ -27,6 +27,7 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from .alpaca import TIMEFRAME_MINUTES, AlpacaClient, demo_bars, local_market_status, nyse_holiday_name
+from .algorithms.voting_ensemble.market_data import VotingEnsembleDelayedMarketDataClient
 from .algorithms.regime.api import router as regime_router
 from .algorithms.regime.api import REGIME_REPOSITORY
 from .algorithms.regime.runtime_factory import get_regime_runtime_supervisor
@@ -98,7 +99,11 @@ alpaca = AlpacaClient(settings)
 # instrument the app is on actually has a source behind it.
 MARKET_DATA_PROVIDERS = build_providers(alpaca)
 session_decision_store = SessionDecisionJsonlStore(root=SESSION_PERSISTENCE_ROOT)
-voting_ensemble_runtime_supervisor = get_voting_ensemble_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
+voting_ensemble_runtime_supervisor = get_voting_ensemble_runtime_supervisor(
+    settings=settings,
+    market_data_client=VotingEnsembleDelayedMarketDataClient(alpaca),
+    candle_store=store,
+)
 regime_runtime_supervisor = get_regime_runtime_supervisor(settings=settings, market_data_client=alpaca, candle_store=store)
 meta_strategy_runtime_supervisor = None
 UI_RESPONSE_CACHE_TTL_SECONDS = 5.0

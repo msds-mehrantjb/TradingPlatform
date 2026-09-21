@@ -5,9 +5,11 @@ import os
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Protocol
 
+from backend.app.algorithms.voting_ensemble.data_clock import data_now
 from backend.app.domain.models import Signal, _require_utc
 from backend.app.execution import PaperGatewayFill
 from backend.app.gates import BrokerAccountSnapshot, BrokerOrderState, BrokerPositionState, aggregate_global_account_risk
@@ -131,6 +133,7 @@ class VotingEnsemblePaperAccount:
     observedAt: datetime
     appliedFillIds: tuple[str, ...] = ()
     usableEntryBuyingPower: Decimal = Decimal("0")
+    sessionStartRealizedPnl: Decimal = Decimal("0")
     allowLeverage: bool = False
     allowMargin: bool = False
     allowShorts: bool = True
@@ -163,6 +166,7 @@ class VotingEnsemblePaperAccount:
                 "equityModel": "cash_plus_local_owned_position_market_value",
                 "realizedPnl": _money(self.realizedPnl),
                 "realizedPnlToday": _money(self.realizedPnlToday),
+                "sessionStartRealizedPnl": _money(self.sessionStartRealizedPnl),
                 "unrealizedPnl": _money(self.unrealizedPnl),
                 "unrealizedPnlToday": _money(self.unrealizedPnl),
                 "dailyNetPnl": _money(self.dailyNetPnl),
@@ -414,7 +418,7 @@ class VotingEnsembleInventoryLedger:
         self.store = store
 
     def account_snapshot(self, *, observed_at: datetime | None = None) -> dict[str, Any]:
-        observed = _require_utc(observed_at or datetime.now(UTC))
+        observed = _require_utc(observed_at or data_now())
         existing = self.store.snapshots.get(_execution_key("local_account.latest"))
         if isinstance(existing, dict):
             enriched = self._enriched_account_payload(existing, observed_at=observed, reason_codes=["voting_ensemble.local_paper_account.enriched_from_existing_balance"])
@@ -438,7 +442,7 @@ class VotingEnsembleInventoryLedger:
         return account
 
     def broker_account_snapshot(self, *, observed_at: datetime | None = None) -> BrokerAccountSnapshot:
-        observed = _require_utc(observed_at or datetime.now(UTC))
+        observed = _require_utc(observed_at or data_now())
         account = self.account_snapshot(observed_at=observed)
         return BrokerAccountSnapshot(
             accountId=str(account["accountId"]),
@@ -454,7 +458,7 @@ class VotingEnsembleInventoryLedger:
             ],
             partiallyFilledOrders=[],
             observedAt=observed,
-            sessionDate=observed.date(),
+            sessionDate=trading_session_date(observed),
             sourceAuthority="local_ui_history",
             positionsReconciled=True,
             openOrdersReconciled=True,
@@ -800,10 +804,10 @@ class VotingEnsembleInventoryLedger:
         return [str(record.get("appliedFillId")) for record in self._records("applied_fill.") if record.get("appliedFillId")]
 
     def persist_inventory_manifest(self, *, observed_at: datetime | None = None) -> dict[str, Any]:
-        observed = _require_utc(observed_at or datetime.now(UTC))
+        observed = _require_utc(observed_at or data_now())
         snapshots = dict(self.store.snapshots)
         latest_account = snapshots.get(_execution_key("local_account.latest"), {})
-        session_date = str(latest_account.get("sessionDate") or observed.date().isoformat()) if isinstance(latest_account, Mapping) else observed.date().isoformat()
+        session_date = str(latest_account.get("sessionDate") or trading_session_date(observed).isoformat()) if isinstance(latest_account, Mapping) else trading_session_date(observed).isoformat()
         trades_today = int(latest_account.get("tradesToday") or 0) if isinstance(latest_account, Mapping) else 0
         payload = _owned_record(
             {
@@ -930,8 +934,29 @@ class VotingEnsembleInventoryLedger:
             brokerState=risk.brokerState,
             riskState=risk.riskState,
             observedAt=observed,
-            sessionDate=observed.date(),
+            sessionDate=trading_session_date(observed),
         ).to_record(reason_codes=["voting_ensemble.local_paper.risk_snapshot_recorded"])
+
+    def roll_trading_session(self, *, observed_at: datetime) -> dict[str, Any] | None:
+        """Start a new trading session on the stored account when the session date changes.
+
+        Nothing rewrote the account on a day without fills, so its sessionDate, trade count
+        and daily P&L stayed on the last day anything happened.
+        """
+        observed = _require_utc(observed_at)
+        existing = self.store.snapshots.get(_execution_key("local_account.latest"))
+        if not isinstance(existing, dict):
+            return None
+        if str(existing.get("sessionDate") or "") == trading_session_date(observed).isoformat():
+            return None
+        rolled = self._enriched_account_payload(
+            existing,
+            observed_at=observed,
+            reason_codes=["voting_ensemble.local_paper_account.trading_session_rolled"],
+        )
+        self.store.write_snapshot("local_account.latest", rolled)
+        self.persist_inventory_manifest(observed_at=observed)
+        return rolled
 
     def _account_payload(
         self,
@@ -944,6 +969,7 @@ class VotingEnsembleInventoryLedger:
         equity: float | Decimal | None = None,
         unrealized_pnl: float | Decimal = 0.0,
         intraday_equity_high: float | Decimal | None = None,
+        previous: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         observed = _require_utc(observed_at)
         initial = _decimal(initial_cash if initial_cash is not None else _configured_initial_cash())
@@ -959,14 +985,28 @@ class VotingEnsembleInventoryLedger:
         max_gross_exposure = resolved_equity * max_leverage
         remaining_exposure = _max_decimal(Decimal("0"), max_gross_exposure - open_notional)
         usable_entry_buying_power = _min_decimal(_max_decimal(Decimal("0"), cash_value), remaining_exposure)
-        previous_high = _decimal(intraday_equity_high) if intraday_equity_high is not None else resolved_equity
+        session_date = trading_session_date(observed)
+        # "Today" is measured from the start of the trading session. The first record of a
+        # new session takes the realized P&L carried in as its baseline and restarts the
+        # intraday high, so the daily loss and drawdown limits see this session only.
+        # Before this, realizedPnlToday was the all-time figure and the high never reset.
+        new_session = previous is not None and str(previous.get("sessionDate") or "") != session_date.isoformat()
+        if previous is None:
+            session_start_realized = Decimal("0")
+        elif new_session:
+            session_start_realized = _decimal(previous.get("realizedPnl") or 0)
+        elif previous.get("sessionStartRealizedPnl") is not None:
+            session_start_realized = _decimal(previous.get("sessionStartRealizedPnl"))
+        else:
+            session_start_realized = _decimal(previous.get("realizedPnl") or 0) - _decimal(previous.get("realizedPnlToday") or 0)
+        previous_high = _decimal(intraday_equity_high) if intraday_equity_high is not None and not new_session else resolved_equity
         high = _max_decimal(previous_high, resolved_equity)
         drawdown = _max_decimal(Decimal("0"), high - resolved_equity)
         drawdown_percent = (drawdown / high * Decimal("100")) if high > 0 else Decimal("0")
         open_risk = self._total_open_risk_dollars(positions)
         open_risk_percent = (open_risk / resolved_equity * Decimal("100")) if resolved_equity > 0 else Decimal("0")
         last_mark_price, last_marked_at = self._last_mark(positions)
-        session_date = observed.date()
+        realized_today = realized - session_start_realized
         account = VotingEnsemblePaperAccount(
             initialCash=initial,
             cash=cash_value,
@@ -974,9 +1014,10 @@ class VotingEnsembleInventoryLedger:
             buyingPower=usable_entry_buying_power,
             usableEntryBuyingPower=usable_entry_buying_power,
             realizedPnl=realized,
-            realizedPnlToday=realized,
+            realizedPnlToday=realized_today,
+            sessionStartRealizedPnl=session_start_realized,
             unrealizedPnl=unrealized,
-            dailyNetPnl=realized + unrealized,
+            dailyNetPnl=realized_today + unrealized,
             intradayEquityHigh=high,
             drawdownDollars=drawdown,
             drawdownPercent=drawdown_percent,
@@ -1008,6 +1049,7 @@ class VotingEnsembleInventoryLedger:
             intraday_equity_high=intraday_high,
             observed_at=observed_at,
             reason_codes=reason_codes,
+            previous=existing,
         )
         existing_session = str(existing.get("sessionDate") or "")
         if existing_session == str(payload.get("sessionDate") or ""):
@@ -1146,6 +1188,7 @@ class VotingEnsembleInventoryLedger:
                 intraday_equity_high=_decimal(account.get("intradayEquityHigh") or equity),
                 observed_at=observed_at,
                 reason_codes=["voting_ensemble.local_paper.account_marked_to_market_from_fresh_nbbo"],
+                previous=account,
             ),
         )
         self.store.write_snapshot("local_risk_snapshot.latest", self.risk_snapshot_payload(observed_at=observed_at))
@@ -1280,6 +1323,7 @@ class VotingEnsembleInventoryLedger:
                 unrealized_pnl=unrealized,
                 intraday_equity_high=_decimal(account.get("intradayEquityHigh") or equity),
                 reason_codes=["voting_ensemble.local_paper.account_updated_from_local_fill"],
+                previous=account,
             ),
         )
 
@@ -1321,7 +1365,7 @@ class VotingEnsembleInventoryLedger:
         count = 0
         for fill in self.fills():
             filled_at = _parse_time(fill.get("filledAt"))
-            if filled_at is None or filled_at.date() != session_date:
+            if filled_at is None or trading_session_date(filled_at) != session_date:
                 continue
             if self._fill_is_exit(fill):
                 continue
@@ -1347,7 +1391,7 @@ class VotingEnsembleInventoryLedger:
 
     @staticmethod
     def _broker_order(payload: Mapping[str, Any]) -> BrokerOrderState:
-        submitted_at = _parse_time(payload.get("submittedAt")) or datetime.now(UTC)
+        submitted_at = _parse_time(payload.get("submittedAt")) or data_now()
         return BrokerOrderState(
             algorithmId=VOTING_ENSEMBLE_ALGORITHM_ID,
             capitalPartitionId=VOTING_ENSEMBLE_CAPITAL_PARTITION_ID,
@@ -1449,6 +1493,14 @@ def _account_requires_upgrade(payload: Mapping[str, Any]) -> bool:
         "version",
     }
     return payload.get("version") != VOTING_ENSEMBLE_LOCAL_PAPER_ACCOUNT_VERSION or any(key not in payload for key in required)
+
+
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def trading_session_date(moment: datetime) -> date:
+    """The US equity session a moment belongs to: its New York calendar date."""
+    return _require_utc(moment).astimezone(NEW_YORK).date()
 
 
 def _configured_initial_cash() -> Decimal:

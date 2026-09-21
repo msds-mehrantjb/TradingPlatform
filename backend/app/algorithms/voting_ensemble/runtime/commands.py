@@ -10,6 +10,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.app.algorithms.voting_ensemble.data_clock import data_now
+
 
 VOTING_ENSEMBLE_COMMAND_SCHEMA_VERSION = "voting_ensemble_runtime_command_v2"
 VOTING_ENSEMBLE_EVALUATION_RESULT_CONTRACT_VERSION = "voting_ensemble_evaluation_result_contract_v2"
@@ -173,7 +175,7 @@ def _command(
     deadline_seconds: int,
     source: str,
 ) -> VotingEnsembleRuntimeCommand:
-    now = datetime.now(UTC)
+    now = data_now()
     idempotency_key = _idempotency_key(command_kind, symbol, bar_end_timestamp, settings_hash, payload)
     command_id = f"ve-command-{uuid4().hex[:12]}"
     return VotingEnsembleRuntimeCommand(

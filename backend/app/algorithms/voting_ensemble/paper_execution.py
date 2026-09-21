@@ -27,6 +27,7 @@ from backend.app.algorithms.voting_ensemble.local_paper_account import (
     _is_voting_ensemble_owned_position,
 )
 from backend.app.config import get_settings
+from backend.app.algorithms.voting_ensemble.data_clock import data_now
 from backend.app.algorithms.voting_ensemble.exit_policy import VOTING_ENSEMBLE_DEFAULT_MAX_HOLDING_MINUTES
 from backend.app.algorithms.voting_ensemble.execution_adapter import (
     VOTING_ENSEMBLE_EXECUTION_STATE_NAMESPACE,
@@ -75,6 +76,9 @@ VOTING_ENSEMBLE_EXECUTION_OUTBOX_STATES = {
 VOTING_ENSEMBLE_RECOVERABLE_OUTBOX_STATES = {"PENDING", "CLAIMED", "RECONCILIATION_REQUIRED"}
 VOTING_ENSEMBLE_UNCERTAIN_OUTBOX_STATES = {"SUBMITTING", "SUBMITTED"}
 VOTING_ENSEMBLE_CLIENT_ORDER_PREFIXES = ("ve-", "ve-paper-")
+# The local paper broker acknowledges an order as OPEN, so the gateway's default set of
+# working statuses never matched it and no local entry order was ever expired.
+LOCAL_PAPER_WORKING_INTENT_STATUSES = frozenset({"PENDING_SUBMISSION", "NEW", "OPEN", "ACCEPTED", "PARTIALLY_FILLED"})
 _PAPER_HOST_MARKER = "paper-api.alpaca.markets"
 _APPROVED_PAPER_ENDPOINT = "https://paper-api.alpaca.markets/v2"
 
@@ -698,7 +702,7 @@ class VotingEnsemblePaperExecutionRepository:
         have done before it is ever enabled. Keyed by order plan, so a refusal repeated at
         submission time overwrites rather than duplicates.
         """
-        observed = _require_utc(evaluated_at or datetime.now(UTC))
+        observed = _require_utc(evaluated_at or data_now())
         shadow_id = f"shadow-{_hash({'orderPlanId': order_plan.orderPlanId, 'decisionId': decision_id})[:20]}"
         payload = {
             "schemaVersion": "voting_ensemble_shadow_decision_v1",
@@ -1183,12 +1187,12 @@ class VotingEnsemblePaperExecutionWorker:
             else:
                 uncertain = self.repository.uncertain_intents()
                 if not uncertain:
-                    return self.reconcile_broker_state(evaluated_at=evaluated_at or datetime.now(UTC))
+                    return self.reconcile_broker_state(evaluated_at=evaluated_at or data_now())
                 return self._mark_uncertain_restart(uncertain[0], evaluated_at=evaluated_at)
         return self.process_intent(intent, evaluated_at=evaluated_at)
 
     def process_intent(self, intent: VotingEnsemblePaperOrderIntent, *, evaluated_at: datetime | None = None) -> dict[str, Any]:
-        now = _require_utc(evaluated_at or datetime.now(UTC))
+        now = _require_utc(evaluated_at or data_now())
         claimed = self.repository.claim_intent(intent, worker_id=self.worker_id, claimed_at=now)
         if claimed is None:
             return {
@@ -1686,7 +1690,7 @@ class VotingEnsemblePaperExecutionWorker:
             )
 
     def _mark_uncertain_restart(self, intent: VotingEnsemblePaperOrderIntent, *, evaluated_at: datetime | None = None) -> dict[str, Any]:
-        now = _require_utc(evaluated_at or datetime.now(UTC))
+        now = _require_utc(evaluated_at or data_now())
         result = {
             "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
             "algorithm_id": VOTING_ENSEMBLE_ALGORITHM_ID,
@@ -1889,9 +1893,9 @@ class VotingEnsemblePaperExecutionRuntime:
             else:
                 uncertain = self.repository.uncertain_intents()
                 if not uncertain:
-                    return self.reconcile_broker_state(evaluated_at=evaluated_at or datetime.now(UTC))
+                    return self.reconcile_broker_state(evaluated_at=evaluated_at or data_now())
                 return self.worker._mark_uncertain_restart(uncertain[0], evaluated_at=evaluated_at)
-        now = _require_utc(evaluated_at or datetime.now(UTC))
+        now = _require_utc(evaluated_at or data_now())
         claimed = self.repository.claim_intent(intent, worker_id=self.worker.worker_id, claimed_at=now)
         if claimed is None:
             return None
@@ -1947,7 +1951,7 @@ class VotingEnsemblePaperExecutionRuntime:
         return self.worker.process_intent(intent, evaluated_at=evaluated_at)
 
     def reconcile_broker_state(self, *, evaluated_at: datetime | None = None) -> dict[str, Any] | None:
-        now = evaluated_at or datetime.now(UTC)
+        now = evaluated_at or data_now()
         if self.execution_mode == "LOCAL_PAPER":
             maintenance = self.run_local_position_order_maintenance(evaluated_at=_require_utc(now))
             consistency = self.validate_local_consistency(evaluated_at=_require_utc(now))
@@ -1964,7 +1968,7 @@ class VotingEnsemblePaperExecutionRuntime:
         return self.paper_gateway.recover_from_restart(evaluated_at=now)
 
     def run_local_position_order_maintenance(self, *, evaluated_at: datetime | None = None) -> dict[str, Any]:
-        now = _require_utc(evaluated_at or datetime.now(UTC))
+        now = _require_utc(evaluated_at or data_now())
         if self.execution_mode != "LOCAL_PAPER":
             return {
                 "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
@@ -1979,10 +1983,20 @@ class VotingEnsemblePaperExecutionRuntime:
                 "evaluatedAt": now.isoformat().replace("+00:00", "Z"),
                 "reasonCodes": ["voting_ensemble.local_paper_maintenance.skipped_for_broker_paper_mode"],
             }
-        # Trail first, against the latest mark, so the protective legs are evaluated at
-        # the stop the position has earned; then protective legs, so a position that
-        # just stopped out is not also sent a time-stop exit; then the holding limit;
-        # then end of day.
+        # Unfilled entries past their order age go first. Nothing else expires a local
+        # order: a limit buy left open for a day was still live the next session, ready
+        # to fill a stale signal. Then trail, against the latest mark, so the protective
+        # legs are evaluated at the stop the position has earned; then protective legs,
+        # so a position that just stopped out is not also sent a time-stop exit; then the
+        # holding limit; then end of day.
+        self.repository.inventory_ledger.roll_trading_session(observed_at=now)
+        stale_cancellations = [
+            item.model_dump(mode="json")
+            for item in self.paper_gateway.cancel_stale_orders(
+                evaluated_at=now,
+                working_statuses=LOCAL_PAPER_WORKING_INTENT_STATUSES,
+            )
+        ]
         trailer = getattr(self.paper_gateway.broker, "trail_protective_stops", None)
         trail_updates = trailer(evaluated_at=now) if callable(trailer) else []
         evaluator = getattr(self.paper_gateway.broker, "evaluate_open_protective_orders", None)
@@ -1997,6 +2011,8 @@ class VotingEnsemblePaperExecutionRuntime:
             "accountId": VOTING_ENSEMBLE_LOCAL_ACCOUNT_ID,
             "executionMode": "LOCAL_PAPER",
             "status": "MAINTAINED",
+            "staleOrderCancellations": stale_cancellations,
+            "staleOrdersCanceled": len([item for item in stale_cancellations if item.get("staleOrderCancelled")]),
             "protectiveFillsObserved": len(protective_fills),
             "stopTrailUpdates": trail_updates,
             "stopsTrailed": len(trail_updates),
@@ -2013,7 +2029,7 @@ class VotingEnsemblePaperExecutionRuntime:
         }
 
     def validate_local_consistency(self, *, evaluated_at: datetime | None = None) -> dict[str, Any]:
-        now = _require_utc(evaluated_at or datetime.now(UTC))
+        now = _require_utc(evaluated_at or data_now())
         if self.execution_mode != "LOCAL_PAPER":
             return {
                 "algorithmId": VOTING_ENSEMBLE_ALGORITHM_ID,
@@ -2060,7 +2076,7 @@ class VotingEnsemblePaperExecutionRuntime:
             or _parse_time(_nested_value(payload, ("market_context", "data_timestamp")))
             or _parse_time(_nested_value(payload, ("marketEvent", "receivedAt")))
             or observed_at
-            or datetime.now(UTC)
+            or data_now()
         )
         return self.repository.mark_local_positions_from_market_data(
             symbol=symbol,
@@ -2069,7 +2085,7 @@ class VotingEnsemblePaperExecutionRuntime:
         )
 
     def update_local_market_clock(self, clock: Mapping[str, Any], *, observed_at: datetime | None = None) -> dict[str, Any]:
-        observed = _require_utc(observed_at or datetime.now(UTC))
+        observed = _require_utc(observed_at or data_now())
         due = _clock_requires_eod_flatten(clock, now=observed)
         payload = {
             "schemaVersion": "voting_ensemble_local_market_clock_v1",
@@ -2094,6 +2110,7 @@ class VotingEnsemblePaperExecutionRuntime:
     def _local_end_of_day_updates(self, *, evaluated_at: datetime) -> list[dict[str, Any]]:
         clock = self._local_market_clock_snapshot()
         if not _clock_requires_eod_flatten(clock, now=evaluated_at):
+            self._lift_end_of_day_entry_block(evaluated_at=evaluated_at)
             return []
         self.repository.write_snapshot(
             "local_entry_control.end_of_day",
@@ -2119,6 +2136,25 @@ class VotingEnsemblePaperExecutionRuntime:
             ]
         return submit_eod(evaluated_at=evaluated_at)
 
+    def _lift_end_of_day_entry_block(self, *, evaluated_at: datetime) -> None:
+        # The end-of-day block used to be written and never removed, so the first session
+        # that reached its close would have refused entries on every session after it.
+        try:
+            control = self.repository.read_snapshot("local_entry_control.end_of_day")
+        except KeyError:
+            return
+        if control.get("newEntriesAllowed") is not False:
+            return
+        self.repository.write_snapshot(
+            "local_entry_control.end_of_day",
+            {
+                **control,
+                "newEntriesAllowed": True,
+                "observedAt": evaluated_at.isoformat().replace("+00:00", "Z"),
+                "reasonCodes": ["voting_ensemble.local_paper.end_of_day_window_passed"],
+            },
+        )
+
     def _local_market_clock_snapshot(self) -> dict[str, Any]:
         try:
             return self.repository.read_snapshot("local_market_clock.latest")
@@ -2140,9 +2176,9 @@ class VotingEnsemblePaperExecutionRuntime:
     def start(self) -> None:
         self._requeue_recoverable_intents()
         if self.execution_mode == "LOCAL_PAPER":
-            self.repository.recover_local_inventory_from_persistence(evaluated_at=datetime.now(UTC))
+            self.repository.recover_local_inventory_from_persistence(evaluated_at=data_now())
         if self.broker_client is not None:
-            self.reconcile_broker_state(evaluated_at=datetime.now(UTC))
+            self.reconcile_broker_state(evaluated_at=data_now())
         if self._thread is None or not self._thread.is_alive():
             self._thread = VotingEnsemblePaperExecutionWorkerThread(self.worker)
             self._thread.start()
@@ -2311,7 +2347,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
                 status="REJECTED",
                 rejectedReason=reason,
             )
-        observed_at = _require_utc(getattr(intent, "createdAt", None) or datetime.now(UTC))
+        observed_at = _require_utc(getattr(intent, "createdAt", None) or data_now())
         self.repository.inventory_ledger.create_order(intent, observed_at=observed_at)
         self.repository.write_snapshot(
             f"local_execution.{intent.clientOrderId}",
@@ -2366,7 +2402,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
             return False
         if int(order.get("filledQuantity") or 0) > 0:
             return False
-        canceled = self.repository.inventory_ledger.cancel_order(client_order_id, canceled_at=datetime.now(UTC))
+        canceled = self.repository.inventory_ledger.cancel_order(client_order_id, canceled_at=data_now())
         if canceled:
             self.repository.write_snapshot(
                 f"local_execution.{client_order_id}",
@@ -2632,7 +2668,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
             side=Signal(order.get("side") or Signal.BUY),
             requested_quantity=int(fill_plan["quantity"]),
             fill_price=float(fill_plan["fillPrice"]),
-            filled_at=_parse_time(order.get("submittedAt")) or datetime.now(UTC),
+            filled_at=_local_fill_time(order, fill_plan),
         )
         if fill is None:
             self.repository.write_snapshot(
@@ -2771,7 +2807,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
             existing = {}
         if str(existing.get("status") or "").upper() in {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}:
             return
-        submitted_at = _parse_time(parent_order.get("submittedAt")) or datetime.now(UTC)
+        submitted_at = _parse_time(parent_order.get("submittedAt")) or data_now()
         payload = {
             **existing,
             "schemaVersion": "voting_ensemble_local_order_v1",
@@ -2922,11 +2958,11 @@ class VotingEnsembleLocalPaperExecutionEngine:
         quote_timestamp = _parse_time(quote.get("quoteTimestamp"))
         if quote_timestamp is None:
             return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.quote_timestamp_missing"}
-        age_ms = max(0.0, (datetime.now(UTC) - quote_timestamp).total_seconds() * 1000.0)
+        age_ms = max(0.0, (data_now() - quote_timestamp).total_seconds() * 1000.0)
         max_age_ms = _local_paper_env_float("VOTING_ENSEMBLE_LOCAL_PAPER_MAX_QUOTE_AGE_MS", 5000.0)
         if age_ms > max_age_ms and quote.get("observedAt"):
             observed = _parse_time(quote.get("observedAt"))
-            age_ms = max(0.0, ((observed or datetime.now(UTC)) - quote_timestamp).total_seconds() * 1000.0)
+            age_ms = max(0.0, ((observed or data_now()) - quote_timestamp).total_seconds() * 1000.0)
         if age_ms > max_age_ms:
             return {"status": "NOT_FILLABLE", "orderStatus": "OPEN", "reasonCode": "voting_ensemble.local_paper_execution_engine.stale_quote"}
         order_type = str(order.get("orderType") or "LIMIT").upper()
@@ -2977,6 +3013,7 @@ class VotingEnsembleLocalPaperExecutionEngine:
             "quantity": fill_quantity,
             "fillPrice": round(fill_price, 6),
             "fillPolicy": fill_policy,
+            "quoteTimestamp": quote_timestamp,
         }
 
     def _record_open_order_status(self, order: Mapping[str, Any], *, status: str, reason_code: str) -> None:
@@ -4253,13 +4290,27 @@ def _maximum_holding_minutes(state: VotingEnsembleExecutionState | None) -> int:
     return max(1, int(plan.maximumHoldingMinutes or 120))
 
 
+def _local_fill_time(order: Mapping[str, Any], fill_plan: Mapping[str, Any]) -> datetime:
+    """When a local fill happened: at the quote it filled against, never before submission.
+
+    Fills used to be stamped with the order's submission time, so a stop that filled hours
+    after entry was recorded as filling at the entry, and its protective legs inherited the
+    same stamp.
+    """
+    submitted = _parse_time(order.get("submittedAt"))
+    quoted = fill_plan.get("quoteTimestamp")
+    quoted = _require_utc(quoted) if isinstance(quoted, datetime) else None
+    candidates = [moment for moment in (submitted, quoted) if moment is not None]
+    return max(candidates) if candidates else data_now()
+
+
 def _clock_requires_eod_flatten(clock: Mapping[str, Any], *, now: datetime | None = None) -> bool:
     if bool(clock.get("forceClose") or clock.get("requiresEodFlatten")):
         return True
     next_close = _parse_time(clock.get("nextClose") or clock.get("next_close"))
     if next_close is None:
         return False
-    observed = _require_utc(now or datetime.now(UTC))
+    observed = _require_utc(now or data_now())
     return next_close - observed <= timedelta(minutes=5)
 
 
@@ -4568,7 +4619,7 @@ def _intent_from_record(payload: Mapping[str, Any]) -> VotingEnsemblePaperOrderI
         idempotencyKey=str(payload["idempotencyKey"]),
         orderPlan=OrderPlan.model_validate(payload["orderPlan"]),
         localGatePassed=bool(payload.get("localGatePassed")),
-        createdAt=_parse_time(payload.get("createdAt")) or datetime.now(UTC),
+        createdAt=_parse_time(payload.get("createdAt")) or data_now(),
         sourceJobId=str(payload["sourceJobId"]) if payload.get("sourceJobId") else None,
         sourceCommandId=str(payload["sourceCommandId"]) if payload.get("sourceCommandId") else None,
         settingsSnapshot=dict(payload.get("settingsSnapshot") or {}),

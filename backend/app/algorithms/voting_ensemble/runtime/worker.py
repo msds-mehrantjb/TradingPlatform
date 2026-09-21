@@ -7,6 +7,7 @@ from threading import Event, Thread
 from time import sleep
 from typing import TYPE_CHECKING, Any, Protocol
 
+from backend.app.algorithms.voting_ensemble.data_clock import data_now
 from backend.app.alpaca import AlpacaClient
 from backend.app.config import get_settings
 from backend.app.algorithms.voting_ensemble.finalized_bar_producer import VotingEnsembleAutomaticSnapshotError
@@ -153,7 +154,7 @@ class VotingEnsembleWorker:
                     idempotency_key=command.idempotencyKey,
                     source_job_id=command.jobId,
                     source_command_id=command.commandId,
-                    evaluated_at=datetime.now(UTC),
+                    evaluated_at=data_now(),
                     source_command_kind=command.commandKind,
                 )
             return {
@@ -314,7 +315,7 @@ def _is_stale(command: VotingEnsembleRuntimeCommand) -> bool:
     deadline = command.deadlineAt
     if deadline.tzinfo is None:
         deadline = deadline.replace(tzinfo=UTC)
-    return deadline.astimezone(UTC) <= datetime.now(UTC)
+    return deadline.astimezone(UTC) <= data_now()
 
 
 def _automatic_fail_closed_result(
@@ -388,7 +389,7 @@ def _mark_local_paper_from_payload(paper_execution_runtime: Any, payload: dict[s
     marker = getattr(paper_execution_runtime, "mark_to_market_from_payload", None)
     if not callable(marker):
         return None
-    return marker(payload, observed_at=datetime.now(UTC))
+    return marker(payload, observed_at=data_now())
 
 
 def _snapshot_hash(payload: dict[str, Any]) -> str | None:

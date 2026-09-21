@@ -12,6 +12,8 @@ from threading import Lock
 from typing import Any
 
 from backend.app.config import Settings, get_settings
+from backend.app.alpaca import local_market_status
+from backend.app.algorithms.voting_ensemble.data_clock import data_now, delayed, market_data_feed
 from backend.app.algorithms.voting_ensemble.finalized_bar_producer import (
     VotingEnsembleAutomaticEvaluationPayloadBuilder,
     VotingEnsembleCandleStore,
@@ -342,7 +344,7 @@ class VotingEnsembleRuntimeSupervisor:
                 account_snapshot_provider=self._default_account_snapshot,
                 quote_provider=self._latest_quote,
                 last_trade_provider=self._latest_trade,
-                feed=(finalized_bar_producer_config.feed if finalized_bar_producer_config else "iex"),
+                feed=(finalized_bar_producer_config.feed if finalized_bar_producer_config else market_data_feed()),
                 history_limit=(finalized_bar_producer_config.history_limit if finalized_bar_producer_config else 390),
             )
             if candle_store is not None
@@ -820,13 +822,15 @@ class VotingEnsembleRuntimeSupervisor:
     async def _position_order_manager_loop(self) -> None:
         while not self.stop_event.is_set():
             if _is_local_paper_mode(self.paper_execution_runtime):
+                now = data_now()
+                await asyncio.to_thread(self._record_local_market_clock, now)
                 local_maintenance = getattr(self.paper_execution_runtime, "run_local_position_order_maintenance", None)
                 if callable(local_maintenance):
-                    await asyncio.to_thread(local_maintenance, evaluated_at=datetime.now(UTC))
+                    await asyncio.to_thread(local_maintenance, evaluated_at=now)
             else:
                 gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
                 if gateway is not None:
-                    await asyncio.to_thread(gateway.cancel_stale_orders, evaluated_at=datetime.now(UTC))
+                    await asyncio.to_thread(gateway.cancel_stale_orders, evaluated_at=data_now())
             await asyncio.sleep(self.config.reconciliation_poll_seconds)
 
     async def _reconciliation_loop(self) -> None:
@@ -834,22 +838,22 @@ class VotingEnsembleRuntimeSupervisor:
             if _is_local_paper_mode(self.paper_execution_runtime):
                 local_validate = getattr(self.paper_execution_runtime, "validate_local_consistency", None)
                 if callable(local_validate):
-                    self.metrics.lastReconciliation = await asyncio.to_thread(local_validate, evaluated_at=datetime.now(UTC))
+                    self.metrics.lastReconciliation = await asyncio.to_thread(local_validate, evaluated_at=data_now())
             else:
                 broker_reconcile = getattr(self.paper_execution_runtime, "reconcile_broker_state", None)
                 if callable(broker_reconcile):
-                    self.metrics.lastReconciliation = await asyncio.to_thread(broker_reconcile, evaluated_at=datetime.now(UTC))
+                    self.metrics.lastReconciliation = await asyncio.to_thread(broker_reconcile, evaluated_at=data_now())
                 else:
                     gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
                     if gateway is not None:
-                        self.metrics.lastReconciliation = await asyncio.to_thread(gateway.recover_from_restart, evaluated_at=datetime.now(UTC))
+                        self.metrics.lastReconciliation = await asyncio.to_thread(gateway.recover_from_restart, evaluated_at=data_now())
             await asyncio.sleep(self.config.reconciliation_poll_seconds)
 
     async def _legacy_reconciliation_loop(self) -> None:
         while not self.stop_event.is_set():
             gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
             if gateway is not None:
-                self.metrics.lastReconciliation = await asyncio.to_thread(gateway.recover_from_restart, evaluated_at=datetime.now(UTC))
+                self.metrics.lastReconciliation = await asyncio.to_thread(gateway.recover_from_restart, evaluated_at=data_now())
             await asyncio.sleep(self.config.reconciliation_poll_seconds)
 
     async def _health_monitor_loop(self) -> None:
@@ -937,7 +941,7 @@ class VotingEnsembleRuntimeSupervisor:
         local_paper_mode = _is_local_paper_mode(self.paper_execution_runtime)
         inventory = self.paper_inventory()
         if local_paper_mode:
-            self._refresh_local_market_data_mark(symbol="SPY", feed="iex")
+            self._refresh_local_market_data_mark(symbol="SPY", feed=market_data_feed())
             inventory = self.paper_inventory()
         account = inventory.get("account") if isinstance(inventory, dict) else None
         local_account_loaded = _local_paper_account_loaded(account)
@@ -1008,19 +1012,45 @@ class VotingEnsembleRuntimeSupervisor:
             if _is_local_paper_mode(self.paper_execution_runtime):
                 local_validate = getattr(self.paper_execution_runtime, "validate_local_consistency", None)
                 if callable(local_validate):
-                    self.metrics.lastReconciliation = local_validate(evaluated_at=datetime.now(UTC))
+                    self.metrics.lastReconciliation = local_validate(evaluated_at=data_now())
                 return
             broker_reconcile = getattr(self.paper_execution_runtime, "reconcile_broker_state", None)
             if callable(broker_reconcile):
-                self.metrics.lastReconciliation = broker_reconcile(evaluated_at=datetime.now(UTC))
+                self.metrics.lastReconciliation = broker_reconcile(evaluated_at=data_now())
                 return
             gateway = getattr(self.paper_execution_runtime, "paper_gateway", None)
             if gateway is not None:
-                self.metrics.lastReconciliation = gateway.recover_from_restart(evaluated_at=datetime.now(UTC))
+                self.metrics.lastReconciliation = gateway.recover_from_restart(evaluated_at=data_now())
         except Exception as exc:
             self.record_worker_failure("reconciliation_loop", exc)
 
+    def _record_local_market_clock(self, observed_at: datetime) -> None:
+        """Give local maintenance the session clock it flattens against.
+
+        End-of-day flattening reads a stored market clock that nothing on the live path
+        wrote, so open positions were never flattened into the close.
+        """
+        recorder = getattr(self.paper_execution_runtime, "update_local_market_clock", None)
+        if not callable(recorder):
+            return
+        try:
+            clock = self.market_clock_provider()
+        except Exception:
+            return
+        if not isinstance(clock, dict) or not clock.get("nextClose"):
+            return
+        recorder({**clock, "sourceAuthority": clock.get("sourceAuthority") or "voting_ensemble.runtime_supervisor.market_clock"}, observed_at=observed_at)
+
     def _default_market_clock(self) -> dict[str, Any]:
+        if delayed():
+            # The broker clock reports the real session. On a delayed data clock the
+            # session opens and closes when the data does, so read the exchange calendar
+            # at the data clock instead.
+            return {
+                **local_market_status(now=data_now()),
+                "sourceAuthority": "voting_ensemble.data_clock_calendar",
+                "reasonCodes": ["voting_ensemble.control.data_clock_calendar_reported"],
+            }
         if not self.settings.has_alpaca_credentials:
             if _is_local_paper_mode(self.paper_execution_runtime):
                 return {
@@ -1101,7 +1131,7 @@ class VotingEnsembleRuntimeSupervisor:
         if not callable(marker):
             return None
         try:
-            observed_at = datetime.now(UTC)
+            observed_at = data_now()
             for key in ("quoteTimestamp", "marketDataReceiptTimestamp", "lastTradeTimestamp"):
                 timestamp = _parse_supervisor_time(quote.get(key))
                 if timestamp is not None and timestamp > observed_at:
