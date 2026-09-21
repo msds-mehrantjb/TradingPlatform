@@ -75,6 +75,12 @@ def main() -> None:
     parser.add_argument("--training-cost", type=float, default=DEFAULT_TRAINING_COST)
     parser.add_argument("--max-rows", type=int, default=DEFAULT_MAX_ROWS)
     parser.add_argument("--model-kind", choices=["xgboost", "logistic"], default="xgboost")
+    # The dataset the manifest points at is IEX; the algorithm now trades SIP. An explicit
+    # path trains on the feed being traded without disturbing the backtest datasets.
+    parser.add_argument("--candles-path", default=None, help="1m candle JSONL to train on (default: the latest dataset manifest)")
+    # Microstructure exists for a few months only, which caps xgboost training at that
+    # window, and inference never supplies it: measured effect on predictions is ~0.01.
+    parser.add_argument("--no-require-microstructure", dest="require_microstructure", action="store_false", default=None)
     parser.add_argument("--horizons", default=",".join(str(horizon) for horizon in DEFAULT_FORECAST_HORIZONS))
     args = parser.parse_args()
 
@@ -96,6 +102,8 @@ def main() -> None:
         max_rows=args.max_rows,
         model_kind=args.model_kind,
         horizons=parse_horizons(args.horizons),
+        candles_path=args.candles_path,
+        require_microstructure=args.require_microstructure,
     )
     print(json.dumps(summary, indent=2))
 
@@ -133,6 +141,8 @@ def train_market_forecast_multi_horizon_model(
     max_rows: int,
     model_kind: str,
     horizons: tuple[int, ...] = DEFAULT_FORECAST_HORIZONS,
+    candles_path: str | None = None,
+    require_microstructure: bool | None = None,
 ) -> dict[str, Any]:
     ordered_horizons = tuple(horizon for horizon in MARKET_FORECAST_POSITION_HORIZONS_MINUTES if horizon in set(horizons))
     ordered_horizons = ordered_horizons + tuple(horizon for horizon in horizons if horizon not in set(ordered_horizons))
@@ -161,6 +171,8 @@ def train_market_forecast_multi_horizon_model(
             max_rows=max_rows,
             model_kind=model_kind,
             horizon_minutes=horizon,
+            candles_path=candles_path,
+            require_microstructure=require_microstructure,
         )
         horizon_summaries[str(horizon)] = summary
         artifact_path = Path(str(summary["candidateArtifactPath"]))
@@ -211,11 +223,17 @@ def train_market_forecast_model(
     max_rows: int,
     model_kind: str,
     horizon_minutes: int = FORECAST_HORIZON_MINUTES,
+    candles_path: str | None = None,
+    require_microstructure: bool | None = None,
 ) -> dict[str, Any]:
     trained_at = datetime.now(UTC).isoformat()
     artifact_id = market_forecast_candidate_artifact_id(symbol=symbol, trained_at=trained_at, model_kind=model_kind)
-    manifest = latest_manifest(symbol)
-    candle_path = Path(str(manifest.get("files", {}).get("continuous1mJsonl") or ""))
+    if candles_path:
+        manifest = {"files": {"continuous1mJsonl": str(candles_path)}, "source": "explicit_candles_path"}
+        candle_path = Path(str(candles_path))
+    else:
+        manifest = latest_manifest(symbol)
+        candle_path = Path(str(manifest.get("files", {}).get("continuous1mJsonl") or ""))
     if not candle_path.exists():
         raise FileNotFoundError(f"1m candle file not found: {candle_path}")
 
@@ -233,7 +251,7 @@ def train_market_forecast_model(
         training_cost=training_cost,
         max_rows=max_rows,
         microstructure_by_timestamp=microstructure_by_timestamp,
-        require_microstructure=model_kind == "xgboost",
+        require_microstructure=(model_kind == "xgboost") if require_microstructure is None else bool(require_microstructure),
         symbol=symbol,
         feed=feed,
         horizon_minutes=horizon_minutes,

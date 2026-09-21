@@ -27,7 +27,12 @@ FORECAST_NEUTRAL_PRICE_MOVE_PCT = 0.00005
 DEFAULT_MAX_SPREAD_ATR = 0.2
 DEFAULT_PROFIT_TARGET_DOLLARS = 1.0
 DEFAULT_MIN_TARGET_PCT = 0.0
-DEFAULT_MIN_STOP_PCT = 0.0025
+# Symmetric with the target floor. A 0.25% stop floor put the down barrier about six times
+# farther from the entry than the up barrier (at SPY 760: $1.90 against $0.30), so "up
+# first" was the label 65% of the time and "down first" 4%. Every model trained on it
+# learned to answer "up" and scored the base rate; measured on the untouched holdout,
+# balancing the barriers dropped AUC from 0.57 to 0.53, which is the honest figure.
+DEFAULT_MIN_STOP_PCT = 0.0
 DEFAULT_TARGET_ATR_MULTIPLIER = 1.0
 DEFAULT_STOP_ATR_MULTIPLIER = 1.0
 DEFAULT_DECISION_TO_SUBMISSION_LATENCY_SECONDS = 0.35
@@ -1493,6 +1498,16 @@ def build_prediction_horizon_records(latest: dict[str, Any], forecast: dict[str,
             }
         )
     return sorted(horizons, key=lambda item: int(item.get("horizonMinutes") or 0))
+
+
+def _configured_or_default(value: Any, default: float) -> float:
+    """A label-config number, honouring an explicit zero."""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def predicted_probability_class(probabilities: dict[str, Any]) -> str | None:
@@ -3213,13 +3228,17 @@ def volatility_adjusted_barriers(
     horizon_minutes: int = FORECAST_HORIZON_MINUTES,
 ) -> dict[str, float]:
     label_config = (artifact or {}).get("label") or {}
-    configured_fixed_target = numeric(label_config.get("profitTargetDollars"))
-    fixed_target = max(configured_fixed_target, DEFAULT_PROFIT_TARGET_DOLLARS)
-    fixed_stop = numeric(label_config.get("stopLossDollars"))
-    min_target_pct = numeric(label_config.get("minTargetPct")) if configured_fixed_target >= DEFAULT_PROFIT_TARGET_DOLLARS else DEFAULT_MIN_TARGET_PCT
-    min_stop_pct = numeric(label_config.get("minStopPct")) or DEFAULT_MIN_STOP_PCT
-    target_multiplier = numeric(label_config.get("targetAtrMultiplier")) or DEFAULT_TARGET_ATR_MULTIPLIER
-    stop_multiplier = numeric(label_config.get("stopAtrMultiplier")) or DEFAULT_STOP_ATR_MULTIPLIER
+    # Serve a model the barriers it was trained on. Forcing a $1.00 target floor while the
+    # stop kept the label's $0.25 asked the probabilities about a different pair of
+    # barriers than the labels used, in the opposite direction to the stop-floor skew.
+    fixed_target = _configured_or_default(label_config.get("profitTargetDollars"), DEFAULT_PROFIT_TARGET_DOLLARS)
+    fixed_stop = _configured_or_default(label_config.get("stopLossDollars"), fixed_target)
+    min_target_pct = _configured_or_default(label_config.get("minTargetPct"), DEFAULT_MIN_TARGET_PCT)
+    # A configured zero is a decision, not a missing value: `or` would serve a model
+    # trained on symmetric barriers with the asymmetric default it was never trained on.
+    min_stop_pct = _configured_or_default(label_config.get("minStopPct"), DEFAULT_MIN_STOP_PCT)
+    target_multiplier = _configured_or_default(label_config.get("targetAtrMultiplier"), DEFAULT_TARGET_ATR_MULTIPLIER)
+    stop_multiplier = _configured_or_default(label_config.get("stopAtrMultiplier"), DEFAULT_STOP_ATR_MULTIPLIER)
     atr_value = float(features["volatility"]["atr_1m"])
     realized = float(features["volatility"]["realized_volatility"]) * latest_close * math.sqrt(horizon_minutes)
     atr_horizon = max(atr_value * math.sqrt(horizon_minutes), realized, 0.01)
