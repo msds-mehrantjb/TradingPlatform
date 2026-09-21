@@ -182,7 +182,15 @@ class VotingEnsemblePaperExecutionRepository:
     def write_snapshot(self, key: str, snapshot: dict[str, Any]) -> None:
         normalized = self._key(key)
         with self._lock:
-            self.snapshots[normalized] = self._owned_payload(snapshot)
+            payload = self._owned_payload(snapshot)
+            existing = self.snapshots.get(normalized)
+            if existing is not None and _is_local_paper_fill_key(normalized):
+                # The gateway records its own view of a fill under the key the local engine
+                # already wrote its accounting record to, and its dump carries no
+                # schemaVersion, appliedFillId or realized P&L. Losing those failed local
+                # recovery on the next restart, which blocked every new entry.
+                payload = {**existing, **payload}
+            self.snapshots[normalized] = payload
             if self._transaction_depth > 0:
                 self._transaction_dirty = True
             else:
@@ -4198,6 +4206,10 @@ def _reconstruct_local_positions_from_fills(local_fills: list[Mapping[str, Any]]
             "reasonCodes": ["voting_ensemble.local_paper_migration.position_created_from_legacy_fill_replay"],
         }
     return {"positions": positions, "failures": sorted(set(failures))}
+
+
+def _is_local_paper_fill_key(key: str) -> bool:
+    return key.startswith(f"{VOTING_ENSEMBLE_PAPER_GATEWAY_NAMESPACE}.paper_order_gateway.fill.")
 
 
 def _is_local_recovery_validated_key(key: str) -> bool:

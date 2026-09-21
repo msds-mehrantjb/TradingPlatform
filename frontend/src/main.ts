@@ -474,6 +474,7 @@ function emptyVotingEnsemblePaperInventory(): VotingEnsemblePaperInventory {
     orders: [],
     fills: [],
     positions: [],
+    closedTrades: [],
     protectiveOrders: [],
     outbox: [],
     results: [],
@@ -648,6 +649,7 @@ type VotingEnsemblePaperInventory = {
   outbox: Record<string, unknown>[];
   results: Record<string, unknown>[];
   reconciliations: Record<string, unknown>[];
+  closedTrades: Record<string, unknown>[];
   generatedAt?: string;
   reasonCodes?: string[];
 };
@@ -3427,6 +3429,7 @@ const state = {
 
 let refreshTimer: number | undefined;
 let marketStatusTimer: number | undefined;
+let votingEnsembleInventoryTimer: number | undefined;
 let marketStatusRefreshInFlight = false;
 let nextChartRefreshAt = 0;
 let contextTimer: number | undefined;
@@ -17087,13 +17090,20 @@ function normalizeVotingEnsemblePaperInventory(raw: unknown): VotingEnsemblePape
     outbox: arrayFromUnknown(record.outbox).filter(isRecord),
     results: arrayFromUnknown(record.results).filter(isRecord),
     reconciliations: arrayFromUnknown(record.reconciliations).filter(isRecord),
+    closedTrades: arrayFromUnknown(record.closedTrades).filter(isRecord),
     generatedAt: stringFromUnknown(record.generatedAt, ""),
     reasonCodes: arrayFromUnknown(record.reasonCodes).map((value) => String(value)),
   };
 }
 
 function votingEnsembleTradeHistoryFromBackendInventory(inventory: VotingEnsemblePaperInventory): TradeHistoryRow[] {
-  const fillRows = inventory.fills.map(votingEnsembleTradeHistoryRowFromFill).filter((row): row is TradeHistoryRow => row !== null);
+  // Without this the sell rows carry no lot, so Order Controls kept offering to sell a
+  // position the backend had already closed -- a stopped-out entry stayed on screen as an
+  // open lot indefinitely.
+  const closedLotByExitOrder = votingEnsembleClosedLotIds(inventory.closedTrades);
+  const fillRows = inventory.fills
+    .map((fill) => votingEnsembleTradeHistoryRowFromFill(fill, closedLotByExitOrder))
+    .filter((row): row is TradeHistoryRow => row !== null);
   if (fillRows.length) {
     return fillRows.sort((a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime()).slice(0, 50);
   }
@@ -17104,7 +17114,27 @@ function votingEnsembleTradeHistoryFromBackendInventory(inventory: VotingEnsembl
     .slice(0, 50);
 }
 
-function votingEnsembleTradeHistoryRowFromFill(fill: Record<string, unknown>): TradeHistoryRow | null {
+function votingEnsembleClosedLotIds(closedTrades: Record<string, unknown>[]): Map<string, string> {
+  const byExitOrder = new Map<string, string>();
+  for (const trade of closedTrades) {
+    const entryOrderId = stringFromUnknown(trade.entryOrderId, "");
+    if (!entryOrderId) {
+      continue;
+    }
+    for (const key of ["exitOrderId", "exitFillId", "clientOrderId"] as const) {
+      const exitId = stringFromUnknown(trade[key], "");
+      if (exitId) {
+        byExitOrder.set(exitId, entryOrderId);
+      }
+    }
+  }
+  return byExitOrder;
+}
+
+function votingEnsembleTradeHistoryRowFromFill(
+  fill: Record<string, unknown>,
+  closedLotByExitOrder: Map<string, string> = new Map(),
+): TradeHistoryRow | null {
   const quantity = Math.max(0, Math.floor(numberFromUnknown(fill.filledQuantity, 0)));
   const price = numberFromUnknown(fill.averageFillPrice, 0);
   const side = normalizeTradeHistorySide(fill.side);
@@ -17112,6 +17142,7 @@ function votingEnsembleTradeHistoryRowFromFill(fill: Record<string, unknown>): T
     return null;
   }
   const id = stringFromUnknown(fill.clientOrderId, "") || stringFromUnknown(fill.orderIntentId, "") || `${stringFromUnknown(fill.filledAt, "")}-${side}`;
+  const closedLotId = side === "Sell" ? closedLotByExitOrder.get(id) : undefined;
   return {
     id,
     side,
@@ -17121,6 +17152,7 @@ function votingEnsembleTradeHistoryRowFromFill(fill: Record<string, unknown>): T
     notional: quantity * price,
     recordedAt: stringFromUnknown(fill.filledAt, new Date().toISOString()),
     evidence: backendTradeEvidence("fill", fill),
+    ...(closedLotId ? { closedLotId } : {}),
   };
 }
 
@@ -23547,6 +23579,22 @@ function sleepAppUntilMarketWake(status = "sleeping-market-closed") {
   markRefresh(status);
 }
 
+// The panel used to reload only on a tab switch, a trade or a page load, so a backend
+// restart left the dashboard showing an empty day until something was clicked.
+const VOTING_ENSEMBLE_INVENTORY_REFRESH_MS = 15000;
+
+function startVotingEnsembleInventoryMonitor() {
+  if (votingEnsembleInventoryTimer) {
+    window.clearInterval(votingEnsembleInventoryTimer);
+  }
+  votingEnsembleInventoryTimer = window.setInterval(() => {
+    if (document.visibilityState === "hidden") {
+      return;
+    }
+    void refreshVotingEnsemblePaperInventory();
+  }, VOTING_ENSEMBLE_INVENTORY_REFRESH_MS);
+}
+
 function startMarketStatusMonitor() {
   if (marketStatusTimer) {
     window.clearInterval(marketStatusTimer);
@@ -24605,6 +24653,7 @@ startBrowserStorageDiskSnapshots();
 scheduleAutoRefresh();
 startWakeActivationMonitor();
 startMarketStatusMonitor();
+startVotingEnsembleInventoryMonitor();
 setMarketRailTab("summary");
 void loadMarketStatus();
 void loadMacroEvents();
